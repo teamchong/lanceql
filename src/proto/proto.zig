@@ -8,6 +8,7 @@ const std = @import("std");
 
 pub const decoder = @import("decoder.zig");
 pub const lance_messages = @import("lance_messages.zig");
+pub const schema = @import("schema.zig");
 
 // Re-export main types
 pub const ProtoDecoder = decoder.ProtoDecoder;
@@ -17,6 +18,10 @@ pub const DecodeError = decoder.DecodeError;
 pub const ColumnMetadata = lance_messages.ColumnMetadata;
 pub const Page = lance_messages.Page;
 pub const Encoding = lance_messages.Encoding;
+
+pub const Schema = schema.Schema;
+pub const Field = schema.Field;
+pub const FieldType = schema.FieldType;
 
 test {
     std.testing.refAllDecls(@This());

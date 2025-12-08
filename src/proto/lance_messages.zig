@@ -97,11 +97,11 @@ pub const ColumnMetadata = struct {
                     const page = try parsePage(allocator, page_bytes);
                     pages.append(allocator, page) catch return DecodeError.OutOfMemory;
                 },
-                3 => { // buffer_offsets (packed repeated uint64)
-                    buffer_offsets = try proto.readPackedFixed64(allocator);
+                3 => { // buffer_offsets (packed repeated uint64 as varints)
+                    buffer_offsets = try proto.readPackedVarints(allocator);
                 },
-                4 => { // buffer_sizes (packed repeated uint64)
-                    buffer_sizes = try proto.readPackedFixed64(allocator);
+                4 => { // buffer_sizes (packed repeated uint64 as varints)
+                    buffer_sizes = try proto.readPackedVarints(allocator);
                 },
                 else => {
                     // Skip unknown fields for forward compatibility
@@ -170,11 +170,11 @@ fn parsePage(allocator: std.mem.Allocator, data: []const u8) DecodeError!Page {
         const header = try proto.readFieldHeader();
 
         switch (header.field_num) {
-            1 => { // buffer_offsets (packed repeated uint64)
-                buffer_offsets = try proto.readPackedFixed64(allocator);
+            1 => { // buffer_offsets (packed repeated uint64 as varints)
+                buffer_offsets = try proto.readPackedVarints(allocator);
             },
-            2 => { // buffer_sizes (packed repeated uint64)
-                buffer_sizes = try proto.readPackedFixed64(allocator);
+            2 => { // buffer_sizes (packed repeated uint64 as varints)
+                buffer_sizes = try proto.readPackedVarints(allocator);
             },
             3 => { // length (uint64)
                 length = try proto.readVarint();

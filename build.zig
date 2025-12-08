@@ -25,6 +25,15 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const table_mod = b.addModule("lanceql.table", .{
+        .root_source_file = b.path("src/table.zig"),
+        .imports = &.{
+            .{ .name = "lanceql.format", .module = format_mod },
+            .{ .name = "lanceql.proto", .module = proto_mod },
+            .{ .name = "lanceql.encoding", .module = encoding_mod },
+        },
+    });
+
     // Root module exports all
     const lanceql_mod = b.addModule("lanceql", .{
         .root_source_file = b.path("src/lanceql.zig"),
@@ -33,6 +42,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lanceql.io", .module = io_mod },
             .{ .name = "lanceql.proto", .module = proto_mod },
             .{ .name = "lanceql.encoding", .module = encoding_mod },
+            .{ .name = "lanceql.table", .module = table_mod },
         },
     });
 
@@ -70,6 +80,9 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "lanceql", .module = lanceql_mod },
                 .{ .name = "lanceql.format", .module = format_mod },
                 .{ .name = "lanceql.io", .module = io_mod },
+                .{ .name = "lanceql.proto", .module = proto_mod },
+                .{ .name = "lanceql.encoding", .module = encoding_mod },
+                .{ .name = "lanceql.table", .module = table_mod },
             },
         }),
     });
@@ -105,17 +118,13 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/wasm.zig"),
             .target = wasm_target,
             .optimize = .ReleaseSmall,
-            .imports = &.{
-                .{ .name = "lanceql", .module = lanceql_mod },
-                .{ .name = "lanceql.format", .module = format_mod },
-                .{ .name = "lanceql.io", .module = io_mod },
-            },
+            // No imports needed - wasm.zig is self-contained
         }),
     });
     wasm.entry = .disabled;
     wasm.rdynamic = true;
 
     const wasm_step = b.step("wasm", "Build WASM module");
-    b.installArtifact(wasm);
-    wasm_step.dependOn(&wasm.step);
+    const install_wasm = b.addInstallArtifact(wasm, .{});
+    wasm_step.dependOn(&install_wasm.step);
 }

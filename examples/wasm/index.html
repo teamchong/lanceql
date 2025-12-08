@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LanceQL Browser Demo</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+        body {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        h1 {
+            color: #333;
+        }
+        .card {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .drop-zone {
+            border: 2px dashed #ccc;
+            border-radius: 8px;
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .drop-zone:hover, .drop-zone.dragover {
+            border-color: #007bff;
+            background: #f0f7ff;
+        }
+        #file-input {
+            display: none;
+        }
+        #status {
+            margin-top: 10px;
+            color: #666;
+        }
+        #results {
+            display: none;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+        th, td {
+            padding: 10px;
+            text-align: left;
+            border-bottom: 1px solid #eee;
+        }
+        th {
+            background: #f9f9f9;
+            font-weight: 600;
+        }
+        .column-data {
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 13px;
+            background: #f5f5f5;
+            padding: 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+            max-height: 200px;
+            overflow-y: auto;
+        }
+        .badge {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        .badge-success {
+            background: #d4edda;
+            color: #155724;
+        }
+        .badge-info {
+            background: #d1ecf1;
+            color: #0c5460;
+        }
+        .version {
+            color: #999;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <h1>LanceQL Browser Demo <span class="version" id="version"></span></h1>
+
+    <div class="card">
+        <h2>Load Lance File</h2>
+        <div class="drop-zone" id="drop-zone">
+            <p>Drop a .lance data file here or click to select</p>
+            <p style="font-size: 12px; color: #666;">Navigate into dataset_name.lance/data/ and select the hex-named .lance file</p>
+            <input type="file" id="file-input">
+        </div>
+        <div id="status"></div>
+    </div>
+
+    <div class="card" id="results">
+        <h2>File Info</h2>
+        <table id="info-table">
+            <tr>
+                <th>Property</th>
+                <th>Value</th>
+            </tr>
+        </table>
+
+        <h2>Columns</h2>
+        <div id="columns"></div>
+    </div>
+
+    <script type="module">
+        import LanceQL from './lanceql.js';
+
+        let lanceql;
+
+        async function init() {
+            try {
+                lanceql = await LanceQL.load('./lanceql.wasm');
+                document.getElementById('version').textContent = `v${lanceql.getVersion()}`;
+                console.log('LanceQL loaded:', lanceql.getVersion());
+            } catch (err) {
+                document.getElementById('status').textContent = 'Failed to load WASM: ' + err.message;
+                console.error(err);
+            }
+        }
+
+        function handleFile(file) {
+            const status = document.getElementById('status');
+            status.textContent = `Loading ${file.name}...`;
+
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                try {
+                    processLanceFile(e.target.result, file.name);
+                } catch (err) {
+                    status.innerHTML = `<span class="badge" style="background:#f8d7da;color:#721c24">Error: ${err.message}</span>`;
+                    console.error('processLanceFile error:', err);
+                }
+            };
+            reader.onerror = () => {
+                status.innerHTML = `<span class="badge" style="background:#f8d7da;color:#721c24">Failed to read file</span>`;
+            };
+            reader.readAsArrayBuffer(file);
+        }
+
+        function processLanceFile(data, filename) {
+            const status = document.getElementById('status');
+
+            // Check if valid
+            if (!lanceql.isValid(data)) {
+                status.innerHTML = `<span class="badge" style="background:#f8d7da;color:#721c24">Invalid Lance file - missing LANC magic bytes</span>`;
+                document.getElementById('results').style.display = 'none';
+                return;
+            }
+
+            // Open file
+            const file = lanceql.open(data);
+
+            try {
+                status.innerHTML = `<span class="badge badge-success">Loaded successfully</span>`;
+
+                // Show results
+                document.getElementById('results').style.display = 'block';
+
+                // File info
+                const infoTable = document.getElementById('info-table');
+                infoTable.innerHTML = `
+                    <tr><th>Property</th><th>Value</th></tr>
+                    <tr><td>Filename</td><td>${filename}</td></tr>
+                    <tr><td>Size</td><td>${(data.byteLength / 1024).toFixed(2)} KB</td></tr>
+                    <tr><td>Columns</td><td>${file.numColumns}</td></tr>
+                `;
+
+                // Columns
+                const columnsDiv = document.getElementById('columns');
+                columnsDiv.innerHTML = '';
+
+                for (let i = 0; i < file.numColumns; i++) {
+                    const debug = file.getColumnDebugInfo(i);
+                    const rowCount = Number(debug.rows);
+
+                    // Try to read as int64 first, then float64
+                    let values;
+                    let type = 'unknown';
+
+                    try {
+                        const int64Data = file.readInt64Column(i);
+                        if (int64Data.length > 0) {
+                            values = Array.from(int64Data).slice(0, 100).map(v => v.toString());
+                            type = 'int64';
+                        }
+                    } catch (e) {}
+
+                    if (!values) {
+                        try {
+                            const float64Data = file.readFloat64Column(i);
+                            if (float64Data.length > 0) {
+                                values = Array.from(float64Data).slice(0, 100).map(v => v.toFixed(4));
+                                type = 'float64';
+                            }
+                        } catch (e) {}
+                    }
+
+                    const colDiv = document.createElement('div');
+                    colDiv.style.marginBottom = '15px';
+                    colDiv.innerHTML = `
+                        <h3>Column ${i} <span class="badge badge-info">${type}</span></h3>
+                        <p>Rows: ${rowCount.toLocaleString()}</p>
+                        <div class="column-data">${values ? values.join(', ') + (values.length < rowCount ? '...' : '') : 'Could not decode'}</div>
+                    `;
+                    columnsDiv.appendChild(colDiv);
+                }
+
+            } finally {
+                file.close();
+            }
+        }
+
+        // Event handlers
+        const dropZone = document.getElementById('drop-zone');
+        const fileInput = document.getElementById('file-input');
+
+        dropZone.addEventListener('click', () => fileInput.click());
+        dropZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dropZone.classList.add('dragover');
+        });
+        dropZone.addEventListener('dragleave', () => {
+            dropZone.classList.remove('dragover');
+        });
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+            const file = e.dataTransfer.files[0];
+            if (file) handleFile(file);
+        });
+        fileInput.addEventListener('change', () => {
+            const file = fileInput.files[0];
+            if (file) handleFile(file);
+        });
+
+        // Initialize
+        init();
+    </script>
+</body>
+</html>

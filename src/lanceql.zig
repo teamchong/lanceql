@@ -22,11 +22,14 @@ pub const format = @import("lanceql.format");
 pub const io = @import("lanceql.io");
 pub const proto = @import("lanceql.proto");
 pub const encoding = @import("lanceql.encoding");
+pub const table = @import("lanceql.table");
 
 // Re-export commonly used types
 pub const Footer = format.Footer;
 pub const Version = format.Version;
 pub const Reader = io.Reader;
+pub const Table = table.Table;
+pub const LanceFile = format.LanceFile;
 
 /// Magic bytes at the end of every Lance file
 pub const LANCE_MAGIC = "LANC";
