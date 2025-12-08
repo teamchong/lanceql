@@ -1,0 +1,35 @@
+# Zig build artifacts
+zig-out/
+.zig-cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+
+# Test fixtures (generated)
+tests/fixtures/*.lance
+tests/fixtures/*.expected.json
+!tests/fixtures/.gitkeep
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+*.o
+*.a
+*.so
+*.dylib
+*.wasm
+!zig-out/bin/*.wasm
