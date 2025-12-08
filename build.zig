@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/value.zig"),
     });
 
-    _ = b.addModule("lanceql.query", .{
+    const query_mod = b.addModule("lanceql.query", .{
         .root_source_file = b.path("src/query/query.zig"),
         .imports = &.{
             .{ .name = "lanceql.value", .module = value_mod },
@@ -45,6 +45,15 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const dataframe_mod = b.addModule("lanceql.dataframe", .{
+        .root_source_file = b.path("src/dataframe.zig"),
+        .imports = &.{
+            .{ .name = "lanceql.value", .module = value_mod },
+            .{ .name = "lanceql.query", .module = query_mod },
+            .{ .name = "lanceql.table", .module = table_mod },
+        },
+    });
+
     // Root module exports all
     const lanceql_mod = b.addModule("lanceql", .{
         .root_source_file = b.path("src/lanceql.zig"),
@@ -54,6 +63,9 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lanceql.proto", .module = proto_mod },
             .{ .name = "lanceql.encoding", .module = encoding_mod },
             .{ .name = "lanceql.table", .module = table_mod },
+            .{ .name = "lanceql.query", .module = query_mod },
+            .{ .name = "lanceql.value", .module = value_mod },
+            .{ .name = "lanceql.dataframe", .module = dataframe_mod },
         },
     });
 
@@ -146,6 +158,26 @@ pub fn build(b: *std.Build) void {
 
     const run_test_value = b.addRunArtifact(test_value);
     test_step.dependOn(&run_test_value.step);
+
+    // DataFrame module tests
+    const test_dataframe = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dataframe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lanceql.value", .module = value_mod },
+                .{ .name = "lanceql.query", .module = query_mod },
+                .{ .name = "lanceql.table", .module = table_mod },
+            },
+        }),
+    });
+
+    const run_test_dataframe = b.addRunArtifact(test_dataframe);
+    test_step.dependOn(&run_test_dataframe.step);
+
+    const test_dataframe_step = b.step("test-dataframe", "Run DataFrame module tests");
+    test_dataframe_step.dependOn(&run_test_dataframe.step);
 
     // === WASM Build ===
     const wasm_target = b.resolveTargetQuery(.{

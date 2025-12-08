@@ -23,8 +23,13 @@ pub const Lexer = lexer.Lexer;
 pub const Token = lexer.Token;
 pub const Parser = parser.Parser;
 pub const SelectStmt = ast.SelectStmt;
+pub const SelectItem = ast.SelectItem;
+pub const OrderBy = ast.OrderBy;
+pub const AggregateType = ast.AggregateType;
 pub const Executor = executor.Executor;
 pub const ResultSet = executor.ResultSet;
+pub const Aggregate = aggregates.Aggregate;
+pub const GroupKey = aggregates.GroupKey;
 
 test {
     std.testing.refAllDecls(@This());
