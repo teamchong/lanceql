@@ -17,6 +17,17 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/encoding/encoding.zig"),
     });
 
+    const value_mod = b.addModule("lanceql.value", .{
+        .root_source_file = b.path("src/value.zig"),
+    });
+
+    _ = b.addModule("lanceql.query", .{
+        .root_source_file = b.path("src/query/query.zig"),
+        .imports = &.{
+            .{ .name = "lanceql.value", .module = value_mod },
+        },
+    });
+
     const format_mod = b.addModule("lanceql.format", .{
         .root_source_file = b.path("src/format/format.zig"),
         .imports = &.{
@@ -105,6 +116,36 @@ pub fn build(b: *std.Build) void {
 
     const test_integration_step = b.step("test-integration", "Run integration tests with real .lance files");
     test_integration_step.dependOn(&run_test_integration.step);
+
+    // Query module tests
+    const test_query = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/query/query.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lanceql.value", .module = value_mod },
+            },
+        }),
+    });
+
+    const run_test_query = b.addRunArtifact(test_query);
+    test_step.dependOn(&run_test_query.step);
+
+    const test_query_step = b.step("test-query", "Run query module tests");
+    test_query_step.dependOn(&run_test_query.step);
+
+    // Value module tests
+    const test_value = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/value.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const run_test_value = b.addRunArtifact(test_value);
+    test_step.dependOn(&run_test_value.step);
 
     // === WASM Build ===
     const wasm_target = b.resolveTargetQuery(.{
