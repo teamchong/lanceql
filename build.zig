@@ -61,19 +61,37 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const test_integration = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/test_integration.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lanceql", .module = lanceql_mod },
+                .{ .name = "lanceql.format", .module = format_mod },
+                .{ .name = "lanceql.io", .module = io_mod },
+            },
+        }),
+    });
+
     // Run tests
     const run_test_footer = b.addRunArtifact(test_footer);
     const run_test_proto = b.addRunArtifact(test_proto);
+    const run_test_integration = b.addRunArtifact(test_integration);
 
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&run_test_footer.step);
     test_step.dependOn(&run_test_proto.step);
+    test_step.dependOn(&run_test_integration.step);
 
     const test_footer_step = b.step("test-footer", "Run footer tests");
     test_footer_step.dependOn(&run_test_footer.step);
 
     const test_proto_step = b.step("test-proto", "Run protobuf tests");
     test_proto_step.dependOn(&run_test_proto.step);
+
+    const test_integration_step = b.step("test-integration", "Run integration tests with real .lance files");
+    test_integration_step.dependOn(&run_test_integration.step);
 
     // === WASM Build ===
     const wasm_target = b.resolveTargetQuery(.{
