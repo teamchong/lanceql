@@ -213,6 +213,348 @@ export class LanceFile {
             this.wasm.freeFloat64Buffer(bufPtr, rowCount);
         }
     }
+
+    // ========================================================================
+    // Query Methods
+    // ========================================================================
+
+    /**
+     * Filter operator constants.
+     */
+    static Op = {
+        EQ: 0,  // Equal
+        NE: 1,  // Not equal
+        LT: 2,  // Less than
+        LE: 3,  // Less than or equal
+        GT: 4,  // Greater than
+        GE: 5   // Greater than or equal
+    };
+
+    /**
+     * Filter int64 column and return matching row indices.
+     * @param {number} colIdx - Column index
+     * @param {number} op - Comparison operator (use LanceFile.Op)
+     * @param {bigint|number} value - Value to compare against
+     * @returns {Uint32Array} Array of matching row indices
+     */
+    filterInt64(colIdx, op, value) {
+        const rowCount = Number(this.getRowCount(colIdx));
+        if (rowCount === 0) return new Uint32Array(0);
+
+        const idxPtr = this.wasm.allocIndexBuffer(rowCount);
+        if (!idxPtr) throw new Error('Failed to allocate index buffer');
+
+        try {
+            const count = this.wasm.filterInt64Column(
+                colIdx, op, BigInt(value), idxPtr, rowCount
+            );
+            const result = new Uint32Array(count);
+            const view = new Uint32Array(this.memory.buffer, idxPtr, count);
+            result.set(view);
+            return result;
+        } finally {
+            this.wasm.free(idxPtr, rowCount * 4);
+        }
+    }
+
+    /**
+     * Filter float64 column and return matching row indices.
+     * @param {number} colIdx - Column index
+     * @param {number} op - Comparison operator (use LanceFile.Op)
+     * @param {number} value - Value to compare against
+     * @returns {Uint32Array} Array of matching row indices
+     */
+    filterFloat64(colIdx, op, value) {
+        const rowCount = Number(this.getRowCount(colIdx));
+        if (rowCount === 0) return new Uint32Array(0);
+
+        const idxPtr = this.wasm.allocIndexBuffer(rowCount);
+        if (!idxPtr) throw new Error('Failed to allocate index buffer');
+
+        try {
+            const count = this.wasm.filterFloat64Column(
+                colIdx, op, value, idxPtr, rowCount
+            );
+            const result = new Uint32Array(count);
+            const view = new Uint32Array(this.memory.buffer, idxPtr, count);
+            result.set(view);
+            return result;
+        } finally {
+            this.wasm.free(idxPtr, rowCount * 4);
+        }
+    }
+
+    /**
+     * Read int64 values at specific row indices.
+     * @param {number} colIdx - Column index
+     * @param {Uint32Array} indices - Row indices to read
+     * @returns {BigInt64Array}
+     */
+    readInt64AtIndices(colIdx, indices) {
+        if (indices.length === 0) return new BigInt64Array(0);
+
+        // Copy indices to WASM memory
+        const idxPtr = this.wasm.allocIndexBuffer(indices.length);
+        if (!idxPtr) throw new Error('Failed to allocate index buffer');
+
+        const outPtr = this.wasm.allocInt64Buffer(indices.length);
+        if (!outPtr) {
+            this.wasm.free(idxPtr, indices.length * 4);
+            throw new Error('Failed to allocate output buffer');
+        }
+
+        try {
+            new Uint32Array(this.memory.buffer, idxPtr, indices.length).set(indices);
+
+            const count = this.wasm.readInt64AtIndices(
+                colIdx, idxPtr, indices.length, outPtr
+            );
+
+            const result = new BigInt64Array(count);
+            const view = new BigInt64Array(this.memory.buffer, outPtr, count);
+            result.set(view);
+            return result;
+        } finally {
+            this.wasm.free(idxPtr, indices.length * 4);
+            this.wasm.freeInt64Buffer(outPtr, indices.length);
+        }
+    }
+
+    /**
+     * Read float64 values at specific row indices.
+     * @param {number} colIdx - Column index
+     * @param {Uint32Array} indices - Row indices to read
+     * @returns {Float64Array}
+     */
+    readFloat64AtIndices(colIdx, indices) {
+        if (indices.length === 0) return new Float64Array(0);
+
+        // Copy indices to WASM memory
+        const idxPtr = this.wasm.allocIndexBuffer(indices.length);
+        if (!idxPtr) throw new Error('Failed to allocate index buffer');
+
+        const outPtr = this.wasm.allocFloat64Buffer(indices.length);
+        if (!outPtr) {
+            this.wasm.free(idxPtr, indices.length * 4);
+            throw new Error('Failed to allocate output buffer');
+        }
+
+        try {
+            new Uint32Array(this.memory.buffer, idxPtr, indices.length).set(indices);
+
+            const count = this.wasm.readFloat64AtIndices(
+                colIdx, idxPtr, indices.length, outPtr
+            );
+
+            const result = new Float64Array(count);
+            const view = new Float64Array(this.memory.buffer, outPtr, count);
+            result.set(view);
+            return result;
+        } finally {
+            this.wasm.free(idxPtr, indices.length * 4);
+            this.wasm.freeFloat64Buffer(outPtr, indices.length);
+        }
+    }
+
+    // ========================================================================
+    // Aggregation Methods
+    // ========================================================================
+
+    /**
+     * Sum all values in an int64 column.
+     * @param {number} colIdx - Column index
+     * @returns {bigint}
+     */
+    sumInt64(colIdx) {
+        return this.wasm.sumInt64Column(colIdx);
+    }
+
+    /**
+     * Sum all values in a float64 column.
+     * @param {number} colIdx - Column index
+     * @returns {number}
+     */
+    sumFloat64(colIdx) {
+        return this.wasm.sumFloat64Column(colIdx);
+    }
+
+    /**
+     * Get minimum value in an int64 column.
+     * @param {number} colIdx - Column index
+     * @returns {bigint}
+     */
+    minInt64(colIdx) {
+        return this.wasm.minInt64Column(colIdx);
+    }
+
+    /**
+     * Get maximum value in an int64 column.
+     * @param {number} colIdx - Column index
+     * @returns {bigint}
+     */
+    maxInt64(colIdx) {
+        return this.wasm.maxInt64Column(colIdx);
+    }
+
+    /**
+     * Get average of a float64 column.
+     * @param {number} colIdx - Column index
+     * @returns {number}
+     */
+    avgFloat64(colIdx) {
+        return this.wasm.avgFloat64Column(colIdx);
+    }
+
+    // ========================================================================
+    // DataFrame-like API
+    // ========================================================================
+
+    /**
+     * Create a DataFrame-like query builder for this file.
+     * @returns {DataFrame}
+     */
+    df() {
+        return new DataFrame(this);
+    }
+}
+
+/**
+ * DataFrame-like query builder for fluent queries.
+ */
+export class DataFrame {
+    constructor(file) {
+        this.file = file;
+        this._filterOps = [];  // Array of {colIdx, op, value, type}
+        this._selectCols = null;
+        this._limitValue = null;
+    }
+
+    /**
+     * Filter rows where column matches condition.
+     * @param {number} colIdx - Column index
+     * @param {string} op - Operator: '=', '!=', '<', '<=', '>', '>='
+     * @param {number|bigint} value - Value to compare
+     * @param {string} type - 'int64' or 'float64'
+     * @returns {DataFrame}
+     */
+    filter(colIdx, op, value, type = 'int64') {
+        const opMap = {
+            '=': LanceFile.Op.EQ, '==': LanceFile.Op.EQ,
+            '!=': LanceFile.Op.NE, '<>': LanceFile.Op.NE,
+            '<': LanceFile.Op.LT,
+            '<=': LanceFile.Op.LE,
+            '>': LanceFile.Op.GT,
+            '>=': LanceFile.Op.GE
+        };
+
+        const df = new DataFrame(this.file);
+        df._filterOps = [...this._filterOps, { colIdx, op: opMap[op], value, type }];
+        df._selectCols = this._selectCols;
+        df._limitValue = this._limitValue;
+        return df;
+    }
+
+    /**
+     * Select specific columns.
+     * @param {...number} colIndices - Column indices to select
+     * @returns {DataFrame}
+     */
+    select(...colIndices) {
+        const df = new DataFrame(this.file);
+        df._filterOps = [...this._filterOps];
+        df._selectCols = colIndices;
+        df._limitValue = this._limitValue;
+        return df;
+    }
+
+    /**
+     * Limit number of results.
+     * @param {number} n - Maximum rows
+     * @returns {DataFrame}
+     */
+    limit(n) {
+        const df = new DataFrame(this.file);
+        df._filterOps = [...this._filterOps];
+        df._selectCols = this._selectCols;
+        df._limitValue = n;
+        return df;
+    }
+
+    /**
+     * Execute the query and return row indices.
+     * @returns {Uint32Array}
+     */
+    collectIndices() {
+        let indices = null;
+
+        // Apply filters
+        for (const f of this._filterOps) {
+            let newIndices;
+            if (f.type === 'int64') {
+                newIndices = this.file.filterInt64(f.colIdx, f.op, f.value);
+            } else {
+                newIndices = this.file.filterFloat64(f.colIdx, f.op, f.value);
+            }
+
+            if (indices === null) {
+                indices = newIndices;
+            } else {
+                // Intersect indices
+                const set = new Set(newIndices);
+                indices = indices.filter(i => set.has(i));
+                indices = new Uint32Array(indices);
+            }
+        }
+
+        // If no filters, get all row indices
+        if (indices === null) {
+            const rowCount = Number(this.file.getRowCount(0));
+            indices = new Uint32Array(rowCount);
+            for (let i = 0; i < rowCount; i++) indices[i] = i;
+        }
+
+        // Apply limit
+        if (this._limitValue !== null && indices.length > this._limitValue) {
+            indices = indices.slice(0, this._limitValue);
+        }
+
+        return indices;
+    }
+
+    /**
+     * Execute the query and return results as arrays.
+     * @returns {Object} Object with column data arrays
+     */
+    collect() {
+        const indices = this.collectIndices();
+        const result = { _indices: indices };
+
+        const cols = this._selectCols ||
+            Array.from({ length: this.file.numColumns }, (_, i) => i);
+
+        for (const colIdx of cols) {
+            // Try int64 first, then float64
+            try {
+                result[`col${colIdx}`] = this.file.readInt64AtIndices(colIdx, indices);
+            } catch {
+                try {
+                    result[`col${colIdx}`] = this.file.readFloat64AtIndices(colIdx, indices);
+                } catch {
+                    result[`col${colIdx}`] = null;
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Count matching rows.
+     * @returns {number}
+     */
+    count() {
+        return this.collectIndices().length;
+    }
 }
 
 /**

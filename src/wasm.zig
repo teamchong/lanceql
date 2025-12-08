@@ -411,3 +411,328 @@ export fn freeFloat64Buffer(ptr: [*]f64, count: usize) void {
     _ = ptr;
     _ = count;
 }
+
+// ============================================================================
+// Query Execution (Simple filter/projection for WASM)
+// ============================================================================
+
+/// Filter result indices where column value matches condition
+/// op: 0=eq, 1=ne, 2=lt, 3=le, 4=gt, 5=ge
+export fn filterInt64Column(
+    col_idx: u32,
+    op: u32,
+    value: i64,
+    out_indices: [*]u32,
+    max_indices: usize,
+) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const row_count = buf_size / 8;
+    var out_count: usize = 0;
+
+    for (0..row_count) |i| {
+        if (out_count >= max_indices) break;
+
+        const col_val = readI64LE(data, buf_start + i * 8);
+        const matches = switch (op) {
+            0 => col_val == value, // eq
+            1 => col_val != value, // ne
+            2 => col_val < value, // lt
+            3 => col_val <= value, // le
+            4 => col_val > value, // gt
+            5 => col_val >= value, // ge
+            else => false,
+        };
+
+        if (matches) {
+            out_indices[out_count] = @intCast(i);
+            out_count += 1;
+        }
+    }
+
+    return out_count;
+}
+
+/// Filter float64 column
+export fn filterFloat64Column(
+    col_idx: u32,
+    op: u32,
+    value: f64,
+    out_indices: [*]u32,
+    max_indices: usize,
+) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const row_count = buf_size / 8;
+    var out_count: usize = 0;
+
+    for (0..row_count) |i| {
+        if (out_count >= max_indices) break;
+
+        const col_val = readF64LE(data, buf_start + i * 8);
+        const matches = switch (op) {
+            0 => col_val == value, // eq
+            1 => col_val != value, // ne
+            2 => col_val < value, // lt
+            3 => col_val <= value, // le
+            4 => col_val > value, // gt
+            5 => col_val >= value, // ge
+            else => false,
+        };
+
+        if (matches) {
+            out_indices[out_count] = @intCast(i);
+            out_count += 1;
+        }
+    }
+
+    return out_count;
+}
+
+/// Read int64 values at specific indices
+export fn readInt64AtIndices(
+    col_idx: u32,
+    indices: [*]const u32,
+    num_indices: usize,
+    out_ptr: [*]i64,
+) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const max_idx = buf_size / 8;
+
+    for (0..num_indices) |i| {
+        const idx = indices[i];
+        if (idx >= max_idx) {
+            out_ptr[i] = 0;
+        } else {
+            out_ptr[i] = readI64LE(data, buf_start + idx * 8);
+        }
+    }
+
+    return num_indices;
+}
+
+/// Read float64 values at specific indices
+export fn readFloat64AtIndices(
+    col_idx: u32,
+    indices: [*]const u32,
+    num_indices: usize,
+    out_ptr: [*]f64,
+) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const max_idx = buf_size / 8;
+
+    for (0..num_indices) |i| {
+        const idx = indices[i];
+        if (idx >= max_idx) {
+            out_ptr[i] = 0;
+        } else {
+            out_ptr[i] = readF64LE(data, buf_start + idx * 8);
+        }
+    }
+
+    return num_indices;
+}
+
+/// Allocate index buffer
+export fn allocIndexBuffer(count: usize) ?[*]u32 {
+    const ptr = wasmAlloc(count * 4) orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
+// ============================================================================
+// Aggregation Functions
+// ============================================================================
+
+/// Sum int64 column
+export fn sumInt64Column(col_idx: u32) i64 {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const row_count = buf_size / 8;
+    var sum: i64 = 0;
+
+    for (0..row_count) |i| {
+        sum += readI64LE(data, buf_start + i * 8);
+    }
+
+    return sum;
+}
+
+/// Sum float64 column
+export fn sumFloat64Column(col_idx: u32) f64 {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const row_count = buf_size / 8;
+    var sum: f64 = 0;
+
+    for (0..row_count) |i| {
+        sum += readF64LE(data, buf_start + i * 8);
+    }
+
+    return sum;
+}
+
+/// Min int64 column
+export fn minInt64Column(col_idx: u32) i64 {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const row_count = buf_size / 8;
+    if (row_count == 0) return 0;
+
+    var min_val: i64 = readI64LE(data, buf_start);
+    for (1..row_count) |i| {
+        const val = readI64LE(data, buf_start + i * 8);
+        if (val < min_val) min_val = val;
+    }
+
+    return min_val;
+}
+
+/// Max int64 column
+export fn maxInt64Column(col_idx: u32) i64 {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const row_count = buf_size / 8;
+    if (row_count == 0) return 0;
+
+    var max_val: i64 = readI64LE(data, buf_start);
+    for (1..row_count) |i| {
+        const val = readI64LE(data, buf_start + i * 8);
+        if (val > max_val) max_val = val;
+    }
+
+    return max_val;
+}
+
+/// Average float64 column
+export fn avgFloat64Column(col_idx: u32) f64 {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const row_count = buf_size / 8;
+    if (row_count == 0) return 0;
+
+    var sum: f64 = 0;
+    for (0..row_count) |i| {
+        sum += readF64LE(data, buf_start + i * 8);
+    }
+
+    return sum / @as(f64, @floatFromInt(row_count));
+}
