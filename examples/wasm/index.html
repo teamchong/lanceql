@@ -40,6 +40,34 @@
         #file-input {
             display: none;
         }
+        .url-input-group {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+        }
+        .url-input-group input {
+            flex: 1;
+            padding: 10px 15px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        .url-input-group button {
+            padding: 10px 20px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .url-input-group button:hover {
+            background: #0056b3;
+        }
+        .url-input-group button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
         #status {
             margin-top: 10px;
             color: #666;
@@ -86,9 +114,28 @@
             background: #d1ecf1;
             color: #0c5460;
         }
+        .badge-remote {
+            background: #e2d4f0;
+            color: #4a2c7a;
+        }
         .version {
             color: #999;
             font-size: 14px;
+        }
+        .divider {
+            text-align: center;
+            margin: 20px 0;
+            color: #999;
+        }
+        .divider::before,
+        .divider::after {
+            content: '';
+            display: inline-block;
+            width: 40%;
+            height: 1px;
+            background: #ddd;
+            vertical-align: middle;
+            margin: 0 10px;
         }
     </style>
 </head>
@@ -102,6 +149,14 @@
             <p style="font-size: 12px; color: #666;">Navigate into dataset_name.lance/data/ and select the hex-named .lance file</p>
             <input type="file" id="file-input">
         </div>
+
+        <div class="divider">or</div>
+
+        <div class="url-input-group">
+            <input type="text" id="url-input" placeholder="Enter Lance file URL (requires CORS)" />
+            <button id="load-url-btn">Load URL</button>
+        </div>
+
         <div id="status"></div>
     </div>
 
@@ -226,9 +281,81 @@
             }
         }
 
+        async function loadFromUrl(url) {
+            const status = document.getElementById('status');
+            const loadBtn = document.getElementById('load-url-btn');
+
+            loadBtn.disabled = true;
+            status.innerHTML = `Loading from URL...`;
+
+            try {
+                const file = await lanceql.openUrl(url);
+
+                status.innerHTML = `<span class="badge badge-success">Loaded successfully</span> <span class="badge badge-remote">Remote</span>`;
+
+                // Show results
+                document.getElementById('results').style.display = 'block';
+
+                // File info
+                const infoTable = document.getElementById('info-table');
+                infoTable.innerHTML = `
+                    <tr><th>Property</th><th>Value</th></tr>
+                    <tr><td>URL</td><td style="word-break: break-all; font-size: 12px;">${url}</td></tr>
+                    <tr><td>Size</td><td>${(file.size / 1024 / 1024).toFixed(2)} MB</td></tr>
+                    <tr><td>Columns</td><td>${file.numColumns}</td></tr>
+                    <tr><td>Version</td><td>${file.version.major}.${file.version.minor}</td></tr>
+                    <tr><td>Column Meta Start</td><td>${file.columnMetaStart.toLocaleString()}</td></tr>
+                    <tr><td>Column Meta Offsets Start</td><td>${file.columnMetaOffsetsStart.toLocaleString()}</td></tr>
+                `;
+
+                // Columns - show basic info (full column reading would require more network requests)
+                const columnsDiv = document.getElementById('columns');
+                columnsDiv.innerHTML = `
+                    <p style="color: #666;">
+                        Found ${file.numColumns} columns. Remote files use lazy loading -
+                        column data is fetched on demand via HTTP Range requests.
+                    </p>
+                `;
+
+                // Fetch info for first few columns
+                for (let i = 0; i < Math.min(file.numColumns, 3); i++) {
+                    try {
+                        const debug = await file.getColumnDebugInfo(i);
+                        const colDiv = document.createElement('div');
+                        colDiv.style.marginBottom = '15px';
+                        colDiv.innerHTML = `
+                            <h3>Column ${i} <span class="badge badge-remote">lazy</span></h3>
+                            <p>Rows: ${debug.rows.toLocaleString()}</p>
+                            <p>Buffer offset: ${debug.offset.toLocaleString()}</p>
+                            <p>Buffer size: ${debug.size.toLocaleString()} bytes</p>
+                        `;
+                        columnsDiv.appendChild(colDiv);
+                    } catch (err) {
+                        console.error(`Failed to get column ${i} info:`, err);
+                    }
+                }
+
+                if (file.numColumns > 3) {
+                    const moreDiv = document.createElement('div');
+                    moreDiv.innerHTML = `<p style="color: #666;">... and ${file.numColumns - 3} more columns</p>`;
+                    columnsDiv.appendChild(moreDiv);
+                }
+
+                file.close();
+
+            } catch (err) {
+                status.innerHTML = `<span class="badge" style="background:#f8d7da;color:#721c24">Error: ${err.message}</span>`;
+                console.error('loadFromUrl error:', err);
+            } finally {
+                loadBtn.disabled = false;
+            }
+        }
+
         // Event handlers
         const dropZone = document.getElementById('drop-zone');
         const fileInput = document.getElementById('file-input');
+        const urlInput = document.getElementById('url-input');
+        const loadUrlBtn = document.getElementById('load-url-btn');
 
         dropZone.addEventListener('click', () => fileInput.click());
         dropZone.addEventListener('dragover', (e) => {
@@ -247,6 +374,22 @@
         fileInput.addEventListener('change', () => {
             const file = fileInput.files[0];
             if (file) handleFile(file);
+        });
+
+        loadUrlBtn.addEventListener('click', () => {
+            const url = urlInput.value.trim();
+            if (url) {
+                loadFromUrl(url);
+            }
+        });
+
+        urlInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                const url = urlInput.value.trim();
+                if (url) {
+                    loadFromUrl(url);
+                }
+            }
         });
 
         // Initialize

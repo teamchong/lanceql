@@ -592,3 +592,48 @@ test "Table API with schema access" {
 
     std.debug.print("  ✓ Schema and column access works!\n", .{});
 }
+
+// ============================================================================
+// HTTP Range Request Tests (requires network)
+// ============================================================================
+
+const HttpReader = io.HttpReader;
+
+test "HTTP reader can read remote Lance file footer" {
+    const allocator = std.testing.allocator;
+
+    const url = "https://data.metal0.dev/laion-1m/images.lance/data/110101001111011111011011ded2064282ae29b42f5d744a13.lance";
+
+    std.debug.print("\nHTTP Reader test:\n", .{});
+    std.debug.print("  URL: {s}\n", .{url});
+
+    // Open HTTP reader
+    var http = HttpReader.open(allocator, url) catch |err| {
+        std.debug.print("  SKIP: Could not connect ({any})\n", .{err});
+        return; // Skip if network unavailable
+    };
+    defer http.deinit();
+
+    std.debug.print("  File size: {d} bytes ({d:.2} GB)\n", .{ http.file_size, @as(f64, @floatFromInt(http.file_size)) / (1024 * 1024 * 1024) });
+
+    // Read footer (last 40 bytes)
+    var footer_buf: [40]u8 = undefined;
+    const footer_offset = http.file_size - 40;
+    const bytes_read = try http.readAt(footer_offset, &footer_buf);
+
+    try std.testing.expectEqual(@as(usize, 40), bytes_read);
+
+    // Check magic
+    try std.testing.expectEqualSlices(u8, "LANC", footer_buf[36..40]);
+    std.debug.print("  ✓ LANC magic verified\n", .{});
+
+    // Parse footer
+    const footer = try Footer.parse(&footer_buf);
+    std.debug.print("  num_columns: {}\n", .{footer.num_columns});
+    std.debug.print("  version: {}.{}\n", .{ footer.major_version, footer.minor_version });
+    std.debug.print("  column_meta_start: {}\n", .{footer.column_meta_start});
+
+    // Verify expected values (from curl test)
+    try std.testing.expectEqual(@as(u32, 6), footer.num_columns);
+    std.debug.print("  ✓ HTTP Range request works!\n", .{});
+}

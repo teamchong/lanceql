@@ -3,6 +3,7 @@
  *
  * JavaScript wrapper for the LanceQL WebAssembly module.
  * Provides a high-level API for reading Lance files in the browser.
+ * Supports both local files and remote URLs via HTTP Range requests.
  */
 
 export class LanceQL {
@@ -36,12 +37,22 @@ export class LanceQL {
     }
 
     /**
-     * Open a Lance file from an ArrayBuffer.
+     * Open a Lance file from an ArrayBuffer (local file).
      * @param {ArrayBuffer} data - The Lance file data
      * @returns {LanceFile}
      */
     open(data) {
         return new LanceFile(this, data);
+    }
+
+    /**
+     * Open a Lance file from a URL using HTTP Range requests.
+     * Only fetches metadata initially - column data is fetched on demand.
+     * @param {string} url - URL to the Lance file
+     * @returns {Promise<RemoteLanceFile>}
+     */
+    async openUrl(url) {
+        return await RemoteLanceFile.open(this, url);
     }
 
     /**
@@ -91,7 +102,7 @@ export class LanceQL {
 }
 
 /**
- * Represents an open Lance file.
+ * Represents an open Lance file (loaded entirely in memory).
  */
 export class LanceFile {
     constructor(lanceql, data) {
@@ -200,6 +211,220 @@ export class LanceFile {
             return result;
         } finally {
             this.wasm.freeFloat64Buffer(bufPtr, rowCount);
+        }
+    }
+}
+
+/**
+ * Represents a Lance file opened from a remote URL.
+ * Uses HTTP Range requests to fetch data on demand.
+ */
+export class RemoteLanceFile {
+    constructor(lanceql, url, fileSize, footerData) {
+        this.lanceql = lanceql;
+        this.wasm = lanceql.wasm;
+        this.memory = lanceql.memory;
+        this.url = url;
+        this.fileSize = fileSize;
+
+        // Store footer data in WASM memory
+        const bytes = new Uint8Array(footerData);
+        this.footerPtr = this.wasm.alloc(bytes.length);
+        if (!this.footerPtr) {
+            throw new Error('Failed to allocate memory for footer');
+        }
+        this.footerLen = bytes.length;
+        new Uint8Array(this.memory.buffer).set(bytes, this.footerPtr);
+
+        // Parse footer
+        this._numColumns = this.wasm.parseFooterGetColumns(this.footerPtr, this.footerLen);
+        this._majorVersion = this.wasm.parseFooterGetMajorVersion(this.footerPtr, this.footerLen);
+        this._minorVersion = this.wasm.parseFooterGetMinorVersion(this.footerPtr, this.footerLen);
+        this._columnMetaStart = this.wasm.getColumnMetaStart(this.footerPtr, this.footerLen);
+        this._columnMetaOffsetsStart = this.wasm.getColumnMetaOffsetsStart(this.footerPtr, this.footerLen);
+    }
+
+    /**
+     * Open a remote Lance file.
+     * @param {LanceQL} lanceql
+     * @param {string} url
+     * @returns {Promise<RemoteLanceFile>}
+     */
+    static async open(lanceql, url) {
+        // First, get file size with HEAD request
+        const headResponse = await fetch(url, { method: 'HEAD' });
+        if (!headResponse.ok) {
+            throw new Error(`HTTP error: ${headResponse.status}`);
+        }
+
+        const contentLength = headResponse.headers.get('Content-Length');
+        if (!contentLength) {
+            throw new Error('Server did not return Content-Length');
+        }
+        const fileSize = parseInt(contentLength, 10);
+
+        // Fetch footer (last 40 bytes)
+        const footerSize = 40;
+        const footerStart = fileSize - footerSize;
+        const footerResponse = await fetch(url, {
+            headers: {
+                'Range': `bytes=${footerStart}-${fileSize - 1}`
+            }
+        });
+
+        if (!footerResponse.ok && footerResponse.status !== 206) {
+            throw new Error(`HTTP error: ${footerResponse.status}`);
+        }
+
+        const footerData = await footerResponse.arrayBuffer();
+
+        // Verify magic bytes
+        const footerBytes = new Uint8Array(footerData);
+        const magic = String.fromCharCode(
+            footerBytes[36], footerBytes[37], footerBytes[38], footerBytes[39]
+        );
+        if (magic !== 'LANC') {
+            throw new Error(`Invalid Lance file: expected LANC magic, got "${magic}"`);
+        }
+
+        return new RemoteLanceFile(lanceql, url, fileSize, footerData);
+    }
+
+    /**
+     * Fetch bytes from the remote file at a specific range.
+     * @param {number} start - Start offset
+     * @param {number} end - End offset (inclusive)
+     * @returns {Promise<ArrayBuffer>}
+     */
+    async fetchRange(start, end) {
+        const response = await fetch(this.url, {
+            headers: {
+                'Range': `bytes=${start}-${end}`
+            }
+        });
+
+        if (!response.ok && response.status !== 206) {
+            throw new Error(`HTTP error: ${response.status}`);
+        }
+
+        return await response.arrayBuffer();
+    }
+
+    /**
+     * Close the file and free memory.
+     */
+    close() {
+        if (this.footerPtr) {
+            this.wasm.free(this.footerPtr, this.footerLen);
+            this.footerPtr = null;
+        }
+    }
+
+    /**
+     * Get the number of columns.
+     * @returns {number}
+     */
+    get numColumns() {
+        return this._numColumns;
+    }
+
+    /**
+     * Get the file size.
+     * @returns {number}
+     */
+    get size() {
+        return this.fileSize;
+    }
+
+    /**
+     * Get the version.
+     * @returns {{major: number, minor: number}}
+     */
+    get version() {
+        return {
+            major: this._majorVersion,
+            minor: this._minorVersion
+        };
+    }
+
+    /**
+     * Get the column metadata start offset.
+     * @returns {number}
+     */
+    get columnMetaStart() {
+        return Number(this._columnMetaStart);
+    }
+
+    /**
+     * Get the column metadata offsets start.
+     * @returns {number}
+     */
+    get columnMetaOffsetsStart() {
+        return Number(this._columnMetaOffsetsStart);
+    }
+
+    /**
+     * Get column offset entry from column metadata offsets.
+     * @param {number} colIdx
+     * @returns {Promise<{pos: number, len: number}>}
+     */
+    async getColumnOffsetEntry(colIdx) {
+        if (colIdx >= this._numColumns) {
+            return { pos: 0, len: 0 };
+        }
+
+        // Each entry is 16 bytes (8 bytes pos + 8 bytes len)
+        const entryOffset = this.columnMetaOffsetsStart + colIdx * 16;
+        const data = await this.fetchRange(entryOffset, entryOffset + 15);
+        const view = new DataView(data);
+
+        return {
+            pos: Number(view.getBigUint64(0, true)),
+            len: Number(view.getBigUint64(8, true))
+        };
+    }
+
+    /**
+     * Get debug info for a column (requires network request).
+     * @param {number} colIdx
+     * @returns {Promise<{offset: number, size: number, rows: number}>}
+     */
+    async getColumnDebugInfo(colIdx) {
+        const entry = await this.getColumnOffsetEntry(colIdx);
+        if (entry.len === 0) {
+            return { offset: 0, size: 0, rows: 0 };
+        }
+
+        // Fetch column metadata
+        const colMetaData = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
+        const bytes = new Uint8Array(colMetaData);
+
+        // Copy to WASM memory and parse
+        const ptr = this.wasm.alloc(bytes.length);
+        if (!ptr) {
+            throw new Error('Failed to allocate memory for column metadata');
+        }
+
+        try {
+            new Uint8Array(this.memory.buffer).set(bytes, ptr);
+
+            // Use existing WASM parsing by temporarily setting file data
+            // This is a workaround - we'd ideally have dedicated functions
+            const oldOpenFile = this.wasm.openFile(ptr, bytes.length);
+
+            const offset = this.wasm.getColumnBufferOffset(0);
+            const size = this.wasm.getColumnBufferSize(0);
+            const rows = this.wasm.getRowCount(0);
+
+            this.wasm.closeFile();
+
+            return {
+                offset: Number(offset),
+                size: Number(size),
+                rows: Number(rows)
+            };
+        } finally {
+            this.wasm.free(ptr, bytes.length);
         }
     }
 }
