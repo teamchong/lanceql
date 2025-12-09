@@ -1740,18 +1740,33 @@ export class RemoteLanceFile {
      * @param {number} colIdx
      * @param {number} rowIdx
      * @returns {Promise<string>}
+     * @throws {Error} If the column is not a string column
      */
     async readStringAt(colIdx, rowIdx) {
         const entry = await this.getColumnOffsetEntry(colIdx);
         const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
         const info = this._parseStringColumnMeta(new Uint8Array(colMeta));
 
-        if (info.offsetsSize === 0 || info.dataSize === 0) return '';
+        // Check if this is actually a string column
+        // String columns have: offsetsSize / rows = 4 or 8 bytes per offset
+        // Numeric columns with validity bitmap have: offsetsSize = rows / 8 (bitmap)
+        if (info.offsetsSize === 0 || info.dataSize === 0) {
+            throw new Error('Not a string column');
+        }
+
+        // Calculate bytes per offset - strings have rows offsets of 4 or 8 bytes each
+        const bytesPerOffset = info.offsetsSize / info.rows;
+
+        // If bytesPerOffset is not 4 or 8, this is not a string column
+        // (e.g., it's a validity bitmap which has rows/8 bytes = 0.125 bytes per row)
+        if (bytesPerOffset !== 4 && bytesPerOffset !== 8) {
+            throw new Error(`Not a string column - bytesPerOffset=${bytesPerOffset}, expected 4 or 8`);
+        }
+
         if (rowIdx >= info.rows) return '';
 
         // Determine offset size (4 or 8 bytes)
-        const offsetSize = info.offsetsSize / (info.rows + 1);
-        if (offsetSize !== 4 && offsetSize !== 8) return '';
+        const offsetSize = bytesPerOffset;
 
         // Fetch the two offsets for this string
         const offsetStart = info.offsetsStart + rowIdx * offsetSize;
@@ -1798,7 +1813,7 @@ export class RemoteLanceFile {
         }
 
         // Determine offset size (4 or 8 bytes)
-        const offsetSize = info.offsetsSize / (info.rows + 1);
+        const offsetSize = info.offsetsSize / info.rows;
         if (offsetSize !== 4 && offsetSize !== 8) {
             return indices.map(() => '');
         }
@@ -1911,28 +1926,25 @@ export class RemoteLanceFile {
         for (let c = 0; c < this._numColumns; c++) {
             let type = 'unknown';
 
+            // Try string first - if we can read a valid string, it's a string column
+            try {
+                const str = await this.readStringAt(c, 0);
+                // readStringAt throws for non-string columns, returns string for valid string columns
+                type = 'string';
+                types.push(type);
+                continue;
+            } catch (e) {
+                // Not a string column, continue to numeric detection
+            }
+
+            // Check numeric column by examining bytes per row
             try {
                 const entry = await this.getColumnOffsetEntry(c);
                 if (entry.len > 0) {
                     const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
                     const bytes = new Uint8Array(colMeta);
-
-                    // Check if it's a string column (has 2 buffers: offsets + data)
-                    const stringInfo = this._parseStringColumnMeta(bytes);
-                    if (stringInfo.offsetsSize > 0 && stringInfo.dataSize > 0 && stringInfo.rows > 0) {
-                        // Verify by trying to read a string
-                        try {
-                            const str = await this.readStringAt(c, 0);
-                            if (str !== undefined) {  // Even empty string means it's a string column
-                                type = 'string';
-                                types.push(type);
-                                continue;
-                            }
-                        } catch (e) {}
-                    }
-
-                    // Check numeric column (single buffer)
                     const info = this._parseColumnMeta(bytes);
+
                     if (info.rows > 0 && info.size > 0) {
                         const bytesPerRow = info.size / info.rows;
 
@@ -1953,10 +1965,8 @@ export class RemoteLanceFile {
                                 type = 'float64';
                             }
                         } else if (bytesPerRow === 4) {
-                            // int32 or float32
-                            type = 'float32';  // Common for embeddings
+                            type = 'float32';
                         } else if (bytesPerRow > 8 && bytesPerRow % 4 === 0) {
-                            // Likely a vector (multiple float32 per row)
                             type = 'vector';
                         } else if (bytesPerRow === 2) {
                             type = 'int16';
