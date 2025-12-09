@@ -1138,6 +1138,10 @@ export class RemoteLanceFile {
         this._columnMetaCache = new Map();
         this._columnOffsetCache = new Map();
         this._columnTypes = null;
+
+        // Schema info from manifest (populated by loadSchema())
+        this._schema = null;
+        this._datasetBaseUrl = null;
     }
 
     /**
@@ -1183,7 +1187,170 @@ export class RemoteLanceFile {
             throw new Error(`Invalid Lance file: expected LANC magic, got "${magic}"`);
         }
 
-        return new RemoteLanceFile(lanceql, url, fileSize, footerData);
+        const file = new RemoteLanceFile(lanceql, url, fileSize, footerData);
+
+        // Try to detect and load schema from manifest
+        await file._tryLoadSchema();
+
+        return file;
+    }
+
+    /**
+     * Try to detect dataset base URL and load schema from manifest.
+     * Lance datasets have structure: base.lance/_versions/, base.lance/data/
+     * @private
+     */
+    async _tryLoadSchema() {
+        // Try to infer dataset base URL from file URL
+        // Pattern: https://host/path/dataset.lance/data/filename.lance
+        const match = this.url.match(/^(.+\.lance)\/data\/.+\.lance$/);
+        if (!match) {
+            // URL doesn't match standard Lance dataset structure
+            return;
+        }
+
+        this._datasetBaseUrl = match[1];
+
+        try {
+            // Try manifest version 1 first
+            const manifestUrl = `${this._datasetBaseUrl}/_versions/1.manifest`;
+            const response = await fetch(manifestUrl);
+
+            if (!response.ok) {
+                return;
+            }
+
+            const manifestData = await response.arrayBuffer();
+            this._schema = this._parseManifest(new Uint8Array(manifestData));
+        } catch (e) {
+            // Silently fail - schema is optional
+            console.warn('Failed to load manifest:', e.message);
+        }
+    }
+
+    /**
+     * Parse Lance manifest protobuf to extract schema.
+     * Manifest structure:
+     * - 4 bytes: content length (little-endian u32)
+     * - N bytes: protobuf content
+     * - 16 bytes: footer (zeros + version + LANC magic)
+     * @private
+     */
+    _parseManifest(bytes) {
+        // Read content length from first 4 bytes
+        const contentLen = new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, true);
+
+        // Protobuf content starts at byte 4 and has contentLen bytes
+        const protoData = bytes.slice(4, 4 + contentLen);
+
+        let pos = 0;
+        const fields = [];
+
+        const readVarint = () => {
+            let result = 0;
+            let shift = 0;
+            while (pos < protoData.length) {
+                const byte = protoData[pos++];
+                result |= (byte & 0x7F) << shift;
+                if ((byte & 0x80) === 0) break;
+                shift += 7;
+            }
+            return result;
+        };
+
+        // Parse top-level Manifest message
+        while (pos < protoData.length) {
+            const tag = readVarint();
+            const fieldNum = tag >> 3;
+            const wireType = tag & 0x7;
+
+            if (fieldNum === 1 && wireType === 2) {
+                // Field 1 = schema (repeated Field message)
+                const fieldLen = readVarint();
+                const fieldEnd = pos + fieldLen;
+
+                // Parse Field message
+                let name = null;
+                let id = null;
+                let logicalType = null;
+
+                while (pos < fieldEnd) {
+                    const fTag = readVarint();
+                    const fNum = fTag >> 3;
+                    const fWire = fTag & 0x7;
+
+                    if (fWire === 0) {
+                        // Varint
+                        const val = readVarint();
+                        if (fNum === 3) id = val;  // Field.id
+                    } else if (fWire === 2) {
+                        // Length-delimited
+                        const len = readVarint();
+                        const content = protoData.slice(pos, pos + len);
+                        pos += len;
+
+                        if (fNum === 2) {
+                            // Field.name
+                            name = new TextDecoder().decode(content);
+                        } else if (fNum === 5) {
+                            // Field.logical_type
+                            logicalType = new TextDecoder().decode(content);
+                        }
+                    } else if (fWire === 5) {
+                        pos += 4;  // Fixed32
+                    } else if (fWire === 1) {
+                        pos += 8;  // Fixed64
+                    }
+                }
+
+                if (name) {
+                    fields.push({ name, id, type: logicalType });
+                }
+            } else {
+                // Skip other fields
+                if (wireType === 0) {
+                    readVarint();
+                } else if (wireType === 2) {
+                    const len = readVarint();
+                    pos += len;
+                } else if (wireType === 5) {
+                    pos += 4;
+                } else if (wireType === 1) {
+                    pos += 8;
+                }
+            }
+        }
+
+        return fields;
+    }
+
+    /**
+     * Get column names from schema (if available).
+     * Falls back to 'column_N' if schema not loaded.
+     * @returns {string[]}
+     */
+    get columnNames() {
+        if (this._schema && this._schema.length > 0) {
+            return this._schema.map(f => f.name);
+        }
+        // Fallback to generic names
+        return Array.from({ length: this._numColumns }, (_, i) => `column_${i}`);
+    }
+
+    /**
+     * Get full schema info (if available).
+     * @returns {Array<{name: string, id: number, type: string}>|null}
+     */
+    get schema() {
+        return this._schema;
+    }
+
+    /**
+     * Get dataset base URL (if detected).
+     * @returns {string|null}
+     */
+    get datasetBaseUrl() {
+        return this._datasetBaseUrl;
     }
 
     /**
@@ -1431,7 +1598,7 @@ export class RemoteLanceFile {
             const wireType = tag & 0x7;
 
             if (fieldNum === 2 && wireType === 2) {
-                // pages field
+                // pages field (first page only)
                 const pageLen = readVarint();
                 const pageEnd = pos + pageLen;
 
@@ -1460,19 +1627,35 @@ export class RemoteLanceFile {
                         pos = packedEnd;
                     } else if (pageField === 3 && pageWire === 0) {
                         rows = readVarint();
+                    } else if (pageField === 4 && pageWire === 2) {
+                        // encoding field - skip it
+                        const skipLen = readVarint();
+                        pos += skipLen;
                     } else {
+                        // Unknown field - skip based on wire type
                         if (pageWire === 0) readVarint();
-                        else if (pageWire === 2) pos += readVarint();
+                        else if (pageWire === 2) {
+                            const skipLen = readVarint();
+                            pos += skipLen;
+                        }
                         else if (pageWire === 5) pos += 4;
                         else if (pageWire === 1) pos += 8;
                     }
                 }
+                // We found the first page, that's enough for type detection
                 break;
             } else {
-                if (wireType === 0) readVarint();
-                else if (wireType === 2) pos += readVarint();
-                else if (wireType === 5) pos += 4;
-                else if (wireType === 1) pos += 8;
+                // Skip unknown fields
+                if (wireType === 0) {
+                    readVarint();
+                } else if (wireType === 2) {
+                    const skipLen = readVarint();
+                    pos += skipLen;
+                } else if (wireType === 5) {
+                    pos += 4;
+                } else if (wireType === 1) {
+                    pos += 8;
+                }
             }
         }
 
@@ -1751,7 +1934,7 @@ export class RemoteLanceFile {
         // String columns have: offsetsSize / rows = 4 or 8 bytes per offset
         // Numeric columns with validity bitmap have: offsetsSize = rows / 8 (bitmap)
         if (info.offsetsSize === 0 || info.dataSize === 0) {
-            throw new Error('Not a string column');
+            throw new Error(`Not a string column - offsetsSize=${info.offsetsSize}, dataSize=${info.dataSize}`);
         }
 
         // Calculate bytes per offset - strings have rows offsets of 4 or 8 bytes each

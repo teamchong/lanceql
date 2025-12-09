@@ -1169,11 +1169,15 @@
             const container = document.getElementById('column-chips');
             container.innerHTML = '';
 
+            // Get column names from schema if available
+            const names = currentFile?.columnNames || [];
+
             for (let i = 0; i < columnTypes.length; i++) {
                 const type = columnTypes[i] || 'unknown';
+                const name = names[i] || `column_${i}`;
                 container.innerHTML += `
                     <div class="column-chip">
-                        col_${i}
+                        ${name}
                         <span class="type ${type}">${type}</span>
                     </div>
                 `;
@@ -1322,9 +1326,11 @@
         // Execute query for remote files via Range requests
         // Uses batched fetching - reads all indices per column in one batch
         async function executeRemoteQuery(limit, randomIndices = null) {
+            // Get column names from schema if available
+            const colNames = currentFile?.columnNames || [];
             const columns = [];
             for (let i = 0; i < currentFile.numColumns; i++) {
-                columns.push(`column_${i}`);
+                columns.push(colNames[i] || `column_${i}`);
             }
 
             const indices = randomIndices || Array.from({length: limit}, (_, i) => i);
@@ -1640,10 +1646,14 @@
                 filterCol.innerHTML = '<option value="">No filter</option>';
                 selectCols.innerHTML = '';
 
+                // Get column names from schema if available
+                const colNames = remoteFile.columnNames || [];
+
                 for (let i = 0; i < remoteFile.numColumns; i++) {
                     const type = columnTypes[i] || 'unknown';
-                    filterCol.innerHTML += `<option value="${i}">column_${i} (${type})</option>`;
-                    selectCols.innerHTML += `<option value="${i}" selected>column_${i}</option>`;
+                    const name = colNames[i] || `column_${i}`;
+                    filterCol.innerHTML += `<option value="${i}">${name} (${type})</option>`;
+                    selectCols.innerHTML += `<option value="${i}" selected>${name}</option>`;
                 }
 
                 // Show results section
@@ -1869,12 +1879,16 @@
 
             if (!currentFile || !currentFile._isRemote) return;
 
+            // Get column names from schema if available
+            const colNames = currentFile.columnNames || [];
+
             // Check each column for vector data
             for (let i = 0; i < currentFile.numColumns; i++) {
                 try {
                     const info = await currentFile.getVectorInfo(i);
                     if (info.dimension > 0) {
-                        vectorCol.innerHTML += `<option value="${i}">column_${i} (${info.dimension}D vectors, ${info.rows} rows)</option>`;
+                        const name = colNames[i] || `column_${i}`;
+                        vectorCol.innerHTML += `<option value="${i}">${name} (${info.dimension}D vectors, ${info.rows} rows)</option>`;
                     }
                 } catch (e) {
                     // Not a vector column
