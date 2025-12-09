@@ -397,6 +397,31 @@
             font-size: 14px;
             color: #64748b;
         }
+        .results-actions {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .export-btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            padding: 6px 12px;
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 6px;
+            color: #94a3b8;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.15s ease;
+        }
+        .export-btn:hover {
+            background: #334155;
+            color: #e2e8f0;
+        }
+        .export-btn svg {
+            opacity: 0.7;
+        }
         .results-body {
             padding: 20px;
             height: calc(100vh - 200px);
@@ -1032,7 +1057,25 @@
                     </svg>
                     Results
                 </h3>
-                <span class="results-count" id="results-count"></span>
+                <div class="results-actions">
+                    <span class="results-count" id="results-count"></span>
+                    <button class="export-btn" id="export-csv" title="Export as CSV">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                            <polyline points="7 10 12 15 17 10"/>
+                            <line x1="12" y1="15" x2="12" y2="3"/>
+                        </svg>
+                        CSV
+                    </button>
+                    <button class="export-btn" id="export-json" title="Export as JSON">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                            <polyline points="7 10 12 15 17 10"/>
+                            <line x1="12" y1="15" x2="12" y2="3"/>
+                        </svg>
+                        JSON
+                    </button>
+                </div>
             </div>
             <div class="agg-bar" id="agg-bar" style="display: none;"></div>
             <div class="results-body" id="results-body">
@@ -1058,6 +1101,9 @@
         let rowCount = 0;
         let totalBytesDownloaded = 0;
         let totalRequests = 0;
+
+        // Store last result for export
+        let lastResult = null;
 
         // Infinite scroll state
         let infiniteScrollState = null;
@@ -2040,6 +2086,13 @@
 
         // Display results with infinite scroll support
         function displayResults(result, append = false) {
+            // Store result for export (merge if appending)
+            if (append && lastResult) {
+                lastResult.rows = [...lastResult.rows, ...result.rows];
+            } else {
+                lastResult = { columns: result.columns, rows: [...result.rows] };
+            }
+
             const body = document.getElementById('results-body');
             const loadedCount = append ? (infiniteScrollState?.loadedCount || 0) + result.rows.length : result.rows.length;
             document.getElementById('results-count').textContent = `${loadedCount.toLocaleString()} of ${result.total.toLocaleString()} rows`;
@@ -2444,6 +2497,67 @@
 
         document.getElementById('run-sql-btn').addEventListener('click', runSqlQuery);
         document.getElementById('run-df-btn').addEventListener('click', runDfQuery);
+
+        // Export buttons
+        document.getElementById('export-csv').addEventListener('click', () => {
+            if (!lastResult || lastResult.rows.length === 0) {
+                showStatus('No data to export', 'error');
+                return;
+            }
+            exportAsCSV(lastResult);
+        });
+
+        document.getElementById('export-json').addEventListener('click', () => {
+            if (!lastResult || lastResult.rows.length === 0) {
+                showStatus('No data to export', 'error');
+                return;
+            }
+            exportAsJSON(lastResult);
+        });
+
+        function exportAsCSV(result) {
+            const escapeCSV = (val) => {
+                if (val === null || val === undefined) return '';
+                const str = String(val);
+                if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+                    return '"' + str.replace(/"/g, '""') + '"';
+                }
+                return str;
+            };
+
+            const header = result.columns.map(escapeCSV).join(',');
+            const rows = result.rows.map(row => row.map(escapeCSV).join(','));
+            const csv = [header, ...rows].join('\n');
+
+            downloadFile(csv, 'results.csv', 'text/csv');
+            showStatus(`Exported ${result.rows.length} rows as CSV`, 'success');
+        }
+
+        function exportAsJSON(result) {
+            const data = result.rows.map(row => {
+                const obj = {};
+                result.columns.forEach((col, i) => {
+                    obj[col] = row[i];
+                });
+                return obj;
+            });
+
+            const json = JSON.stringify(data, null, 2);
+            downloadFile(json, 'results.json', 'application/json');
+            showStatus(`Exported ${result.rows.length} rows as JSON`, 'success');
+        }
+
+        function downloadFile(content, filename, mimeType) {
+            const blob = new Blob([content], { type: mimeType });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
 
         // Random sample button
         document.getElementById('random-sample-btn').addEventListener('click', async () => {
