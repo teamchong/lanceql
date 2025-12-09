@@ -1673,7 +1673,71 @@
                 // For remote files, use async methods
                 if (currentFile._isRemote) {
                     console.log('Using remote file path');
-                    const indices = Array.from({length: limit}, (_, i) => i);
+
+                    let indices;
+
+                    // Apply filter if specified
+                    if (filterCol !== '' && !isNaN(filterVal)) {
+                        const filterColIdx = parseInt(filterCol);
+                        const filterType = columnTypes[filterColIdx];
+                        console.log(`Applying filter: column ${filterColIdx} ${filterOp} ${filterVal} (type: ${filterType})`);
+
+                        showProgress('Applying filter...', 0, 1);
+
+                        // Fetch filter column data in batches and filter
+                        const totalRows = await currentFile.getRowCount(0);
+                        const matchingIndices = [];
+                        const batchSize = 1000;
+
+                        for (let batchStart = 0; batchStart < totalRows && matchingIndices.length < limit * 10; batchStart += batchSize) {
+                            const batchEnd = Math.min(batchStart + batchSize, totalRows);
+                            const batchIndices = Array.from({length: batchEnd - batchStart}, (_, i) => batchStart + i);
+
+                            let batchData;
+                            if (filterType === 'int64') {
+                                const rawData = await currentFile.readInt64AtIndices(filterColIdx, batchIndices);
+                                batchData = Array.from(rawData, v => Number(v));
+                            } else if (filterType === 'float64') {
+                                const rawData = await currentFile.readFloat64AtIndices(filterColIdx, batchIndices);
+                                batchData = Array.from(rawData);
+                            } else if (filterType === 'int32') {
+                                const rawData = await currentFile.readInt32AtIndices(filterColIdx, batchIndices);
+                                batchData = Array.from(rawData);
+                            } else if (filterType === 'float32') {
+                                const rawData = await currentFile.readFloat32AtIndices(filterColIdx, batchIndices);
+                                batchData = Array.from(rawData);
+                            } else {
+                                console.warn(`Filter not supported for type ${filterType}`);
+                                break;
+                            }
+
+                            // Apply filter condition
+                            for (let i = 0; i < batchData.length; i++) {
+                                const val = batchData[i];
+                                let matches = false;
+                                switch (filterOp) {
+                                    case '>': matches = val > filterVal; break;
+                                    case '>=': matches = val >= filterVal; break;
+                                    case '<': matches = val < filterVal; break;
+                                    case '<=': matches = val <= filterVal; break;
+                                    case '=': matches = val === filterVal; break;
+                                    case '!=': matches = val !== filterVal; break;
+                                }
+                                if (matches) {
+                                    matchingIndices.push(batchIndices[i]);
+                                }
+                            }
+
+                            showProgress(`Filtering... found ${matchingIndices.length} matches`, batchStart, totalRows);
+                        }
+
+                        indices = matchingIndices.slice(0, limit);
+                        console.log(`Filter matched ${matchingIndices.length} rows, using first ${indices.length}`);
+                    } else {
+                        // No filter, just take first N rows
+                        indices = Array.from({length: limit}, (_, i) => i);
+                    }
+
                     const numCols = cols.length;
 
                     // Show progress bar
