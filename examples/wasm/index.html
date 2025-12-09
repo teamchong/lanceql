@@ -2415,10 +2415,8 @@
                 showStatus('Detecting column types...', 'info');
                 try {
                     columnTypes = await remoteFile.detectColumnTypes();
-                    console.log('columnTypes array after detection:', columnTypes);
                     showColumnChips();
                 } catch (e) {
-                    console.warn('Failed to detect column types:', e);
                     columnTypes = Array(remoteFile.numColumns).fill('unknown');
                 }
 
