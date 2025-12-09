@@ -10,7 +10,8 @@ const initResult = wasm.clip_init();
 console.log('Init result:', initResult);
 
 console.log('Loading model...');
-const modelData = fs.readFileSync('./clip-vit-b32.gguf');
+// Use OpenAI CLIP model
+const modelData = fs.readFileSync('./clip-vit-b32-openai.gguf');
 console.log('Model size:', modelData.byteLength, 'bytes');
 
 const bufPtr = wasm.clip_alloc_model_buffer(modelData.byteLength);

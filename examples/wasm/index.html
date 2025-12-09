@@ -930,6 +930,21 @@
             display: flex;
             align-items: center;
         }
+        .clip-model-select {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            color: #94a3b8;
+        }
+        .clip-model-select select {
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 4px;
+            color: #e2e8f0;
+            padding: 4px 8px;
+            font-size: 12px;
+        }
         .toggle-label {
             display: flex;
             align-items: center;
@@ -1181,6 +1196,13 @@
                                 <span class="toggle-text">Dataset has image embeddings</span>
                             </label>
                         </div>
+                        <div class="clip-model-select">
+                            <label for="clip-model">CLIP Model:</label>
+                            <select id="clip-model">
+                                <option value="clip-vit-b32-openai.gguf">OpenAI ViT-B/32 (122MB)</option>
+                                <option value="clip-vit-b32.gguf">LAION ViT-B/32 (290MB)</option>
+                            </select>
+                        </div>
                     </div>
                     <div class="clip-text-input">
                         <input type="text" id="clip-text-input" placeholder="Describe what you're looking for... (e.g., 'a photo of a cat')">
@@ -1262,6 +1284,7 @@
 
         let lanceql;
         let currentFile = null;
+        window.currentFile = null; // Expose for debugging
         let columnTypes = [];
         let rowCount = 0;
         let totalBytesDownloaded = 0;
@@ -1360,6 +1383,7 @@
 
             if (currentFile) currentFile.close();
             currentFile = lanceql.open(data);
+            window.currentFile = currentFile;
             columnTypes = [];
 
             // Get row count from first column
@@ -1608,17 +1632,21 @@
             const sqlBtn = document.getElementById('run-sql-btn');
             const dfBtn = document.getElementById('run-df-btn');
             const urlBtn = document.getElementById('load-url-btn');
+            const clipBtn = document.getElementById('run-clip-btn');
 
             sqlBtn.disabled = isLoading;
             dfBtn.disabled = isLoading;
             urlBtn.disabled = isLoading;
+            clipBtn.disabled = isLoading;
 
             if (isLoading) {
                 sqlBtn.innerHTML = '<span class="spinner"></span> Loading...';
                 dfBtn.innerHTML = '<span class="spinner"></span> Loading...';
+                clipBtn.innerHTML = '<span class="spinner"></span> Searching...';
             } else {
                 sqlBtn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg> Run Query`;
                 dfBtn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg> Execute`;
+                clipBtn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> Search by Text`;
             }
         }
 
@@ -2594,6 +2622,7 @@
                 // Store as current file with remote flag
                 if (currentFile && currentFile.close) currentFile.close();
                 currentFile = remoteFile;
+                window.currentFile = currentFile;
                 currentFile._isRemote = true;
                 currentFile._url = url;
 
@@ -2947,10 +2976,15 @@
             const colNames = currentFile.columnNames || [];
 
             // Check each column for vector data
+            // Only consider it a vector if dimension > 2 (to exclude scalar types that return small dimensions)
             for (let i = 0; i < currentFile.numColumns; i++) {
                 try {
+                    const type = columnTypes[i];
+                    // Skip if we already know the type and it's not a vector
+                    if (type && type !== 'vector' && type !== 'unknown') continue;
+
                     const info = await currentFile.getVectorInfo(i);
-                    if (info.dimension > 0) {
+                    if (info.dimension > 2) {
                         const name = colNames[i] || `column_${i}`;
                         vectorCol.innerHTML += `<option value="${i}">${name} (${info.dimension}D vectors, ${info.rows} rows)</option>`;
                     }
@@ -2962,6 +2996,11 @@
             // Enable vector search button if we have vector columns
             const hasVectorCols = vectorCol.options.length > 1;
             document.getElementById('run-vector-btn').disabled = !hasVectorCols;
+
+            // Auto-select first vector column
+            if (hasVectorCols) {
+                vectorCol.selectedIndex = 1;
+            }
         }
 
         // Handle "Find Similar" button clicks (event delegation)
@@ -2994,6 +3033,7 @@
         let clipWasm = null;
         let clipModelLoaded = false;
         let clipModelLoading = false;
+        let currentClipModel = null; // Track which model is loaded
 
         async function initClipWasm() {
             try {
@@ -3026,8 +3066,18 @@
         }
 
         async function ensureClipModelLoaded() {
-            // Already loaded
-            if (clipModelLoaded) return true;
+            const selectedModel = document.getElementById('clip-model').value;
+
+            // Check if we need to reload (different model selected)
+            if (clipModelLoaded && currentClipModel === selectedModel) {
+                return true;
+            }
+
+            // If different model selected, need to reinitialize
+            if (clipModelLoaded && currentClipModel !== selectedModel) {
+                clipModelLoaded = false;
+                clipWasm.clip_init(); // Reset CLIP state
+            }
 
             // Currently loading - wait
             if (clipModelLoading) {
@@ -3041,12 +3091,13 @@
             clipModelLoading = true;
             updateClipStatus('Downloading...', 'loading');
 
+            const modelSize = selectedModel.includes('openai') ? '128MB' : '304MB';
             try {
-                showStatus('First text search - downloading CLIP model (~290MB, one-time)...', 'info');
+                showStatus(`Downloading CLIP model (${modelSize}, one-time)...`, 'info');
 
-                const response = await fetch('clip-vit-b32.gguf');
+                const response = await fetch(selectedModel);
                 if (!response.ok) {
-                    throw new Error('clip-vit-b32.gguf not found in examples/wasm/');
+                    throw new Error(`${selectedModel} not found in examples/wasm/`);
                 }
 
                 const modelData = await response.arrayBuffer();
@@ -3078,8 +3129,10 @@
 
                 if (loadResult === 0) {
                     clipModelLoaded = true;
-                    updateClipStatus('Loaded', '');
-                    showStatus('CLIP model ready!', 'success');
+                    currentClipModel = selectedModel;
+                    const modelName = selectedModel.includes('openai') ? 'OpenAI' : 'LAION';
+                    updateClipStatus(`${modelName}`, '');
+                    showStatus(`CLIP model (${modelName}) ready!`, 'success');
                     return true;
                 } else {
                     const errors = {'-2': 'GGUF parse', '-3': 'Vocab', '-4': 'Vocab load', '-6': 'Weights'};
