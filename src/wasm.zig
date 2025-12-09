@@ -959,3 +959,182 @@ export fn allocU32Buffer(count: usize) ?[*]u32 {
     const ptr = wasmAlloc(count * 4) orelse return null;
     return @ptrCast(@alignCast(ptr));
 }
+
+// ============================================================================
+// Vector Column Support (Fixed-size float arrays for embeddings)
+// ============================================================================
+
+fn readF32LE(data: []const u8, offset: usize) f32 {
+    if (offset + 4 > data.len) return 0;
+    const bits = readU32LE(data, offset);
+    return @bitCast(bits);
+}
+
+/// Get vector info from column: dimension and count
+/// Vectors are stored as fixed-size arrays of float32
+export fn getVectorInfo(col_idx: u32) u64 {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    // Return packed: high 32 bits = rows, low 32 bits = estimated dimension
+    // Dimension = buffer_size / (rows * 4) for float32
+    if (info.rows == 0) return 0;
+    const dim = info.size / (info.rows * 4);
+    return (info.rows << 32) | dim;
+}
+
+/// Read a single vector at index
+/// Returns number of floats written
+export fn readVectorAt(
+    col_idx: u32,
+    row_idx: u32,
+    out_ptr: [*]f32,
+    max_dim: usize,
+) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    if (info.rows == 0) return 0;
+    if (row_idx >= info.rows) return 0;
+
+    const dim: usize = @intCast(info.size / (info.rows * 4));
+    if (dim == 0) return 0;
+
+    const buf_start: usize = @intCast(info.offset);
+    const vec_start = buf_start + @as(usize, row_idx) * dim * 4;
+
+    const actual_dim = @min(dim, max_dim);
+    for (0..actual_dim) |i| {
+        out_ptr[i] = readF32LE(data, vec_start + i * 4);
+    }
+
+    return actual_dim;
+}
+
+/// Allocate float32 buffer for vectors
+export fn allocFloat32Buffer(count: usize) ?[*]f32 {
+    const ptr = wasmAlloc(count * 4) orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
+/// Compute cosine similarity between two vectors
+/// Returns similarity score (-1 to 1, higher is more similar)
+export fn cosineSimilarity(
+    vec_a: [*]const f32,
+    vec_b: [*]const f32,
+    dim: usize,
+) f32 {
+    var dot: f32 = 0;
+    var norm_a: f32 = 0;
+    var norm_b: f32 = 0;
+
+    for (0..dim) |i| {
+        const a = vec_a[i];
+        const b = vec_b[i];
+        dot += a * b;
+        norm_a += a * a;
+        norm_b += b * b;
+    }
+
+    const denom = @sqrt(norm_a) * @sqrt(norm_b);
+    if (denom == 0) return 0;
+    return dot / denom;
+}
+
+/// Find top-k most similar vectors to query
+/// Returns number of results written
+/// out_indices: row indices of top matches
+/// out_scores: similarity scores
+export fn vectorSearchTopK(
+    col_idx: u32,
+    query_ptr: [*]const f32,
+    query_dim: usize,
+    top_k: usize,
+    out_indices: [*]u32,
+    out_scores: [*]f32,
+) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    if (info.rows == 0) return 0;
+
+    const dim: usize = @intCast(info.size / (info.rows * 4));
+    if (dim != query_dim) return 0; // Dimension mismatch
+
+    const buf_start: usize = @intCast(info.offset);
+    const num_rows: usize = @intCast(info.rows);
+    const actual_k = @min(top_k, num_rows);
+
+    // Initialize with worst scores
+    for (0..actual_k) |i| {
+        out_indices[i] = 0;
+        out_scores[i] = -2.0; // Worse than minimum cosine similarity
+    }
+
+    // Scan all vectors and maintain top-k
+    for (0..num_rows) |row| {
+        // Compute similarity
+        var dot: f32 = 0;
+        var norm_a: f32 = 0;
+        var norm_b: f32 = 0;
+
+        const vec_start = buf_start + row * dim * 4;
+        for (0..dim) |i| {
+            const a = query_ptr[i];
+            const b = readF32LE(data, vec_start + i * 4);
+            dot += a * b;
+            norm_a += a * a;
+            norm_b += b * b;
+        }
+
+        const denom = @sqrt(norm_a) * @sqrt(norm_b);
+        const score: f32 = if (denom == 0) 0 else dot / denom;
+
+        // Insert into top-k if better than worst
+        if (score > out_scores[actual_k - 1]) {
+            // Find insertion point
+            var insert_pos: usize = actual_k - 1;
+            while (insert_pos > 0 and score > out_scores[insert_pos - 1]) {
+                insert_pos -= 1;
+            }
+
+            // Shift elements down
+            var j: usize = actual_k - 1;
+            while (j > insert_pos) {
+                out_indices[j] = out_indices[j - 1];
+                out_scores[j] = out_scores[j - 1];
+                j -= 1;
+            }
+
+            // Insert new element
+            out_indices[insert_pos] = @intCast(row);
+            out_scores[insert_pos] = score;
+        }
+    }
+
+    return actual_k;
+}

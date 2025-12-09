@@ -517,6 +517,109 @@ export class LanceFile {
     }
 
     // ========================================================================
+    // Vector Column Support (for embeddings/semantic search)
+    // ========================================================================
+
+    /**
+     * Get vector info for a column.
+     * @param {number} colIdx - Column index
+     * @returns {{rows: number, dimension: number}}
+     */
+    getVectorInfo(colIdx) {
+        const packed = this.wasm.getVectorInfo(colIdx);
+        return {
+            rows: Number(BigInt(packed) >> 32n),
+            dimension: Number(BigInt(packed) & 0xFFFFFFFFn)
+        };
+    }
+
+    /**
+     * Read a single vector at index.
+     * @param {number} colIdx - Column index
+     * @param {number} rowIdx - Row index
+     * @returns {Float32Array}
+     */
+    readVectorAt(colIdx, rowIdx) {
+        const info = this.getVectorInfo(colIdx);
+        if (info.dimension === 0) return new Float32Array(0);
+
+        const bufPtr = this.wasm.allocFloat32Buffer(info.dimension);
+        if (!bufPtr) throw new Error('Failed to allocate vector buffer');
+
+        try {
+            const dim = this.wasm.readVectorAt(colIdx, rowIdx, bufPtr, info.dimension);
+            const result = new Float32Array(dim);
+            const view = new Float32Array(this.memory.buffer, bufPtr, dim);
+            result.set(view);
+            return result;
+        } finally {
+            this.wasm.free(bufPtr, info.dimension * 4);
+        }
+    }
+
+    /**
+     * Compute cosine similarity between two vectors.
+     * @param {Float32Array} vecA
+     * @param {Float32Array} vecB
+     * @returns {number} Similarity score (-1 to 1)
+     */
+    cosineSimilarity(vecA, vecB) {
+        if (vecA.length !== vecB.length) {
+            throw new Error('Vector dimensions must match');
+        }
+
+        const ptrA = this.wasm.allocFloat32Buffer(vecA.length);
+        const ptrB = this.wasm.allocFloat32Buffer(vecB.length);
+        if (!ptrA || !ptrB) throw new Error('Failed to allocate buffers');
+
+        try {
+            new Float32Array(this.memory.buffer, ptrA, vecA.length).set(vecA);
+            new Float32Array(this.memory.buffer, ptrB, vecB.length).set(vecB);
+            return this.wasm.cosineSimilarity(ptrA, ptrB, vecA.length);
+        } finally {
+            this.wasm.free(ptrA, vecA.length * 4);
+            this.wasm.free(ptrB, vecB.length * 4);
+        }
+    }
+
+    /**
+     * Find top-k most similar vectors to query.
+     * @param {number} colIdx - Column index with vectors
+     * @param {Float32Array} queryVec - Query vector
+     * @param {number} topK - Number of results to return
+     * @returns {{indices: Uint32Array, scores: Float32Array}}
+     */
+    vectorSearch(colIdx, queryVec, topK = 10) {
+        const queryPtr = this.wasm.allocFloat32Buffer(queryVec.length);
+        const indicesPtr = this.wasm.allocIndexBuffer(topK);
+        const scoresPtr = this.wasm.allocFloat32Buffer(topK);
+
+        if (!queryPtr || !indicesPtr || !scoresPtr) {
+            throw new Error('Failed to allocate buffers');
+        }
+
+        try {
+            new Float32Array(this.memory.buffer, queryPtr, queryVec.length).set(queryVec);
+
+            const count = this.wasm.vectorSearchTopK(
+                colIdx, queryPtr, queryVec.length, topK, indicesPtr, scoresPtr
+            );
+
+            const indices = new Uint32Array(count);
+            const scores = new Float32Array(count);
+
+            indices.set(new Uint32Array(this.memory.buffer, indicesPtr, count));
+            scores.set(new Float32Array(this.memory.buffer, scoresPtr, count));
+
+            return { indices, scores };
+        } finally {
+            this.wasm.free(queryPtr, queryVec.length * 4);
+            this.wasm.free(indicesPtr, topK * 4);
+            this.wasm.free(scoresPtr, topK * 4);
+        }
+    }
+
+    // ========================================================================
     // DataFrame-like API
     // ========================================================================
 
@@ -1397,6 +1500,195 @@ export class RemoteLanceFile {
 
         this._columnMetaCache.set(colIdx, bytes);
         return bytes;
+    }
+
+    // ========================================================================
+    // Vector Column Support (for embeddings/semantic search via Range requests)
+    // ========================================================================
+
+    /**
+     * Get vector info for a column via Range requests.
+     * @param {number} colIdx - Column index
+     * @returns {Promise<{rows: number, dimension: number}>}
+     */
+    async getVectorInfo(colIdx) {
+        const entry = await this.getColumnOffsetEntry(colIdx);
+        if (entry.len === 0) return { rows: 0, dimension: 0 };
+
+        const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
+        const info = this._parseColumnMeta(new Uint8Array(colMeta));
+
+        if (info.rows === 0 || info.size === 0) return { rows: 0, dimension: 0 };
+
+        // Dimension = buffer_size / (rows * 4) for float32
+        const dimension = Math.floor(info.size / (info.rows * 4));
+
+        return { rows: info.rows, dimension };
+    }
+
+    /**
+     * Read a single vector at index via Range requests.
+     * @param {number} colIdx - Column index
+     * @param {number} rowIdx - Row index
+     * @returns {Promise<Float32Array>}
+     */
+    async readVectorAt(colIdx, rowIdx) {
+        const entry = await this.getColumnOffsetEntry(colIdx);
+        const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
+        const info = this._parseColumnMeta(new Uint8Array(colMeta));
+
+        if (info.rows === 0) return new Float32Array(0);
+        if (rowIdx >= info.rows) return new Float32Array(0);
+
+        const dim = Math.floor(info.size / (info.rows * 4));
+        if (dim === 0) return new Float32Array(0);
+
+        // Fetch the vector data
+        const vecStart = info.offset + rowIdx * dim * 4;
+        const vecEnd = vecStart + dim * 4 - 1;
+        const data = await this.fetchRange(vecStart, vecEnd);
+
+        return new Float32Array(data);
+    }
+
+    /**
+     * Read multiple vectors at indices via Range requests.
+     * Uses batched fetching for efficiency.
+     * @param {number} colIdx - Column index
+     * @param {number[]} indices - Row indices
+     * @returns {Promise<Float32Array[]>}
+     */
+    async readVectorsAtIndices(colIdx, indices) {
+        if (indices.length === 0) return [];
+
+        const entry = await this.getColumnOffsetEntry(colIdx);
+        const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
+        const info = this._parseColumnMeta(new Uint8Array(colMeta));
+
+        if (info.rows === 0) return indices.map(() => new Float32Array(0));
+
+        const dim = Math.floor(info.size / (info.rows * 4));
+        if (dim === 0) return indices.map(() => new Float32Array(0));
+
+        const vecSize = dim * 4;
+        const results = new Array(indices.length);
+
+        // Batch indices for efficient fetching
+        const batches = this._batchIndices(indices, vecSize, vecSize * 10);
+
+        await Promise.all(batches.map(async (batch) => {
+            const startOffset = info.offset + batch.startIdx * vecSize;
+            const endOffset = info.offset + (batch.endIdx + 1) * vecSize - 1;
+            const data = await this.fetchRange(startOffset, endOffset);
+
+            for (const item of batch.items) {
+                const localOffset = (item.idx - batch.startIdx) * vecSize;
+                results[item.origPos] = new Float32Array(
+                    data.slice(localOffset, localOffset + vecSize)
+                );
+            }
+        }));
+
+        return results;
+    }
+
+    /**
+     * Compute cosine similarity between two vectors (in JS).
+     * @param {Float32Array} vecA
+     * @param {Float32Array} vecB
+     * @returns {number}
+     */
+    cosineSimilarity(vecA, vecB) {
+        if (vecA.length !== vecB.length) return 0;
+
+        let dot = 0, normA = 0, normB = 0;
+        for (let i = 0; i < vecA.length; i++) {
+            dot += vecA[i] * vecB[i];
+            normA += vecA[i] * vecA[i];
+            normB += vecB[i] * vecB[i];
+        }
+
+        const denom = Math.sqrt(normA) * Math.sqrt(normB);
+        return denom === 0 ? 0 : dot / denom;
+    }
+
+    /**
+     * Find top-k most similar vectors to query via Range requests.
+     * NOTE: This requires scanning the entire vector column which can be slow
+     * for large datasets. For production, use an index.
+     *
+     * @param {number} colIdx - Column index with vectors
+     * @param {Float32Array} queryVec - Query vector
+     * @param {number} topK - Number of results to return
+     * @param {function} onProgress - Progress callback(current, total)
+     * @returns {Promise<{indices: number[], scores: number[]}>}
+     */
+    async vectorSearch(colIdx, queryVec, topK = 10, onProgress = null) {
+        const info = await this.getVectorInfo(colIdx);
+        if (info.dimension === 0 || info.dimension !== queryVec.length) {
+            throw new Error(`Dimension mismatch: query=${queryVec.length}, column=${info.dimension}`);
+        }
+
+        const dim = info.dimension;
+        const vecSize = dim * 4;
+        const numRows = info.rows;
+
+        // Batch size for fetching (fetch multiple vectors at once)
+        const batchSize = Math.min(100, numRows);
+
+        // Top-k heap (min-heap by score)
+        const topResults = [];
+
+        const entry = await this.getColumnOffsetEntry(colIdx);
+        const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
+        const metaInfo = this._parseColumnMeta(new Uint8Array(colMeta));
+
+        for (let batchStart = 0; batchStart < numRows; batchStart += batchSize) {
+            const batchEnd = Math.min(batchStart + batchSize, numRows);
+
+            if (onProgress) {
+                onProgress(batchStart, numRows);
+            }
+
+            // Fetch batch of vectors
+            const startOffset = metaInfo.offset + batchStart * vecSize;
+            const endOffset = metaInfo.offset + batchEnd * vecSize - 1;
+            const data = await this.fetchRange(startOffset, endOffset);
+
+            // Compute similarities for this batch
+            for (let i = 0; i < batchEnd - batchStart; i++) {
+                const rowIdx = batchStart + i;
+                const vecData = new Float32Array(data.slice(i * vecSize, (i + 1) * vecSize));
+
+                // Compute cosine similarity
+                let dot = 0, normA = 0, normB = 0;
+                for (let j = 0; j < dim; j++) {
+                    dot += queryVec[j] * vecData[j];
+                    normA += queryVec[j] * queryVec[j];
+                    normB += vecData[j] * vecData[j];
+                }
+                const denom = Math.sqrt(normA) * Math.sqrt(normB);
+                const score = denom === 0 ? 0 : dot / denom;
+
+                // Insert into top-k
+                if (topResults.length < topK) {
+                    topResults.push({ idx: rowIdx, score });
+                    topResults.sort((a, b) => b.score - a.score);
+                } else if (score > topResults[topK - 1].score) {
+                    topResults[topK - 1] = { idx: rowIdx, score };
+                    topResults.sort((a, b) => b.score - a.score);
+                }
+            }
+        }
+
+        if (onProgress) {
+            onProgress(numRows, numRows);
+        }
+
+        return {
+            indices: topResults.map(r => r.idx),
+            scores: topResults.map(r => r.score)
+        };
     }
 }
 
