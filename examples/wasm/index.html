@@ -1468,6 +1468,9 @@
             showStatus('Loaded successfully - ' + currentFile.numColumns + ' columns, ' + rowCount.toLocaleString() + ' rows', 'success');
             updateDfPreview();
 
+            // Show column chips
+            showColumnChips();
+
             // Show initial aggregations
             showAggregations();
 

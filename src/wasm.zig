@@ -243,6 +243,12 @@ fn getPageBufferInfo(col_meta: []const u8) struct { offset: u64, size: u64, rows
         const wire_type: u3 = @truncate(tag);
 
         switch (field_num) {
+            1 => { // encoding (length-delimited) - skip it
+                if (wire_type == 2) {
+                    const skip_len = readVarint(col_meta, &pos);
+                    pos += @as(usize, @intCast(skip_len));
+                }
+            },
             2 => { // pages (length-delimited)
                 if (wire_type != 2) break;
                 const page_len = readVarint(col_meta, &pos);
@@ -1195,6 +1201,12 @@ fn getStringBufferInfo(col_meta: []const u8) struct {
         const wire_type: u3 = @truncate(tag);
 
         switch (field_num) {
+            1 => { // encoding (length-delimited) - skip it
+                if (wire_type == 2) {
+                    const skip_len = readVarint(col_meta, &pos);
+                    pos += @as(usize, @intCast(skip_len));
+                }
+            },
             2 => { // pages (length-delimited)
                 if (wire_type != 2) break;
                 const page_len = readVarint(col_meta, &pos);
@@ -1291,6 +1303,7 @@ fn getStringBufferInfo(col_meta: []const u8) struct {
 }
 
 /// Get number of strings in column
+/// Returns 0 if not a string column (string columns have 2 buffers: offsets + data)
 export fn getStringCount(col_idx: u32) u64 {
     const data = file_data orelse return 0;
     const entry = getColumnOffsetEntry(col_idx);
@@ -1302,6 +1315,11 @@ export fn getStringCount(col_idx: u32) u64 {
 
     const col_meta = data[col_meta_start..][0..col_meta_len];
     const info = getStringBufferInfo(col_meta);
+
+    // String columns have 2 buffers (offsets + data), non-string columns have 1
+    // If data_size is 0, this is not a string column
+    if (info.data_size == 0) return 0;
+
     return info.rows;
 }
 
@@ -1325,22 +1343,26 @@ export fn readStringAt(col_idx: u32, row_idx: u32, out_ptr: [*]u8, out_max: usiz
     const offsets_start: usize = @intCast(info.offsets_start);
     const data_start: usize = @intCast(info.data_start);
 
-    // Check if using 32-bit or 64-bit offsets
-    // If offsets_size / (rows + 1) == 4, it's int32; if 8, it's int64
-    const offset_size = info.offsets_size / (info.rows + 1);
+    // Lance v2 uses N offsets for N strings (end positions, not N+1 start/end pairs)
+    // Check if using 32-bit or 64-bit offsets: offsets_size / rows
+    const offset_size = info.offsets_size / info.rows;
     if (offset_size != 4 and offset_size != 8) return 0;
 
     var str_start: usize = 0;
     var str_end: usize = 0;
 
     if (offset_size == 4) {
-        // 32-bit offsets
-        str_start = readU32LE(data, offsets_start + row_idx * 4);
-        str_end = readU32LE(data, offsets_start + (row_idx + 1) * 4);
+        // 32-bit offsets - each offset is the END position of that string
+        str_end = readU32LE(data, offsets_start + row_idx * 4);
+        if (row_idx > 0) {
+            str_start = readU32LE(data, offsets_start + (row_idx - 1) * 4);
+        }
     } else {
         // 64-bit offsets
-        str_start = @intCast(readU64LE(data, offsets_start + row_idx * 8));
-        str_end = @intCast(readU64LE(data, offsets_start + (row_idx + 1) * 8));
+        str_end = @intCast(readU64LE(data, offsets_start + row_idx * 8));
+        if (row_idx > 0) {
+            str_start = @intCast(readU64LE(data, offsets_start + (row_idx - 1) * 8));
+        }
     }
 
     if (str_end < str_start) return 0;
