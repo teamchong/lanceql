@@ -3213,6 +3213,12 @@ export class SQLExecutor {
         const outputColumns = this.resolveOutputColumns(ast);
         console.log('Output columns:', outputColumns);
 
+        // Check if this is an aggregation query
+        const hasAggregates = this.hasAggregates(ast);
+        if (hasAggregates) {
+            return await this.executeAggregateQuery(ast, totalRows, onProgress);
+        }
+
         // Calculate indices to fetch
         let indices;
         const limit = ast.limit || 100;
@@ -3561,10 +3567,185 @@ export class SQLExecutor {
         if (!expr) return '?';
         switch (expr.type) {
             case 'column': return expr.name;
-            case 'call': return `${expr.name}(...)`;
+            case 'call': {
+                const argStr = expr.args.map(a => {
+                    if (a.type === 'star') return '*';
+                    if (a.type === 'column') return a.name;
+                    return '?';
+                }).join(', ');
+                return `${expr.name}(${argStr})`;
+            }
             case 'literal': return String(expr.value);
             default: return '?';
         }
+    }
+
+    /**
+     * Check if the query contains aggregate functions
+     */
+    hasAggregates(ast) {
+        const aggFunctions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'];
+        for (const col of ast.columns) {
+            if (col.type === 'expr' && col.expr.type === 'call') {
+                if (aggFunctions.includes(col.expr.name.toUpperCase())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Execute an aggregation query
+     */
+    async executeAggregateQuery(ast, totalRows, onProgress) {
+        const aggFunctions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'];
+
+        // Initialize aggregators for each column
+        const aggregators = [];
+        const colNames = [];
+
+        for (const col of ast.columns) {
+            if (col.type === 'star') {
+                // COUNT(*) case
+                aggregators.push({ type: 'COUNT', column: null, isStar: true });
+                colNames.push('COUNT(*)');
+            } else if (col.expr.type === 'call' && aggFunctions.includes(col.expr.name.toUpperCase())) {
+                const aggType = col.expr.name.toUpperCase();
+                const argExpr = col.expr.args[0];
+                const colName = argExpr?.type === 'column' ? argExpr.name : null;
+                const isStar = argExpr?.type === 'star';
+
+                aggregators.push({
+                    type: aggType,
+                    column: colName,
+                    isStar,
+                    sum: 0,
+                    count: 0,
+                    min: null,
+                    max: null,
+                });
+
+                const displayName = col.alias || this.exprToName(col.expr);
+                colNames.push(displayName);
+            } else {
+                // Non-aggregate column - just take first value (or could error)
+                aggregators.push({
+                    type: 'FIRST',
+                    column: col.expr.type === 'column' ? col.expr.name : null,
+                    value: null,
+                });
+                colNames.push(col.alias || this.exprToName(col.expr));
+            }
+        }
+
+        // Determine which columns we need to read
+        const neededCols = new Set();
+        for (const agg of aggregators) {
+            if (agg.column) {
+                neededCols.add(agg.column.toLowerCase());
+            }
+        }
+
+        // Also need columns from WHERE clause
+        if (ast.where) {
+            this.collectColumnsFromExpr(ast.where, neededCols);
+        }
+
+        // Process data in batches
+        const batchSize = 1000;
+        let processedRows = 0;
+
+        for (let batchStart = 0; batchStart < totalRows; batchStart += batchSize) {
+            if (onProgress) {
+                onProgress(`Aggregating...`, batchStart, totalRows);
+            }
+
+            const batchEnd = Math.min(batchStart + batchSize, totalRows);
+            const batchIndices = Array.from({ length: batchEnd - batchStart }, (_, i) => batchStart + i);
+
+            // Fetch needed column data for this batch
+            const batchData = {};
+            for (const colName of neededCols) {
+                const colIdx = this.columnMap[colName.toLowerCase()];
+                if (colIdx !== undefined) {
+                    batchData[colName.toLowerCase()] = await this.readColumnData(colIdx, batchIndices);
+                }
+            }
+
+            // Process each row in the batch
+            for (let i = 0; i < batchIndices.length; i++) {
+                // Apply WHERE filter if present
+                if (ast.where) {
+                    const matches = this.evaluateExpr(ast.where, batchData, i);
+                    if (!matches) continue;
+                }
+
+                processedRows++;
+
+                // Update aggregators
+                for (const agg of aggregators) {
+                    if (agg.type === 'COUNT') {
+                        agg.count++;
+                    } else if (agg.type === 'FIRST') {
+                        if (agg.value === null && agg.column) {
+                            const data = batchData[agg.column.toLowerCase()];
+                            if (data) agg.value = data[i];
+                        }
+                    } else {
+                        // SUM, AVG, MIN, MAX need column value
+                        const data = agg.column ? batchData[agg.column.toLowerCase()] : null;
+                        const val = data ? data[i] : null;
+
+                        if (val !== null && val !== undefined && !isNaN(val)) {
+                            agg.count++;
+                            if (agg.type === 'SUM' || agg.type === 'AVG') {
+                                agg.sum += val;
+                            }
+                            if (agg.type === 'MIN') {
+                                agg.min = agg.min === null ? val : Math.min(agg.min, val);
+                            }
+                            if (agg.type === 'MAX') {
+                                agg.max = agg.max === null ? val : Math.max(agg.max, val);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build result row
+        const resultRow = [];
+        for (const agg of aggregators) {
+            switch (agg.type) {
+                case 'COUNT':
+                    resultRow.push(agg.count);
+                    break;
+                case 'SUM':
+                    resultRow.push(agg.sum);
+                    break;
+                case 'AVG':
+                    resultRow.push(agg.count > 0 ? agg.sum / agg.count : null);
+                    break;
+                case 'MIN':
+                    resultRow.push(agg.min);
+                    break;
+                case 'MAX':
+                    resultRow.push(agg.max);
+                    break;
+                case 'FIRST':
+                    resultRow.push(agg.value);
+                    break;
+                default:
+                    resultRow.push(null);
+            }
+        }
+
+        return {
+            columns: colNames,
+            rows: [resultRow],
+            total: 1,
+        };
     }
 }
 
