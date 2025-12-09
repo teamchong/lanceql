@@ -988,9 +988,9 @@
         <section class="file-section">
             <div id="file-loader-section">
                 <div class="drop-zone" id="drop-zone">
-                    <p>Drop a .lance file here or click to select</p>
-                    <p style="font-size: 12px;">Navigate into dataset_name.lance/data/ and select the data file</p>
-                    <input type="file" id="file-input">
+                    <p>Drop a .lance folder here or click to select</p>
+                    <p style="font-size: 12px;">Select the dataset_name.lance folder</p>
+                    <input type="file" id="file-input" webkitdirectory directory>
                 </div>
                 <div class="divider">or load from URL</div>
                 <div class="url-input-group">
@@ -1372,7 +1372,180 @@
             reader.readAsArrayBuffer(file);
         }
 
-        function processLanceFile(data, filename) {
+        // Handle multiple files from directory selection
+        async function handleLanceFiles(files) {
+            showStatus('Processing lance folder...', 'info');
+
+            // Find the data file (in data/ subfolder, ends with .lance)
+            const dataFile = files.find(f => f.webkitRelativePath.includes('/data/') && f.name.endsWith('.lance'));
+            // Find manifest file (in _versions/ subfolder)
+            const manifestFile = files.find(f => f.webkitRelativePath.includes('/_versions/') && f.name.endsWith('.manifest'));
+
+            if (!dataFile) {
+                showStatus('No .lance data file found in data/ folder', 'error');
+                return;
+            }
+
+            // Get folder name from path
+            const pathParts = dataFile.webkitRelativePath.split('/');
+            const folderName = pathParts[0] || 'dataset';
+
+            // Read the data file
+            const dataBuffer = await dataFile.arrayBuffer();
+
+            // Read manifest if available (for column names)
+            let columnNames = null;
+            if (manifestFile) {
+                try {
+                    const manifestBuffer = await manifestFile.arrayBuffer();
+                    columnNames = parseManifestForColumnNames(new Uint8Array(manifestBuffer));
+                    console.log('Parsed column names from manifest:', columnNames);
+                } catch (e) {
+                    console.warn('Failed to parse manifest:', e);
+                }
+            }
+
+            processLanceFile(dataBuffer, folderName, columnNames);
+        }
+
+        // Handle folder drop via webkitGetAsEntry
+        async function handleLanceFolder(entry) {
+            showStatus('Processing lance folder...', 'info');
+
+            const files = await readDirectoryRecursive(entry);
+
+            // Find the data file and manifest
+            const dataFile = files.find(f => f.path.includes('/data/') && f.name.endsWith('.lance'));
+            const manifestFile = files.find(f => f.path.includes('/_versions/') && f.name.endsWith('.manifest'));
+
+            if (!dataFile) {
+                showStatus('No .lance data file found in data/ folder', 'error');
+                return;
+            }
+
+            const dataBuffer = await readFileAsArrayBuffer(dataFile.file);
+
+            let columnNames = null;
+            if (manifestFile) {
+                try {
+                    const manifestBuffer = await readFileAsArrayBuffer(manifestFile.file);
+                    columnNames = parseManifestForColumnNames(new Uint8Array(manifestBuffer));
+                    console.log('Parsed column names from manifest:', columnNames);
+                } catch (e) {
+                    console.warn('Failed to parse manifest:', e);
+                }
+            }
+
+            processLanceFile(dataBuffer, entry.name, columnNames);
+        }
+
+        // Recursively read directory entries
+        async function readDirectoryRecursive(dirEntry, path = '') {
+            const files = [];
+            const reader = dirEntry.createReader();
+
+            const readEntries = () => new Promise((resolve, reject) => {
+                reader.readEntries(resolve, reject);
+            });
+
+            let entries;
+            do {
+                entries = await readEntries();
+                for (const entry of entries) {
+                    const entryPath = path + '/' + entry.name;
+                    if (entry.isFile) {
+                        const file = await new Promise(resolve => entry.file(resolve));
+                        files.push({ file, path: entryPath, name: entry.name });
+                    } else if (entry.isDirectory) {
+                        const subFiles = await readDirectoryRecursive(entry, entryPath);
+                        files.push(...subFiles);
+                    }
+                }
+            } while (entries.length > 0);
+
+            return files;
+        }
+
+        function readFileAsArrayBuffer(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = reject;
+                reader.readAsArrayBuffer(file);
+            });
+        }
+
+        // Parse manifest protobuf to extract column names
+        // Manifest is a protobuf message with fields (repeated Field)
+        // Field has: name (string, field 2), id (int32, field 3), logical_type (string, field 5)
+        function parseManifestForColumnNames(data) {
+            const names = [];
+            let pos = 0;
+
+            function readVarint() {
+                let result = 0;
+                let shift = 0;
+                while (pos < data.length) {
+                    const byte = data[pos++];
+                    result |= (byte & 0x7f) << shift;
+                    if ((byte & 0x80) === 0) break;
+                    shift += 7;
+                }
+                return result;
+            }
+
+            function readString(len) {
+                const str = new TextDecoder().decode(data.slice(pos, pos + len));
+                pos += len;
+                return str;
+            }
+
+            function skipField(wireType) {
+                if (wireType === 0) readVarint();
+                else if (wireType === 1) pos += 8;
+                else if (wireType === 2) pos += readVarint();
+                else if (wireType === 5) pos += 4;
+            }
+
+            // Parse top-level Manifest message
+            while (pos < data.length) {
+                const tag = readVarint();
+                const fieldNum = tag >> 3;
+                const wireType = tag & 0x7;
+
+                if (fieldNum === 1 && wireType === 2) {
+                    // fields (repeated Field)
+                    const fieldLen = readVarint();
+                    const fieldEnd = pos + fieldLen;
+
+                    // Parse Field message
+                    let fieldName = null;
+                    while (pos < fieldEnd) {
+                        const fieldTag = readVarint();
+                        const fieldFieldNum = fieldTag >> 3;
+                        const fieldWireType = fieldTag & 0x7;
+
+                        if (fieldFieldNum === 2 && fieldWireType === 2) {
+                            // name (string)
+                            const nameLen = readVarint();
+                            fieldName = readString(nameLen);
+                        } else {
+                            skipField(fieldWireType);
+                        }
+                    }
+
+                    if (fieldName) {
+                        names.push(fieldName);
+                    }
+                } else {
+                    skipField(wireType);
+                }
+            }
+
+            return names.length > 0 ? names : null;
+        }
+
+        function processLanceFile(data, filename, columnNames = null) {
             if (!lanceql.isValid(data)) {
                 showStatus('Invalid Lance file - missing LANC magic bytes', 'error');
                 return;
@@ -1383,6 +1556,7 @@
 
             if (currentFile) currentFile.close();
             currentFile = lanceql.open(data);
+            currentFile.columnNames = columnNames; // Store column names from manifest
             window.currentFile = currentFile;
             columnTypes = [];
 
@@ -1444,9 +1618,11 @@
             filterCol.innerHTML = '<option value="">No filter</option>';
             selectCols.innerHTML = '';
 
+            const colNames = currentFile.columnNames || [];
             for (let i = 0; i < currentFile.numColumns; i++) {
-                filterCol.innerHTML += `<option value="${i}">column_${i} (${columnTypes[i]})</option>`;
-                selectCols.innerHTML += `<option value="${i}" selected>column_${i}</option>`;
+                const name = colNames[i] || `column_${i}`;
+                filterCol.innerHTML += `<option value="${i}">${name} (${columnTypes[i]})</option>`;
+                selectCols.innerHTML += `<option value="${i}" selected>${name}</option>`;
             }
 
             // Populate vector column dropdown for local files
@@ -2718,13 +2894,28 @@
             dropZone.classList.add('dragover');
         });
         dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
-        dropZone.addEventListener('drop', (e) => {
+        dropZone.addEventListener('drop', async (e) => {
             e.preventDefault();
             dropZone.classList.remove('dragover');
+            // Handle folder drop via DataTransferItemList
+            if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
+                const item = e.dataTransfer.items[0];
+                if (item.webkitGetAsEntry) {
+                    const entry = item.webkitGetAsEntry();
+                    if (entry && entry.isDirectory) {
+                        await handleLanceFolder(entry);
+                        return;
+                    }
+                }
+            }
+            // Fallback to single file
             if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
         });
         fileInput.addEventListener('change', () => {
-            if (fileInput.files[0]) handleFile(fileInput.files[0]);
+            // With webkitdirectory, files contains all files in the folder
+            if (fileInput.files && fileInput.files.length > 0) {
+                handleLanceFiles(Array.from(fileInput.files));
+            }
         });
 
         loadUrlBtn.addEventListener('click', () => {
