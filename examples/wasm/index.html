@@ -1032,7 +1032,7 @@
     </div>
 
     <script type="module">
-        import LanceQL from './lanceql.js';
+        import LanceQL, { SQLExecutor } from './lanceql.js';
 
         let lanceql;
         let currentFile = null;
@@ -1367,9 +1367,28 @@
             try {
                 setLoading(true);
                 showStatus('Executing query...', 'info');
-                // Parse simple SQL and execute
-                const result = await executeSimpleSql(sql);
-                displayResults(result);
+
+                // Use the new SQL executor for proper parsing
+                const executor = new SQLExecutor(currentFile);
+                const result = await executor.execute(sql, (msg, current, total) => {
+                    showProgress(msg, current, total);
+                });
+
+                // Format the result for display
+                const formattedResult = {
+                    columns: result.columns,
+                    rows: result.rows.map(row => row.map(cell => {
+                        if (cell === null || cell === undefined) return '';
+                        if (typeof cell === 'number') {
+                            return Number.isInteger(cell) ? cell.toString() : cell.toFixed(4);
+                        }
+                        return String(cell);
+                    })),
+                    total: result.total
+                };
+
+                displayResults(formattedResult);
+                hideProgress();
                 showStatus(`Query completed: ${result.rows.length} rows`, 'success');
             } catch (err) {
                 showStatus('Query error: ' + err.message, 'error');

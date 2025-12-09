@@ -2526,5 +2526,1046 @@ export class RemoteLanceFile {
     }
 }
 
+// ============================================================================
+// SQL Parser and Executor
+// ============================================================================
+
+/**
+ * SQL Token types
+ */
+const TokenType = {
+    // Keywords
+    SELECT: 'SELECT',
+    DISTINCT: 'DISTINCT',
+    FROM: 'FROM',
+    WHERE: 'WHERE',
+    AND: 'AND',
+    OR: 'OR',
+    NOT: 'NOT',
+    ORDER: 'ORDER',
+    BY: 'BY',
+    ASC: 'ASC',
+    DESC: 'DESC',
+    LIMIT: 'LIMIT',
+    OFFSET: 'OFFSET',
+    AS: 'AS',
+    NULL: 'NULL',
+    IS: 'IS',
+    IN: 'IN',
+    BETWEEN: 'BETWEEN',
+    LIKE: 'LIKE',
+    TRUE: 'TRUE',
+    FALSE: 'FALSE',
+    GROUP: 'GROUP',
+    HAVING: 'HAVING',
+    COUNT: 'COUNT',
+    SUM: 'SUM',
+    AVG: 'AVG',
+    MIN: 'MIN',
+    MAX: 'MAX',
+
+    // Literals
+    IDENTIFIER: 'IDENTIFIER',
+    NUMBER: 'NUMBER',
+    STRING: 'STRING',
+
+    // Operators
+    STAR: 'STAR',
+    COMMA: 'COMMA',
+    DOT: 'DOT',
+    LPAREN: 'LPAREN',
+    RPAREN: 'RPAREN',
+    EQ: 'EQ',
+    NE: 'NE',
+    LT: 'LT',
+    LE: 'LE',
+    GT: 'GT',
+    GE: 'GE',
+    PLUS: 'PLUS',
+    MINUS: 'MINUS',
+    SLASH: 'SLASH',
+
+    // Special
+    EOF: 'EOF',
+};
+
+const KEYWORDS = {
+    'SELECT': TokenType.SELECT,
+    'DISTINCT': TokenType.DISTINCT,
+    'FROM': TokenType.FROM,
+    'WHERE': TokenType.WHERE,
+    'AND': TokenType.AND,
+    'OR': TokenType.OR,
+    'NOT': TokenType.NOT,
+    'ORDER': TokenType.ORDER,
+    'BY': TokenType.BY,
+    'ASC': TokenType.ASC,
+    'DESC': TokenType.DESC,
+    'LIMIT': TokenType.LIMIT,
+    'OFFSET': TokenType.OFFSET,
+    'AS': TokenType.AS,
+    'NULL': TokenType.NULL,
+    'IS': TokenType.IS,
+    'IN': TokenType.IN,
+    'BETWEEN': TokenType.BETWEEN,
+    'LIKE': TokenType.LIKE,
+    'TRUE': TokenType.TRUE,
+    'FALSE': TokenType.FALSE,
+    'GROUP': TokenType.GROUP,
+    'HAVING': TokenType.HAVING,
+    'COUNT': TokenType.COUNT,
+    'SUM': TokenType.SUM,
+    'AVG': TokenType.AVG,
+    'MIN': TokenType.MIN,
+    'MAX': TokenType.MAX,
+};
+
+/**
+ * SQL Lexer - tokenizes SQL input
+ */
+class SQLLexer {
+    constructor(sql) {
+        this.sql = sql;
+        this.pos = 0;
+        this.length = sql.length;
+    }
+
+    peek() {
+        if (this.pos >= this.length) return '\0';
+        return this.sql[this.pos];
+    }
+
+    advance() {
+        if (this.pos < this.length) {
+            return this.sql[this.pos++];
+        }
+        return '\0';
+    }
+
+    skipWhitespace() {
+        while (this.pos < this.length && /\s/.test(this.sql[this.pos])) {
+            this.pos++;
+        }
+    }
+
+    readIdentifier() {
+        const start = this.pos;
+        while (this.pos < this.length && /[a-zA-Z0-9_]/.test(this.sql[this.pos])) {
+            this.pos++;
+        }
+        return this.sql.slice(start, this.pos);
+    }
+
+    readNumber() {
+        const start = this.pos;
+        let hasDecimal = false;
+
+        while (this.pos < this.length) {
+            const ch = this.sql[this.pos];
+            if (ch === '.' && !hasDecimal) {
+                hasDecimal = true;
+                this.pos++;
+            } else if (/\d/.test(ch)) {
+                this.pos++;
+            } else {
+                break;
+            }
+        }
+        return this.sql.slice(start, this.pos);
+    }
+
+    readString(quote) {
+        const start = this.pos;
+        this.advance(); // Skip opening quote
+
+        while (this.pos < this.length) {
+            const ch = this.sql[this.pos];
+            if (ch === quote) {
+                // Check for escaped quote
+                if (this.pos + 1 < this.length && this.sql[this.pos + 1] === quote) {
+                    this.pos += 2;
+                    continue;
+                }
+                this.pos++; // Skip closing quote
+                break;
+            }
+            this.pos++;
+        }
+
+        // Return string without quotes, handling escaped quotes
+        const inner = this.sql.slice(start + 1, this.pos - 1);
+        return inner.replace(new RegExp(quote + quote, 'g'), quote);
+    }
+
+    nextToken() {
+        this.skipWhitespace();
+
+        if (this.pos >= this.length) {
+            return { type: TokenType.EOF, value: null };
+        }
+
+        const ch = this.peek();
+
+        // Identifiers and keywords
+        if (/[a-zA-Z_]/.test(ch)) {
+            const value = this.readIdentifier();
+            const upper = value.toUpperCase();
+            const type = KEYWORDS[upper] || TokenType.IDENTIFIER;
+            return { type, value: type === TokenType.IDENTIFIER ? value : upper };
+        }
+
+        // Numbers
+        if (/\d/.test(ch)) {
+            const value = this.readNumber();
+            return { type: TokenType.NUMBER, value };
+        }
+
+        // Strings
+        if (ch === "'" || ch === '"') {
+            const value = this.readString(ch);
+            return { type: TokenType.STRING, value };
+        }
+
+        // Operators
+        this.advance();
+
+        switch (ch) {
+            case '*': return { type: TokenType.STAR, value: '*' };
+            case ',': return { type: TokenType.COMMA, value: ',' };
+            case '.': return { type: TokenType.DOT, value: '.' };
+            case '(': return { type: TokenType.LPAREN, value: '(' };
+            case ')': return { type: TokenType.RPAREN, value: ')' };
+            case '+': return { type: TokenType.PLUS, value: '+' };
+            case '-': return { type: TokenType.MINUS, value: '-' };
+            case '/': return { type: TokenType.SLASH, value: '/' };
+            case '=': return { type: TokenType.EQ, value: '=' };
+            case '<':
+                if (this.peek() === '=') {
+                    this.advance();
+                    return { type: TokenType.LE, value: '<=' };
+                }
+                if (this.peek() === '>') {
+                    this.advance();
+                    return { type: TokenType.NE, value: '<>' };
+                }
+                return { type: TokenType.LT, value: '<' };
+            case '>':
+                if (this.peek() === '=') {
+                    this.advance();
+                    return { type: TokenType.GE, value: '>=' };
+                }
+                return { type: TokenType.GT, value: '>' };
+            case '!':
+                if (this.peek() === '=') {
+                    this.advance();
+                    return { type: TokenType.NE, value: '!=' };
+                }
+                throw new Error(`Unexpected character: ${ch}`);
+            default:
+                throw new Error(`Unexpected character: ${ch}`);
+        }
+    }
+
+    tokenize() {
+        const tokens = [];
+        let token;
+        while ((token = this.nextToken()).type !== TokenType.EOF) {
+            tokens.push(token);
+        }
+        tokens.push(token); // Include EOF
+        return tokens;
+    }
+}
+
+/**
+ * SQL Parser - parses tokens into AST
+ */
+class SQLParser {
+    constructor(tokens) {
+        this.tokens = tokens;
+        this.pos = 0;
+    }
+
+    current() {
+        return this.tokens[this.pos] || { type: TokenType.EOF };
+    }
+
+    advance() {
+        if (this.pos < this.tokens.length) {
+            return this.tokens[this.pos++];
+        }
+        return { type: TokenType.EOF };
+    }
+
+    expect(type) {
+        const token = this.current();
+        if (token.type !== type) {
+            throw new Error(`Expected ${type}, got ${token.type} (${token.value})`);
+        }
+        return this.advance();
+    }
+
+    match(...types) {
+        if (types.includes(this.current().type)) {
+            return this.advance();
+        }
+        return null;
+    }
+
+    check(...types) {
+        return types.includes(this.current().type);
+    }
+
+    /**
+     * Parse SELECT statement
+     */
+    parse() {
+        this.expect(TokenType.SELECT);
+
+        // DISTINCT
+        const distinct = !!this.match(TokenType.DISTINCT);
+
+        // Select list
+        const columns = this.parseSelectList();
+
+        // FROM
+        let from = null;
+        if (this.match(TokenType.FROM)) {
+            from = this.expect(TokenType.IDENTIFIER).value;
+        }
+
+        // WHERE
+        let where = null;
+        if (this.match(TokenType.WHERE)) {
+            where = this.parseExpr();
+        }
+
+        // GROUP BY
+        let groupBy = [];
+        if (this.match(TokenType.GROUP)) {
+            this.expect(TokenType.BY);
+            groupBy = this.parseColumnList();
+        }
+
+        // HAVING
+        let having = null;
+        if (this.match(TokenType.HAVING)) {
+            having = this.parseExpr();
+        }
+
+        // ORDER BY
+        let orderBy = [];
+        if (this.match(TokenType.ORDER)) {
+            this.expect(TokenType.BY);
+            orderBy = this.parseOrderByList();
+        }
+
+        // LIMIT
+        let limit = null;
+        if (this.match(TokenType.LIMIT)) {
+            limit = parseInt(this.expect(TokenType.NUMBER).value, 10);
+        }
+
+        // OFFSET
+        let offset = null;
+        if (this.match(TokenType.OFFSET)) {
+            offset = parseInt(this.expect(TokenType.NUMBER).value, 10);
+        }
+
+        return {
+            type: 'SELECT',
+            distinct,
+            columns,
+            from,
+            where,
+            groupBy,
+            having,
+            orderBy,
+            limit,
+            offset,
+        };
+    }
+
+    parseSelectList() {
+        const items = [this.parseSelectItem()];
+
+        while (this.match(TokenType.COMMA)) {
+            items.push(this.parseSelectItem());
+        }
+
+        return items;
+    }
+
+    parseSelectItem() {
+        // Check for *
+        if (this.match(TokenType.STAR)) {
+            return { type: 'star' };
+        }
+
+        // Expression
+        const expr = this.parseExpr();
+
+        // Optional AS alias
+        let alias = null;
+        if (this.match(TokenType.AS)) {
+            alias = this.expect(TokenType.IDENTIFIER).value;
+        } else if (this.check(TokenType.IDENTIFIER) && !this.check(TokenType.FROM, TokenType.WHERE, TokenType.ORDER, TokenType.LIMIT, TokenType.GROUP)) {
+            // Implicit alias
+            alias = this.advance().value;
+        }
+
+        return { type: 'expr', expr, alias };
+    }
+
+    parseColumnList() {
+        const columns = [this.expect(TokenType.IDENTIFIER).value];
+
+        while (this.match(TokenType.COMMA)) {
+            columns.push(this.expect(TokenType.IDENTIFIER).value);
+        }
+
+        return columns;
+    }
+
+    parseOrderByList() {
+        const items = [this.parseOrderByItem()];
+
+        while (this.match(TokenType.COMMA)) {
+            items.push(this.parseOrderByItem());
+        }
+
+        return items;
+    }
+
+    parseOrderByItem() {
+        const column = this.expect(TokenType.IDENTIFIER).value;
+
+        let descending = false;
+        if (this.match(TokenType.DESC)) {
+            descending = true;
+        } else {
+            this.match(TokenType.ASC);
+        }
+
+        return { column, descending };
+    }
+
+    // Expression parsing with precedence
+    parseExpr() {
+        return this.parseOrExpr();
+    }
+
+    parseOrExpr() {
+        let left = this.parseAndExpr();
+
+        while (this.match(TokenType.OR)) {
+            const right = this.parseAndExpr();
+            left = { type: 'binary', op: 'OR', left, right };
+        }
+
+        return left;
+    }
+
+    parseAndExpr() {
+        let left = this.parseNotExpr();
+
+        while (this.match(TokenType.AND)) {
+            const right = this.parseNotExpr();
+            left = { type: 'binary', op: 'AND', left, right };
+        }
+
+        return left;
+    }
+
+    parseNotExpr() {
+        if (this.match(TokenType.NOT)) {
+            const operand = this.parseNotExpr();
+            return { type: 'unary', op: 'NOT', operand };
+        }
+        return this.parseCmpExpr();
+    }
+
+    parseCmpExpr() {
+        let left = this.parseAddExpr();
+
+        // IS NULL / IS NOT NULL
+        if (this.match(TokenType.IS)) {
+            const negated = !!this.match(TokenType.NOT);
+            this.expect(TokenType.NULL);
+            return {
+                type: 'binary',
+                op: negated ? '!=' : '==',
+                left,
+                right: { type: 'literal', value: null }
+            };
+        }
+
+        // IN
+        if (this.match(TokenType.IN)) {
+            this.expect(TokenType.LPAREN);
+            const values = [];
+            values.push(this.parsePrimary());
+            while (this.match(TokenType.COMMA)) {
+                values.push(this.parsePrimary());
+            }
+            this.expect(TokenType.RPAREN);
+            return { type: 'in', expr: left, values };
+        }
+
+        // BETWEEN
+        if (this.match(TokenType.BETWEEN)) {
+            const low = this.parseAddExpr();
+            this.expect(TokenType.AND);
+            const high = this.parseAddExpr();
+            return { type: 'between', expr: left, low, high };
+        }
+
+        // LIKE
+        if (this.match(TokenType.LIKE)) {
+            const pattern = this.parsePrimary();
+            return { type: 'like', expr: left, pattern };
+        }
+
+        // Comparison operators
+        const opMap = {
+            [TokenType.EQ]: '==',
+            [TokenType.NE]: '!=',
+            [TokenType.LT]: '<',
+            [TokenType.LE]: '<=',
+            [TokenType.GT]: '>',
+            [TokenType.GE]: '>=',
+        };
+
+        const opToken = this.match(TokenType.EQ, TokenType.NE, TokenType.LT, TokenType.LE, TokenType.GT, TokenType.GE);
+        if (opToken) {
+            const right = this.parseAddExpr();
+            return { type: 'binary', op: opMap[opToken.type], left, right };
+        }
+
+        return left;
+    }
+
+    parseAddExpr() {
+        let left = this.parseMulExpr();
+
+        while (true) {
+            const opToken = this.match(TokenType.PLUS, TokenType.MINUS);
+            if (!opToken) break;
+            const right = this.parseMulExpr();
+            left = { type: 'binary', op: opToken.value, left, right };
+        }
+
+        return left;
+    }
+
+    parseMulExpr() {
+        let left = this.parseUnaryExpr();
+
+        while (true) {
+            const opToken = this.match(TokenType.STAR, TokenType.SLASH);
+            if (!opToken) break;
+            const right = this.parseUnaryExpr();
+            left = { type: 'binary', op: opToken.value, left, right };
+        }
+
+        return left;
+    }
+
+    parseUnaryExpr() {
+        if (this.match(TokenType.MINUS)) {
+            const operand = this.parseUnaryExpr();
+            return { type: 'unary', op: '-', operand };
+        }
+        return this.parsePrimary();
+    }
+
+    parsePrimary() {
+        // NULL
+        if (this.match(TokenType.NULL)) {
+            return { type: 'literal', value: null };
+        }
+
+        // TRUE/FALSE
+        if (this.match(TokenType.TRUE)) {
+            return { type: 'literal', value: true };
+        }
+        if (this.match(TokenType.FALSE)) {
+            return { type: 'literal', value: false };
+        }
+
+        // Number
+        if (this.check(TokenType.NUMBER)) {
+            const value = this.advance().value;
+            return { type: 'literal', value: parseFloat(value) };
+        }
+
+        // String
+        if (this.check(TokenType.STRING)) {
+            const value = this.advance().value;
+            return { type: 'literal', value };
+        }
+
+        // Function call or column reference
+        if (this.check(TokenType.IDENTIFIER) || this.check(TokenType.COUNT, TokenType.SUM, TokenType.AVG, TokenType.MIN, TokenType.MAX)) {
+            const name = this.advance().value;
+
+            // Function call
+            if (this.match(TokenType.LPAREN)) {
+                let distinct = !!this.match(TokenType.DISTINCT);
+                const args = [];
+
+                if (!this.check(TokenType.RPAREN)) {
+                    // Handle COUNT(*)
+                    if (this.check(TokenType.STAR)) {
+                        this.advance();
+                        args.push({ type: 'star' });
+                    } else {
+                        args.push(this.parseExpr());
+                        while (this.match(TokenType.COMMA)) {
+                            args.push(this.parseExpr());
+                        }
+                    }
+                }
+
+                this.expect(TokenType.RPAREN);
+                return { type: 'call', name: name.toUpperCase(), args, distinct };
+            }
+
+            // Column reference
+            return { type: 'column', name };
+        }
+
+        // Parenthesized expression
+        if (this.match(TokenType.LPAREN)) {
+            const expr = this.parseExpr();
+            this.expect(TokenType.RPAREN);
+            return expr;
+        }
+
+        // Star (for SELECT *)
+        if (this.match(TokenType.STAR)) {
+            return { type: 'star' };
+        }
+
+        throw new Error(`Unexpected token: ${this.current().type} (${this.current().value})`);
+    }
+}
+
+/**
+ * SQL Executor - executes parsed SQL against a LanceFile
+ */
+export class SQLExecutor {
+    constructor(file) {
+        this.file = file;
+        this.columnMap = {};
+        this.columnTypes = [];
+
+        // Build column name -> index map
+        if (file.columnNames) {
+            file.columnNames.forEach((name, idx) => {
+                this.columnMap[name.toLowerCase()] = idx;
+            });
+        }
+    }
+
+    /**
+     * Execute a SQL query
+     * @param {string} sql - SQL query string
+     * @param {function} onProgress - Optional progress callback
+     * @returns {Promise<{columns: string[], rows: any[][], total: number}>}
+     */
+    async execute(sql, onProgress = null) {
+        // Tokenize and parse
+        const lexer = new SQLLexer(sql);
+        const tokens = lexer.tokenize();
+        const parser = new SQLParser(tokens);
+        const ast = parser.parse();
+
+        console.log('Parsed SQL AST:', ast);
+
+        // Detect column types if not already done
+        if (this.columnTypes.length === 0) {
+            if (this.file._isRemote && this.file.detectColumnTypes) {
+                this.columnTypes = await this.file.detectColumnTypes();
+            } else if (this.file._columnTypes) {
+                this.columnTypes = this.file._columnTypes;
+            } else {
+                // Default to unknown for all columns
+                this.columnTypes = Array(this.file.numColumns || 0).fill('unknown');
+            }
+        }
+
+        // Get total row count
+        const totalRows = this.file._isRemote
+            ? await this.file.getRowCount(0)
+            : Number(this.file.getRowCount(0));
+
+        // Determine which columns to read
+        const neededColumns = this.collectNeededColumns(ast);
+        console.log('Needed columns:', neededColumns);
+
+        // Determine output columns
+        const outputColumns = this.resolveOutputColumns(ast);
+        console.log('Output columns:', outputColumns);
+
+        // Calculate indices to fetch
+        let indices;
+        const limit = ast.limit || 100;
+        const offset = ast.offset || 0;
+
+        // For queries without WHERE, we can just fetch the needed indices directly
+        // For queries with WHERE, we need to fetch more data and filter
+        if (!ast.where) {
+            // Simple case: no filtering needed
+            indices = [];
+            const endIdx = Math.min(offset + limit, totalRows);
+            for (let i = offset; i < endIdx; i++) {
+                indices.push(i);
+            }
+        } else {
+            // Complex case: need to evaluate WHERE clause
+            // Fetch data in batches and filter
+            indices = await this.evaluateWhere(ast.where, totalRows, onProgress);
+
+            // Apply OFFSET and LIMIT to filtered results
+            indices = indices.slice(offset, offset + limit);
+        }
+
+        if (onProgress) {
+            onProgress('Fetching column data...', 0, outputColumns.length);
+        }
+
+        // Fetch data for output columns
+        const columnData = {};
+        for (let i = 0; i < neededColumns.length; i++) {
+            const colName = neededColumns[i];
+            const colIdx = this.columnMap[colName.toLowerCase()];
+            if (colIdx === undefined) continue;
+
+            if (onProgress) {
+                onProgress(`Fetching ${colName}...`, i, neededColumns.length);
+            }
+
+            columnData[colName.toLowerCase()] = await this.readColumnData(colIdx, indices);
+        }
+
+        // Build result rows
+        const rows = [];
+        for (let i = 0; i < indices.length; i++) {
+            const row = [];
+            for (const col of outputColumns) {
+                if (col.type === 'star') {
+                    // Expand all columns
+                    for (const name of this.file.columnNames || []) {
+                        const data = columnData[name.toLowerCase()];
+                        row.push(data ? data[i] : null);
+                    }
+                } else {
+                    const value = this.evaluateExpr(col.expr, columnData, i);
+                    row.push(value);
+                }
+            }
+            rows.push(row);
+        }
+
+        // Apply ORDER BY
+        if (ast.orderBy && ast.orderBy.length > 0) {
+            this.applyOrderBy(rows, ast.orderBy, outputColumns);
+        }
+
+        // Build column names for output
+        const colNames = [];
+        for (const col of outputColumns) {
+            if (col.type === 'star') {
+                colNames.push(...(this.file.columnNames || []));
+            } else {
+                colNames.push(col.alias || this.exprToName(col.expr));
+            }
+        }
+
+        return {
+            columns: colNames,
+            rows,
+            total: totalRows,
+        };
+    }
+
+    collectNeededColumns(ast) {
+        const columns = new Set();
+
+        // From SELECT
+        for (const item of ast.columns) {
+            if (item.type === 'star') {
+                (this.file.columnNames || []).forEach(n => columns.add(n.toLowerCase()));
+            } else {
+                this.collectColumnsFromExpr(item.expr, columns);
+            }
+        }
+
+        // From WHERE
+        if (ast.where) {
+            this.collectColumnsFromExpr(ast.where, columns);
+        }
+
+        // From ORDER BY
+        for (const ob of ast.orderBy || []) {
+            columns.add(ob.column.toLowerCase());
+        }
+
+        return Array.from(columns);
+    }
+
+    collectColumnsFromExpr(expr, columns) {
+        if (!expr) return;
+
+        switch (expr.type) {
+            case 'column':
+                columns.add(expr.name.toLowerCase());
+                break;
+            case 'binary':
+                this.collectColumnsFromExpr(expr.left, columns);
+                this.collectColumnsFromExpr(expr.right, columns);
+                break;
+            case 'unary':
+                this.collectColumnsFromExpr(expr.operand, columns);
+                break;
+            case 'call':
+                for (const arg of expr.args || []) {
+                    this.collectColumnsFromExpr(arg, columns);
+                }
+                break;
+            case 'in':
+                this.collectColumnsFromExpr(expr.expr, columns);
+                break;
+            case 'between':
+                this.collectColumnsFromExpr(expr.expr, columns);
+                break;
+            case 'like':
+                this.collectColumnsFromExpr(expr.expr, columns);
+                break;
+        }
+    }
+
+    resolveOutputColumns(ast) {
+        return ast.columns;
+    }
+
+    async readColumnData(colIdx, indices) {
+        const type = this.columnTypes[colIdx] || 'unknown';
+
+        try {
+            if (type === 'string') {
+                return await this.file.readStringsAtIndices(colIdx, indices);
+            } else if (type === 'int64') {
+                const data = await this.file.readInt64AtIndices(colIdx, indices);
+                // Convert BigInt to Number for easier handling
+                return data.map(v => Number(v));
+            } else if (type === 'float64') {
+                return await this.file.readFloat64AtIndices(colIdx, indices);
+            } else if (type === 'int32') {
+                return await this.file.readInt32AtIndices(colIdx, indices);
+            } else if (type === 'float32') {
+                return await this.file.readFloat32AtIndices(colIdx, indices);
+            } else if (type === 'vector') {
+                // Return placeholder for vectors
+                return indices.map(() => '[vector]');
+            } else {
+                // Try string as fallback
+                try {
+                    return await this.file.readStringsAtIndices(colIdx, indices);
+                } catch (e) {
+                    return indices.map(() => null);
+                }
+            }
+        } catch (e) {
+            console.error(`Failed to read column ${colIdx}:`, e);
+            return indices.map(() => null);
+        }
+    }
+
+    async evaluateWhere(whereExpr, totalRows, onProgress) {
+        // For simple conditions on a single numeric column, we can use WASM filtering
+        // For complex conditions, we need to fetch data and filter in JS
+
+        const matchingIndices = [];
+        const batchSize = 1000;
+
+        for (let batchStart = 0; batchStart < totalRows; batchStart += batchSize) {
+            if (onProgress) {
+                onProgress(`Filtering rows...`, batchStart, totalRows);
+            }
+
+            const batchEnd = Math.min(batchStart + batchSize, totalRows);
+            const batchIndices = [];
+            for (let i = batchStart; i < batchEnd; i++) {
+                batchIndices.push(i);
+            }
+
+            // Fetch needed column data for this batch
+            const neededCols = new Set();
+            this.collectColumnsFromExpr(whereExpr, neededCols);
+
+            const batchData = {};
+            for (const colName of neededCols) {
+                const colIdx = this.columnMap[colName.toLowerCase()];
+                if (colIdx !== undefined) {
+                    batchData[colName.toLowerCase()] = await this.readColumnData(colIdx, batchIndices);
+                }
+            }
+
+            // Evaluate WHERE for each row in batch
+            for (let i = 0; i < batchIndices.length; i++) {
+                const result = this.evaluateExpr(whereExpr, batchData, i);
+                if (result) {
+                    matchingIndices.push(batchIndices[i]);
+                }
+            }
+
+            // Early exit if we have enough results
+            if (matchingIndices.length >= 10000) {
+                break;
+            }
+        }
+
+        return matchingIndices;
+    }
+
+    evaluateExpr(expr, columnData, rowIdx) {
+        if (!expr) return null;
+
+        switch (expr.type) {
+            case 'literal':
+                return expr.value;
+
+            case 'column': {
+                const data = columnData[expr.name.toLowerCase()];
+                return data ? data[rowIdx] : null;
+            }
+
+            case 'star':
+                return '*';
+
+            case 'binary': {
+                const left = this.evaluateExpr(expr.left, columnData, rowIdx);
+                const right = this.evaluateExpr(expr.right, columnData, rowIdx);
+
+                switch (expr.op) {
+                    case '+': return (left || 0) + (right || 0);
+                    case '-': return (left || 0) - (right || 0);
+                    case '*': return (left || 0) * (right || 0);
+                    case '/': return right !== 0 ? (left || 0) / right : null;
+                    case '==': return left === right;
+                    case '!=': return left !== right;
+                    case '<': return left < right;
+                    case '<=': return left <= right;
+                    case '>': return left > right;
+                    case '>=': return left >= right;
+                    case 'AND': return left && right;
+                    case 'OR': return left || right;
+                    default: return null;
+                }
+            }
+
+            case 'unary': {
+                const operand = this.evaluateExpr(expr.operand, columnData, rowIdx);
+                switch (expr.op) {
+                    case '-': return -operand;
+                    case 'NOT': return !operand;
+                    default: return null;
+                }
+            }
+
+            case 'in': {
+                const value = this.evaluateExpr(expr.expr, columnData, rowIdx);
+                const values = expr.values.map(v => this.evaluateExpr(v, columnData, rowIdx));
+                return values.includes(value);
+            }
+
+            case 'between': {
+                const value = this.evaluateExpr(expr.expr, columnData, rowIdx);
+                const low = this.evaluateExpr(expr.low, columnData, rowIdx);
+                const high = this.evaluateExpr(expr.high, columnData, rowIdx);
+                return value >= low && value <= high;
+            }
+
+            case 'like': {
+                const value = this.evaluateExpr(expr.expr, columnData, rowIdx);
+                const pattern = this.evaluateExpr(expr.pattern, columnData, rowIdx);
+                if (typeof value !== 'string' || typeof pattern !== 'string') return false;
+                // Convert SQL LIKE pattern to regex
+                const regex = new RegExp('^' + pattern.replace(/%/g, '.*').replace(/_/g, '.') + '$', 'i');
+                return regex.test(value);
+            }
+
+            case 'call':
+                // Aggregate functions not supported in row-level evaluation
+                return null;
+
+            default:
+                return null;
+        }
+    }
+
+    applyOrderBy(rows, orderBy, outputColumns) {
+        // Build column index map
+        const colIdxMap = {};
+        let idx = 0;
+        for (const col of outputColumns) {
+            if (col.type === 'star') {
+                for (const name of this.file.columnNames || []) {
+                    colIdxMap[name.toLowerCase()] = idx++;
+                }
+            } else {
+                const name = col.alias || this.exprToName(col.expr);
+                colIdxMap[name.toLowerCase()] = idx++;
+            }
+        }
+
+        rows.sort((a, b) => {
+            for (const ob of orderBy) {
+                const colIdx = colIdxMap[ob.column.toLowerCase()];
+                if (colIdx === undefined) continue;
+
+                const valA = a[colIdx];
+                const valB = b[colIdx];
+
+                let cmp = 0;
+                if (valA == null && valB == null) cmp = 0;
+                else if (valA == null) cmp = 1;
+                else if (valB == null) cmp = -1;
+                else if (valA < valB) cmp = -1;
+                else if (valA > valB) cmp = 1;
+
+                if (cmp !== 0) {
+                    return ob.descending ? -cmp : cmp;
+                }
+            }
+            return 0;
+        });
+    }
+
+    exprToName(expr) {
+        if (!expr) return '?';
+        switch (expr.type) {
+            case 'column': return expr.name;
+            case 'call': return `${expr.name}(...)`;
+            case 'literal': return String(expr.value);
+            default: return '?';
+        }
+    }
+}
+
+/**
+ * Parse a SQL string and return the AST
+ * @param {string} sql - SQL query string
+ * @returns {object} - Parsed AST
+ */
+export function parseSQL(sql) {
+    const lexer = new SQLLexer(sql);
+    const tokens = lexer.tokenize();
+    const parser = new SQLParser(tokens);
+    return parser.parse();
+}
+
 // Default export for convenience
 export default LanceQL;
