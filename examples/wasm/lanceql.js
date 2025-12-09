@@ -695,6 +695,11 @@ export class RemoteLanceFile {
         this._minorVersion = this.wasm.parseFooterGetMinorVersion(this.footerPtr, this.footerLen);
         this._columnMetaStart = this.wasm.getColumnMetaStart(this.footerPtr, this.footerLen);
         this._columnMetaOffsetsStart = this.wasm.getColumnMetaOffsetsStart(this.footerPtr, this.footerLen);
+
+        // Cache for column metadata to avoid repeated fetches
+        this._columnMetaCache = new Map();
+        this._columnOffsetCache = new Map();
+        this._columnTypes = null;
     }
 
     /**
@@ -833,6 +838,7 @@ export class RemoteLanceFile {
 
     /**
      * Get column offset entry from column metadata offsets.
+     * Uses caching to avoid repeated fetches.
      * @param {number} colIdx
      * @returns {Promise<{pos: number, len: number}>}
      */
@@ -841,15 +847,24 @@ export class RemoteLanceFile {
             return { pos: 0, len: 0 };
         }
 
+        // Check cache first
+        if (this._columnOffsetCache.has(colIdx)) {
+            return this._columnOffsetCache.get(colIdx);
+        }
+
         // Each entry is 16 bytes (8 bytes pos + 8 bytes len)
         const entryOffset = this.columnMetaOffsetsStart + colIdx * 16;
         const data = await this.fetchRange(entryOffset, entryOffset + 15);
         const view = new DataView(data);
 
-        return {
+        const entry = {
             pos: Number(view.getBigUint64(0, true)),
             len: Number(view.getBigUint64(8, true))
         };
+
+        // Cache the result
+        this._columnOffsetCache.set(colIdx, entry);
+        return entry;
     }
 
     /**
@@ -1033,7 +1048,41 @@ export class RemoteLanceFile {
     }
 
     /**
+     * Batch indices into contiguous ranges to minimize HTTP requests.
+     * Groups nearby indices if the gap is smaller than gapThreshold.
+     * @private
+     */
+    _batchIndices(indices, valueSize, gapThreshold = 1024) {
+        if (indices.length === 0) return [];
+
+        // Sort indices for contiguous access
+        const sorted = [...indices].map((v, i) => ({ idx: v, origPos: i }));
+        sorted.sort((a, b) => a.idx - b.idx);
+
+        const batches = [];
+        let batchStart = 0;
+
+        for (let i = 1; i <= sorted.length; i++) {
+            // Check if we should end the current batch
+            const endBatch = i === sorted.length ||
+                (sorted[i].idx - sorted[i-1].idx) * valueSize > gapThreshold;
+
+            if (endBatch) {
+                batches.push({
+                    startIdx: sorted[batchStart].idx,
+                    endIdx: sorted[i-1].idx,
+                    items: sorted.slice(batchStart, i)
+                });
+                batchStart = i;
+            }
+        }
+
+        return batches;
+    }
+
+    /**
      * Read int64 values at specific row indices via Range requests.
+     * Uses batched fetching to minimize HTTP requests.
      * @param {number} colIdx
      * @param {number[]} indices - Row indices
      * @returns {Promise<BigInt64Array>}
@@ -1046,20 +1095,31 @@ export class RemoteLanceFile {
         const info = this._parseColumnMeta(new Uint8Array(colMeta));
 
         const results = new BigInt64Array(indices.length);
-        const view = new DataView(new ArrayBuffer(8));
+        const valueSize = 8;
 
-        // Fetch each value (could optimize with batch fetching)
-        for (let i = 0; i < indices.length; i++) {
-            const offset = info.offset + indices[i] * 8;
-            const data = await this.fetchRange(offset, offset + 7);
-            results[i] = new DataView(data).getBigInt64(0, true);
-        }
+        // Batch indices into contiguous ranges
+        const batches = this._batchIndices(indices, valueSize);
+
+        // Fetch each batch in parallel
+        await Promise.all(batches.map(async (batch) => {
+            const startOffset = info.offset + batch.startIdx * valueSize;
+            const endOffset = info.offset + (batch.endIdx + 1) * valueSize - 1;
+            const data = await this.fetchRange(startOffset, endOffset);
+            const view = new DataView(data);
+
+            // Extract values from batch
+            for (const item of batch.items) {
+                const localOffset = (item.idx - batch.startIdx) * valueSize;
+                results[item.origPos] = view.getBigInt64(localOffset, true);
+            }
+        }));
 
         return results;
     }
 
     /**
      * Read float64 values at specific row indices via Range requests.
+     * Uses batched fetching to minimize HTTP requests.
      * @param {number} colIdx
      * @param {number[]} indices
      * @returns {Promise<Float64Array>}
@@ -1072,12 +1132,24 @@ export class RemoteLanceFile {
         const info = this._parseColumnMeta(new Uint8Array(colMeta));
 
         const results = new Float64Array(indices.length);
+        const valueSize = 8;
 
-        for (let i = 0; i < indices.length; i++) {
-            const offset = info.offset + indices[i] * 8;
-            const data = await this.fetchRange(offset, offset + 7);
-            results[i] = new DataView(data).getFloat64(0, true);
-        }
+        // Batch indices into contiguous ranges
+        const batches = this._batchIndices(indices, valueSize);
+
+        // Fetch each batch in parallel
+        await Promise.all(batches.map(async (batch) => {
+            const startOffset = info.offset + batch.startIdx * valueSize;
+            const endOffset = info.offset + (batch.endIdx + 1) * valueSize - 1;
+            const data = await this.fetchRange(startOffset, endOffset);
+            const view = new DataView(data);
+
+            // Extract values from batch
+            for (const item of batch.items) {
+                const localOffset = (item.idx - batch.startIdx) * valueSize;
+                results[item.origPos] = view.getFloat64(localOffset, true);
+            }
+        }));
 
         return results;
     }
@@ -1128,15 +1200,107 @@ export class RemoteLanceFile {
 
     /**
      * Read multiple strings at indices via Range requests.
+     * Uses batched fetching to minimize HTTP requests.
      * @param {number} colIdx
      * @param {number[]} indices
      * @returns {Promise<string[]>}
      */
     async readStringsAtIndices(colIdx, indices) {
-        const results = [];
-        for (const idx of indices) {
-            results.push(await this.readStringAt(colIdx, idx));
+        if (indices.length === 0) return [];
+
+        const entry = await this.getColumnOffsetEntry(colIdx);
+        const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
+        const info = this._parseStringColumnMeta(new Uint8Array(colMeta));
+
+        if (info.offsetsSize === 0 || info.dataSize === 0) {
+            return indices.map(() => '');
         }
+
+        // Determine offset size (4 or 8 bytes)
+        const offsetSize = info.offsetsSize / (info.rows + 1);
+        if (offsetSize !== 4 && offsetSize !== 8) {
+            return indices.map(() => '');
+        }
+
+        const results = new Array(indices.length).fill('');
+
+        // Batch offset fetching - each string needs 2 consecutive offsets
+        const offsetBatches = this._batchIndices(indices, offsetSize, 2048);
+
+        // First pass: fetch all offsets in batches
+        const stringRanges = new Array(indices.length);
+
+        await Promise.all(offsetBatches.map(async (batch) => {
+            // Fetch offsets for entire batch range (need +1 for end offset)
+            const startOffset = info.offsetsStart + batch.startIdx * offsetSize;
+            const endOffset = info.offsetsStart + (batch.endIdx + 2) * offsetSize - 1;
+            const data = await this.fetchRange(startOffset, endOffset);
+            const view = new DataView(data);
+
+            // Extract string ranges from offsets
+            for (const item of batch.items) {
+                if (item.idx >= info.rows) continue;
+
+                const localIdx = item.idx - batch.startIdx;
+                let strStart, strEnd;
+
+                if (offsetSize === 4) {
+                    strStart = view.getUint32(localIdx * 4, true);
+                    strEnd = view.getUint32((localIdx + 1) * 4, true);
+                } else {
+                    strStart = Number(view.getBigUint64(localIdx * 8, true));
+                    strEnd = Number(view.getBigUint64((localIdx + 1) * 8, true));
+                }
+
+                if (strEnd > strStart) {
+                    stringRanges[item.origPos] = { start: strStart, end: strEnd };
+                }
+            }
+        }));
+
+        // Second pass: batch fetch string data
+        // Group strings that are close together in the data buffer
+        const dataItems = stringRanges
+            .map((range, origPos) => range ? { ...range, origPos } : null)
+            .filter(Boolean)
+            .sort((a, b) => a.start - b.start);
+
+        if (dataItems.length === 0) return results;
+
+        // Batch string data fetches
+        const dataBatches = [];
+        let batchStart = 0;
+
+        for (let i = 1; i <= dataItems.length; i++) {
+            const endBatch = i === dataItems.length ||
+                (dataItems[i].start - dataItems[i-1].end) > 4096;
+
+            if (endBatch) {
+                dataBatches.push({
+                    rangeStart: dataItems[batchStart].start,
+                    rangeEnd: dataItems[i-1].end,
+                    items: dataItems.slice(batchStart, i)
+                });
+                batchStart = i;
+            }
+        }
+
+        // Fetch string data batches in parallel
+        await Promise.all(dataBatches.map(async (batch) => {
+            const data = await this.fetchRange(
+                info.dataStart + batch.rangeStart,
+                info.dataStart + batch.rangeEnd - 1
+            );
+            const bytes = new Uint8Array(data);
+
+            for (const item of batch.items) {
+                const localStart = item.start - batch.rangeStart;
+                const len = item.end - item.start;
+                const strBytes = bytes.slice(localStart, localStart + len);
+                results[item.origPos] = new TextDecoder().decode(strBytes);
+            }
+        }));
+
         return results;
     }
 
@@ -1148,6 +1312,91 @@ export class RemoteLanceFile {
     async getRowCount(colIdx) {
         const info = await this.getColumnDebugInfo(colIdx);
         return info.rows;
+    }
+
+    /**
+     * Detect column types by sampling first row.
+     * Returns array of type strings: 'string', 'int64', 'float64', 'unknown'
+     * @returns {Promise<string[]>}
+     */
+    async detectColumnTypes() {
+        // Return cached if available
+        if (this._columnTypes) {
+            return this._columnTypes;
+        }
+
+        const types = [];
+
+        for (let c = 0; c < this._numColumns; c++) {
+            let type = 'unknown';
+
+            // Try string first
+            try {
+                const str = await this.readStringAt(c, 0);
+                if (str && str.length > 0) {
+                    type = 'string';
+                    types.push(type);
+                    continue;
+                }
+            } catch (e) {}
+
+            // Try to read column metadata and check buffer structure
+            try {
+                const entry = await this.getColumnOffsetEntry(c);
+                if (entry.len > 0) {
+                    const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
+                    const info = this._parseColumnMeta(new Uint8Array(colMeta));
+
+                    // If buffer size / rows = 8, likely numeric
+                    if (info.rows > 0 && info.size > 0) {
+                        const bytesPerRow = info.size / info.rows;
+                        if (bytesPerRow === 8) {
+                            // Could be int64 or float64, try reading one value
+                            try {
+                                const data = await this.readInt64AtIndices(c, [0]);
+                                if (data.length > 0) {
+                                    // Check if it looks like a reasonable int vs float
+                                    const val = data[0];
+                                    if (val >= -1e15 && val <= 1e15) {
+                                        type = 'int64';
+                                    } else {
+                                        type = 'float64';
+                                    }
+                                }
+                            } catch (e) {
+                                type = 'float64';
+                            }
+                        }
+                    }
+                }
+            } catch (e) {}
+
+            types.push(type);
+        }
+
+        this._columnTypes = types;
+        return types;
+    }
+
+    /**
+     * Get cached column metadata, fetching if necessary.
+     * @private
+     */
+    async _getCachedColumnMeta(colIdx) {
+        if (this._columnMetaCache.has(colIdx)) {
+            return this._columnMetaCache.get(colIdx);
+        }
+
+        const entry = await this.getColumnOffsetEntry(colIdx);
+        if (entry.len === 0) {
+            return null;
+        }
+
+        const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
+        const bytes = new Uint8Array(colMeta);
+
+        this._columnMetaCache.set(colIdx, bytes);
+        return bytes;
     }
 }
 

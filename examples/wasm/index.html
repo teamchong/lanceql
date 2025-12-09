@@ -1198,57 +1198,77 @@
         }
 
         // Execute query for remote files via Range requests
+        // Uses batched fetching - reads all indices per column in one batch
         async function executeRemoteQuery(limit, randomIndices = null) {
             const columns = [];
             for (let i = 0; i < currentFile.numColumns; i++) {
                 columns.push(`column_${i}`);
             }
 
-            const rows = [];
             const indices = randomIndices || Array.from({length: limit}, (_, i) => i);
             const actualLimit = indices.length;
+            const numCols = currentFile.numColumns;
 
             // Show progress bar
-            showProgress('Fetching rows...', 0, actualLimit);
+            showProgress('Fetching column data...', 0, numCols);
 
-            // Fetch data for each row
+            // Fetch all data per column (batched Range requests)
+            const columnData = [];
+
+            for (let c = 0; c < numCols; c++) {
+                showProgress(`Fetching column ${c + 1}/${numCols}`, c, numCols);
+
+                let data = null;
+
+                // Try string first (most common for URLs)
+                try {
+                    data = await currentFile.readStringsAtIndices(c, indices);
+                    if (data && data.some(s => s && s.length > 0)) {
+                        columnData.push({ type: 'string', data });
+                        continue;
+                    }
+                } catch (e) {}
+
+                // Try int64
+                try {
+                    data = await currentFile.readInt64AtIndices(c, indices);
+                    if (data && data.length > 0) {
+                        columnData.push({ type: 'int64', data });
+                        continue;
+                    }
+                } catch (e) {}
+
+                // Try float64
+                try {
+                    data = await currentFile.readFloat64AtIndices(c, indices);
+                    if (data && data.length > 0) {
+                        columnData.push({ type: 'float64', data });
+                        continue;
+                    }
+                } catch (e) {}
+
+                columnData.push({ type: 'unknown', data: null });
+            }
+
+            showProgress('Building results...', numCols, numCols);
+
+            // Build rows from column data
+            const rows = [];
             for (let i = 0; i < actualLimit; i++) {
-                const rowIdx = indices[i];
                 const row = [];
-                for (let c = 0; c < currentFile.numColumns; c++) {
-                    try {
-                        // Try string first (most likely for image URLs)
-                        const str = await currentFile.readStringAt(c, rowIdx);
-                        if (str) {
-                            row.push(str);
-                            continue;
-                        }
-                    } catch (e) {}
-
-                    try {
-                        // Try int64
-                        const data = await currentFile.readInt64AtIndices(c, [rowIdx]);
-                        if (data.length > 0) {
-                            row.push(data[0].toString());
-                            continue;
-                        }
-                    } catch (e) {}
-
-                    try {
-                        // Try float64
-                        const data = await currentFile.readFloat64AtIndices(c, [rowIdx]);
-                        if (data.length > 0) {
-                            row.push(data[0].toFixed(4));
-                            continue;
-                        }
-                    } catch (e) {}
-
-                    row.push('?');
+                for (let c = 0; c < numCols; c++) {
+                    const col = columnData[c];
+                    if (col.type === 'string') {
+                        row.push(col.data[i] || '');
+                    } else if (col.type === 'int64') {
+                        row.push(col.data[i]?.toString() || '');
+                    } else if (col.type === 'float64') {
+                        row.push(col.data[i]?.toFixed(4) || '');
+                    } else {
+                        row.push('?');
+                    }
                 }
                 rows.push(row);
-
-                // Update progress
-                showProgress(`Fetching row ${i + 1}/${actualLimit}`, i + 1, actualLimit);
             }
 
             hideProgress();
@@ -1474,19 +1494,30 @@
                 // Show network stats
                 document.getElementById('network-stats').classList.remove('hidden');
 
+                // Detect column types
+                showStatus('Detecting column types...', 'info');
+                try {
+                    columnTypes = await remoteFile.detectColumnTypes();
+                    showColumnChips();
+                } catch (e) {
+                    console.warn('Failed to detect column types:', e);
+                    columnTypes = Array(remoteFile.numColumns).fill('unknown');
+                }
+
                 // Show query section
                 document.getElementById('query-section').style.display = 'block';
                 document.getElementById('run-sql-btn').disabled = false;
                 document.getElementById('run-df-btn').disabled = false;
 
-                // Populate DataFrame builder selects
+                // Populate DataFrame builder selects with type info
                 const filterCol = document.getElementById('df-filter-col');
                 const selectCols = document.getElementById('df-select-cols');
                 filterCol.innerHTML = '<option value="">No filter</option>';
                 selectCols.innerHTML = '';
 
                 for (let i = 0; i < remoteFile.numColumns; i++) {
-                    filterCol.innerHTML += `<option value="${i}">column_${i}</option>`;
+                    const type = columnTypes[i] || 'unknown';
+                    filterCol.innerHTML += `<option value="${i}">column_${i} (${type})</option>`;
                     selectCols.innerHTML += `<option value="${i}" selected>column_${i}</option>`;
                 }
 
