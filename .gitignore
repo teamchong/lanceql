@@ -38,4 +38,10 @@ Thumbs.db
 # npm
 node_modules/
 
+# Large model files
+*.gguf
+
+# Allow specific wasm files in examples
+!examples/wasm/*.wasm
+
 CLAUDE.md

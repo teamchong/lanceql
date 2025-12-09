@@ -825,6 +825,107 @@
             color: #a78bfa;
             font-size: 13px;
         }
+
+        /* CLIP Text Search */
+        .clip-section {
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid #334155;
+        }
+        .clip-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 15px;
+        }
+        .clip-title {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            color: #e2e8f0;
+        }
+        .clip-title .badge {
+            font-size: 10px;
+            padding: 2px 6px;
+            background: #22c55e;
+            color: white;
+            border-radius: 4px;
+        }
+        .clip-title .badge.loading {
+            background: #f59e0b;
+        }
+        .clip-title .badge.error {
+            background: #ef4444;
+        }
+        .clip-load-btn {
+            padding: 6px 12px;
+            background: #334155;
+            border: none;
+            border-radius: 6px;
+            color: #94a3b8;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .clip-load-btn:hover {
+            background: #475569;
+            color: #e2e8f0;
+        }
+        .clip-load-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .clip-text-input {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        .clip-text-input input {
+            flex: 1;
+            padding: 12px 15px;
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            color: #e2e8f0;
+            font-size: 14px;
+        }
+        .clip-text-input input:focus {
+            outline: none;
+            border-color: #22c55e;
+        }
+        .clip-text-input input::placeholder {
+            color: #64748b;
+        }
+        .clip-examples {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .clip-example {
+            padding: 6px 12px;
+            background: #334155;
+            border: none;
+            border-radius: 6px;
+            color: #94a3b8;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .clip-example:hover {
+            background: #22c55e;
+            color: white;
+        }
+        .btn-clip-search {
+            background: #22c55e !important;
+        }
+        .btn-clip-search:hover {
+            background: #16a34a !important;
+        }
+        .btn-clip-search:disabled {
+            background: #475569 !important;
+        }
     </style>
 </head>
 <body>
@@ -1038,8 +1139,41 @@
                             <circle cx="11" cy="11" r="8"/>
                             <line x1="21" y1="21" x2="16.65" y2="16.65"/>
                         </svg>
-                        Search Similar
+                        Search by Row
                     </button>
+                </div>
+
+                <!-- CLIP Text Search Section -->
+                <div class="clip-section" id="clip-section">
+                    <div class="clip-header">
+                        <div class="clip-title">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+                            </svg>
+                            Text Search (CLIP)
+                            <span class="badge" id="clip-status-badge">Ready</span>
+                        </div>
+                    </div>
+                    <div class="clip-text-input">
+                        <input type="text" id="clip-text-input" placeholder="Describe what you're looking for... (e.g., 'a photo of a cat')">
+                    </div>
+                    <div class="clip-examples">
+                        <button class="clip-example" data-text="a photo of a cat">cat</button>
+                        <button class="clip-example" data-text="a photo of a dog">dog</button>
+                        <button class="clip-example" data-text="a sunset over the ocean">sunset</button>
+                        <button class="clip-example" data-text="a city skyline at night">city night</button>
+                        <button class="clip-example" data-text="a person smiling">person smiling</button>
+                        <button class="clip-example" data-text="food on a plate">food</button>
+                    </div>
+                    <div class="run-section">
+                        <button class="btn btn-primary btn-clip-search" id="run-clip-btn">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="11" cy="11" r="8"/>
+                                <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                            </svg>
+                            Search by Text
+                        </button>
+                    </div>
                 </div>
             </div>
 
@@ -2774,6 +2908,214 @@
             // Run the search
             await runVectorSearch();
         });
+
+        // =============================================
+        // CLIP Text-to-Image Search Integration
+        // =============================================
+        let clipWasm = null;
+        let clipModelLoaded = false;
+        let clipModelLoading = false;
+
+        async function initClipWasm() {
+            try {
+                const response = await fetch('clip.wasm');
+                const bytes = await response.arrayBuffer();
+                const { instance } = await WebAssembly.instantiate(bytes, {});
+                clipWasm = instance.exports;
+
+                // Initialize CLIP
+                const initResult = clipWasm.clip_init();
+                if (initResult === 0) {
+                    console.log('CLIP WASM initialized');
+                    updateClipStatus('Ready', '');
+                } else {
+                    console.error('CLIP init failed:', initResult);
+                    updateClipStatus('Init Failed', 'error');
+                }
+            } catch (e) {
+                console.error('Failed to load CLIP WASM:', e);
+                updateClipStatus('WASM Error', 'error');
+            }
+        }
+
+        function updateClipStatus(text, state = '') {
+            const badge = document.getElementById('clip-status-badge');
+            if (badge) {
+                badge.textContent = text;
+                badge.className = 'badge' + (state ? ' ' + state : '');
+            }
+        }
+
+        async function ensureClipModelLoaded() {
+            // Already loaded
+            if (clipModelLoaded) return true;
+
+            // Currently loading - wait
+            if (clipModelLoading) {
+                while (clipModelLoading) {
+                    await new Promise(r => setTimeout(r, 100));
+                }
+                return clipModelLoaded;
+            }
+
+            // Need to load
+            clipModelLoading = true;
+            updateClipStatus('Downloading...', 'loading');
+
+            try {
+                showStatus('First text search - downloading CLIP model (~290MB, one-time)...', 'info');
+
+                const response = await fetch('clip-vit-b32.gguf');
+                if (!response.ok) {
+                    throw new Error('clip-vit-b32.gguf not found in examples/wasm/');
+                }
+
+                const modelData = await response.arrayBuffer();
+                showStatus(`Downloaded ${(modelData.byteLength / 1024 / 1024).toFixed(0)}MB, parsing model...`, 'info');
+
+                // Allocate and copy to WASM
+                const bufPtr = clipWasm.clip_alloc_model_buffer(modelData.byteLength);
+                if (bufPtr === 0) {
+                    throw new Error('Failed to allocate WASM memory');
+                }
+
+                const wasmMem = new Uint8Array(clipWasm.memory.buffer);
+                wasmMem.set(new Uint8Array(modelData), bufPtr);
+
+                // Parse and load
+                updateClipStatus('Parsing...', 'loading');
+                const loadResult = clipWasm.clip_load_model(modelData.byteLength);
+
+                if (loadResult === 0) {
+                    clipModelLoaded = true;
+                    updateClipStatus('Loaded', '');
+                    showStatus('CLIP model ready!', 'success');
+                    return true;
+                } else {
+                    const errors = {'-2': 'GGUF parse', '-3': 'Vocab', '-4': 'Vocab load', '-6': 'Weights'};
+                    throw new Error(errors[loadResult] || `Error ${loadResult}`);
+                }
+            } catch (e) {
+                console.error('CLIP load error:', e);
+                updateClipStatus('Error', 'error');
+                showStatus('CLIP load error: ' + e.message, 'error');
+                return false;
+            } finally {
+                clipModelLoading = false;
+            }
+        }
+
+        function encodeTextWithClip(text) {
+            if (!clipWasm || !clipModelLoaded) return null;
+
+            const textBuf = clipWasm.clip_get_text_buffer();
+            const textBytes = new TextEncoder().encode(text);
+            const memory = new Uint8Array(clipWasm.memory.buffer);
+            memory.set(textBytes, textBuf);
+
+            const result = clipWasm.clip_encode_text(textBytes.length);
+            if (result !== 0) {
+                console.error('CLIP encode error:', result);
+                return null;
+            }
+
+            const outputBuf = clipWasm.clip_get_output_buffer();
+            const outputDim = clipWasm.clip_get_output_dim();
+            return new Float32Array(clipWasm.memory.buffer, outputBuf, outputDim).slice();
+        }
+
+        async function runClipSearch() {
+            const text = document.getElementById('clip-text-input').value.trim();
+            if (!text) {
+                showStatus('Enter a text description', 'error');
+                return;
+            }
+
+            const vectorColIdx = parseInt(document.getElementById('vector-col').value);
+            if (isNaN(vectorColIdx)) {
+                showStatus('Select a vector column first', 'error');
+                return;
+            }
+
+            const topK = parseInt(document.getElementById('top-k').value) || 20;
+
+            try {
+                setLoading(true);
+
+                // Auto-load model on first search
+                if (!clipModelLoaded) {
+                    const loaded = await ensureClipModelLoaded();
+                    if (!loaded) {
+                        setLoading(false);
+                        return;
+                    }
+                }
+
+                showStatus(`Encoding text: "${text}"...`, 'info');
+
+                // Encode text to embedding
+                const queryVec = encodeTextWithClip(text);
+                if (!queryVec) {
+                    showStatus('Failed to encode text', 'error');
+                    setLoading(false);
+                    return;
+                }
+
+                showStatus(`Searching with ${queryVec.length}-dim text embedding...`, 'info');
+
+                // Run vector search
+                const results = await currentFile.vectorSearch(
+                    vectorColIdx,
+                    queryVec,
+                    topK,
+                    (current, total) => {
+                        showProgress(`Scanning vectors...`, current, total);
+                    }
+                );
+
+                hideProgress();
+
+                // Get image URLs
+                const urlColIdx = 0;
+                const urls = await currentFile.readStringsAtIndices(urlColIdx, results.indices);
+
+                // Build results
+                const columns = ['rank', 'row_idx', 'similarity', 'image'];
+                const rows = results.indices.map((idx, i) => [
+                    (i + 1).toString(),
+                    idx.toString(),
+                    results.scores[i].toFixed(4),
+                    urls[i] || ''
+                ]);
+
+                displayResults({ columns, rows, total: results.indices.length });
+                showStatus(`Found ${results.indices.length} images matching "${text}"`, 'success');
+            } catch (err) {
+                showStatus('Text search error: ' + err.message, 'error');
+                console.error(err);
+            } finally {
+                setLoading(false);
+            }
+        }
+
+        // CLIP event listeners
+        document.getElementById('run-clip-btn').addEventListener('click', runClipSearch);
+
+        document.getElementById('clip-text-input').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                runClipSearch();
+            }
+        });
+
+        document.querySelectorAll('.clip-example').forEach(btn => {
+            btn.addEventListener('click', () => {
+                document.getElementById('clip-text-input').value = btn.dataset.text;
+                runClipSearch();
+            });
+        });
+
+        // Initialize CLIP WASM on page load
+        initClipWasm();
 
         // Initialize
         init();
