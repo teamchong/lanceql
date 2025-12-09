@@ -1897,7 +1897,7 @@ export class RemoteLanceFile {
 
     /**
      * Detect column types by sampling first row.
-     * Returns array of type strings: 'string', 'int64', 'float64', 'unknown'
+     * Returns array of type strings: 'string', 'int64', 'float64', 'float32', 'vector', 'unknown'
      * @returns {Promise<string[]>}
      */
     async detectColumnTypes() {
@@ -1911,33 +1911,38 @@ export class RemoteLanceFile {
         for (let c = 0; c < this._numColumns; c++) {
             let type = 'unknown';
 
-            // Try string first
-            try {
-                const str = await this.readStringAt(c, 0);
-                if (str && str.length > 0) {
-                    type = 'string';
-                    types.push(type);
-                    continue;
-                }
-            } catch (e) {}
-
-            // Try to read column metadata and check buffer structure
             try {
                 const entry = await this.getColumnOffsetEntry(c);
                 if (entry.len > 0) {
                     const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
-                    const info = this._parseColumnMeta(new Uint8Array(colMeta));
+                    const bytes = new Uint8Array(colMeta);
 
-                    // If buffer size / rows = 8, likely numeric
+                    // Check if it's a string column (has 2 buffers: offsets + data)
+                    const stringInfo = this._parseStringColumnMeta(bytes);
+                    if (stringInfo.offsetsSize > 0 && stringInfo.dataSize > 0 && stringInfo.rows > 0) {
+                        // Verify by trying to read a string
+                        try {
+                            const str = await this.readStringAt(c, 0);
+                            if (str !== undefined) {  // Even empty string means it's a string column
+                                type = 'string';
+                                types.push(type);
+                                continue;
+                            }
+                        } catch (e) {}
+                    }
+
+                    // Check numeric column (single buffer)
+                    const info = this._parseColumnMeta(bytes);
                     if (info.rows > 0 && info.size > 0) {
                         const bytesPerRow = info.size / info.rows;
+
                         if (bytesPerRow === 8) {
-                            // Could be int64 or float64, try reading one value
+                            // int64 or float64
                             try {
                                 const data = await this.readInt64AtIndices(c, [0]);
                                 if (data.length > 0) {
-                                    // Check if it looks like a reasonable int vs float
                                     const val = data[0];
+                                    // Heuristic: if value looks like reasonable int
                                     if (val >= -1e15 && val <= 1e15) {
                                         type = 'int64';
                                     } else {
@@ -1947,10 +1952,22 @@ export class RemoteLanceFile {
                             } catch (e) {
                                 type = 'float64';
                             }
+                        } else if (bytesPerRow === 4) {
+                            // int32 or float32
+                            type = 'float32';  // Common for embeddings
+                        } else if (bytesPerRow > 8 && bytesPerRow % 4 === 0) {
+                            // Likely a vector (multiple float32 per row)
+                            type = 'vector';
+                        } else if (bytesPerRow === 2) {
+                            type = 'int16';
+                        } else if (bytesPerRow === 1) {
+                            type = 'int8';
                         }
                     }
                 }
-            } catch (e) {}
+            } catch (e) {
+                console.warn(`Failed to detect type for column ${c}:`, e);
+            }
 
             types.push(type);
         }
