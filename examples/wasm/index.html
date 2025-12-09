@@ -509,6 +509,24 @@
             opacity: 0.8;
         }
 
+        /* Find Similar Button */
+        .find-similar-btn {
+            background: rgba(139, 92, 246, 0.2);
+            border: 1px solid rgba(139, 92, 246, 0.4);
+            border-radius: 4px;
+            padding: 4px 6px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.15s ease;
+        }
+        .find-similar-btn:hover {
+            background: rgba(139, 92, 246, 0.4);
+            transform: scale(1.1);
+        }
+        .find-similar-btn:active {
+            transform: scale(0.95);
+        }
+
         /* Image Grid */
         .image-grid {
             display: grid;
@@ -2065,15 +2083,30 @@
                 return;
             }
 
+            // Check if we have vector columns for "Find Similar" feature
+            const hasVectorCol = columnTypes.some(t => t === 'vector');
+            const vectorColIdx = columnTypes.findIndex(t => t === 'vector');
+
             // Build new table
             let html = '<table class="data-table" id="results-table"><thead><tr>';
+            if (hasVectorCol && currentFile?._isRemote) {
+                html += '<th style="width: 40px;" title="Find similar rows">🔍</th>';
+            }
             for (const col of result.columns) {
                 html += `<th>${escapeHtml(col)}</th>`;
             }
             html += '</tr></thead><tbody>';
 
-            for (const row of result.rows) {
+            // Track the starting row index for this result set
+            const startRowIdx = result.startRowIdx || 0;
+
+            for (let i = 0; i < result.rows.length; i++) {
+                const row = result.rows[i];
+                const rowIdx = result.rowIndices ? result.rowIndices[i] : (startRowIdx + i);
                 html += '<tr>';
+                if (hasVectorCol && currentFile?._isRemote) {
+                    html += `<td><button class="find-similar-btn" data-row="${rowIdx}" data-col="${vectorColIdx}" title="Find similar to row ${rowIdx}">🔍</button></td>`;
+                }
                 for (const cell of row) {
                     html += `<td>${formatCell(cell)}</td>`;
                 }
@@ -2590,6 +2623,30 @@
             const hasVectorCols = vectorCol.options.length > 1;
             document.getElementById('run-vector-btn').disabled = !hasVectorCols;
         }
+
+        // Handle "Find Similar" button clicks (event delegation)
+        document.getElementById('results-body').addEventListener('click', async (e) => {
+            const btn = e.target.closest('.find-similar-btn');
+            if (!btn) return;
+
+            const rowIdx = parseInt(btn.dataset.row);
+            const colIdx = parseInt(btn.dataset.col);
+
+            if (isNaN(rowIdx) || isNaN(colIdx)) return;
+
+            // Update the vector search UI and run search
+            document.getElementById('vector-col').value = colIdx;
+            document.getElementById('query-row').value = rowIdx;
+
+            // Switch to vector search tab
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            document.querySelector('[data-tab="vector"]').classList.add('active');
+            document.getElementById('tab-vector').classList.add('active');
+
+            // Run the search
+            await runVectorSearch();
+        });
 
         // Initialize
         init();
