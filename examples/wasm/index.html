@@ -1172,13 +1172,13 @@
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
                             </svg>
-                            Text Search (CLIP)
+                            <span id="clip-search-title">Text Search (CLIP)</span>
                             <span class="badge" id="clip-status-badge">Ready</span>
                         </div>
                         <div class="clip-mode-toggle">
-                            <label class="toggle-label">
+                            <label class="toggle-label" title="Check if your lance file contains image embeddings (from CLIP image encoder). Uncheck if it contains text embeddings.">
                                 <input type="checkbox" id="clip-image-mode">
-                                <span class="toggle-text">Image embeddings</span>
+                                <span class="toggle-text">Dataset has image embeddings</span>
                             </label>
                         </div>
                     </div>
@@ -3002,19 +3002,30 @@
                 }
 
                 const modelData = await response.arrayBuffer();
-                showStatus(`Downloaded ${(modelData.byteLength / 1024 / 1024).toFixed(0)}MB, parsing model...`, 'info');
+                console.log('Model downloaded:', modelData.byteLength, 'bytes');
+                showStatus(`Downloaded ${(modelData.byteLength / 1024 / 1024).toFixed(0)}MB, allocating memory...`, 'info');
 
                 // Allocate and copy to WASM
+                console.log('Allocating WASM buffer...');
                 const bufPtr = clipWasm.clip_alloc_model_buffer(modelData.byteLength);
+                console.log('Buffer pointer:', bufPtr);
                 if (bufPtr === 0) {
                     throw new Error('Failed to allocate WASM memory');
                 }
 
+                console.log('Copying model data to WASM...');
+                showStatus('Copying model to WASM memory...', 'info');
                 const wasmMem = new Uint8Array(clipWasm.memory.buffer);
                 wasmMem.set(new Uint8Array(modelData), bufPtr);
+                console.log('Model data copied');
 
-                // Parse and load
+                // Parse and load - use setTimeout to allow UI update
                 updateClipStatus('Parsing...', 'loading');
+                showStatus('Parsing GGUF and loading weights (this may take 10-30 seconds)...', 'info');
+
+                // Allow UI to update before blocking call
+                await new Promise(r => setTimeout(r, 100));
+
                 const loadResult = clipWasm.clip_load_model(modelData.byteLength);
 
                 if (loadResult === 0) {
@@ -3041,10 +3052,13 @@
 
             const textBuf = clipWasm.clip_get_text_buffer();
             const textBytes = new TextEncoder().encode(text);
+            // Re-create memory view in case WASM memory grew
             const memory = new Uint8Array(clipWasm.memory.buffer);
             memory.set(textBytes, textBuf);
 
+            console.log('Encoding text:', text, 'length:', textBytes.length);
             const result = clipWasm.clip_encode_text(textBytes.length);
+            console.log('Encode result:', result);
             if (result !== 0) {
                 console.error('CLIP encode error:', result);
                 return null;
@@ -3069,11 +3083,12 @@
             }
 
             const topK = parseInt(document.getElementById('top-k').value) || 20;
+            const isImageMode = document.getElementById('clip-image-mode').checked;
 
             try {
                 setLoading(true);
 
-                // Auto-load model on first search
+                // Always need CLIP to encode the text query
                 if (!clipModelLoaded) {
                     const loaded = await ensureClipModelLoaded();
                     if (!loaded) {
@@ -3082,17 +3097,21 @@
                     }
                 }
 
-                showStatus(`Encoding text: "${text}"...`, 'info');
+                const modeLabel = isImageMode ? 'image' : 'text';
+                showStatus(`Encoding "${text}" with CLIP...`, 'info');
 
-                // Encode text to embedding
+                // Encode text to embedding using CLIP
                 const queryVec = encodeTextWithClip(text);
                 if (!queryVec) {
-                    showStatus('Failed to encode text', 'error');
+                    showStatus('Failed to encode text with CLIP', 'error');
                     setLoading(false);
                     return;
                 }
 
-                showStatus(`Searching with ${queryVec.length}-dim text embedding...`, 'info');
+                console.log('CLIP query embedding (first 8):', Array.from(queryVec.slice(0, 8)).map(v => v.toFixed(4)));
+                console.log('Query embedding L2 norm:', Math.sqrt(queryVec.reduce((sum, v) => sum + v*v, 0)).toFixed(4));
+                console.log('Search mode:', isImageMode ? 'text-to-image' : 'text-to-text');
+                showStatus(`Searching ${modeLabel} embeddings...`, 'info');
 
                 // Run vector search
                 const results = await currentFile.vectorSearch(
@@ -3106,21 +3125,52 @@
 
                 hideProgress();
 
-                // Get image URLs
+                // Get image URLs and any text column
                 const urlColIdx = 0;
                 const urls = await currentFile.readStringsAtIndices(urlColIdx, results.indices);
 
-                // Build results
-                const columns = ['rank', 'row_idx', 'similarity', 'image'];
-                const rows = results.indices.map((idx, i) => [
-                    (i + 1).toString(),
-                    idx.toString(),
-                    results.scores[i].toFixed(4),
-                    urls[i] || ''
-                ]);
+                // Try to find a text/caption column (usually column 1 or named 'text', 'caption')
+                let textColIdx = -1;
+                const colNames = currentFile.columnNames || [];
+                for (let i = 0; i < colNames.length; i++) {
+                    const name = colNames[i].toLowerCase();
+                    if (name === 'text' || name === 'caption' || name === 'description' || name === 'title') {
+                        textColIdx = i;
+                        break;
+                    }
+                }
+                // If no named text column, try column 1 if it exists and isn't the vector column
+                if (textColIdx === -1 && colNames.length > 2) {
+                    const vecColIdx = parseInt(document.getElementById('vector-col').value);
+                    textColIdx = (vecColIdx !== 1) ? 1 : -1;
+                }
 
+                let texts = [];
+                if (textColIdx >= 0) {
+                    texts = await currentFile.readStringsAtIndices(textColIdx, results.indices);
+                }
+
+                // Build results with both image and text
+                const columns = texts.length > 0
+                    ? ['rank', 'row_idx', 'similarity', 'image', 'text']
+                    : ['rank', 'row_idx', 'similarity', 'image'];
+                const rows = results.indices.map((idx, i) => {
+                    const row = [
+                        (i + 1).toString(),
+                        idx.toString(),
+                        results.scores[i].toFixed(4),
+                        urls[i] || ''
+                    ];
+                    if (texts.length > 0) {
+                        row.push(texts[i] || '');
+                    }
+                    return row;
+                });
+
+                console.log('Search results - top scores:', results.scores.slice(0, 5));
                 displayResults({ columns, rows, total: results.indices.length });
-                showStatus(`Found ${results.indices.length} images matching "${text}"`, 'success');
+                const resultType = isImageMode ? 'images' : 'texts';
+                showStatus(`Found ${results.indices.length} ${resultType} matching "${text}" (top score: ${results.scores[0]?.toFixed(4) || 'N/A'})`, 'success');
             } catch (err) {
                 showStatus('Text search error: ' + err.message, 'error');
                 console.error(err);
