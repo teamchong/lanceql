@@ -1803,14 +1803,19 @@
                                         row.push('');
                                     }
                                 } else {
-                                    row.push(col.data[i]?.toString() || '');
+                                    // BigInt64Array elements are BigInt, convert to Number then string
+                                    const val = col.data[i];
+                                    row.push(val !== undefined ? Number(val).toString() : '');
                                 }
                             } else if (col.type === 'float64') {
-                                row.push(col.data[i]?.toFixed(4) || '');
+                                const val = col.data[i];
+                                row.push(val !== undefined ? Number(val).toFixed(4) : '');
                             } else if (col.type === 'int32' || col.type === 'int16' || col.type === 'int8') {
-                                row.push(col.data[i]?.toString() || '');
+                                const val = col.data[i];
+                                row.push(val !== undefined ? Number(val).toString() : '');
                             } else if (col.type === 'float32') {
-                                row.push(col.data[i]?.toFixed(4) || '');
+                                const val = col.data[i];
+                                row.push(val !== undefined ? Number(val).toFixed(4) : '');
                             } else if (col.type === 'vector') {
                                 row.push(`[vector ${col.info?.dimension || '?'}d]`);
                             } else {
@@ -1847,10 +1852,11 @@
                             const type = columnTypes[c];
                             if (type === 'int64') {
                                 const data = currentFile.readInt64AtIndices(c, new Uint32Array([idx]));
-                                row.push(data[0]?.toString() || '');
+                                // BigInt64Array elements are BigInt
+                                row.push(data[0] !== undefined ? Number(data[0]).toString() : '');
                             } else if (type === 'float64') {
                                 const data = currentFile.readFloat64AtIndices(c, new Uint32Array([idx]));
-                                row.push(data[0]?.toFixed(4) || '');
+                                row.push(data[0] !== undefined ? Number(data[0]).toFixed(4) : '');
                             } else if (type === 'string') {
                                 const str = currentFile.readStringAt(c, idx);
                                 row.push(str || '');
