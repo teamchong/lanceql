@@ -438,8 +438,8 @@
             border-radius: 4px;
             background: #1e293b;
         }
-        .image-cell img.broken {
-            display: none;
+        .image-cell img.placeholder {
+            opacity: 0.6;
         }
         .image-cell .url-text {
             font-size: 11px;
@@ -1678,12 +1678,12 @@
                 return '<span class="empty-value">(empty)</span>';
             }
 
-            // Handle image URLs - show thumbnail with fallback
+            // Handle image URLs - show thumbnail with fallback placeholder
             if (isImageUrl(cell)) {
                 const escaped = escapeHtml(cell);
                 const short = escaped.length > 40 ? escaped.substring(0, 40) + '...' : escaped;
                 return `<div class="image-cell">
-                    <img src="${escaped}" alt="" loading="lazy" onerror="this.classList.add('broken')">
+                    <img src="${escaped}" alt="" loading="lazy" onerror="this.onerror=null; this.src='data:image/svg+xml,${encodeURIComponent('<svg xmlns=&quot;http://www.w3.org/2000/svg&quot; viewBox=&quot;0 0 100 60&quot;><rect fill=&quot;%23334155&quot; width=&quot;100&quot; height=&quot;60&quot;/><text x=&quot;50&quot; y=&quot;30&quot; fill=&quot;%2364748b&quot; font-size=&quot;10&quot; text-anchor=&quot;middle&quot; dominant-baseline=&quot;middle&quot; font-family=&quot;sans-serif&quot;>No Image</text></svg>')}'; this.classList.add('placeholder');">
                     <a href="${escaped}" target="_blank" class="url-text" title="${escaped}">${short}</a>
                 </div>`;
             }
