@@ -911,6 +911,25 @@
             document.getElementById('df-preview').innerHTML = code;
         }
 
+        // Set loading state for buttons
+        function setLoading(isLoading) {
+            const sqlBtn = document.getElementById('run-sql-btn');
+            const dfBtn = document.getElementById('run-df-btn');
+            const urlBtn = document.getElementById('load-url-btn');
+
+            sqlBtn.disabled = isLoading;
+            dfBtn.disabled = isLoading;
+            urlBtn.disabled = isLoading;
+
+            if (isLoading) {
+                sqlBtn.innerHTML = '<span class="spinner"></span> Loading...';
+                dfBtn.innerHTML = '<span class="spinner"></span> Loading...';
+            } else {
+                sqlBtn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg> Run Query`;
+                dfBtn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg> Execute`;
+            }
+        }
+
         // Run SQL query
         async function runSqlQuery() {
             if (!currentFile) return;
@@ -922,6 +941,7 @@
             }
 
             try {
+                setLoading(true);
                 showStatus('Executing query...', 'info');
                 // Parse simple SQL and execute
                 const result = await executeSimpleSql(sql);
@@ -930,6 +950,8 @@
             } catch (err) {
                 showStatus('Query error: ' + err.message, 'error');
                 console.error(err);
+            } finally {
+                setLoading(false);
             }
         }
 
@@ -1243,8 +1265,7 @@
         // Load from URL using HTTP Range requests (lazy loading)
         async function loadFromUrl(url) {
             showStatus('Loading metadata via Range requests...', 'info');
-            const loadBtn = document.getElementById('load-url-btn');
-            loadBtn.disabled = true;
+            setLoading(true);
 
             try {
                 // Use RemoteLanceFile for lazy loading via Range requests
@@ -1295,7 +1316,7 @@
                 showStatus('Failed to load URL: ' + err.message, 'error');
                 console.error(err);
             } finally {
-                loadBtn.disabled = false;
+                setLoading(false);
             }
         }
 
