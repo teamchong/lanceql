@@ -1360,6 +1360,13 @@ export class RemoteLanceFile {
      * @returns {Promise<ArrayBuffer>}
      */
     async fetchRange(start, end) {
+        console.log(`fetchRange: ${start}-${end} (size: ${end - start + 1}) from ${this.url.split('/').pop()}`);
+
+        // Validate range
+        if (start < 0 || end < start || end >= this.size) {
+            console.error(`Invalid range: ${start}-${end}, file size: ${this.size}`);
+        }
+
         const response = await fetch(this.url, {
             headers: {
                 'Range': `bytes=${start}-${end}`
@@ -1367,6 +1374,7 @@ export class RemoteLanceFile {
         });
 
         if (!response.ok && response.status !== 206) {
+            console.error(`Fetch failed: ${response.status} for range ${start}-${end}`);
             throw new Error(`HTTP error: ${response.status}`);
         }
 
@@ -1494,24 +1502,28 @@ export class RemoteLanceFile {
 
     /**
      * Parse column metadata to extract buffer offsets and row count.
+     * For nullable columns, there are typically 2 buffers:
+     * - Buffer 0: null bitmap
+     * - Buffer 1: actual data values
      * @private
      */
     _parseColumnMeta(bytes) {
         let pos = 0;
-        let bufferOffset = 0;
-        let bufferSize = 0;
+        const bufferOffsets = [];
+        const bufferSizes = [];
         let rows = 0;
 
+        // Read varint as BigInt to handle large values (>2GB offsets)
         const readVarint = () => {
-            let result = 0;
-            let shift = 0;
+            let result = 0n;
+            let shift = 0n;
             while (pos < bytes.length) {
                 const byte = bytes[pos++];
-                result |= (byte & 0x7F) << shift;
+                result |= BigInt(byte & 0x7F) << shift;
                 if ((byte & 0x80) === 0) break;
-                shift += 7;
+                shift += 7n;
             }
-            return result;
+            return Number(result);
         };
 
         while (pos < bytes.length) {
@@ -1531,21 +1543,19 @@ export class RemoteLanceFile {
                     const pageWire = pageTag & 0x7;
 
                     if (pageField === 1 && pageWire === 2) {
-                        // buffer_offsets (packed)
+                        // buffer_offsets (packed) - read ALL offsets
                         const packedLen = readVarint();
                         const packedEnd = pos + packedLen;
-                        if (pos < packedEnd) {
-                            bufferOffset = readVarint();
+                        while (pos < packedEnd) {
+                            bufferOffsets.push(readVarint());
                         }
-                        pos = packedEnd;
                     } else if (pageField === 2 && pageWire === 2) {
-                        // buffer_sizes (packed)
+                        // buffer_sizes (packed) - read ALL sizes
                         const packedLen = readVarint();
                         const packedEnd = pos + packedLen;
-                        if (pos < packedEnd) {
-                            bufferSize = readVarint();
+                        while (pos < packedEnd) {
+                            bufferSizes.push(readVarint());
                         }
-                        pos = packedEnd;
                     } else if (pageField === 3 && pageWire === 0) {
                         // length (rows)
                         rows = readVarint();
@@ -1573,7 +1583,23 @@ export class RemoteLanceFile {
             }
         }
 
-        return { offset: bufferOffset, size: bufferSize, rows };
+        // For nullable columns: buffer 0 = null bitmap, buffer 1 = data
+        // For non-nullable: buffer 0 = data
+        // Use the LAST buffer (data buffer) for reading values
+        const dataBufferIdx = bufferOffsets.length > 1 ? 1 : 0;
+        const nullBitmapIdx = bufferOffsets.length > 1 ? 0 : -1;
+
+        console.log(`_parseColumnMeta: ${bufferOffsets.length} buffers, offsets=${bufferOffsets}, sizes=${bufferSizes}, rows=${rows}`);
+
+        return {
+            offset: bufferOffsets[dataBufferIdx] || 0,
+            size: bufferSizes[dataBufferIdx] || 0,
+            rows,
+            nullBitmapOffset: nullBitmapIdx >= 0 ? bufferOffsets[nullBitmapIdx] : null,
+            nullBitmapSize: nullBitmapIdx >= 0 ? bufferSizes[nullBitmapIdx] : null,
+            bufferOffsets,
+            bufferSizes
+        };
     }
 
     /**
@@ -1721,6 +1747,8 @@ export class RemoteLanceFile {
         const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
         const info = this._parseColumnMeta(new Uint8Array(colMeta));
 
+        console.log(`readInt64AtIndices col ${colIdx}: offset=${info.offset}, size=${info.size}, rows=${info.rows}`);
+
         const results = new BigInt64Array(indices.length);
         const valueSize = 8;
 
@@ -1733,6 +1761,15 @@ export class RemoteLanceFile {
             const endOffset = info.offset + (batch.endIdx + 1) * valueSize - 1;
             const data = await this.fetchRange(startOffset, endOffset);
             const view = new DataView(data);
+
+            // Debug: show first few bytes
+            if (batch.startIdx === 0) {
+                const bytes = new Uint8Array(data);
+                console.log(`readInt64AtIndices col ${colIdx} first bytes:`, Array.from(bytes.slice(0, 32)));
+                // Also try reading as int32 to see
+                console.log(`  as int32[0]: ${view.getInt32(0, true)}, int32[1]: ${view.getInt32(4, true)}`);
+                console.log(`  as int64[0]: ${view.getBigInt64(0, true)}`);
+            }
 
             // Extract values from batch
             for (const item of batch.items) {
@@ -1841,6 +1878,39 @@ export class RemoteLanceFile {
             for (const item of batch.items) {
                 const localOffset = (item.idx - batch.startIdx) * valueSize;
                 results[item.origPos] = view.getFloat32(localOffset, true);
+            }
+        }));
+
+        return results;
+    }
+
+    /**
+     * Read int16 values at specific row indices via Range requests.
+     * @param {number} colIdx
+     * @param {number[]} indices
+     * @returns {Promise<Int16Array>}
+     */
+    async readInt16AtIndices(colIdx, indices) {
+        if (indices.length === 0) return new Int16Array(0);
+
+        const entry = await this.getColumnOffsetEntry(colIdx);
+        const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
+        const info = this._parseColumnMeta(new Uint8Array(colMeta));
+
+        const results = new Int16Array(indices.length);
+        const valueSize = 2;
+
+        const batches = this._batchIndices(indices, valueSize);
+
+        await Promise.all(batches.map(async (batch) => {
+            const startOffset = info.offset + batch.startIdx * valueSize;
+            const endOffset = info.offset + (batch.endIdx + 1) * valueSize - 1;
+            const data = await this.fetchRange(startOffset, endOffset);
+            const view = new DataView(data);
+
+            for (const item of batch.items) {
+                const localOffset = (item.idx - batch.startIdx) * valueSize;
+                results[item.origPos] = view.getInt16(localOffset, true);
             }
         }));
 
@@ -2101,7 +2171,7 @@ export class RemoteLanceFile {
 
     /**
      * Detect column types by sampling first row.
-     * Returns array of type strings: 'string', 'int64', 'float64', 'float32', 'vector', 'unknown'
+     * Returns array of type strings: 'string', 'int64', 'float64', 'float32', 'int32', 'int16', 'vector', 'unknown'
      * @returns {Promise<string[]>}
      */
     async detectColumnTypes() {
@@ -2112,14 +2182,76 @@ export class RemoteLanceFile {
 
         const types = [];
 
+        // First, try to use schema types if available
+        if (this._schema && this._schema.length > 0) {
+            console.log('Schema available:', this._schema);
+
+            // Build a map from schema - schema may have more fields than physical columns
+            for (let c = 0; c < this._numColumns; c++) {
+                const schemaField = this._schema[c];
+                const schemaType = schemaField?.type?.toLowerCase() || '';
+                const schemaName = schemaField?.name?.toLowerCase() || '';
+                let type = 'unknown';
+
+                console.log(`Column ${c}: name="${schemaField?.name}", schema type = "${schemaType}"`);
+
+                // Check if column name suggests it's a vector/embedding
+                const isEmbeddingName = schemaName.includes('embedding') || schemaName.includes('vector') ||
+                                        schemaName.includes('emb') || schemaName === 'vec';
+
+                // Map Lance/Arrow logical types to our types
+                if (schemaType.includes('utf8') || schemaType.includes('string') || schemaType.includes('large_utf8')) {
+                    type = 'string';
+                } else if (schemaType.includes('fixed_size_list') || schemaType.includes('vector') || isEmbeddingName) {
+                    // Vector detection - check schema type OR column name
+                    type = 'vector';
+                } else if (schemaType.includes('int64') || schemaType === 'int64') {
+                    type = 'int64';
+                } else if (schemaType.includes('int32') || schemaType === 'int32') {
+                    type = 'int32';
+                } else if (schemaType.includes('int16') || schemaType === 'int16') {
+                    type = 'int16';
+                } else if (schemaType.includes('int8') || schemaType === 'int8') {
+                    type = 'int8';
+                } else if (schemaType.includes('float64') || schemaType.includes('double')) {
+                    type = 'float64';
+                } else if (schemaType.includes('float32') || schemaType.includes('float') && !schemaType.includes('64')) {
+                    type = 'float32';
+                } else if (schemaType.includes('bool')) {
+                    type = 'bool';
+                }
+
+                types.push(type);
+            }
+
+            // If we got useful types from schema, cache and return
+            if (types.some(t => t !== 'unknown')) {
+                console.log('Detected types from schema:', types);
+                this._columnTypes = types;
+                return types;
+            }
+
+            // Otherwise fall through to detection
+            console.log('Schema types all unknown, falling back to data detection');
+            types.length = 0;
+        }
+
+        // Fall back to detection by examining data
+        console.log('Detecting column types from data...');
         for (let c = 0; c < this._numColumns; c++) {
             let type = 'unknown';
+            const colName = this.columnNames[c]?.toLowerCase() || '';
+
+            // Check if column name suggests it's a vector/embedding
+            const isEmbeddingName = colName.includes('embedding') || colName.includes('vector') ||
+                                    colName.includes('emb') || colName === 'vec';
 
             // Try string first - if we can read a valid string, it's a string column
             try {
                 const str = await this.readStringAt(c, 0);
                 // readStringAt throws for non-string columns, returns string for valid string columns
                 type = 'string';
+                console.log(`Column ${c} (${colName}): detected as string`);
                 types.push(type);
                 continue;
             } catch (e) {
@@ -2134,27 +2266,34 @@ export class RemoteLanceFile {
                     const bytes = new Uint8Array(colMeta);
                     const info = this._parseColumnMeta(bytes);
 
+                    console.log(`Column ${c} (${colName}): rows=${info.rows}, size=${info.size}, bytesPerRow=${info.size / info.rows}`);
+
                     if (info.rows > 0 && info.size > 0) {
                         const bytesPerRow = info.size / info.rows;
 
-                        if (bytesPerRow === 8) {
-                            // int64 or float64
+                        // If column name suggests embedding, treat as vector regardless of size
+                        if (isEmbeddingName && bytesPerRow >= 4) {
+                            type = 'vector';
+                        } else if (bytesPerRow === 8) {
+                            // int64 or float64 - try to distinguish
+                            type = 'int64';  // Default to int64
+                        } else if (bytesPerRow === 4) {
+                            // int32 or float32 - try reading as int32 to check
                             try {
-                                const data = await this.readInt64AtIndices(c, [0]);
+                                const data = await this.readInt32AtIndices(c, [0]);
                                 if (data.length > 0) {
                                     const val = data[0];
-                                    // Heuristic: if value looks like reasonable int
-                                    if (val >= -1e15 && val <= 1e15) {
-                                        type = 'int64';
+                                    console.log(`Column ${c} (${colName}): int32 sample value = ${val}`);
+                                    // Heuristic: small integers likely int32, weird values likely float32
+                                    if (val >= -1000000 && val <= 1000000 && Number.isInteger(val)) {
+                                        type = 'int32';
                                     } else {
-                                        type = 'float64';
+                                        type = 'float32';
                                     }
                                 }
                             } catch (e) {
-                                type = 'float64';
+                                type = 'float32';
                             }
-                        } else if (bytesPerRow === 4) {
-                            type = 'float32';
                         } else if (bytesPerRow > 8 && bytesPerRow % 4 === 0) {
                             type = 'vector';
                         } else if (bytesPerRow === 2) {
@@ -2168,6 +2307,7 @@ export class RemoteLanceFile {
                 console.warn(`Failed to detect type for column ${c}:`, e);
             }
 
+            console.log(`Column ${c} (${colName}): final type = ${type}`);
             types.push(type);
         }
 

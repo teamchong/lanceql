@@ -127,6 +127,28 @@
         .file-info.hidden {
             display: none;
         }
+        .btn-change-file {
+            margin-left: auto;
+            padding: 6px 12px;
+            background: transparent;
+            border: 1px solid #475569;
+            border-radius: 6px;
+            color: #94a3b8;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .btn-change-file:hover {
+            background: #1e293b;
+            border-color: #64748b;
+            color: #e2e8f0;
+        }
+        #file-loader-section {
+            transition: all 0.3s ease;
+        }
+        #file-loader-section.collapsed {
+            display: none;
+        }
         .file-icon {
             width: 48px;
             height: 48px;
@@ -377,7 +399,8 @@
         }
         .results-body {
             padding: 20px;
-            max-height: 500px;
+            height: calc(100vh - 200px);
+            min-height: 400px;
             overflow: auto;
         }
 
@@ -449,6 +472,41 @@
         }
         .image-cell .url-text:hover {
             color: #60a5fa;
+        }
+
+        /* Scroll loader */
+        .scroll-loader {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            padding: 20px;
+            color: #64748b;
+            font-size: 14px;
+        }
+
+        /* Vector and Hash badges */
+        .vector-badge, .hash-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 500;
+        }
+        .vector-badge {
+            background: rgba(139, 92, 246, 0.2);
+            color: #a78bfa;
+            border: 1px solid rgba(139, 92, 246, 0.3);
+        }
+        .hash-badge {
+            background: rgba(100, 116, 139, 0.2);
+            color: #94a3b8;
+            border: 1px solid rgba(100, 116, 139, 0.3);
+        }
+        .vector-badge svg, .hash-badge svg {
+            opacity: 0.8;
         }
 
         /* Image Grid */
@@ -747,15 +805,17 @@
 
         <!-- File Loader -->
         <section class="file-section">
-            <div class="drop-zone" id="drop-zone">
-                <p>Drop a .lance file here or click to select</p>
-                <p style="font-size: 12px;">Navigate into dataset_name.lance/data/ and select the data file</p>
-                <input type="file" id="file-input">
-            </div>
-            <div class="divider">or load from URL</div>
-            <div class="url-input-group">
-                <input type="text" id="url-input" placeholder="Enter Lance file URL (requires CORS headers)">
-                <button class="btn btn-primary" id="load-url-btn">Load URL</button>
+            <div id="file-loader-section">
+                <div class="drop-zone" id="drop-zone">
+                    <p>Drop a .lance file here or click to select</p>
+                    <p style="font-size: 12px;">Navigate into dataset_name.lance/data/ and select the data file</p>
+                    <input type="file" id="file-input">
+                </div>
+                <div class="divider">or load from URL</div>
+                <div class="url-input-group">
+                    <input type="text" id="url-input" placeholder="Enter Lance file URL (requires CORS headers)">
+                    <button class="btn btn-primary" id="load-url-btn">Load URL</button>
+                </div>
             </div>
             <div class="file-info hidden" id="file-info">
                 <div class="file-icon">
@@ -778,6 +838,9 @@
                         <div class="stat-label">Rows</div>
                     </div>
                 </div>
+                <button class="btn-change-file" onclick="toggleFileLoader()" title="Load a different file">
+                    Change File
+                </button>
             </div>
             <div class="column-chips" id="column-chips"></div>
             <div class="network-stats hidden" id="network-stats">
@@ -878,7 +941,7 @@
                     <div class="df-step">
                         <div class="df-step-num">2</div>
                         <div class="df-step-label">Select</div>
-                        <select id="df-select-cols" multiple style="min-width: 200px; height: 60px;">
+                        <select id="df-select-cols" multiple size="2" style="min-width: 200px;">
                         </select>
                         <span style="color: #64748b; font-size: 12px;">Cmd/Ctrl+click for multiple</span>
                     </div>
@@ -978,6 +1041,11 @@
         let totalBytesDownloaded = 0;
         let totalRequests = 0;
 
+        // Infinite scroll state
+        let infiniteScrollState = null;
+        let isLoadingMore = false;
+        const PAGE_SIZE = 50;
+
         // Default demo dataset URL - LAION 1M images dataset
         const DEFAULT_DATASET_URL = 'https://data.metal0.dev/laion-1m/images.lance/data/110101001111011111011011ded2064282ae29b42f5d744a13.lance';
         const DEFAULT_QUERY = "SELECT * FROM data LIMIT 50";
@@ -1004,6 +1072,18 @@
                 showStatus('Failed to load WASM: ' + err.message, 'error');
                 console.error(err);
             }
+        }
+
+        // Toggle file loader visibility (make global for onclick)
+        window.toggleFileLoader = function() {
+            const loader = document.getElementById('file-loader-section');
+            loader.classList.toggle('collapsed');
+            console.log('Toggled file loader, collapsed:', loader.classList.contains('collapsed'));
+        };
+
+        // Collapse file loader when file is loaded
+        function collapseFileLoader() {
+            document.getElementById('file-loader-section').classList.add('collapsed');
         }
 
         // Tab switching
@@ -1078,6 +1158,7 @@
 
             // Update UI
             document.getElementById('file-info').classList.remove('hidden');
+            collapseFileLoader();
             document.getElementById('file-name').textContent = filename;
             document.getElementById('file-size').textContent = (data.byteLength / 1024).toFixed(2) + ' KB';
             document.getElementById('col-count').textContent = currentFile.numColumns;
@@ -1386,42 +1467,86 @@
             // Show progress bar
             showProgress('Fetching column data...', 0, numCols);
 
-            // Fetch all data per column (batched Range requests)
+            // Fetch all data per column using detected types
             const columnData = [];
 
             for (let c = 0; c < numCols; c++) {
                 showProgress(`Fetching column ${c + 1}/${numCols}`, c, numCols);
 
+                const type = columnTypes[c] || 'unknown';
+                const colName = colNames[c]?.toLowerCase() || '';
                 let data = null;
 
-                // Try string first (most common for URLs)
+                console.log(`executeRemoteQuery: column ${c} (${colNames[c]}), type=${type}`);
+
                 try {
-                    data = await currentFile.readStringsAtIndices(c, indices);
-                    if (data && data.some(s => s && s.length > 0)) {
+                    if (type === 'string') {
+                        data = await currentFile.readStringsAtIndices(c, indices);
                         columnData.push({ type: 'string', data });
                         continue;
                     }
-                } catch (e) {}
 
-                // Try int64
-                try {
-                    data = await currentFile.readInt64AtIndices(c, indices);
-                    if (data && data.length > 0) {
-                        columnData.push({ type: 'int64', data });
+                    if (type === 'int64') {
+                        data = await currentFile.readInt64AtIndices(c, indices);
+                        columnData.push({ type: 'int64', data, colName });
                         continue;
                     }
-                } catch (e) {}
 
-                // Try float64
-                try {
-                    data = await currentFile.readFloat64AtIndices(c, indices);
-                    if (data && data.length > 0) {
+                    if (type === 'float64') {
+                        data = await currentFile.readFloat64AtIndices(c, indices);
                         columnData.push({ type: 'float64', data });
                         continue;
                     }
-                } catch (e) {}
 
-                columnData.push({ type: 'unknown', data: null });
+                    if (type === 'int32') {
+                        data = await currentFile.readInt32AtIndices(c, indices);
+                        columnData.push({ type: 'int32', data });
+                        continue;
+                    }
+
+                    if (type === 'float32') {
+                        data = await currentFile.readFloat32AtIndices(c, indices);
+                        columnData.push({ type: 'float32', data });
+                        continue;
+                    }
+
+                    if (type === 'int16') {
+                        data = await currentFile.readInt16AtIndices(c, indices);
+                        columnData.push({ type: 'int16', data });
+                        continue;
+                    }
+
+                    if (type === 'int8') {
+                        data = await currentFile.readUint8AtIndices(c, indices);
+                        columnData.push({ type: 'int8', data });
+                        continue;
+                    }
+
+                    if (type === 'vector') {
+                        // For vectors, just show placeholder
+                        try {
+                            const info = await currentFile.getVectorInfo(c);
+                            columnData.push({ type: 'vector', data: null, info });
+                        } catch (e) {
+                            columnData.push({ type: 'vector', data: null, info: { dimension: '?' } });
+                        }
+                        continue;
+                    }
+
+                    // Fallback for unknown: try string first
+                    try {
+                        data = await currentFile.readStringsAtIndices(c, indices);
+                        if (data && data.some(s => s && s.length > 0)) {
+                            columnData.push({ type: 'string', data });
+                            continue;
+                        }
+                    } catch (e) {}
+
+                    columnData.push({ type: 'unknown', data: null });
+                } catch (e) {
+                    console.error(`Failed to read column ${c} (${colNames[c]}) as ${type}:`, e);
+                    columnData.push({ type: 'unknown', data: null });
+                }
             }
 
             showProgress('Building results...', numCols, numCols);
@@ -1432,12 +1557,23 @@
                 const row = [];
                 for (let c = 0; c < numCols; c++) {
                     const col = columnData[c];
+                    const colName = col.colName || '';
+
                     if (col.type === 'string') {
                         row.push(col.data[i] || '');
                     } else if (col.type === 'int64') {
-                        row.push(col.data[i]?.toString() || '');
-                    } else if (col.type === 'float64') {
+                        // Check if embedding/hash column
+                        if (colName.includes('embedding') || colName.includes('hash')) {
+                            row.push('[hash]');
+                        } else {
+                            row.push(col.data[i]?.toString() || '');
+                        }
+                    } else if (col.type === 'float64' || col.type === 'float32') {
                         row.push(col.data[i]?.toFixed(4) || '');
+                    } else if (col.type === 'int32' || col.type === 'int16' || col.type === 'int8') {
+                        row.push(col.data[i]?.toString() || '');
+                    } else if (col.type === 'vector') {
+                        row.push(`[vector ${col.info?.dimension || '?'}d]`);
                     } else {
                         row.push('?');
                     }
@@ -1500,13 +1636,24 @@
                 const selectedCols = Array.from(document.getElementById('df-select-cols').selectedOptions).map(o => parseInt(o.value));
                 const limit = parseInt(document.getElementById('df-limit').value);
 
+                console.log('runDfQuery called:', {
+                    isRemote: currentFile._isRemote,
+                    numColumns: currentFile.numColumns,
+                    selectedCols,
+                    limit,
+                    columnTypes
+                });
+
                 // Get column names from schema if available
                 const colNames = currentFile?.columnNames || [];
                 const cols = selectedCols.length > 0 ? selectedCols : Array.from({length: currentFile.numColumns}, (_, i) => i);
                 const columns = cols.map(c => colNames[c] || `column_${c}`);
 
+                console.log('cols to fetch:', cols, 'columns:', columns);
+
                 // For remote files, use async methods
                 if (currentFile._isRemote) {
+                    console.log('Using remote file path');
                     const indices = Array.from({length: limit}, (_, i) => i);
                     const numCols = cols.length;
 
@@ -1522,26 +1669,67 @@
                         const type = columnTypes[c];
                         let data = null;
 
-                        if (type === 'string') {
-                            try {
+                        console.log(`Reading column ${c} (${columns[i]}): detected type = ${type}`);
+
+                        // Read based on detected type
+                        try {
+                            if (type === 'string') {
                                 data = await currentFile.readStringsAtIndices(c, indices);
                                 columnData.push({ type: 'string', data });
+                                console.log(`Column ${c}: read ${data.length} strings`);
                                 continue;
-                            } catch (e) {}
-                        }
+                            }
 
-                        if (type === 'int64') {
-                            try {
+                            if (type === 'int64') {
                                 data = await currentFile.readInt64AtIndices(c, indices);
                                 columnData.push({ type: 'int64', data });
+                                console.log(`Column ${c}: read ${data.length} int64s, sample:`, data[0]);
                                 continue;
-                            } catch (e) {}
-                        }
+                            }
 
-                        if (type === 'float64') {
-                            try {
+                            if (type === 'float64') {
                                 data = await currentFile.readFloat64AtIndices(c, indices);
                                 columnData.push({ type: 'float64', data });
+                                console.log(`Column ${c}: read ${data.length} float64s, sample:`, data[0]);
+                                continue;
+                            }
+
+                            if (type === 'int32') {
+                                data = await currentFile.readInt32AtIndices(c, indices);
+                                columnData.push({ type: 'int32', data });
+                                console.log(`Column ${c}: read ${data.length} int32s, sample:`, data[0]);
+                                continue;
+                            }
+
+                            if (type === 'float32') {
+                                data = await currentFile.readFloat32AtIndices(c, indices);
+                                columnData.push({ type: 'float32', data });
+                                console.log(`Column ${c}: read ${data.length} float32s, sample:`, data[0]);
+                                continue;
+                            }
+
+                            if (type === 'int16') {
+                                data = await currentFile.readInt16AtIndices(c, indices);
+                                columnData.push({ type: 'int16', data });
+                                console.log(`Column ${c}: read ${data.length} int16s, sample:`, data[0]);
+                                continue;
+                            }
+
+                            if (type === 'int8') {
+                                data = await currentFile.readUint8AtIndices(c, indices);
+                                columnData.push({ type: 'int8', data });
+                                console.log(`Column ${c}: read ${data.length} int8s, sample:`, data[0]);
+                                continue;
+                            }
+                        } catch (e) {
+                            console.error(`Column ${c} (${columns[i]}) read failed for type ${type}:`, e);
+                        }
+
+                        if (type === 'vector') {
+                            // For vectors, show dimension info instead of raw data
+                            try {
+                                const info = await currentFile.getVectorInfo(c);
+                                columnData.push({ type: 'vector', data: null, info });
                                 continue;
                             } catch (e) {}
                         }
@@ -1582,12 +1770,30 @@
                         const row = [];
                         for (let j = 0; j < cols.length; j++) {
                             const col = columnData[j];
+                            const colName = columns[j]?.toLowerCase() || '';
+
                             if (col.type === 'string') {
                                 row.push(col.data[i] || '');
                             } else if (col.type === 'int64') {
-                                row.push(col.data[i]?.toString() || '');
+                                // Check if this is an embedding hash column - show abbreviated
+                                if (colName.includes('embedding') || colName.includes('hash')) {
+                                    const val = col.data[i];
+                                    if (val !== undefined && val !== null) {
+                                        row.push(`[hash]`);
+                                    } else {
+                                        row.push('');
+                                    }
+                                } else {
+                                    row.push(col.data[i]?.toString() || '');
+                                }
                             } else if (col.type === 'float64') {
                                 row.push(col.data[i]?.toFixed(4) || '');
+                            } else if (col.type === 'int32' || col.type === 'int16' || col.type === 'int8') {
+                                row.push(col.data[i]?.toString() || '');
+                            } else if (col.type === 'float32') {
+                                row.push(col.data[i]?.toFixed(4) || '');
+                            } else if (col.type === 'vector') {
+                                row.push(`[vector ${col.info?.dimension || '?'}d]`);
                             } else {
                                 row.push('?');
                             }
@@ -1700,16 +1906,39 @@
                 return `<span title="${escapeHtml(cell)}">${escapeHtml(cell.substring(0, 100))}...</span>`;
             }
 
+            // Handle vector placeholders
+            if (typeof cell === 'string' && cell.startsWith('[vector ')) {
+                const match = cell.match(/\[vector (\d+)d\]/);
+                const dim = match ? match[1] : '?';
+                return `<span class="vector-badge" title="Vector embedding with ${dim} dimensions">
+                    <svg viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
+                        <circle cx="3" cy="8" r="2"/><circle cx="8" cy="8" r="2"/><circle cx="13" cy="8" r="2"/>
+                    </svg>
+                    ${dim}d
+                </span>`;
+            }
+
+            // Handle hash placeholders
+            if (cell === '[hash]') {
+                return `<span class="hash-badge" title="Hash/ID value">
+                    <svg viewBox="0 0 16 16" fill="currentColor" width="12" height="12">
+                        <path d="M5 1v3H1v2h4v4H1v2h4v3h2v-3h4v3h2v-3h3v-2h-3V6h3V4h-3V1h-2v3H7V1H5zm2 5h4v4H7V6z"/>
+                    </svg>
+                </span>`;
+            }
+
             // Default: escape and display
             return escapeHtml(String(cell));
         }
 
-        // Display results
-        function displayResults(result) {
+        // Display results with infinite scroll support
+        function displayResults(result, append = false) {
             const body = document.getElementById('results-body');
-            document.getElementById('results-count').textContent = `${result.rows.length} of ${result.total.toLocaleString()} rows`;
+            const loadedCount = append ? (infiniteScrollState?.loadedCount || 0) + result.rows.length : result.rows.length;
+            document.getElementById('results-count').textContent = `${loadedCount.toLocaleString()} of ${result.total.toLocaleString()} rows`;
 
-            if (result.rows.length === 0) {
+            if (result.rows.length === 0 && !append) {
+                infiniteScrollState = null;
                 body.innerHTML = `
                     <div class="empty-state">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -1724,8 +1953,31 @@
                 return;
             }
 
-            // Build table
-            let html = '<table class="data-table"><thead><tr>';
+            if (append) {
+                // Append rows to existing table
+                const tbody = body.querySelector('tbody');
+                if (tbody) {
+                    let html = '';
+                    for (const row of result.rows) {
+                        html += '<tr>';
+                        for (const cell of row) {
+                            html += `<td>${formatCell(cell)}</td>`;
+                        }
+                        html += '</tr>';
+                    }
+                    tbody.insertAdjacentHTML('beforeend', html);
+
+                    // Update state
+                    if (infiniteScrollState) {
+                        infiniteScrollState.loadedCount = loadedCount;
+                        infiniteScrollState.nextOffset += result.rows.length;
+                    }
+                }
+                return;
+            }
+
+            // Build new table
+            let html = '<table class="data-table" id="results-table"><thead><tr>';
             for (const col of result.columns) {
                 html += `<th>${escapeHtml(col)}</th>`;
             }
@@ -1740,7 +1992,183 @@
             }
 
             html += '</tbody></table>';
+
+            // Add loading indicator
+            html += '<div id="scroll-loader" class="scroll-loader" style="display: none;"><span class="spinner"></span> Loading more...</div>';
+
             body.innerHTML = html;
+
+            // Store state for infinite scroll
+            infiniteScrollState = {
+                columns: result.columns,
+                total: result.total,
+                loadedCount: result.rows.length,
+                nextOffset: result.rows.length
+            };
+        }
+
+        // Load more rows for infinite scroll
+        async function loadMoreRows() {
+            if (!infiniteScrollState || !currentFile || !currentFile._isRemote) return;
+            if (isLoadingMore) return;
+            if (infiniteScrollState.loadedCount >= infiniteScrollState.total) return;
+
+            isLoadingMore = true;
+            const loader = document.getElementById('scroll-loader');
+            if (loader) loader.style.display = 'flex';
+
+            try {
+                const startIdx = infiniteScrollState.nextOffset;
+                const indices = Array.from({length: PAGE_SIZE}, (_, i) => startIdx + i)
+                    .filter(i => i < infiniteScrollState.total);
+
+                if (indices.length === 0) {
+                    isLoadingMore = false;
+                    if (loader) loader.style.display = 'none';
+                    return;
+                }
+
+                const colNames = currentFile?.columnNames || [];
+                const numCols = currentFile.numColumns;
+                const columnData = [];
+
+                for (let c = 0; c < numCols; c++) {
+                    const type = columnTypes[c];
+                    let data = null;
+
+                    if (type === 'string') {
+                        try {
+                            data = await currentFile.readStringsAtIndices(c, indices);
+                            columnData.push({ type: 'string', data });
+                            continue;
+                        } catch (e) {}
+                    }
+
+                    if (type === 'int64') {
+                        try {
+                            data = await currentFile.readInt64AtIndices(c, indices);
+                            columnData.push({ type: 'int64', data });
+                            continue;
+                        } catch (e) {}
+                    }
+
+                    if (type === 'float64') {
+                        try {
+                            data = await currentFile.readFloat64AtIndices(c, indices);
+                            columnData.push({ type: 'float64', data });
+                            continue;
+                        } catch (e) {}
+                    }
+
+                    if (type === 'int32' || type === 'float32') {
+                        try {
+                            if (type === 'int32') {
+                                data = await currentFile.readInt32AtIndices(c, indices);
+                            } else {
+                                data = await currentFile.readFloat32AtIndices(c, indices);
+                            }
+                            columnData.push({ type, data });
+                            continue;
+                        } catch (e) {}
+                    }
+
+                    if (type === 'int16') {
+                        try {
+                            data = await currentFile.readInt16AtIndices(c, indices);
+                            columnData.push({ type: 'int16', data });
+                            continue;
+                        } catch (e) {}
+                    }
+
+                    if (type === 'int8') {
+                        try {
+                            data = await currentFile.readUint8AtIndices(c, indices);
+                            columnData.push({ type: 'int8', data });
+                            continue;
+                        } catch (e) {}
+                    }
+
+                    if (type === 'vector') {
+                        try {
+                            const info = await currentFile.getVectorInfo(c);
+                            columnData.push({ type: 'vector', data: null, info });
+                            continue;
+                        } catch (e) {}
+                    }
+
+                    // Fallback
+                    try {
+                        data = await currentFile.readStringsAtIndices(c, indices);
+                        if (data && data.some(s => s && s.length > 0)) {
+                            columnData.push({ type: 'string', data });
+                            continue;
+                        }
+                    } catch (e) {}
+
+                    columnData.push({ type: 'unknown', data: null });
+                }
+
+                // Build rows
+                const rows = [];
+                for (let i = 0; i < indices.length; i++) {
+                    const row = [];
+                    for (let c = 0; c < numCols; c++) {
+                        const col = columnData[c];
+                        const colName = colNames[c]?.toLowerCase() || '';
+
+                        if (col.type === 'string') {
+                            row.push(col.data[i] || '');
+                        } else if (col.type === 'int64') {
+                            if (colName.includes('embedding') || colName.includes('hash')) {
+                                row.push(col.data[i] !== undefined ? '[hash]' : '');
+                            } else {
+                                row.push(col.data[i]?.toString() || '');
+                            }
+                        } else if (col.type === 'float64') {
+                            row.push(col.data[i]?.toFixed(4) || '');
+                        } else if (col.type === 'int32' || col.type === 'int16' || col.type === 'int8') {
+                            row.push(col.data[i]?.toString() || '');
+                        } else if (col.type === 'float32') {
+                            row.push(col.data[i]?.toFixed(4) || '');
+                        } else if (col.type === 'vector') {
+                            row.push(`[vector ${col.info?.dimension || '?'}d]`);
+                        } else {
+                            row.push('?');
+                        }
+                    }
+                    rows.push(row);
+                }
+
+                displayResults({
+                    columns: infiniteScrollState.columns,
+                    rows,
+                    total: infiniteScrollState.total
+                }, true);
+
+            } catch (err) {
+                console.error('Error loading more rows:', err);
+            } finally {
+                isLoadingMore = false;
+                const loader = document.getElementById('scroll-loader');
+                if (loader) loader.style.display = 'none';
+            }
+        }
+
+        // Set up scroll listener for infinite scroll
+        function setupInfiniteScroll() {
+            const body = document.getElementById('results-body');
+            body.addEventListener('scroll', () => {
+                if (!infiniteScrollState || !currentFile?._isRemote) return;
+
+                const scrollTop = body.scrollTop;
+                const scrollHeight = body.scrollHeight;
+                const clientHeight = body.clientHeight;
+
+                // Load more when within 200px of bottom
+                if (scrollTop + clientHeight >= scrollHeight - 200) {
+                    loadMoreRows();
+                }
+            });
         }
 
         function showStatus(message, type) {
@@ -1776,8 +2204,14 @@
                 columnTypes = [];
                 rowCount = 0; // Will be determined per column
 
+                // Clear cached column types to force re-detection
+                if (remoteFile._columnTypes) {
+                    remoteFile._columnTypes = null;
+                }
+
                 // Update UI
                 document.getElementById('file-info').classList.remove('hidden');
+                collapseFileLoader();
                 document.getElementById('file-name').textContent = url.split('/').pop() || 'remote.lance';
                 document.getElementById('file-size').textContent = (remoteFile.size / 1024 / 1024).toFixed(2) + ' MB';
                 document.getElementById('col-count').textContent = remoteFile.numColumns;
@@ -1793,6 +2227,7 @@
                 showStatus('Detecting column types...', 'info');
                 try {
                     columnTypes = await remoteFile.detectColumnTypes();
+                    console.log('columnTypes array after detection:', columnTypes);
                     showColumnChips();
                 } catch (e) {
                     console.warn('Failed to detect column types:', e);
@@ -2069,6 +2504,7 @@
 
         // Initialize
         init();
+        setupInfiniteScroll();
     </script>
 </body>
 </html>
