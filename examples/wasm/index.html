@@ -2083,14 +2083,24 @@
                 return;
             }
 
-            // Check if we have vector columns for "Find Similar" feature
-            const hasVectorCol = columnTypes.some(t => t === 'vector');
-            const vectorColIdx = columnTypes.findIndex(t => t === 'vector');
+            // Find all vector columns for "Find Similar" feature
+            const vectorCols = [];
+            const colNames = currentFile?.columnNames || [];
+            columnTypes.forEach((t, idx) => {
+                if (t === 'vector') {
+                    vectorCols.push({ idx, name: colNames[idx] || `col_${idx}` });
+                }
+            });
+            const hasVectorCol = vectorCols.length > 0 && currentFile?._isRemote;
 
             // Build new table
             let html = '<table class="data-table" id="results-table"><thead><tr>';
-            if (hasVectorCol && currentFile?._isRemote) {
-                html += '<th style="width: 40px;" title="Find similar rows">🔍</th>';
+            if (hasVectorCol) {
+                // Add a header for each vector column's search button
+                for (const vc of vectorCols) {
+                    const shortName = vc.name.length > 8 ? vc.name.slice(0, 6) + '..' : vc.name;
+                    html += `<th style="width: 50px;" title="Find similar using ${vc.name}">🔍 ${shortName}</th>`;
+                }
             }
             for (const col of result.columns) {
                 html += `<th>${escapeHtml(col)}</th>`;
@@ -2104,8 +2114,11 @@
                 const row = result.rows[i];
                 const rowIdx = result.rowIndices ? result.rowIndices[i] : (startRowIdx + i);
                 html += '<tr>';
-                if (hasVectorCol && currentFile?._isRemote) {
-                    html += `<td><button class="find-similar-btn" data-row="${rowIdx}" data-col="${vectorColIdx}" title="Find similar to row ${rowIdx}">🔍</button></td>`;
+                if (hasVectorCol) {
+                    // Add a search button for each vector column
+                    for (const vc of vectorCols) {
+                        html += `<td><button class="find-similar-btn" data-row="${rowIdx}" data-col="${vc.idx}" title="Find similar using ${vc.name}">🔍</button></td>`;
+                    }
                 }
                 for (const cell of row) {
                     html += `<td>${formatCell(cell)}</td>`;
