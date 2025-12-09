@@ -4092,11 +4092,122 @@ export class SQLExecutor {
     }
 
     async evaluateWhere(whereExpr, totalRows, onProgress) {
-        // For simple conditions on a single numeric column, we can use WASM filtering
-        // For complex conditions, we need to fetch data and filter in JS
+        // Optimization: For simple conditions on a single numeric column,
+        // fetch only the filter column first, then fetch other columns only for matches
+        const simpleFilter = this._detectSimpleFilter(whereExpr);
 
+        if (simpleFilter) {
+            return await this._evaluateSimpleFilter(simpleFilter, totalRows, onProgress);
+        }
+
+        // Complex conditions: fetch all needed columns in batches
+        return await this._evaluateComplexFilter(whereExpr, totalRows, onProgress);
+    }
+
+    /**
+     * Detect if WHERE clause is a simple comparison (column op value).
+     * @private
+     */
+    _detectSimpleFilter(expr) {
+        if (expr.type !== 'binary') return null;
+        if (!['==', '!=', '<', '<=', '>', '>='].includes(expr.op)) return null;
+
+        // Check if it's (column op literal) or (literal op column)
+        let column = null;
+        let value = null;
+        let op = expr.op;
+
+        if (expr.left.type === 'column' && expr.right.type === 'literal') {
+            column = expr.left.name;
+            value = expr.right.value;
+        } else if (expr.left.type === 'literal' && expr.right.type === 'column') {
+            column = expr.right.name;
+            value = expr.left.value;
+            // Reverse the operator for (literal op column)
+            if (op === '<') op = '>';
+            else if (op === '>') op = '<';
+            else if (op === '<=') op = '>=';
+            else if (op === '>=') op = '<=';
+        }
+
+        if (!column || value === null) return null;
+
+        const colIdx = this.columnMap[column.toLowerCase()];
+        if (colIdx === undefined) return null;
+
+        const colType = this.columnTypes[colIdx];
+        if (!['int64', 'int32', 'float64', 'float32'].includes(colType)) return null;
+
+        return { column, colIdx, op, value, colType };
+    }
+
+    /**
+     * Optimized evaluation for simple column comparisons.
+     * Fetches only the filter column in large batches.
+     * @private
+     */
+    async _evaluateSimpleFilter(filter, totalRows, onProgress) {
+        const matchingIndices = [];
+        // Use larger batch size for single-column filtering
+        const batchSize = 5000;
+
+        console.log(`Using optimized simple filter: ${filter.column} ${filter.op} ${filter.value}`);
+
+        for (let batchStart = 0; batchStart < totalRows; batchStart += batchSize) {
+            if (onProgress) {
+                const pct = Math.round((batchStart / totalRows) * 100);
+                onProgress(`Filtering ${filter.column}... ${pct}%`, batchStart, totalRows);
+            }
+
+            const batchEnd = Math.min(batchStart + batchSize, totalRows);
+            const batchIndices = [];
+            for (let i = batchStart; i < batchEnd; i++) {
+                batchIndices.push(i);
+            }
+
+            // Fetch only the filter column
+            const colData = await this.readColumnData(filter.colIdx, batchIndices);
+
+            // Apply filter
+            for (let i = 0; i < batchIndices.length; i++) {
+                const val = colData[i];
+                let matches = false;
+
+                switch (filter.op) {
+                    case '==': matches = val === filter.value; break;
+                    case '!=': matches = val !== filter.value; break;
+                    case '<': matches = val < filter.value; break;
+                    case '<=': matches = val <= filter.value; break;
+                    case '>': matches = val > filter.value; break;
+                    case '>=': matches = val >= filter.value; break;
+                }
+
+                if (matches) {
+                    matchingIndices.push(batchIndices[i]);
+                }
+            }
+
+            // Early exit if we have enough results
+            if (matchingIndices.length >= 10000) {
+                console.log(`Early exit: found ${matchingIndices.length} matches`);
+                break;
+            }
+        }
+
+        return matchingIndices;
+    }
+
+    /**
+     * General evaluation for complex WHERE clauses.
+     * @private
+     */
+    async _evaluateComplexFilter(whereExpr, totalRows, onProgress) {
         const matchingIndices = [];
         const batchSize = 1000;
+
+        // Pre-compute needed columns
+        const neededCols = new Set();
+        this.collectColumnsFromExpr(whereExpr, neededCols);
 
         for (let batchStart = 0; batchStart < totalRows; batchStart += batchSize) {
             if (onProgress) {
@@ -4110,9 +4221,6 @@ export class SQLExecutor {
             }
 
             // Fetch needed column data for this batch
-            const neededCols = new Set();
-            this.collectColumnsFromExpr(whereExpr, neededCols);
-
             const batchData = {};
             for (const colName of neededCols) {
                 const colIdx = this.columnMap[colName.toLowerCase()];
