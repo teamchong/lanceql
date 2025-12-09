@@ -598,6 +598,82 @@
         .column-chip .type.int64 { background: #1e40af; color: #93c5fd; }
         .column-chip .type.float64 { background: #7c2d12; color: #fdba74; }
         .column-chip .type.unknown { background: #374151; color: #9ca3af; }
+        .column-chip .type.vector { background: #7c3aed; color: #ddd6fe; }
+
+        /* Vector Search */
+        .vector-search {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        .vector-search-input {
+            display: flex;
+            gap: 10px;
+        }
+        .vector-search-input input {
+            flex: 1;
+            padding: 12px 15px;
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            color: #e2e8f0;
+            font-size: 14px;
+        }
+        .vector-search-input input:focus {
+            outline: none;
+            border-color: #7c3aed;
+        }
+        .vector-search-input input::placeholder {
+            color: #64748b;
+        }
+        .vector-config {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .vector-config label {
+            color: #94a3b8;
+            font-size: 14px;
+        }
+        .vector-config select, .vector-config input[type="number"] {
+            padding: 8px 12px;
+            background: #0f172a;
+            border: 1px solid #334155;
+            border-radius: 6px;
+            color: #e2e8f0;
+            font-size: 14px;
+        }
+        .vector-config input[type="number"] {
+            width: 80px;
+        }
+        .search-examples {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .search-example {
+            padding: 6px 12px;
+            background: #334155;
+            border: none;
+            border-radius: 6px;
+            color: #94a3b8;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .search-example:hover {
+            background: #7c3aed;
+            color: white;
+        }
+        .vector-notice {
+            padding: 12px 15px;
+            background: rgba(124, 58, 237, 0.1);
+            border: 1px solid rgba(124, 58, 237, 0.3);
+            border-radius: 8px;
+            color: #a78bfa;
+            font-size: 13px;
+        }
     </style>
 </head>
 <body>
@@ -701,6 +777,13 @@
                     </svg>
                     DataFrame Builder
                 </button>
+                <button class="tab-btn" data-tab="vector">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="11" cy="11" r="8"/>
+                        <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                    </svg>
+                    Vector Search
+                </button>
             </div>
 
             <!-- SQL Tab -->
@@ -765,6 +848,41 @@
                             <polygon points="5,3 19,12 5,21"/>
                         </svg>
                         Execute
+                    </button>
+                </div>
+            </div>
+
+            <!-- Vector Search Tab -->
+            <div class="tab-content" id="tab-vector">
+                <div class="vector-search">
+                    <div class="vector-notice">
+                        <strong>Semantic Search:</strong> Find similar images by searching with a reference image's embedding.
+                        Select a row index to use as query, or the search will use a random sample.
+                    </div>
+                    <div class="vector-config">
+                        <label>Vector Column:</label>
+                        <select id="vector-col">
+                            <option value="">Select column...</option>
+                        </select>
+                        <label>Query Row:</label>
+                        <input type="number" id="query-row" value="0" min="0" placeholder="Row idx">
+                        <label>Top K:</label>
+                        <input type="number" id="top-k" value="20" min="1" max="100">
+                    </div>
+                    <div class="search-examples">
+                        <button class="search-example" data-row="0">Row 0</button>
+                        <button class="search-example" data-row="100">Row 100</button>
+                        <button class="search-example" data-row="1000">Row 1000</button>
+                        <button class="search-example" data-row="random">Random</button>
+                    </div>
+                </div>
+                <div class="run-section">
+                    <button class="btn btn-primary" id="run-vector-btn" disabled style="background: #7c3aed;">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="11" cy="11" r="8"/>
+                            <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                        </svg>
+                        Search Similar
                     </button>
                 </div>
             </div>
@@ -1504,6 +1622,9 @@
                     columnTypes = Array(remoteFile.numColumns).fill('unknown');
                 }
 
+                // Populate vector columns for vector search
+                await populateVectorColumns();
+
                 // Show query section
                 document.getElementById('query-section').style.display = 'block';
                 document.getElementById('run-sql-btn').disabled = false;
@@ -1646,6 +1767,120 @@
             document.getElementById(id).addEventListener('change', updateDfPreview);
             document.getElementById(id).addEventListener('input', updateDfPreview);
         });
+
+        // Vector Search
+        document.getElementById('run-vector-btn').addEventListener('click', runVectorSearch);
+
+        // Search example buttons
+        document.querySelectorAll('.search-example').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const row = btn.dataset.row;
+                if (row === 'random') {
+                    // Generate random row
+                    const totalRows = currentFile?._isRemote
+                        ? currentFile._numColumns > 0 ? 100000 : 0  // Estimate for remote
+                        : rowCount;
+                    document.getElementById('query-row').value = Math.floor(Math.random() * totalRows);
+                } else {
+                    document.getElementById('query-row').value = row;
+                }
+            });
+        });
+
+        async function runVectorSearch() {
+            if (!currentFile || !currentFile._isRemote) {
+                showStatus('Vector search requires a remote file', 'error');
+                return;
+            }
+
+            const vectorColIdx = parseInt(document.getElementById('vector-col').value);
+            const queryRowIdx = parseInt(document.getElementById('query-row').value);
+            const topK = parseInt(document.getElementById('top-k').value) || 20;
+
+            if (isNaN(vectorColIdx)) {
+                showStatus('Please select a vector column', 'error');
+                return;
+            }
+
+            try {
+                setLoading(true);
+                showStatus('Reading query vector...', 'info');
+
+                // Get query vector from the specified row
+                const queryVec = await currentFile.readVectorAt(vectorColIdx, queryRowIdx);
+
+                if (queryVec.length === 0) {
+                    showStatus('Failed to read query vector', 'error');
+                    setLoading(false);
+                    return;
+                }
+
+                showStatus(`Searching with ${queryVec.length}-dim vector from row ${queryRowIdx}...`, 'info');
+
+                // Run vector search
+                const results = await currentFile.vectorSearch(
+                    vectorColIdx,
+                    queryVec,
+                    topK,
+                    (current, total) => {
+                        showProgress(`Scanning vectors...`, current, total);
+                    }
+                );
+
+                hideProgress();
+
+                // Get the image URLs (assuming column 0 is URL)
+                const urlColIdx = 0;  // Assuming first column has URLs
+                const urls = await currentFile.readStringsAtIndices(urlColIdx, results.indices);
+
+                // Build results
+                const columns = ['rank', 'row_idx', 'similarity', 'image'];
+                const rows = results.indices.map((idx, i) => [
+                    (i + 1).toString(),
+                    idx.toString(),
+                    results.scores[i].toFixed(4),
+                    urls[i] || ''
+                ]);
+
+                // Display results
+                displayResults({
+                    columns,
+                    rows,
+                    total: results.indices.length
+                });
+
+                showStatus(`Found ${results.indices.length} similar images (query: row ${queryRowIdx})`, 'success');
+            } catch (err) {
+                showStatus('Vector search error: ' + err.message, 'error');
+                console.error(err);
+            } finally {
+                setLoading(false);
+            }
+        }
+
+        // Populate vector column select when remote file loads
+        async function populateVectorColumns() {
+            const vectorCol = document.getElementById('vector-col');
+            vectorCol.innerHTML = '<option value="">Select column...</option>';
+
+            if (!currentFile || !currentFile._isRemote) return;
+
+            // Check each column for vector data
+            for (let i = 0; i < currentFile.numColumns; i++) {
+                try {
+                    const info = await currentFile.getVectorInfo(i);
+                    if (info.dimension > 0) {
+                        vectorCol.innerHTML += `<option value="${i}">column_${i} (${info.dimension}D vectors, ${info.rows} rows)</option>`;
+                    }
+                } catch (e) {
+                    // Not a vector column
+                }
+            }
+
+            // Enable vector search button if we have vector columns
+            const hasVectorCols = vectorCol.options.length > 1;
+            document.getElementById('run-vector-btn').disabled = !hasVectorCols;
+        }
 
         // Initialize
         init();
