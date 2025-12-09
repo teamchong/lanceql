@@ -1441,61 +1441,163 @@
         }
 
         // Run DataFrame query
-        function runDfQuery() {
+        async function runDfQuery() {
             if (!currentFile) return;
 
             try {
+                setLoading(true);
+                showStatus('Executing query...', 'info');
+
                 const filterCol = document.getElementById('df-filter-col').value;
                 const filterOp = document.getElementById('df-filter-op').value;
                 const filterVal = parseFloat(document.getElementById('df-filter-value').value);
                 const selectedCols = Array.from(document.getElementById('df-select-cols').selectedOptions).map(o => parseInt(o.value));
                 const limit = parseInt(document.getElementById('df-limit').value);
 
-                let df = currentFile.df();
-
-                // Apply filter
-                if (filterCol !== '') {
-                    const colIdx = parseInt(filterCol);
-                    const type = columnTypes[colIdx] || 'int64';
-                    df = df.filter(colIdx, filterOp, filterVal, type);
-                }
-
-                // Get indices
-                df = df.limit(limit);
-                const indices = df.collectIndices();
-                const matchCount = df.count();
-
-                // Build result
+                // Get column names from schema if available
+                const colNames = currentFile?.columnNames || [];
                 const cols = selectedCols.length > 0 ? selectedCols : Array.from({length: currentFile.numColumns}, (_, i) => i);
-                const columns = cols.map(c => `column_${c}`);
-                const rows = [];
+                const columns = cols.map(c => colNames[c] || `column_${c}`);
 
-                for (let i = 0; i < indices.length; i++) {
-                    const row = [];
-                    const idx = indices[i];
-                    for (const c of cols) {
+                // For remote files, use async methods
+                if (currentFile._isRemote) {
+                    const indices = Array.from({length: limit}, (_, i) => i);
+                    const numCols = cols.length;
+
+                    // Show progress bar
+                    showProgress('Fetching column data...', 0, numCols);
+
+                    // Fetch data for selected columns
+                    const columnData = [];
+                    for (let i = 0; i < cols.length; i++) {
+                        const c = cols[i];
+                        showProgress(`Fetching column ${i + 1}/${numCols}`, i, numCols);
+
                         const type = columnTypes[c];
-                        if (type === 'int64') {
-                            const data = currentFile.readInt64AtIndices(c, new Uint32Array([idx]));
-                            row.push(data[0]?.toString() || '');
-                        } else if (type === 'float64') {
-                            const data = currentFile.readFloat64AtIndices(c, new Uint32Array([idx]));
-                            row.push(data[0]?.toFixed(4) || '');
-                        } else if (type === 'string') {
-                            const str = currentFile.readStringAt(c, idx);
-                            row.push(str || '');
-                        } else {
-                            row.push('?');
-                        }
-                    }
-                    rows.push(row);
-                }
+                        let data = null;
 
-                displayResults({ columns, rows, total: matchCount });
-                showStatus(`Query completed: ${rows.length} of ${matchCount} matching rows`, 'success');
+                        if (type === 'string') {
+                            try {
+                                data = await currentFile.readStringsAtIndices(c, indices);
+                                columnData.push({ type: 'string', data });
+                                continue;
+                            } catch (e) {}
+                        }
+
+                        if (type === 'int64') {
+                            try {
+                                data = await currentFile.readInt64AtIndices(c, indices);
+                                columnData.push({ type: 'int64', data });
+                                continue;
+                            } catch (e) {}
+                        }
+
+                        if (type === 'float64') {
+                            try {
+                                data = await currentFile.readFloat64AtIndices(c, indices);
+                                columnData.push({ type: 'float64', data });
+                                continue;
+                            } catch (e) {}
+                        }
+
+                        // Fallback: try all types
+                        try {
+                            data = await currentFile.readStringsAtIndices(c, indices);
+                            if (data && data.some(s => s && s.length > 0)) {
+                                columnData.push({ type: 'string', data });
+                                continue;
+                            }
+                        } catch (e) {}
+
+                        try {
+                            data = await currentFile.readInt64AtIndices(c, indices);
+                            if (data && data.length > 0) {
+                                columnData.push({ type: 'int64', data });
+                                continue;
+                            }
+                        } catch (e) {}
+
+                        try {
+                            data = await currentFile.readFloat64AtIndices(c, indices);
+                            if (data && data.length > 0) {
+                                columnData.push({ type: 'float64', data });
+                                continue;
+                            }
+                        } catch (e) {}
+
+                        columnData.push({ type: 'unknown', data: null });
+                    }
+
+                    hideProgress();
+
+                    // Build rows
+                    const rows = [];
+                    for (let i = 0; i < indices.length; i++) {
+                        const row = [];
+                        for (let j = 0; j < cols.length; j++) {
+                            const col = columnData[j];
+                            if (col.type === 'string') {
+                                row.push(col.data[i] || '');
+                            } else if (col.type === 'int64') {
+                                row.push(col.data[i]?.toString() || '');
+                            } else if (col.type === 'float64') {
+                                row.push(col.data[i]?.toFixed(4) || '');
+                            } else {
+                                row.push('?');
+                            }
+                        }
+                        rows.push(row);
+                    }
+
+                    const totalRows = await currentFile.getRowCount(0);
+                    displayResults({ columns, rows, total: totalRows });
+                    showStatus(`Query completed: ${rows.length} of ${totalRows} rows`, 'success');
+                } else {
+                    // Local file path
+                    let df = currentFile.df();
+
+                    // Apply filter
+                    if (filterCol !== '') {
+                        const colIdx = parseInt(filterCol);
+                        const type = columnTypes[colIdx] || 'int64';
+                        df = df.filter(colIdx, filterOp, filterVal, type);
+                    }
+
+                    // Get indices
+                    df = df.limit(limit);
+                    const indices = df.collectIndices();
+                    const matchCount = df.count();
+
+                    const rows = [];
+                    for (let i = 0; i < indices.length; i++) {
+                        const row = [];
+                        const idx = indices[i];
+                        for (const c of cols) {
+                            const type = columnTypes[c];
+                            if (type === 'int64') {
+                                const data = currentFile.readInt64AtIndices(c, new Uint32Array([idx]));
+                                row.push(data[0]?.toString() || '');
+                            } else if (type === 'float64') {
+                                const data = currentFile.readFloat64AtIndices(c, new Uint32Array([idx]));
+                                row.push(data[0]?.toFixed(4) || '');
+                            } else if (type === 'string') {
+                                const str = currentFile.readStringAt(c, idx);
+                                row.push(str || '');
+                            } else {
+                                row.push('?');
+                            }
+                        }
+                        rows.push(row);
+                    }
+
+                    displayResults({ columns, rows, total: matchCount });
+                    showStatus(`Query completed: ${rows.length} of ${matchCount} matching rows`, 'success');
+                }
             } catch (err) {
                 showStatus('Query error: ' + err.message, 'error');
                 console.error(err);
+            } finally {
+                setLoading(false);
             }
         }
 
