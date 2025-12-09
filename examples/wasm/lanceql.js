@@ -3366,7 +3366,9 @@ export class SQLExecutor {
 
         try {
             if (type === 'string') {
-                return await this.file.readStringsAtIndices(colIdx, indices);
+                const data = await this.file.readStringsAtIndices(colIdx, indices);
+                // readStringsAtIndices returns array of strings
+                return Array.isArray(data) ? data : Array.from(data);
             } else if (type === 'int64') {
                 const data = await this.file.readInt64AtIndices(colIdx, indices);
                 // Convert BigInt64Array to regular array of Numbers
