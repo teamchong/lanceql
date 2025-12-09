@@ -2872,6 +2872,11 @@ class SQLParser {
             offset = parseInt(this.expect(TokenType.NUMBER).value, 10);
         }
 
+        // Check that we've consumed all tokens
+        if (this.current().type !== TokenType.EOF) {
+            throw new Error(`Unexpected token after query: ${this.current().type} (${this.current().value}). Check your SQL syntax.`);
+        }
+
         return {
             type: 'SELECT',
             distinct,
@@ -3358,14 +3363,22 @@ export class SQLExecutor {
                 return await this.file.readStringsAtIndices(colIdx, indices);
             } else if (type === 'int64') {
                 const data = await this.file.readInt64AtIndices(colIdx, indices);
-                // Convert BigInt to Number for easier handling
-                return data.map(v => Number(v));
+                // Convert BigInt64Array to regular array of Numbers
+                const result = [];
+                for (let i = 0; i < data.length; i++) {
+                    result.push(Number(data[i]));
+                }
+                return result;
             } else if (type === 'float64') {
-                return await this.file.readFloat64AtIndices(colIdx, indices);
+                const data = await this.file.readFloat64AtIndices(colIdx, indices);
+                // Convert Float64Array to regular array
+                return Array.from(data);
             } else if (type === 'int32') {
-                return await this.file.readInt32AtIndices(colIdx, indices);
+                const data = await this.file.readInt32AtIndices(colIdx, indices);
+                return Array.from(data);
             } else if (type === 'float32') {
-                return await this.file.readFloat32AtIndices(colIdx, indices);
+                const data = await this.file.readFloat32AtIndices(colIdx, indices);
+                return Array.from(data);
             } else if (type === 'vector') {
                 // Return placeholder for vectors
                 return indices.map(() => '[vector]');
