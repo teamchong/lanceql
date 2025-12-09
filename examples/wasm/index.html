@@ -384,7 +384,8 @@
         /* Data Table */
         .data-table {
             width: 100%;
-            border-collapse: collapse;
+            border-collapse: separate;
+            border-spacing: 0;
             font-size: 14px;
         }
         .data-table th {
@@ -395,6 +396,7 @@
             font-weight: 500;
             position: sticky;
             top: 0;
+            z-index: 1;
         }
         .data-table td {
             padding: 12px;
