@@ -1476,11 +1476,15 @@
         }
 
         // Parse manifest protobuf to extract column names
-        // Manifest is a protobuf message with fields (repeated Field)
+        // Manifest file format: 4-byte length prefix + protobuf Manifest message + footer
+        // Manifest protobuf has: fields (repeated Field, field 1)
         // Field has: name (string, field 2), id (int32, field 3), logical_type (string, field 5)
         function parseManifestForColumnNames(data) {
             const names = [];
-            let pos = 0;
+            // Read 4-byte length prefix (little-endian)
+            const protoLen = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
+            const protoEnd = 4 + protoLen;
+            let pos = 4;
 
             function readVarint() {
                 let result = 0;
@@ -1507,8 +1511,8 @@
                 else if (wireType === 5) pos += 4;
             }
 
-            // Parse top-level Manifest message
-            while (pos < data.length) {
+            // Parse top-level Manifest message (within protoLen bounds)
+            while (pos < protoEnd) {
                 const tag = readVarint();
                 const fieldNum = tag >> 3;
                 const wireType = tag & 0x7;

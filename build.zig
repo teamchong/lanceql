@@ -200,4 +200,16 @@ pub fn build(b: *std.Build) void {
     const wasm_step = b.step("wasm", "Build WASM module");
     const install_wasm = b.addInstallArtifact(wasm, .{});
     wasm_step.dependOn(&install_wasm.step);
+
+    // === WASM Tests (Node.js) ===
+    // Requires: node tests/wasm_test.mjs
+    // This step builds WASM first, then runs the Node.js test suite
+    const wasm_test = b.addSystemCommand(&.{ "node", "tests/wasm_test.mjs" });
+    wasm_test.step.dependOn(&install_wasm.step);
+
+    const wasm_test_step = b.step("test-wasm", "Run WASM parser tests (requires Node.js)");
+    wasm_test_step.dependOn(&wasm_test.step);
+
+    // Add to main test step
+    test_step.dependOn(&wasm_test.step);
 }

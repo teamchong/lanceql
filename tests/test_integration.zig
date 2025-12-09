@@ -400,8 +400,8 @@ test "parse column metadata from large dataset" {
     std.debug.print("  pages: {}\n", .{col_meta.pages.len});
     std.debug.print("  row_count: {}\n", .{col_meta.rowCount()});
 
-    // Large dataset has 10000 rows
-    try std.testing.expectEqual(@as(u64, 10000), col_meta.rowCount());
+    // Large dataset has 1000 rows (regenerated fixture)
+    try std.testing.expectEqual(@as(u64, 1000), col_meta.rowCount());
 }
 
 // ============================================================================
