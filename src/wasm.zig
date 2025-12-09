@@ -91,8 +91,33 @@ fn readI64LE(data: []const u8, offset: usize) i64 {
     return std.mem.readInt(i64, data[offset..][0..8], .little);
 }
 
+fn readI32LE(data: []const u8, offset: usize) i32 {
+    if (offset + 4 > data.len) return 0;
+    return std.mem.readInt(i32, data[offset..][0..4], .little);
+}
+
+fn readI16LE(data: []const u8, offset: usize) i16 {
+    if (offset + 2 > data.len) return 0;
+    return std.mem.readInt(i16, data[offset..][0..2], .little);
+}
+
+fn readI8(data: []const u8, offset: usize) i8 {
+    if (offset >= data.len) return 0;
+    return @bitCast(data[offset]);
+}
+
+fn readU8(data: []const u8, offset: usize) u8 {
+    if (offset >= data.len) return 0;
+    return data[offset];
+}
+
 fn readF64LE(data: []const u8, offset: usize) f64 {
     const bits = readU64LE(data, offset);
+    return @bitCast(bits);
+}
+
+fn readF32LE(data: []const u8, offset: usize) f32 {
+    const bits = readU32LE(data, offset);
     return @bitCast(bits);
 }
 
@@ -594,6 +619,412 @@ export fn allocIndexBuffer(count: usize) ?[*]u32 {
 }
 
 // ============================================================================
+// Additional Numeric Type Column Reading
+// ============================================================================
+
+/// Read int32 column
+export fn readInt32Column(col_idx: u32, out_ptr: [*]i32, max_len: usize) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const count = @min(buf_size / 4, max_len);
+    for (0..count) |i| {
+        out_ptr[i] = readI32LE(data, buf_start + i * 4);
+    }
+    return count;
+}
+
+/// Read int16 column
+export fn readInt16Column(col_idx: u32, out_ptr: [*]i16, max_len: usize) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const count = @min(buf_size / 2, max_len);
+    for (0..count) |i| {
+        out_ptr[i] = readI16LE(data, buf_start + i * 2);
+    }
+    return count;
+}
+
+/// Read int8 column
+export fn readInt8Column(col_idx: u32, out_ptr: [*]i8, max_len: usize) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const count = @min(buf_size, max_len);
+    for (0..count) |i| {
+        out_ptr[i] = readI8(data, buf_start + i);
+    }
+    return count;
+}
+
+/// Read uint64 column
+export fn readUint64Column(col_idx: u32, out_ptr: [*]u64, max_len: usize) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const count = @min(buf_size / 8, max_len);
+    for (0..count) |i| {
+        out_ptr[i] = readU64LE(data, buf_start + i * 8);
+    }
+    return count;
+}
+
+/// Read uint32 column
+export fn readUint32Column(col_idx: u32, out_ptr: [*]u32, max_len: usize) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const count = @min(buf_size / 4, max_len);
+    for (0..count) |i| {
+        out_ptr[i] = readU32LE(data, buf_start + i * 4);
+    }
+    return count;
+}
+
+/// Read uint16 column
+export fn readUint16Column(col_idx: u32, out_ptr: [*]u16, max_len: usize) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const count = @min(buf_size / 2, max_len);
+    for (0..count) |i| {
+        out_ptr[i] = readU16LE(data, buf_start + i * 2);
+    }
+    return count;
+}
+
+/// Read uint8 column
+export fn readUint8Column(col_idx: u32, out_ptr: [*]u8, max_len: usize) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const count = @min(buf_size, max_len);
+    @memcpy(out_ptr[0..count], data[buf_start..][0..count]);
+    return count;
+}
+
+/// Read float32 column
+export fn readFloat32Column(col_idx: u32, out_ptr: [*]f32, max_len: usize) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const count = @min(buf_size / 4, max_len);
+    for (0..count) |i| {
+        out_ptr[i] = readF32LE(data, buf_start + i * 4);
+    }
+    return count;
+}
+
+/// Read boolean column (stored as bit-packed in Lance)
+export fn readBoolColumn(col_idx: u32, out_ptr: [*]u8, max_len: usize) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    // Boolean values are bit-packed (8 values per byte)
+    const num_bools: usize = @intCast(info.rows);
+    const count = @min(num_bools, max_len);
+
+    for (0..count) |i| {
+        const byte_idx = i / 8;
+        const bit_idx: u3 = @intCast(i % 8);
+        if (byte_idx < buf_size) {
+            const byte = data[buf_start + byte_idx];
+            out_ptr[i] = if ((byte >> bit_idx) & 1 == 1) 1 else 0;
+        } else {
+            out_ptr[i] = 0;
+        }
+    }
+    return count;
+}
+
+/// Allocate int32 buffer
+export fn allocInt32Buffer(count: usize) ?[*]i32 {
+    const ptr = wasmAlloc(count * 4) orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
+/// Allocate int16 buffer
+export fn allocInt16Buffer(count: usize) ?[*]i16 {
+    const ptr = wasmAlloc(count * 2) orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
+/// Allocate int8 buffer
+export fn allocInt8Buffer(count: usize) ?[*]i8 {
+    return @ptrCast(wasmAlloc(count));
+}
+
+/// Allocate uint64 buffer
+export fn allocUint64Buffer(count: usize) ?[*]u64 {
+    const ptr = wasmAlloc(count * 8) orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
+/// Allocate uint16 buffer
+export fn allocUint16Buffer(count: usize) ?[*]u16 {
+    const ptr = wasmAlloc(count * 2) orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
+
+/// Read int32 values at specific indices
+export fn readInt32AtIndices(
+    col_idx: u32,
+    indices: [*]const u32,
+    num_indices: usize,
+    out_ptr: [*]i32,
+) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const max_idx = buf_size / 4;
+
+    for (0..num_indices) |i| {
+        const idx = indices[i];
+        if (idx >= max_idx) {
+            out_ptr[i] = 0;
+        } else {
+            out_ptr[i] = readI32LE(data, buf_start + idx * 4);
+        }
+    }
+
+    return num_indices;
+}
+
+/// Read float32 values at specific indices
+export fn readFloat32AtIndices(
+    col_idx: u32,
+    indices: [*]const u32,
+    num_indices: usize,
+    out_ptr: [*]f32,
+) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const max_idx = buf_size / 4;
+
+    for (0..num_indices) |i| {
+        const idx = indices[i];
+        if (idx >= max_idx) {
+            out_ptr[i] = 0;
+        } else {
+            out_ptr[i] = readF32LE(data, buf_start + idx * 4);
+        }
+    }
+
+    return num_indices;
+}
+
+/// Read uint8 values at specific indices
+export fn readUint8AtIndices(
+    col_idx: u32,
+    indices: [*]const u32,
+    num_indices: usize,
+    out_ptr: [*]u8,
+) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    for (0..num_indices) |i| {
+        const idx = indices[i];
+        if (idx >= buf_size) {
+            out_ptr[i] = 0;
+        } else {
+            out_ptr[i] = data[buf_start + idx];
+        }
+    }
+
+    return num_indices;
+}
+
+/// Read bool values at specific indices
+export fn readBoolAtIndices(
+    col_idx: u32,
+    indices: [*]const u32,
+    num_indices: usize,
+    out_ptr: [*]u8,
+) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getPageBufferInfo(col_meta);
+
+    const buf_start: usize = @intCast(info.offset);
+    const buf_size: usize = @intCast(info.size);
+    if (buf_start + buf_size > data.len) return 0;
+
+    const num_bools: usize = @intCast(info.rows);
+
+    for (0..num_indices) |i| {
+        const idx = indices[i];
+        if (idx >= num_bools) {
+            out_ptr[i] = 0;
+        } else {
+            const byte_idx = idx / 8;
+            const bit_idx: u3 = @intCast(idx % 8);
+            if (byte_idx < buf_size) {
+                const byte = data[buf_start + byte_idx];
+                out_ptr[i] = if ((byte >> bit_idx) & 1 == 1) 1 else 0;
+            } else {
+                out_ptr[i] = 0;
+            }
+        }
+    }
+
+    return num_indices;
+}
+
+// ============================================================================
 // Aggregation Functions
 // ============================================================================
 
@@ -963,12 +1394,6 @@ export fn allocU32Buffer(count: usize) ?[*]u32 {
 // ============================================================================
 // Vector Column Support (Fixed-size float arrays for embeddings)
 // ============================================================================
-
-fn readF32LE(data: []const u8, offset: usize) f32 {
-    if (offset + 4 > data.len) return 0;
-    const bits = readU32LE(data, offset);
-    return @bitCast(bits);
-}
 
 /// Get vector info from column: dimension and count
 /// Vectors are stored as fixed-size arrays of float32

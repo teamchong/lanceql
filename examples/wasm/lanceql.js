@@ -215,6 +215,341 @@ export class LanceFile {
     }
 
     // ========================================================================
+    // Additional Numeric Type Column Methods
+    // ========================================================================
+
+    /**
+     * Read an int32 column as an Int32Array.
+     * @param {number} colIdx - Column index
+     * @returns {Int32Array}
+     */
+    readInt32Column(colIdx) {
+        const rowCount = Number(this.getRowCount(colIdx));
+        if (rowCount === 0) return new Int32Array(0);
+
+        const bufPtr = this.wasm.allocInt32Buffer(rowCount);
+        if (!bufPtr) throw new Error('Failed to allocate int32 buffer');
+
+        try {
+            const count = this.wasm.readInt32Column(colIdx, bufPtr, rowCount);
+            const result = new Int32Array(count);
+            const view = new Int32Array(this.memory.buffer, bufPtr, count);
+            result.set(view);
+            return result;
+        } finally {
+            this.wasm.free(bufPtr, rowCount * 4);
+        }
+    }
+
+    /**
+     * Read an int16 column as an Int16Array.
+     * @param {number} colIdx - Column index
+     * @returns {Int16Array}
+     */
+    readInt16Column(colIdx) {
+        const rowCount = Number(this.getRowCount(colIdx));
+        if (rowCount === 0) return new Int16Array(0);
+
+        const bufPtr = this.wasm.allocInt16Buffer(rowCount);
+        if (!bufPtr) throw new Error('Failed to allocate int16 buffer');
+
+        try {
+            const count = this.wasm.readInt16Column(colIdx, bufPtr, rowCount);
+            const result = new Int16Array(count);
+            const view = new Int16Array(this.memory.buffer, bufPtr, count);
+            result.set(view);
+            return result;
+        } finally {
+            this.wasm.free(bufPtr, rowCount * 2);
+        }
+    }
+
+    /**
+     * Read an int8 column as an Int8Array.
+     * @param {number} colIdx - Column index
+     * @returns {Int8Array}
+     */
+    readInt8Column(colIdx) {
+        const rowCount = Number(this.getRowCount(colIdx));
+        if (rowCount === 0) return new Int8Array(0);
+
+        const bufPtr = this.wasm.allocInt8Buffer(rowCount);
+        if (!bufPtr) throw new Error('Failed to allocate int8 buffer');
+
+        try {
+            const count = this.wasm.readInt8Column(colIdx, bufPtr, rowCount);
+            const result = new Int8Array(count);
+            const view = new Int8Array(this.memory.buffer, bufPtr, count);
+            result.set(view);
+            return result;
+        } finally {
+            this.wasm.free(bufPtr, rowCount);
+        }
+    }
+
+    /**
+     * Read a uint64 column as a BigUint64Array.
+     * @param {number} colIdx - Column index
+     * @returns {BigUint64Array}
+     */
+    readUint64Column(colIdx) {
+        const rowCount = Number(this.getRowCount(colIdx));
+        if (rowCount === 0) return new BigUint64Array(0);
+
+        const bufPtr = this.wasm.allocUint64Buffer(rowCount);
+        if (!bufPtr) throw new Error('Failed to allocate uint64 buffer');
+
+        try {
+            const count = this.wasm.readUint64Column(colIdx, bufPtr, rowCount);
+            const result = new BigUint64Array(count);
+            const view = new BigUint64Array(this.memory.buffer, bufPtr, count);
+            result.set(view);
+            return result;
+        } finally {
+            this.wasm.free(bufPtr, rowCount * 8);
+        }
+    }
+
+    /**
+     * Read a uint32 column as a Uint32Array.
+     * @param {number} colIdx - Column index
+     * @returns {Uint32Array}
+     */
+    readUint32Column(colIdx) {
+        const rowCount = Number(this.getRowCount(colIdx));
+        if (rowCount === 0) return new Uint32Array(0);
+
+        const bufPtr = this.wasm.allocIndexBuffer(rowCount);
+        if (!bufPtr) throw new Error('Failed to allocate uint32 buffer');
+
+        try {
+            const count = this.wasm.readUint32Column(colIdx, bufPtr, rowCount);
+            const result = new Uint32Array(count);
+            const view = new Uint32Array(this.memory.buffer, bufPtr, count);
+            result.set(view);
+            return result;
+        } finally {
+            this.wasm.free(bufPtr, rowCount * 4);
+        }
+    }
+
+    /**
+     * Read a uint16 column as a Uint16Array.
+     * @param {number} colIdx - Column index
+     * @returns {Uint16Array}
+     */
+    readUint16Column(colIdx) {
+        const rowCount = Number(this.getRowCount(colIdx));
+        if (rowCount === 0) return new Uint16Array(0);
+
+        const bufPtr = this.wasm.allocUint16Buffer(rowCount);
+        if (!bufPtr) throw new Error('Failed to allocate uint16 buffer');
+
+        try {
+            const count = this.wasm.readUint16Column(colIdx, bufPtr, rowCount);
+            const result = new Uint16Array(count);
+            const view = new Uint16Array(this.memory.buffer, bufPtr, count);
+            result.set(view);
+            return result;
+        } finally {
+            this.wasm.free(bufPtr, rowCount * 2);
+        }
+    }
+
+    /**
+     * Read a uint8 column as a Uint8Array.
+     * @param {number} colIdx - Column index
+     * @returns {Uint8Array}
+     */
+    readUint8Column(colIdx) {
+        const rowCount = Number(this.getRowCount(colIdx));
+        if (rowCount === 0) return new Uint8Array(0);
+
+        const bufPtr = this.wasm.allocStringBuffer(rowCount);
+        if (!bufPtr) throw new Error('Failed to allocate uint8 buffer');
+
+        try {
+            const count = this.wasm.readUint8Column(colIdx, bufPtr, rowCount);
+            const result = new Uint8Array(count);
+            const view = new Uint8Array(this.memory.buffer, bufPtr, count);
+            result.set(view);
+            return result;
+        } finally {
+            this.wasm.free(bufPtr, rowCount);
+        }
+    }
+
+    /**
+     * Read a float32 column as a Float32Array.
+     * @param {number} colIdx - Column index
+     * @returns {Float32Array}
+     */
+    readFloat32Column(colIdx) {
+        const rowCount = Number(this.getRowCount(colIdx));
+        if (rowCount === 0) return new Float32Array(0);
+
+        const bufPtr = this.wasm.allocFloat32Buffer(rowCount);
+        if (!bufPtr) throw new Error('Failed to allocate float32 buffer');
+
+        try {
+            const count = this.wasm.readFloat32Column(colIdx, bufPtr, rowCount);
+            const result = new Float32Array(count);
+            const view = new Float32Array(this.memory.buffer, bufPtr, count);
+            result.set(view);
+            return result;
+        } finally {
+            this.wasm.free(bufPtr, rowCount * 4);
+        }
+    }
+
+    /**
+     * Read a boolean column as a Uint8Array (0 or 1 values).
+     * @param {number} colIdx - Column index
+     * @returns {Uint8Array}
+     */
+    readBoolColumn(colIdx) {
+        const rowCount = Number(this.getRowCount(colIdx));
+        if (rowCount === 0) return new Uint8Array(0);
+
+        const bufPtr = this.wasm.allocStringBuffer(rowCount);
+        if (!bufPtr) throw new Error('Failed to allocate bool buffer');
+
+        try {
+            const count = this.wasm.readBoolColumn(colIdx, bufPtr, rowCount);
+            const result = new Uint8Array(count);
+            const view = new Uint8Array(this.memory.buffer, bufPtr, count);
+            result.set(view);
+            return result;
+        } finally {
+            this.wasm.free(bufPtr, rowCount);
+        }
+    }
+
+    /**
+     * Read int32 values at specific row indices.
+     * @param {number} colIdx - Column index
+     * @param {Uint32Array} indices - Row indices to read
+     * @returns {Int32Array}
+     */
+    readInt32AtIndices(colIdx, indices) {
+        if (indices.length === 0) return new Int32Array(0);
+
+        const idxPtr = this.wasm.allocIndexBuffer(indices.length);
+        if (!idxPtr) throw new Error('Failed to allocate index buffer');
+
+        const outPtr = this.wasm.allocInt32Buffer(indices.length);
+        if (!outPtr) {
+            this.wasm.free(idxPtr, indices.length * 4);
+            throw new Error('Failed to allocate output buffer');
+        }
+
+        try {
+            new Uint32Array(this.memory.buffer, idxPtr, indices.length).set(indices);
+            const count = this.wasm.readInt32AtIndices(colIdx, idxPtr, indices.length, outPtr);
+            const result = new Int32Array(count);
+            const view = new Int32Array(this.memory.buffer, outPtr, count);
+            result.set(view);
+            return result;
+        } finally {
+            this.wasm.free(idxPtr, indices.length * 4);
+            this.wasm.free(outPtr, indices.length * 4);
+        }
+    }
+
+    /**
+     * Read float32 values at specific row indices.
+     * @param {number} colIdx - Column index
+     * @param {Uint32Array} indices - Row indices to read
+     * @returns {Float32Array}
+     */
+    readFloat32AtIndices(colIdx, indices) {
+        if (indices.length === 0) return new Float32Array(0);
+
+        const idxPtr = this.wasm.allocIndexBuffer(indices.length);
+        if (!idxPtr) throw new Error('Failed to allocate index buffer');
+
+        const outPtr = this.wasm.allocFloat32Buffer(indices.length);
+        if (!outPtr) {
+            this.wasm.free(idxPtr, indices.length * 4);
+            throw new Error('Failed to allocate output buffer');
+        }
+
+        try {
+            new Uint32Array(this.memory.buffer, idxPtr, indices.length).set(indices);
+            const count = this.wasm.readFloat32AtIndices(colIdx, idxPtr, indices.length, outPtr);
+            const result = new Float32Array(count);
+            const view = new Float32Array(this.memory.buffer, outPtr, count);
+            result.set(view);
+            return result;
+        } finally {
+            this.wasm.free(idxPtr, indices.length * 4);
+            this.wasm.free(outPtr, indices.length * 4);
+        }
+    }
+
+    /**
+     * Read uint8 values at specific row indices.
+     * @param {number} colIdx - Column index
+     * @param {Uint32Array} indices - Row indices to read
+     * @returns {Uint8Array}
+     */
+    readUint8AtIndices(colIdx, indices) {
+        if (indices.length === 0) return new Uint8Array(0);
+
+        const idxPtr = this.wasm.allocIndexBuffer(indices.length);
+        if (!idxPtr) throw new Error('Failed to allocate index buffer');
+
+        const outPtr = this.wasm.allocStringBuffer(indices.length);
+        if (!outPtr) {
+            this.wasm.free(idxPtr, indices.length * 4);
+            throw new Error('Failed to allocate output buffer');
+        }
+
+        try {
+            new Uint32Array(this.memory.buffer, idxPtr, indices.length).set(indices);
+            const count = this.wasm.readUint8AtIndices(colIdx, idxPtr, indices.length, outPtr);
+            const result = new Uint8Array(count);
+            const view = new Uint8Array(this.memory.buffer, outPtr, count);
+            result.set(view);
+            return result;
+        } finally {
+            this.wasm.free(idxPtr, indices.length * 4);
+            this.wasm.free(outPtr, indices.length);
+        }
+    }
+
+    /**
+     * Read bool values at specific row indices.
+     * @param {number} colIdx - Column index
+     * @param {Uint32Array} indices - Row indices to read
+     * @returns {Uint8Array}
+     */
+    readBoolAtIndices(colIdx, indices) {
+        if (indices.length === 0) return new Uint8Array(0);
+
+        const idxPtr = this.wasm.allocIndexBuffer(indices.length);
+        if (!idxPtr) throw new Error('Failed to allocate index buffer');
+
+        const outPtr = this.wasm.allocStringBuffer(indices.length);
+        if (!outPtr) {
+            this.wasm.free(idxPtr, indices.length * 4);
+            throw new Error('Failed to allocate output buffer');
+        }
+
+        try {
+            new Uint32Array(this.memory.buffer, idxPtr, indices.length).set(indices);
+            const count = this.wasm.readBoolAtIndices(colIdx, idxPtr, indices.length, outPtr);
+            const result = new Uint8Array(count);
+            const view = new Uint8Array(this.memory.buffer, outPtr, count);
+            result.set(view);
+            return result;
+        } finally {
+            this.wasm.free(idxPtr, indices.length * 4);
+            this.wasm.free(outPtr, indices.length);
+        }
+    }
+
+    // ========================================================================
     // Query Methods
     // ========================================================================
 
@@ -1253,6 +1588,149 @@ export class RemoteLanceFile {
                 results[item.origPos] = view.getFloat64(localOffset, true);
             }
         }));
+
+        return results;
+    }
+
+    /**
+     * Read int32 values at specific row indices via Range requests.
+     * @param {number} colIdx
+     * @param {number[]} indices
+     * @returns {Promise<Int32Array>}
+     */
+    async readInt32AtIndices(colIdx, indices) {
+        if (indices.length === 0) return new Int32Array(0);
+
+        const entry = await this.getColumnOffsetEntry(colIdx);
+        const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
+        const info = this._parseColumnMeta(new Uint8Array(colMeta));
+
+        const results = new Int32Array(indices.length);
+        const valueSize = 4;
+
+        const batches = this._batchIndices(indices, valueSize);
+
+        await Promise.all(batches.map(async (batch) => {
+            const startOffset = info.offset + batch.startIdx * valueSize;
+            const endOffset = info.offset + (batch.endIdx + 1) * valueSize - 1;
+            const data = await this.fetchRange(startOffset, endOffset);
+            const view = new DataView(data);
+
+            for (const item of batch.items) {
+                const localOffset = (item.idx - batch.startIdx) * valueSize;
+                results[item.origPos] = view.getInt32(localOffset, true);
+            }
+        }));
+
+        return results;
+    }
+
+    /**
+     * Read float32 values at specific row indices via Range requests.
+     * @param {number} colIdx
+     * @param {number[]} indices
+     * @returns {Promise<Float32Array>}
+     */
+    async readFloat32AtIndices(colIdx, indices) {
+        if (indices.length === 0) return new Float32Array(0);
+
+        const entry = await this.getColumnOffsetEntry(colIdx);
+        const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
+        const info = this._parseColumnMeta(new Uint8Array(colMeta));
+
+        const results = new Float32Array(indices.length);
+        const valueSize = 4;
+
+        const batches = this._batchIndices(indices, valueSize);
+
+        await Promise.all(batches.map(async (batch) => {
+            const startOffset = info.offset + batch.startIdx * valueSize;
+            const endOffset = info.offset + (batch.endIdx + 1) * valueSize - 1;
+            const data = await this.fetchRange(startOffset, endOffset);
+            const view = new DataView(data);
+
+            for (const item of batch.items) {
+                const localOffset = (item.idx - batch.startIdx) * valueSize;
+                results[item.origPos] = view.getFloat32(localOffset, true);
+            }
+        }));
+
+        return results;
+    }
+
+    /**
+     * Read uint8 values at specific row indices via Range requests.
+     * @param {number} colIdx
+     * @param {number[]} indices
+     * @returns {Promise<Uint8Array>}
+     */
+    async readUint8AtIndices(colIdx, indices) {
+        if (indices.length === 0) return new Uint8Array(0);
+
+        const entry = await this.getColumnOffsetEntry(colIdx);
+        const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
+        const info = this._parseColumnMeta(new Uint8Array(colMeta));
+
+        const results = new Uint8Array(indices.length);
+        const valueSize = 1;
+
+        const batches = this._batchIndices(indices, valueSize);
+
+        await Promise.all(batches.map(async (batch) => {
+            const startOffset = info.offset + batch.startIdx * valueSize;
+            const endOffset = info.offset + (batch.endIdx + 1) * valueSize - 1;
+            const data = await this.fetchRange(startOffset, endOffset);
+            const bytes = new Uint8Array(data);
+
+            for (const item of batch.items) {
+                const localOffset = item.idx - batch.startIdx;
+                results[item.origPos] = bytes[localOffset];
+            }
+        }));
+
+        return results;
+    }
+
+    /**
+     * Read bool values at specific row indices via Range requests.
+     * Boolean values are bit-packed (8 values per byte).
+     * @param {number} colIdx
+     * @param {number[]} indices
+     * @returns {Promise<Uint8Array>}
+     */
+    async readBoolAtIndices(colIdx, indices) {
+        if (indices.length === 0) return new Uint8Array(0);
+
+        const entry = await this.getColumnOffsetEntry(colIdx);
+        const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
+        const info = this._parseColumnMeta(new Uint8Array(colMeta));
+
+        const results = new Uint8Array(indices.length);
+
+        // Calculate byte ranges needed for bit-packed booleans
+        const byteIndices = indices.map(i => Math.floor(i / 8));
+        const uniqueBytes = [...new Set(byteIndices)].sort((a, b) => a - b);
+
+        if (uniqueBytes.length === 0) return results;
+
+        // Fetch the byte range
+        const startByte = uniqueBytes[0];
+        const endByte = uniqueBytes[uniqueBytes.length - 1];
+        const startOffset = info.offset + startByte;
+        const endOffset = info.offset + endByte;
+        const data = await this.fetchRange(startOffset, endOffset);
+        const bytes = new Uint8Array(data);
+
+        // Extract boolean values
+        for (let i = 0; i < indices.length; i++) {
+            const idx = indices[i];
+            const byteIdx = Math.floor(idx / 8);
+            const bitIdx = idx % 8;
+            const localByteIdx = byteIdx - startByte;
+            if (localByteIdx >= 0 && localByteIdx < bytes.length) {
+                results[i] = (bytes[localByteIdx] >> bitIdx) & 1;
+            }
+        }
 
         return results;
     }
