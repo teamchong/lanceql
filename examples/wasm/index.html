@@ -1382,6 +1382,14 @@
                         if (strCount > 0) type = 'string';
                     } catch (e) {}
                 }
+                if (type === 'unknown') {
+                    try {
+                        const info = currentFile.getVectorInfo(i);
+                        if (info && info.dimension > 0) {
+                            type = 'vector';
+                        }
+                    } catch (e) {}
+                }
                 columnTypes[i] = type;
             }
 
@@ -1407,6 +1415,19 @@
             for (let i = 0; i < currentFile.numColumns; i++) {
                 filterCol.innerHTML += `<option value="${i}">column_${i} (${columnTypes[i]})</option>`;
                 selectCols.innerHTML += `<option value="${i}" selected>column_${i}</option>`;
+            }
+
+            // Populate vector column dropdown for local files
+            const vectorCol = document.getElementById('vector-col');
+            vectorCol.innerHTML = '<option value="">Select column...</option>';
+            for (let i = 0; i < currentFile.numColumns; i++) {
+                if (columnTypes[i] === 'vector') {
+                    try {
+                        const info = currentFile.getVectorInfo(i);
+                        const name = (currentFile.columnNames && currentFile.columnNames[i]) || `column_${i}`;
+                        vectorCol.innerHTML += `<option value="${i}">${name} (${info.dimension}D vectors, ${info.rows} rows)</option>`;
+                    } catch (e) {}
+                }
             }
 
             // Show results section
