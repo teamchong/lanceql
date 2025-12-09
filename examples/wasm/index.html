@@ -926,6 +926,28 @@
         .btn-clip-search:disabled {
             background: #475569 !important;
         }
+        .clip-mode-toggle {
+            display: flex;
+            align-items: center;
+        }
+        .toggle-label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+            font-size: 12px;
+            color: #94a3b8;
+        }
+        .toggle-label input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            cursor: pointer;
+        }
+        .clip-note {
+            margin-top: 10px;
+            color: #64748b;
+            font-size: 11px;
+        }
     </style>
 </head>
 <body>
@@ -1153,6 +1175,12 @@
                             Text Search (CLIP)
                             <span class="badge" id="clip-status-badge">Ready</span>
                         </div>
+                        <div class="clip-mode-toggle">
+                            <label class="toggle-label">
+                                <input type="checkbox" id="clip-image-mode">
+                                <span class="toggle-text">Image embeddings</span>
+                            </label>
+                        </div>
                     </div>
                     <div class="clip-text-input">
                         <input type="text" id="clip-text-input" placeholder="Describe what you're looking for... (e.g., 'a photo of a cat')">
@@ -1173,6 +1201,9 @@
                             </svg>
                             Search by Text
                         </button>
+                    </div>
+                    <div class="clip-note">
+                        <small>Toggle "Image embeddings" if your dataset contains CLIP image vectors (e.g., LAION). Leave unchecked for text embeddings.</small>
                     </div>
                 </div>
             </div>
