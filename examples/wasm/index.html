@@ -1355,6 +1355,9 @@
                 return;
             }
 
+            // Clear URL input when loading a local file
+            document.getElementById('url-input').value = '';
+
             if (currentFile) currentFile.close();
             currentFile = lanceql.open(data);
             columnTypes = [];
@@ -1364,32 +1367,37 @@
             rowCount = Number(debug.rows);
 
             // Detect column types
+            // Check vector FIRST since vectors can also be read as numeric arrays
+            console.log('Detecting column types for', currentFile.numColumns, 'columns');
             for (let i = 0; i < currentFile.numColumns; i++) {
                 let type = 'unknown';
+                // Check vector first - dimension > 2 indicates a real vector column
                 try {
-                    const int64Data = currentFile.readInt64Column(i);
-                    if (int64Data.length > 0) type = 'int64';
-                } catch (e) {}
-                if (type === 'unknown') {
-                    try {
-                        const float64Data = currentFile.readFloat64Column(i);
-                        if (float64Data.length > 0) type = 'float64';
-                    } catch (e) {}
-                }
+                    const info = currentFile.getVectorInfo(i);
+                    console.log('Column', i, 'vector info:', info);
+                    if (info && info.dimension > 2) {
+                        type = 'vector';
+                    }
+                } catch (e) { console.log('Column', i, 'not vector:', e.message); }
                 if (type === 'unknown') {
                     try {
                         const strCount = currentFile.getStringCount(i);
                         if (strCount > 0) type = 'string';
-                    } catch (e) {}
+                    } catch (e) { console.log('Column', i, 'not string:', e.message); }
                 }
                 if (type === 'unknown') {
                     try {
-                        const info = currentFile.getVectorInfo(i);
-                        if (info && info.dimension > 0) {
-                            type = 'vector';
-                        }
-                    } catch (e) {}
+                        const int64Data = currentFile.readInt64Column(i);
+                        if (int64Data.length > 0) type = 'int64';
+                    } catch (e) { console.log('Column', i, 'not int64:', e.message); }
                 }
+                if (type === 'unknown') {
+                    try {
+                        const float64Data = currentFile.readFloat64Column(i);
+                        if (float64Data.length > 0) type = 'float64';
+                    } catch (e) { console.log('Column', i, 'not float64:', e.message); }
+                }
+                console.log('Column', i, 'detected as:', type);
                 columnTypes[i] = type;
             }
 
@@ -1438,6 +1446,14 @@
 
             // Show initial aggregations
             showAggregations();
+
+            // Auto-select first vector column if available
+            if (vectorCol.options.length > 1) {
+                vectorCol.selectedIndex = 1;
+            }
+
+            // Run initial query to show sample data
+            runDfQuery();
         }
 
         function showAggregations() {
@@ -1493,10 +1509,12 @@
         }
 
         function formatNumber(n) {
-            if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(1) + 'B';
-            if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + 'M';
-            if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + 'K';
-            return n.toLocaleString();
+            // Convert BigInt to Number if needed
+            const num = typeof n === 'bigint' ? Number(n) : n;
+            if (Math.abs(num) >= 1e9) return (num / 1e9).toFixed(1) + 'B';
+            if (Math.abs(num) >= 1e6) return (num / 1e6).toFixed(1) + 'M';
+            if (Math.abs(num) >= 1e3) return (num / 1e3).toFixed(1) + 'K';
+            return num.toLocaleString();
         }
 
         function formatBytes(bytes) {
@@ -2172,8 +2190,17 @@
                                 const data = currentFile.readFloat64AtIndices(c, new Uint32Array([idx]));
                                 row.push(data[0] !== undefined ? Number(data[0]).toFixed(4) : '');
                             } else if (type === 'string') {
-                                const str = currentFile.readStringAt(c, idx);
-                                row.push(str || '');
+                                try {
+                                    const str = currentFile.readStringAt(c, idx);
+                                    console.log(`String col ${c} row ${idx}:`, str);
+                                    row.push(str || '');
+                                } catch (e) {
+                                    console.error(`String read failed col ${c} row ${idx}:`, e);
+                                    row.push('');
+                                }
+                            } else if (type === 'vector') {
+                                const info = currentFile.getVectorInfo(c);
+                                row.push(`[vector ${info?.dimension || '?'}d]`);
                             } else {
                                 row.push('?');
                             }

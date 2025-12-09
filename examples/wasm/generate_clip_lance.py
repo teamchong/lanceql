@@ -56,12 +56,17 @@ def main():
             emb = emb[0].numpy().astype(np.float32)
         embeddings.append(emb)
 
-    # Create PyArrow table
+    # Create PyArrow table with FixedSizeList for embeddings
     print("Creating Lance file...")
+
+    # Use FixedSizeList for vector embeddings (512-dim)
+    embedding_type = pa.list_(pa.float32(), 512)
+    embedding_array = pa.array([emb.tolist() for emb in embeddings], type=embedding_type)
+
     table = pa.table({
-        'url': urls,
-        'text': texts,
-        'embedding': [emb.tolist() for emb in embeddings],
+        'url': pa.array(urls, type=pa.utf8()),
+        'text': pa.array(texts, type=pa.utf8()),
+        'embedding': embedding_array,
     })
 
     # Write to Lance format
