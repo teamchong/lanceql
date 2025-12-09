@@ -1198,6 +1198,15 @@ export class RemoteLanceFile {
         // Try to load IVF index for ANN search
         await file._tryLoadIndex();
 
+        // Log summary
+        console.log('=== Remote Lance File Loaded ===');
+        console.log(`  URL: ${url}`);
+        console.log(`  File size: ${(fileSize / 1024 / 1024).toFixed(2)} MB`);
+        console.log(`  Columns: ${file._numColumns}`);
+        console.log(`  Schema: ${file._schema ? 'loaded' : 'not available'}`);
+        console.log(`  IVF Index: ${file.hasIndex() ? `loaded (${file._ivfIndex.numPartitions} partitions)` : 'not available'}`);
+        console.log('================================');
+
         return file;
     }
 

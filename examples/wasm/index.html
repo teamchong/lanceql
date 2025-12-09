@@ -2680,7 +2680,9 @@
                     return;
                 }
 
-                showStatus(`Searching with ${queryVec.length}-dim vector from row ${queryRowIdx}...`, 'info');
+                const hasIndex = currentFile.hasIndex?.() || false;
+                const searchMode = hasIndex ? 'ANN (IVF index)' : 'brute-force';
+                showStatus(`Searching with ${queryVec.length}-dim vector from row ${queryRowIdx} [${searchMode}]...`, 'info');
 
                 // Run vector search
                 const results = await currentFile.vectorSearch(
