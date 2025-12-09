@@ -509,10 +509,95 @@
             border-top-color: currentColor;
             border-radius: 50%;
             animation: spin 0.8s linear infinite;
+            display: inline-block;
         }
         @keyframes spin {
             to { transform: rotate(360deg); }
         }
+
+        /* Progress bar */
+        .progress-container {
+            margin-top: 15px;
+            display: none;
+        }
+        .progress-container.show {
+            display: block;
+        }
+        .progress-bar {
+            height: 6px;
+            background: #334155;
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+            border-radius: 3px;
+            transition: width 0.3s ease;
+            width: 0%;
+        }
+        .progress-text {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 8px;
+            font-size: 12px;
+            color: #64748b;
+        }
+
+        /* Network stats */
+        .network-stats {
+            display: flex;
+            gap: 20px;
+            padding: 10px 15px;
+            background: #0f172a;
+            border-radius: 8px;
+            margin-top: 10px;
+            font-size: 12px;
+        }
+        .network-stats.hidden {
+            display: none;
+        }
+        .network-stat {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            color: #94a3b8;
+        }
+        .network-stat svg {
+            width: 14px;
+            height: 14px;
+        }
+        .network-stat strong {
+            color: #3b82f6;
+        }
+
+        /* Column info chips */
+        .column-chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-top: 10px;
+        }
+        .column-chip {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            background: #334155;
+            border-radius: 12px;
+            font-size: 11px;
+            color: #94a3b8;
+        }
+        .column-chip .type {
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-size: 10px;
+            font-weight: 500;
+        }
+        .column-chip .type.string { background: #065f46; color: #6ee7b7; }
+        .column-chip .type.int64 { background: #1e40af; color: #93c5fd; }
+        .column-chip .type.float64 { background: #7c2d12; color: #fdba74; }
+        .column-chip .type.unknown { background: #374151; color: #9ca3af; }
     </style>
 </head>
 <body>
@@ -568,6 +653,33 @@
                     </div>
                 </div>
             </div>
+            <div class="column-chips" id="column-chips"></div>
+            <div class="network-stats hidden" id="network-stats">
+                <div class="network-stat">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                        <polyline points="7 10 12 15 17 10"/>
+                        <line x1="12" y1="15" x2="12" y2="3"/>
+                    </svg>
+                    <span>Downloaded: <strong id="bytes-downloaded">0 KB</strong></span>
+                </div>
+                <div class="network-stat">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10"/>
+                        <polyline points="12 6 12 12 16 14"/>
+                    </svg>
+                    <span>Requests: <strong id="request-count">0</strong></span>
+                </div>
+            </div>
+            <div class="progress-container" id="progress-container">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progress-fill"></div>
+                </div>
+                <div class="progress-text">
+                    <span id="progress-label">Loading...</span>
+                    <span id="progress-percent">0%</span>
+                </div>
+            </div>
         </section>
 
         <!-- Query Interface -->
@@ -596,10 +708,9 @@
                 <div class="sql-editor">
                     <textarea class="sql-textarea" id="sql-input" placeholder="SELECT * FROM data WHERE column_0 > 100 LIMIT 50">SELECT * FROM data LIMIT 100</textarea>
                     <div class="sql-examples">
-                        <button class="sql-example" data-sql="SELECT * FROM data LIMIT 100">All rows (limit 100)</button>
-                        <button class="sql-example" data-sql="SELECT * FROM data WHERE column_0 > 50">Filter column_0 > 50</button>
-                        <button class="sql-example" data-sql="SELECT COUNT(*), SUM(column_0), AVG(column_0) FROM data">Aggregations</button>
-                        <button class="sql-example" data-sql="SELECT * FROM data ORDER BY column_0 DESC LIMIT 20">Top 20 by column_0</button>
+                        <button class="sql-example" data-sql="SELECT * FROM data LIMIT 50">First 50 rows</button>
+                        <button class="sql-example" id="random-sample-btn">Random 20 rows</button>
+                        <button class="sql-example" data-sql="SELECT * FROM data LIMIT 100">First 100 rows</button>
                     </div>
                 </div>
                 <div class="run-section">
@@ -696,6 +807,8 @@
         let currentFile = null;
         let columnTypes = [];
         let rowCount = 0;
+        let totalBytesDownloaded = 0;
+        let totalRequests = 0;
 
         // Default demo dataset URL - LAION 1M images dataset
         const DEFAULT_DATASET_URL = 'https://data.metal0.dev/laion-1m/images.lance/data/110101001111011111011011ded2064282ae29b42f5d744a13.lance';
@@ -887,6 +1000,64 @@
             return n.toLocaleString();
         }
 
+        function formatBytes(bytes) {
+            if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(2) + ' MB';
+            if (bytes >= 1024) return (bytes / 1024).toFixed(2) + ' KB';
+            return bytes + ' B';
+        }
+
+        // Progress bar functions
+        function showProgress(label, current, total) {
+            const container = document.getElementById('progress-container');
+            const fill = document.getElementById('progress-fill');
+            const labelEl = document.getElementById('progress-label');
+            const percentEl = document.getElementById('progress-percent');
+
+            container.classList.add('show');
+            const percent = Math.round((current / total) * 100);
+            fill.style.width = percent + '%';
+            labelEl.textContent = label;
+            percentEl.textContent = percent + '%';
+        }
+
+        function hideProgress() {
+            document.getElementById('progress-container').classList.remove('show');
+        }
+
+        // Network stats functions
+        function updateNetworkStats(bytes, requests) {
+            totalBytesDownloaded += bytes;
+            totalRequests += requests;
+
+            const statsEl = document.getElementById('network-stats');
+            statsEl.classList.remove('hidden');
+            document.getElementById('bytes-downloaded').textContent = formatBytes(totalBytesDownloaded);
+            document.getElementById('request-count').textContent = totalRequests;
+        }
+
+        function resetNetworkStats() {
+            totalBytesDownloaded = 0;
+            totalRequests = 0;
+            document.getElementById('bytes-downloaded').textContent = '0 KB';
+            document.getElementById('request-count').textContent = '0';
+        }
+
+        // Column chips display
+        function showColumnChips() {
+            const container = document.getElementById('column-chips');
+            container.innerHTML = '';
+
+            for (let i = 0; i < columnTypes.length; i++) {
+                const type = columnTypes[i] || 'unknown';
+                container.innerHTML += `
+                    <div class="column-chip">
+                        col_${i}
+                        <span class="type ${type}">${type}</span>
+                    </div>
+                `;
+            }
+        }
+
         function updateDfPreview() {
             const filterCol = document.getElementById('df-filter-col').value;
             const filterOp = document.getElementById('df-filter-op').value;
@@ -1027,22 +1198,27 @@
         }
 
         // Execute query for remote files via Range requests
-        async function executeRemoteQuery(limit) {
+        async function executeRemoteQuery(limit, randomIndices = null) {
             const columns = [];
             for (let i = 0; i < currentFile.numColumns; i++) {
                 columns.push(`column_${i}`);
             }
 
             const rows = [];
-            const indices = Array.from({length: limit}, (_, i) => i);
+            const indices = randomIndices || Array.from({length: limit}, (_, i) => i);
+            const actualLimit = indices.length;
 
-            // Fetch data for each row (in parallel for efficiency)
-            for (let i = 0; i < limit; i++) {
+            // Show progress bar
+            showProgress('Fetching rows...', 0, actualLimit);
+
+            // Fetch data for each row
+            for (let i = 0; i < actualLimit; i++) {
+                const rowIdx = indices[i];
                 const row = [];
                 for (let c = 0; c < currentFile.numColumns; c++) {
                     try {
                         // Try string first (most likely for image URLs)
-                        const str = await currentFile.readStringAt(c, i);
+                        const str = await currentFile.readStringAt(c, rowIdx);
                         if (str) {
                             row.push(str);
                             continue;
@@ -1051,7 +1227,7 @@
 
                     try {
                         // Try int64
-                        const data = await currentFile.readInt64AtIndices(c, [i]);
+                        const data = await currentFile.readInt64AtIndices(c, [rowIdx]);
                         if (data.length > 0) {
                             row.push(data[0].toString());
                             continue;
@@ -1060,7 +1236,7 @@
 
                     try {
                         // Try float64
-                        const data = await currentFile.readFloat64AtIndices(c, [i]);
+                        const data = await currentFile.readFloat64AtIndices(c, [rowIdx]);
                         if (data.length > 0) {
                             row.push(data[0].toFixed(4));
                             continue;
@@ -1071,11 +1247,11 @@
                 }
                 rows.push(row);
 
-                // Update status periodically
-                if (i % 10 === 0) {
-                    showStatus(`Loading row ${i + 1}/${limit}...`, 'info');
-                }
+                // Update progress
+                showProgress(`Fetching row ${i + 1}/${actualLimit}`, i + 1, actualLimit);
             }
+
+            hideProgress();
 
             // Get total row count from first column
             const totalRows = await currentFile.getRowCount(0);
@@ -1277,6 +1453,11 @@
                 currentFile._isRemote = true;
                 currentFile._url = url;
 
+                // Set up network stats callback
+                currentFile.onFetch((bytes, requests) => {
+                    updateNetworkStats(bytes, requests);
+                });
+
                 columnTypes = [];
                 rowCount = 0; // Will be determined per column
 
@@ -1286,6 +1467,12 @@
                 document.getElementById('file-size').textContent = (remoteFile.size / 1024 / 1024).toFixed(2) + ' MB';
                 document.getElementById('col-count').textContent = remoteFile.numColumns;
                 document.getElementById('row-count').textContent = 'Lazy';
+
+                // Reset network stats for new file
+                resetNetworkStats();
+
+                // Show network stats
+                document.getElementById('network-stats').classList.remove('hidden');
 
                 // Show query section
                 document.getElementById('query-section').style.display = 'block';
@@ -1354,6 +1541,74 @@
 
         document.getElementById('run-sql-btn').addEventListener('click', runSqlQuery);
         document.getElementById('run-df-btn').addEventListener('click', runDfQuery);
+
+        // Random sample button
+        document.getElementById('random-sample-btn').addEventListener('click', async () => {
+            if (!currentFile) return;
+
+            try {
+                setLoading(true);
+                showStatus('Generating random sample...', 'info');
+
+                // Get total row count
+                const totalRows = currentFile._isRemote
+                    ? await currentFile.getRowCount(0)
+                    : rowCount;
+
+                // Generate 20 random indices
+                const sampleSize = 20;
+                const randomIndices = [];
+                const seen = new Set();
+                while (randomIndices.length < sampleSize && randomIndices.length < totalRows) {
+                    const idx = Math.floor(Math.random() * totalRows);
+                    if (!seen.has(idx)) {
+                        seen.add(idx);
+                        randomIndices.push(idx);
+                    }
+                }
+                randomIndices.sort((a, b) => a - b);
+
+                let result;
+                if (currentFile._isRemote) {
+                    result = await executeRemoteQuery(sampleSize, randomIndices);
+                } else {
+                    // For local files, read at random indices
+                    const columns = [];
+                    for (let i = 0; i < currentFile.numColumns; i++) {
+                        columns.push(`column_${i}`);
+                    }
+                    const rows = [];
+                    for (const idx of randomIndices) {
+                        const row = [];
+                        for (let c = 0; c < currentFile.numColumns; c++) {
+                            const type = columnTypes[c];
+                            if (type === 'int64') {
+                                const data = currentFile.readInt64AtIndices(c, new Uint32Array([idx]));
+                                row.push(data[0]?.toString() || '');
+                            } else if (type === 'float64') {
+                                const data = currentFile.readFloat64AtIndices(c, new Uint32Array([idx]));
+                                row.push(data[0]?.toFixed(4) || '');
+                            } else if (type === 'string') {
+                                const str = currentFile.readStringAt(c, idx);
+                                row.push(str || '');
+                            } else {
+                                row.push('?');
+                            }
+                        }
+                        rows.push(row);
+                    }
+                    result = { columns, rows, total: totalRows };
+                }
+
+                displayResults(result);
+                showStatus(`Random sample: ${result.rows.length} rows`, 'success');
+            } catch (err) {
+                showStatus('Error: ' + err.message, 'error');
+                console.error(err);
+            } finally {
+                setLoading(false);
+            }
+        });
 
         // DataFrame preview updates
         ['df-filter-col', 'df-filter-op', 'df-filter-value', 'df-select-cols', 'df-limit'].forEach(id => {

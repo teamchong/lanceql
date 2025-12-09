@@ -760,7 +760,22 @@ export class RemoteLanceFile {
             throw new Error(`HTTP error: ${response.status}`);
         }
 
-        return await response.arrayBuffer();
+        const data = await response.arrayBuffer();
+
+        // Track stats if callback available
+        if (this._onFetch) {
+            this._onFetch(data.byteLength, 1);
+        }
+
+        return data;
+    }
+
+    /**
+     * Set callback for network stats tracking.
+     * @param {function} callback - Function(bytesDownloaded, requestCount)
+     */
+    onFetch(callback) {
+        this._onFetch = callback;
     }
 
     /**
