@@ -1630,52 +1630,32 @@
                 return;
             }
 
-            // Check if any column contains image URLs
-            const hasImages = result.rows.some(row => row.some(cell => isImageUrl(cell)));
+            // Build table with optional image rendering
+            let html = '<table class="data-table"><thead><tr>';
+            for (const col of result.columns) {
+                html += `<th>${col}</th>`;
+            }
+            html += '</tr></thead><tbody>';
 
-            if (hasImages) {
-                // Display as image grid
-                let html = '<div class="image-grid">';
-                for (const row of result.rows) {
-                    for (const cell of row) {
-                        if (isImageUrl(cell)) {
-                            html += `
-                                <div class="image-card">
-                                    <img src="${cell}" alt="Image" loading="lazy" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><rect fill=%22%23334155%22 width=%22100%22 height=%22100%22/><text x=%2250%22 y=%2250%22 fill=%22%2394a3b8%22 text-anchor=%22middle%22 dominant-baseline=%22middle%22>No Image</text></svg>'">
-                                    <div class="image-card-info">
-                                        <p>${cell.substring(cell.lastIndexOf('/') + 1).substring(0, 30)}...</p>
-                                    </div>
-                                </div>
-                            `;
-                            break; // Only show first image per row
-                        }
-                    }
-                }
-                html += '</div>';
-                body.innerHTML = html;
-            } else {
-                // Build table
-                let html = '<table class="data-table"><thead><tr>';
-                for (const col of result.columns) {
-                    html += `<th>${col}</th>`;
-                }
-                html += '</tr></thead><tbody>';
-
-                for (const row of result.rows) {
-                    html += '<tr>';
-                    for (const cell of row) {
+            for (const row of result.rows) {
+                html += '<tr>';
+                for (const cell of row) {
+                    if (isImageUrl(cell)) {
+                        // Render image URLs as thumbnails
+                        html += `<td><img src="${cell}" alt="Image" loading="lazy" style="max-width: 100px; max-height: 60px; object-fit: cover; border-radius: 4px;" onerror="this.style.display='none'; this.nextSibling.style.display='inline'"><span style="display:none">${cell.substring(0, 50)}...</span></td>`;
+                    } else {
                         // Truncate long strings
                         const displayCell = typeof cell === 'string' && cell.length > 100
                             ? cell.substring(0, 100) + '...'
                             : cell;
                         html += `<td>${displayCell}</td>`;
                     }
-                    html += '</tr>';
                 }
-
-                html += '</tbody></table>';
-                body.innerHTML = html;
+                html += '</tr>';
             }
+
+            html += '</tbody></table>';
+            body.innerHTML = html;
         }
 
         function showStatus(message, type) {

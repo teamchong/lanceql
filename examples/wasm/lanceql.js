@@ -1552,7 +1552,10 @@ export class RemoteLanceFile {
                     } else {
                         // Skip field
                         if (pageWire === 0) readVarint();
-                        else if (pageWire === 2) pos += readVarint();
+                        else if (pageWire === 2) {
+                            const skipLen = readVarint();
+                            pos += skipLen;
+                        }
                         else if (pageWire === 5) pos += 4;
                         else if (pageWire === 1) pos += 8;
                     }
@@ -1561,7 +1564,10 @@ export class RemoteLanceFile {
             } else {
                 // Skip field
                 if (wireType === 0) readVarint();
-                else if (wireType === 2) pos += readVarint();
+                else if (wireType === 2) {
+                    const skipLen = readVarint();
+                    pos += skipLen;
+                }
                 else if (wireType === 5) pos += 4;
                 else if (wireType === 1) pos += 8;
             }
