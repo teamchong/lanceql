@@ -2523,25 +2523,40 @@ export class RemoteLanceFile {
         const partitions = this._ivfIndex.findNearestPartitions(queryVec, nprobe);
         console.log(`Searching ${partitions.length} partitions:`, partitions);
 
-        // For now, we don't have partition offsets, so fall back to sampling
-        // In a full implementation, we'd fetch only the vectors in these partitions
-        // This is a simplified version that demonstrates the concept
-
         const entry = await this.getColumnOffsetEntry(colIdx);
         const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
         const metaInfo = this._parseColumnMeta(new Uint8Array(colMeta));
         const numRows = metaInfo.rows;
 
-        // Without partition offsets, we estimate which rows belong to each partition
-        // by dividing the dataset evenly (this is an approximation)
-        const rowsPerPartition = Math.ceil(numRows / this._ivfIndex.numPartitions);
+        // Determine which row indices to search based on partition info
         const indicesToSearch = [];
+        const hasPartitionInfo = this._ivfIndex.partitionLengths.length === this._ivfIndex.numPartitions;
 
-        for (const p of partitions) {
-            const startRow = p * rowsPerPartition;
-            const endRow = Math.min((p + 1) * rowsPerPartition, numRows);
-            for (let r = startRow; r < endRow; r++) {
-                indicesToSearch.push(r);
+        if (hasPartitionInfo) {
+            // Use actual partition boundaries from index
+            console.log('Using partition lengths from index');
+            let currentRow = 0;
+            for (let p = 0; p < this._ivfIndex.numPartitions; p++) {
+                const partitionLen = this._ivfIndex.partitionLengths[p];
+                if (partitions.includes(p)) {
+                    // Include all rows in this partition
+                    for (let r = 0; r < partitionLen; r++) {
+                        indicesToSearch.push(currentRow + r);
+                    }
+                }
+                currentRow += partitionLen;
+            }
+        } else {
+            // Fallback: estimate partition boundaries by dividing evenly
+            console.log('Estimating partition boundaries (no partition lengths in index)');
+            const rowsPerPartition = Math.ceil(numRows / this._ivfIndex.numPartitions);
+
+            for (const p of partitions) {
+                const startRow = p * rowsPerPartition;
+                const endRow = Math.min((p + 1) * rowsPerPartition, numRows);
+                for (let r = startRow; r < endRow; r++) {
+                    indicesToSearch.push(r);
+                }
             }
         }
 
@@ -2864,18 +2879,113 @@ export class IVFIndex {
 
     /**
      * Parse IVF index file.
+     * Index file contains VectorIndex protobuf with IVF stage.
+     * IVF message structure:
+     *   field 1: repeated float centroids (deprecated)
+     *   field 2: repeated uint64 offsets - byte offset of each partition
+     *   field 3: repeated uint32 lengths - number of records per partition
+     *   field 4: Tensor centroids_tensor - centroids as tensor
+     *   field 5: optional double loss
      * @private
      */
     static _parseIndexFile(bytes, indexInfo) {
-        // Index file structure varies by version, but generally:
-        // - Header/metadata section
-        // - Centroids tensor
-        // - Partition info
-
         const index = new IVFIndex();
 
-        // Try to parse as protobuf
+        // Try to find and parse IVF message within the file
+        // The file may have nested protobuf structures
+        const ivfData = IVFIndex._findIVFMessage(bytes);
+
+        if (ivfData) {
+            if (ivfData.centroids) {
+                index.centroids = ivfData.centroids.data;
+                index.numPartitions = ivfData.centroids.numPartitions;
+                index.dimension = ivfData.centroids.dimension;
+            }
+            if (ivfData.offsets && ivfData.offsets.length > 0) {
+                index.partitionOffsets = ivfData.offsets;
+                console.log(`Loaded ${ivfData.offsets.length} partition offsets`);
+            }
+            if (ivfData.lengths && ivfData.lengths.length > 0) {
+                index.partitionLengths = ivfData.lengths;
+                console.log(`Loaded ${ivfData.lengths.length} partition lengths`);
+            }
+
+            if (index.centroids) {
+                console.log(`Loaded IVF index: ${index.numPartitions} partitions, ${index.dimension}D`);
+                if (index.partitionOffsets.length > 0) {
+                    console.log(`  Partition offsets: [${index.partitionOffsets.slice(0, 3).join(', ')}...]`);
+                }
+                if (index.partitionLengths.length > 0) {
+                    const totalRows = index.partitionLengths.reduce((a, b) => a + b, 0);
+                    console.log(`  Total rows in index: ${totalRows}`);
+                }
+            }
+        }
+
+        // Fallback: try to find centroids in nested messages
+        if (!index.centroids) {
+            let pos = 0;
+            const readVarint = () => {
+                let result = 0;
+                let shift = 0;
+                while (pos < bytes.length) {
+                    const byte = bytes[pos++];
+                    result |= (byte & 0x7F) << shift;
+                    if ((byte & 0x80) === 0) break;
+                    shift += 7;
+                }
+                return result;
+            };
+
+            while (pos < bytes.length - 4) {
+                const tag = readVarint();
+                const fieldNum = tag >> 3;
+                const wireType = tag & 0x7;
+
+                if (wireType === 2) {
+                    const len = readVarint();
+                    if (len > bytes.length - pos) break;
+
+                    const content = bytes.slice(pos, pos + len);
+                    pos += len;
+
+                    if (len > 100 && len < 100000000) {
+                        const centroids = IVFIndex._tryParseCentroids(content);
+                        if (centroids) {
+                            index.centroids = centroids.data;
+                            index.numPartitions = centroids.numPartitions;
+                            index.dimension = centroids.dimension;
+                            console.log(`Loaded IVF centroids (fallback): ${index.numPartitions} partitions, ${index.dimension}D`);
+                        }
+                    }
+                } else if (wireType === 0) {
+                    readVarint();
+                } else if (wireType === 5) {
+                    pos += 4;
+                } else if (wireType === 1) {
+                    pos += 8;
+                }
+            }
+        }
+
+        return index.centroids ? index : null;
+    }
+
+    /**
+     * Find and parse IVF message within index file bytes.
+     * Recursively searches nested protobuf messages.
+     * @private
+     */
+    static _findIVFMessage(bytes) {
+        // IVF message fields:
+        // field 2: repeated uint64 offsets (packed)
+        // field 3: repeated uint32 lengths (packed)
+        // field 4: Tensor centroids_tensor
+
         let pos = 0;
+        let offsets = [];
+        let lengths = [];
+        let centroids = null;
 
         const readVarint = () => {
             let result = 0;
@@ -2889,34 +2999,89 @@ export class IVFIndex {
             return result;
         };
 
-        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
+        const readFixed64 = () => {
+            if (pos + 8 > bytes.length) return 0n;
+            const view = new DataView(bytes.buffer, bytes.byteOffset + pos, 8);
+            pos += 8;
+            return view.getBigUint64(0, true);
+        };
 
-        // Look for centroids tensor in the file
-        // The index file typically has:
-        // - VectorIndex protobuf with IVF stage
-        // - IVF contains centroids_tensor (Tensor message)
+        const readFixed32 = () => {
+            if (pos + 4 > bytes.length) return 0;
+            const view = new DataView(bytes.buffer, bytes.byteOffset + pos, 4);
+            pos += 4;
+            return view.getUint32(0, true);
+        };
 
         while (pos < bytes.length - 4) {
+            const startPos = pos;
             const tag = readVarint();
             const fieldNum = tag >> 3;
             const wireType = tag & 0x7;
 
             if (wireType === 2) {
+                // Length-delimited field
                 const len = readVarint();
-                if (len > bytes.length - pos) break;
+                if (len > bytes.length - pos || len < 0) {
+                    pos = startPos + 1;
+                    continue;
+                }
 
                 const content = bytes.slice(pos, pos + len);
                 pos += len;
 
-                // Try to find centroids within nested messages
-                // IVF message field 4 = centroids_tensor
-                if (len > 100 && len < 100000000) {
-                    const centroids = IVFIndex._tryParseCentroids(content);
+                if (fieldNum === 2) {
+                    // offsets - packed uint64
+                    // Could be packed fixed64 or packed varint
+                    if (len % 8 === 0 && len > 0) {
+                        // Try as packed fixed64
+                        const numOffsets = len / 8;
+                        const view = new DataView(content.buffer, content.byteOffset, len);
+                        for (let i = 0; i < numOffsets; i++) {
+                            offsets.push(Number(view.getBigUint64(i * 8, true)));
+                        }
+                        console.log(`Parsed ${offsets.length} partition offsets (fixed64)`);
+                    }
+                } else if (fieldNum === 3) {
+                    // lengths - packed uint32
+                    if (len % 4 === 0 && len > 0) {
+                        // Try as packed fixed32
+                        const numLengths = len / 4;
+                        const view = new DataView(content.buffer, content.byteOffset, len);
+                        for (let i = 0; i < numLengths; i++) {
+                            lengths.push(view.getUint32(i * 4, true));
+                        }
+                        console.log(`Parsed ${lengths.length} partition lengths (fixed32)`);
+                    } else {
+                        // Try as packed varint
+                        let lpos = 0;
+                        while (lpos < content.length) {
+                            let val = 0, shift = 0;
+                            while (lpos < content.length) {
+                                const byte = content[lpos++];
+                                val |= (byte & 0x7F) << shift;
+                                if ((byte & 0x80) === 0) break;
+                                shift += 7;
+                            }
+                            lengths.push(val);
+                        }
+                        if (lengths.length > 0) {
+                            console.log(`Parsed ${lengths.length} partition lengths (varint)`);
+                        }
+                    }
+                } else if (fieldNum === 4) {
+                    // centroids_tensor
+                    centroids = IVFIndex._tryParseCentroids(content);
                     if (centroids) {
-                        index.centroids = centroids.data;
-                        index.numPartitions = centroids.numPartitions;
-                        index.dimension = centroids.dimension;
-                        console.log(`Loaded IVF index: ${index.numPartitions} partitions, ${index.dimension}D`);
+                        console.log(`Parsed centroids tensor: ${centroids.numPartitions}x${centroids.dimension}`);
+                    }
+                } else if (len > 100) {
+                    // Recursively search nested messages
+                    const nested = IVFIndex._findIVFMessage(content);
+                    if (nested && (nested.centroids || nested.offsets?.length > 0)) {
+                        if (nested.centroids && !centroids) centroids = nested.centroids;
+                        if (nested.offsets?.length > offsets.length) offsets = nested.offsets;
+                        if (nested.lengths?.length > lengths.length) lengths = nested.lengths;
                     }
                 }
             } else if (wireType === 0) {
@@ -2925,20 +3090,16 @@ export class IVFIndex {
                 pos += 4;
             } else if (wireType === 1) {
                 pos += 8;
+            } else {
+                // Unknown wire type, skip byte
+                pos = startPos + 1;
             }
         }
 
-        // If we couldn't parse structured data, try to find raw float32 centroids
-        if (!index.centroids && bytes.length > 4096) {
-            // Heuristic: look for a large block of float32s that could be centroids
-            // Typical IVF has 256-4096 partitions, 128-1024 dimensions
-            // So centroids would be 128KB - 16MB
-
-            console.log('Attempting heuristic centroid detection...');
-            // This is a fallback - structured parsing is preferred
+        if (centroids || offsets.length > 0 || lengths.length > 0) {
+            return { centroids, offsets, lengths };
         }
-
-        return index.centroids ? index : null;
+        return null;
     }
 
     /**
