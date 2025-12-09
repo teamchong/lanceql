@@ -736,3 +736,226 @@ export fn avgFloat64Column(col_idx: u32) f64 {
 
     return sum / @as(f64, @floatFromInt(row_count));
 }
+
+// ============================================================================
+// String Column Support
+// ============================================================================
+
+/// Get string buffer info from column metadata (for variable-length data)
+/// Lance stores strings with:
+///   - buffer[0]: offsets (int32 or int64)
+///   - buffer[1]: data (UTF-8 bytes)
+fn getStringBufferInfo(col_meta: []const u8) struct {
+    offsets_start: u64,
+    offsets_size: u64,
+    data_start: u64,
+    data_size: u64,
+    rows: u64,
+} {
+    var pos: usize = 0;
+    var buffer_offsets: [2]u64 = .{ 0, 0 };
+    var buffer_sizes: [2]u64 = .{ 0, 0 };
+    var page_rows: u64 = 0;
+    var buf_idx: usize = 0;
+
+    while (pos < col_meta.len) {
+        const tag = readVarint(col_meta, &pos);
+        const field_num = tag >> 3;
+        const wire_type: u3 = @truncate(tag);
+
+        switch (field_num) {
+            2 => { // pages (length-delimited)
+                if (wire_type != 2) break;
+                const page_len = readVarint(col_meta, &pos);
+                const page_end = pos + @as(usize, @intCast(page_len));
+
+                // Parse page message
+                while (pos < page_end and pos < col_meta.len) {
+                    const page_tag = readVarint(col_meta, &pos);
+                    const page_field = page_tag >> 3;
+                    const page_wire: u3 = @truncate(page_tag);
+
+                    switch (page_field) {
+                        1 => { // buffer_offsets (packed repeated uint64)
+                            if (page_wire == 2) {
+                                const packed_len = readVarint(col_meta, &pos);
+                                const packed_end = pos + @as(usize, @intCast(packed_len));
+                                buf_idx = 0;
+                                while (pos < packed_end and buf_idx < 2) {
+                                    buffer_offsets[buf_idx] = readVarint(col_meta, &pos);
+                                    buf_idx += 1;
+                                }
+                                pos = packed_end;
+                            } else {
+                                if (buf_idx < 2) {
+                                    buffer_offsets[buf_idx] = readVarint(col_meta, &pos);
+                                    buf_idx += 1;
+                                }
+                            }
+                        },
+                        2 => { // buffer_sizes (packed repeated uint64)
+                            if (page_wire == 2) {
+                                const packed_len = readVarint(col_meta, &pos);
+                                const packed_end = pos + @as(usize, @intCast(packed_len));
+                                buf_idx = 0;
+                                while (pos < packed_end and buf_idx < 2) {
+                                    buffer_sizes[buf_idx] = readVarint(col_meta, &pos);
+                                    buf_idx += 1;
+                                }
+                                pos = packed_end;
+                            } else {
+                                if (buf_idx < 2) {
+                                    buffer_sizes[buf_idx] = readVarint(col_meta, &pos);
+                                    buf_idx += 1;
+                                }
+                            }
+                        },
+                        3 => { // length (rows)
+                            page_rows = readVarint(col_meta, &pos);
+                        },
+                        else => {
+                            if (page_wire == 0) {
+                                _ = readVarint(col_meta, &pos);
+                            } else if (page_wire == 2) {
+                                const skip_len = readVarint(col_meta, &pos);
+                                pos += @as(usize, @intCast(skip_len));
+                            } else if (page_wire == 5) {
+                                pos += 4;
+                            } else if (page_wire == 1) {
+                                pos += 8;
+                            }
+                        },
+                    }
+                }
+                return .{
+                    .offsets_start = buffer_offsets[0],
+                    .offsets_size = buffer_sizes[0],
+                    .data_start = buffer_offsets[1],
+                    .data_size = buffer_sizes[1],
+                    .rows = page_rows,
+                };
+            },
+            else => {
+                if (wire_type == 0) {
+                    _ = readVarint(col_meta, &pos);
+                } else if (wire_type == 2) {
+                    const skip_len = readVarint(col_meta, &pos);
+                    pos += @as(usize, @intCast(skip_len));
+                } else if (wire_type == 5) {
+                    pos += 4;
+                } else if (wire_type == 1) {
+                    pos += 8;
+                }
+            },
+        }
+    }
+
+    return .{
+        .offsets_start = 0,
+        .offsets_size = 0,
+        .data_start = 0,
+        .data_size = 0,
+        .rows = 0,
+    };
+}
+
+/// Get number of strings in column
+export fn getStringCount(col_idx: u32) u64 {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getStringBufferInfo(col_meta);
+    return info.rows;
+}
+
+/// Read a single string at index into output buffer
+/// Returns actual string length (may exceed out_max if truncated)
+export fn readStringAt(col_idx: u32, row_idx: u32, out_ptr: [*]u8, out_max: usize) usize {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getStringBufferInfo(col_meta);
+
+    if (info.offsets_size == 0 or info.data_size == 0) return 0;
+    if (row_idx >= info.rows) return 0;
+
+    const offsets_start: usize = @intCast(info.offsets_start);
+    const data_start: usize = @intCast(info.data_start);
+
+    // Check if using 32-bit or 64-bit offsets
+    // If offsets_size / (rows + 1) == 4, it's int32; if 8, it's int64
+    const offset_size = info.offsets_size / (info.rows + 1);
+    if (offset_size != 4 and offset_size != 8) return 0;
+
+    var str_start: usize = 0;
+    var str_end: usize = 0;
+
+    if (offset_size == 4) {
+        // 32-bit offsets
+        str_start = readU32LE(data, offsets_start + row_idx * 4);
+        str_end = readU32LE(data, offsets_start + (row_idx + 1) * 4);
+    } else {
+        // 64-bit offsets
+        str_start = @intCast(readU64LE(data, offsets_start + row_idx * 8));
+        str_end = @intCast(readU64LE(data, offsets_start + (row_idx + 1) * 8));
+    }
+
+    if (str_end < str_start) return 0;
+    const str_len = str_end - str_start;
+
+    // Check bounds
+    if (data_start + str_end > data.len) return 0;
+
+    // Copy string to output buffer
+    const copy_len = @min(str_len, out_max);
+    const str_data = data[data_start + str_start ..][0..copy_len];
+    @memcpy(out_ptr[0..copy_len], str_data);
+
+    return str_len;
+}
+
+/// Read multiple strings at indices
+/// Returns total bytes written to out_ptr
+/// out_lengths receives the length of each string
+export fn readStringsAtIndices(
+    col_idx: u32,
+    indices: [*]const u32,
+    num_indices: usize,
+    out_ptr: [*]u8,
+    out_max: usize,
+    out_lengths: [*]u32,
+) usize {
+    var total_written: usize = 0;
+
+    for (0..num_indices) |i| {
+        const remaining = if (total_written < out_max) out_max - total_written else 0;
+        const len = readStringAt(col_idx, indices[i], out_ptr + total_written, remaining);
+        out_lengths[i] = @intCast(len);
+        total_written += @min(len, remaining);
+    }
+
+    return total_written;
+}
+
+/// Allocate string buffer
+export fn allocStringBuffer(size: usize) ?[*]u8 {
+    return wasmAlloc(size);
+}
+
+/// Allocate u32 buffer for lengths
+export fn allocU32Buffer(count: usize) ?[*]u32 {
+    const ptr = wasmAlloc(count * 4) orelse return null;
+    return @ptrCast(@alignCast(ptr));
+}
