@@ -33,4 +33,9 @@ Thumbs.db
 *.dylib
 *.wasm
 !zig-out/bin/*.wasm
+!dist/*.wasm
+
+# npm
+node_modules/
+
 CLAUDE.md
