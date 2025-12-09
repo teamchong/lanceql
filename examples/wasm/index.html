@@ -407,6 +407,50 @@
             background: rgba(255,255,255,0.02);
         }
 
+        /* Cell formatting */
+        .null-value {
+            color: #64748b;
+            font-style: italic;
+        }
+        .empty-value {
+            color: #64748b;
+            font-style: italic;
+            font-size: 12px;
+        }
+        .url-link {
+            color: #60a5fa;
+            text-decoration: none;
+            word-break: break-all;
+        }
+        .url-link:hover {
+            text-decoration: underline;
+        }
+        .image-cell {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            max-width: 150px;
+        }
+        .image-cell img {
+            max-width: 100px;
+            max-height: 60px;
+            object-fit: cover;
+            border-radius: 4px;
+            background: #1e293b;
+        }
+        .image-cell img.broken {
+            display: none;
+        }
+        .image-cell .url-text {
+            font-size: 11px;
+            color: #64748b;
+            text-decoration: none;
+            word-break: break-all;
+        }
+        .image-cell .url-text:hover {
+            color: #60a5fa;
+        }
+
         /* Image Grid */
         .image-grid {
             display: grid;
@@ -1612,6 +1656,54 @@
                     lower.includes('.gif') || lower.includes('.webp') || lower.includes('.svg'));
         }
 
+        // Check if a string is a URL (not necessarily an image)
+        function isUrl(str) {
+            if (!str || typeof str !== 'string') return false;
+            return str.startsWith('http://') || str.startsWith('https://');
+        }
+
+        // Escape HTML to prevent XSS
+        function escapeHtml(str) {
+            if (typeof str !== 'string') return str;
+            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+
+        // Format a cell value for display
+        function formatCell(cell) {
+            // Handle null/undefined/empty
+            if (cell === null || cell === undefined) {
+                return '<span class="null-value">NULL</span>';
+            }
+            if (cell === '') {
+                return '<span class="empty-value">(empty)</span>';
+            }
+
+            // Handle image URLs - show thumbnail with fallback
+            if (isImageUrl(cell)) {
+                const escaped = escapeHtml(cell);
+                const short = escaped.length > 40 ? escaped.substring(0, 40) + '...' : escaped;
+                return `<div class="image-cell">
+                    <img src="${escaped}" alt="" loading="lazy" onerror="this.classList.add('broken')">
+                    <a href="${escaped}" target="_blank" class="url-text" title="${escaped}">${short}</a>
+                </div>`;
+            }
+
+            // Handle other URLs - show as clickable link
+            if (isUrl(cell)) {
+                const escaped = escapeHtml(cell);
+                const short = escaped.length > 50 ? escaped.substring(0, 50) + '...' : escaped;
+                return `<a href="${escaped}" target="_blank" class="url-link" title="${escaped}">${short}</a>`;
+            }
+
+            // Handle long strings - truncate
+            if (typeof cell === 'string' && cell.length > 100) {
+                return `<span title="${escapeHtml(cell)}">${escapeHtml(cell.substring(0, 100))}...</span>`;
+            }
+
+            // Default: escape and display
+            return escapeHtml(String(cell));
+        }
+
         // Display results
         function displayResults(result) {
             const body = document.getElementById('results-body');
@@ -1632,26 +1724,17 @@
                 return;
             }
 
-            // Build table with optional image rendering
+            // Build table
             let html = '<table class="data-table"><thead><tr>';
             for (const col of result.columns) {
-                html += `<th>${col}</th>`;
+                html += `<th>${escapeHtml(col)}</th>`;
             }
             html += '</tr></thead><tbody>';
 
             for (const row of result.rows) {
                 html += '<tr>';
                 for (const cell of row) {
-                    if (isImageUrl(cell)) {
-                        // Render image URLs as thumbnails
-                        html += `<td><img src="${cell}" alt="Image" loading="lazy" style="max-width: 100px; max-height: 60px; object-fit: cover; border-radius: 4px;" onerror="this.style.display='none'; this.nextSibling.style.display='inline'"><span style="display:none">${cell.substring(0, 50)}...</span></td>`;
-                    } else {
-                        // Truncate long strings
-                        const displayCell = typeof cell === 'string' && cell.length > 100
-                            ? cell.substring(0, 100) + '...'
-                            : cell;
-                        html += `<td>${displayCell}</td>`;
-                    }
+                    html += `<td>${formatCell(cell)}</td>`;
                 }
                 html += '</tr>';
             }
