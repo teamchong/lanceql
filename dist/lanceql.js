@@ -1199,13 +1199,7 @@ export class RemoteLanceFile {
         await file._tryLoadIndex();
 
         // Log summary
-        console.log('=== Remote Lance File Loaded ===');
-        console.log(`  URL: ${url}`);
-        console.log(`  File size: ${(fileSize / 1024 / 1024).toFixed(2)} MB`);
-        console.log(`  Columns: ${file._numColumns}`);
-        console.log(`  Schema: ${file._schema ? 'loaded' : 'not available'}`);
-        console.log(`  IVF Index: ${file.hasIndex() ? `loaded (${file._ivfIndex.numPartitions} partitions)` : 'not available'}`);
-        console.log('================================');
+        console.log(`[LanceQL] Loaded: ${file._numColumns} columns, ${(fileSize / 1024 / 1024).toFixed(1)}MB, schema: ${file._schema ? 'yes' : 'no'}, index: ${file.hasIndex() ? 'yes' : 'no'}`);
 
         return file;
     }
@@ -1219,11 +1213,8 @@ export class RemoteLanceFile {
 
         try {
             this._ivfIndex = await IVFIndex.tryLoad(this._datasetBaseUrl);
-            if (this._ivfIndex) {
-                console.log(`Loaded IVF index: ${this._ivfIndex.numPartitions} partitions, ${this._ivfIndex.dimension}D`);
-            }
         } catch (e) {
-            console.warn('Failed to load IVF index:', e.message);
+            // Index loading is optional, silently ignore
         }
     }
 
@@ -1264,7 +1255,7 @@ export class RemoteLanceFile {
             this._schema = this._parseManifest(new Uint8Array(manifestData));
         } catch (e) {
             // Silently fail - schema is optional
-            console.warn('Failed to load manifest:', e.message);
+            // Manifest loading is optional, silently ignore
         }
     }
 
@@ -1400,7 +1391,7 @@ export class RemoteLanceFile {
      * @returns {Promise<ArrayBuffer>}
      */
     async fetchRange(start, end) {
-        console.log(`fetchRange: ${start}-${end} (size: ${end - start + 1}) from ${this.url.split('/').pop()}`);
+        // Debug: console.log(`fetchRange: ${start}-${end} (size: ${end - start + 1})`);
 
         // Validate range
         if (start < 0 || end < start || end >= this.size) {
@@ -1629,7 +1620,7 @@ export class RemoteLanceFile {
         const dataBufferIdx = bufferOffsets.length > 1 ? 1 : 0;
         const nullBitmapIdx = bufferOffsets.length > 1 ? 0 : -1;
 
-        console.log(`_parseColumnMeta: ${bufferOffsets.length} buffers, offsets=${bufferOffsets}, sizes=${bufferSizes}, rows=${rows}`);
+        // Debug: console.log(`_parseColumnMeta: ${bufferOffsets.length} buffers, rows=${rows}`);
 
         return {
             offset: bufferOffsets[dataBufferIdx] || 0,
@@ -1787,7 +1778,7 @@ export class RemoteLanceFile {
         const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
         const info = this._parseColumnMeta(new Uint8Array(colMeta));
 
-        console.log(`readInt64AtIndices col ${colIdx}: offset=${info.offset}, size=${info.size}, rows=${info.rows}`);
+        // Debug: console.log(`readInt64AtIndices col ${colIdx}: rows=${info.rows}`);
 
         const results = new BigInt64Array(indices.length);
         const valueSize = 8;
@@ -1801,15 +1792,6 @@ export class RemoteLanceFile {
             const endOffset = info.offset + (batch.endIdx + 1) * valueSize - 1;
             const data = await this.fetchRange(startOffset, endOffset);
             const view = new DataView(data);
-
-            // Debug: show first few bytes
-            if (batch.startIdx === 0) {
-                const bytes = new Uint8Array(data);
-                console.log(`readInt64AtIndices col ${colIdx} first bytes:`, Array.from(bytes.slice(0, 32)));
-                // Also try reading as int32 to see
-                console.log(`  as int32[0]: ${view.getInt32(0, true)}, int32[1]: ${view.getInt32(4, true)}`);
-                console.log(`  as int64[0]: ${view.getBigInt64(0, true)}`);
-            }
 
             // Extract values from batch
             for (const item of batch.items) {
@@ -2224,7 +2206,7 @@ export class RemoteLanceFile {
 
         // First, try to use schema types if available
         if (this._schema && this._schema.length > 0) {
-            console.log('Schema available:', this._schema);
+            // Schema loaded successfully
 
             // Build a map from schema - schema may have more fields than physical columns
             for (let c = 0; c < this._numColumns; c++) {
@@ -2233,7 +2215,7 @@ export class RemoteLanceFile {
                 const schemaName = schemaField?.name?.toLowerCase() || '';
                 let type = 'unknown';
 
-                console.log(`Column ${c}: name="${schemaField?.name}", schema type = "${schemaType}"`);
+                // Debug: console.log(`Column ${c}: name="${schemaField?.name}", type="${schemaType}"`);
 
                 // Check if column name suggests it's a vector/embedding
                 const isEmbeddingName = schemaName.includes('embedding') || schemaName.includes('vector') ||
@@ -2266,18 +2248,18 @@ export class RemoteLanceFile {
 
             // If we got useful types from schema, cache and return
             if (types.some(t => t !== 'unknown')) {
-                console.log('Detected types from schema:', types);
+                // Debug: console.log('Detected types from schema:', types);
                 this._columnTypes = types;
                 return types;
             }
 
             // Otherwise fall through to detection
-            console.log('Schema types all unknown, falling back to data detection');
+            // Schema types all unknown, fall back to data detection
             types.length = 0;
         }
 
         // Fall back to detection by examining data
-        console.log('Detecting column types from data...');
+        // Detecting column types from data
         for (let c = 0; c < this._numColumns; c++) {
             let type = 'unknown';
             const colName = this.columnNames[c]?.toLowerCase() || '';
@@ -2291,7 +2273,7 @@ export class RemoteLanceFile {
                 const str = await this.readStringAt(c, 0);
                 // readStringAt throws for non-string columns, returns string for valid string columns
                 type = 'string';
-                console.log(`Column ${c} (${colName}): detected as string`);
+                // Detected as string
                 types.push(type);
                 continue;
             } catch (e) {
@@ -2306,7 +2288,7 @@ export class RemoteLanceFile {
                     const bytes = new Uint8Array(colMeta);
                     const info = this._parseColumnMeta(bytes);
 
-                    console.log(`Column ${c} (${colName}): rows=${info.rows}, size=${info.size}, bytesPerRow=${info.size / info.rows}`);
+                    // Debug: console.log(`Column ${c}: bytesPerRow=${info.size / info.rows}`);
 
                     if (info.rows > 0 && info.size > 0) {
                         const bytesPerRow = info.size / info.rows;
@@ -2323,7 +2305,7 @@ export class RemoteLanceFile {
                                 const data = await this.readInt32AtIndices(c, [0]);
                                 if (data.length > 0) {
                                     const val = data[0];
-                                    console.log(`Column ${c} (${colName}): int32 sample value = ${val}`);
+                                    // Detected int32 via sample value
                                     // Heuristic: small integers likely int32, weird values likely float32
                                     if (val >= -1000000 && val <= 1000000 && Number.isInteger(val)) {
                                         type = 'int32';
@@ -2344,10 +2326,10 @@ export class RemoteLanceFile {
                     }
                 }
             } catch (e) {
-                console.warn(`Failed to detect type for column ${c}:`, e);
+                // Failed to detect type for column, leave as unknown
             }
 
-            console.log(`Column ${c} (${colName}): final type = ${type}`);
+            // Debug: console.log(`Column ${c}: ${type}`);
             types.push(type);
         }
 
@@ -2510,12 +2492,12 @@ export class RemoteLanceFile {
 
         // Try to use IVF index if available and enabled
         if (useIndex && this.hasIndex() && this._ivfIndex.dimension === queryVec.length) {
-            console.log(`Using IVF index with nprobe=${nprobe}`);
+            // Using IVF index for ANN search
             return await this._vectorSearchWithIndex(colIdx, queryVec, topK, nprobe, onProgress);
         }
 
         // Fall back to brute-force search
-        console.log('Using brute-force vector search');
+        // Using brute-force vector search
         return await this._vectorSearchBruteForce(colIdx, queryVec, topK, onProgress);
     }
 
@@ -2530,7 +2512,7 @@ export class RemoteLanceFile {
         // Find nearest partitions using centroids
         if (onProgress) onProgress(0, 100);
         const partitions = this._ivfIndex.findNearestPartitions(queryVec, nprobe);
-        console.log(`Searching ${partitions.length} partitions:`, partitions);
+        // Debug: console.log(`Searching ${partitions.length} partitions`);
 
         const entry = await this.getColumnOffsetEntry(colIdx);
         const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
@@ -2543,7 +2525,7 @@ export class RemoteLanceFile {
 
         if (hasPartitionInfo) {
             // Use actual partition boundaries from index
-            console.log('Using partition lengths from index');
+            // Using partition lengths from index
             let currentRow = 0;
             for (let p = 0; p < this._ivfIndex.numPartitions; p++) {
                 const partitionLen = this._ivfIndex.partitionLengths[p];
@@ -2557,7 +2539,7 @@ export class RemoteLanceFile {
             }
         } else {
             // Fallback: estimate partition boundaries by dividing evenly
-            console.log('Estimating partition boundaries (no partition lengths in index)');
+            // Estimating partition boundaries (no partition lengths in index)
             const rowsPerPartition = Math.ceil(numRows / this._ivfIndex.numPartitions);
 
             for (const p of partitions) {
@@ -2569,7 +2551,7 @@ export class RemoteLanceFile {
             }
         }
 
-        console.log(`Searching ${indicesToSearch.length} rows (${(indicesToSearch.length / numRows * 100).toFixed(1)}% of data)`);
+        // Debug: console.log(`Searching ${indicesToSearch.length} rows (${(indicesToSearch.length / numRows * 100).toFixed(1)}% of data)`);
 
         // Search only the selected indices
         const topResults = [];
@@ -2723,24 +2705,24 @@ export class IVFIndex {
             const indexInfo = IVFIndex._parseManifestForIndex(new Uint8Array(manifestData));
 
             if (!indexInfo || !indexInfo.uuid) {
-                console.log('No vector index found in manifest');
+                // No vector index found in manifest
                 return null;
             }
 
-            console.log('Found vector index:', indexInfo);
+            // Found vector index in manifest
 
             // Fetch the index file
             const indexUrl = `${datasetBaseUrl}/_indices/${indexInfo.uuid}/index.idx`;
             const indexResp = await fetch(indexUrl);
             if (!indexResp.ok) {
-                console.log('Index file not found:', indexUrl);
+                // Index file not found
                 return null;
             }
 
             const indexData = await indexResp.arrayBuffer();
             return IVFIndex._parseIndexFile(new Uint8Array(indexData), indexInfo);
         } catch (e) {
-            console.warn('Failed to load IVF index:', e.message);
+            // Failed to load IVF index
             return null;
         }
     }
@@ -2912,23 +2894,14 @@ export class IVFIndex {
             }
             if (ivfData.offsets && ivfData.offsets.length > 0) {
                 index.partitionOffsets = ivfData.offsets;
-                console.log(`Loaded ${ivfData.offsets.length} partition offsets`);
+                // Loaded partition offsets
             }
             if (ivfData.lengths && ivfData.lengths.length > 0) {
                 index.partitionLengths = ivfData.lengths;
-                console.log(`Loaded ${ivfData.lengths.length} partition lengths`);
+                // Loaded partition lengths
             }
 
-            if (index.centroids) {
-                console.log(`Loaded IVF index: ${index.numPartitions} partitions, ${index.dimension}D`);
-                if (index.partitionOffsets.length > 0) {
-                    console.log(`  Partition offsets: [${index.partitionOffsets.slice(0, 3).join(', ')}...]`);
-                }
-                if (index.partitionLengths.length > 0) {
-                    const totalRows = index.partitionLengths.reduce((a, b) => a + b, 0);
-                    console.log(`  Total rows in index: ${totalRows}`);
-                }
-            }
+            // Index centroids loaded successfully
         }
 
         // Fallback: try to find centroids in nested messages
@@ -2964,7 +2937,7 @@ export class IVFIndex {
                             index.centroids = centroids.data;
                             index.numPartitions = centroids.numPartitions;
                             index.dimension = centroids.dimension;
-                            console.log(`Loaded IVF centroids (fallback): ${index.numPartitions} partitions, ${index.dimension}D`);
+                            // Loaded IVF centroids via fallback parsing
                         }
                     }
                 } else if (wireType === 0) {
@@ -3049,7 +3022,7 @@ export class IVFIndex {
                         for (let i = 0; i < numOffsets; i++) {
                             offsets.push(Number(view.getBigUint64(i * 8, true)));
                         }
-                        console.log(`Parsed ${offsets.length} partition offsets (fixed64)`);
+                        // Parsed partition offsets
                     }
                 } else if (fieldNum === 3) {
                     // lengths - packed uint32
@@ -3060,7 +3033,7 @@ export class IVFIndex {
                         for (let i = 0; i < numLengths; i++) {
                             lengths.push(view.getUint32(i * 4, true));
                         }
-                        console.log(`Parsed ${lengths.length} partition lengths (fixed32)`);
+                        // Parsed partition lengths (fixed32)
                     } else {
                         // Try as packed varint
                         let lpos = 0;
@@ -3074,16 +3047,11 @@ export class IVFIndex {
                             }
                             lengths.push(val);
                         }
-                        if (lengths.length > 0) {
-                            console.log(`Parsed ${lengths.length} partition lengths (varint)`);
-                        }
+                        // Parsed partition lengths (varint)
                     }
                 } else if (fieldNum === 4) {
                     // centroids_tensor
                     centroids = IVFIndex._tryParseCentroids(content);
-                    if (centroids) {
-                        console.log(`Parsed centroids tensor: ${centroids.numPartitions}x${centroids.dimension}`);
-                    }
                 } else if (len > 100) {
                     // Recursively search nested messages
                     const nested = IVFIndex._findIVFMessage(content);
@@ -3882,7 +3850,7 @@ export class SQLExecutor {
         const parser = new SQLParser(tokens);
         const ast = parser.parse();
 
-        console.log('Parsed SQL AST:', ast);
+        // Debug: console.log('Parsed SQL AST:', ast);
 
         // Detect column types if not already done
         if (this.columnTypes.length === 0) {
@@ -3903,11 +3871,11 @@ export class SQLExecutor {
 
         // Determine which columns to read
         const neededColumns = this.collectNeededColumns(ast);
-        console.log('Needed columns:', neededColumns);
+        // Debug: console.log('Needed columns:', neededColumns);
 
         // Determine output columns
         const outputColumns = this.resolveOutputColumns(ast);
-        console.log('Output columns:', outputColumns);
+        // Debug: console.log('Output columns:', outputColumns);
 
         // Check if this is an aggregation query
         const hasAggregates = this.hasAggregates(ast);
@@ -4095,7 +4063,7 @@ export class SQLExecutor {
                 }
             }
         } catch (e) {
-            console.error(`Failed to read column ${colIdx}:`, e);
+            // Failed to read column, returning nulls
             return indices.map(() => null);
         }
     }
@@ -4160,7 +4128,7 @@ export class SQLExecutor {
         // Use larger batch size for single-column filtering
         const batchSize = 5000;
 
-        console.log(`Using optimized simple filter: ${filter.column} ${filter.op} ${filter.value}`);
+        // Using optimized simple filter path
 
         for (let batchStart = 0; batchStart < totalRows; batchStart += batchSize) {
             if (onProgress) {
@@ -4198,7 +4166,7 @@ export class SQLExecutor {
 
             // Early exit if we have enough results
             if (matchingIndices.length >= 10000) {
-                console.log(`Early exit: found ${matchingIndices.length} matches`);
+                // Early exit: found enough matches
                 break;
             }
         }
