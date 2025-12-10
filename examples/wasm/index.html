@@ -1994,6 +1994,34 @@
                         console.warn('Could not detect column types:', e);
                     }
 
+                    // Populate DataFrame builder selects
+                    document.getElementById('run-df-btn').disabled = false;
+                    const filterCol = document.getElementById('df-filter-col');
+                    const selectCols = document.getElementById('df-select-cols');
+                    filterCol.innerHTML = '<option value="">No filter</option>';
+                    selectCols.innerHTML = '';
+
+                    const colNames = currentFile.columnNames || [];
+                    for (let i = 0; i < currentFile.numColumns; i++) {
+                        const name = colNames[i] || `column_${i}`;
+                        const type = columnTypes[i] || 'unknown';
+                        filterCol.innerHTML += `<option value="${i}">${name} (${type})</option>`;
+                        selectCols.innerHTML += `<option value="${i}" selected>${name}</option>`;
+                    }
+
+                    // Populate vector column dropdown
+                    const vectorCol = document.getElementById('vector-col');
+                    vectorCol.innerHTML = '<option value="">Select column...</option>';
+                    for (let i = 0; i < currentFile.numColumns; i++) {
+                        if (columnTypes[i] === 'vector') {
+                            const name = colNames[i] || `column_${i}`;
+                            vectorCol.innerHTML += `<option value="${i}">${name}</option>`;
+                        }
+                    }
+                    if (vectorCol.options.length > 1) {
+                        vectorCol.selectedIndex = 1;
+                    }
+
                     targetFile = currentFile;
                 }
 
