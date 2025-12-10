@@ -2650,7 +2650,7 @@ export class RemoteLanceFile {
      * Handles multi-page columns correctly.
      * @private
      */
-    async _vectorSearchBruteForce(colIdx, queryVec, topK, onProgress) {
+    async _vectorSearchBruteForce(colIdx, queryVec, topK, onProgress, maxRows = null) {
         const entry = await this.getColumnOffsetEntry(colIdx);
         const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
         const metaInfo = this._parseColumnMeta(new Uint8Array(colMeta));
@@ -2671,14 +2671,18 @@ export class RemoteLanceFile {
 
         const dim = Math.floor(firstPageSize / (firstPageRows * 4));
         const vecSize = dim * 4;
-        const totalRows = metaInfo.rows;
+        const totalRows = maxRows || metaInfo.rows;
         const batchSize = 1000; // Process 1000 vectors at a time
         const topResults = [];
 
         let globalRowIdx = 0;
+        let scannedRows = 0;
 
         // Process each page
         for (let pageIdx = 0; pageIdx < metaInfo.pages.length; pageIdx++) {
+            // Check if we've reached the row limit
+            if (maxRows && scannedRows >= maxRows) break;
+
             const page = metaInfo.pages[pageIdx];
             const pageDataIdx = page.sizes.length > 1 ? 1 : 0;
             const pageOffset = page.offsets[pageDataIdx] || 0;
@@ -2686,13 +2690,18 @@ export class RemoteLanceFile {
 
             if (pageRows === 0) continue;
 
+            // Calculate how many rows to scan from this page
+            const rowsToScanFromPage = maxRows
+                ? Math.min(pageRows, maxRows - scannedRows)
+                : pageRows;
+
             // Stream this page in batches
-            for (let batchStart = 0; batchStart < pageRows; batchStart += batchSize) {
-                const batchEnd = Math.min(batchStart + batchSize, pageRows);
+            for (let batchStart = 0; batchStart < rowsToScanFromPage; batchStart += batchSize) {
+                const batchEnd = Math.min(batchStart + batchSize, rowsToScanFromPage);
                 const batchCount = batchEnd - batchStart;
 
                 if (onProgress) {
-                    onProgress(globalRowIdx + batchStart, totalRows);
+                    onProgress(scannedRows + batchStart, totalRows);
                 }
 
                 // Fetch just this batch
@@ -2733,10 +2742,11 @@ export class RemoteLanceFile {
             }
 
             globalRowIdx += pageRows;
+            scannedRows += rowsToScanFromPage;
         }
 
         if (onProgress) {
-            onProgress(totalRows, totalRows);
+            onProgress(scannedRows, totalRows);
         }
 
         return {
@@ -2752,10 +2762,11 @@ export class RemoteLanceFile {
      * @param {Float32Array} queryVec - Query vector
      * @param {number} topK - Number of results
      * @param {boolean} normalized - Whether vectors are L2-normalized (unused, always computes full cosine)
+     * @param {number} maxRows - Maximum rows to scan (optional, defaults to all)
      * @returns {Promise<{indices: Uint32Array, scores: Float32Array, count: number}>}
      */
-    async vectorSearchTopK(colIdx, queryVec, topK, normalized = true) {
-        const result = await this._vectorSearchBruteForce(colIdx, queryVec, topK, null);
+    async vectorSearchTopK(colIdx, queryVec, topK, normalized = true, maxRows = null) {
+        const result = await this._vectorSearchBruteForce(colIdx, queryVec, topK, null, maxRows);
         return {
             indices: new Uint32Array(result.indices),
             scores: new Float32Array(result.scores),
@@ -5320,14 +5331,16 @@ export class RemoteLanceDataset {
         }
 
         const dim = queryVec.length;
-        console.log(`[VectorSearch] Query dim=${dim}, topK=${topK}, fragments=${this._fragments.length}`);
+        console.log(`[VectorSearch] Query dim=${dim}, topK=${topK}, fragments=${this._fragments.length}, workerPool=${!!workerPool}`);
 
         // Try parallel search with workers
         if (workerPool) {
+            console.log('[VectorSearch] Using parallel search with workers');
             return await this._parallelVectorSearch(queryVec, topK, vectorColIdx, normalized, workerPool);
         }
 
-        // Fallback: sequential search across fragments
+        // Fallback: sequential search across fragments (streams batches, doesn't download all)
+        console.log('[VectorSearch] Using sequential streaming search');
         return await this._sequentialVectorSearch(queryVec, topK, vectorColIdx, normalized, onProgress);
     }
 
@@ -5399,31 +5412,48 @@ export class RemoteLanceDataset {
 
     /**
      * Sequential vector search (fallback when workers unavailable).
+     * Streams batches to limit memory and bandwidth usage.
+     * Limits scan to first N rows for demo efficiency.
      * @private
      */
     async _sequentialVectorSearch(query, topK, vectorColIdx, normalized, onProgress = null) {
         const dim = query.length;
         const allResults = [];
 
+        // Limit scan to avoid downloading entire dataset
+        // For 1M rows @ 512 dims @ 4 bytes = 2GB - way too much for a demo
+        // Scan only first 50K rows (~100MB) for reasonable demo performance
+        const MAX_SCAN_ROWS = 50000;
+
         let globalOffset = 0;
         let processedRows = 0;
-        const totalRows = this._totalRows;
+        let scannedRows = 0;
 
         for (let fragIdx = 0; fragIdx < this._fragments.length; fragIdx++) {
+            // Stop if we've scanned enough rows
+            if (scannedRows >= MAX_SCAN_ROWS) {
+                console.log(`[VectorSearch] Stopped early after ${scannedRows} rows (limit: ${MAX_SCAN_ROWS})`);
+                break;
+            }
+
             const frag = this._fragments[fragIdx];
             const file = await this.openFragment(fragIdx);
 
             // Report progress
             if (onProgress) {
-                onProgress(processedRows, totalRows);
+                onProgress(processedRows, MAX_SCAN_ROWS);
             }
 
-            // Get top-k from this fragment
+            // Calculate how many rows to scan from this fragment
+            const rowsToScan = Math.min(frag.numRows, MAX_SCAN_ROWS - scannedRows);
+
+            // Get top-k from this fragment (limited rows)
             const results = await file.vectorSearchTopK(
                 vectorColIdx,
                 query,
                 topK,
-                normalized
+                normalized,
+                rowsToScan  // Pass limit
             );
 
             // Add global offset to indices
@@ -5436,11 +5466,12 @@ export class RemoteLanceDataset {
 
             globalOffset += frag.numRows;
             processedRows += frag.numRows;
+            scannedRows += rowsToScan;
         }
 
         // Final progress
         if (onProgress) {
-            onProgress(totalRows, totalRows);
+            onProgress(scannedRows, MAX_SCAN_ROWS);
         }
 
         // Sort and take top-k
@@ -5450,7 +5481,7 @@ export class RemoteLanceDataset {
         const indices = Array.from({ length: finalK }, (_, i) => allResults[i].index);
         const scores = Array.from({ length: finalK }, (_, i) => allResults[i].score);
 
-        return { indices, scores, usedIndex: false };
+        return { indices, scores, usedIndex: false, scannedRows };
     }
 
     /**
