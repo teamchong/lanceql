@@ -2669,15 +2669,16 @@ export class RemoteLanceFile {
             throw new Error(`Dimension mismatch: query=${queryVec.length}, column=${info.dimension}`);
         }
 
-        // Try to use IVF index if available and enabled
-        if (useIndex && this.hasIndex() && this._ivfIndex.dimension === queryVec.length) {
-            // Using IVF index for ANN search
-            return await this._vectorSearchWithIndex(colIdx, queryVec, topK, nprobe, onProgress);
+        // Require IVF index - no brute force fallback
+        if (!this.hasIndex()) {
+            throw new Error('No IVF index found. Vector search requires an IVF index for efficient querying.');
         }
 
-        // Fall back to brute-force search
-        // Using brute-force vector search
-        return await this._vectorSearchBruteForce(colIdx, queryVec, topK, onProgress);
+        if (this._ivfIndex.dimension !== queryVec.length) {
+            throw new Error(`Query dimension (${queryVec.length}) does not match index dimension (${this._ivfIndex.dimension}).`);
+        }
+
+        return await this._vectorSearchWithIndex(colIdx, queryVec, topK, nprobe, onProgress);
     }
 
     /**
@@ -2705,9 +2706,8 @@ export class RemoteLanceFile {
             return await this._searchWithRowIdMappings(colIdx, queryVec, topK, rowIdMappings, onProgress);
         }
 
-        // Fallback: estimate which rows to search based on partition boundaries
-        console.log('[IVFSearch] Falling back to estimated partition boundaries');
-        return await this._searchWithEstimatedPartitions(colIdx, queryVec, topK, partitions, onProgress);
+        // No fallback - require proper row ID mapping
+        throw new Error('Failed to fetch row IDs from IVF index. Dataset may be missing auxiliary.idx or ivf_partitions.bin.');
     }
 
     /**
@@ -2779,231 +2779,9 @@ export class RemoteLanceFile {
         };
     }
 
-    /**
-     * Search using estimated partition boundaries (fallback).
-     * Less accurate but works when row ID fetching fails.
-     * @private
-     */
-    async _searchWithEstimatedPartitions(colIdx, queryVec, topK, partitions, onProgress) {
-        const dim = queryVec.length;
-
-        const entry = await this.getColumnOffsetEntry(colIdx);
-        const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
-        const metaInfo = this._parseColumnMeta(new Uint8Array(colMeta));
-        const numRows = metaInfo.rows;
-
-        // Estimate partition boundaries
-        const indicesToSearch = [];
-        const hasPartitionInfo = this._ivfIndex.partitionLengths.length === this._ivfIndex.numPartitions;
-
-        if (hasPartitionInfo) {
-            // Use partition lengths as hints (though order may differ)
-            let currentRow = 0;
-            for (let p = 0; p < this._ivfIndex.numPartitions; p++) {
-                const partitionLen = this._ivfIndex.partitionLengths[p];
-                if (partitions.includes(p)) {
-                    for (let r = 0; r < partitionLen; r++) {
-                        indicesToSearch.push(currentRow + r);
-                    }
-                }
-                currentRow += partitionLen;
-            }
-        } else {
-            // Divide evenly
-            const rowsPerPartition = Math.ceil(numRows / this._ivfIndex.numPartitions);
-            for (const p of partitions) {
-                const startRow = p * rowsPerPartition;
-                const endRow = Math.min((p + 1) * rowsPerPartition, numRows);
-                for (let r = startRow; r < endRow; r++) {
-                    indicesToSearch.push(r);
-                }
-            }
-        }
-
-        console.log(`[IVFSearch] Estimated ${indicesToSearch.length} rows to search`);
-
-        // Search selected indices
-        const topResults = [];
-        const batchSize = 100;
-
-        for (let i = 0; i < indicesToSearch.length; i += batchSize) {
-            if (onProgress) onProgress(i, indicesToSearch.length);
-
-            const batchIndices = indicesToSearch.slice(i, i + batchSize);
-            const vectors = await this.readVectorsAtIndices(colIdx, batchIndices);
-
-            for (let j = 0; j < batchIndices.length; j++) {
-                const rowIdx = batchIndices[j];
-                const vec = vectors[j];
-                if (!vec || vec.length !== dim) continue;
-
-                let dot = 0, normA = 0, normB = 0;
-                for (let k = 0; k < dim; k++) {
-                    dot += queryVec[k] * vec[k];
-                    normA += queryVec[k] * queryVec[k];
-                    normB += vec[k] * vec[k];
-                }
-                const denom = Math.sqrt(normA) * Math.sqrt(normB);
-                const score = denom === 0 ? 0 : dot / denom;
-
-                if (topResults.length < topK) {
-                    topResults.push({ idx: rowIdx, score });
-                    topResults.sort((a, b) => b.score - a.score);
-                } else if (score > topResults[topK - 1].score) {
-                    topResults[topK - 1] = { idx: rowIdx, score };
-                    topResults.sort((a, b) => b.score - a.score);
-                }
-            }
-        }
-
-        if (onProgress) onProgress(indicesToSearch.length, indicesToSearch.length);
-
-        return {
-            indices: topResults.map(r => r.idx),
-            scores: topResults.map(r => r.score),
-            usedIndex: true,
-            searchedRows: indicesToSearch.length
-        };
-    }
-
-    /**
-     * Brute-force vector search (exact).
-     * Streams vectors in batches to avoid downloading entire column.
-     * Handles multi-page columns correctly.
-     * @private
-     */
-    async _vectorSearchBruteForce(colIdx, queryVec, topK, onProgress, maxRows = null) {
-        const entry = await this.getColumnOffsetEntry(colIdx);
-        const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
-        const metaInfo = this._parseColumnMeta(new Uint8Array(colMeta));
-
-        if (!metaInfo.pages || metaInfo.pages.length === 0) {
-            return { indices: [], scores: [], usedIndex: false };
-        }
-
-        // Get dimension from first page
-        const firstPage = metaInfo.pages[0];
-        const dataIdx = firstPage.sizes.length > 1 ? 1 : 0;
-        const firstPageSize = firstPage.sizes[dataIdx] || 0;
-        const firstPageRows = firstPage.rows || 0;
-
-        if (firstPageRows === 0 || firstPageSize === 0) {
-            return { indices: [], scores: [], usedIndex: false };
-        }
-
-        const dim = Math.floor(firstPageSize / (firstPageRows * 4));
-        const vecSize = dim * 4;
-        const totalRows = maxRows || metaInfo.rows;
-        const batchSize = 1000; // Process 1000 vectors at a time
-        const topResults = [];
-
-        let globalRowIdx = 0;
-        let scannedRows = 0;
-
-        // Process each page
-        for (let pageIdx = 0; pageIdx < metaInfo.pages.length; pageIdx++) {
-            // Check if we've reached the row limit
-            if (maxRows && scannedRows >= maxRows) break;
-
-            const page = metaInfo.pages[pageIdx];
-            const pageDataIdx = page.sizes.length > 1 ? 1 : 0;
-            const pageOffset = page.offsets[pageDataIdx] || 0;
-            const pageRows = page.rows || 0;
-
-            if (pageRows === 0) continue;
-
-            // Calculate how many rows to scan from this page
-            const rowsToScanFromPage = maxRows
-                ? Math.min(pageRows, maxRows - scannedRows)
-                : pageRows;
-
-            // Stream this page in batches
-            for (let batchStart = 0; batchStart < rowsToScanFromPage; batchStart += batchSize) {
-                const batchEnd = Math.min(batchStart + batchSize, rowsToScanFromPage);
-                const batchCount = batchEnd - batchStart;
-
-                if (onProgress) {
-                    onProgress(scannedRows + batchStart, totalRows);
-                }
-
-                // Fetch just this batch
-                const startOffset = pageOffset + batchStart * vecSize;
-                const endOffset = pageOffset + batchEnd * vecSize - 1;
-                const data = await this.fetchRange(startOffset, endOffset);
-
-                // Compute similarities for this batch
-                // data is ArrayBuffer from fetchRange, create Float32Array view directly
-                const floatData = new Float32Array(data);
-
-                // Debug: log first batch data
-                if (scannedRows === 0 && batchStart === 0) {
-                    console.log(`[VectorSearch Debug] colIdx=${colIdx}, pageOffset=${pageOffset}`);
-                    console.log(`[VectorSearch Debug] First vector (8 values):`, Array.from(floatData.slice(0, 8)).map(v => v.toFixed(4)));
-                    console.log(`[VectorSearch Debug] Query vec (8 values):`, Array.from(queryVec.slice(0, 8)).map(v => v.toFixed(4)));
-                    console.log(`[VectorSearch Debug] data.byteLength=${data.byteLength}, floatData.length=${floatData.length}, dim=${dim}, batchCount=${batchCount}`);
-                }
-
-                for (let i = 0; i < batchCount; i++) {
-                    const rowIdx = globalRowIdx + batchStart + i;
-                    const vecStart = i * dim;
-
-                    // Compute cosine similarity (optimized)
-                    let dot = 0, normB = 0;
-                    for (let j = 0; j < dim; j++) {
-                        const v = floatData[vecStart + j];
-                        dot += queryVec[j] * v;
-                        normB += v * v;
-                    }
-
-                    // For normalized vectors (CLIP), normB ≈ 1, so score ≈ dot
-                    // But compute full cosine for safety
-                    const normA = 1.0; // Assume query is normalized
-                    const denom = Math.sqrt(normA) * Math.sqrt(normB);
-                    const score = denom === 0 ? 0 : dot / denom;
-
-                    // Insert into top-k using binary search for efficiency
-                    if (topResults.length < topK) {
-                        topResults.push({ idx: rowIdx, score });
-                        topResults.sort((a, b) => b.score - a.score);
-                    } else if (score > topResults[topK - 1].score) {
-                        topResults[topK - 1] = { idx: rowIdx, score };
-                        topResults.sort((a, b) => b.score - a.score);
-                    }
-                }
-            }
-
-            globalRowIdx += pageRows;
-            scannedRows += rowsToScanFromPage;
-        }
-
-        if (onProgress) {
-            onProgress(scannedRows, totalRows);
-        }
-
-        return {
-            indices: topResults.map(r => r.idx),
-            scores: topResults.map(r => r.score),
-            usedIndex: false
-        };
-    }
-
-    /**
-     * Wrapper for vector search that returns results in worker-compatible format.
-     * @param {number} colIdx - Vector column index
-     * @param {Float32Array} queryVec - Query vector
-     * @param {number} topK - Number of results
-     * @param {boolean} normalized - Whether vectors are L2-normalized (unused, always computes full cosine)
-     * @param {number} maxRows - Maximum rows to scan (optional, defaults to all)
-     * @returns {Promise<{indices: Uint32Array, scores: Float32Array, count: number}>}
-     */
-    async vectorSearchTopK(colIdx, queryVec, topK, normalized = true, maxRows = null) {
-        const result = await this._vectorSearchBruteForce(colIdx, queryVec, topK, null, maxRows);
-        return {
-            indices: new Uint32Array(result.indices),
-            scores: new Float32Array(result.scores),
-            count: result.indices.length
-        };
-    }
+    // NOTE: _searchWithEstimatedPartitions and _vectorSearchBruteForce have been removed.
+    // All vector search now requires IVF index with proper partition mapping.
+    // Use LanceDataset for multi-fragment datasets with ivf_partitions.bin.
 
     /**
      * Read all vectors from a column as a flat Float32Array.

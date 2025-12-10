@@ -963,6 +963,10 @@
             color: #64748b;
             font-size: 11px;
         }
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
     </style>
 </head>
 <body>
@@ -3400,6 +3404,20 @@
             return new Float32Array(clipWasm.memory.buffer, outputBuf, outputDim).slice();
         }
 
+        function showSearchLoading() {
+            const body = document.getElementById('results-body');
+            document.getElementById('results-count').textContent = 'Searching...';
+            body.innerHTML = `
+                <div class="empty-state">
+                    <svg class="spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="animation: spin 1s linear infinite;">
+                        <circle cx="12" cy="12" r="10" stroke-dasharray="32" stroke-dashoffset="12"/>
+                    </svg>
+                    <h3>Searching...</h3>
+                    <p>Finding similar items using IVF index</p>
+                </div>
+            `;
+        }
+
         async function runClipSearch() {
             const text = document.getElementById('clip-text-input').value.trim();
             if (!text) {
@@ -3418,6 +3436,7 @@
 
             try {
                 setLoading(true);
+                showSearchLoading();
 
                 let queryVec;
                 const modelName = isImageMode ? 'CLIP' : 'MiniLM';
