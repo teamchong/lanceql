@@ -45,3 +45,4 @@ node_modules/
 !examples/wasm/*.wasm
 
 CLAUDE.md
+tests/fixtures/lance-repo
