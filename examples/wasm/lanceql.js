@@ -5596,6 +5596,7 @@ export class RemoteLanceDataset {
         this._fragmentFiles = new Map(); // Cache of opened RemoteLanceFile per fragment
         this._isRemote = true;
         this._ivfIndex = null; // IVF index for ANN search
+        this._deletedRows = new Map(); // Cache of deleted row Sets per fragment index
     }
 
     /**
@@ -5887,6 +5888,7 @@ export class RemoteLanceDataset {
                 let fragId = null;
                 let filePath = null;
                 let numRows = 0;
+                let deletionFile = null;  // Track deletion info
 
                 while (pos < fragEnd) {
                     const fTag = readVarint();
@@ -5896,7 +5898,7 @@ export class RemoteLanceDataset {
                     if (fWire === 0) {
                         const val = readVarint();
                         if (fNum === 1) fragId = val;  // Fragment.id
-                        else if (fNum === 4) numRows = val;  // Fragment.num_rows (physical_rows)
+                        else if (fNum === 4) numRows = val;  // Fragment.physical_rows
                     } else if (fWire === 2) {
                         const len = readVarint();
                         const content = protoData.slice(pos, pos + len);
@@ -5936,6 +5938,9 @@ export class RemoteLanceDataset {
                                     innerPos += 8;
                                 }
                             }
+                        } else if (fNum === 3) {
+                            // Fragment.deletion_file - parse DeletionFile message
+                            deletionFile = this._parseDeletionFile(content, fragId);
                         }
                     } else {
                         skipField(fWire);
@@ -5943,10 +5948,13 @@ export class RemoteLanceDataset {
                 }
 
                 if (filePath) {
+                    const logicalRows = deletionFile ? numRows - deletionFile.numDeletedRows : numRows;
                     fragments.push({
                         id: fragId,
                         path: filePath,
-                        numRows: numRows,
+                        numRows: logicalRows,  // Logical rows (excluding deleted)
+                        physicalRows: numRows, // Physical rows (including deleted)
+                        deletionFile: deletionFile,
                         url: `${this.baseUrl}/data/${filePath}`
                     });
                 }
@@ -5959,6 +5967,242 @@ export class RemoteLanceDataset {
         this._fragments = fragments;
         this._numColumns = fields.length;
         this._totalRows = fragments.reduce((sum, f) => sum + f.numRows, 0);
+
+        // Track if any fragment has deletions
+        const deletedCount = fragments.reduce((sum, f) => sum + (f.deletionFile?.numDeletedRows || 0), 0);
+        if (deletedCount > 0) {
+            console.log(`[LanceQL Dataset] Has ${deletedCount} deleted rows across fragments`);
+        }
+    }
+
+    /**
+     * Parse DeletionFile protobuf message.
+     * @param {Uint8Array} data - Raw protobuf bytes
+     * @param {number} fragId - Fragment ID for path construction
+     * @returns {Object|null} Deletion file info
+     * @private
+     */
+    _parseDeletionFile(data, fragId) {
+        let fileType = 0;  // 0 = ARROW_ARRAY, 1 = BITMAP
+        let readVersion = 0;
+        let id = 0;
+        let numDeletedRows = 0;
+
+        let pos = 0;
+        const readVarint = () => {
+            let result = 0;
+            let shift = 0;
+            while (pos < data.length) {
+                const b = data[pos++];
+                result |= (b & 0x7F) << shift;
+                if ((b & 0x80) === 0) break;
+                shift += 7;
+            }
+            return result;
+        };
+
+        while (pos < data.length) {
+            const tag = readVarint();
+            const fieldNum = tag >> 3;
+            const wireType = tag & 0x7;
+
+            if (wireType === 0) {
+                const val = readVarint();
+                if (fieldNum === 1) fileType = val;       // DeletionFile.file_type
+                else if (fieldNum === 2) readVersion = val; // DeletionFile.read_version
+                else if (fieldNum === 3) id = val;        // DeletionFile.id
+                else if (fieldNum === 4) numDeletedRows = val; // DeletionFile.num_deleted_rows
+            } else if (wireType === 2) {
+                const len = readVarint();
+                pos += len; // Skip length-delimited fields
+            } else if (wireType === 5) {
+                pos += 4;
+            } else if (wireType === 1) {
+                pos += 8;
+            }
+        }
+
+        if (numDeletedRows === 0) return null;
+
+        const ext = fileType === 0 ? 'arrow' : 'bin';
+        const path = `_deletions/${fragId}-${readVersion}-${id}.${ext}`;
+
+        return {
+            fileType: fileType === 0 ? 'arrow' : 'bitmap',
+            readVersion,
+            id,
+            numDeletedRows,
+            path,
+            url: `${this.baseUrl}/${path}`
+        };
+    }
+
+    /**
+     * Load deleted row indices for a fragment.
+     * @param {number} fragmentIndex - Fragment index
+     * @returns {Promise<Set<number>>} Set of deleted row indices (local to fragment)
+     * @private
+     */
+    async _loadDeletedRows(fragmentIndex) {
+        // Check cache
+        if (this._deletedRows.has(fragmentIndex)) {
+            return this._deletedRows.get(fragmentIndex);
+        }
+
+        const frag = this._fragments[fragmentIndex];
+        if (!frag?.deletionFile) {
+            const emptySet = new Set();
+            this._deletedRows.set(fragmentIndex, emptySet);
+            return emptySet;
+        }
+
+        const { url, fileType, numDeletedRows } = frag.deletionFile;
+        console.log(`[LanceQL] Loading ${numDeletedRows} deletions from ${url} (${fileType})`);
+
+        try {
+            const response = await fetch(url);
+            if (!response.ok) {
+                console.warn(`[LanceQL] Failed to load deletion file: ${response.status}`);
+                const emptySet = new Set();
+                this._deletedRows.set(fragmentIndex, emptySet);
+                return emptySet;
+            }
+
+            const buffer = await response.arrayBuffer();
+            const data = new Uint8Array(buffer);
+            let deletedSet;
+
+            if (fileType === 'arrow') {
+                deletedSet = this._parseArrowDeletions(data);
+            } else {
+                deletedSet = this._parseRoaringBitmap(data);
+            }
+
+            console.log(`[LanceQL] Loaded ${deletedSet.size} deleted rows for fragment ${fragmentIndex}`);
+            this._deletedRows.set(fragmentIndex, deletedSet);
+            return deletedSet;
+        } catch (e) {
+            console.error(`[LanceQL] Error loading deletion file:`, e);
+            const emptySet = new Set();
+            this._deletedRows.set(fragmentIndex, emptySet);
+            return emptySet;
+        }
+    }
+
+    /**
+     * Parse Arrow IPC deletion file (Int32Array of deleted indices).
+     * @param {Uint8Array} data - Raw Arrow IPC bytes
+     * @returns {Set<number>} Set of deleted row indices
+     * @private
+     */
+    _parseArrowDeletions(data) {
+        // Arrow IPC format: Magic (ARROW1) + schema + record batch
+        // For simplicity, we look for the Int32 data after the schema
+        const deletedSet = new Set();
+
+        // Find continuation marker (-1 as int32 LE = 0xFFFFFFFF)
+        // Then record batch metadata length, then metadata, then body (Int32 array)
+        let pos = 0;
+
+        // Skip magic "ARROW1" + padding
+        if (data.length >= 8 && String.fromCharCode(...data.slice(0, 6)) === 'ARROW1') {
+            pos = 8;
+        }
+
+        // Look for continuation markers and skip metadata
+        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+
+        while (pos < data.length - 4) {
+            const marker = view.getInt32(pos, true);
+            if (marker === -1) {
+                // Continuation marker found
+                pos += 4;
+                if (pos + 4 > data.length) break;
+                const metaLen = view.getInt32(pos, true);
+                pos += 4 + metaLen; // Skip metadata
+
+                // The body follows - for deletion vectors it's just Int32 array
+                // We need to read until end or next message
+                while (pos + 4 <= data.length) {
+                    // Check if this looks like the start of data (not another marker)
+                    const nextMarker = view.getInt32(pos, true);
+                    if (nextMarker === -1) break; // Another message starts
+
+                    // Read Int32 values until we hit something that looks like a marker
+                    // or reach expected count
+                    const val = view.getInt32(pos, true);
+                    if (val >= 0 && val < 10000000) { // Sanity check
+                        deletedSet.add(val);
+                    }
+                    pos += 4;
+                }
+            } else {
+                pos++;
+            }
+        }
+
+        return deletedSet;
+    }
+
+    /**
+     * Parse Roaring Bitmap deletion file.
+     * @param {Uint8Array} data - Raw Roaring Bitmap bytes
+     * @returns {Set<number>} Set of deleted row indices
+     * @private
+     */
+    _parseRoaringBitmap(data) {
+        // Roaring bitmap format: header + containers
+        // This is a simplified parser for common cases
+        const deletedSet = new Set();
+        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+
+        if (data.length < 8) return deletedSet;
+
+        // Read cookie (first 4 bytes indicate format)
+        const cookie = view.getUint32(0, true);
+
+        // Standard roaring format: cookie = 12346 or 12347
+        // Portable format: first 8 bytes are magic
+        if (cookie === 12346 || cookie === 12347) {
+            // Standard format
+            const isRunContainer = (cookie === 12347);
+            let pos = 4;
+
+            // Number of containers
+            const numContainers = view.getUint16(pos, true);
+            pos += 2;
+
+            // Skip to container data
+            // Each key is 2 bytes, each cardinality is 2 bytes
+            const keysStart = pos;
+            pos += numContainers * 4; // keys + cardinalities
+
+            for (let i = 0; i < numContainers && pos < data.length; i++) {
+                const key = view.getUint16(keysStart + i * 4, true);
+                const card = view.getUint16(keysStart + i * 4 + 2, true) + 1;
+                const baseValue = key << 16;
+
+                // Read container values (simplified - assumes array container)
+                for (let j = 0; j < card && pos + 2 <= data.length; j++) {
+                    const lowBits = view.getUint16(pos, true);
+                    deletedSet.add(baseValue | lowBits);
+                    pos += 2;
+                }
+            }
+        }
+
+        return deletedSet;
+    }
+
+    /**
+     * Check if a row is deleted in a fragment.
+     * @param {number} fragmentIndex - Fragment index
+     * @param {number} localRowIndex - Row index within the fragment
+     * @returns {Promise<boolean>} True if row is deleted
+     */
+    async isRowDeleted(fragmentIndex, localRowIndex) {
+        const deletedSet = await this._loadDeletedRows(fragmentIndex);
+        return deletedSet.has(localRowIndex);
     }
 
     /**
