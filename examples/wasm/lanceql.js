@@ -2817,7 +2817,16 @@ export class RemoteLanceFile {
                 const data = await this.fetchRange(startOffset, endOffset);
 
                 // Compute similarities for this batch
-                const floatData = new Float32Array(data.buffer, data.byteOffset, batchCount * dim);
+                // Ensure proper alignment for Float32Array by copying to aligned buffer if needed
+                let floatData;
+                if (data.byteOffset % 4 === 0) {
+                    floatData = new Float32Array(data.buffer, data.byteOffset, batchCount * dim);
+                } else {
+                    // Copy to aligned buffer
+                    const alignedBuffer = new ArrayBuffer(batchCount * dim * 4);
+                    new Uint8Array(alignedBuffer).set(data);
+                    floatData = new Float32Array(alignedBuffer);
+                }
 
                 for (let i = 0; i < batchCount; i++) {
                     const rowIdx = globalRowIdx + batchStart + i;
@@ -2924,9 +2933,18 @@ export class RemoteLanceFile {
             if (pageSize === 0) return { pageIdx, data: new Float32Array(0), rows: 0 };
 
             const data = await this.fetchRange(pageOffset, pageOffset + pageSize - 1);
+            // Ensure proper alignment for Float32Array
+            let floatData;
+            if (data.byteOffset % 4 === 0) {
+                floatData = new Float32Array(data.buffer, data.byteOffset, page.rows * dim);
+            } else {
+                const alignedBuffer = new ArrayBuffer(page.rows * dim * 4);
+                new Uint8Array(alignedBuffer).set(data);
+                floatData = new Float32Array(alignedBuffer);
+            }
             return {
                 pageIdx,
-                data: new Float32Array(data.buffer, data.byteOffset, page.rows * dim),
+                data: floatData,
                 rows: page.rows
             };
         });
