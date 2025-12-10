@@ -4406,11 +4406,17 @@ export class SQLParser {
             let encoder = 'minilm'; // default
             let column = null;
 
-            // USING encoder
+            // USING encoder (minilm, clip-openai, clip-laion)
             if (this.match(TokenType.USING)) {
-                encoder = this.expect(TokenType.IDENTIFIER).value.toLowerCase();
-                if (encoder !== 'minilm' && encoder !== 'clip') {
-                    throw new Error(`Unknown encoder: ${encoder}. Supported: minilm, clip`);
+                let encoderName = this.expect(TokenType.IDENTIFIER).value.toLowerCase();
+                // Handle hyphenated names like clip-openai
+                if (this.match(TokenType.MINUS)) {
+                    encoderName += '-' + this.expect(TokenType.IDENTIFIER).value.toLowerCase();
+                }
+                encoder = encoderName;
+                const validEncoders = ['minilm', 'clip', 'clip-openai', 'clip-laion'];
+                if (!validEncoders.includes(encoder)) {
+                    throw new Error(`Unknown encoder: ${encoder}. Supported: minilm, clip-openai, clip-laion`);
                 }
             }
 

@@ -1135,8 +1135,9 @@
                     <div class="sql-examples">
                         <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50">First 50 rows</button>
                         <button class="sql-example" id="random-sample-btn">Random 20 rows</button>
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'cat' LIMIT 20">Search 'cat'</button>
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'sunset beach' USING clip LIMIT 20">CLIP search</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'cat' LIMIT 20">MiniLM text (87MB)</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'sunset beach' USING clip-openai LIMIT 20">CLIP OpenAI (122MB)</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'sunset beach' USING clip-laion LIMIT 20">CLIP LAION (290MB)</button>
                     </div>
                 </div>
                 <div class="run-section">
@@ -1156,10 +1157,11 @@
                         <div class="df-step-num">1</div>
                         <div class="df-step-label">Search</div>
                         <input type="text" id="df-search-query" placeholder="e.g. cat, sunset beach" style="width: 150px;">
-                        <select id="df-search-encoder" style="width: 90px;">
+                        <select id="df-search-encoder" style="width: 180px;">
                             <option value="">No search</option>
-                            <option value="minilm">MiniLM</option>
-                            <option value="clip">CLIP</option>
+                            <option value="minilm">MiniLM text (87MB)</option>
+                            <option value="clip-openai">CLIP OpenAI (122MB)</option>
+                            <option value="clip-laion">CLIP LAION (290MB)</option>
                         </select>
                     </div>
                     <div class="df-step">
@@ -1416,7 +1418,7 @@
         // SQL syntax highlighting
         function highlightSQL(sql) {
             const keywords = /\b(SELECT|FROM|WHERE|AND|OR|NOT|ORDER|BY|ASC|DESC|LIMIT|OFFSET|AS|NULL|IS|IN|BETWEEN|LIKE|TRUE|FALSE|GROUP|HAVING|DISTINCT|JOIN|LEFT|RIGHT|INNER|OUTER|ON|UNION|ALL|INSERT|UPDATE|DELETE|CREATE|DROP|TABLE|INDEX|VIEW|SEARCH|USING)\b/gi;
-            const functions = /\b(read_lance|COUNT|SUM|AVG|MIN|MAX|COALESCE|CAST|UPPER|LOWER|LENGTH|SUBSTRING|CONCAT|ABS|ROUND|FLOOR|CEIL|minilm|clip)\b/gi;
+            const functions = /\b(read_lance|COUNT|SUM|AVG|MIN|MAX|COALESCE|CAST|UPPER|LOWER|LENGTH|SUBSTRING|CONCAT|ABS|ROUND|FLOOR|CEIL|minilm|clip|clip-openai|clip-laion)\b/gi;
             const strings = /('(?:[^'\\]|\\.)*')/g;
             const numbers = /\b(\d+\.?\d*)\b/g;
             const operators = /([=<>!]+|[+\-*\/])/g;
@@ -3659,7 +3661,15 @@
 
             // Get query vector using appropriate encoder
             let queryVec;
-            if (encoder === 'clip') {
+            if (encoder === 'clip' || encoder === 'clip-openai' || encoder === 'clip-laion') {
+                // Select CLIP model URL based on encoder
+                const clipModelSelect = document.getElementById('clip-model-select');
+                if (encoder === 'clip-openai') {
+                    clipModelSelect.value = 'https://data.metal0.dev/models/clip-vit-b32-openai.gguf';
+                } else if (encoder === 'clip-laion') {
+                    clipModelSelect.value = 'https://data.metal0.dev/models/clip-vit-b32.gguf';
+                }
+
                 if (!clipModelLoaded) {
                     const loaded = await ensureClipModelLoaded();
                     if (!loaded) {
