@@ -2888,7 +2888,7 @@
                     selectedCols = ops.select.map(name => colNames.indexOf(name)).filter(i => i >= 0);
                 }
 
-                const limit = ops.limit || 10000; // No limit specified = fetch up to 10k rows
+                const limit = ops.limit || 50; // Default to 50 to align with SQL
 
                 // If search query is specified, run vector search instead
                 if (ops.search) {
