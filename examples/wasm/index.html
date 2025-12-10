@@ -852,6 +852,64 @@
         .column-chip .type.float32 { background: #7c2d12; color: #fdba74; }
         .column-chip .type.unknown { background: #374151; color: #9ca3af; }
         .column-chip .type.vector { background: #7c3aed; color: #ddd6fe; }
+        .column-chip {
+            cursor: pointer;
+            transition: transform 0.1s, box-shadow 0.1s;
+            position: relative;
+        }
+        .column-chip:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        }
+        .column-chip.loading::after {
+            content: '...';
+            margin-left: 4px;
+        }
+        .column-stats-popup {
+            position: fixed;
+            background: #1e293b;
+            border: 1px solid #475569;
+            border-radius: 8px;
+            padding: 12px;
+            z-index: 1000;
+            min-width: 200px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+            font-size: 12px;
+        }
+        .column-stats-popup h4 {
+            margin: 0 0 8px 0;
+            color: #e2e8f0;
+            font-size: 13px;
+            border-bottom: 1px solid #475569;
+            padding-bottom: 6px;
+        }
+        .column-stats-popup .stat-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 3px 0;
+            color: #94a3b8;
+        }
+        .column-stats-popup .stat-row .label {
+            color: #64748b;
+        }
+        .column-stats-popup .stat-row .value {
+            color: #e2e8f0;
+            font-family: 'SF Mono', Monaco, monospace;
+        }
+        .column-stats-popup .close-btn {
+            position: absolute;
+            top: 8px;
+            right: 8px;
+            background: none;
+            border: none;
+            color: #64748b;
+            cursor: pointer;
+            font-size: 16px;
+            line-height: 1;
+        }
+        .column-stats-popup .close-btn:hover {
+            color: #e2e8f0;
+        }
 
         /* Vector Search */
         .vector-search {
@@ -1936,13 +1994,122 @@
             for (let i = 0; i < columnTypes.length; i++) {
                 const type = columnTypes[i] || 'unknown';
                 const name = names[i] || `column_${i}`;
-                container.innerHTML += `
-                    <div class="column-chip">
-                        ${name}
-                        <span class="type ${type}">${type}</span>
-                    </div>
-                `;
+                const chip = document.createElement('div');
+                chip.className = 'column-chip';
+                chip.dataset.colIdx = i;
+                chip.innerHTML = `${name}<span class="type ${type}">${type}</span>`;
+                chip.addEventListener('click', (e) => showColumnStats(i, name, type, e));
+                container.appendChild(chip);
             }
+        }
+
+        // Show column statistics popup
+        async function showColumnStats(colIdx, colName, colType, event) {
+            // Remove any existing popup
+            document.querySelectorAll('.column-stats-popup').forEach(p => p.remove());
+
+            const chip = event.currentTarget;
+            chip.classList.add('loading');
+
+            try {
+                // Calculate stats based on column type
+                let stats = { type: colType };
+
+                if (!currentFile?._isRemote) {
+                    stats.error = 'Stats only available for remote datasets';
+                } else if (colType === 'vector') {
+                    // For vectors, show dimension info
+                    const info = await currentFile.getVectorInfo(colIdx);
+                    stats.dimension = info.dimension;
+                    stats.rows = info.rows;
+                } else if (colType === 'string') {
+                    // Sample first 100 strings for stats
+                    const sample = await currentFile.readStringsAtIndices(colIdx, Array.from({length: Math.min(100, currentFile.rowCount || 100)}, (_, i) => i));
+                    const lengths = sample.filter(s => s).map(s => s.length);
+                    stats.sampleSize = sample.length;
+                    stats.nullCount = sample.filter(s => !s).length;
+                    stats.avgLength = lengths.length > 0 ? Math.round(lengths.reduce((a, b) => a + b, 0) / lengths.length) : 0;
+                    stats.maxLength = lengths.length > 0 ? Math.max(...lengths) : 0;
+                } else if (colType.includes('int') || colType.includes('float') || colType === 'double') {
+                    // Sample first 100 values for numeric stats
+                    let values;
+                    if (colType.includes('int')) {
+                        values = await currentFile.readInt64AtIndices(colIdx, Array.from({length: Math.min(100, currentFile.rowCount || 100)}, (_, i) => i));
+                        values = Array.from(values).map(v => Number(v));
+                    } else {
+                        values = await currentFile.readFloat64AtIndices(colIdx, Array.from({length: Math.min(100, currentFile.rowCount || 100)}, (_, i) => i));
+                        values = Array.from(values);
+                    }
+                    const validValues = values.filter(v => v !== null && !isNaN(v));
+                    stats.sampleSize = values.length;
+                    stats.nullCount = values.length - validValues.length;
+                    if (validValues.length > 0) {
+                        stats.min = Math.min(...validValues);
+                        stats.max = Math.max(...validValues);
+                        stats.avg = validValues.reduce((a, b) => a + b, 0) / validValues.length;
+                    }
+                }
+
+                // Create popup
+                const popup = document.createElement('div');
+                popup.className = 'column-stats-popup';
+
+                let html = `<button class="close-btn">&times;</button><h4>${colName}</h4>`;
+
+                if (stats.error) {
+                    html += `<div class="stat-row"><span class="value">${stats.error}</span></div>`;
+                } else if (colType === 'vector') {
+                    html += `<div class="stat-row"><span class="label">Dimension:</span><span class="value">${stats.dimension}</span></div>`;
+                    html += `<div class="stat-row"><span class="label">Rows:</span><span class="value">${stats.rows?.toLocaleString()}</span></div>`;
+                } else if (colType === 'string') {
+                    html += `<div class="stat-row"><span class="label">Sample size:</span><span class="value">${stats.sampleSize}</span></div>`;
+                    html += `<div class="stat-row"><span class="label">Null count:</span><span class="value">${stats.nullCount}</span></div>`;
+                    html += `<div class="stat-row"><span class="label">Avg length:</span><span class="value">${stats.avgLength}</span></div>`;
+                    html += `<div class="stat-row"><span class="label">Max length:</span><span class="value">${stats.maxLength}</span></div>`;
+                } else {
+                    html += `<div class="stat-row"><span class="label">Sample size:</span><span class="value">${stats.sampleSize}</span></div>`;
+                    html += `<div class="stat-row"><span class="label">Null count:</span><span class="value">${stats.nullCount}</span></div>`;
+                    if (stats.min !== undefined) {
+                        html += `<div class="stat-row"><span class="label">Min:</span><span class="value">${formatNumber(stats.min)}</span></div>`;
+                        html += `<div class="stat-row"><span class="label">Max:</span><span class="value">${formatNumber(stats.max)}</span></div>`;
+                        html += `<div class="stat-row"><span class="label">Avg:</span><span class="value">${formatNumber(stats.avg)}</span></div>`;
+                    }
+                }
+
+                popup.innerHTML = html;
+
+                // Position popup near the chip
+                const rect = chip.getBoundingClientRect();
+                popup.style.top = (rect.bottom + 8) + 'px';
+                popup.style.left = rect.left + 'px';
+
+                document.body.appendChild(popup);
+
+                // Close button handler
+                popup.querySelector('.close-btn').addEventListener('click', () => popup.remove());
+
+                // Close on click outside
+                setTimeout(() => {
+                    document.addEventListener('click', function closePopup(e) {
+                        if (!popup.contains(e.target) && !chip.contains(e.target)) {
+                            popup.remove();
+                            document.removeEventListener('click', closePopup);
+                        }
+                    });
+                }, 100);
+
+            } catch (e) {
+                console.error('Failed to get column stats:', e);
+                showStatus(`Failed to get stats: ${e.message}`, 'error');
+            } finally {
+                chip.classList.remove('loading');
+            }
+        }
+
+        function formatNumber(n) {
+            if (n === null || n === undefined) return 'N/A';
+            if (Number.isInteger(n)) return n.toLocaleString();
+            return n.toFixed(4);
         }
 
         // Generate plain Python code from UI inputs
