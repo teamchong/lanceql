@@ -4935,6 +4935,31 @@ export class RemoteLanceDataset {
     }
 
     /**
+     * Get vector info for a column by querying first fragment.
+     * @param {number} colIdx - Column index
+     * @returns {Promise<{rows: number, dimension: number}>}
+     */
+    async getVectorInfo(colIdx) {
+        if (this._fragments.length === 0) {
+            return { rows: 0, dimension: 0 };
+        }
+
+        // Get vector info from first fragment
+        const file = await this.openFragment(0);
+        const fragInfo = await file.getVectorInfo(colIdx);
+
+        if (fragInfo.dimension === 0) {
+            return { rows: 0, dimension: 0 };
+        }
+
+        // Return total rows across all fragments, dimension from first fragment
+        return {
+            rows: this._totalRows,
+            dimension: fragInfo.dimension
+        };
+    }
+
+    /**
      * Get column names from schema.
      */
     get columnNames() {
