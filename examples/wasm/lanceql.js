@@ -6,6 +6,124 @@
  * Supports both local files and remote URLs via HTTP Range requests.
  */
 
+/**
+ * IndexedDB cache for dataset metadata.
+ * Caches schema, column types, and fragment info to speed up repeat visits.
+ */
+class MetadataCache {
+    constructor(dbName = 'lanceql-cache', version = 1) {
+        this.dbName = dbName;
+        this.version = version;
+        this.db = null;
+    }
+
+    async open() {
+        if (this.db) return this.db;
+
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open(this.dbName, this.version);
+
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => {
+                this.db = request.result;
+                resolve(this.db);
+            };
+
+            request.onupgradeneeded = (event) => {
+                const db = event.target.result;
+                if (!db.objectStoreNames.contains('datasets')) {
+                    const store = db.createObjectStore('datasets', { keyPath: 'url' });
+                    store.createIndex('timestamp', 'timestamp');
+                }
+            };
+        });
+    }
+
+    /**
+     * Get cached metadata for a dataset URL.
+     * @param {string} url - Dataset URL
+     * @returns {Promise<Object|null>} Cached metadata or null
+     */
+    async get(url) {
+        try {
+            const db = await this.open();
+            return new Promise((resolve) => {
+                const tx = db.transaction('datasets', 'readonly');
+                const store = tx.objectStore('datasets');
+                const request = store.get(url);
+                request.onsuccess = () => resolve(request.result || null);
+                request.onerror = () => resolve(null);
+            });
+        } catch (e) {
+            console.warn('[MetadataCache] Get failed:', e);
+            return null;
+        }
+    }
+
+    /**
+     * Cache metadata for a dataset URL.
+     * @param {string} url - Dataset URL
+     * @param {Object} metadata - Metadata to cache (schema, columnTypes, fragments, etc.)
+     */
+    async set(url, metadata) {
+        try {
+            const db = await this.open();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction('datasets', 'readwrite');
+                const store = tx.objectStore('datasets');
+                const data = {
+                    url,
+                    timestamp: Date.now(),
+                    ...metadata
+                };
+                const request = store.put(data);
+                request.onsuccess = () => resolve();
+                request.onerror = () => reject(request.error);
+            });
+        } catch (e) {
+            console.warn('[MetadataCache] Set failed:', e);
+        }
+    }
+
+    /**
+     * Delete cached metadata for a URL.
+     * @param {string} url - Dataset URL
+     */
+    async delete(url) {
+        try {
+            const db = await this.open();
+            return new Promise((resolve) => {
+                const tx = db.transaction('datasets', 'readwrite');
+                const store = tx.objectStore('datasets');
+                store.delete(url);
+                tx.oncomplete = () => resolve();
+            });
+        } catch (e) {
+            console.warn('[MetadataCache] Delete failed:', e);
+        }
+    }
+
+    /**
+     * Clear all cached metadata.
+     */
+    async clear() {
+        try {
+            const db = await this.open();
+            return new Promise((resolve) => {
+                const tx = db.transaction('datasets', 'readwrite');
+                const store = tx.objectStore('datasets');
+                store.clear();
+                tx.oncomplete = () => resolve();
+            });
+        } catch (e) {
+            console.warn('[MetadataCache] Clear failed:', e);
+        }
+    }
+}
+
+// Global cache instance
+const metadataCache = new MetadataCache();
+
 export class LanceQL {
     constructor(wasmInstance) {
         this.wasm = wasmInstance.exports;
@@ -5611,7 +5729,36 @@ export class RemoteLanceDataset {
     static async open(lanceql, baseUrl, options = {}) {
         const dataset = new RemoteLanceDataset(lanceql, baseUrl);
         dataset._requestedVersion = options.version || null;
-        await dataset._loadManifest();
+
+        // Try to load from cache first (unless skipCache is true)
+        const cacheKey = options.version ? `${baseUrl}@v${options.version}` : baseUrl;
+        if (!options.skipCache) {
+            const cached = await metadataCache.get(cacheKey);
+            if (cached && cached.schema && cached.fragments) {
+                console.log(`[LanceQL Dataset] Using cached metadata for ${baseUrl}`);
+                dataset._schema = cached.schema;
+                dataset._fragments = cached.fragments;
+                dataset._numColumns = cached.schema.length;
+                dataset._totalRows = cached.fragments.reduce((sum, f) => sum + f.numRows, 0);
+                dataset._version = cached.version;
+                dataset._columnTypes = cached.columnTypes || null;
+                dataset._fromCache = true;
+            }
+        }
+
+        // If not cached, load from network
+        if (!dataset._fromCache) {
+            await dataset._loadManifest();
+
+            // Cache the metadata for next time
+            metadataCache.set(cacheKey, {
+                schema: dataset._schema,
+                fragments: dataset._fragments,
+                version: dataset._version,
+                columnTypes: null // Will be set after detectColumnTypes
+            }).catch(() => {}); // Don't block on cache errors
+        }
+
         await dataset._tryLoadIndex();
 
         // Prefetch fragment metadata for faster first query
@@ -6412,12 +6559,27 @@ export class RemoteLanceDataset {
      * @returns {Promise<string[]>}
      */
     async detectColumnTypes() {
+        // Return cached types if available
+        if (this._columnTypes && this._columnTypes.length > 0) {
+            return this._columnTypes;
+        }
+
         if (this._fragments.length === 0) {
             return [];
         }
         const file = await this.openFragment(0);
         const types = await file.detectColumnTypes();
         this._columnTypes = types;
+
+        // Update cache with column types
+        const cacheKey = this._requestedVersion ? `${this.baseUrl}@v${this._requestedVersion}` : this.baseUrl;
+        metadataCache.get(cacheKey).then(cached => {
+            if (cached) {
+                cached.columnTypes = types;
+                metadataCache.set(cacheKey, cached).catch(() => {});
+            }
+        }).catch(() => {});
+
         return types;
     }
 
