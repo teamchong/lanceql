@@ -6553,9 +6553,10 @@ export class RemoteLanceDataset {
      * @param {number} options.offset - Starting row offset
      * @param {number} options.limit - Maximum rows to return
      * @param {number[]} options.columns - Column indices to read (optional)
+     * @param {boolean} options._isPrefetch - Internal flag to prevent recursive prefetch
      * @returns {Promise<{columns: Array[], columnNames: string[], total: number}>}
      */
-    async readRows({ offset = 0, limit = 50, columns = null } = {}) {
+    async readRows({ offset = 0, limit = 50, columns = null, _isPrefetch = false } = {}) {
         // Determine which fragments contain the requested rows
         const fragmentRanges = [];
         let currentOffset = 0;
@@ -6616,11 +6617,48 @@ export class RemoteLanceDataset {
             mergedColumns.push(colData);
         }
 
-        return {
+        const result = {
             columns: mergedColumns,
             columnNames: colNames,
             total: this._totalRows
         };
+
+        // Speculative prefetch: if there are more rows, prefetch next page in background
+        // Only prefetch if: not already a prefetch, limit is reasonable, more rows exist
+        const nextOffset = offset + limit;
+        if (!_isPrefetch && nextOffset < this._totalRows && limit <= 100) {
+            this._prefetchNextPage(nextOffset, limit, columns);
+        }
+
+        return result;
+    }
+
+    /**
+     * Prefetch next page of rows in background.
+     * @private
+     */
+    _prefetchNextPage(offset, limit, columns) {
+        // Use a cache key to avoid duplicate prefetches
+        const cacheKey = `${offset}-${limit}-${columns?.join(',') || 'all'}`;
+        if (this._prefetchCache?.has(cacheKey)) {
+            return; // Already prefetching or prefetched
+        }
+
+        if (!this._prefetchCache) {
+            this._prefetchCache = new Map();
+        }
+
+        // Start prefetch in background (don't await)
+        const prefetchPromise = this.readRows({ offset, limit, columns, _isPrefetch: true })
+            .then(result => {
+                this._prefetchCache.set(cacheKey, result);
+                console.log(`[LanceQL] Prefetched rows ${offset}-${offset + limit}`);
+            })
+            .catch(() => {
+                // Ignore prefetch errors
+            });
+
+        this._prefetchCache.set(cacheKey, prefetchPromise);
     }
 
     /**
