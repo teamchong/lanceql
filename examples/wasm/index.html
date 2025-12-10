@@ -250,14 +250,15 @@
             margin: 0;
             border: 1px solid #334155;
             border-radius: 8px;
-            font-family: 'Monaco', 'Consolas', monospace;
-            font-size: 14px;
-            line-height: 1.5;
+            font: 14px/1.5 ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+            letter-spacing: normal;
             white-space: pre-wrap;
             word-wrap: break-word;
             overflow-wrap: break-word;
             box-sizing: border-box;
             overflow: auto;
+            tab-size: 4;
+            -moz-tab-size: 4;
         }
         .sql-highlight {
             background: #0f172a;
@@ -271,6 +272,7 @@
             caret-color: #e2e8f0;
             resize: none;
             z-index: 2;
+            -webkit-text-fill-color: transparent;
         }
         .sql-textarea:focus {
             outline: none;
