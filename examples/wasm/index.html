@@ -1197,8 +1197,11 @@
                             </label>
                         </div>
                         <div class="clip-model-select">
-                            <label>CLIP Model:</label>
-                            <span style="color: #94a3b8; font-size: 13px;">OpenAI ViT-B/32 (Transformers.js)</span>
+                            <label for="clip-model">CLIP Model:</label>
+                            <select id="clip-model">
+                                <option value="https://data.metal0.dev/models/clip-vit-b32-openai.gguf">OpenAI ViT-B/32 (122MB)</option>
+                                <option value="https://data.metal0.dev/models/clip-vit-b32.gguf">LAION ViT-B/32 (290MB)</option>
+                            </select>
                         </div>
                     </div>
                     <div class="clip-text-input">
@@ -3241,17 +3244,41 @@
         });
 
         // =============================================
-        // CLIP Text-to-Image Search Integration (Transformers.js)
+        // CLIP Text-to-Image Search Integration
         // =============================================
-        let clipTokenizer = null;
-        let clipTextModel = null;
+        let clipWasm = null;
         let clipModelLoaded = false;
         let clipModelLoading = false;
+        let currentClipModel = null; // Track which model is loaded
 
         async function initClipWasm() {
-            // Initialize Transformers.js CLIP (lazy load)
-            updateClipStatus('Ready', '');
-            console.log('CLIP ready (using Transformers.js)');
+            try {
+                // CLIP functions are now in combined lanceql.wasm
+                // Wait for lanceql to be loaded first
+                if (!lanceql || !lanceql.wasm) {
+                    // lanceql not loaded yet, wait for it
+                    await new Promise(r => setTimeout(r, 100));
+                    if (!lanceql || !lanceql.wasm) {
+                        throw new Error('LanceQL WASM not loaded');
+                    }
+                }
+
+                // Use the combined WASM which has both Lance and CLIP functions
+                clipWasm = lanceql.wasm;
+
+                // Initialize CLIP
+                const initResult = clipWasm.clip_init();
+                if (initResult === 0) {
+                    console.log('CLIP WASM initialized (combined with LanceQL)');
+                    updateClipStatus('Ready', '');
+                } else {
+                    console.error('CLIP init failed:', initResult);
+                    updateClipStatus('Init Failed', 'error');
+                }
+            } catch (e) {
+                console.error('Failed to load CLIP WASM:', e);
+                updateClipStatus('WASM Error', 'error');
+            }
         }
 
         function updateClipStatus(text, state = '') {
@@ -3263,8 +3290,20 @@
         }
 
         async function ensureClipModelLoaded() {
-            if (clipModelLoaded) return true;
+            const selectedModel = document.getElementById('clip-model').value;
 
+            // Check if we need to reload (different model selected)
+            if (clipModelLoaded && currentClipModel === selectedModel) {
+                return true;
+            }
+
+            // If different model selected, need to reinitialize
+            if (clipModelLoaded && currentClipModel !== selectedModel) {
+                clipModelLoaded = false;
+                clipWasm.clip_init(); // Reset CLIP state
+            }
+
+            // Currently loading - wait
             if (clipModelLoading) {
                 while (clipModelLoading) {
                     await new Promise(r => setTimeout(r, 100));
@@ -3272,30 +3311,57 @@
                 return clipModelLoaded;
             }
 
+            // Need to load
             clipModelLoading = true;
-            updateClipStatus('Loading...', 'loading');
+            updateClipStatus('Downloading...', 'loading');
 
+            const modelSize = selectedModel.includes('openai') ? '128MB' : '304MB';
             try {
-                showStatus('Loading CLIP model (Transformers.js, ~100MB one-time download)...', 'info');
+                showStatus(`Downloading CLIP model (${modelSize}, one-time)...`, 'info');
 
-                // Dynamically import Transformers.js
-                const { AutoTokenizer, CLIPTextModelWithProjection } = await import(
-                    'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.0'
-                );
+                const response = await fetch(selectedModel);
+                if (!response.ok) {
+                    throw new Error(`${selectedModel} not found in examples/wasm/`);
+                }
 
-                // Load OpenAI CLIP ViT-B/32 (matches dataset embeddings)
-                const modelId = 'Xenova/clip-vit-base-patch32';
+                const modelData = await response.arrayBuffer();
+                console.log('Model downloaded:', modelData.byteLength, 'bytes');
+                showStatus(`Downloaded ${(modelData.byteLength / 1024 / 1024).toFixed(0)}MB, allocating memory...`, 'info');
 
-                showStatus('Downloading tokenizer...', 'info');
-                clipTokenizer = await AutoTokenizer.from_pretrained(modelId);
+                // Allocate and copy to WASM
+                console.log('Allocating WASM buffer...');
+                const bufPtr = clipWasm.clip_alloc_model_buffer(modelData.byteLength);
+                console.log('Buffer pointer:', bufPtr);
+                if (bufPtr === 0) {
+                    throw new Error('Failed to allocate WASM memory');
+                }
 
-                showStatus('Downloading text encoder (~100MB)...', 'info');
-                clipTextModel = await CLIPTextModelWithProjection.from_pretrained(modelId);
+                console.log('Copying model data to WASM...');
+                showStatus('Copying model to WASM memory...', 'info');
+                const wasmMem = new Uint8Array(clipWasm.memory.buffer);
+                wasmMem.set(new Uint8Array(modelData), bufPtr);
+                console.log('Model data copied');
 
-                clipModelLoaded = true;
-                updateClipStatus('OpenAI', '');
-                showStatus('CLIP model ready!', 'success');
-                return true;
+                // Parse and load - use setTimeout to allow UI update
+                updateClipStatus('Parsing...', 'loading');
+                showStatus('Parsing GGUF and loading weights (this may take 10-30 seconds)...', 'info');
+
+                // Allow UI to update before blocking call
+                await new Promise(r => setTimeout(r, 100));
+
+                const loadResult = clipWasm.clip_load_model(modelData.byteLength);
+
+                if (loadResult === 0) {
+                    clipModelLoaded = true;
+                    currentClipModel = selectedModel;
+                    const modelName = selectedModel.includes('openai') ? 'OpenAI' : 'LAION';
+                    updateClipStatus(`${modelName}`, '');
+                    showStatus(`CLIP model (${modelName}) ready!`, 'success');
+                    return true;
+                } else {
+                    const errors = {'-2': 'GGUF parse', '-3': 'Vocab', '-4': 'Vocab load', '-6': 'Weights'};
+                    throw new Error(errors[loadResult] || `Error ${loadResult}`);
+                }
             } catch (e) {
                 console.error('CLIP load error:', e);
                 updateClipStatus('Error', 'error');
@@ -3306,44 +3372,26 @@
             }
         }
 
-        async function encodeTextWithClip(text) {
-            if (!clipModelLoaded || !clipTokenizer || !clipTextModel) return null;
+        function encodeTextWithClip(text) {
+            if (!clipWasm || !clipModelLoaded) return null;
 
-            try {
-                // Tokenize
-                const inputs = await clipTokenizer(text, {
-                    padding: true,
-                    truncation: true,
-                    max_length: 77
-                });
+            const textBuf = clipWasm.clip_get_text_buffer();
+            const textBytes = new TextEncoder().encode(text);
+            // Re-create memory view in case WASM memory grew
+            const memory = new Uint8Array(clipWasm.memory.buffer);
+            memory.set(textBytes, textBuf);
 
-                // Encode
-                const output = await clipTextModel(inputs);
-
-                // Get text embedding and normalize
-                const embedding = output.text_embeds.data;
-                const dim = embedding.length;
-
-                // L2 normalize
-                let norm = 0;
-                for (let i = 0; i < dim; i++) {
-                    norm += embedding[i] * embedding[i];
-                }
-                norm = Math.sqrt(norm);
-
-                const normalized = new Float32Array(dim);
-                for (let i = 0; i < dim; i++) {
-                    normalized[i] = embedding[i] / norm;
-                }
-
-                console.log('CLIP embedding (first 8):', Array.from(normalized.slice(0, 8)).map(v => v.toFixed(4)));
-                console.log('Embedding norm:', Math.sqrt(normalized.reduce((s, v) => s + v * v, 0)).toFixed(4));
-
-                return normalized;
-            } catch (e) {
-                console.error('CLIP encode error:', e);
+            console.log('Encoding text:', text, 'length:', textBytes.length);
+            const result = clipWasm.clip_encode_text(textBytes.length);
+            console.log('Encode result:', result);
+            if (result !== 0) {
+                console.error('CLIP encode error:', result);
                 return null;
             }
+
+            const outputBuf = clipWasm.clip_get_output_buffer();
+            const outputDim = clipWasm.clip_get_output_dim();
+            return new Float32Array(clipWasm.memory.buffer, outputBuf, outputDim).slice();
         }
 
         async function runClipSearch() {
@@ -3377,8 +3425,8 @@
                 const modeLabel = isImageMode ? 'image' : 'text';
                 showStatus(`Encoding "${text}" with CLIP...`, 'info');
 
-                // Encode text to embedding using CLIP (async)
-                const queryVec = await encodeTextWithClip(text);
+                // Encode text to embedding using CLIP
+                const queryVec = encodeTextWithClip(text);
                 if (!queryVec) {
                     showStatus('Failed to encode text with CLIP', 'error');
                     setLoading(false);
