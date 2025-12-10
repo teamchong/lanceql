@@ -4791,6 +4791,15 @@ export class RemoteLanceDataset {
     }
 
     /**
+     * Get row count for a column (for API compatibility with RemoteLanceFile).
+     * @param {number} columnIndex - Column index (ignored, all columns have same row count)
+     * @returns {Promise<number>}
+     */
+    async getRowCount(columnIndex = 0) {
+        return this._totalRows;
+    }
+
+    /**
      * Get column names from schema.
      */
     get columnNames() {
