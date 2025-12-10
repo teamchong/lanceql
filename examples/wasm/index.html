@@ -1199,6 +1199,7 @@
                         <button class="sql-example" data-sql="SELECT COUNT(*) FROM read_lance('https://data.metal0.dev/laion-1m/images.lance')">COUNT(*)</button>
                         <button class="sql-example" data-sql="SELECT AVG(aesthetic), MIN(aesthetic), MAX(aesthetic) FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 10000">Stats 10K</button>
                         <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'cat' LIMIT 20">Search 'cat'</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') AT VERSION 1 LIMIT 50">Version 1</button>
                     </div>
                     <div class="dataset-hint" id="dataset-hint" style="display: none;"></div>
                 </div>
@@ -1958,8 +1959,9 @@
 
             if (currentFile?._isRemote && currentFile?._url) {
                 const url = currentFile._url;
+                const versionArg = currentFile.version ? `, version=${currentFile.version}` : '';
                 code += `# Open remote dataset\n`;
-                code += `dataset = lanceql.open("${url}")\n\n`;
+                code += `dataset = lanceql.open("${url}"${versionArg})\n\n`;
             } else if (currentFile) {
                 code += `# Open local file\n`;
                 code += `dataset = lanceql.open("file.lance")\n\n`;
@@ -2083,6 +2085,7 @@
         function parseDfCode(code) {
             const ops = {
                 url: null,
+                version: null,
                 search: null,
                 searchEncoder: null,
                 filter: null,
@@ -2090,10 +2093,13 @@
                 limit: null
             };
 
-            // Extract URL from lanceql.open("...")
-            const urlMatch = code.match(/lanceql\.open\s*\(\s*["']([^"']+)["']\s*\)/);
+            // Extract URL and optional version from lanceql.open("...", version=N)
+            const urlMatch = code.match(/lanceql\.open\s*\(\s*["']([^"']+)["'](?:\s*,\s*version\s*=\s*(\d+))?\s*\)/);
             if (urlMatch) {
                 ops.url = urlMatch[1];
+                if (urlMatch[2]) {
+                    ops.version = parseInt(urlMatch[2]);
+                }
             }
 
             // Extract .search("query", encoder="encoder")
@@ -2173,12 +2179,14 @@
                 let targetFile = currentFile;
                 if (ast.from && ast.from.type === 'url') {
                     const url = ast.from.url;
-                    showStatus(`Loading dataset from ${url}...`, 'info');
+                    const version = ast.from.version || null;
+                    const versionMsg = version ? ` (v${version})` : '';
+                    showStatus(`Loading dataset from ${url}${versionMsg}...`, 'info');
 
                     // Load dataset (detect if it's a dataset or single file)
                     let remoteFile;
                     if (url.endsWith('.lance') && !url.includes('/data/')) {
-                        remoteFile = await lanceql.openDataset(url);
+                        remoteFile = await lanceql.openDataset(url, { version });
                     } else {
                         remoteFile = await lanceql.openUrl(url);
                     }
@@ -2203,7 +2211,8 @@
                     document.getElementById('file-info').classList.remove('hidden');
                     collapseFileLoader();
                     const displayName = url.split('/').pop() || 'remote.lance';
-                    document.getElementById('file-name').textContent = displayName + (currentFile._isDataset ? ' (dataset)' : '');
+                    const versionSuffix = currentFile.version ? ` v${currentFile.version}` : '';
+                    document.getElementById('file-name').textContent = displayName + (currentFile._isDataset ? ` (dataset${versionSuffix})` : '');
                     document.getElementById('file-size').textContent = (currentFile.size / 1024 / 1024).toFixed(2) + ' MB';
                     document.getElementById('col-count').textContent = currentFile.numColumns;
                     document.getElementById('row-count').textContent = currentFile._isDataset ? rowCount.toLocaleString() : 'Lazy';
@@ -2673,10 +2682,24 @@
 
                 console.log('Parsed DataFrame ops:', ops);
 
-                // If URL specified in code and different from current file, load it
-                if (ops.url && (!currentFile || currentFile._url !== ops.url)) {
-                    showStatus(`Loading dataset from ${ops.url}...`, 'info');
-                    await loadFromUrl(ops.url);
+                // If URL specified in code and different from current file (or version changed), load it
+                const needsReload = ops.url && (!currentFile || currentFile._url !== ops.url ||
+                    (ops.version && currentFile.version !== ops.version));
+                if (needsReload) {
+                    const versionMsg = ops.version ? ` (v${ops.version})` : '';
+                    showStatus(`Loading dataset from ${ops.url}${versionMsg}...`, 'info');
+                    if (ops.url.endsWith('.lance') && !ops.url.includes('/data/')) {
+                        const remoteFile = await lanceql.openDataset(ops.url, { version: ops.version });
+                        if (currentFile && currentFile.close) currentFile.close();
+                        currentFile = remoteFile;
+                        window.currentFile = currentFile;
+                        currentFile._isRemote = true;
+                        currentFile._url = ops.url;
+                        currentFile._isDataset = true;
+                        columnTypes = await currentFile.detectColumnTypes();
+                    } else {
+                        await loadFromUrl(ops.url);
+                    }
                 }
 
                 if (!currentFile) {

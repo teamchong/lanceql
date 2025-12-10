@@ -59,10 +59,12 @@ export class LanceQL {
      * Open a Lance dataset from a base URL using HTTP Range requests.
      * Loads manifest to discover all fragments and enables parallel querying.
      * @param {string} baseUrl - Base URL to the Lance dataset (e.g., https://host/dataset.lance)
+     * @param {object} [options] - Options for opening
+     * @param {number} [options.version] - Specific version to load (time-travel)
      * @returns {Promise<RemoteLanceDataset>}
      */
-    async openDataset(baseUrl) {
-        return await RemoteLanceDataset.open(this, baseUrl);
+    async openDataset(baseUrl, options = {}) {
+        return await RemoteLanceDataset.open(this, baseUrl, options);
     }
 
     /**
@@ -4105,6 +4107,9 @@ const TokenType = {
     SEARCH: 'SEARCH',
     USING: 'USING',
     ON: 'ON',
+    // Time-travel keywords
+    AT: 'AT',
+    VERSION: 'VERSION',
 
     // Literals
     IDENTIFIER: 'IDENTIFIER',
@@ -4163,6 +4168,8 @@ const KEYWORDS = {
     'SEARCH': TokenType.SEARCH,
     'USING': TokenType.USING,
     'ON': TokenType.ON,
+    'AT': TokenType.AT,
+    'VERSION': TokenType.VERSION,
 };
 
 /**
@@ -4511,14 +4518,15 @@ export class SQLParser {
      * - 'url.lance' (string literal, auto-detect)
      */
     parseFromClause() {
+        let from = null;
+
         // Check for string literal (direct URL/path)
         if (this.check(TokenType.STRING)) {
             const url = this.advance().value;
-            return { type: 'url', url };
+            from = { type: 'url', url };
         }
-
         // Check for function call like read_lance('url')
-        if (this.check(TokenType.IDENTIFIER)) {
+        else if (this.check(TokenType.IDENTIFIER)) {
             const name = this.advance().value;
 
             // If followed by (, it's a function call
@@ -4527,16 +4535,26 @@ export class SQLParser {
                 if (funcName === 'read_lance') {
                     const url = this.expect(TokenType.STRING).value;
                     this.expect(TokenType.RPAREN);
-                    return { type: 'url', url, function: 'read_lance' };
+                    from = { type: 'url', url, function: 'read_lance' };
+                } else {
+                    throw new Error(`Unknown table function: ${name}. Supported: read_lance()`);
                 }
-                throw new Error(`Unknown table function: ${name}. Supported: read_lance()`);
+            } else {
+                // Just an identifier (table name - for future use)
+                from = { type: 'table', name };
             }
-
-            // Just an identifier (table name - for future use)
-            return { type: 'table', name };
+        } else {
+            throw new Error('Expected table name, URL string, or read_lance() after FROM');
         }
 
-        throw new Error('Expected table name, URL string, or read_lance() after FROM');
+        // Check for AT VERSION (time-travel)
+        if (this.match(TokenType.AT)) {
+            this.expect(TokenType.VERSION);
+            const version = parseInt(this.expect(TokenType.NUMBER).value, 10);
+            from.version = version;
+        }
+
+        return from;
     }
 
     parseColumnList() {
@@ -5584,10 +5602,13 @@ export class RemoteLanceDataset {
      * Open a remote Lance dataset.
      * @param {LanceQL} lanceql - LanceQL instance
      * @param {string} baseUrl - Base URL to the dataset
+     * @param {object} [options] - Options
+     * @param {number} [options.version] - Specific version to load (time-travel)
      * @returns {Promise<RemoteLanceDataset>}
      */
-    static async open(lanceql, baseUrl) {
+    static async open(lanceql, baseUrl, options = {}) {
         const dataset = new RemoteLanceDataset(lanceql, baseUrl);
+        dataset._requestedVersion = options.version || null;
         await dataset._loadManifest();
         await dataset._tryLoadIndex();
         return dataset;
@@ -5624,14 +5645,90 @@ export class RemoteLanceDataset {
      * @private
      */
     async _loadManifest() {
-        // Find the latest manifest version using binary search approach
         let manifestData = null;
         let manifestVersion = 0;
 
-        // First check common versions in parallel
-        const checkVersions = [1, 5, 10, 20, 50, 100];
+        // If specific version requested (time-travel), use that
+        if (this._requestedVersion) {
+            manifestVersion = this._requestedVersion;
+            const manifestUrl = `${this.baseUrl}/_versions/${manifestVersion}.manifest`;
+            const response = await fetch(manifestUrl);
+            if (!response.ok) {
+                throw new Error(`Version ${manifestVersion} not found (${response.status})`);
+            }
+            manifestData = new Uint8Array(await response.arrayBuffer());
+        } else {
+            // Find the latest manifest version using binary search approach
+            // First check common versions in parallel
+            const checkVersions = [1, 5, 10, 20, 50, 100];
+            const checks = await Promise.all(
+                checkVersions.map(async v => {
+                    try {
+                        const url = `${this.baseUrl}/_versions/${v}.manifest`;
+                        const response = await fetch(url, { method: 'HEAD' });
+                        return response.ok ? v : 0;
+                    } catch {
+                        return 0;
+                    }
+                })
+            );
+
+            // Find highest existing version from quick check
+            let highestFound = Math.max(...checks);
+
+            // If we found a high version, scan forward from there
+            if (highestFound > 0) {
+                for (let v = highestFound + 1; v <= highestFound + 50; v++) {
+                    try {
+                        const url = `${this.baseUrl}/_versions/${v}.manifest`;
+                        const response = await fetch(url, { method: 'HEAD' });
+                        if (response.ok) {
+                            highestFound = v;
+                        } else {
+                            break;
+                        }
+                    } catch {
+                        break;
+                    }
+                }
+            }
+
+            manifestVersion = highestFound;
+
+            if (manifestVersion === 0) {
+                throw new Error('No manifest found in dataset');
+            }
+
+            // Fetch the latest manifest
+            const manifestUrl = `${this.baseUrl}/_versions/${manifestVersion}.manifest`;
+            const response = await fetch(manifestUrl);
+            if (!response.ok) {
+                throw new Error(`Failed to fetch manifest: ${response.status}`);
+            }
+            manifestData = new Uint8Array(await response.arrayBuffer());
+        }
+
+        // Store the version we loaded
+        this._version = manifestVersion;
+        this._latestVersion = this._requestedVersion ? null : manifestVersion;
+
+        console.log(`[LanceQL Dataset] Loading manifest v${manifestVersion}${this._requestedVersion ? ' (time-travel)' : ''}...`);
+        this._parseManifest(manifestData);
+
+        console.log(`[LanceQL Dataset] Loaded: ${this._fragments.length} fragments, ${this._totalRows.toLocaleString()} rows, ${this._numColumns} columns`);
+    }
+
+    /**
+     * Get list of available versions.
+     * @returns {Promise<number[]>}
+     */
+    async listVersions() {
+        const versions = [];
+        // Scan for versions 1 to latestVersion (or 100 if unknown)
+        const maxVersion = this._latestVersion || 100;
+
         const checks = await Promise.all(
-            checkVersions.map(async v => {
+            Array.from({ length: maxVersion }, (_, i) => i + 1).map(async v => {
                 try {
                     const url = `${this.baseUrl}/_versions/${v}.manifest`;
                     const response = await fetch(url, { method: 'HEAD' });
@@ -5642,44 +5739,14 @@ export class RemoteLanceDataset {
             })
         );
 
-        // Find highest existing version from quick check
-        let highestFound = Math.max(...checks);
+        return checks.filter(v => v > 0);
+    }
 
-        // If we found a high version, scan forward from there
-        if (highestFound > 0) {
-            for (let v = highestFound + 1; v <= highestFound + 50; v++) {
-                try {
-                    const url = `${this.baseUrl}/_versions/${v}.manifest`;
-                    const response = await fetch(url, { method: 'HEAD' });
-                    if (response.ok) {
-                        highestFound = v;
-                    } else {
-                        break;
-                    }
-                } catch {
-                    break;
-                }
-            }
-        }
-
-        manifestVersion = highestFound;
-
-        if (manifestVersion === 0) {
-            throw new Error('No manifest found in dataset');
-        }
-
-        // Fetch the latest manifest
-        const manifestUrl = `${this.baseUrl}/_versions/${manifestVersion}.manifest`;
-        console.log(`[LanceQL Dataset] Loading manifest v${manifestVersion}...`);
-        const response = await fetch(manifestUrl);
-        if (!response.ok) {
-            throw new Error(`Failed to fetch manifest: ${response.status}`);
-        }
-
-        manifestData = new Uint8Array(await response.arrayBuffer());
-        this._parseManifest(manifestData);
-
-        console.log(`[LanceQL Dataset] Loaded: ${this._fragments.length} fragments, ${this._totalRows.toLocaleString()} rows, ${this._numColumns} columns`);
+    /**
+     * Get current loaded version.
+     */
+    get version() {
+        return this._version;
     }
 
     /**
