@@ -1134,6 +1134,7 @@
                     </div>
                     <div class="sql-examples">
                         <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50">First 50 rows</button>
+                        <button class="sql-example" id="random-sample-btn">Random 20 rows</button>
                         <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'cat' LIMIT 20">Search 'cat'</button>
                         <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'sunset beach' USING clip LIMIT 20">CLIP search</button>
                     </div>
@@ -3322,8 +3323,11 @@
 
         // DataFrame preview updates
         ['df-search-query', 'df-search-encoder', 'df-filter-col', 'df-filter-op', 'df-filter-value', 'df-select-cols', 'df-limit'].forEach(id => {
-            document.getElementById(id).addEventListener('change', updateDfPreview);
-            document.getElementById(id).addEventListener('input', updateDfPreview);
+            const el = document.getElementById(id);
+            if (el) {
+                el.addEventListener('change', updateDfPreview);
+                el.addEventListener('input', updateDfPreview);
+            }
         });
 
         // Vector Search
