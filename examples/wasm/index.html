@@ -1319,7 +1319,8 @@
                 document.getElementById('version').textContent = `v${lanceql.getVersion()}`;
                 console.log('LanceQL loaded:', lanceql.getVersion());
 
-                // Enable SQL button immediately - queries can load their own data via read_lance()
+                // Show query section immediately - queries can load their own data via read_lance()
+                document.getElementById('query-section').style.display = 'block';
                 document.getElementById('run-sql-btn').disabled = false;
 
                 // Set default URL in input for reference
