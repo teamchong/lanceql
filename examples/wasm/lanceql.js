@@ -5261,38 +5261,38 @@ export class RemoteLanceDataset {
     }
 
     /**
-     * Parallel vector search across all fragments using WorkerPool.
-     * Falls back to sequential search if workers unavailable.
+     * Vector search across all fragments.
+     * API compatible with RemoteLanceFile.vectorSearch.
      *
-     * @param {Float32Array} query - Query vector (must match dataset dimension)
+     * @param {number} colIdx - Vector column index
+     * @param {Float32Array} queryVec - Query vector
      * @param {number} topK - Number of results to return
+     * @param {Function} onProgress - Progress callback (current, total)
      * @param {Object} options - Search options
-     * @param {number} options.vectorColIdx - Index of vector column (auto-detected if not provided)
-     * @param {boolean} options.normalized - Whether vectors are L2-normalized (default: true for CLIP)
-     * @param {WorkerPool} options.workerPool - Optional pre-initialized worker pool
-     * @returns {Promise<{indices: Uint32Array, scores: Float32Array, rows: Object[]}>}
+     * @returns {Promise<{indices: number[], scores: number[], usedIndex: boolean}>}
      */
-    async vectorSearch(query, topK = 10, options = {}) {
+    async vectorSearch(colIdx, queryVec, topK = 10, onProgress = null, options = {}) {
         const {
-            vectorColIdx = this._findVectorColumn(),
             normalized = true,
             workerPool = null
         } = options;
+
+        const vectorColIdx = colIdx;
 
         if (vectorColIdx < 0) {
             throw new Error('No vector column found in dataset');
         }
 
-        const dim = query.length;
+        const dim = queryVec.length;
         console.log(`[VectorSearch] Query dim=${dim}, topK=${topK}, fragments=${this._fragments.length}`);
 
         // Try parallel search with workers
         if (workerPool) {
-            return await this._parallelVectorSearch(query, topK, vectorColIdx, normalized, workerPool);
+            return await this._parallelVectorSearch(queryVec, topK, vectorColIdx, normalized, workerPool);
         }
 
         // Fallback: sequential search across fragments
-        return await this._sequentialVectorSearch(query, topK, vectorColIdx, normalized);
+        return await this._sequentialVectorSearch(queryVec, topK, vectorColIdx, normalized, onProgress);
     }
 
     /**
@@ -5365,14 +5365,22 @@ export class RemoteLanceDataset {
      * Sequential vector search (fallback when workers unavailable).
      * @private
      */
-    async _sequentialVectorSearch(query, topK, vectorColIdx, normalized) {
+    async _sequentialVectorSearch(query, topK, vectorColIdx, normalized, onProgress = null) {
         const dim = query.length;
         const allResults = [];
 
         let globalOffset = 0;
+        let processedRows = 0;
+        const totalRows = this._totalRows;
+
         for (let fragIdx = 0; fragIdx < this._fragments.length; fragIdx++) {
             const frag = this._fragments[fragIdx];
             const file = await this.openFragment(fragIdx);
+
+            // Report progress
+            if (onProgress) {
+                onProgress(processedRows, totalRows);
+            }
 
             // Get top-k from this fragment
             const results = await file.vectorSearchTopK(
@@ -5391,24 +5399,22 @@ export class RemoteLanceDataset {
             }
 
             globalOffset += frag.numRows;
+            processedRows += frag.numRows;
+        }
+
+        // Final progress
+        if (onProgress) {
+            onProgress(totalRows, totalRows);
         }
 
         // Sort and take top-k
         allResults.sort((a, b) => b.score - a.score);
         const finalK = Math.min(topK, allResults.length);
 
-        const indices = new Uint32Array(finalK);
-        const scores = new Float32Array(finalK);
+        const indices = Array.from({ length: finalK }, (_, i) => allResults[i].index);
+        const scores = Array.from({ length: finalK }, (_, i) => allResults[i].score);
 
-        for (let i = 0; i < finalK; i++) {
-            indices[i] = allResults[i].index;
-            scores[i] = allResults[i].score;
-        }
-
-        // Fetch row data for results
-        const rows = await this._fetchResultRows(indices);
-
-        return { indices, scores, rows };
+        return { indices, scores, usedIndex: false };
     }
 
     /**
