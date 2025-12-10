@@ -1937,14 +1937,29 @@ export fn clip_get_output_dim() usize {
     return CLIP_EMBED_DIM;
 }
 
-/// Allocate buffer for model weights
+/// Allocate buffer for model weights using WASM memory growth
 export fn clip_alloc_model_buffer(size: usize) usize {
-    // Use a separate large allocation for model (can't use heap - too small)
-    // In WASM, we'll grow memory as needed
-    const ptr = wasmAlloc(size) orelse return 0;
+    // For large allocations like CLIP model (100MB+), grow WASM memory directly
+    // WASM pages are 64KB each
+    const page_size: usize = 65536;
+    const pages_needed = (size + page_size - 1) / page_size;
+
+    // Get current memory size in pages
+    const current_pages = @wasmMemorySize(0);
+    const current_size = current_pages * page_size;
+
+    // Try to grow memory
+    const result = @wasmMemoryGrow(0, pages_needed);
+    if (result == @as(usize, @bitCast(@as(isize, -1)))) {
+        // Growth failed
+        return 0;
+    }
+
+    // The new memory starts at the old end
+    const ptr: [*]u8 = @ptrFromInt(current_size);
     clip_model_buffer = ptr;
     clip_model_size = size;
-    return @intFromPtr(ptr);
+    return current_size;
 }
 
 /// Check if model weights are loaded
