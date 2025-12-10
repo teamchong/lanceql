@@ -4827,6 +4827,25 @@ export class SQLExecutor {
         // Check if this is an aggregation query
         const hasAggregates = this.hasAggregates(ast);
         if (hasAggregates) {
+            // Special case: COUNT(*) without WHERE/SEARCH returns metadata row count (free)
+            if (this.isSimpleCountStar(ast) && !ast.where && !ast.search) {
+                return {
+                    columns: ['COUNT(*)'],
+                    rows: [[totalRows]],
+                    total: 1,
+                    aggregationStats: {
+                        scannedRows: 0,
+                        totalRows,
+                        coveragePercent: '100.00',
+                        isPartialScan: false,
+                        fromMetadata: true,
+                    },
+                };
+            }
+            // For aggregations with SEARCH, we need to run search first
+            if (ast.search) {
+                return await this.executeAggregateWithSearch(ast, totalRows, onProgress);
+            }
             return await this.executeAggregateQuery(ast, totalRows, onProgress);
         }
 
@@ -4909,10 +4928,15 @@ export class SQLExecutor {
         // This ensures infinite scroll respects the LIMIT clause
         const effectiveTotal = ast.limit ? rows.length : totalRows;
 
+        // Track if ORDER BY was applied on a subset (honest about sorting limitations)
+        const orderByOnSubset = ast.orderBy && ast.orderBy.length > 0 && rows.length < totalRows;
+
         return {
             columns: colNames,
             rows,
             total: effectiveTotal,
+            orderByOnSubset,
+            orderByColumns: ast.orderBy ? ast.orderBy.map(ob => `${ob.column} ${ob.direction}`) : [],
         };
     }
 
@@ -5306,6 +5330,37 @@ export class SQLExecutor {
     }
 
     /**
+     * Check if query is just SELECT COUNT(*) with no other columns
+     */
+    isSimpleCountStar(ast) {
+        if (ast.columns.length !== 1) return false;
+        const col = ast.columns[0];
+        if (col.type === 'star') return true; // COUNT(*) parsed as star
+        if (col.type === 'expr' && col.expr.type === 'call') {
+            const name = col.expr.name.toUpperCase();
+            if (name === 'COUNT') {
+                const arg = col.expr.args[0];
+                return arg?.type === 'star';
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Execute aggregation query after running vector search
+     */
+    async executeAggregateWithSearch(ast, totalRows, onProgress) {
+        // This is a simplified version - aggregate over search results
+        // For now, just return an error/notice that this combination isn't fully supported
+        return {
+            columns: ['error'],
+            rows: [['Aggregations with SEARCH not yet supported. Use SEARCH without aggregations, or aggregations without SEARCH.']],
+            total: 1,
+            aggregationStats: null,
+        };
+    }
+
+    /**
      * Check if the query contains aggregate functions
      */
     hasAggregates(ast) {
@@ -5378,16 +5433,21 @@ export class SQLExecutor {
         }
 
         // Process data in batches
+        // Respect LIMIT - only scan up to LIMIT rows for aggregation
+        const scanLimit = ast.limit || totalRows; // If no LIMIT, scan all (could be slow)
+        const maxRowsToScan = Math.min(scanLimit, totalRows);
         const batchSize = 1000;
         let processedRows = 0;
+        let scannedRows = 0;
 
-        for (let batchStart = 0; batchStart < totalRows; batchStart += batchSize) {
+        for (let batchStart = 0; batchStart < maxRowsToScan; batchStart += batchSize) {
             if (onProgress) {
-                onProgress(`Aggregating...`, batchStart, totalRows);
+                onProgress(`Aggregating...`, batchStart, maxRowsToScan);
             }
 
-            const batchEnd = Math.min(batchStart + batchSize, totalRows);
+            const batchEnd = Math.min(batchStart + batchSize, maxRowsToScan);
             const batchIndices = Array.from({ length: batchEnd - batchStart }, (_, i) => batchStart + i);
+            scannedRows += batchIndices.length;
 
             // Fetch needed column data for this batch
             const batchData = {};
@@ -5466,10 +5526,20 @@ export class SQLExecutor {
             }
         }
 
+        // Calculate coverage stats
+        const coveragePercent = totalRows > 0 ? ((scannedRows / totalRows) * 100).toFixed(2) : 100;
+        const isPartialScan = scannedRows < totalRows;
+
         return {
             columns: colNames,
             rows: [resultRow],
             total: 1,
+            aggregationStats: {
+                scannedRows,
+                totalRows,
+                coveragePercent,
+                isPartialScan,
+            },
         };
     }
 }

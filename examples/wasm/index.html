@@ -479,6 +479,26 @@
             font-size: 14px;
             color: #64748b;
         }
+        .results-notice {
+            color: #f59e0b;
+            font-size: 12px;
+            background: rgba(245, 158, 11, 0.1);
+            padding: 4px 8px;
+            border-radius: 4px;
+            margin-left: 8px;
+        }
+        .dataset-hint {
+            color: #94a3b8;
+            font-size: 12px;
+            padding: 8px 12px;
+            background: rgba(148, 163, 184, 0.1);
+            border-radius: 6px;
+            margin-top: 10px;
+            line-height: 1.4;
+        }
+        .dataset-hint strong {
+            color: #e2e8f0;
+        }
         .results-actions {
             display: flex;
             align-items: center;
@@ -1174,12 +1194,14 @@
                         <div class="sql-highlight" id="sql-highlight" aria-hidden="true"></div>
                     </div>
                     <div class="sql-examples">
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50">First 50 rows</button>
-                        <button class="sql-example" id="random-sample-btn">Random 20 rows</button>
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'cat' LIMIT 20">TEXT: MiniLM (87MB)</button>
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'sunset beach' USING clip-openai LIMIT 20">IMAGE: CLIP OpenAI (122MB)</button>
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'sunset beach' USING clip-laion LIMIT 20">IMAGE: CLIP LAION (290MB)</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50">First 50</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50 ORDER BY aesthetic DESC">Top aesthetic</button>
+                        <button class="sql-example" data-sql="SELECT COUNT(*) FROM read_lance('https://data.metal0.dev/laion-1m/images.lance')">COUNT(*)</button>
+                        <button class="sql-example" data-sql="SELECT AVG(aesthetic), MIN(aesthetic), MAX(aesthetic) FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 10000">Stats 10K</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'cat' LIMIT 20">MiniLM</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'sunset' USING clip-openai LIMIT 20">CLIP</button>
                     </div>
+                    <div class="dataset-hint" id="dataset-hint" style="display: none;"></div>
                 </div>
                 <div class="run-section">
                     <button class="btn btn-primary" id="run-sql-btn" disabled>
@@ -1340,6 +1362,7 @@
                 </h3>
                 <div class="results-actions">
                     <span class="results-count" id="results-count"></span>
+                    <span class="results-notice" id="results-notice" style="display: none;"></span>
                     <button class="export-btn" id="export-csv" title="Export as CSV">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
@@ -3067,6 +3090,28 @@
             const loadedCount = append ? (infiniteScrollState?.loadedCount || 0) + result.rows.length : result.rows.length;
             document.getElementById('results-count').textContent = `${loadedCount.toLocaleString()} of ${result.total.toLocaleString()} rows`;
 
+            // Show notice if ORDER BY was applied on a subset or aggregation on partial data
+            const noticeEl = document.getElementById('results-notice');
+            if (result.aggregationStats?.fromMetadata && !append) {
+                noticeEl.textContent = `✓ Row count from metadata (no scan required)`;
+                noticeEl.style.display = 'inline';
+                noticeEl.style.color = '#22c55e';
+                noticeEl.style.background = 'rgba(34, 197, 94, 0.1)';
+            } else if (result.aggregationStats?.isPartialScan && !append) {
+                const stats = result.aggregationStats;
+                noticeEl.textContent = `⚠ Aggregated over ${stats.scannedRows.toLocaleString()} of ${stats.totalRows.toLocaleString()} rows (${stats.coveragePercent}% coverage)`;
+                noticeEl.style.display = 'inline';
+                noticeEl.style.color = '#f59e0b';
+                noticeEl.style.background = 'rgba(245, 158, 11, 0.1)';
+            } else if (result.orderByOnSubset && !append) {
+                noticeEl.textContent = `⚠ Sorted within ${loadedCount} fetched rows only, not full dataset`;
+                noticeEl.style.display = 'inline';
+                noticeEl.style.color = '#f59e0b';
+                noticeEl.style.background = 'rgba(245, 158, 11, 0.1)';
+            } else if (!append) {
+                noticeEl.style.display = 'none';
+            }
+
             if (result.rows.length === 0 && !append) {
                 infiniteScrollState = null;
                 body.innerHTML = `
@@ -3442,6 +3487,15 @@
                 showStatus(statusMsg, 'success');
                 updateDfPreview();
 
+                // Show dataset hint for default dataset
+                const hintEl = document.getElementById('dataset-hint');
+                if (url.includes('data.metal0.dev/laion-1m/images.lance')) {
+                    hintEl.innerHTML = `<strong>ℹ️ Default dataset:</strong> 1M LAION images with <strong>text embeddings</strong> (all-MiniLM-L6-v2, 384-dim). Use <strong>MiniLM encoder</strong> for vector search. CLIP encoder won't match these embeddings.`;
+                    hintEl.style.display = 'block';
+                } else {
+                    hintEl.style.display = 'none';
+                }
+
             } catch (err) {
                 showStatus('Failed to load URL: ' + err.message, 'error');
                 console.error(err);
@@ -3561,8 +3615,8 @@
             URL.revokeObjectURL(url);
         }
 
-        // Random sample button
-        document.getElementById('random-sample-btn').addEventListener('click', async () => {
+        // Random sample button (only if element exists)
+        document.getElementById('random-sample-btn')?.addEventListener('click', async () => {
             if (!currentFile) return;
 
             try {
