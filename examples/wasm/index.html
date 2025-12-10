@@ -1135,9 +1135,9 @@
                     <div class="sql-examples">
                         <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50">First 50 rows</button>
                         <button class="sql-example" id="random-sample-btn">Random 20 rows</button>
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'cat' LIMIT 20">MiniLM text (87MB)</button>
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'sunset beach' USING clip-openai LIMIT 20">CLIP OpenAI (122MB)</button>
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'sunset beach' USING clip-laion LIMIT 20">CLIP LAION (290MB)</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'cat' LIMIT 20">TEXT: MiniLM (87MB)</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'sunset beach' USING clip-openai LIMIT 20">IMAGE: CLIP OpenAI (122MB)</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'sunset beach' USING clip-laion LIMIT 20">IMAGE: CLIP LAION (290MB)</button>
                     </div>
                 </div>
                 <div class="run-section">
@@ -1157,11 +1157,11 @@
                         <div class="df-step-num">1</div>
                         <div class="df-step-label">Search</div>
                         <input type="text" id="df-search-query" placeholder="e.g. cat, sunset beach" style="width: 150px;">
-                        <select id="df-search-encoder" style="width: 180px;">
+                        <select id="df-search-encoder" style="width: 200px;">
                             <option value="">No search</option>
-                            <option value="minilm">MiniLM text (87MB)</option>
-                            <option value="clip-openai">CLIP OpenAI (122MB)</option>
-                            <option value="clip-laion">CLIP LAION (290MB)</option>
+                            <option value="minilm">TEXT: MiniLM (87MB)</option>
+                            <option value="clip-openai">IMAGE: CLIP OpenAI (122MB)</option>
+                            <option value="clip-laion">IMAGE: CLIP LAION (290MB)</option>
                         </select>
                     </div>
                     <div class="df-step">
@@ -1241,38 +1241,27 @@
                     </button>
                 </div>
 
-                <!-- CLIP Text Search Section -->
+                <!-- Text Search Section -->
                 <div class="clip-section" id="clip-section">
                     <div class="clip-header">
                         <div class="clip-title">
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
                             </svg>
-                            <span id="clip-search-title">Text Search (MiniLM)</span>
+                            <span id="clip-search-title">Text Search</span>
                             <span class="badge" id="clip-status-badge">Ready</span>
                         </div>
-                        <div class="clip-mode-toggle">
-                            <label class="toggle-label" title="Check if your lance file contains image embeddings (from CLIP image encoder). Uncheck if it contains text embeddings.">
-                                <input type="checkbox" id="clip-image-mode">
-                                <span class="toggle-text">Dataset has image embeddings</span>
-                            </label>
-                        </div>
-                        <div class="clip-model-select" id="clip-model-container" style="display: none;">
-                            <label for="clip-model">CLIP Model:</label>
-                            <select id="clip-model">
-                                <option value="https://data.metal0.dev/models/clip-vit-b32-openai.gguf">OpenAI ViT-B/32 (122MB)</option>
-                                <option value="https://data.metal0.dev/models/clip-vit-b32.gguf">LAION ViT-B/32 (290MB)</option>
-                            </select>
-                        </div>
-                        <div class="clip-model-select" id="text-model-container">
-                            <label for="text-model">Text Model:</label>
-                            <select id="text-model">
-                                <option value="https://data.metal0.dev/models/minilm-l6-v2.gguf">all-MiniLM-L6-v2 (87MB)</option>
+                        <div class="clip-model-select">
+                            <label for="clip-model-select">Encoder:</label>
+                            <select id="clip-model-select">
+                                <option value="minilm">TEXT: MiniLM (87MB)</option>
+                                <option value="clip-openai">IMAGE: CLIP OpenAI (122MB)</option>
+                                <option value="clip-laion">IMAGE: CLIP LAION (290MB)</option>
                             </select>
                         </div>
                     </div>
                     <div class="clip-text-input">
-                        <input type="text" id="clip-text-input" placeholder="Search for text... (e.g., 'tickets', 'food', 'cat')">
+                        <input type="text" id="clip-text-input" placeholder="Search for text... (e.g., 'cat', 'sunset beach')">
                     </div>
                     <div class="clip-examples">
                         <button class="clip-example" data-text="ticket">ticket</button>
@@ -1290,9 +1279,6 @@
                             </svg>
                             Search by Text
                         </button>
-                    </div>
-                    <div class="clip-note">
-                        <small id="model-note">Default dataset uses all-MiniLM-L6-v2 (384-dim) text embeddings. Check "Dataset has image embeddings" only if using CLIP image embeddings.</small>
                     </div>
                 </div>
             </div>
@@ -3533,7 +3519,8 @@
         }
 
         async function ensureClipModelLoaded() {
-            const selectedModel = document.getElementById('clip-model').value;
+            // Use override URL if set, otherwise default to OpenAI model
+            const selectedModel = window._clipModelUrlOverride || 'https://data.metal0.dev/models/clip-vit-b32-openai.gguf';
 
             // Check if we need to reload (different model selected)
             if (clipModelLoaded && currentClipModel === selectedModel) {
@@ -3779,17 +3766,29 @@
             }
 
             const topK = parseInt(document.getElementById('top-k').value) || 20;
-            const isImageMode = document.getElementById('clip-image-mode').checked;
+            const encoder = document.getElementById('clip-model-select').value;
 
             try {
                 setLoading(true);
                 showSearchLoading();
 
                 let queryVec;
-                const modelName = isImageMode ? 'CLIP' : 'MiniLM';
+                const isClipModel = encoder.startsWith('clip');
+                const modelName = encoder === 'minilm' ? 'MiniLM' : encoder === 'clip-openai' ? 'CLIP OpenAI' : 'CLIP LAION';
 
-                if (isImageMode) {
-                    // Image mode: use CLIP
+                if (isClipModel) {
+                    // Set the correct CLIP model URL
+                    const clipModelUrl = encoder === 'clip-openai'
+                        ? 'https://data.metal0.dev/models/clip-vit-b32-openai.gguf'
+                        : 'https://data.metal0.dev/models/clip-vit-b32.gguf';
+
+                    // Force reload if different model selected
+                    if (clipModelLoaded && window._loadedClipModelUrl !== clipModelUrl) {
+                        clipModelLoaded = false;
+                    }
+                    window._loadedClipModelUrl = clipModelUrl;
+                    window._clipModelUrlOverride = clipModelUrl;
+
                     if (!clipModelLoaded) {
                         const loaded = await ensureClipModelLoaded();
                         if (!loaded) {
@@ -3797,10 +3796,10 @@
                             return;
                         }
                     }
-                    showStatus(`Encoding "${text}" with CLIP...`, 'info');
+                    showStatus(`Encoding "${text}" with ${modelName}...`, 'info');
                     queryVec = encodeTextWithClip(text);
                 } else {
-                    // Text mode: use MiniLM
+                    // MiniLM
                     if (!minilmModelLoaded) {
                         const loaded = await ensureMinilmModelLoaded();
                         if (!loaded) {
@@ -3818,11 +3817,9 @@
                     return;
                 }
 
-                const modeLabel = isImageMode ? 'image' : 'text';
                 console.log(`${modelName} query embedding (first 8):`, Array.from(queryVec.slice(0, 8)).map(v => v.toFixed(4)));
                 console.log('Query embedding L2 norm:', Math.sqrt(queryVec.reduce((sum, v) => sum + v*v, 0)).toFixed(4));
-                console.log('Search mode:', isImageMode ? 'text-to-image' : 'text-to-text');
-                showStatus(`Searching ${modeLabel} embeddings...`, 'info');
+                showStatus(`Searching embeddings...`, 'info');
 
                 // Run vector search
                 const results = await currentFile.vectorSearch(
