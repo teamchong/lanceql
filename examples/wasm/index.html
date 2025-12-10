@@ -2284,7 +2284,9 @@
                         }
                         return String(cell);
                     })),
-                    total: result.total
+                    total: result.total,
+                    aggregationStats: result.aggregationStats,
+                    orderByOnSubset: result.orderByOnSubset
                 };
 
                 document.getElementById('results-section').style.display = 'block';
@@ -3152,13 +3154,20 @@
             }
 
             // Find all vector columns for "Find Similar" feature
+            // Only show search buttons if result contains actual data rows (not aggregations)
             const vectorCols = [];
             const colNames = currentFile?.columnNames || [];
-            columnTypes.forEach((t, idx) => {
-                if (t === 'vector') {
-                    vectorCols.push({ idx, name: colNames[idx] || `col_${idx}` });
-                }
-            });
+            const resultColNames = result.columns || [];
+            const isAggregationResult = resultColNames.some(c =>
+                /^(COUNT|SUM|AVG|MIN|MAX)\s*\(/i.test(c)
+            );
+            if (!isAggregationResult) {
+                columnTypes.forEach((t, idx) => {
+                    if (t === 'vector') {
+                        vectorCols.push({ idx, name: colNames[idx] || `col_${idx}` });
+                    }
+                });
+            }
             const hasVectorCol = vectorCols.length > 0 && currentFile?._isRemote;
 
             // Build new table

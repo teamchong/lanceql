@@ -5888,6 +5888,20 @@ export class RemoteLanceDataset {
     }
 
     /**
+     * Read a single vector at a global row index.
+     * Delegates to the correct fragment based on row index.
+     * @param {number} colIdx - Column index
+     * @param {number} rowIdx - Global row index
+     * @returns {Promise<Float32Array>}
+     */
+    async readVectorAt(colIdx, rowIdx) {
+        const loc = this._getFragmentForRow(rowIdx);
+        if (!loc) return new Float32Array(0);
+        const file = await this.openFragment(loc.fragmentIndex);
+        return await file.readVectorAt(colIdx, loc.localIndex);
+    }
+
+    /**
      * Get vector info for a column by querying first fragment.
      * @param {number} colIdx - Column index
      * @returns {Promise<{rows: number, dimension: number}>}
