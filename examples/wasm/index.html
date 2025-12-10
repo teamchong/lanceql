@@ -2023,6 +2023,7 @@
                     total: result.total
                 };
 
+                document.getElementById('results-section').style.display = 'block';
                 displayResults(formattedResult);
                 hideProgress();
                 showStatus(`Query completed: ${result.rows.length} rows`, 'success');
