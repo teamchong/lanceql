@@ -4161,7 +4161,7 @@ const KEYWORDS = {
 /**
  * SQL Lexer - tokenizes SQL input
  */
-class SQLLexer {
+export class SQLLexer {
     constructor(sql) {
         this.sql = sql;
         this.pos = 0;
@@ -4318,7 +4318,7 @@ class SQLLexer {
 /**
  * SQL Parser - parses tokens into AST
  */
-class SQLParser {
+export class SQLParser {
     constructor(tokens) {
         this.tokens = tokens;
         this.pos = 0;
@@ -4366,10 +4366,10 @@ class SQLParser {
         // Select list
         const columns = this.parseSelectList();
 
-        // FROM
+        // FROM - supports: table_name, read_lance('url'), 'url.lance'
         let from = null;
         if (this.match(TokenType.FROM)) {
-            from = this.expect(TokenType.IDENTIFIER).value;
+            from = this.parseFromClause();
         }
 
         // WHERE
@@ -4458,6 +4458,41 @@ class SQLParser {
         }
 
         return { type: 'expr', expr, alias };
+    }
+
+    /**
+     * Parse FROM clause - supports:
+     * - table_name (identifier)
+     * - read_lance('url') (function call)
+     * - 'url.lance' (string literal, auto-detect)
+     */
+    parseFromClause() {
+        // Check for string literal (direct URL/path)
+        if (this.check(TokenType.STRING)) {
+            const url = this.advance().value;
+            return { type: 'url', url };
+        }
+
+        // Check for function call like read_lance('url')
+        if (this.check(TokenType.IDENTIFIER)) {
+            const name = this.advance().value;
+
+            // If followed by (, it's a function call
+            if (this.match(TokenType.LPAREN)) {
+                const funcName = name.toLowerCase();
+                if (funcName === 'read_lance') {
+                    const url = this.expect(TokenType.STRING).value;
+                    this.expect(TokenType.RPAREN);
+                    return { type: 'url', url, function: 'read_lance' };
+                }
+                throw new Error(`Unknown table function: ${name}. Supported: read_lance()`);
+            }
+
+            // Just an identifier (table name - for future use)
+            return { type: 'table', name };
+        }
+
+        throw new Error('Expected table name, URL string, or read_lance() after FROM');
     }
 
     parseColumnList() {

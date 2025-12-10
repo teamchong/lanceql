@@ -1087,11 +1087,11 @@
             <!-- SQL Tab -->
             <div class="tab-content active" id="tab-sql">
                 <div class="sql-editor">
-                    <textarea class="sql-textarea" id="sql-input" placeholder="SELECT * FROM data WHERE column_0 > 100 LIMIT 50">SELECT * FROM data LIMIT 100</textarea>
+                    <textarea class="sql-textarea" id="sql-input" placeholder="SELECT * FROM read_lance('https://...') LIMIT 50">SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50</textarea>
                     <div class="sql-examples">
-                        <button class="sql-example" data-sql="SELECT * FROM data LIMIT 50">First 50 rows</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50">First 50 rows</button>
                         <button class="sql-example" id="random-sample-btn">Random 20 rows</button>
-                        <button class="sql-example" data-sql="SELECT * FROM data LIMIT 100">First 100 rows</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 100">First 100 rows</button>
                     </div>
                 </div>
                 <div class="run-section">
@@ -1290,7 +1290,7 @@
     </div>
 
     <script type="module">
-        import LanceQL, { SQLExecutor } from './lanceql.js';
+        import LanceQL, { SQLExecutor, SQLLexer, SQLParser } from './lanceql.js';
 
         let lanceql;
         let currentFile = null;
@@ -1310,7 +1310,7 @@
 
         // Default demo dataset URL - LAION 1M images dataset
         const DEFAULT_DATASET_URL = 'https://data.metal0.dev/laion-1m/images.lance';
-        const DEFAULT_QUERY = "SELECT * FROM data LIMIT 50";
+        const DEFAULT_QUERY = "SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50";
 
         // Initialize
         async function init() {
@@ -1319,17 +1319,15 @@
                 document.getElementById('version').textContent = `v${lanceql.getVersion()}`;
                 console.log('LanceQL loaded:', lanceql.getVersion());
 
-                // Load default dataset if configured
-                if (DEFAULT_DATASET_URL) {
-                    document.getElementById('url-input').value = DEFAULT_DATASET_URL;
-                    await loadFromUrl(DEFAULT_DATASET_URL);
+                // Enable SQL button immediately - queries can load their own data via read_lance()
+                document.getElementById('run-sql-btn').disabled = false;
 
-                    // Run default query after loading
-                    if (currentFile) {
-                        document.getElementById('sql-input').value = DEFAULT_QUERY;
-                        setTimeout(runSqlQuery, 100);
-                    }
-                }
+                // Set default URL in input for reference
+                document.getElementById('url-input').value = DEFAULT_DATASET_URL;
+
+                // Set default query and run it (query contains its own data source)
+                document.getElementById('sql-input').value = DEFAULT_QUERY;
+                setTimeout(runSqlQuery, 100);
             } catch (err) {
                 showStatus('Failed to load WASM: ' + err.message, 'error');
                 console.error(err);
@@ -1845,8 +1843,6 @@
 
         // Run SQL query
         async function runSqlQuery() {
-            if (!currentFile) return;
-
             const sql = document.getElementById('sql-input').value.trim();
             if (!sql) {
                 showStatus('Please enter a SQL query', 'error');
@@ -1855,10 +1851,76 @@
 
             try {
                 setLoading(true);
+
+                // Pre-parse SQL to check for URL in FROM clause
+                const lexer = new SQLLexer(sql);
+                const tokens = lexer.tokenize();
+                const parser = new SQLParser(tokens);
+                const ast = parser.parse();
+
+                // If FROM clause has URL, load dataset first
+                let targetFile = currentFile;
+                if (ast.from && ast.from.type === 'url') {
+                    const url = ast.from.url;
+                    showStatus(`Loading dataset from ${url}...`, 'info');
+
+                    // Load dataset (detect if it's a dataset or single file)
+                    let remoteFile;
+                    if (url.endsWith('.lance') && !url.includes('/data/')) {
+                        remoteFile = await lanceql.openDataset(url);
+                    } else {
+                        remoteFile = await lanceql.openUrl(url);
+                    }
+
+                    // Update UI to show the loaded file
+                    if (currentFile && currentFile.close) currentFile.close();
+                    currentFile = remoteFile;
+                    window.currentFile = currentFile;
+                    currentFile._isRemote = true;
+                    currentFile._url = url;
+                    currentFile._isDataset = url.endsWith('.lance') && !url.includes('/data/');
+
+                    // Set up network stats callback
+                    currentFile.onFetch((bytes, requests) => {
+                        updateNetworkStats(bytes, requests);
+                    });
+
+                    columnTypes = [];
+                    rowCount = currentFile._isDataset ? currentFile.rowCount : 0;
+
+                    // Update UI
+                    document.getElementById('file-info').classList.remove('hidden');
+                    collapseFileLoader();
+                    const displayName = url.split('/').pop() || 'remote.lance';
+                    document.getElementById('file-name').textContent = displayName + (currentFile._isDataset ? ' (dataset)' : '');
+                    document.getElementById('file-size').textContent = (currentFile.size / 1024 / 1024).toFixed(2) + ' MB';
+                    document.getElementById('col-count').textContent = currentFile.numColumns;
+                    document.getElementById('row-count').textContent = currentFile._isDataset ? rowCount.toLocaleString() : 'Lazy';
+
+                    // Reset network stats
+                    resetNetworkStats();
+                    document.getElementById('network-stats').classList.remove('hidden');
+
+                    // Detect column types
+                    try {
+                        columnTypes = await currentFile.detectColumnTypes();
+                        showColumnChips();
+                    } catch (e) {
+                        console.warn('Could not detect column types:', e);
+                    }
+
+                    targetFile = currentFile;
+                }
+
+                if (!targetFile) {
+                    showStatus('No file loaded. Use: SELECT * FROM read_lance(\'https://...\') LIMIT 10', 'error');
+                    return;
+                }
+
                 showStatus('Executing query...', 'info');
 
                 // Use the new SQL executor for proper parsing
-                const executor = new SQLExecutor(currentFile);
+                const executor = new SQLExecutor(targetFile);
                 const result = await executor.execute(sql, (msg, current, total) => {
                     showProgress(msg, current, total);
                 });
