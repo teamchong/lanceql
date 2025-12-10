@@ -1158,7 +1158,6 @@
                         <div class="df-step-label">Search</div>
                         <input type="text" id="df-search-query" placeholder="e.g. cat, sunset beach" style="width: 150px;">
                         <select id="df-search-encoder" style="width: 200px;">
-                            <option value="">No search</option>
                             <option value="minilm">TEXT: MiniLM (87MB)</option>
                             <option value="clip-openai">IMAGE: CLIP OpenAI (122MB)</option>
                             <option value="clip-laion">IMAGE: CLIP LAION (290MB)</option>
@@ -1908,8 +1907,8 @@
             code += `result = (\n`;
             code += `    dataset.<span class="method">df</span>()\n`;
 
-            // Vector search
-            if (searchQuery && searchEncoder) {
+            // Vector search (only if query text is provided)
+            if (searchQuery) {
                 code += `    .<span class="method">search</span>(<span class="string">"${searchQuery}"</span>, encoder=<span class="string">"${searchEncoder}"</span>)\n`;
             }
 
@@ -2478,7 +2477,7 @@
                 const limit = parseInt(document.getElementById('df-limit').value);
 
                 // If search query is specified, run vector search instead
-                if (searchQuery && searchEncoder) {
+                if (searchQuery) {
                     await runDfVectorSearch(searchQuery, searchEncoder, selectedCols, limit);
                     return;
                 }
