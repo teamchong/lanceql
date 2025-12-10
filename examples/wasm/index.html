@@ -3253,15 +3253,23 @@
 
         async function initClipWasm() {
             try {
-                const response = await fetch('clip.wasm');
-                const bytes = await response.arrayBuffer();
-                const { instance } = await WebAssembly.instantiate(bytes, {});
-                clipWasm = instance.exports;
+                // CLIP functions are now in combined lanceql.wasm
+                // Wait for lanceql to be loaded first
+                if (!lanceql || !lanceql.wasm) {
+                    // lanceql not loaded yet, wait for it
+                    await new Promise(r => setTimeout(r, 100));
+                    if (!lanceql || !lanceql.wasm) {
+                        throw new Error('LanceQL WASM not loaded');
+                    }
+                }
+
+                // Use the combined WASM which has both Lance and CLIP functions
+                clipWasm = lanceql.wasm;
 
                 // Initialize CLIP
                 const initResult = clipWasm.clip_init();
                 if (initResult === 0) {
-                    console.log('CLIP WASM initialized');
+                    console.log('CLIP WASM initialized (combined with LanceQL)');
                     updateClipStatus('Ready', '');
                 } else {
                     console.error('CLIP init failed:', initResult);
