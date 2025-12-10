@@ -3726,21 +3726,36 @@
             const columns = ['score', ...colNames];
             const rows = [];
 
-            // Fetch data for each result
+            // Fetch data for all result indices at once (batch for efficiency)
+            const columnData = {};
+            for (let c = 0; c < colNames.length; c++) {
+                const type = columnTypes[c];
+                if (type === 'string') {
+                    columnData[c] = await targetFile.readStringsAtIndices(c, results.indices);
+                } else if (type === 'int64' || type === 'int32') {
+                    columnData[c] = await targetFile.readInt64AtIndices(c, results.indices);
+                } else if (type === 'float64' || type === 'float32' || type === 'double') {
+                    columnData[c] = await targetFile.readFloat64AtIndices(c, results.indices);
+                } else if (type === 'vector') {
+                    columnData[c] = results.indices.map(() => '[vector]');
+                } else {
+                    columnData[c] = results.indices.map(() => '');
+                }
+            }
+
+            // Build rows from column data
             for (let i = 0; i < results.indices.length; i++) {
-                const idx = results.indices[i];
                 const score = results.scores[i];
                 const row = [score.toFixed(4)];
 
                 for (let c = 0; c < colNames.length; c++) {
-                    const type = columnTypes[c];
-                    if (type === 'string') {
-                        const vals = await targetFile.readStringsAtIndices(c, [idx]);
-                        row.push(vals[0] || '');
-                    } else if (type === 'vector') {
-                        row.push('[vector]');
-                    } else {
+                    const val = columnData[c][i];
+                    if (val === null || val === undefined) {
                         row.push('');
+                    } else if (typeof val === 'number') {
+                        row.push(Number.isInteger(val) ? val.toString() : val.toFixed(4));
+                    } else {
+                        row.push(val);
                     }
                 }
                 rows.push(row);
@@ -3833,52 +3848,48 @@
 
                 hideProgress();
 
-                // Get image URLs and any text column
-                const urlColIdx = 0;
-                const urls = await currentFile.readStringsAtIndices(urlColIdx, results.indices);
-
-                // Try to find a text/caption column (usually column 1 or named 'text', 'caption')
-                let textColIdx = -1;
+                // Fetch all columns for results
                 const colNames = currentFile.columnNames || [];
-                for (let i = 0; i < colNames.length; i++) {
-                    const name = colNames[i].toLowerCase();
-                    if (name === 'text' || name === 'caption' || name === 'description' || name === 'title') {
-                        textColIdx = i;
-                        break;
+                const columns = ['score', ...colNames];
+                const columnData = {};
+
+                for (let c = 0; c < colNames.length; c++) {
+                    const type = columnTypes[c];
+                    if (type === 'string') {
+                        columnData[c] = await currentFile.readStringsAtIndices(c, results.indices);
+                    } else if (type === 'int64' || type === 'int32') {
+                        columnData[c] = await currentFile.readInt64AtIndices(c, results.indices);
+                    } else if (type === 'float64' || type === 'float32' || type === 'double') {
+                        columnData[c] = await currentFile.readFloat64AtIndices(c, results.indices);
+                    } else if (type === 'vector') {
+                        columnData[c] = results.indices.map(() => '[vector]');
+                    } else {
+                        columnData[c] = results.indices.map(() => '');
                     }
                 }
-                // If no named text column, try column 1 if it exists and isn't the vector column
-                if (textColIdx === -1 && colNames.length > 2) {
-                    const vecColIdx = parseInt(document.getElementById('vector-col').value);
-                    textColIdx = (vecColIdx !== 1) ? 1 : -1;
-                }
 
-                let texts = [];
-                if (textColIdx >= 0) {
-                    texts = await currentFile.readStringsAtIndices(textColIdx, results.indices);
-                }
+                // Build rows from column data
+                const rows = [];
+                for (let i = 0; i < results.indices.length; i++) {
+                    const score = results.scores[i];
+                    const row = [score.toFixed(4)];
 
-                // Build results with both image and text
-                const columns = texts.length > 0
-                    ? ['rank', 'row_idx', 'similarity', 'image', 'text']
-                    : ['rank', 'row_idx', 'similarity', 'image'];
-                const rows = results.indices.map((idx, i) => {
-                    const row = [
-                        (i + 1).toString(),
-                        idx.toString(),
-                        results.scores[i].toFixed(4),
-                        urls[i] || ''
-                    ];
-                    if (texts.length > 0) {
-                        row.push(texts[i] || '');
+                    for (let c = 0; c < colNames.length; c++) {
+                        const val = columnData[c][i];
+                        if (val === null || val === undefined) {
+                            row.push('');
+                        } else if (typeof val === 'number') {
+                            row.push(Number.isInteger(val) ? val.toString() : val.toFixed(4));
+                        } else {
+                            row.push(val);
+                        }
                     }
-                    return row;
-                });
+                    rows.push(row);
+                }
 
                 console.log('Search results - top scores:', results.scores.slice(0, 5));
                 displayResults({ columns, rows, total: results.indices.length });
-                const resultType = isImageMode ? 'images' : 'texts';
-                showStatus(`Found ${results.indices.length} ${resultType} matching "${text}" (top score: ${results.scores[0]?.toFixed(4) || 'N/A'})`, 'success');
+                showStatus(`Found ${results.indices.length} results for "${text}" (top score: ${results.scores[0]?.toFixed(4) || 'N/A'})`, 'success');
             } catch (err) {
                 showStatus('Text search error: ' + err.message, 'error');
                 console.error(err);
