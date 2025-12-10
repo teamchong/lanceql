@@ -1887,34 +1887,41 @@
             const selectedCols = Array.from(document.getElementById('df-select-cols').selectedOptions).map(o => o.value);
             const limit = document.getElementById('df-limit').value;
 
-            // Show data source based on how file was loaded
-            let code = '';
+            // Show Python-like code with data source
+            let code = `<span class="keyword">import</span> lanceql\n\n`;
+
             if (currentFile?._isRemote && currentFile?._url) {
                 const url = currentFile._url;
-                if (currentFile._isDataset) {
-                    code = `<span class="keyword">const</span> file = <span class="keyword">await</span> lanceql.<span class="method">openDataset</span>(<span class="string">'${url}'</span>);\n`;
-                } else {
-                    code = `<span class="keyword">const</span> file = <span class="keyword">await</span> lanceql.<span class="method">openUrl</span>(<span class="string">'${url}'</span>);\n`;
-                }
+                code += `<span class="comment"># Open remote dataset</span>\n`;
+                code += `dataset = lanceql.<span class="method">open</span>(<span class="string">"${url}"</span>)\n\n`;
             } else if (currentFile) {
-                code = `<span class="keyword">const</span> file = lanceql.<span class="method">open</span>(arrayBuffer);\n`;
+                code += `<span class="comment"># Open local file</span>\n`;
+                code += `dataset = lanceql.<span class="method">open</span>(<span class="string">"file.lance"</span>)\n\n`;
             } else {
-                code = `<span class="comment">// Load a file first</span>\n`;
+                code += `<span class="comment"># Load a file first</span>\n`;
             }
 
-            code += `<span class="keyword">const</span> result = file.<span class="method">df</span>()`;
+            code += `<span class="comment"># Query data</span>\n`;
+            code += `result = (\n`;
+            code += `    dataset.<span class="method">df</span>()\n`;
 
             if (filterCol !== '') {
+                const colName = currentFile?.columnNames?.[parseInt(filterCol)] || `col_${filterCol}`;
                 const type = columnTypes[parseInt(filterCol)] || 'int64';
-                code += `\n  .<span class="method">filter</span>(<span class="number">${filterCol}</span>, <span class="string">'${filterOp}'</span>, <span class="number">${filterVal}</span>, <span class="string">'${type}'</span>)`;
+                code += `    .<span class="method">filter</span>(<span class="string">"${colName}"</span>, <span class="string">"${filterOp}"</span>, <span class="number">${filterVal}</span>)\n`;
             }
 
             if (selectedCols.length > 0 && selectedCols.length < currentFile?.numColumns) {
-                code += `\n  .<span class="method">select</span>(${selectedCols.map(c => `<span class="number">${c}</span>`).join(', ')})`;
+                const colNames = selectedCols.map(c => {
+                    const name = currentFile?.columnNames?.[parseInt(c)] || `col_${c}`;
+                    return `<span class="string">"${name}"</span>`;
+                }).join(', ');
+                code += `    .<span class="method">select</span>([${colNames}])\n`;
             }
 
-            code += `\n  .<span class="method">limit</span>(<span class="number">${limit}</span>)`;
-            code += `\n  .<span class="method">collect</span>();`;
+            code += `    .<span class="method">limit</span>(<span class="number">${limit}</span>)\n`;
+            code += `    .<span class="method">collect</span>()\n`;
+            code += `)`;
 
             document.getElementById('df-preview').innerHTML = code;
         }
