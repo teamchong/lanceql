@@ -4101,6 +4101,10 @@ const TokenType = {
     AVG: 'AVG',
     MIN: 'MIN',
     MAX: 'MAX',
+    // Vector search keywords
+    SEARCH: 'SEARCH',
+    USING: 'USING',
+    ON: 'ON',
 
     // Literals
     IDENTIFIER: 'IDENTIFIER',
@@ -4156,6 +4160,9 @@ const KEYWORDS = {
     'AVG': TokenType.AVG,
     'MIN': TokenType.MIN,
     'MAX': TokenType.MAX,
+    'SEARCH': TokenType.SEARCH,
+    'USING': TokenType.USING,
+    'ON': TokenType.ON,
 };
 
 /**
@@ -4391,6 +4398,30 @@ export class SQLParser {
             having = this.parseExpr();
         }
 
+        // SEARCH - vector similarity search
+        // Syntax: SEARCH 'query' [USING minilm|clip] [ON column]
+        let search = null;
+        if (this.match(TokenType.SEARCH)) {
+            const query = this.expect(TokenType.STRING).value;
+            let encoder = 'minilm'; // default
+            let column = null;
+
+            // USING encoder
+            if (this.match(TokenType.USING)) {
+                encoder = this.expect(TokenType.IDENTIFIER).value.toLowerCase();
+                if (encoder !== 'minilm' && encoder !== 'clip') {
+                    throw new Error(`Unknown encoder: ${encoder}. Supported: minilm, clip`);
+                }
+            }
+
+            // ON column
+            if (this.match(TokenType.ON)) {
+                column = this.expect(TokenType.IDENTIFIER).value;
+            }
+
+            search = { query, encoder, column };
+        }
+
         // ORDER BY
         let orderBy = [];
         if (this.match(TokenType.ORDER)) {
@@ -4423,6 +4454,7 @@ export class SQLParser {
             where,
             groupBy,
             having,
+            search,
             orderBy,
             limit,
             offset,

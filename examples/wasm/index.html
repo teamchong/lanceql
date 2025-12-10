@@ -1134,8 +1134,8 @@
                     </div>
                     <div class="sql-examples">
                         <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50">First 50 rows</button>
-                        <button class="sql-example" id="random-sample-btn">Random 20 rows</button>
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 100">First 100 rows</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'cat' LIMIT 20">Search 'cat'</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'sunset beach' USING clip LIMIT 20">CLIP search</button>
                     </div>
                 </div>
                 <div class="run-section">
@@ -1404,8 +1404,8 @@
 
         // SQL syntax highlighting
         function highlightSQL(sql) {
-            const keywords = /\b(SELECT|FROM|WHERE|AND|OR|NOT|ORDER|BY|ASC|DESC|LIMIT|OFFSET|AS|NULL|IS|IN|BETWEEN|LIKE|TRUE|FALSE|GROUP|HAVING|DISTINCT|JOIN|LEFT|RIGHT|INNER|OUTER|ON|UNION|ALL|INSERT|UPDATE|DELETE|CREATE|DROP|TABLE|INDEX|VIEW)\b/gi;
-            const functions = /\b(read_lance|COUNT|SUM|AVG|MIN|MAX|COALESCE|CAST|UPPER|LOWER|LENGTH|SUBSTRING|CONCAT|ABS|ROUND|FLOOR|CEIL)\b/gi;
+            const keywords = /\b(SELECT|FROM|WHERE|AND|OR|NOT|ORDER|BY|ASC|DESC|LIMIT|OFFSET|AS|NULL|IS|IN|BETWEEN|LIKE|TRUE|FALSE|GROUP|HAVING|DISTINCT|JOIN|LEFT|RIGHT|INNER|OUTER|ON|UNION|ALL|INSERT|UPDATE|DELETE|CREATE|DROP|TABLE|INDEX|VIEW|SEARCH|USING)\b/gi;
+            const functions = /\b(read_lance|COUNT|SUM|AVG|MIN|MAX|COALESCE|CAST|UPPER|LOWER|LENGTH|SUBSTRING|CONCAT|ABS|ROUND|FLOOR|CEIL|minilm|clip)\b/gi;
             const strings = /('(?:[^'\\]|\\.)*')/g;
             const numbers = /\b(\d+\.?\d*)\b/g;
             const operators = /([=<>!]+|[+\-*\/])/g;
@@ -2055,6 +2055,12 @@
 
                 if (!targetFile) {
                     showStatus('No file loaded. Use: SELECT * FROM read_lance(\'https://...\') LIMIT 10', 'error');
+                    return;
+                }
+
+                // Check if this is a vector search query
+                if (ast.search) {
+                    await runVectorSearchQuery(ast, targetFile);
                     return;
                 }
 
@@ -3620,6 +3626,112 @@
                     <p>Finding similar items using IVF index</p>
                 </div>
             `;
+        }
+
+        // Run vector search from SQL SEARCH clause
+        async function runVectorSearchQuery(ast, targetFile) {
+            const { query, encoder, column } = ast.search;
+            const topK = ast.limit || 20;
+
+            showStatus(`Encoding "${query}" with ${encoder.toUpperCase()}...`, 'info');
+            showSearchLoading();
+
+            // Get query vector using appropriate encoder
+            let queryVec;
+            if (encoder === 'clip') {
+                if (!clipModelLoaded) {
+                    const loaded = await ensureClipModelLoaded();
+                    if (!loaded) {
+                        setLoading(false);
+                        return;
+                    }
+                }
+                queryVec = encodeTextWithClip(query);
+            } else {
+                // Default: minilm
+                if (!minilmModelLoaded) {
+                    const loaded = await ensureMinilmModelLoaded();
+                    if (!loaded) {
+                        setLoading(false);
+                        return;
+                    }
+                }
+                queryVec = encodeTextWithMinilm(query);
+            }
+
+            if (!queryVec) {
+                showStatus(`Failed to encode text with ${encoder}`, 'error');
+                setLoading(false);
+                return;
+            }
+
+            // Find vector column (by name or auto-detect)
+            let vectorColIdx = -1;
+            const colNames = targetFile.columnNames || [];
+            if (column) {
+                vectorColIdx = colNames.findIndex(n => n.toLowerCase() === column.toLowerCase());
+                if (vectorColIdx === -1) {
+                    showStatus(`Column "${column}" not found`, 'error');
+                    setLoading(false);
+                    return;
+                }
+            } else {
+                // Auto-detect first vector column
+                for (let i = 0; i < columnTypes.length; i++) {
+                    if (columnTypes[i] === 'vector') {
+                        vectorColIdx = i;
+                        break;
+                    }
+                }
+                if (vectorColIdx === -1) {
+                    showStatus('No vector column found. Use ON column_name to specify.', 'error');
+                    setLoading(false);
+                    return;
+                }
+            }
+
+            showStatus(`Searching vectors...`, 'info');
+
+            // Run vector search
+            const results = await targetFile.vectorSearch(
+                vectorColIdx,
+                queryVec,
+                topK,
+                (current, total) => {
+                    showProgress(`Scanning vectors...`, current, total);
+                }
+            );
+
+            hideProgress();
+
+            // Get all columns for results
+            const columns = ['score', ...colNames];
+            const rows = [];
+
+            // Fetch data for each result
+            for (let i = 0; i < results.indices.length; i++) {
+                const idx = results.indices[i];
+                const score = results.scores[i];
+                const row = [score.toFixed(4)];
+
+                for (let c = 0; c < colNames.length; c++) {
+                    const type = columnTypes[c];
+                    if (type === 'string') {
+                        const vals = await targetFile.readStringsAtIndices(c, [idx]);
+                        row.push(vals[0] || '');
+                    } else if (type === 'vector') {
+                        row.push('[vector]');
+                    } else {
+                        row.push('');
+                    }
+                }
+                rows.push(row);
+            }
+
+            document.getElementById('results-section').style.display = 'block';
+            displayResults({ columns, rows, total: results.indices.length });
+            showStatus(`Found ${results.indices.length} similar items for "${query}"`, 'success');
+            setLoading(false);
         }
 
         async function runClipSearch() {
