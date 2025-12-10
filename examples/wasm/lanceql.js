@@ -4579,24 +4579,45 @@ export class RemoteLanceDataset {
      * @private
      */
     async _loadManifest() {
-        // Find the latest manifest version
+        // Find the latest manifest version using binary search approach
         let manifestData = null;
         let manifestVersion = 0;
 
-        // Try versions 1-100 to find the latest
-        for (let v = 1; v <= 100; v++) {
-            try {
-                const url = `${this.baseUrl}/_versions/${v}.manifest`;
-                const response = await fetch(url, { method: 'HEAD' });
-                if (response.ok) {
-                    manifestVersion = v;
-                } else {
+        // First check common versions in parallel
+        const checkVersions = [1, 5, 10, 20, 50, 100];
+        const checks = await Promise.all(
+            checkVersions.map(async v => {
+                try {
+                    const url = `${this.baseUrl}/_versions/${v}.manifest`;
+                    const response = await fetch(url, { method: 'HEAD' });
+                    return response.ok ? v : 0;
+                } catch {
+                    return 0;
+                }
+            })
+        );
+
+        // Find highest existing version from quick check
+        let highestFound = Math.max(...checks);
+
+        // If we found a high version, scan forward from there
+        if (highestFound > 0) {
+            for (let v = highestFound + 1; v <= highestFound + 50; v++) {
+                try {
+                    const url = `${this.baseUrl}/_versions/${v}.manifest`;
+                    const response = await fetch(url, { method: 'HEAD' });
+                    if (response.ok) {
+                        highestFound = v;
+                    } else {
+                        break;
+                    }
+                } catch {
                     break;
                 }
-            } catch {
-                break;
             }
         }
+
+        manifestVersion = highestFound;
 
         if (manifestVersion === 0) {
             throw new Error('No manifest found in dataset');
@@ -4604,6 +4625,7 @@ export class RemoteLanceDataset {
 
         // Fetch the latest manifest
         const manifestUrl = `${this.baseUrl}/_versions/${manifestVersion}.manifest`;
+        console.log(`[LanceQL Dataset] Loading manifest v${manifestVersion}...`);
         const response = await fetch(manifestUrl);
         if (!response.ok) {
             throw new Error(`Failed to fetch manifest: ${response.status}`);
