@@ -280,7 +280,10 @@
         .sql-textarea:focus + .sql-highlight {
             border-color: #3b82f6;
         }
-        /* SQL syntax highlighting colors - no font changes to preserve alignment */
+        /* SQL syntax highlighting colors */
+        .sql-highlight span {
+            font: inherit;
+        }
         .sql-keyword { color: #c084fc; }
         .sql-function { color: #60a5fa; }
         .sql-string { color: #4ade80; }
