@@ -5123,6 +5123,196 @@ export class RemoteLanceDataset {
     }
 
     /**
+     * Parallel vector search across all fragments using WorkerPool.
+     * Falls back to sequential search if workers unavailable.
+     *
+     * @param {Float32Array} query - Query vector (must match dataset dimension)
+     * @param {number} topK - Number of results to return
+     * @param {Object} options - Search options
+     * @param {number} options.vectorColIdx - Index of vector column (auto-detected if not provided)
+     * @param {boolean} options.normalized - Whether vectors are L2-normalized (default: true for CLIP)
+     * @param {WorkerPool} options.workerPool - Optional pre-initialized worker pool
+     * @returns {Promise<{indices: Uint32Array, scores: Float32Array, rows: Object[]}>}
+     */
+    async vectorSearch(query, topK = 10, options = {}) {
+        const {
+            vectorColIdx = this._findVectorColumn(),
+            normalized = true,
+            workerPool = null
+        } = options;
+
+        if (vectorColIdx < 0) {
+            throw new Error('No vector column found in dataset');
+        }
+
+        const dim = query.length;
+        console.log(`[VectorSearch] Query dim=${dim}, topK=${topK}, fragments=${this._fragments.length}`);
+
+        // Try parallel search with workers
+        if (workerPool) {
+            return await this._parallelVectorSearch(query, topK, vectorColIdx, normalized, workerPool);
+        }
+
+        // Fallback: sequential search across fragments
+        return await this._sequentialVectorSearch(query, topK, vectorColIdx, normalized);
+    }
+
+    /**
+     * Find the vector column index by looking at schema.
+     * @private
+     */
+    _findVectorColumn() {
+        if (!this._schema) return -1;
+
+        for (let i = 0; i < this._schema.length; i++) {
+            const field = this._schema[i];
+            if (field.name === 'embedding' || field.name === 'vector' ||
+                field.type === 'fixed_size_list' || field.type === 'list') {
+                return i;
+            }
+        }
+
+        // Assume last column is vector if schema unclear
+        return this._schema.length - 1;
+    }
+
+    /**
+     * Parallel vector search using WorkerPool.
+     * @private
+     */
+    async _parallelVectorSearch(query, topK, vectorColIdx, normalized, workerPool) {
+        const dim = query.length;
+
+        // Load vectors from each fragment in parallel
+        const chunkPromises = this._fragments.map(async (frag, idx) => {
+            const file = await this.openFragment(idx);
+
+            // Get vector data for this fragment
+            const vectors = await file.readVectorColumn(vectorColIdx);
+            if (!vectors || vectors.length === 0) {
+                return null;
+            }
+
+            // Calculate start index for this fragment
+            let startIndex = 0;
+            for (let i = 0; i < idx; i++) {
+                startIndex += this._fragments[i].numRows;
+            }
+
+            return {
+                vectors: new Float32Array(vectors),
+                startIndex,
+                numVectors: vectors.length / dim
+            };
+        });
+
+        const chunks = (await Promise.all(chunkPromises)).filter(c => c !== null);
+
+        if (chunks.length === 0) {
+            return { indices: new Uint32Array(0), scores: new Float32Array(0), rows: [] };
+        }
+
+        // Perform parallel search
+        const { indices, scores } = await workerPool.parallelVectorSearch(
+            query, chunks, dim, topK, normalized
+        );
+
+        // Fetch row data for results
+        const rows = await this._fetchResultRows(indices);
+
+        return { indices, scores, rows };
+    }
+
+    /**
+     * Sequential vector search (fallback when workers unavailable).
+     * @private
+     */
+    async _sequentialVectorSearch(query, topK, vectorColIdx, normalized) {
+        const dim = query.length;
+        const allResults = [];
+
+        let globalOffset = 0;
+        for (let fragIdx = 0; fragIdx < this._fragments.length; fragIdx++) {
+            const frag = this._fragments[fragIdx];
+            const file = await this.openFragment(fragIdx);
+
+            // Get top-k from this fragment
+            const results = await file.vectorSearchTopK(
+                vectorColIdx,
+                query,
+                topK,
+                normalized
+            );
+
+            // Add global offset to indices
+            for (let i = 0; i < results.count; i++) {
+                allResults.push({
+                    index: globalOffset + results.indices[i],
+                    score: results.scores[i]
+                });
+            }
+
+            globalOffset += frag.numRows;
+        }
+
+        // Sort and take top-k
+        allResults.sort((a, b) => b.score - a.score);
+        const finalK = Math.min(topK, allResults.length);
+
+        const indices = new Uint32Array(finalK);
+        const scores = new Float32Array(finalK);
+
+        for (let i = 0; i < finalK; i++) {
+            indices[i] = allResults[i].index;
+            scores[i] = allResults[i].score;
+        }
+
+        // Fetch row data for results
+        const rows = await this._fetchResultRows(indices);
+
+        return { indices, scores, rows };
+    }
+
+    /**
+     * Fetch full row data for result indices.
+     * @private
+     */
+    async _fetchResultRows(indices) {
+        if (indices.length === 0) return [];
+
+        const rows = [];
+
+        // Group indices by fragment for efficient fetching
+        const groups = this._groupIndicesByFragment(Array.from(indices));
+
+        for (const [fragIdx, group] of groups) {
+            const file = await this.openFragment(fragIdx);
+
+            // Read string columns for display
+            for (const localIdx of group.localIndices) {
+                const row = {};
+
+                // Try to read text/url columns
+                for (let colIdx = 0; colIdx < this._numColumns; colIdx++) {
+                    const colName = this.columnNames[colIdx];
+                    if (colName === 'text' || colName === 'url' || colName === 'caption') {
+                        try {
+                            const values = await file.readStringsAtIndices(colIdx, [localIdx]);
+                            row[colName] = values[0];
+                        } catch (e) {
+                            // Column might not be string type
+                        }
+                    }
+                }
+
+                rows.push(row);
+            }
+        }
+
+        return rows;
+    }
+
+    /**
      * Execute SQL query across all fragments in parallel.
      * @param {string} sql - SQL query
      * @returns {Promise<{columns: Array[], columnNames: string[], total: number}>}
@@ -5196,6 +5386,402 @@ export class RemoteLanceDataset {
             if (file.close) file.close();
         }
         this._fragmentFiles.clear();
+    }
+}
+
+// ============================================================================
+// WorkerPool - Parallel WASM execution across Web Workers
+// ============================================================================
+
+/**
+ * WorkerPool manages a pool of Web Workers, each running their own WASM instance.
+ * Enables true parallel processing across CPU cores.
+ *
+ * Features:
+ * - Automatic worker scaling based on hardware concurrency
+ * - Task queue with load balancing
+ * - Support for SharedArrayBuffer (zero-copy) when available
+ * - Graceful degradation to transferable ArrayBuffers
+ */
+export class WorkerPool {
+    /**
+     * Create a new worker pool.
+     * @param {number} size - Number of workers (default: navigator.hardwareConcurrency)
+     * @param {string} workerPath - Path to worker.js
+     */
+    constructor(size = null, workerPath = './worker.js') {
+        this.size = size || navigator.hardwareConcurrency || 4;
+        this.workerPath = workerPath;
+        this.workers = [];
+        this.taskQueue = [];
+        this.pendingTasks = new Map();
+        this.nextTaskId = 0;
+        this.idleWorkers = [];
+        this.initialized = false;
+
+        // Check for SharedArrayBuffer support
+        this.hasSharedArrayBuffer = typeof SharedArrayBuffer !== 'undefined';
+    }
+
+    /**
+     * Initialize all workers.
+     * @returns {Promise<void>}
+     */
+    async init() {
+        if (this.initialized) return;
+
+        const initPromises = [];
+
+        for (let i = 0; i < this.size; i++) {
+            const worker = new Worker(this.workerPath, { type: 'module' });
+            this.workers.push(worker);
+
+            // Set up message handling
+            worker.onmessage = (e) => this._handleMessage(i, e.data);
+            worker.onerror = (e) => this._handleError(i, e);
+
+            // Initialize worker with WASM
+            initPromises.push(this._initWorker(i));
+        }
+
+        await Promise.all(initPromises);
+        this.initialized = true;
+
+        console.log(`[WorkerPool] Initialized ${this.size} workers (SharedArrayBuffer: ${this.hasSharedArrayBuffer})`);
+    }
+
+    /**
+     * Initialize a single worker.
+     * @private
+     */
+    _initWorker(workerId) {
+        return new Promise((resolve, reject) => {
+            const taskId = this.nextTaskId++;
+
+            this.pendingTasks.set(taskId, {
+                resolve: (result) => {
+                    this.idleWorkers.push(workerId);
+                    resolve(result);
+                },
+                reject
+            });
+
+            this.workers[workerId].postMessage({
+                type: 'init',
+                id: taskId,
+                params: { workerId }
+            });
+        });
+    }
+
+    /**
+     * Handle message from worker.
+     * @private
+     */
+    _handleMessage(workerId, data) {
+        // Handle ready message (initial worker startup)
+        if (data.type === 'ready') {
+            return;
+        }
+
+        const { id, success, result, error } = data;
+        const task = this.pendingTasks.get(id);
+
+        if (!task) {
+            console.warn(`[WorkerPool] Unknown task ID: ${id}`);
+            return;
+        }
+
+        this.pendingTasks.delete(id);
+
+        if (success) {
+            task.resolve(result);
+        } else {
+            task.reject(new Error(error));
+        }
+
+        // Worker is now idle
+        this.idleWorkers.push(workerId);
+
+        // Process next task in queue
+        this._processQueue();
+    }
+
+    /**
+     * Handle worker error.
+     * @private
+     */
+    _handleError(workerId, error) {
+        console.error(`[WorkerPool] Worker ${workerId} error:`, error);
+    }
+
+    /**
+     * Process next task in queue.
+     * @private
+     */
+    _processQueue() {
+        while (this.taskQueue.length > 0 && this.idleWorkers.length > 0) {
+            const task = this.taskQueue.shift();
+            const workerId = this.idleWorkers.shift();
+            this._sendTask(workerId, task);
+        }
+    }
+
+    /**
+     * Send task to worker.
+     * @private
+     */
+    _sendTask(workerId, task) {
+        const worker = this.workers[workerId];
+        const transfer = task.transfer || [];
+
+        worker.postMessage({
+            type: task.type,
+            id: task.id,
+            params: task.params
+        }, transfer);
+    }
+
+    /**
+     * Submit a task to the pool.
+     * @param {string} type - Task type
+     * @param {Object} params - Task parameters
+     * @param {Array} transfer - Transferable objects
+     * @returns {Promise<any>}
+     */
+    submit(type, params, transfer = []) {
+        return new Promise((resolve, reject) => {
+            const taskId = this.nextTaskId++;
+
+            this.pendingTasks.set(taskId, { resolve, reject });
+
+            const task = { type, params, transfer, id: taskId };
+
+            if (this.idleWorkers.length > 0) {
+                const workerId = this.idleWorkers.shift();
+                this._sendTask(workerId, task);
+            } else {
+                this.taskQueue.push(task);
+            }
+        });
+    }
+
+    /**
+     * Parallel vector search across multiple data chunks.
+     *
+     * @param {Float32Array} query - Query vector
+     * @param {Array<{vectors: Float32Array, startIndex: number}>} chunks - Data chunks
+     * @param {number} dim - Vector dimension
+     * @param {number} topK - Number of results per chunk
+     * @param {boolean} normalized - Whether vectors are L2-normalized
+     * @returns {Promise<{indices: Uint32Array, scores: Float32Array}>}
+     */
+    async parallelVectorSearch(query, chunks, dim, topK, normalized = false) {
+        if (!this.initialized) {
+            await this.init();
+        }
+
+        // Submit search task to each worker
+        const searchPromises = chunks.map((chunk, i) => {
+            // Copy query for each worker (will be transferred)
+            const queryCopy = new Float32Array(query);
+
+            return this.submit('vectorSearch', {
+                vectors: chunk.vectors,
+                query: queryCopy,
+                dim,
+                numVectors: chunk.vectors.length / dim,
+                topK,
+                startIndex: chunk.startIndex,
+                normalized
+            }, [chunk.vectors.buffer, queryCopy.buffer]);
+        });
+
+        // Wait for all workers
+        const results = await Promise.all(searchPromises);
+
+        // Merge results from all workers
+        return this._mergeTopK(results, topK);
+    }
+
+    /**
+     * Merge top-k results from multiple workers.
+     * @private
+     */
+    _mergeTopK(results, topK) {
+        // Collect all results
+        const allResults = [];
+
+        for (const result of results) {
+            for (let i = 0; i < result.count; i++) {
+                allResults.push({
+                    index: result.indices[i],
+                    score: result.scores[i]
+                });
+            }
+        }
+
+        // Sort by score descending
+        allResults.sort((a, b) => b.score - a.score);
+
+        // Take top-k
+        const finalK = Math.min(topK, allResults.length);
+        const indices = new Uint32Array(finalK);
+        const scores = new Float32Array(finalK);
+
+        for (let i = 0; i < finalK; i++) {
+            indices[i] = allResults[i].index;
+            scores[i] = allResults[i].score;
+        }
+
+        return { indices, scores };
+    }
+
+    /**
+     * Parallel batch similarity computation.
+     *
+     * @param {Float32Array} query - Query vector
+     * @param {Array<Float32Array>} vectorChunks - Chunks of vectors
+     * @param {number} dim - Vector dimension
+     * @param {boolean} normalized - Whether vectors are L2-normalized
+     * @returns {Promise<Float32Array>} - All similarity scores
+     */
+    async parallelBatchSimilarity(query, vectorChunks, dim, normalized = false) {
+        if (!this.initialized) {
+            await this.init();
+        }
+
+        const similarityPromises = vectorChunks.map(chunk => {
+            const queryCopy = new Float32Array(query);
+            return this.submit('batchSimilarity', {
+                query: queryCopy,
+                vectors: chunk,
+                dim,
+                numVectors: chunk.length / dim,
+                normalized
+            }, [chunk.buffer, queryCopy.buffer]);
+        });
+
+        const results = await Promise.all(similarityPromises);
+
+        // Concatenate all scores
+        const totalLength = results.reduce((sum, r) => sum + r.scores.length, 0);
+        const allScores = new Float32Array(totalLength);
+
+        let offset = 0;
+        for (const result of results) {
+            allScores.set(result.scores, offset);
+            offset += result.scores.length;
+        }
+
+        return allScores;
+    }
+
+    /**
+     * Terminate all workers.
+     */
+    terminate() {
+        for (const worker of this.workers) {
+            worker.terminate();
+        }
+        this.workers = [];
+        this.idleWorkers = [];
+        this.initialized = false;
+    }
+}
+
+// ============================================================================
+// SharedArrayBuffer Vector Store - Zero-copy data sharing
+// ============================================================================
+
+/**
+ * SharedVectorStore provides zero-copy data sharing between main thread and workers.
+ * Requires Cross-Origin-Isolation (COOP/COEP headers).
+ */
+export class SharedVectorStore {
+    constructor() {
+        this.buffer = null;
+        this.vectors = null;
+        this.dim = 0;
+        this.numVectors = 0;
+
+        if (typeof SharedArrayBuffer === 'undefined') {
+            console.warn('[SharedVectorStore] SharedArrayBuffer not available. Using regular ArrayBuffer.');
+        }
+    }
+
+    /**
+     * Check if SharedArrayBuffer is available.
+     */
+    static isAvailable() {
+        return typeof SharedArrayBuffer !== 'undefined' &&
+               typeof Atomics !== 'undefined';
+    }
+
+    /**
+     * Allocate shared memory for vectors.
+     *
+     * @param {number} numVectors - Number of vectors to store
+     * @param {number} dim - Vector dimension
+     */
+    allocate(numVectors, dim) {
+        this.numVectors = numVectors;
+        this.dim = dim;
+
+        const byteLength = numVectors * dim * 4; // float32
+
+        if (SharedVectorStore.isAvailable()) {
+            this.buffer = new SharedArrayBuffer(byteLength);
+        } else {
+            // Fallback to regular ArrayBuffer
+            this.buffer = new ArrayBuffer(byteLength);
+        }
+
+        this.vectors = new Float32Array(this.buffer);
+    }
+
+    /**
+     * Copy vectors into shared memory.
+     *
+     * @param {Float32Array} source - Source vectors
+     * @param {number} startIndex - Starting index in store
+     */
+    set(source, startIndex = 0) {
+        this.vectors.set(source, startIndex * this.dim);
+    }
+
+    /**
+     * Get a slice of vectors (view, not copy).
+     *
+     * @param {number} start - Start vector index
+     * @param {number} count - Number of vectors
+     * @returns {Float32Array}
+     */
+    slice(start, count) {
+        const startOffset = start * this.dim;
+        const length = count * this.dim;
+        return new Float32Array(this.buffer, startOffset * 4, length);
+    }
+
+    /**
+     * Get chunk boundaries for parallel processing.
+     *
+     * @param {number} numChunks - Number of chunks
+     * @returns {Array<{start: number, count: number}>}
+     */
+    getChunks(numChunks) {
+        const chunks = [];
+        const chunkSize = Math.ceil(this.numVectors / numChunks);
+
+        for (let i = 0; i < numChunks; i++) {
+            const start = i * chunkSize;
+            const count = Math.min(chunkSize, this.numVectors - start);
+            if (count > 0) {
+                chunks.push({ start, count });
+            }
+        }
+
+        return chunks;
     }
 }
 

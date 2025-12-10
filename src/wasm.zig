@@ -1504,7 +1504,153 @@ export fn cosineSimilarity(
     return dot / denom;
 }
 
-/// Find top-k most similar vectors to query
+// ============================================================================
+// SIMD-Optimized Vector Operations
+// ============================================================================
+
+const Vec4 = @Vector(4, f32);
+
+/// SIMD dot product for f32 vectors (4-wide)
+fn simdDotProduct(a_ptr: [*]const f32, b_ptr: [*]const f32, dim: usize) f32 {
+    var sum: Vec4 = @splat(0);
+    var i: usize = 0;
+
+    // Process 4 elements at a time
+    while (i + 4 <= dim) : (i += 4) {
+        const va: Vec4 = .{ a_ptr[i], a_ptr[i + 1], a_ptr[i + 2], a_ptr[i + 3] };
+        const vb: Vec4 = .{ b_ptr[i], b_ptr[i + 1], b_ptr[i + 2], b_ptr[i + 3] };
+        sum += va * vb;
+    }
+
+    // Horizontal sum
+    var result = @reduce(.Add, sum);
+
+    // Handle remainder
+    while (i < dim) : (i += 1) {
+        result += a_ptr[i] * b_ptr[i];
+    }
+
+    return result;
+}
+
+/// SIMD L2 norm squared
+fn simdNormSquared(ptr: [*]const f32, dim: usize) f32 {
+    var sum: Vec4 = @splat(0);
+    var i: usize = 0;
+
+    while (i + 4 <= dim) : (i += 4) {
+        const v: Vec4 = .{ ptr[i], ptr[i + 1], ptr[i + 2], ptr[i + 3] };
+        sum += v * v;
+    }
+
+    var result = @reduce(.Add, sum);
+
+    while (i < dim) : (i += 1) {
+        result += ptr[i] * ptr[i];
+    }
+
+    return result;
+}
+
+/// SIMD cosine similarity for pre-normalized vectors (just dot product)
+export fn simdCosineSimilarityNormalized(
+    vec_a: [*]const f32,
+    vec_b: [*]const f32,
+    dim: usize,
+) f32 {
+    return simdDotProduct(vec_a, vec_b, dim);
+}
+
+/// SIMD cosine similarity for un-normalized vectors
+export fn simdCosineSimilarity(
+    vec_a: [*]const f32,
+    vec_b: [*]const f32,
+    dim: usize,
+) f32 {
+    const dot = simdDotProduct(vec_a, vec_b, dim);
+    const norm_a = @sqrt(simdNormSquared(vec_a, dim));
+    const norm_b = @sqrt(simdNormSquared(vec_b, dim));
+    const denom = norm_a * norm_b;
+    if (denom == 0) return 0;
+    return dot / denom;
+}
+
+/// Batch compute similarities between query and multiple vectors
+/// Much faster than calling simdCosineSimilarity in a loop
+/// vectors_ptr: flattened array of [num_vectors * dim] f32
+/// out_scores: array of [num_vectors] f32
+export fn batchCosineSimilarity(
+    query_ptr: [*]const f32,
+    vectors_ptr: [*]const f32,
+    dim: usize,
+    num_vectors: usize,
+    out_scores: [*]f32,
+    normalized: u32,
+) void {
+    // Pre-compute query norm if not normalized
+    const query_norm = if (normalized == 0) @sqrt(simdNormSquared(query_ptr, dim)) else 1.0;
+
+    for (0..num_vectors) |i| {
+        const vec_ptr = vectors_ptr + i * dim;
+        const dot = simdDotProduct(query_ptr, vec_ptr, dim);
+
+        if (normalized != 0) {
+            // Vectors are L2-normalized, dot product = cosine similarity
+            out_scores[i] = dot;
+        } else {
+            const vec_norm = @sqrt(simdNormSquared(vec_ptr, dim));
+            const denom = query_norm * vec_norm;
+            out_scores[i] = if (denom == 0) 0 else dot / denom;
+        }
+    }
+}
+
+/// Find top-k from pre-computed scores
+/// Uses partial selection for better performance than full sort
+fn findTopK(
+    scores: [*]const f32,
+    num_scores: usize,
+    top_k: usize,
+    out_indices: [*]u32,
+    out_scores: [*]f32,
+) usize {
+    const actual_k = @min(top_k, num_scores);
+
+    // Initialize with worst scores
+    for (0..actual_k) |i| {
+        out_indices[i] = 0;
+        out_scores[i] = -2.0;
+    }
+
+    // Simple insertion sort into top-k (good for small k)
+    for (0..num_scores) |i| {
+        const score = scores[i];
+
+        if (score > out_scores[actual_k - 1]) {
+            // Find insertion point
+            var insert_pos: usize = actual_k - 1;
+            while (insert_pos > 0 and score > out_scores[insert_pos - 1]) {
+                insert_pos -= 1;
+            }
+
+            // Shift elements down
+            var j: usize = actual_k - 1;
+            while (j > insert_pos) {
+                out_indices[j] = out_indices[j - 1];
+                out_scores[j] = out_scores[j - 1];
+                j -= 1;
+            }
+
+            // Insert
+            out_indices[insert_pos] = @intCast(i);
+            out_scores[insert_pos] = score;
+        }
+    }
+
+    return actual_k;
+}
+
+/// Find top-k most similar vectors to query (SIMD optimized)
 /// Returns number of results written
 /// out_indices: row indices of top matches
 /// out_scores: similarity scores
@@ -1530,7 +1676,7 @@ export fn vectorSearchTopK(
     if (info.rows == 0) return 0;
 
     const dim: usize = @intCast(info.size / (info.rows * 4));
-    if (dim != query_dim) return 0; // Dimension mismatch
+    if (dim != query_dim) return 0;
 
     const buf_start: usize = @intCast(info.offset);
     const num_rows: usize = @intCast(info.rows);
@@ -1539,37 +1685,32 @@ export fn vectorSearchTopK(
     // Initialize with worst scores
     for (0..actual_k) |i| {
         out_indices[i] = 0;
-        out_scores[i] = -2.0; // Worse than minimum cosine similarity
+        out_scores[i] = -2.0;
     }
 
-    // Scan all vectors and maintain top-k
+    // Pre-compute query norm (assume vectors may not be normalized)
+    const query_norm = @sqrt(simdNormSquared(query_ptr, query_dim));
+
+    // Scan all vectors using SIMD
     for (0..num_rows) |row| {
-        // Compute similarity
-        var dot: f32 = 0;
-        var norm_a: f32 = 0;
-        var norm_b: f32 = 0;
-
         const vec_start = buf_start + row * dim * 4;
-        for (0..dim) |i| {
-            const a = query_ptr[i];
-            const b = readF32LE(data, vec_start + i * 4);
-            dot += a * b;
-            norm_a += a * a;
-            norm_b += b * b;
-        }
 
-        const denom = @sqrt(norm_a) * @sqrt(norm_b);
+        // Get pointer to vector data (may be unaligned)
+        const vec_ptr: [*]const f32 = @ptrCast(@alignCast(data.ptr + vec_start));
+
+        // SIMD dot product
+        const dot = simdDotProduct(query_ptr, vec_ptr, dim);
+        const vec_norm = @sqrt(simdNormSquared(vec_ptr, dim));
+        const denom = query_norm * vec_norm;
         const score: f32 = if (denom == 0) 0 else dot / denom;
 
         // Insert into top-k if better than worst
         if (score > out_scores[actual_k - 1]) {
-            // Find insertion point
             var insert_pos: usize = actual_k - 1;
             while (insert_pos > 0 and score > out_scores[insert_pos - 1]) {
                 insert_pos -= 1;
             }
 
-            // Shift elements down
             var j: usize = actual_k - 1;
             while (j > insert_pos) {
                 out_indices[j] = out_indices[j - 1];
@@ -1577,9 +1718,122 @@ export fn vectorSearchTopK(
                 j -= 1;
             }
 
-            // Insert new element
             out_indices[insert_pos] = @intCast(row);
             out_scores[insert_pos] = score;
+        }
+    }
+
+    return actual_k;
+}
+
+/// Vector search on raw buffer (for worker-based processing)
+/// Searches vectors directly from a provided buffer, not from file_data
+/// normalized: 1 if vectors are L2-normalized (skip norm computation)
+export fn vectorSearchBuffer(
+    vectors_ptr: [*]const f32,
+    num_vectors: usize,
+    dim: usize,
+    query_ptr: [*]const f32,
+    top_k: usize,
+    out_indices: [*]u32,
+    out_scores: [*]f32,
+    normalized: u32,
+    start_index: u32,
+) usize {
+    const actual_k = @min(top_k, num_vectors);
+
+    // Initialize with worst scores
+    for (0..actual_k) |i| {
+        out_indices[i] = 0;
+        out_scores[i] = -2.0;
+    }
+
+    // Pre-compute query norm if not normalized
+    const query_norm = if (normalized == 0) @sqrt(simdNormSquared(query_ptr, dim)) else 1.0;
+
+    // Scan all vectors using SIMD
+    for (0..num_vectors) |row| {
+        const vec_ptr = vectors_ptr + row * dim;
+
+        const dot = simdDotProduct(query_ptr, vec_ptr, dim);
+
+        var score: f32 = undefined;
+        if (normalized != 0) {
+            // For L2-normalized vectors, dot product = cosine similarity
+            score = dot;
+        } else {
+            const vec_norm = @sqrt(simdNormSquared(vec_ptr, dim));
+            const denom = query_norm * vec_norm;
+            score = if (denom == 0) 0 else dot / denom;
+        }
+
+        // Insert into top-k if better than worst
+        if (score > out_scores[actual_k - 1]) {
+            var insert_pos: usize = actual_k - 1;
+            while (insert_pos > 0 and score > out_scores[insert_pos - 1]) {
+                insert_pos -= 1;
+            }
+
+            var j: usize = actual_k - 1;
+            while (j > insert_pos) {
+                out_indices[j] = out_indices[j - 1];
+                out_scores[j] = out_scores[j - 1];
+                j -= 1;
+            }
+
+            // Store global index (start_index + local row)
+            out_indices[insert_pos] = start_index + @as(u32, @intCast(row));
+            out_scores[insert_pos] = score;
+        }
+    }
+
+    return actual_k;
+}
+
+/// Merge multiple top-k results into final top-k
+/// Used by main thread to combine results from workers
+export fn mergeTopK(
+    indices_arrays: [*]const [*]const u32,
+    scores_arrays: [*]const [*]const f32,
+    num_arrays: usize,
+    k_per_array: usize,
+    final_k: usize,
+    out_indices: [*]u32,
+    out_scores: [*]f32,
+) usize {
+    const actual_k = @min(final_k, num_arrays * k_per_array);
+
+    // Initialize
+    for (0..actual_k) |i| {
+        out_indices[i] = 0;
+        out_scores[i] = -2.0;
+    }
+
+    // Merge all results
+    for (0..num_arrays) |arr_idx| {
+        const indices = indices_arrays[arr_idx];
+        const scores = scores_arrays[arr_idx];
+
+        for (0..k_per_array) |i| {
+            const score = scores[i];
+            if (score <= -2.0) continue; // Skip invalid
+
+            if (score > out_scores[actual_k - 1]) {
+                var insert_pos: usize = actual_k - 1;
+                while (insert_pos > 0 and score > out_scores[insert_pos - 1]) {
+                    insert_pos -= 1;
+                }
+
+                var j: usize = actual_k - 1;
+                while (j > insert_pos) {
+                    out_indices[j] = out_indices[j - 1];
+                    out_scores[j] = out_scores[j - 1];
+                    j -= 1;
+                }
+
+                out_indices[insert_pos] = indices[i];
+                out_scores[insert_pos] = score;
+            }
         }
     }
 
