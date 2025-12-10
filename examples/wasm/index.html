@@ -1153,6 +1153,16 @@
                 <div class="df-builder">
                     <div class="df-step">
                         <div class="df-step-num">1</div>
+                        <div class="df-step-label">Search</div>
+                        <input type="text" id="df-search-query" placeholder="e.g. cat, sunset beach" style="width: 150px;">
+                        <select id="df-search-encoder" style="width: 90px;">
+                            <option value="">No search</option>
+                            <option value="minilm">MiniLM</option>
+                            <option value="clip">CLIP</option>
+                        </select>
+                    </div>
+                    <div class="df-step">
+                        <div class="df-step-num">2</div>
                         <div class="df-step-label">Filter</div>
                         <select id="df-filter-col">
                             <option value="">No filter</option>
@@ -1168,14 +1178,14 @@
                         <input type="number" id="df-filter-value" value="0" placeholder="Value">
                     </div>
                     <div class="df-step">
-                        <div class="df-step-num">2</div>
+                        <div class="df-step-num">3</div>
                         <div class="df-step-label">Select</div>
                         <select id="df-select-cols" multiple size="2" style="min-width: 200px;">
                         </select>
                         <span style="color: #64748b; font-size: 12px;">Cmd/Ctrl+click for multiple</span>
                     </div>
                     <div class="df-step">
-                        <div class="df-step-num">3</div>
+                        <div class="df-step-num">4</div>
                         <div class="df-step-label">Limit</div>
                         <input type="number" id="df-limit" value="50" min="1" max="10000">
                         <span style="color: #64748b; font-size: 12px;">rows</span>
@@ -1883,6 +1893,8 @@
         }
 
         function updateDfPreview() {
+            const searchQuery = document.getElementById('df-search-query').value.trim();
+            const searchEncoder = document.getElementById('df-search-encoder').value;
             const filterCol = document.getElementById('df-filter-col').value;
             const filterOp = document.getElementById('df-filter-op').value;
             const filterVal = document.getElementById('df-filter-value').value;
@@ -1906,6 +1918,11 @@
             code += `<span class="comment"># Query data</span>\n`;
             code += `result = (\n`;
             code += `    dataset.<span class="method">df</span>()\n`;
+
+            // Vector search
+            if (searchQuery && searchEncoder) {
+                code += `    .<span class="method">search</span>(<span class="string">"${searchQuery}"</span>, encoder=<span class="string">"${searchEncoder}"</span>)\n`;
+            }
 
             if (filterCol !== '') {
                 const colName = currentFile?.columnNames?.[parseInt(filterCol)] || `col_${filterCol}`;
@@ -3304,7 +3321,7 @@
         });
 
         // DataFrame preview updates
-        ['df-filter-col', 'df-filter-op', 'df-filter-value', 'df-select-cols', 'df-limit'].forEach(id => {
+        ['df-search-query', 'df-search-encoder', 'df-filter-col', 'df-filter-op', 'df-filter-value', 'df-select-cols', 'df-limit'].forEach(id => {
             document.getElementById(id).addEventListener('change', updateDfPreview);
             document.getElementById(id).addEventListener('input', updateDfPreview);
         });
