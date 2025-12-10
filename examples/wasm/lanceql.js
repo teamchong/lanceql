@@ -4832,10 +4832,14 @@ export class SQLExecutor {
             }
         }
 
+        // When LIMIT is specified, total should reflect the limited count, not full dataset
+        // This ensures infinite scroll respects the LIMIT clause
+        const effectiveTotal = ast.limit ? rows.length : totalRows;
+
         return {
             columns: colNames,
             rows,
-            total: totalRows,
+            total: effectiveTotal,
         };
     }
 
