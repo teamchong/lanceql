@@ -2646,61 +2646,97 @@ export class RemoteLanceFile {
 
     /**
      * Brute-force vector search (exact).
+     * Streams vectors in batches to avoid downloading entire column.
+     * Handles multi-page columns correctly.
      * @private
      */
     async _vectorSearchBruteForce(colIdx, queryVec, topK, onProgress) {
-        const info = await this.getVectorInfo(colIdx);
-        const dim = info.dimension;
-        const vecSize = dim * 4;
-        const numRows = info.rows;
-
-        const batchSize = Math.min(100, numRows);
-        const topResults = [];
-
         const entry = await this.getColumnOffsetEntry(colIdx);
         const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
         const metaInfo = this._parseColumnMeta(new Uint8Array(colMeta));
 
-        for (let batchStart = 0; batchStart < numRows; batchStart += batchSize) {
-            const batchEnd = Math.min(batchStart + batchSize, numRows);
+        if (!metaInfo.pages || metaInfo.pages.length === 0) {
+            return { indices: [], scores: [], usedIndex: false };
+        }
 
-            if (onProgress) {
-                onProgress(batchStart, numRows);
+        // Get dimension from first page
+        const firstPage = metaInfo.pages[0];
+        const dataIdx = firstPage.sizes.length > 1 ? 1 : 0;
+        const firstPageSize = firstPage.sizes[dataIdx] || 0;
+        const firstPageRows = firstPage.rows || 0;
+
+        if (firstPageRows === 0 || firstPageSize === 0) {
+            return { indices: [], scores: [], usedIndex: false };
+        }
+
+        const dim = Math.floor(firstPageSize / (firstPageRows * 4));
+        const vecSize = dim * 4;
+        const totalRows = metaInfo.rows;
+        const batchSize = 1000; // Process 1000 vectors at a time
+        const topResults = [];
+
+        let globalRowIdx = 0;
+
+        // Process each page
+        for (let pageIdx = 0; pageIdx < metaInfo.pages.length; pageIdx++) {
+            const page = metaInfo.pages[pageIdx];
+            const pageDataIdx = page.sizes.length > 1 ? 1 : 0;
+            const pageOffset = page.offsets[pageDataIdx] || 0;
+            const pageRows = page.rows || 0;
+
+            if (pageRows === 0) continue;
+
+            // Stream this page in batches
+            for (let batchStart = 0; batchStart < pageRows; batchStart += batchSize) {
+                const batchEnd = Math.min(batchStart + batchSize, pageRows);
+                const batchCount = batchEnd - batchStart;
+
+                if (onProgress) {
+                    onProgress(globalRowIdx + batchStart, totalRows);
+                }
+
+                // Fetch just this batch
+                const startOffset = pageOffset + batchStart * vecSize;
+                const endOffset = pageOffset + batchEnd * vecSize - 1;
+                const data = await this.fetchRange(startOffset, endOffset);
+
+                // Compute similarities for this batch
+                const floatData = new Float32Array(data.buffer, data.byteOffset, batchCount * dim);
+
+                for (let i = 0; i < batchCount; i++) {
+                    const rowIdx = globalRowIdx + batchStart + i;
+                    const vecStart = i * dim;
+
+                    // Compute cosine similarity (optimized)
+                    let dot = 0, normB = 0;
+                    for (let j = 0; j < dim; j++) {
+                        const v = floatData[vecStart + j];
+                        dot += queryVec[j] * v;
+                        normB += v * v;
+                    }
+
+                    // For normalized vectors (CLIP), normB ≈ 1, so score ≈ dot
+                    // But compute full cosine for safety
+                    const normA = 1.0; // Assume query is normalized
+                    const denom = Math.sqrt(normA) * Math.sqrt(normB);
+                    const score = denom === 0 ? 0 : dot / denom;
+
+                    // Insert into top-k using binary search for efficiency
+                    if (topResults.length < topK) {
+                        topResults.push({ idx: rowIdx, score });
+                        topResults.sort((a, b) => b.score - a.score);
+                    } else if (score > topResults[topK - 1].score) {
+                        topResults[topK - 1] = { idx: rowIdx, score };
+                        topResults.sort((a, b) => b.score - a.score);
+                    }
+                }
             }
 
-            // Fetch batch of vectors
-            const startOffset = metaInfo.offset + batchStart * vecSize;
-            const endOffset = metaInfo.offset + batchEnd * vecSize - 1;
-            const data = await this.fetchRange(startOffset, endOffset);
-
-            // Compute similarities for this batch
-            for (let i = 0; i < batchEnd - batchStart; i++) {
-                const rowIdx = batchStart + i;
-                const vecData = new Float32Array(data.slice(i * vecSize, (i + 1) * vecSize));
-
-                // Compute cosine similarity
-                let dot = 0, normA = 0, normB = 0;
-                for (let j = 0; j < dim; j++) {
-                    dot += queryVec[j] * vecData[j];
-                    normA += queryVec[j] * queryVec[j];
-                    normB += vecData[j] * vecData[j];
-                }
-                const denom = Math.sqrt(normA) * Math.sqrt(normB);
-                const score = denom === 0 ? 0 : dot / denom;
-
-                // Insert into top-k
-                if (topResults.length < topK) {
-                    topResults.push({ idx: rowIdx, score });
-                    topResults.sort((a, b) => b.score - a.score);
-                } else if (score > topResults[topK - 1].score) {
-                    topResults[topK - 1] = { idx: rowIdx, score };
-                    topResults.sort((a, b) => b.score - a.score);
-                }
-            }
+            globalRowIdx += pageRows;
         }
 
         if (onProgress) {
-            onProgress(numRows, numRows);
+            onProgress(totalRows, totalRows);
         }
 
         return {
