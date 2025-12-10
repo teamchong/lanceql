@@ -1195,11 +1195,10 @@
                     </div>
                     <div class="sql-examples">
                         <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50">First 50</button>
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50 ORDER BY aesthetic DESC">Top aesthetic</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') ORDER BY aesthetic DESC LIMIT 50">Top aesthetic</button>
                         <button class="sql-example" data-sql="SELECT COUNT(*) FROM read_lance('https://data.metal0.dev/laion-1m/images.lance')">COUNT(*)</button>
                         <button class="sql-example" data-sql="SELECT AVG(aesthetic), MIN(aesthetic), MAX(aesthetic) FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 10000">Stats 10K</button>
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'cat' LIMIT 20">MiniLM</button>
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'sunset' USING clip-openai LIMIT 20">CLIP</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'cat' LIMIT 20">Search 'cat'</button>
                     </div>
                     <div class="dataset-hint" id="dataset-hint" style="display: none;"></div>
                 </div>

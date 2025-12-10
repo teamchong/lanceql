@@ -4428,21 +4428,27 @@ export class SQLParser {
             search = { query, encoder, column };
         }
 
-        // ORDER BY
+        // ORDER BY and LIMIT can appear in either order
         let orderBy = [];
+        let limit = null;
+        let offset = null;
+
+        // First pass: check for ORDER BY or LIMIT
         if (this.match(TokenType.ORDER)) {
             this.expect(TokenType.BY);
             orderBy = this.parseOrderByList();
         }
-
-        // LIMIT
-        let limit = null;
         if (this.match(TokenType.LIMIT)) {
             limit = parseInt(this.expect(TokenType.NUMBER).value, 10);
         }
 
-        // OFFSET
-        let offset = null;
+        // Second pass: allow ORDER BY after LIMIT (non-standard but common)
+        if (orderBy.length === 0 && this.match(TokenType.ORDER)) {
+            this.expect(TokenType.BY);
+            orderBy = this.parseOrderByList();
+        }
+
+        // OFFSET (can come after LIMIT)
         if (this.match(TokenType.OFFSET)) {
             offset = parseInt(this.expect(TokenType.NUMBER).value, 10);
         }
