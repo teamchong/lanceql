@@ -2675,6 +2675,51 @@ export class RemoteLanceFile {
             usedIndex: false
         };
     }
+
+    /**
+     * Wrapper for vector search that returns results in worker-compatible format.
+     * @param {number} colIdx - Vector column index
+     * @param {Float32Array} queryVec - Query vector
+     * @param {number} topK - Number of results
+     * @param {boolean} normalized - Whether vectors are L2-normalized (unused, always computes full cosine)
+     * @returns {Promise<{indices: Uint32Array, scores: Float32Array, count: number}>}
+     */
+    async vectorSearchTopK(colIdx, queryVec, topK, normalized = true) {
+        const result = await this._vectorSearchBruteForce(colIdx, queryVec, topK, null);
+        return {
+            indices: new Uint32Array(result.indices),
+            scores: new Float32Array(result.scores),
+            count: result.indices.length
+        };
+    }
+
+    /**
+     * Read all vectors from a column as a flat Float32Array.
+     * Used for worker-based parallel search.
+     * @param {number} colIdx - Vector column index
+     * @returns {Promise<Float32Array>} - Flattened vector data [numRows * dim]
+     */
+    async readVectorColumn(colIdx) {
+        const info = await this.getVectorInfo(colIdx);
+        if (info.dimension === 0 || info.rows === 0) {
+            return new Float32Array(0);
+        }
+
+        const dim = info.dimension;
+        const numRows = info.rows;
+        const vecSize = dim * 4; // float32
+
+        const entry = await this.getColumnOffsetEntry(colIdx);
+        const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
+        const metaInfo = this._parseColumnMeta(new Uint8Array(colMeta));
+
+        // Fetch all vector data at once
+        const totalBytes = numRows * vecSize;
+        const data = await this.fetchRange(metaInfo.offset, metaInfo.offset + totalBytes - 1);
+
+        // Convert to Float32Array
+        return new Float32Array(data.buffer, data.byteOffset, numRows * dim);
+    }
 }
 
 // ============================================================================
