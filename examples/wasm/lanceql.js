@@ -5604,6 +5604,7 @@ export class RemoteLanceDataset {
      * @param {string} baseUrl - Base URL to the dataset
      * @param {object} [options] - Options
      * @param {number} [options.version] - Specific version to load (time-travel)
+     * @param {boolean} [options.prefetch] - Prefetch fragment metadata (default: true for small datasets)
      * @returns {Promise<RemoteLanceDataset>}
      */
     static async open(lanceql, baseUrl, options = {}) {
@@ -5611,7 +5612,30 @@ export class RemoteLanceDataset {
         dataset._requestedVersion = options.version || null;
         await dataset._loadManifest();
         await dataset._tryLoadIndex();
+
+        // Prefetch fragment metadata for faster first query
+        // Default: prefetch if <= 5 fragments
+        const shouldPrefetch = options.prefetch ?? (dataset._fragments.length <= 5);
+        if (shouldPrefetch && dataset._fragments.length > 0) {
+            dataset._prefetchFragments();
+        }
+
         return dataset;
+    }
+
+    /**
+     * Prefetch fragment metadata (footers) in parallel.
+     * Does not block - runs in background.
+     * @private
+     */
+    _prefetchFragments() {
+        const prefetchPromises = this._fragments.map((_, idx) =>
+            this.openFragment(idx).catch(() => null)
+        );
+        // Run in background, don't await
+        Promise.all(prefetchPromises).then(() => {
+            console.log(`[LanceQL Dataset] Prefetched ${this._fragments.length} fragment(s)`);
+        });
     }
 
     /**
