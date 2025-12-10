@@ -2458,12 +2458,38 @@ fn matmul(input: []const f32, weight: []const f32, bias: ?[]const f32, output: [
     }
 }
 
-// GELU activation (approximation using sigmoid)
+// Error function (erf) approximation using Abramowitz and Stegun formula 7.1.26
+// Maximum error: 1.5e-7
+fn erf(x: f32) f32 {
+    // Constants for the approximation
+    const a1: f32 = 0.254829592;
+    const a2: f32 = -0.284496736;
+    const a3: f32 = 1.421413741;
+    const a4: f32 = -1.453152027;
+    const a5: f32 = 1.061405429;
+    const p: f32 = 0.3275911;
+
+    // Save the sign of x
+    const sign: f32 = if (x < 0) -1.0 else 1.0;
+    const abs_x = @abs(x);
+
+    // A&S formula 7.1.26
+    const t = 1.0 / (1.0 + p * abs_x);
+    const t2 = t * t;
+    const t3 = t2 * t;
+    const t4 = t3 * t;
+    const t5 = t4 * t;
+
+    const y = 1.0 - (a1 * t + a2 * t2 + a3 * t3 + a4 * t4 + a5 * t5) * @exp(-abs_x * abs_x);
+
+    return sign * y;
+}
+
+// Standard GELU activation (exact, using erf)
+// GELU(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
 fn gelu(x: f32) f32 {
-    // GELU(x) ≈ x * sigmoid(1.702 * x) - faster approximation
-    const scaled = 1.702 * x;
-    const sigmoid = 1.0 / (1.0 + @exp(-scaled));
-    return x * sigmoid;
+    const sqrt2_inv: f32 = 0.7071067811865476; // 1 / sqrt(2)
+    return x * 0.5 * (1.0 + erf(x * sqrt2_inv));
 }
 
 // Softmax over last dimension
@@ -2725,23 +2751,37 @@ fn mlpBlock(input: []f32, residual: []f32, seq_len: usize, layer: usize) void {
         var mlp_hidden: [CLIP_MLP_DIM]f32 = undefined;
         linearLayerSimd(CLIP_EMBED_DIM, CLIP_MLP_DIM, h, fc1_w_idx, fc1_b_idx, &mlp_hidden, weight_row_buf[0..CLIP_EMBED_DIM]);
 
-        // GELU activation with SIMD
+        // Standard GELU activation (exact, using erf)
+        // GELU(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
+        // This matches PyTorch's GELU(approximate='none')
+        const sqrt2_inv: f32 = 1.0 / @sqrt(2.0); // 0.7071067811865476
         var i: usize = 0;
         while (i < CLIP_MLP_DIM) : (i += SIMD_WIDTH) {
             const x: Vec4 = mlp_hidden[i..][0..SIMD_WIDTH].*;
-            const neg_x = -x * @as(Vec4, @splat(1.702));
-            // exp approximation or use @exp element-wise
-            var exp_neg: Vec4 = undefined;
+            // Compute erf(x / sqrt(2)) element-wise
+            var erf_val: Vec4 = undefined;
             inline for (0..SIMD_WIDTH) |k| {
-                exp_neg[k] = @exp(neg_x[k]);
+                erf_val[k] = erf(x[k] * sqrt2_inv);
             }
-            const sigmoid = @as(Vec4, @splat(1.0)) / (@as(Vec4, @splat(1.0)) + exp_neg);
-            mlp_hidden[i..][0..SIMD_WIDTH].* = x * sigmoid;
+            // GELU = x * 0.5 * (1 + erf_val)
+            const half: Vec4 = @splat(0.5);
+            const one: Vec4 = @splat(1.0);
+            mlp_hidden[i..][0..SIMD_WIDTH].* = x * half * (one + erf_val);
+        }
+
+        // Debug: save fc1 output (after GELU) for layer 0, pos 0
+        if (layer == 0 and pos == 0) {
+            @memcpy(&debug_after_fc1, mlp_hidden[0..8]);
         }
 
         // Second linear: mlp_dim -> embed_dim using SIMD
         var fc2_out: [CLIP_EMBED_DIM]f32 = undefined;
         linearLayerSimd(CLIP_MLP_DIM, CLIP_EMBED_DIM, &mlp_hidden, fc2_w_idx, fc2_b_idx, &fc2_out, &weight_row_buf);
+
+        // Debug: save fc2 output for layer 0, pos 0
+        if (layer == 0 and pos == 0) {
+            @memcpy(&debug_after_fc2, fc2_out[0..8]);
+        }
 
         // Add to residual with SIMD
         const res: *[CLIP_EMBED_DIM]f32 = @ptrCast(residual[pos * CLIP_EMBED_DIM ..][0..CLIP_EMBED_DIM]);
@@ -2827,6 +2867,9 @@ export fn clip_encode_text(text_len: usize) i32 {
         }
     }
 
+    // Debug: save initial embedding for position 0
+    @memcpy(&debug_after_embedding, scratch_hidden[0..CLIP_EMBED_DIM]);
+
     // Run through transformer layers
     // CLIP uses pre-norm: LN -> Attn -> residual, LN -> MLP -> residual
     for (0..CLIP_NUM_LAYERS) |layer| {
@@ -2838,8 +2881,18 @@ export fn clip_encode_text(text_len: usize) i32 {
         @memcpy(scratch_ln[0 .. seq_len * CLIP_EMBED_DIM], scratch_hidden[0 .. seq_len * CLIP_EMBED_DIM]);
         layerNormInPlace(&scratch_ln, seq_len, ln1_w_idx, ln1_b_idx);
 
+        // Debug: save after ln1 on first layer
+        if (layer == 0) {
+            @memcpy(&debug_after_ln1, scratch_ln[0..CLIP_EMBED_DIM]);
+        }
+
         // Multi-head attention on normalized input, adds to scratch_hidden (residual)
         multiHeadAttention(&scratch_ln, &scratch_hidden, seq_len, layer, &scratch_q, &scratch_k, &scratch_v, &scratch_attn);
+
+        // Debug: save after attention on first layer
+        if (layer == 0) {
+            @memcpy(&debug_after_attn, scratch_hidden[0..CLIP_EMBED_DIM]);
+        }
 
         // Pre-MLP layer norm
         const ln2_w_idx = layer_ln2_weight_idx[layer] orelse continue;
@@ -2847,10 +2900,43 @@ export fn clip_encode_text(text_len: usize) i32 {
 
         // Apply layer norm to scratch_ln (input to MLP)
         @memcpy(scratch_ln[0 .. seq_len * CLIP_EMBED_DIM], scratch_hidden[0 .. seq_len * CLIP_EMBED_DIM]);
+
+        // Debug: save pre-ln2 and weights on first layer
+        if (layer == 0) {
+            @memcpy(&debug_pre_ln2, scratch_ln[0..8]);
+            for (0..8) |i| {
+                debug_ln2_w[i] = readWeight(ln2_w_idx, i);
+                debug_ln2_b[i] = readWeight(ln2_b_idx, i);
+            }
+
+            // Compute mean/std for debug
+            const h = scratch_ln[0..CLIP_EMBED_DIM];
+            var sum: f32 = 0;
+            for (h) |v| sum += v;
+            debug_ln2_mean = sum / @as(f32, CLIP_EMBED_DIM);
+
+            var var_sum: f32 = 0;
+            for (h) |v| {
+                const diff = v - debug_ln2_mean;
+                var_sum += diff * diff;
+            }
+            debug_ln2_std = @sqrt(var_sum / @as(f32, CLIP_EMBED_DIM));
+        }
+
         layerNormInPlace(&scratch_ln, seq_len, ln2_w_idx, ln2_b_idx);
+
+        // Debug: save after ln2 on first layer
+        if (layer == 0) {
+            @memcpy(&debug_after_ln2, scratch_ln[0..CLIP_EMBED_DIM]);
+        }
 
         // MLP on normalized input, adds to scratch_hidden (residual)
         mlpBlock(&scratch_ln, &scratch_hidden, seq_len, layer);
+
+        // Debug: save after first layer
+        if (layer == 0) {
+            @memcpy(&debug_after_layer0, scratch_hidden[0..CLIP_EMBED_DIM]);
+        }
     }
 
     // Final layer norm
@@ -2868,6 +2954,12 @@ export fn clip_encode_text(text_len: usize) i32 {
         }
         clip_output_buffer[i] = sum;
     }
+
+    // Debug: save pre-norm output
+    @memcpy(&debug_pre_norm, clip_output_buffer[0..8]);
+    var pre_norm_sq: f32 = 0;
+    for (clip_output_buffer) |v| pre_norm_sq += v * v;
+    debug_pre_norm_norm = @sqrt(pre_norm_sq);
 
     // L2 normalize
     var norm_sq: f32 = 0;
@@ -2889,6 +2981,24 @@ export fn clip_test_add(a: i32, b: i32) i32 {
 var debug_tokens: [CLIP_MAX_SEQ_LEN]u32 = undefined;
 var debug_token_count: usize = 0;
 
+// Debug buffer to store intermediate values
+var debug_hidden: [CLIP_EMBED_DIM]f32 = undefined;
+var debug_stage: usize = 0; // 0=embedding, 1=after_layer0, etc
+var debug_after_embedding: [CLIP_EMBED_DIM]f32 = undefined;
+var debug_after_ln1: [CLIP_EMBED_DIM]f32 = undefined;
+var debug_after_attn: [CLIP_EMBED_DIM]f32 = undefined;
+var debug_after_ln2: [CLIP_EMBED_DIM]f32 = undefined;
+var debug_after_fc1: [8]f32 = undefined; // First 8 of mlp_hidden (after GELU)
+var debug_after_fc2: [8]f32 = undefined; // First 8 of fc2 output
+var debug_after_layer0: [CLIP_EMBED_DIM]f32 = undefined;
+var debug_ln2_w: [8]f32 = undefined;
+var debug_ln2_b: [8]f32 = undefined;
+var debug_pre_ln2: [8]f32 = undefined; // hidden state before ln2
+var debug_ln2_mean: f32 = 0;
+var debug_ln2_std: f32 = 0;
+var debug_pre_norm: [8]f32 = undefined;
+var debug_pre_norm_norm: f32 = 0;
+
 export fn clip_debug_get_token(pos: usize) u32 {
     if (pos < debug_token_count) {
         return debug_tokens[pos];
@@ -2898,6 +3008,102 @@ export fn clip_debug_get_token(pos: usize) u32 {
 
 export fn clip_debug_get_token_count() usize {
     return debug_token_count;
+}
+
+// Get debug hidden state at dimension i
+export fn clip_debug_get_hidden(i: usize) f32 {
+    if (i < CLIP_EMBED_DIM) {
+        return debug_hidden[i];
+    }
+    return 0;
+}
+
+// Get token embedding value directly
+export fn clip_debug_get_token_emb(token_id: u32, dim: usize) f32 {
+    const tok_emb_idx = token_embedding_idx orelse return -999;
+    return readWeight(tok_emb_idx, token_id * CLIP_EMBED_DIM + dim);
+}
+
+// Get position embedding value directly
+export fn clip_debug_get_pos_emb(pos: usize, dim: usize) f32 {
+    const pos_emb_idx = position_embedding_idx orelse return -999;
+    return readWeight(pos_emb_idx, pos * CLIP_EMBED_DIM + dim);
+}
+
+// Get scratch_hidden value (after embedding, or after each layer)
+export fn clip_debug_get_scratch_hidden(pos: usize, dim: usize) f32 {
+    if (pos < CLIP_MAX_SEQ_LEN and dim < CLIP_EMBED_DIM) {
+        return scratch_hidden[pos * CLIP_EMBED_DIM + dim];
+    }
+    return -999;
+}
+
+// Get debug values at different stages
+export fn clip_debug_get_after_embedding(dim: usize) f32 {
+    if (dim < CLIP_EMBED_DIM) return debug_after_embedding[dim];
+    return -999;
+}
+
+export fn clip_debug_get_after_layer0(dim: usize) f32 {
+    if (dim < CLIP_EMBED_DIM) return debug_after_layer0[dim];
+    return -999;
+}
+
+export fn clip_debug_get_after_ln1(dim: usize) f32 {
+    if (dim < CLIP_EMBED_DIM) return debug_after_ln1[dim];
+    return -999;
+}
+
+export fn clip_debug_get_after_attn(dim: usize) f32 {
+    if (dim < CLIP_EMBED_DIM) return debug_after_attn[dim];
+    return -999;
+}
+
+export fn clip_debug_get_after_ln2(dim: usize) f32 {
+    if (dim < CLIP_EMBED_DIM) return debug_after_ln2[dim];
+    return -999;
+}
+
+export fn clip_debug_get_after_fc1(dim: usize) f32 {
+    if (dim < 8) return debug_after_fc1[dim];
+    return -999;
+}
+
+export fn clip_debug_get_after_fc2(dim: usize) f32 {
+    if (dim < 8) return debug_after_fc2[dim];
+    return -999;
+}
+
+export fn clip_debug_get_ln2_w(dim: usize) f32 {
+    if (dim < 8) return debug_ln2_w[dim];
+    return -999;
+}
+
+export fn clip_debug_get_ln2_b(dim: usize) f32 {
+    if (dim < 8) return debug_ln2_b[dim];
+    return -999;
+}
+
+export fn clip_debug_get_pre_ln2(dim: usize) f32 {
+    if (dim < 8) return debug_pre_ln2[dim];
+    return -999;
+}
+
+export fn clip_debug_get_ln2_mean() f32 {
+    return debug_ln2_mean;
+}
+
+export fn clip_debug_get_ln2_std() f32 {
+    return debug_ln2_std;
+}
+
+export fn clip_debug_get_pre_norm(dim: usize) f32 {
+    if (dim < 8) return debug_pre_norm[dim];
+    return -999;
+}
+
+export fn clip_debug_get_pre_norm_norm() f32 {
+    return debug_pre_norm_norm;
 }
 
 // ============================================================================
@@ -2934,6 +3140,795 @@ export fn zstd_decompress(
 
     return bytes_written;
 }
+
+// ============================================================================
+// MiniLM Text Encoder (all-MiniLM-L6-v2)
+// ============================================================================
+
+// MiniLM model constants
+const MINILM_VOCAB_SIZE: usize = 30522;
+const MINILM_MAX_SEQ_LEN: usize = 256; // Shorter for typical queries
+const MINILM_EMBED_DIM: usize = 384;
+const MINILM_NUM_HEADS: usize = 12;
+const MINILM_NUM_LAYERS: usize = 6;
+const MINILM_MLP_DIM: usize = 1536;
+const MINILM_HEAD_DIM: usize = MINILM_EMBED_DIM / MINILM_NUM_HEADS; // 32
+
+// Comptime assertions for SIMD alignment
+comptime {
+    if (MINILM_EMBED_DIM % SIMD_WIDTH != 0) @compileError("MINILM_EMBED_DIM must be divisible by SIMD_WIDTH");
+    if (MINILM_HEAD_DIM % SIMD_WIDTH != 0) @compileError("MINILM_HEAD_DIM must be divisible by SIMD_WIDTH");
+    if (MINILM_MLP_DIM % SIMD_WIDTH != 0) @compileError("MINILM_MLP_DIM must be divisible by SIMD_WIDTH");
+}
+
+// MiniLM state
+var minilm_initialized: bool = false;
+var minilm_model_loaded: bool = false;
+
+// Buffers for MiniLM
+var minilm_text_buffer: [1024]u8 = undefined;
+var minilm_output_buffer: [MINILM_EMBED_DIM]f32 = undefined;
+
+// Model weights storage
+var minilm_model_buffer: ?[*]u8 = null;
+var minilm_model_size: usize = 0;
+
+// GGUF parsing state for MiniLM
+var minilm_gguf_data_offset: usize = 0;
+var minilm_n_tensors_loaded: usize = 0;
+var minilm_tensor_names: [MAX_TENSORS][96]u8 = undefined; // Longer names for BERT
+var minilm_tensor_name_lens: [MAX_TENSORS]usize = undefined;
+var minilm_tensor_offsets: [MAX_TENSORS]u64 = undefined;
+var minilm_tensor_types: [MAX_TENSORS]u32 = undefined;
+var minilm_tensor_dims: [MAX_TENSORS][4]u64 = undefined;
+var minilm_tensor_n_dims: [MAX_TENSORS]u32 = undefined;
+
+// MiniLM vocab
+var minilm_vocab_data: ?[*]const u8 = null;
+var minilm_vocab_count: usize = 0;
+var minilm_vocab_string_offsets: [MINILM_VOCAB_SIZE + 1]u32 = undefined;
+
+// MiniLM weight tensor indices
+var minilm_word_emb_idx: ?usize = null;
+var minilm_pos_emb_idx: ?usize = null;
+var minilm_token_type_emb_idx: ?usize = null;
+var minilm_emb_ln_weight_idx: ?usize = null;
+var minilm_emb_ln_bias_idx: ?usize = null;
+
+// Per-layer weight indices (6 layers)
+var minilm_layer_q_weight_idx: [MINILM_NUM_LAYERS]?usize = [_]?usize{null} ** MINILM_NUM_LAYERS;
+var minilm_layer_q_bias_idx: [MINILM_NUM_LAYERS]?usize = [_]?usize{null} ** MINILM_NUM_LAYERS;
+var minilm_layer_k_weight_idx: [MINILM_NUM_LAYERS]?usize = [_]?usize{null} ** MINILM_NUM_LAYERS;
+var minilm_layer_k_bias_idx: [MINILM_NUM_LAYERS]?usize = [_]?usize{null} ** MINILM_NUM_LAYERS;
+var minilm_layer_v_weight_idx: [MINILM_NUM_LAYERS]?usize = [_]?usize{null} ** MINILM_NUM_LAYERS;
+var minilm_layer_v_bias_idx: [MINILM_NUM_LAYERS]?usize = [_]?usize{null} ** MINILM_NUM_LAYERS;
+var minilm_layer_out_weight_idx: [MINILM_NUM_LAYERS]?usize = [_]?usize{null} ** MINILM_NUM_LAYERS;
+var minilm_layer_out_bias_idx: [MINILM_NUM_LAYERS]?usize = [_]?usize{null} ** MINILM_NUM_LAYERS;
+var minilm_layer_attn_ln_weight_idx: [MINILM_NUM_LAYERS]?usize = [_]?usize{null} ** MINILM_NUM_LAYERS;
+var minilm_layer_attn_ln_bias_idx: [MINILM_NUM_LAYERS]?usize = [_]?usize{null} ** MINILM_NUM_LAYERS;
+var minilm_layer_ffn_up_weight_idx: [MINILM_NUM_LAYERS]?usize = [_]?usize{null} ** MINILM_NUM_LAYERS;
+var minilm_layer_ffn_up_bias_idx: [MINILM_NUM_LAYERS]?usize = [_]?usize{null} ** MINILM_NUM_LAYERS;
+var minilm_layer_ffn_down_weight_idx: [MINILM_NUM_LAYERS]?usize = [_]?usize{null} ** MINILM_NUM_LAYERS;
+var minilm_layer_ffn_down_bias_idx: [MINILM_NUM_LAYERS]?usize = [_]?usize{null} ** MINILM_NUM_LAYERS;
+var minilm_layer_ffn_ln_weight_idx: [MINILM_NUM_LAYERS]?usize = [_]?usize{null} ** MINILM_NUM_LAYERS;
+var minilm_layer_ffn_ln_bias_idx: [MINILM_NUM_LAYERS]?usize = [_]?usize{null} ** MINILM_NUM_LAYERS;
+
+// Scratch buffers for MiniLM inference
+var minilm_scratch_hidden: [MINILM_MAX_SEQ_LEN * MINILM_EMBED_DIM]f32 = undefined;
+var minilm_scratch_q: [MINILM_MAX_SEQ_LEN * MINILM_EMBED_DIM]f32 = undefined;
+var minilm_scratch_k: [MINILM_MAX_SEQ_LEN * MINILM_EMBED_DIM]f32 = undefined;
+var minilm_scratch_v: [MINILM_MAX_SEQ_LEN * MINILM_EMBED_DIM]f32 = undefined;
+var minilm_scratch_attn: [MINILM_NUM_HEADS * MINILM_MAX_SEQ_LEN * MINILM_MAX_SEQ_LEN]f32 = undefined;
+var minilm_scratch_ln: [MINILM_MAX_SEQ_LEN * MINILM_EMBED_DIM]f32 = undefined;
+var minilm_weight_row_buf: [MINILM_MLP_DIM]f32 = undefined;
+
+/// Initialize MiniLM module
+export fn minilm_init() i32 {
+    minilm_initialized = true;
+    minilm_model_loaded = false;
+
+    for (&minilm_output_buffer) |*v| {
+        v.* = 0;
+    }
+
+    return 0;
+}
+
+/// Get pointer to text input buffer
+export fn minilm_get_text_buffer() [*]u8 {
+    return &minilm_text_buffer;
+}
+
+/// Get size of text input buffer
+export fn minilm_get_text_buffer_size() usize {
+    return minilm_text_buffer.len;
+}
+
+/// Get pointer to output embedding buffer
+export fn minilm_get_output_buffer() [*]f32 {
+    return &minilm_output_buffer;
+}
+
+/// Get output embedding dimension
+export fn minilm_get_output_dim() usize {
+    return MINILM_EMBED_DIM;
+}
+
+/// Allocate buffer for model weights
+export fn minilm_alloc_model_buffer(size: usize) usize {
+    const page_size: usize = 65536;
+    const pages_needed = (size + page_size - 1) / page_size;
+
+    const current_pages = @wasmMemorySize(0);
+    const current_size = current_pages * page_size;
+
+    const result = @wasmMemoryGrow(0, pages_needed);
+    if (result == @as(usize, @bitCast(@as(isize, -1)))) {
+        return 0;
+    }
+
+    const ptr: [*]u8 = @ptrFromInt(current_size);
+    minilm_model_buffer = ptr;
+    minilm_model_size = size;
+    return current_size;
+}
+
+/// Check if model weights are loaded
+export fn minilm_weights_loaded() i32 {
+    return if (minilm_model_loaded) 1 else 0;
+}
+
+// Find tensor in MiniLM model
+fn minilmFindTensor(name: []const u8) ?usize {
+    for (0..minilm_n_tensors_loaded) |i| {
+        if (strEql(minilm_tensor_names[i][0..minilm_tensor_name_lens[i]], name)) {
+            return i;
+        }
+    }
+    return null;
+}
+
+// Read weight from MiniLM model
+fn minilmReadWeight(idx: usize, i: usize) f32 {
+    const model_data = minilm_model_buffer orelse return 0;
+    const offset: usize = minilm_gguf_data_offset + @as(usize, @intCast(minilm_tensor_offsets[idx]));
+
+    if (minilm_tensor_types[idx] == GGML_TYPE_F16) {
+        const ptr: [*]const u16 = @ptrCast(@alignCast(model_data + offset));
+        return f16ToF32(ptr[i]);
+    } else {
+        const ptr: [*]const f32 = @ptrCast(@alignCast(model_data + offset));
+        return ptr[i];
+    }
+}
+
+// Get weight row from MiniLM model
+fn minilmGetWeightRowF32(idx: usize, row: usize, row_len: usize, buf: []f32) void {
+    const model_data = minilm_model_buffer orelse return;
+    const offset: usize = minilm_gguf_data_offset + @as(usize, @intCast(minilm_tensor_offsets[idx]));
+    const row_offset = row * row_len;
+
+    if (minilm_tensor_types[idx] == GGML_TYPE_F16) {
+        const ptr: [*]const u16 = @ptrCast(@alignCast(model_data + offset));
+        for (0..row_len) |i| {
+            buf[i] = f16ToF32(ptr[row_offset + i]);
+        }
+    } else {
+        const ptr: [*]const f32 = @ptrCast(@alignCast(model_data + offset));
+        @memcpy(buf[0..row_len], ptr[row_offset .. row_offset + row_len]);
+    }
+}
+
+// Linear layer for MiniLM dimensions
+fn minilmLinearLayer384to384(
+    input: *const [MINILM_EMBED_DIM]f32,
+    w_idx: usize,
+    b_idx: usize,
+    output: *[MINILM_EMBED_DIM]f32,
+) void {
+    for (0..MINILM_EMBED_DIM) |i| {
+        minilmGetWeightRowF32(w_idx, i, MINILM_EMBED_DIM, minilm_weight_row_buf[0..MINILM_EMBED_DIM]);
+        var sum: f32 = minilmReadWeight(b_idx, i);
+        var j: usize = 0;
+        while (j < MINILM_EMBED_DIM) : (j += SIMD_WIDTH) {
+            const va: Vec4 = input[j..][0..SIMD_WIDTH].*;
+            const vb: Vec4 = minilm_weight_row_buf[j..][0..SIMD_WIDTH].*;
+            sum += @reduce(.Add, va * vb);
+        }
+        output[i] = sum;
+    }
+}
+
+fn minilmLinearLayer384to1536(
+    input: *const [MINILM_EMBED_DIM]f32,
+    w_idx: usize,
+    b_idx: usize,
+    output: *[MINILM_MLP_DIM]f32,
+) void {
+    for (0..MINILM_MLP_DIM) |i| {
+        minilmGetWeightRowF32(w_idx, i, MINILM_EMBED_DIM, minilm_weight_row_buf[0..MINILM_EMBED_DIM]);
+        var sum: f32 = minilmReadWeight(b_idx, i);
+        var j: usize = 0;
+        while (j < MINILM_EMBED_DIM) : (j += SIMD_WIDTH) {
+            const va: Vec4 = input[j..][0..SIMD_WIDTH].*;
+            const vb: Vec4 = minilm_weight_row_buf[j..][0..SIMD_WIDTH].*;
+            sum += @reduce(.Add, va * vb);
+        }
+        output[i] = sum;
+    }
+}
+
+fn minilmLinearLayer1536to384(
+    input: *const [MINILM_MLP_DIM]f32,
+    w_idx: usize,
+    b_idx: usize,
+    output: *[MINILM_EMBED_DIM]f32,
+) void {
+    for (0..MINILM_EMBED_DIM) |i| {
+        minilmGetWeightRowF32(w_idx, i, MINILM_MLP_DIM, &minilm_weight_row_buf);
+        var sum: f32 = minilmReadWeight(b_idx, i);
+        var j: usize = 0;
+        while (j < MINILM_MLP_DIM) : (j += SIMD_WIDTH) {
+            const va: Vec4 = input[j..][0..SIMD_WIDTH].*;
+            const vb: Vec4 = minilm_weight_row_buf[j..][0..SIMD_WIDTH].*;
+            sum += @reduce(.Add, va * vb);
+        }
+        output[i] = sum;
+    }
+}
+
+// Layer norm for MiniLM
+fn minilmLayerNorm(input: []f32, seq_len: usize, weight_idx: usize, bias_idx: usize) void {
+    const eps: f32 = 1e-12; // BERT uses 1e-12
+
+    for (0..seq_len) |pos| {
+        var h: *[MINILM_EMBED_DIM]f32 = @ptrCast(input[pos * MINILM_EMBED_DIM ..][0..MINILM_EMBED_DIM]);
+
+        // Mean
+        var sum_vec: Vec4 = @splat(0);
+        var i: usize = 0;
+        while (i < MINILM_EMBED_DIM) : (i += SIMD_WIDTH) {
+            sum_vec += h[i..][0..SIMD_WIDTH].*;
+        }
+        const mean = @reduce(.Add, sum_vec) / @as(f32, MINILM_EMBED_DIM);
+
+        // Variance
+        const mean_vec: Vec4 = @splat(mean);
+        var var_vec: Vec4 = @splat(0);
+        i = 0;
+        while (i < MINILM_EMBED_DIM) : (i += SIMD_WIDTH) {
+            const diff = h[i..][0..SIMD_WIDTH].* - mean_vec;
+            var_vec += diff * diff;
+        }
+        const variance = @reduce(.Add, var_vec) / @as(f32, MINILM_EMBED_DIM);
+        const inv_std = 1.0 / @sqrt(variance + eps);
+
+        // Normalize
+        var weight_buf: [MINILM_EMBED_DIM]f32 = undefined;
+        var bias_buf: [MINILM_EMBED_DIM]f32 = undefined;
+        minilmGetWeightRowF32(weight_idx, 0, MINILM_EMBED_DIM, &weight_buf);
+        minilmGetWeightRowF32(bias_idx, 0, MINILM_EMBED_DIM, &bias_buf);
+
+        const inv_std_vec: Vec4 = @splat(inv_std);
+        i = 0;
+        while (i < MINILM_EMBED_DIM) : (i += SIMD_WIDTH) {
+            const x = h[i..][0..SIMD_WIDTH].*;
+            const w: Vec4 = weight_buf[i..][0..SIMD_WIDTH].*;
+            const b: Vec4 = bias_buf[i..][0..SIMD_WIDTH].*;
+            h[i..][0..SIMD_WIDTH].* = (x - mean_vec) * inv_std_vec * w + b;
+        }
+    }
+}
+
+// MiniLM multi-head attention (bidirectional, no causal mask)
+fn minilmMultiHeadAttention(
+    input: []f32,
+    seq_len: usize,
+    layer: usize,
+) void {
+    const q_w_idx = minilm_layer_q_weight_idx[layer] orelse return;
+    const q_b_idx = minilm_layer_q_bias_idx[layer] orelse return;
+    const k_w_idx = minilm_layer_k_weight_idx[layer] orelse return;
+    const k_b_idx = minilm_layer_k_bias_idx[layer] orelse return;
+    const v_w_idx = minilm_layer_v_weight_idx[layer] orelse return;
+    const v_b_idx = minilm_layer_v_bias_idx[layer] orelse return;
+    const out_w_idx = minilm_layer_out_weight_idx[layer] orelse return;
+    const out_b_idx = minilm_layer_out_bias_idx[layer] orelse return;
+    const ln_w_idx = minilm_layer_attn_ln_weight_idx[layer] orelse return;
+    const ln_b_idx = minilm_layer_attn_ln_bias_idx[layer] orelse return;
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, MINILM_HEAD_DIM));
+
+    // Compute Q, K, V
+    for (0..seq_len) |pos| {
+        const h: *const [MINILM_EMBED_DIM]f32 = @ptrCast(input[pos * MINILM_EMBED_DIM ..][0..MINILM_EMBED_DIM]);
+        const q: *[MINILM_EMBED_DIM]f32 = @ptrCast(minilm_scratch_q[pos * MINILM_EMBED_DIM ..][0..MINILM_EMBED_DIM]);
+        const k: *[MINILM_EMBED_DIM]f32 = @ptrCast(minilm_scratch_k[pos * MINILM_EMBED_DIM ..][0..MINILM_EMBED_DIM]);
+        const v: *[MINILM_EMBED_DIM]f32 = @ptrCast(minilm_scratch_v[pos * MINILM_EMBED_DIM ..][0..MINILM_EMBED_DIM]);
+
+        minilmLinearLayer384to384(h, q_w_idx, q_b_idx, q);
+        minilmLinearLayer384to384(h, k_w_idx, k_b_idx, k);
+        minilmLinearLayer384to384(h, v_w_idx, v_b_idx, v);
+    }
+
+    // Compute attention scores (bidirectional - no causal mask)
+    for (0..MINILM_NUM_HEADS) |head| {
+        const head_offset = head * MINILM_HEAD_DIM;
+
+        for (0..seq_len) |i| {
+            for (0..seq_len) |j| {
+                // SIMD dot product for head dimension
+                var sum: f32 = 0;
+                var d: usize = 0;
+                while (d < MINILM_HEAD_DIM) : (d += SIMD_WIDTH) {
+                    const qi: Vec4 = minilm_scratch_q[i * MINILM_EMBED_DIM + head_offset + d ..][0..SIMD_WIDTH].*;
+                    const kj: Vec4 = minilm_scratch_k[j * MINILM_EMBED_DIM + head_offset + d ..][0..SIMD_WIDTH].*;
+                    sum += @reduce(.Add, qi * kj);
+                }
+                minilm_scratch_attn[head * seq_len * seq_len + i * seq_len + j] = sum * scale;
+            }
+        }
+
+        // Softmax per row
+        for (0..seq_len) |i| {
+            const row_start = head * seq_len * seq_len + i * seq_len;
+
+            // Find max
+            var max_val: f32 = minilm_scratch_attn[row_start];
+            for (1..seq_len) |j| {
+                if (minilm_scratch_attn[row_start + j] > max_val) max_val = minilm_scratch_attn[row_start + j];
+            }
+
+            // Exp and sum
+            var sum: f32 = 0;
+            for (0..seq_len) |j| {
+                minilm_scratch_attn[row_start + j] = @exp(minilm_scratch_attn[row_start + j] - max_val);
+                sum += minilm_scratch_attn[row_start + j];
+            }
+
+            // Normalize
+            const inv_sum = 1.0 / sum;
+            for (0..seq_len) |j| {
+                minilm_scratch_attn[row_start + j] *= inv_sum;
+            }
+        }
+    }
+
+    // Compute attention output
+    var attn_output: [MINILM_MAX_SEQ_LEN * MINILM_EMBED_DIM]f32 = undefined;
+
+    for (0..seq_len) |pos| {
+        // Zero output
+        for (0..MINILM_EMBED_DIM) |d| {
+            attn_output[pos * MINILM_EMBED_DIM + d] = 0;
+        }
+
+        for (0..MINILM_NUM_HEADS) |head| {
+            const head_offset = head * MINILM_HEAD_DIM;
+
+            for (0..seq_len) |j| {
+                const attn_weight = minilm_scratch_attn[head * seq_len * seq_len + pos * seq_len + j];
+                for (0..MINILM_HEAD_DIM) |d| {
+                    attn_output[pos * MINILM_EMBED_DIM + head_offset + d] +=
+                        attn_weight * minilm_scratch_v[j * MINILM_EMBED_DIM + head_offset + d];
+                }
+            }
+        }
+
+        // Output projection
+        const attn_vec: *const [MINILM_EMBED_DIM]f32 = @ptrCast(attn_output[pos * MINILM_EMBED_DIM ..][0..MINILM_EMBED_DIM]);
+        var proj_out: [MINILM_EMBED_DIM]f32 = undefined;
+        minilmLinearLayer384to384(attn_vec, out_w_idx, out_b_idx, &proj_out);
+
+        // Add to input (residual connection)
+        for (0..MINILM_EMBED_DIM) |d| {
+            input[pos * MINILM_EMBED_DIM + d] += proj_out[d];
+        }
+    }
+
+    // Post-attention layer norm
+    minilmLayerNorm(input, seq_len, ln_w_idx, ln_b_idx);
+}
+
+// MiniLM FFN block
+fn minilmFFNBlock(input: []f32, seq_len: usize, layer: usize) void {
+    const up_w_idx = minilm_layer_ffn_up_weight_idx[layer] orelse return;
+    const up_b_idx = minilm_layer_ffn_up_bias_idx[layer] orelse return;
+    const down_w_idx = minilm_layer_ffn_down_weight_idx[layer] orelse return;
+    const down_b_idx = minilm_layer_ffn_down_bias_idx[layer] orelse return;
+    const ln_w_idx = minilm_layer_ffn_ln_weight_idx[layer] orelse return;
+    const ln_b_idx = minilm_layer_ffn_ln_bias_idx[layer] orelse return;
+
+    for (0..seq_len) |pos| {
+        const h: *const [MINILM_EMBED_DIM]f32 = @ptrCast(input[pos * MINILM_EMBED_DIM ..][0..MINILM_EMBED_DIM]);
+
+        // Up projection: 384 -> 1536
+        var mlp_hidden: [MINILM_MLP_DIM]f32 = undefined;
+        minilmLinearLayer384to1536(h, up_w_idx, up_b_idx, &mlp_hidden);
+
+        // GELU activation
+        const sqrt2_inv: f32 = 1.0 / @sqrt(2.0);
+        var i: usize = 0;
+        while (i < MINILM_MLP_DIM) : (i += SIMD_WIDTH) {
+            const x: Vec4 = mlp_hidden[i..][0..SIMD_WIDTH].*;
+            var erf_val: Vec4 = undefined;
+            inline for (0..SIMD_WIDTH) |k| {
+                erf_val[k] = erf(x[k] * sqrt2_inv);
+            }
+            const half: Vec4 = @splat(0.5);
+            const one: Vec4 = @splat(1.0);
+            mlp_hidden[i..][0..SIMD_WIDTH].* = x * half * (one + erf_val);
+        }
+
+        // Down projection: 1536 -> 384
+        var ffn_out: [MINILM_EMBED_DIM]f32 = undefined;
+        minilmLinearLayer1536to384(&mlp_hidden, down_w_idx, down_b_idx, &ffn_out);
+
+        // Residual connection
+        for (0..MINILM_EMBED_DIM) |d| {
+            input[pos * MINILM_EMBED_DIM + d] += ffn_out[d];
+        }
+    }
+
+    // Post-FFN layer norm
+    minilmLayerNorm(input, seq_len, ln_w_idx, ln_b_idx);
+}
+
+// Get MiniLM vocab token
+fn minilmGetVocabToken(idx: usize) []const u8 {
+    if (minilm_vocab_data == null or idx >= minilm_vocab_count) return "";
+    const start = minilm_vocab_string_offsets[idx];
+    const vdata = minilm_vocab_data.?;
+    const len: usize = @intCast(
+        @as(u64, vdata[start]) |
+            (@as(u64, vdata[start + 1]) << 8) |
+            (@as(u64, vdata[start + 2]) << 16) |
+            (@as(u64, vdata[start + 3]) << 24) |
+            (@as(u64, vdata[start + 4]) << 32) |
+            (@as(u64, vdata[start + 5]) << 40) |
+            (@as(u64, vdata[start + 6]) << 48) |
+            (@as(u64, vdata[start + 7]) << 56),
+    );
+    return vdata[start + 8 .. start + 8 + len];
+}
+
+// WordPiece tokenizer for BERT
+fn minilmTokenize(text: []const u8, tokens: []u32, attention_mask: []u32) usize {
+    var n_tokens: usize = 0;
+
+    // [CLS] token
+    tokens[n_tokens] = 101;
+    attention_mask[n_tokens] = 1;
+    n_tokens += 1;
+
+    var text_pos: usize = 0;
+
+    while (text_pos < text.len and n_tokens < MINILM_MAX_SEQ_LEN - 1) {
+        if (text[text_pos] == 0) break;
+
+        // Skip spaces
+        if (text[text_pos] == ' ') {
+            text_pos += 1;
+            continue;
+        }
+
+        // Find word boundary
+        var word_end = text_pos;
+        while (word_end < text.len and text[word_end] != ' ' and text[word_end] != 0) {
+            word_end += 1;
+        }
+
+        // Process word with WordPiece
+        var word_pos = text_pos;
+        var is_first = true;
+
+        while (word_pos < word_end and n_tokens < MINILM_MAX_SEQ_LEN - 1) {
+            var best_len: usize = 0;
+            var best_id: u32 = 100; // [UNK]
+
+            // Try to find longest matching token
+            for (0..minilm_vocab_count) |i| {
+                const tok = minilmGetVocabToken(i);
+                if (tok.len == 0) continue;
+
+                // Handle ## prefix for continuation
+                var tok_text = tok;
+                var is_subword = false;
+                if (tok.len >= 2 and tok[0] == '#' and tok[1] == '#') {
+                    tok_text = tok[2..];
+                    is_subword = true;
+                }
+
+                // Only match subwords if not first piece, and non-subwords if first piece
+                if (is_subword == is_first) continue;
+
+                const remaining = word_end - word_pos;
+                if (tok_text.len > remaining) continue;
+                if (tok_text.len <= best_len) continue;
+
+                // Case-insensitive match
+                var matches = true;
+                for (0..tok_text.len) |j| {
+                    var tc = tok_text[j];
+                    var xc = text[word_pos + j];
+                    if (tc >= 'A' and tc <= 'Z') tc = tc + 32;
+                    if (xc >= 'A' and xc <= 'Z') xc = xc + 32;
+                    if (tc != xc) {
+                        matches = false;
+                        break;
+                    }
+                }
+
+                if (matches) {
+                    best_len = tok_text.len;
+                    best_id = @intCast(i);
+                }
+            }
+
+            if (best_len > 0) {
+                tokens[n_tokens] = best_id;
+                attention_mask[n_tokens] = 1;
+                n_tokens += 1;
+                word_pos += best_len;
+                is_first = false;
+            } else {
+                // Unknown character, skip
+                word_pos += 1;
+            }
+        }
+
+        text_pos = word_end;
+    }
+
+    // [SEP] token
+    tokens[n_tokens] = 102;
+    attention_mask[n_tokens] = 1;
+    n_tokens += 1;
+
+    // Pad
+    const final_len = n_tokens;
+    while (n_tokens < MINILM_MAX_SEQ_LEN) {
+        tokens[n_tokens] = 0; // [PAD]
+        attention_mask[n_tokens] = 0;
+        n_tokens += 1;
+    }
+
+    return final_len;
+}
+
+/// Load MiniLM GGUF model
+export fn minilm_load_model(size: usize) i32 {
+    const model_data = minilm_model_buffer orelse return -1;
+    if (size < 128) return -2;
+
+    const data = model_data[0..size];
+
+    // Check GGUF magic
+    if (data[0] != 'G' or data[1] != 'G' or data[2] != 'U' or data[3] != 'F') {
+        return -3;
+    }
+
+    const version = readU32LE(data, 4);
+    if (version < 2 or version > 3) {
+        return -4;
+    }
+
+    const n_tensors: usize = @intCast(readU64LE(data, 8));
+    const n_kv: usize = @intCast(readU64LE(data, 16));
+
+    var pos: usize = 24;
+
+    // Parse KV pairs to find vocab
+    for (0..n_kv) |_| {
+        const key = ggufReadString(data, &pos);
+        if (pos + 4 > data.len) return -5;
+        const vtype = readU32LE(data, pos);
+        pos += 4;
+
+        if (strEql(key, "tokenizer.ggml.tokens")) {
+            if (vtype != GGUF_TYPE_ARRAY) {
+                ggufSkipValue(data, &pos, vtype);
+                continue;
+            }
+            if (pos + 12 > data.len) return -6;
+            const atype = readU32LE(data, pos);
+            pos += 4;
+            const alen: usize = @intCast(readU64LE(data, pos));
+            pos += 8;
+
+            if (atype == GGUF_TYPE_STRING and alen <= MINILM_VOCAB_SIZE) {
+                minilm_vocab_data = data.ptr + pos;
+                minilm_vocab_count = alen;
+
+                var str_pos: u32 = 0;
+                for (0..alen) |i| {
+                    minilm_vocab_string_offsets[i] = str_pos;
+                    const slen: u32 = @intCast(readU64LE(data, pos));
+                    pos += 8;
+                    str_pos += slen + 8;
+                    pos += slen;
+                }
+                minilm_vocab_string_offsets[alen] = str_pos;
+            } else {
+                ggufSkipValue(data, &pos, vtype);
+            }
+        } else {
+            ggufSkipValue(data, &pos, vtype);
+        }
+    }
+
+    // Parse tensor info
+    minilm_n_tensors_loaded = @min(n_tensors, MAX_TENSORS);
+    for (0..minilm_n_tensors_loaded) |i| {
+        const name = ggufReadString(data, &pos);
+        const name_len = @min(name.len, 95);
+        @memcpy(minilm_tensor_names[i][0..name_len], name[0..name_len]);
+        minilm_tensor_name_lens[i] = name_len;
+
+        if (pos + 4 > data.len) return -7;
+        const n_dims = readU32LE(data, pos);
+        pos += 4;
+        minilm_tensor_n_dims[i] = n_dims;
+
+        for (0..@min(n_dims, 4)) |d| {
+            if (pos + 8 > data.len) return -8;
+            minilm_tensor_dims[i][d] = readU64LE(data, pos);
+            pos += 8;
+        }
+
+        if (pos + 12 > data.len) return -9;
+        minilm_tensor_types[i] = readU32LE(data, pos);
+        pos += 4;
+        minilm_tensor_offsets[i] = readU64LE(data, pos);
+        pos += 8;
+    }
+
+    // Data offset (aligned to 32 bytes)
+    minilm_gguf_data_offset = (pos + 31) & ~@as(usize, 31);
+
+    // Find embedding tensors
+    minilm_word_emb_idx = minilmFindTensor("bert.embeddings.word_embeddings.weight");
+    minilm_pos_emb_idx = minilmFindTensor("bert.embeddings.position_embeddings.weight");
+    minilm_token_type_emb_idx = minilmFindTensor("bert.embeddings.token_type_embeddings.weight");
+    minilm_emb_ln_weight_idx = minilmFindTensor("bert.embeddings.LayerNorm.weight");
+    minilm_emb_ln_bias_idx = minilmFindTensor("bert.embeddings.LayerNorm.bias");
+
+    // Find per-layer tensors
+    for (0..MINILM_NUM_LAYERS) |layer| {
+        var name_buf: [128]u8 = undefined;
+
+        const q_w = std.fmt.bufPrint(&name_buf, "bert.encoder.layer.{d}.attention.self.query.weight", .{layer}) catch continue;
+        minilm_layer_q_weight_idx[layer] = minilmFindTensor(q_w);
+
+        const q_b = std.fmt.bufPrint(&name_buf, "bert.encoder.layer.{d}.attention.self.query.bias", .{layer}) catch continue;
+        minilm_layer_q_bias_idx[layer] = minilmFindTensor(q_b);
+
+        const k_w = std.fmt.bufPrint(&name_buf, "bert.encoder.layer.{d}.attention.self.key.weight", .{layer}) catch continue;
+        minilm_layer_k_weight_idx[layer] = minilmFindTensor(k_w);
+
+        const k_b = std.fmt.bufPrint(&name_buf, "bert.encoder.layer.{d}.attention.self.key.bias", .{layer}) catch continue;
+        minilm_layer_k_bias_idx[layer] = minilmFindTensor(k_b);
+
+        const v_w = std.fmt.bufPrint(&name_buf, "bert.encoder.layer.{d}.attention.self.value.weight", .{layer}) catch continue;
+        minilm_layer_v_weight_idx[layer] = minilmFindTensor(v_w);
+
+        const v_b = std.fmt.bufPrint(&name_buf, "bert.encoder.layer.{d}.attention.self.value.bias", .{layer}) catch continue;
+        minilm_layer_v_bias_idx[layer] = minilmFindTensor(v_b);
+
+        const out_w = std.fmt.bufPrint(&name_buf, "bert.encoder.layer.{d}.attention.output.dense.weight", .{layer}) catch continue;
+        minilm_layer_out_weight_idx[layer] = minilmFindTensor(out_w);
+
+        const out_b = std.fmt.bufPrint(&name_buf, "bert.encoder.layer.{d}.attention.output.dense.bias", .{layer}) catch continue;
+        minilm_layer_out_bias_idx[layer] = minilmFindTensor(out_b);
+
+        const attn_ln_w = std.fmt.bufPrint(&name_buf, "bert.encoder.layer.{d}.attention.output.LayerNorm.weight", .{layer}) catch continue;
+        minilm_layer_attn_ln_weight_idx[layer] = minilmFindTensor(attn_ln_w);
+
+        const attn_ln_b = std.fmt.bufPrint(&name_buf, "bert.encoder.layer.{d}.attention.output.LayerNorm.bias", .{layer}) catch continue;
+        minilm_layer_attn_ln_bias_idx[layer] = minilmFindTensor(attn_ln_b);
+
+        const up_w = std.fmt.bufPrint(&name_buf, "bert.encoder.layer.{d}.intermediate.dense.weight", .{layer}) catch continue;
+        minilm_layer_ffn_up_weight_idx[layer] = minilmFindTensor(up_w);
+
+        const up_b = std.fmt.bufPrint(&name_buf, "bert.encoder.layer.{d}.intermediate.dense.bias", .{layer}) catch continue;
+        minilm_layer_ffn_up_bias_idx[layer] = minilmFindTensor(up_b);
+
+        const down_w = std.fmt.bufPrint(&name_buf, "bert.encoder.layer.{d}.output.dense.weight", .{layer}) catch continue;
+        minilm_layer_ffn_down_weight_idx[layer] = minilmFindTensor(down_w);
+
+        const down_b = std.fmt.bufPrint(&name_buf, "bert.encoder.layer.{d}.output.dense.bias", .{layer}) catch continue;
+        minilm_layer_ffn_down_bias_idx[layer] = minilmFindTensor(down_b);
+
+        const ffn_ln_w = std.fmt.bufPrint(&name_buf, "bert.encoder.layer.{d}.output.LayerNorm.weight", .{layer}) catch continue;
+        minilm_layer_ffn_ln_weight_idx[layer] = minilmFindTensor(ffn_ln_w);
+
+        const ffn_ln_b = std.fmt.bufPrint(&name_buf, "bert.encoder.layer.{d}.output.LayerNorm.bias", .{layer}) catch continue;
+        minilm_layer_ffn_ln_bias_idx[layer] = minilmFindTensor(ffn_ln_b);
+    }
+
+    // Verify essential weights
+    if (minilm_word_emb_idx == null) return -10;
+    if (minilm_pos_emb_idx == null) return -11;
+    if (minilm_emb_ln_weight_idx == null) return -12;
+
+    minilm_model_loaded = true;
+    return 0;
+}
+
+/// Encode text to embedding
+export fn minilm_encode_text(text_len: usize) i32 {
+    if (!minilm_initialized) return -1;
+    if (!minilm_model_loaded) return -2;
+    if (text_len == 0 or text_len > minilm_text_buffer.len) return -3;
+
+    const word_emb_idx = minilm_word_emb_idx orelse return -4;
+    const pos_emb_idx = minilm_pos_emb_idx orelse return -5;
+    const token_type_emb_idx = minilm_token_type_emb_idx orelse return -6;
+    const emb_ln_w_idx = minilm_emb_ln_weight_idx orelse return -7;
+    const emb_ln_b_idx = minilm_emb_ln_bias_idx orelse return -8;
+
+    // Tokenize
+    var tokens: [MINILM_MAX_SEQ_LEN]u32 = undefined;
+    var attention_mask: [MINILM_MAX_SEQ_LEN]u32 = undefined;
+    const seq_len = minilmTokenize(minilm_text_buffer[0..text_len], &tokens, &attention_mask);
+
+    // Initialize hidden states with embeddings
+    for (0..seq_len) |pos| {
+        const tok_id = tokens[pos];
+        for (0..MINILM_EMBED_DIM) |i| {
+            // word + position + token_type embeddings
+            minilm_scratch_hidden[pos * MINILM_EMBED_DIM + i] =
+                minilmReadWeight(word_emb_idx, tok_id * MINILM_EMBED_DIM + i) +
+                minilmReadWeight(pos_emb_idx, pos * MINILM_EMBED_DIM + i) +
+                minilmReadWeight(token_type_emb_idx, i); // token_type = 0 for single sequence
+        }
+    }
+
+    // Embedding layer norm
+    minilmLayerNorm(&minilm_scratch_hidden, seq_len, emb_ln_w_idx, emb_ln_b_idx);
+
+    // Run through transformer layers (BERT uses post-norm)
+    for (0..MINILM_NUM_LAYERS) |layer| {
+        minilmMultiHeadAttention(&minilm_scratch_hidden, seq_len, layer);
+        minilmFFNBlock(&minilm_scratch_hidden, seq_len, layer);
+    }
+
+    // Mean pooling over non-padded tokens
+    for (0..MINILM_EMBED_DIM) |d| {
+        minilm_output_buffer[d] = 0;
+    }
+
+    var valid_tokens: f32 = 0;
+    for (0..seq_len) |pos| {
+        if (attention_mask[pos] == 1) {
+            for (0..MINILM_EMBED_DIM) |d| {
+                minilm_output_buffer[d] += minilm_scratch_hidden[pos * MINILM_EMBED_DIM + d];
+            }
+            valid_tokens += 1;
+        }
+    }
+
+    // Average
+    if (valid_tokens > 0) {
+        for (0..MINILM_EMBED_DIM) |d| {
+            minilm_output_buffer[d] /= valid_tokens;
+        }
+    }
+
+    // L2 normalize
+    var norm_sq: f32 = 0;
+    for (minilm_output_buffer) |v| norm_sq += v * v;
+    const norm = @sqrt(norm_sq);
+    if (norm > 0) {
+        for (&minilm_output_buffer) |*v| v.* /= norm;
+    }
+
+    return 0;
+}
+
+// ============================================================================
+// Zstd Decompression
+// ============================================================================
 
 /// Returns the decompressed size from zstd frame header (if available).
 /// This allows JS to know how much memory to allocate before decompression.

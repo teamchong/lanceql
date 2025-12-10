@@ -1187,7 +1187,7 @@
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
                             </svg>
-                            <span id="clip-search-title">Text Search (CLIP)</span>
+                            <span id="clip-search-title">Text Search (MiniLM)</span>
                             <span class="badge" id="clip-status-badge">Ready</span>
                         </div>
                         <div class="clip-mode-toggle">
@@ -1196,24 +1196,30 @@
                                 <span class="toggle-text">Dataset has image embeddings</span>
                             </label>
                         </div>
-                        <div class="clip-model-select">
+                        <div class="clip-model-select" id="clip-model-container" style="display: none;">
                             <label for="clip-model">CLIP Model:</label>
                             <select id="clip-model">
                                 <option value="https://data.metal0.dev/models/clip-vit-b32-openai.gguf">OpenAI ViT-B/32 (122MB)</option>
                                 <option value="https://data.metal0.dev/models/clip-vit-b32.gguf">LAION ViT-B/32 (290MB)</option>
                             </select>
                         </div>
+                        <div class="clip-model-select" id="text-model-container">
+                            <label for="text-model">Text Model:</label>
+                            <select id="text-model">
+                                <option value="https://data.metal0.dev/models/minilm-l6-v2.gguf">all-MiniLM-L6-v2 (87MB)</option>
+                            </select>
+                        </div>
                     </div>
                     <div class="clip-text-input">
-                        <input type="text" id="clip-text-input" placeholder="Describe what you're looking for... (e.g., 'a photo of a cat')">
+                        <input type="text" id="clip-text-input" placeholder="Search for text... (e.g., 'tickets', 'food', 'cat')">
                     </div>
                     <div class="clip-examples">
-                        <button class="clip-example" data-text="a photo of a cat">cat</button>
-                        <button class="clip-example" data-text="a photo of a dog">dog</button>
-                        <button class="clip-example" data-text="a sunset over the ocean">sunset</button>
-                        <button class="clip-example" data-text="a city skyline at night">city night</button>
-                        <button class="clip-example" data-text="a person smiling">person smiling</button>
-                        <button class="clip-example" data-text="food on a plate">food</button>
+                        <button class="clip-example" data-text="ticket">ticket</button>
+                        <button class="clip-example" data-text="cat">cat</button>
+                        <button class="clip-example" data-text="dog">dog</button>
+                        <button class="clip-example" data-text="sunset">sunset</button>
+                        <button class="clip-example" data-text="food">food</button>
+                        <button class="clip-example" data-text="city">city</button>
                     </div>
                     <div class="run-section">
                         <button class="btn btn-primary btn-clip-search" id="run-clip-btn">
@@ -1225,7 +1231,7 @@
                         </button>
                     </div>
                     <div class="clip-note">
-                        <small>Toggle "Image embeddings" if your dataset contains CLIP image vectors (e.g., LAION). Leave unchecked for text embeddings.</small>
+                        <small id="model-note">Default dataset uses all-MiniLM-L6-v2 (384-dim) text embeddings. Check "Dataset has image embeddings" only if using CLIP image embeddings.</small>
                     </div>
                 </div>
             </div>
@@ -3413,27 +3419,41 @@
             try {
                 setLoading(true);
 
-                // Always need CLIP to encode the text query
-                if (!clipModelLoaded) {
-                    const loaded = await ensureClipModelLoaded();
-                    if (!loaded) {
-                        setLoading(false);
-                        return;
+                let queryVec;
+                const modelName = isImageMode ? 'CLIP' : 'MiniLM';
+
+                if (isImageMode) {
+                    // Image mode: use CLIP
+                    if (!clipModelLoaded) {
+                        const loaded = await ensureClipModelLoaded();
+                        if (!loaded) {
+                            setLoading(false);
+                            return;
+                        }
                     }
+                    showStatus(`Encoding "${text}" with CLIP...`, 'info');
+                    queryVec = encodeTextWithClip(text);
+                } else {
+                    // Text mode: use MiniLM
+                    if (!minilmModelLoaded) {
+                        const loaded = await ensureMinilmModelLoaded();
+                        if (!loaded) {
+                            setLoading(false);
+                            return;
+                        }
+                    }
+                    showStatus(`Encoding "${text}" with MiniLM...`, 'info');
+                    queryVec = encodeTextWithMinilm(text);
                 }
 
-                const modeLabel = isImageMode ? 'image' : 'text';
-                showStatus(`Encoding "${text}" with CLIP...`, 'info');
-
-                // Encode text to embedding using CLIP
-                const queryVec = encodeTextWithClip(text);
                 if (!queryVec) {
-                    showStatus('Failed to encode text with CLIP', 'error');
+                    showStatus(`Failed to encode text with ${modelName}`, 'error');
                     setLoading(false);
                     return;
                 }
 
-                console.log('CLIP query embedding (first 8):', Array.from(queryVec.slice(0, 8)).map(v => v.toFixed(4)));
+                const modeLabel = isImageMode ? 'image' : 'text';
+                console.log(`${modelName} query embedding (first 8):`, Array.from(queryVec.slice(0, 8)).map(v => v.toFixed(4)));
                 console.log('Query embedding L2 norm:', Math.sqrt(queryVec.reduce((sum, v) => sum + v*v, 0)).toFixed(4));
                 console.log('Search mode:', isImageMode ? 'text-to-image' : 'text-to-text');
                 showStatus(`Searching ${modeLabel} embeddings...`, 'info');
@@ -3504,6 +3524,108 @@
             }
         }
 
+        // =============================================
+        // MiniLM Text-to-Text Search Integration
+        // =============================================
+        let minilmModelLoaded = false;
+        let minilmModelLoading = false;
+        const MINILM_MODEL_URL = 'https://data.metal0.dev/models/minilm-l6-v2.gguf';
+
+        async function initMinilmWasm() {
+            if (!lanceql || !lanceql.wasm) {
+                return;
+            }
+            const wasm = lanceql.wasm;
+            if (wasm.minilm_init) {
+                const result = wasm.minilm_init();
+                console.log('MiniLM WASM initialized:', result);
+            }
+        }
+
+        async function ensureMinilmModelLoaded() {
+            if (minilmModelLoaded) return true;
+            if (minilmModelLoading) {
+                while (minilmModelLoading) {
+                    await new Promise(r => setTimeout(r, 100));
+                }
+                return minilmModelLoaded;
+            }
+
+            minilmModelLoading = true;
+            updateClipStatus('Loading MiniLM...', 'loading');
+
+            try {
+                const wasm = lanceql.wasm;
+
+                // Initialize MiniLM first
+                if (wasm.minilm_init) {
+                    const initResult = wasm.minilm_init();
+                    console.log('MiniLM init result:', initResult);
+                }
+
+                showStatus('Downloading MiniLM model (~87MB, one-time)...', 'info');
+                const response = await fetch(MINILM_MODEL_URL);
+                if (!response.ok) {
+                    throw new Error('MiniLM model not found');
+                }
+
+                const modelData = await response.arrayBuffer();
+                console.log('MiniLM downloaded:', modelData.byteLength, 'bytes');
+                showStatus(`Downloaded ${(modelData.byteLength / 1024 / 1024).toFixed(0)}MB, allocating memory...`, 'info');
+                const bufPtr = wasm.minilm_alloc_model_buffer(modelData.byteLength);
+                if (bufPtr === 0) {
+                    throw new Error('Failed to allocate WASM memory');
+                }
+
+                showStatus('Copying model to WASM memory...', 'info');
+                const wasmMem = new Uint8Array(wasm.memory.buffer);
+                wasmMem.set(new Uint8Array(modelData), bufPtr);
+
+                updateClipStatus('Parsing...', 'loading');
+                showStatus('Parsing GGUF and loading MiniLM weights...', 'info');
+                await new Promise(r => setTimeout(r, 100));
+
+                const loadResult = wasm.minilm_load_model(modelData.byteLength);
+                if (loadResult === 0) {
+                    minilmModelLoaded = true;
+                    updateClipStatus('MiniLM', '');
+                    showStatus('MiniLM model ready!', 'success');
+                    return true;
+                } else {
+                    throw new Error(`MiniLM load error: ${loadResult}`);
+                }
+            } catch (e) {
+                console.error('MiniLM load error:', e);
+                updateClipStatus('Error', 'error');
+                showStatus('MiniLM load error: ' + e.message, 'error');
+                return false;
+            } finally {
+                minilmModelLoading = false;
+            }
+        }
+
+        function encodeTextWithMinilm(text) {
+            const wasm = lanceql.wasm;
+            if (!wasm || !minilmModelLoaded) return null;
+
+            const textBuf = wasm.minilm_get_text_buffer();
+            const textBytes = new TextEncoder().encode(text);
+            const memory = new Uint8Array(wasm.memory.buffer);
+            memory.set(textBytes, textBuf);
+
+            console.log('MiniLM encoding text:', text, 'length:', textBytes.length);
+            const result = wasm.minilm_encode_text(textBytes.length);
+            console.log('MiniLM encode result:', result);
+            if (result !== 0) {
+                console.error('MiniLM encode error:', result);
+                return null;
+            }
+
+            const outputBuf = wasm.minilm_get_output_buffer();
+            const outputDim = wasm.minilm_get_output_dim();
+            return new Float32Array(wasm.memory.buffer, outputBuf, outputDim).slice();
+        }
+
         // CLIP event listeners
         document.getElementById('run-clip-btn').addEventListener('click', runClipSearch);
 
@@ -3520,8 +3642,17 @@
             });
         });
 
+        // Toggle UI for image/text mode
+        document.getElementById('clip-image-mode').addEventListener('change', (e) => {
+            const isImageMode = e.target.checked;
+            document.getElementById('clip-model-container').style.display = isImageMode ? '' : 'none';
+            document.getElementById('text-model-container').style.display = isImageMode ? 'none' : '';
+            document.getElementById('clip-search-title').textContent = isImageMode ? 'Image Search (CLIP)' : 'Text Search (MiniLM)';
+        });
+
         // Initialize CLIP WASM on page load
         initClipWasm();
+        initMinilmWasm();
 
         // Initialize
         init();
