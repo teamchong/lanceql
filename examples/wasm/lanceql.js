@@ -1278,11 +1278,31 @@ export class RemoteLanceFile {
      * @private
      */
     _parseManifest(bytes) {
-        // Read content length from first 4 bytes
-        const contentLen = new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, true);
+        const view = new DataView(bytes.buffer, bytes.byteOffset);
 
-        // Protobuf content starts at byte 4 and has contentLen bytes
-        const protoData = bytes.slice(4, 4 + contentLen);
+        // Lance manifest file structure:
+        // - Chunk 1 (len-prefixed): Transaction metadata (may be small/incremental)
+        // - Chunk 2 (len-prefixed): Full manifest with schema + fragments
+        // - Footer (16 bytes): Offsets + "LANC" magic
+
+        // Read chunk 1 length
+        const chunk1Len = view.getUint32(0, true);
+
+        // Check if there's a chunk 2 (full manifest data)
+        const chunk2Start = 4 + chunk1Len;
+        let protoData;
+
+        if (chunk2Start + 4 < bytes.length) {
+            const chunk2Len = view.getUint32(chunk2Start, true);
+            if (chunk2Len > 0 && chunk2Start + 4 + chunk2Len <= bytes.length) {
+                // Use chunk 2 (full manifest)
+                protoData = bytes.slice(chunk2Start + 4, chunk2Start + 4 + chunk2Len);
+            } else {
+                protoData = bytes.slice(4, 4 + chunk1Len);
+            }
+        } else {
+            protoData = bytes.slice(4, 4 + chunk1Len);
+        }
 
         let pos = 0;
         const fields = [];
@@ -2547,34 +2567,126 @@ export class RemoteLanceFile {
 
     /**
      * Vector search using IVF index (ANN).
+     * Fetches row IDs from auxiliary.idx for nearest partitions,
+     * then looks up original vectors by fragment/offset.
      * @private
      */
     async _vectorSearchWithIndex(colIdx, queryVec, topK, nprobe, onProgress) {
         const dim = queryVec.length;
-        const vecSize = dim * 4;
 
         // Find nearest partitions using centroids
         if (onProgress) onProgress(0, 100);
         const partitions = this._ivfIndex.findNearestPartitions(queryVec, nprobe);
-        // Debug: console.log(`Searching ${partitions.length} partitions`);
+        const estimatedRows = this._ivfIndex.getPartitionRowCount(partitions);
+
+        console.log(`[IVFSearch] Searching ${partitions.length} partitions (~${estimatedRows.toLocaleString()} rows)`);
+
+        // Try to fetch row IDs from auxiliary.idx
+        const rowIdMappings = await this._ivfIndex.fetchPartitionRowIds(partitions);
+
+        if (rowIdMappings && rowIdMappings.length > 0) {
+            // Use proper row ID mapping from auxiliary.idx
+            console.log(`[IVFSearch] Fetched ${rowIdMappings.length} row ID mappings`);
+            return await this._searchWithRowIdMappings(colIdx, queryVec, topK, rowIdMappings, onProgress);
+        }
+
+        // Fallback: estimate which rows to search based on partition boundaries
+        console.log('[IVFSearch] Falling back to estimated partition boundaries');
+        return await this._searchWithEstimatedPartitions(colIdx, queryVec, topK, partitions, onProgress);
+    }
+
+    /**
+     * Search using proper row ID mappings from auxiliary.idx.
+     * Groups row IDs by fragment and fetches vectors efficiently.
+     * @private
+     */
+    async _searchWithRowIdMappings(colIdx, queryVec, topK, rowIdMappings, onProgress) {
+        const dim = queryVec.length;
+
+        // Group row IDs by fragment for efficient batch fetching
+        const byFragment = new Map();
+        for (const mapping of rowIdMappings) {
+            if (!byFragment.has(mapping.fragId)) {
+                byFragment.set(mapping.fragId, []);
+            }
+            byFragment.get(mapping.fragId).push(mapping.rowOffset);
+        }
+
+        console.log(`[IVFSearch] Fetching from ${byFragment.size} fragments`);
+
+        const topResults = [];
+        let processed = 0;
+        const total = rowIdMappings.length;
+
+        // Process each fragment
+        for (const [fragId, offsets] of byFragment) {
+            if (onProgress) onProgress(processed, total);
+
+            // Fetch vectors for this fragment's offsets
+            const vectors = await this.readVectorsAtIndices(colIdx, offsets);
+
+            for (let i = 0; i < offsets.length; i++) {
+                const vec = vectors[i];
+                if (!vec || vec.length !== dim) continue;
+
+                // Compute cosine similarity
+                let dot = 0, normA = 0, normB = 0;
+                for (let k = 0; k < dim; k++) {
+                    dot += queryVec[k] * vec[k];
+                    normA += queryVec[k] * queryVec[k];
+                    normB += vec[k] * vec[k];
+                }
+                const denom = Math.sqrt(normA) * Math.sqrt(normB);
+                const score = denom === 0 ? 0 : dot / denom;
+
+                // Reconstruct global row index from fragment ID and offset
+                const globalIdx = fragId * 50000 + offsets[i]; // Assuming 50K rows per fragment
+
+                if (topResults.length < topK) {
+                    topResults.push({ idx: globalIdx, score });
+                    topResults.sort((a, b) => b.score - a.score);
+                } else if (score > topResults[topK - 1].score) {
+                    topResults[topK - 1] = { idx: globalIdx, score };
+                    topResults.sort((a, b) => b.score - a.score);
+                }
+
+                processed++;
+            }
+        }
+
+        if (onProgress) onProgress(total, total);
+
+        return {
+            indices: topResults.map(r => r.idx),
+            scores: topResults.map(r => r.score),
+            usedIndex: true,
+            searchedRows: total
+        };
+    }
+
+    /**
+     * Search using estimated partition boundaries (fallback).
+     * Less accurate but works when row ID fetching fails.
+     * @private
+     */
+    async _searchWithEstimatedPartitions(colIdx, queryVec, topK, partitions, onProgress) {
+        const dim = queryVec.length;
 
         const entry = await this.getColumnOffsetEntry(colIdx);
         const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
         const metaInfo = this._parseColumnMeta(new Uint8Array(colMeta));
         const numRows = metaInfo.rows;
 
-        // Determine which row indices to search based on partition info
+        // Estimate partition boundaries
         const indicesToSearch = [];
         const hasPartitionInfo = this._ivfIndex.partitionLengths.length === this._ivfIndex.numPartitions;
 
         if (hasPartitionInfo) {
-            // Use actual partition boundaries from index
-            // Using partition lengths from index
+            // Use partition lengths as hints (though order may differ)
             let currentRow = 0;
             for (let p = 0; p < this._ivfIndex.numPartitions; p++) {
                 const partitionLen = this._ivfIndex.partitionLengths[p];
                 if (partitions.includes(p)) {
-                    // Include all rows in this partition
                     for (let r = 0; r < partitionLen; r++) {
                         indicesToSearch.push(currentRow + r);
                     }
@@ -2582,10 +2694,8 @@ export class RemoteLanceFile {
                 currentRow += partitionLen;
             }
         } else {
-            // Fallback: estimate partition boundaries by dividing evenly
-            // Estimating partition boundaries (no partition lengths in index)
+            // Divide evenly
             const rowsPerPartition = Math.ceil(numRows / this._ivfIndex.numPartitions);
-
             for (const p of partitions) {
                 const startRow = p * rowsPerPartition;
                 const endRow = Math.min((p + 1) * rowsPerPartition, numRows);
@@ -2595,27 +2705,23 @@ export class RemoteLanceFile {
             }
         }
 
-        // Debug: console.log(`Searching ${indicesToSearch.length} rows (${(indicesToSearch.length / numRows * 100).toFixed(1)}% of data)`);
+        console.log(`[IVFSearch] Estimated ${indicesToSearch.length} rows to search`);
 
-        // Search only the selected indices
+        // Search selected indices
         const topResults = [];
         const batchSize = 100;
 
         for (let i = 0; i < indicesToSearch.length; i += batchSize) {
-            if (onProgress) {
-                onProgress(i, indicesToSearch.length);
-            }
+            if (onProgress) onProgress(i, indicesToSearch.length);
 
             const batchIndices = indicesToSearch.slice(i, i + batchSize);
-
-            // Fetch vectors at these indices
             const vectors = await this.readVectorsAtIndices(colIdx, batchIndices);
 
             for (let j = 0; j < batchIndices.length; j++) {
                 const rowIdx = batchIndices[j];
                 const vec = vectors[j];
+                if (!vec || vec.length !== dim) continue;
 
-                // Compute cosine similarity
                 let dot = 0, normA = 0, normB = 0;
                 for (let k = 0; k < dim; k++) {
                     dot += queryVec[k] * vec[k];
@@ -2640,7 +2746,8 @@ export class RemoteLanceFile {
         return {
             indices: topResults.map(r => r.idx),
             scores: topResults.map(r => r.score),
-            usedIndex: true
+            usedIndex: true,
+            searchedRows: indicesToSearch.length
         };
     }
 
@@ -2866,8 +2973,11 @@ export class IVFIndex {
         if (!datasetBaseUrl) return null;
 
         try {
-            // First, try to find index from manifest
-            const manifestUrl = `${datasetBaseUrl}/_versions/1.manifest`;
+            // Find latest manifest version
+            const manifestVersion = await IVFIndex._findLatestManifestVersion(datasetBaseUrl);
+            if (!manifestVersion) return null;
+
+            const manifestUrl = `${datasetBaseUrl}/_versions/${manifestVersion}.manifest`;
             const manifestResp = await fetch(manifestUrl);
             if (!manifestResp.ok) return null;
 
@@ -2879,22 +2989,330 @@ export class IVFIndex {
                 return null;
             }
 
-            // Found vector index in manifest
+            console.log(`[IVFIndex] Found index UUID: ${indexInfo.uuid}`);
 
-            // Fetch the index file
+            // Fetch the index file (contains centroids)
             const indexUrl = `${datasetBaseUrl}/_indices/${indexInfo.uuid}/index.idx`;
             const indexResp = await fetch(indexUrl);
             if (!indexResp.ok) {
-                // Index file not found
+                console.warn('[IVFIndex] index.idx not found');
                 return null;
             }
 
             const indexData = await indexResp.arrayBuffer();
-            return IVFIndex._parseIndexFile(new Uint8Array(indexData), indexInfo);
+            const index = IVFIndex._parseIndexFile(new Uint8Array(indexData), indexInfo);
+
+            if (!index) return null;
+
+            // Store auxiliary URL for later partition data fetching
+            index.auxiliaryUrl = `${datasetBaseUrl}/_indices/${indexInfo.uuid}/auxiliary.idx`;
+            index.datasetBaseUrl = datasetBaseUrl;
+
+            // Fetch auxiliary.idx metadata (footer + partition info)
+            // We only need the last ~13MB which has the partition metadata
+            try {
+                await index._loadAuxiliaryMetadata();
+            } catch (e) {
+                console.warn('[IVFIndex] Failed to load auxiliary metadata:', e);
+            }
+
+            console.log(`[IVFIndex] Loaded: ${index.numPartitions} partitions, dim=${index.dimension}`);
+            if (index.partitionLengths.length > 0) {
+                const totalRows = index.partitionLengths.reduce((a, b) => a + b, 0);
+                console.log(`[IVFIndex] Partition info: ${totalRows.toLocaleString()} total rows`);
+            }
+
+            return index;
         } catch (e) {
-            // Failed to load IVF index
+            console.warn('[IVFIndex] Failed to load:', e);
             return null;
         }
+    }
+
+    /**
+     * Find latest manifest version using binary search.
+     * @private
+     */
+    static async _findLatestManifestVersion(baseUrl) {
+        // Check common versions in parallel
+        const checkVersions = [1, 5, 10, 20, 50, 100];
+        const checks = await Promise.all(
+            checkVersions.map(async v => {
+                try {
+                    const url = `${baseUrl}/_versions/${v}.manifest`;
+                    const response = await fetch(url, { method: 'HEAD' });
+                    return response.ok ? v : 0;
+                } catch {
+                    return 0;
+                }
+            })
+        );
+
+        let highestFound = Math.max(...checks);
+        if (highestFound === 0) return null;
+
+        // Scan forward from highest found
+        for (let v = highestFound + 1; v <= highestFound + 30; v++) {
+            try {
+                const url = `${baseUrl}/_versions/${v}.manifest`;
+                const response = await fetch(url, { method: 'HEAD' });
+                if (response.ok) {
+                    highestFound = v;
+                } else {
+                    break;
+                }
+            } catch {
+                break;
+            }
+        }
+
+        return highestFound;
+    }
+
+    /**
+     * Load partition metadata from auxiliary.idx.
+     * Uses HTTP range request to fetch only the metadata section.
+     * @private
+     */
+    async _loadAuxiliaryMetadata() {
+        // Fetch file size first
+        const headResp = await fetch(this.auxiliaryUrl, { method: 'HEAD' });
+        if (!headResp.ok) return;
+
+        const fileSize = parseInt(headResp.headers.get('content-length'));
+        if (!fileSize) return;
+
+        // Fetch footer (last 40 bytes) to get metadata locations
+        const footerResp = await fetch(this.auxiliaryUrl, {
+            headers: { 'Range': `bytes=${fileSize - 40}-${fileSize - 1}` }
+        });
+        if (!footerResp.ok) return;
+
+        const footer = new Uint8Array(await footerResp.arrayBuffer());
+        const view = new DataView(footer.buffer, footer.byteOffset);
+
+        // Parse Lance footer
+        const globalBuffOffsetsStart = Number(view.getBigUint64(16, true));
+        const numGlobalBuffers = view.getUint32(24, true);
+        const magic = new TextDecoder().decode(footer.slice(36, 40));
+
+        if (magic !== 'LANC') {
+            console.warn('[IVFIndex] Invalid auxiliary.idx magic');
+            return;
+        }
+
+        // Fetch global buffer offsets
+        const gboSize = (numGlobalBuffers + 1) * 8;
+        const gboResp = await fetch(this.auxiliaryUrl, {
+            headers: { 'Range': `bytes=${globalBuffOffsetsStart}-${globalBuffOffsetsStart + gboSize - 1}` }
+        });
+        if (!gboResp.ok) return;
+
+        const gboData = new Uint8Array(await gboResp.arrayBuffer());
+        const gboView = new DataView(gboData.buffer, gboData.byteOffset);
+
+        const bufferOffsets = [];
+        for (let i = 0; i <= numGlobalBuffers; i++) {
+            bufferOffsets.push(Number(gboView.getBigUint64(i * 8, true)));
+        }
+
+        // Buffer 2 contains IVF metadata (partition offsets/lengths and PQ codebook)
+        // It's typically at a high offset (e.g., 59MB for 1M vectors)
+        if (bufferOffsets.length < 4) return;
+
+        const buf2Start = bufferOffsets[2];
+        const buf2End = bufferOffsets[3] || globalBuffOffsetsStart;
+        const buf2Size = buf2End - buf2Start;
+
+        // Limit fetch to first 2KB which contains partition info
+        const metaSize = Math.min(buf2Size, 2048);
+        const metaResp = await fetch(this.auxiliaryUrl, {
+            headers: { 'Range': `bytes=${buf2Start}-${buf2Start + metaSize - 1}` }
+        });
+        if (!metaResp.ok) return;
+
+        const metaData = new Uint8Array(await metaResp.arrayBuffer());
+        this._parseAuxiliaryPartitionInfo(metaData);
+
+        // Store buffer offsets for later row ID fetching
+        this._auxBufferOffsets = bufferOffsets;
+        this._auxFileSize = fileSize;
+    }
+
+    /**
+     * Parse partition offsets and lengths from auxiliary.idx metadata.
+     * @private
+     */
+    _parseAuxiliaryPartitionInfo(bytes) {
+        let pos = 0;
+
+        const readVarint = () => {
+            let result = 0;
+            let shift = 0;
+            while (pos < bytes.length) {
+                const byte = bytes[pos++];
+                result |= (byte & 0x7F) << shift;
+                if ((byte & 0x80) === 0) break;
+                shift += 7;
+            }
+            return result;
+        };
+
+        // Parse protobuf structure
+        while (pos < bytes.length - 4) {
+            const tag = readVarint();
+            const fieldNum = tag >> 3;
+            const wireType = tag & 0x7;
+
+            if (wireType === 2) {
+                const len = readVarint();
+                if (len > bytes.length - pos) break;
+
+                const content = bytes.slice(pos, pos + len);
+                pos += len;
+
+                if (fieldNum === 2 && len > 100 && len < 2000) {
+                    // Partition offsets (varint-encoded)
+                    const offsets = [];
+                    let innerPos = 0;
+                    while (innerPos < content.length) {
+                        let val = 0, shift = 0;
+                        while (innerPos < content.length) {
+                            const byte = content[innerPos++];
+                            val |= (byte & 0x7F) << shift;
+                            if ((byte & 0x80) === 0) break;
+                            shift += 7;
+                        }
+                        offsets.push(val);
+                    }
+                    if (offsets.length === this.numPartitions) {
+                        this.partitionOffsets = offsets;
+                        console.log(`[IVFIndex] Loaded ${offsets.length} partition offsets`);
+                    }
+                } else if (fieldNum === 3 && len > 100 && len < 2000) {
+                    // Partition lengths (varint-encoded)
+                    const lengths = [];
+                    let innerPos = 0;
+                    while (innerPos < content.length) {
+                        let val = 0, shift = 0;
+                        while (innerPos < content.length) {
+                            const byte = content[innerPos++];
+                            val |= (byte & 0x7F) << shift;
+                            if ((byte & 0x80) === 0) break;
+                            shift += 7;
+                        }
+                        lengths.push(val);
+                    }
+                    if (lengths.length === this.numPartitions) {
+                        this.partitionLengths = lengths;
+                        console.log(`[IVFIndex] Loaded ${lengths.length} partition lengths`);
+                    }
+                }
+            } else if (wireType === 0) {
+                readVarint();
+            } else if (wireType === 1) {
+                pos += 8;
+            } else if (wireType === 5) {
+                pos += 4;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /**
+     * Fetch row IDs for specified partitions from auxiliary.idx.
+     * Returns array of decoded row IDs (as {fragId, rowOffset} pairs).
+     *
+     * The auxiliary.idx data region layout for each row:
+     * - Column 0: _rowid (uint64) - 8 bytes per row
+     * - Column 1: __pq_code (64 uint8s) - 64 bytes per row
+     * Total: 72 bytes per row if stored contiguously
+     *
+     * However, Lance stores columns separately, so we need to read
+     * just the _rowid column data.
+     *
+     * @param {number[]} partitionIndices - Partition indices to fetch
+     * @returns {Promise<Array<{fragId: number, rowOffset: number}>>}
+     */
+    async fetchPartitionRowIds(partitionIndices) {
+        if (!this.auxiliaryUrl || !this._auxBufferOffsets) {
+            return null;
+        }
+
+        // Calculate total rows to fetch and their byte ranges
+        const rowRanges = [];
+        for (const p of partitionIndices) {
+            if (p < this.partitionOffsets.length) {
+                const startRow = this.partitionOffsets[p];
+                const numRows = this.partitionLengths[p];
+                rowRanges.push({ partition: p, startRow, numRows });
+            }
+        }
+
+        if (rowRanges.length === 0) return [];
+
+        // The data region starts at bufferOffsets[1]
+        // auxiliary.idx stores _rowid as uint64 (8 bytes each)
+        // Data is stored with _rowid column first, then __pq_code column
+        // We only need _rowid values
+
+        // First, get the _rowid column metadata from auxiliary.idx footer
+        // For now, use a simpler approach: assume row IDs are stored at
+        // (dataStart + rowIndex * 8) for each row in the partition order
+
+        // Note: This is a simplification. Full implementation would parse
+        // the column encoding from auxiliary.idx metadata.
+
+        const results = [];
+        const dataStart = this._auxBufferOffsets[1];
+
+        // Fetch row IDs in batches
+        for (const range of rowRanges) {
+            // Calculate byte offset for this partition's row IDs
+            // Row IDs are at the start of the data region
+            const byteStart = dataStart + range.startRow * 8;
+            const byteEnd = byteStart + range.numRows * 8 - 1;
+
+            try {
+                const resp = await fetch(this.auxiliaryUrl, {
+                    headers: { 'Range': `bytes=${byteStart}-${byteEnd}` }
+                });
+
+                if (!resp.ok) {
+                    console.warn(`[IVFIndex] Failed to fetch row IDs for partition ${range.partition}`);
+                    continue;
+                }
+
+                const data = new Uint8Array(await resp.arrayBuffer());
+                const view = new DataView(data.buffer, data.byteOffset);
+
+                for (let i = 0; i < range.numRows; i++) {
+                    const rowId = Number(view.getBigUint64(i * 8, true));
+                    // Decode Lance row ID: fragId = rowId >> 32, rowOffset = rowId & 0xFFFFFFFF
+                    const fragId = Math.floor(rowId / 0x100000000);
+                    const rowOffset = rowId % 0x100000000;
+                    results.push({ fragId, rowOffset, partition: range.partition });
+                }
+            } catch (e) {
+                console.warn(`[IVFIndex] Error fetching partition ${range.partition}:`, e);
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * Get estimated number of rows to search for given partitions.
+     */
+    getPartitionRowCount(partitionIndices) {
+        let total = 0;
+        for (const p of partitionIndices) {
+            if (p < this.partitionLengths.length) {
+                total += this.partitionLengths[p];
+            }
+        }
+        return total;
     }
 
     /**
@@ -4799,12 +5217,39 @@ export class RemoteLanceDataset {
 
     /**
      * Parse manifest protobuf to extract schema and fragment info.
+     *
+     * Lance manifest file structure:
+     * - Chunk 1 (len-prefixed): Transaction metadata (may be small/incremental)
+     * - Chunk 2 (len-prefixed): Full manifest with schema + fragments
+     * - Footer (16 bytes): Offsets + "LANC" magic
+     *
      * @private
      */
     _parseManifest(bytes) {
-        // Read content length from first 4 bytes
-        const contentLen = new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, true);
-        const protoData = bytes.slice(4, 4 + contentLen);
+        const view = new DataView(bytes.buffer, bytes.byteOffset);
+
+        // Read chunk 1 length
+        const chunk1Len = view.getUint32(0, true);
+
+        // Check if there's a chunk 2 (full manifest data)
+        // Chunk 2 starts at offset (4 + chunk1Len)
+        const chunk2Start = 4 + chunk1Len;
+        let protoData;
+
+        if (chunk2Start + 4 < bytes.length) {
+            const chunk2Len = view.getUint32(chunk2Start, true);
+            // Verify chunk 2 exists and has reasonable size
+            if (chunk2Len > 0 && chunk2Start + 4 + chunk2Len <= bytes.length) {
+                // Use chunk 2 (full manifest)
+                protoData = bytes.slice(chunk2Start + 4, chunk2Start + 4 + chunk2Len);
+            } else {
+                // Fall back to chunk 1
+                protoData = bytes.slice(4, 4 + chunk1Len);
+            }
+        } else {
+            // Only chunk 1 exists
+            protoData = bytes.slice(4, 4 + chunk1Len);
+        }
 
         let pos = 0;
         const fields = [];
