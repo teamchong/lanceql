@@ -4005,14 +4005,6 @@
             });
         });
 
-        // Toggle UI for image/text mode
-        document.getElementById('clip-image-mode').addEventListener('change', (e) => {
-            const isImageMode = e.target.checked;
-            document.getElementById('clip-model-container').style.display = isImageMode ? '' : 'none';
-            document.getElementById('text-model-container').style.display = isImageMode ? 'none' : '';
-            document.getElementById('clip-search-title').textContent = isImageMode ? 'Image Search (CLIP)' : 'Text Search (MiniLM)';
-        });
-
         // Initialize CLIP WASM on page load
         initClipWasm();
         initMinilmWasm();
