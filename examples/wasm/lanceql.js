@@ -5746,16 +5746,22 @@ export class RemoteLanceDataset {
             }
         }
 
-        // If not cached, load from network
+        // If not cached, try sidecar first, then manifest
         if (!dataset._fromCache) {
-            await dataset._loadManifest();
+            // Try to load .meta.json sidecar (faster, pre-calculated)
+            const sidecarLoaded = await dataset._tryLoadSidecar();
+
+            if (!sidecarLoaded) {
+                // Fall back to parsing manifest
+                await dataset._loadManifest();
+            }
 
             // Cache the metadata for next time
             metadataCache.set(cacheKey, {
                 schema: dataset._schema,
                 fragments: dataset._fragments,
                 version: dataset._version,
-                columnTypes: null // Will be set after detectColumnTypes
+                columnTypes: dataset._columnTypes || null
             }).catch(() => {}); // Don't block on cache errors
         }
 
@@ -5769,6 +5775,69 @@ export class RemoteLanceDataset {
         }
 
         return dataset;
+    }
+
+    /**
+     * Try to load sidecar manifest (.meta.json) for faster startup.
+     * @returns {Promise<boolean>} True if sidecar was loaded successfully
+     * @private
+     */
+    async _tryLoadSidecar() {
+        try {
+            const sidecarUrl = `${this.baseUrl}/.meta.json`;
+            const response = await fetch(sidecarUrl);
+
+            if (!response.ok) {
+                return false;
+            }
+
+            const sidecar = await response.json();
+
+            // Validate sidecar format
+            if (!sidecar.schema || !sidecar.fragments) {
+                console.warn('[LanceQL Dataset] Invalid sidecar format');
+                return false;
+            }
+
+            console.log(`[LanceQL Dataset] Loaded sidecar manifest`);
+
+            // Convert sidecar schema to internal format
+            this._schema = sidecar.schema.map(col => ({
+                name: col.name,
+                id: col.index,
+                type: col.type
+            }));
+
+            // Convert sidecar fragments to internal format
+            this._fragments = sidecar.fragments.map(frag => ({
+                id: frag.id,
+                path: frag.data_files?.[0] || `${frag.id}.lance`,
+                numRows: frag.num_rows,
+                physicalRows: frag.physical_rows || frag.num_rows,
+                url: `${this.baseUrl}/data/${frag.data_files?.[0] || frag.id + '.lance'}`,
+                deletionFile: frag.has_deletions ? { numDeletedRows: frag.deleted_rows || 0 } : null
+            }));
+
+            this._numColumns = sidecar.num_columns;
+            this._totalRows = sidecar.total_rows;
+            this._version = sidecar.lance_version;
+
+            // Extract column types from sidecar schema
+            this._columnTypes = sidecar.schema.map(col => {
+                const type = col.type;
+                if (type.startsWith('vector[')) return 'vector';
+                if (type === 'float64' || type === 'double') return 'float64';
+                if (type === 'float32') return 'float32';
+                if (type.includes('int')) return type;
+                if (type === 'string') return 'string';
+                return 'unknown';
+            });
+
+            return true;
+        } catch (e) {
+            // Sidecar not available or invalid - fall back to manifest
+            return false;
+        }
     }
 
     /**
