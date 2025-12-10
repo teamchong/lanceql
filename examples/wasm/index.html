@@ -359,22 +359,61 @@
         .df-step input[type="number"] {
             width: 100px;
         }
-        .df-code-preview {
-            background: #0f172a;
-            border-radius: 8px;
-            padding: 15px;
-            font-family: 'Monaco', 'Consolas', monospace;
-            font-size: 13px;
-            color: #94a3b8;
-            overflow-x: auto;
-            white-space: pre-wrap;
-            line-height: 1.5;
+        /* DataFrame code editor - same overlay technique as SQL */
+        .df-editor-container {
+            position: relative;
+            width: 100%;
+            height: 200px;
         }
-        .df-code-preview .keyword { color: #93c5fd; }
-        .df-code-preview .string { color: #fcd34d; }
-        .df-code-preview .number { color: #86efac; }
-        .df-code-preview .method { color: #c4b5fd; }
-        .df-code-preview .comment { color: #64748b; font-style: italic; }
+        .df-highlight, .df-textarea {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            padding: 15px;
+            margin: 0;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            font: 13px/1.5 ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+            letter-spacing: normal;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            box-sizing: border-box;
+            overflow: auto;
+            tab-size: 4;
+            -moz-tab-size: 4;
+        }
+        .df-highlight {
+            background: #0f172a;
+            pointer-events: none;
+            z-index: 1;
+        }
+        .df-highlight span {
+            font: inherit;
+        }
+        .df-textarea {
+            background: transparent;
+            border-color: transparent;
+            color: transparent;
+            caret-color: #e2e8f0;
+            resize: none;
+            z-index: 2;
+            -webkit-text-fill-color: transparent;
+        }
+        .df-textarea:focus {
+            outline: none;
+        }
+        .df-textarea:focus + .df-highlight {
+            border-color: #3b82f6;
+        }
+        /* DataFrame syntax highlighting */
+        .df-keyword { color: #93c5fd; }
+        .df-string { color: #fcd34d; }
+        .df-number { color: #86efac; }
+        .df-method { color: #c4b5fd; }
+        .df-comment { color: #64748b; }
 
         /* Run button */
         .run-section {
@@ -1194,8 +1233,9 @@
                         <input type="number" id="df-limit" value="50" min="1" max="10000">
                         <span style="color: #64748b; font-size: 12px;">rows</span>
                     </div>
-                    <div class="df-code-preview" id="df-preview">
-                        <span class="keyword">const</span> result = file.<span class="method">df</span>()
+                    <div class="df-editor-container">
+                        <textarea class="df-textarea" id="df-input" spellcheck="false"></textarea>
+                        <div class="df-highlight" id="df-highlight" aria-hidden="true"></div>
                     </div>
                 </div>
                 <div class="run-section">
@@ -1882,7 +1922,8 @@
             }
         }
 
-        function updateDfPreview() {
+        // Generate plain Python code from UI inputs
+        function generateDfCode() {
             const searchQuery = document.getElementById('df-search-query').value.trim();
             const searchEncoder = document.getElementById('df-search-encoder').value;
             const filterCol = document.getElementById('df-filter-col').value;
@@ -1891,48 +1932,179 @@
             const selectedCols = Array.from(document.getElementById('df-select-cols').selectedOptions).map(o => o.value);
             const limit = document.getElementById('df-limit').value;
 
-            // Show Python-like code with data source
-            let code = `<span class="keyword">import</span> lanceql\n\n`;
+            let code = `import lanceql\n\n`;
 
             if (currentFile?._isRemote && currentFile?._url) {
                 const url = currentFile._url;
-                code += `<span class="comment"># Open remote dataset</span>\n`;
-                code += `dataset = lanceql.<span class="method">open</span>(<span class="string">"${url}"</span>)\n\n`;
+                code += `# Open remote dataset\n`;
+                code += `dataset = lanceql.open("${url}")\n\n`;
             } else if (currentFile) {
-                code += `<span class="comment"># Open local file</span>\n`;
-                code += `dataset = lanceql.<span class="method">open</span>(<span class="string">"file.lance"</span>)\n\n`;
+                code += `# Open local file\n`;
+                code += `dataset = lanceql.open("file.lance")\n\n`;
             } else {
-                code += `<span class="comment"># Load a file first</span>\n`;
+                code += `# Load a file first\n`;
             }
 
-            code += `<span class="comment"># Query data</span>\n`;
+            code += `# Query data\n`;
             code += `result = (\n`;
-            code += `    dataset.<span class="method">df</span>()\n`;
+            code += `    dataset.df()\n`;
 
-            // Vector search (only if query text is provided)
             if (searchQuery) {
-                code += `    .<span class="method">search</span>(<span class="string">"${searchQuery}"</span>, encoder=<span class="string">"${searchEncoder}"</span>)\n`;
+                code += `    .search("${searchQuery}", encoder="${searchEncoder}")\n`;
             }
 
             if (filterCol !== '') {
                 const colName = currentFile?.columnNames?.[parseInt(filterCol)] || `col_${filterCol}`;
-                const type = columnTypes[parseInt(filterCol)] || 'int64';
-                code += `    .<span class="method">filter</span>(<span class="string">"${colName}"</span>, <span class="string">"${filterOp}"</span>, <span class="number">${filterVal}</span>)\n`;
+                code += `    .filter("${colName}", "${filterOp}", ${filterVal})\n`;
             }
 
             if (selectedCols.length > 0 && selectedCols.length < currentFile?.numColumns) {
                 const colNames = selectedCols.map(c => {
                     const name = currentFile?.columnNames?.[parseInt(c)] || `col_${c}`;
-                    return `<span class="string">"${name}"</span>`;
+                    return `"${name}"`;
                 }).join(', ');
-                code += `    .<span class="method">select</span>([${colNames}])\n`;
+                code += `    .select([${colNames}])\n`;
             }
 
-            code += `    .<span class="method">limit</span>(<span class="number">${limit}</span>)\n`;
-            code += `    .<span class="method">collect</span>()\n`;
+            code += `    .limit(${limit})\n`;
+            code += `    .collect()\n`;
             code += `)`;
 
-            document.getElementById('df-preview').innerHTML = code;
+            return code;
+        }
+
+        // Syntax highlight Python-like DataFrame code
+        function highlightDfCode(code) {
+            // Use a unique marker that can't appear in user input after HTML escaping
+            // We escape < to &lt; first, so \x00 (null char) is safe as internal marker
+            const M = '\x00'; // Marker character
+
+            // Escape HTML entities in user code AND strip any null chars
+            let html = code
+                .replace(/\x00/g, '') // Remove any null chars from input
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+
+            // Highlight comments
+            html = html.replace(/(#.*$)/gm, `${M}C${M}$1${M}/C${M}`);
+
+            // Highlight strings
+            html = html.replace(/("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/g, `${M}S${M}$1${M}/S${M}`);
+
+            // Highlight methods (.word()
+            html = html.replace(/\.(\w+)\(/g, `.${M}M${M}$1${M}/M${M}(`);
+
+            // Highlight keywords
+            html = html.replace(/\b(import|from|as|def|return|if|else|elif|for|while|in|not|and|or|True|False|None|result|dataset)\b/g, `${M}K${M}$1${M}/K${M}`);
+
+            // Highlight numbers (but not inside markers)
+            html = html.replace(/\b(\d+\.?\d*)\b/g, (match, num, offset) => {
+                const before = html.substring(0, offset);
+                const opens = (before.match(new RegExp(`${M}[CSMK]${M}`, 'g')) || []).length;
+                const closes = (before.match(new RegExp(`${M}/[CSMK]${M}`, 'g')) || []).length;
+                if (opens > closes) return match;
+                return `${M}N${M}${num}${M}/N${M}`;
+            });
+
+            // Convert markers to HTML spans
+            html = html
+                .replace(new RegExp(`${M}C${M}`, 'g'), '<span class="df-comment">')
+                .replace(new RegExp(`${M}/C${M}`, 'g'), '</span>')
+                .replace(new RegExp(`${M}S${M}`, 'g'), '<span class="df-string">')
+                .replace(new RegExp(`${M}/S${M}`, 'g'), '</span>')
+                .replace(new RegExp(`${M}M${M}`, 'g'), '<span class="df-method">')
+                .replace(new RegExp(`${M}/M${M}`, 'g'), '</span>')
+                .replace(new RegExp(`${M}K${M}`, 'g'), '<span class="df-keyword">')
+                .replace(new RegExp(`${M}/K${M}`, 'g'), '</span>')
+                .replace(new RegExp(`${M}N${M}`, 'g'), '<span class="df-number">')
+                .replace(new RegExp(`${M}/N${M}`, 'g'), '</span>');
+
+            return html;
+        }
+
+        function updateDfPreview() {
+            const textarea = document.getElementById('df-input');
+            const highlight = document.getElementById('df-highlight');
+
+            // Only update if textarea is empty or matches last generated code
+            const currentCode = textarea.value;
+            const generatedCode = generateDfCode();
+
+            // If user hasn't edited, update with generated code
+            if (!textarea.dataset.userEdited || currentCode === textarea.dataset.lastGenerated) {
+                textarea.value = generatedCode;
+                textarea.dataset.lastGenerated = generatedCode;
+            }
+
+            // Always update highlighting to match current textarea content
+            highlight.innerHTML = highlightDfCode(textarea.value) + '\n';
+        }
+
+        // Sync textarea scroll with highlight
+        function setupDfEditorSync() {
+            const textarea = document.getElementById('df-input');
+            const highlight = document.getElementById('df-highlight');
+
+            textarea.addEventListener('input', () => {
+                textarea.dataset.userEdited = 'true';
+                highlight.innerHTML = highlightDfCode(textarea.value) + '\n';
+            });
+
+            textarea.addEventListener('scroll', () => {
+                highlight.scrollTop = textarea.scrollTop;
+                highlight.scrollLeft = textarea.scrollLeft;
+            });
+        }
+
+        // Parse Python-like DataFrame code to extract operations
+        function parseDfCode(code) {
+            const ops = {
+                url: null,
+                search: null,
+                searchEncoder: null,
+                filter: null,
+                select: null,
+                limit: null
+            };
+
+            // Extract URL from lanceql.open("...")
+            const urlMatch = code.match(/lanceql\.open\s*\(\s*["']([^"']+)["']\s*\)/);
+            if (urlMatch) {
+                ops.url = urlMatch[1];
+            }
+
+            // Extract .search("query", encoder="encoder")
+            const searchMatch = code.match(/\.search\s*\(\s*["']([^"']+)["'](?:\s*,\s*encoder\s*=\s*["']([^"']+)["'])?\s*\)/);
+            if (searchMatch) {
+                ops.search = searchMatch[1];
+                ops.searchEncoder = searchMatch[2] || 'minilm';
+            }
+
+            // Extract .filter("col", "op", value)
+            const filterMatch = code.match(/\.filter\s*\(\s*["']([^"']+)["']\s*,\s*["']([^"']+)["']\s*,\s*([^\)]+)\s*\)/);
+            if (filterMatch) {
+                ops.filter = {
+                    column: filterMatch[1],
+                    op: filterMatch[2],
+                    value: parseFloat(filterMatch[3])
+                };
+            }
+
+            // Extract .select([...])
+            const selectMatch = code.match(/\.select\s*\(\s*\[([^\]]+)\]\s*\)/);
+            if (selectMatch) {
+                const colsStr = selectMatch[1];
+                ops.select = colsStr.match(/["']([^"']+)["']/g)?.map(s => s.replace(/["']/g, '')) || [];
+            }
+
+            // Extract .limit(n)
+            const limitMatch = code.match(/\.limit\s*\(\s*(\d+)\s*\)/);
+            if (limitMatch) {
+                ops.limit = parseInt(limitMatch[1]);
+            }
+
+            return ops;
         }
 
         // Set loading state for buttons
@@ -2464,24 +2636,51 @@
 
         // Run DataFrame query
         async function runDfQuery() {
-            if (!currentFile) return;
-
             try {
                 setLoading(true);
                 showStatus('Executing query...', 'info');
 
-                const searchQuery = document.getElementById('df-search-query').value.trim();
-                const searchEncoder = document.getElementById('df-search-encoder').value;
-                const filterCol = document.getElementById('df-filter-col').value;
-                const filterOp = document.getElementById('df-filter-op').value;
-                const filterVal = parseFloat(document.getElementById('df-filter-value').value);
-                const selectedCols = Array.from(document.getElementById('df-select-cols').selectedOptions).map(o => parseInt(o.value));
-                const limit = parseInt(document.getElementById('df-limit').value);
+                // Parse code from editor
+                const code = document.getElementById('df-input').value;
+                const ops = parseDfCode(code);
+
+                console.log('Parsed DataFrame ops:', ops);
+
+                // If URL specified in code and different from current file, load it
+                if (ops.url && (!currentFile || currentFile._url !== ops.url)) {
+                    showStatus(`Loading dataset from ${ops.url}...`, 'info');
+                    await loadFromUrl(ops.url);
+                }
+
+                if (!currentFile) {
+                    showStatus('No dataset loaded. Add lanceql.open("url") to your code.', 'error');
+                    setLoading(false);
+                    return;
+                }
+
+                // Convert column names to indices
+                const colNames = currentFile?.columnNames || [];
+                let selectedCols = [];
+                if (ops.select && ops.select.length > 0) {
+                    selectedCols = ops.select.map(name => colNames.indexOf(name)).filter(i => i >= 0);
+                }
+
+                const limit = ops.limit || 50;
 
                 // If search query is specified, run vector search instead
-                if (searchQuery) {
-                    await runDfVectorSearch(searchQuery, searchEncoder, selectedCols, limit);
+                if (ops.search) {
+                    await runDfVectorSearch(ops.search, ops.searchEncoder || 'minilm', selectedCols, limit);
                     return;
+                }
+
+                // Convert filter column name to index
+                let filterColIdx = -1;
+                let filterOp = null;
+                let filterVal = NaN;
+                if (ops.filter) {
+                    filterColIdx = colNames.indexOf(ops.filter.column);
+                    filterOp = ops.filter.op;
+                    filterVal = ops.filter.value;
                 }
 
                 console.log('runDfQuery called:', {
@@ -2492,8 +2691,7 @@
                     columnTypes
                 });
 
-                // Get column names from schema if available
-                const colNames = currentFile?.columnNames || [];
+                // Get columns to fetch
                 const cols = selectedCols.length > 0 ? selectedCols : Array.from({length: currentFile.numColumns}, (_, i) => i);
                 const columns = cols.map(c => colNames[c] || `column_${c}`);
 
@@ -2506,8 +2704,7 @@
                     let indices;
 
                     // Apply filter if specified
-                    if (filterCol !== '' && !isNaN(filterVal)) {
-                        const filterColIdx = parseInt(filterCol);
+                    if (filterColIdx >= 0 && !isNaN(filterVal)) {
                         const filterType = columnTypes[filterColIdx];
                         console.log(`Applying filter: column ${filterColIdx} ${filterOp} ${filterVal} (type: ${filterType})`);
 
@@ -2726,10 +2923,9 @@
                     let df = currentFile.df();
 
                     // Apply filter
-                    if (filterCol !== '') {
-                        const colIdx = parseInt(filterCol);
-                        const type = columnTypes[colIdx] || 'int64';
-                        df = df.filter(colIdx, filterOp, filterVal, type);
+                    if (filterColIdx >= 0 && !isNaN(filterVal)) {
+                        const type = columnTypes[filterColIdx] || 'int64';
+                        df = df.filter(filterColIdx, filterOp, filterVal, type);
                     }
 
                     // Get indices
@@ -4147,6 +4343,7 @@
         // Initialize
         init();
         setupInfiniteScroll();
+        setupDfEditorSync();
     </script>
 </body>
 </html>
