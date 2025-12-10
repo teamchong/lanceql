@@ -280,13 +280,13 @@
         .sql-textarea:focus + .sql-highlight {
             border-color: #3b82f6;
         }
-        /* SQL syntax highlighting colors */
-        .sql-keyword { color: #c084fc; font-weight: 500; }
+        /* SQL syntax highlighting colors - no font changes to preserve alignment */
+        .sql-keyword { color: #c084fc; }
         .sql-function { color: #60a5fa; }
         .sql-string { color: #4ade80; }
         .sql-number { color: #fbbf24; }
         .sql-operator { color: #f472b6; }
-        .sql-comment { color: #64748b; font-style: italic; }
+        .sql-comment { color: #64748b; }
         .sql-identifier { color: #e2e8f0; }
         .sql-examples {
             margin-top: 10px;
@@ -360,10 +360,12 @@
             background: #0f172a;
             border-radius: 8px;
             padding: 15px;
-            font: 13px/1.5 ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 13px;
             color: #94a3b8;
             overflow-x: auto;
             white-space: pre-wrap;
+            line-height: 1.5;
         }
         .df-code-preview .keyword { color: #93c5fd; }
         .df-code-preview .string { color: #fcd34d; }
