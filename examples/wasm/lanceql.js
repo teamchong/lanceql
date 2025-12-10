@@ -1550,9 +1550,8 @@ export class RemoteLanceFile {
      */
     _parseColumnMeta(bytes) {
         let pos = 0;
-        const bufferOffsets = [];
-        const bufferSizes = [];
-        let rows = 0;
+        const pages = [];
+        let totalRows = 0;
 
         // Read varint as BigInt to handle large values (>2GB offsets)
         const readVarint = () => {
@@ -1573,9 +1572,13 @@ export class RemoteLanceFile {
             const wireType = tag & 0x7;
 
             if (fieldNum === 2 && wireType === 2) {
-                // pages field (length-delimited)
+                // pages field (length-delimited) - parse ALL pages
                 const pageLen = readVarint();
                 const pageEnd = pos + pageLen;
+
+                const pageOffsets = [];
+                const pageSizes = [];
+                let pageRows = 0;
 
                 // Parse page
                 while (pos < pageEnd) {
@@ -1584,22 +1587,22 @@ export class RemoteLanceFile {
                     const pageWire = pageTag & 0x7;
 
                     if (pageField === 1 && pageWire === 2) {
-                        // buffer_offsets (packed) - read ALL offsets
+                        // buffer_offsets (packed)
                         const packedLen = readVarint();
                         const packedEnd = pos + packedLen;
                         while (pos < packedEnd) {
-                            bufferOffsets.push(readVarint());
+                            pageOffsets.push(readVarint());
                         }
                     } else if (pageField === 2 && pageWire === 2) {
-                        // buffer_sizes (packed) - read ALL sizes
+                        // buffer_sizes (packed)
                         const packedLen = readVarint();
                         const packedEnd = pos + packedLen;
                         while (pos < packedEnd) {
-                            bufferSizes.push(readVarint());
+                            pageSizes.push(readVarint());
                         }
                     } else if (pageField === 3 && pageWire === 0) {
                         // length (rows)
-                        rows = readVarint();
+                        pageRows = readVarint();
                     } else {
                         // Skip field
                         if (pageWire === 0) readVarint();
@@ -1611,7 +1614,14 @@ export class RemoteLanceFile {
                         else if (pageWire === 1) pos += 8;
                     }
                 }
-                break;
+
+                pages.push({
+                    offsets: pageOffsets,
+                    sizes: pageSizes,
+                    rows: pageRows
+                });
+                totalRows += pageRows;
+                // Don't break - continue to read more pages
             } else {
                 // Skip field
                 if (wireType === 0) readVarint();
@@ -1624,22 +1634,34 @@ export class RemoteLanceFile {
             }
         }
 
+        // Combine all pages - use first page for offset/size (for backward compat)
+        // Also compute total size across all pages for multi-page columns
+        const firstPage = pages[0] || { offsets: [], sizes: [], rows: 0 };
+        const bufferOffsets = firstPage.offsets;
+        const bufferSizes = firstPage.sizes;
+
+        // For multi-page columns (like embeddings), compute total size
+        let totalSize = 0;
+        for (const page of pages) {
+            // Use the data buffer (last buffer, or buffer 1 for nullable)
+            const dataIdx = page.sizes.length > 1 ? 1 : 0;
+            totalSize += page.sizes[dataIdx] || 0;
+        }
+
         // For nullable columns: buffer 0 = null bitmap, buffer 1 = data
         // For non-nullable: buffer 0 = data
-        // Use the LAST buffer (data buffer) for reading values
         const dataBufferIdx = bufferOffsets.length > 1 ? 1 : 0;
         const nullBitmapIdx = bufferOffsets.length > 1 ? 0 : -1;
 
-        // Debug: console.log(`_parseColumnMeta: ${bufferOffsets.length} buffers, rows=${rows}`);
-
         return {
             offset: bufferOffsets[dataBufferIdx] || 0,
-            size: bufferSizes[dataBufferIdx] || 0,
-            rows,
+            size: pages.length > 1 ? totalSize : (bufferSizes[dataBufferIdx] || 0),
+            rows: totalRows,
             nullBitmapOffset: nullBitmapIdx >= 0 ? bufferOffsets[nullBitmapIdx] : null,
             nullBitmapSize: nullBitmapIdx >= 0 ? bufferSizes[nullBitmapIdx] : null,
             bufferOffsets,
-            bufferSizes
+            bufferSizes,
+            pages  // Include all pages for multi-page access
         };
     }
 
@@ -2384,10 +2406,22 @@ export class RemoteLanceFile {
         const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
         const info = this._parseColumnMeta(new Uint8Array(colMeta));
 
-        if (info.rows === 0 || info.size === 0) return { rows: 0, dimension: 0 };
+        if (info.rows === 0) return { rows: 0, dimension: 0 };
 
-        // Dimension = buffer_size / (rows * 4) for float32
-        const dimension = Math.floor(info.size / (info.rows * 4));
+        // Calculate dimension from first page (all pages have same dimension)
+        let dimension = 0;
+        if (info.pages && info.pages.length > 0) {
+            const firstPage = info.pages[0];
+            const dataIdx = firstPage.sizes.length > 1 ? 1 : 0;
+            const pageSize = firstPage.sizes[dataIdx] || 0;
+            const pageRows = firstPage.rows || 0;
+            if (pageRows > 0 && pageSize > 0) {
+                dimension = Math.floor(pageSize / (pageRows * 4));
+            }
+        } else if (info.size > 0) {
+            // Fallback for single-page
+            dimension = Math.floor(info.size / (info.rows * 4));
+        }
 
         return { rows: info.rows, dimension };
     }
@@ -2696,29 +2730,63 @@ export class RemoteLanceFile {
     /**
      * Read all vectors from a column as a flat Float32Array.
      * Used for worker-based parallel search.
+     * Handles multi-page columns by fetching and combining all pages.
      * @param {number} colIdx - Vector column index
      * @returns {Promise<Float32Array>} - Flattened vector data [numRows * dim]
      */
     async readVectorColumn(colIdx) {
-        const info = await this.getVectorInfo(colIdx);
-        if (info.dimension === 0 || info.rows === 0) {
-            return new Float32Array(0);
-        }
-
-        const dim = info.dimension;
-        const numRows = info.rows;
-        const vecSize = dim * 4; // float32
-
         const entry = await this.getColumnOffsetEntry(colIdx);
         const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
         const metaInfo = this._parseColumnMeta(new Uint8Array(colMeta));
 
-        // Fetch all vector data at once
-        const totalBytes = numRows * vecSize;
-        const data = await this.fetchRange(metaInfo.offset, metaInfo.offset + totalBytes - 1);
+        if (!metaInfo.pages || metaInfo.pages.length === 0 || metaInfo.rows === 0) {
+            return new Float32Array(0);
+        }
 
-        // Convert to Float32Array
-        return new Float32Array(data.buffer, data.byteOffset, numRows * dim);
+        // Calculate dimension from first page
+        const firstPage = metaInfo.pages[0];
+        const dataIdx = firstPage.sizes.length > 1 ? 1 : 0;
+        const firstPageSize = firstPage.sizes[dataIdx] || 0;
+        const firstPageRows = firstPage.rows || 0;
+
+        if (firstPageRows === 0 || firstPageSize === 0) {
+            return new Float32Array(0);
+        }
+
+        const dim = Math.floor(firstPageSize / (firstPageRows * 4));
+        if (dim === 0) {
+            return new Float32Array(0);
+        }
+
+        const totalRows = metaInfo.rows;
+        const result = new Float32Array(totalRows * dim);
+
+        // Fetch each page in parallel
+        const pagePromises = metaInfo.pages.map(async (page, pageIdx) => {
+            const pageDataIdx = page.sizes.length > 1 ? 1 : 0;
+            const pageOffset = page.offsets[pageDataIdx] || 0;
+            const pageSize = page.sizes[pageDataIdx] || 0;
+
+            if (pageSize === 0) return { pageIdx, data: new Float32Array(0), rows: 0 };
+
+            const data = await this.fetchRange(pageOffset, pageOffset + pageSize - 1);
+            return {
+                pageIdx,
+                data: new Float32Array(data.buffer, data.byteOffset, page.rows * dim),
+                rows: page.rows
+            };
+        });
+
+        const pageResults = await Promise.all(pagePromises);
+
+        // Combine pages in order
+        let offset = 0;
+        for (const pageResult of pageResults.sort((a, b) => a.pageIdx - b.pageIdx)) {
+            result.set(pageResult.data, offset);
+            offset += pageResult.rows * dim;
+        }
+
+        return result;
     }
 }
 
