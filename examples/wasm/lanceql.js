@@ -1690,10 +1690,9 @@ export class RemoteLanceFile {
      * @private
      */
     _parseStringColumnMeta(bytes) {
+        // Parse ALL pages for multi-page string columns
+        const pages = [];
         let pos = 0;
-        let bufferOffsets = [0, 0];
-        let bufferSizes = [0, 0];
-        let rows = 0;
 
         const readVarint = () => {
             let result = 0;
@@ -1713,9 +1712,13 @@ export class RemoteLanceFile {
             const wireType = tag & 0x7;
 
             if (fieldNum === 2 && wireType === 2) {
-                // pages field (first page only)
+                // pages field - parse this page
                 const pageLen = readVarint();
                 const pageEnd = pos + pageLen;
+
+                let bufferOffsets = [0, 0];
+                let bufferSizes = [0, 0];
+                let rows = 0;
 
                 while (pos < pageEnd) {
                     const pageTag = readVarint();
@@ -1757,8 +1760,14 @@ export class RemoteLanceFile {
                         else if (pageWire === 1) pos += 8;
                     }
                 }
-                // We found the first page, that's enough for type detection
-                break;
+
+                pages.push({
+                    offsetsStart: bufferOffsets[0],
+                    offsetsSize: bufferSizes[0],
+                    dataStart: bufferOffsets[1],
+                    dataSize: bufferSizes[1],
+                    rows
+                });
             } else {
                 // Skip unknown fields
                 if (wireType === 0) {
@@ -1774,12 +1783,11 @@ export class RemoteLanceFile {
             }
         }
 
+        // Return first page for backwards compatibility, but also include all pages
+        const firstPage = pages[0] || { offsetsStart: 0, offsetsSize: 0, dataStart: 0, dataSize: 0, rows: 0 };
         return {
-            offsetsStart: bufferOffsets[0],
-            offsetsSize: bufferSizes[0],
-            dataStart: bufferOffsets[1],
-            dataSize: bufferSizes[1],
-            rows
+            ...firstPage,
+            pages
         };
     }
 
@@ -2246,94 +2254,149 @@ export class RemoteLanceFile {
         const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
         const info = this._parseStringColumnMeta(new Uint8Array(colMeta));
 
-        if (info.offsetsSize === 0 || info.dataSize === 0) {
-            return indices.map(() => '');
-        }
-
-        // Determine offset size (4 or 8 bytes)
-        const offsetSize = info.offsetsSize / info.rows;
-        if (offsetSize !== 4 && offsetSize !== 8) {
+        if (!info.pages || info.pages.length === 0) {
             return indices.map(() => '');
         }
 
         const results = new Array(indices.length).fill('');
 
-        // Batch offset fetching - each string needs 2 consecutive offsets
-        const offsetBatches = this._batchIndices(indices, offsetSize, 2048);
-
-        // First pass: fetch all offsets in batches
-        const stringRanges = new Array(indices.length);
-
-        await Promise.all(offsetBatches.map(async (batch) => {
-            // Fetch offsets for entire batch range (need +1 for end offset)
-            const startOffset = info.offsetsStart + batch.startIdx * offsetSize;
-            const endOffset = info.offsetsStart + (batch.endIdx + 2) * offsetSize - 1;
-            const data = await this.fetchRange(startOffset, endOffset);
-            const view = new DataView(data);
-
-            // Extract string ranges from offsets
-            for (const item of batch.items) {
-                if (item.idx >= info.rows) continue;
-
-                const localIdx = item.idx - batch.startIdx;
-                let strStart, strEnd;
-
-                if (offsetSize === 4) {
-                    strStart = view.getUint32(localIdx * 4, true);
-                    strEnd = view.getUint32((localIdx + 1) * 4, true);
-                } else {
-                    strStart = Number(view.getBigUint64(localIdx * 8, true));
-                    strEnd = Number(view.getBigUint64((localIdx + 1) * 8, true));
-                }
-
-                if (strEnd > strStart) {
-                    stringRanges[item.origPos] = { start: strStart, end: strEnd };
-                }
+        // Build page index with cumulative row counts
+        let pageRowStart = 0;
+        const pageIndex = [];
+        for (const page of info.pages) {
+            if (page.offsetsSize === 0 || page.dataSize === 0 || page.rows === 0) {
+                pageRowStart += page.rows;
+                continue;
             }
-        }));
+            pageIndex.push({
+                start: pageRowStart,
+                end: pageRowStart + page.rows,
+                page
+            });
+            pageRowStart += page.rows;
+        }
 
-        // Second pass: batch fetch string data
-        // Group strings that are close together in the data buffer
-        const dataItems = stringRanges
-            .map((range, origPos) => range ? { ...range, origPos } : null)
-            .filter(Boolean)
-            .sort((a, b) => a.start - b.start);
-
-        if (dataItems.length === 0) return results;
-
-        // Batch string data fetches
-        const dataBatches = [];
-        let batchStart = 0;
-
-        for (let i = 1; i <= dataItems.length; i++) {
-            const endBatch = i === dataItems.length ||
-                (dataItems[i].start - dataItems[i-1].end) > 4096;
-
-            if (endBatch) {
-                dataBatches.push({
-                    rangeStart: dataItems[batchStart].start,
-                    rangeEnd: dataItems[i-1].end,
-                    items: dataItems.slice(batchStart, i)
-                });
-                batchStart = i;
+        // Group indices by page
+        const pageGroups = new Map();
+        for (let i = 0; i < indices.length; i++) {
+            const rowIdx = indices[i];
+            // Find which page contains this row
+            for (let p = 0; p < pageIndex.length; p++) {
+                const pi = pageIndex[p];
+                if (rowIdx >= pi.start && rowIdx < pi.end) {
+                    if (!pageGroups.has(p)) {
+                        pageGroups.set(p, []);
+                    }
+                    pageGroups.get(p).push({
+                        globalIdx: rowIdx,
+                        localIdx: rowIdx - pi.start,
+                        resultIdx: i
+                    });
+                    break;
+                }
             }
         }
 
-        // Fetch string data batches in parallel
-        await Promise.all(dataBatches.map(async (batch) => {
-            const data = await this.fetchRange(
-                info.dataStart + batch.rangeStart,
-                info.dataStart + batch.rangeEnd - 1
-            );
-            const bytes = new Uint8Array(data);
+        // Fetch strings from each page
+        for (const [pageNum, items] of pageGroups) {
+            const pi = pageIndex[pageNum];
+            const page = pi.page;
 
-            for (const item of batch.items) {
-                const localStart = item.start - batch.rangeStart;
-                const len = item.end - item.start;
-                const strBytes = bytes.slice(localStart, localStart + len);
-                results[item.origPos] = new TextDecoder().decode(strBytes);
+            // Determine offset size (4 or 8 bytes per offset)
+            const offsetSize = page.offsetsSize / page.rows;
+            if (offsetSize !== 4 && offsetSize !== 8) continue;
+
+            // Sort items by localIdx for efficient batching
+            items.sort((a, b) => a.localIdx - b.localIdx);
+
+            // Fetch offsets in batches
+            const offsetBatches = [];
+            let batchStart = 0;
+            for (let i = 1; i <= items.length; i++) {
+                if (i === items.length || items[i].localIdx - items[i-1].localIdx > 100) {
+                    offsetBatches.push(items.slice(batchStart, i));
+                    batchStart = i;
+                }
             }
-        }));
+
+            // Collect string ranges from offset fetches
+            // Lance string encoding: offset[N] = end of string N, start is offset[N-1] (or 0 if N=0)
+            const stringRanges = [];
+
+            await Promise.all(offsetBatches.map(async (batch) => {
+                const minIdx = batch[0].localIdx;
+                const maxIdx = batch[batch.length - 1].localIdx;
+
+                // Fetch offsets: need offset[minIdx-1] through offset[maxIdx]
+                // But if minIdx=0, we don't need offset[-1] since start is implicitly 0
+                const fetchStartIdx = minIdx > 0 ? minIdx - 1 : 0;
+                const fetchEndIdx = maxIdx;
+                const startOffset = page.offsetsStart + fetchStartIdx * offsetSize;
+                const endOffset = page.offsetsStart + (fetchEndIdx + 1) * offsetSize - 1;
+                const data = await this.fetchRange(startOffset, endOffset);
+                const view = new DataView(data);
+
+                for (const item of batch) {
+                    // Position in fetched data
+                    const dataIdx = item.localIdx - fetchStartIdx;
+                    let strStart, strEnd;
+
+                    if (offsetSize === 4) {
+                        // strEnd = offset[localIdx], strStart = offset[localIdx-1] or 0
+                        strEnd = view.getUint32(dataIdx * 4, true);
+                        strStart = item.localIdx === 0 ? 0 : view.getUint32((dataIdx - 1) * 4, true);
+                    } else {
+                        strEnd = Number(view.getBigUint64(dataIdx * 8, true));
+                        strStart = item.localIdx === 0 ? 0 : Number(view.getBigUint64((dataIdx - 1) * 8, true));
+                    }
+
+                    if (strEnd > strStart) {
+                        stringRanges.push({
+                            start: strStart,
+                            end: strEnd,
+                            resultIdx: item.resultIdx,
+                            dataStart: page.dataStart
+                        });
+                    }
+                }
+            }));
+
+            // Fetch string data
+            if (stringRanges.length > 0) {
+                stringRanges.sort((a, b) => a.start - b.start);
+
+                // Batch nearby string fetches
+                const dataBatches = [];
+                let dbStart = 0;
+                for (let i = 1; i <= stringRanges.length; i++) {
+                    if (i === stringRanges.length ||
+                        stringRanges[i].start - stringRanges[i-1].end > 4096) {
+                        dataBatches.push({
+                            rangeStart: stringRanges[dbStart].start,
+                            rangeEnd: stringRanges[i-1].end,
+                            items: stringRanges.slice(dbStart, i),
+                            dataStart: stringRanges[dbStart].dataStart
+                        });
+                        dbStart = i;
+                    }
+                }
+
+                await Promise.all(dataBatches.map(async (batch) => {
+                    const data = await this.fetchRange(
+                        batch.dataStart + batch.rangeStart,
+                        batch.dataStart + batch.rangeEnd - 1
+                    );
+                    const bytes = new Uint8Array(data);
+
+                    for (const item of batch.items) {
+                        const localStart = item.start - batch.rangeStart;
+                        const len = item.end - item.start;
+                        const strBytes = bytes.slice(localStart, localStart + len);
+                        results[item.resultIdx] = new TextDecoder().decode(strBytes);
+                    }
+                }));
+            }
+        }
 
         return results;
     }
@@ -2952,114 +3015,117 @@ export class IVFIndex {
     }
 
     /**
-     * Load custom partition index from ivf_partitions.bin.
+     * Load partition-organized vectors index from ivf_vectors.bin.
      * This file contains:
-     *   - Header: 257 uint32 (partition_starts, cumulative row counts)
-     *   - Data: row IDs sorted by partition (uint32 each)
+     *   - Header: 257 uint64 byte offsets (2056 bytes)
+     *   - Per partition: [row_count: uint32][row_ids: uint32 × n][vectors: float32 × n × 384]
      * @private
      */
     async _loadPartitionIndex() {
-        const url = `${this.datasetBaseUrl}/ivf_partitions.bin`;
-        this.partitionIndexUrl = url;
+        const url = `${this.datasetBaseUrl}/ivf_vectors.bin`;
+        this.partitionVectorsUrl = url;
 
-        // Fetch header (257 uint32s = 1028 bytes)
+        // Fetch header (257 uint64s = 2056 bytes)
         const headerResp = await fetch(url, {
-            headers: { 'Range': 'bytes=0-1027' }
+            headers: { 'Range': 'bytes=0-2055' }
         });
         if (!headerResp.ok) {
-            console.log('[IVFIndex] ivf_partitions.bin not found, will use fallback search');
+            console.log('[IVFIndex] ivf_vectors.bin not found, IVF search disabled');
             return;
         }
 
         const headerData = await headerResp.arrayBuffer();
-        this.partitionStarts = new Uint32Array(headerData);
+        // Parse as BigUint64Array then convert to regular numbers
+        const bigOffsets = new BigUint64Array(headerData);
+        this.partitionOffsets = Array.from(bigOffsets, n => Number(n));
 
-        // Compute partition lengths from starts
-        this.partitionLengths = [];
-        for (let i = 0; i < 256; i++) {
-            this.partitionLengths.push(this.partitionStarts[i + 1] - this.partitionStarts[i]);
-        }
-
-        const totalRows = this.partitionStarts[256];
         this.hasPartitionIndex = true;
-        console.log(`[IVFIndex] Loaded partition index: ${totalRows.toLocaleString()} total rows`);
+        console.log(`[IVFIndex] Loaded partition vectors index: 256 partitions`);
     }
 
     /**
-     * Fetch row IDs for specified partitions from ivf_partitions.bin.
-     * Uses HTTP range requests to fetch only the needed partition data.
+     * Fetch partition data (row IDs and vectors) directly from ivf_vectors.bin.
+     * Each partition contains: [row_count: uint32][row_ids: uint32 × n][vectors: float32 × n × dim]
      * @param {number[]} partitionIndices - Partition indices to fetch
-     * @returns {Promise<number[]>} Array of row IDs
+     * @param {number} dim - Vector dimension (default 384)
+     * @param {function} onProgress - Progress callback (bytesLoaded, totalBytes)
+     * @returns {Promise<{rowIds: number[], vectors: Float32Array[]}>}
      */
-    async fetchPartitionRowIdsFromIndex(partitionIndices) {
-        if (!this.hasPartitionIndex || !this.partitionIndexUrl) {
+    async fetchPartitionData(partitionIndices, dim = 384, onProgress = null) {
+        if (!this.hasPartitionIndex || !this.partitionVectorsUrl) {
             return null;
         }
 
-        const headerSize = 257 * 4;  // 257 uint32s
         const allRowIds = [];
+        const allVectors = [];
+        let totalBytesToFetch = 0;
+        let bytesLoaded = 0;
 
-        // Batch nearby partitions to reduce number of requests
-        const sortedPartitions = [...partitionIndices].sort((a, b) => a - b);
-
-        // Group consecutive or nearby partitions
-        const ranges = [];
-        let rangeStart = sortedPartitions[0];
-        let rangeEnd = sortedPartitions[0];
-
-        for (let i = 1; i < sortedPartitions.length; i++) {
-            const p = sortedPartitions[i];
-            // If partition is close (within 5), extend range
-            if (p <= rangeEnd + 5) {
-                rangeEnd = p;
-            } else {
-                ranges.push({ start: rangeStart, end: rangeEnd });
-                rangeStart = p;
-                rangeEnd = p;
-            }
+        // Calculate total bytes for progress reporting
+        for (const p of partitionIndices) {
+            const startOffset = this.partitionOffsets[p];
+            const endOffset = this.partitionOffsets[p + 1];
+            totalBytesToFetch += endOffset - startOffset;
         }
-        ranges.push({ start: rangeStart, end: rangeEnd });
 
-        // Fetch each range
-        for (const range of ranges) {
-            const startRow = this.partitionStarts[range.start];
-            const endRow = this.partitionStarts[range.end + 1];
-            const numRows = endRow - startRow;
+        console.log(`[IVFIndex] Fetching ${partitionIndices.length} partitions, ${(totalBytesToFetch / 1024 / 1024).toFixed(1)} MB total`);
 
-            if (numRows === 0) continue;
+        // Fetch partitions in parallel (max 4 concurrent)
+        const PARALLEL_LIMIT = 4;
+        for (let i = 0; i < partitionIndices.length; i += PARALLEL_LIMIT) {
+            const batch = partitionIndices.slice(i, i + PARALLEL_LIMIT);
 
-            const byteStart = headerSize + startRow * 4;
-            const byteEnd = headerSize + endRow * 4 - 1;
+            const results = await Promise.all(batch.map(async (p) => {
+                const startOffset = this.partitionOffsets[p];
+                const endOffset = this.partitionOffsets[p + 1];
+                const byteSize = endOffset - startOffset;
 
-            console.log(`[IVFIndex] Fetching partitions ${range.start}-${range.end}: rows ${startRow}-${endRow}, bytes ${byteStart}-${byteEnd}`);
-
-            try {
-                const resp = await fetch(this.partitionIndexUrl, {
-                    headers: { 'Range': `bytes=${byteStart}-${byteEnd}` }
-                });
-                if (!resp.ok) {
-                    console.warn(`[IVFIndex] Fetch failed with status ${resp.status}`);
-                    continue;
-                }
-
-                const data = new Uint32Array(await resp.arrayBuffer());
-
-                // Extract only the partitions we need from this range
-                for (const p of sortedPartitions) {
-                    if (p >= range.start && p <= range.end) {
-                        const pStartRow = this.partitionStarts[p] - startRow;
-                        const pEndRow = this.partitionStarts[p + 1] - startRow;
-                        for (let i = pStartRow; i < pEndRow; i++) {
-                            allRowIds.push(data[i]);
-                        }
+                try {
+                    const resp = await fetch(this.partitionVectorsUrl, {
+                        headers: { 'Range': `bytes=${startOffset}-${endOffset - 1}` }
+                    });
+                    if (!resp.ok) {
+                        console.warn(`[IVFIndex] Partition ${p} fetch failed: ${resp.status}`);
+                        return { rowIds: [], vectors: [] };
                     }
+
+                    const data = await resp.arrayBuffer();
+                    const view = new DataView(data);
+
+                    // Parse: [row_count: uint32][row_ids: uint32 × n][vectors: float32 × n × dim]
+                    const rowCount = view.getUint32(0, true);  // little-endian
+                    const rowIdsStart = 4;
+                    const rowIdsEnd = rowIdsStart + rowCount * 4;
+                    const vectorsStart = rowIdsEnd;
+
+                    const rowIds = new Uint32Array(data.slice(rowIdsStart, rowIdsEnd));
+                    const vectorsFlat = new Float32Array(data.slice(vectorsStart));
+
+                    // Split flat vectors into individual arrays
+                    const vectors = [];
+                    for (let j = 0; j < rowCount; j++) {
+                        vectors.push(vectorsFlat.slice(j * dim, (j + 1) * dim));
+                    }
+
+                    bytesLoaded += byteSize;
+                    if (onProgress) onProgress(bytesLoaded, totalBytesToFetch);
+
+                    return { rowIds: Array.from(rowIds), vectors };
+                } catch (e) {
+                    console.warn(`[IVFIndex] Error fetching partition ${p}:`, e);
+                    return { rowIds: [], vectors: [] };
                 }
-            } catch (e) {
-                console.warn(`[IVFIndex] Error fetching partitions ${range.start}-${range.end}:`, e);
+            }));
+
+            // Collect results
+            for (const result of results) {
+                allRowIds.push(...result.rowIds);
+                allVectors.push(...result.vectors);
             }
         }
 
-        return allRowIds;
+        console.log(`[IVFIndex] Loaded ${allRowIds.length.toLocaleString()} vectors from ${partitionIndices.length} partitions`);
+        return { rowIds: allRowIds, vectors: allVectors };
     }
 
     /**
@@ -5895,12 +5961,18 @@ export class RemoteLanceDataset {
         const groups = this._groupIndicesByFragment(indices);
         const results = new Map();
 
+        console.log(`[ReadStrings] Reading ${indices.length} strings from col ${colIdx}`);
+        console.log(`[ReadStrings] First 5 indices: ${indices.slice(0, 5)}`);
+        console.log(`[ReadStrings] Fragment groups: ${Array.from(groups.keys())}`);
+
         // Fetch from each fragment in parallel
         const fetchPromises = [];
         for (const [fragIdx, group] of groups) {
             fetchPromises.push((async () => {
                 const file = await this.openFragment(fragIdx);
+                console.log(`[ReadStrings] Fragment ${fragIdx}: reading ${group.localIndices.length} strings, first local indices: ${group.localIndices.slice(0, 3)}`);
                 const data = await file.readStringsAtIndices(colIdx, group.localIndices);
+                console.log(`[ReadStrings] Fragment ${fragIdx}: got ${data.length} strings, first 3: ${data.slice(0, 3).map(s => s?.slice(0, 20) + '...')}`);
                 for (let i = 0; i < group.globalIndices.length; i++) {
                     results.set(group.globalIndices[i], data[i]);
                 }
@@ -6047,7 +6119,8 @@ export class RemoteLanceDataset {
 
     /**
      * IVF index-based ANN search.
-     * Uses centroids to find relevant partitions, then searches only those.
+     * Fetches partition data (row IDs + vectors) directly from ivf_vectors.bin.
+     * This is much faster than fetching scattered vectors from Lance files.
      * @private
      */
     async _ivfIndexSearch(queryVec, topK, vectorColIdx, nprobe, onProgress) {
@@ -6055,86 +6128,50 @@ export class RemoteLanceDataset {
         const partitions = this._ivfIndex.findNearestPartitions(queryVec, nprobe);
         console.log(`[VectorSearch] Searching ${partitions.length} partitions:`, partitions);
 
-        // Try to get row IDs from custom partition index first
-        let allRowIds = null;
-        if (this._ivfIndex.hasPartitionIndex) {
-            allRowIds = await this._ivfIndex.fetchPartitionRowIdsFromIndex(partitions);
-            if (allRowIds && allRowIds.length > 0) {
-                console.log(`[VectorSearch] Got ${allRowIds.length.toLocaleString()} row IDs from partition index`);
-            }
-        }
-
-        // If custom partition index not available, try auxiliary.idx
-        if (!allRowIds || allRowIds.length === 0) {
-            const rowIdMappings = await this._ivfIndex.fetchPartitionRowIds(partitions);
-            if (rowIdMappings && rowIdMappings.length > 0) {
-                allRowIds = [];
-                for (const [partitionIdx, rowIds] of rowIdMappings) {
-                    for (const rowId of rowIds) {
-                        allRowIds.push(rowId);
-                    }
+        // Fetch partition data (row IDs + vectors) directly
+        const partitionData = await this._ivfIndex.fetchPartitionData(
+            partitions,
+            this._ivfIndex.dimension,
+            (loaded, total) => {
+                if (onProgress) {
+                    const pct = total > 0 ? loaded / total : 0;
+                    onProgress(Math.floor(pct * 100), 100);
                 }
             }
+        );
+
+        if (!partitionData || partitionData.rowIds.length === 0) {
+            throw new Error('IVF index not available. This dataset requires ivf_vectors.bin for efficient search.');
         }
 
-        // If still no row IDs, IVF search is not possible
-        if (!allRowIds || allRowIds.length === 0) {
-            throw new Error('IVF index not available. This dataset requires ivf_partitions.bin for efficient search.');
-        }
+        const { rowIds, vectors } = partitionData;
+        console.log(`[VectorSearch] Computing similarities for ${rowIds.length.toLocaleString()} vectors`);
 
-        console.log(`[VectorSearch] Total rows to search: ${allRowIds.length.toLocaleString()}`);
-
-        if (onProgress) {
-            onProgress(0, allRowIds.length);
-        }
-
-        // Group row IDs by fragment
-        const fragmentGroups = this._groupIndicesByFragment(allRowIds);
-
-        // Search fragments in parallel (max 4 concurrent)
+        // Compute similarities - vectors are already loaded, no more network requests!
         const allResults = [];
-        let processedCount = 0;
-        const fragmentEntries = Array.from(fragmentGroups.entries());
-        const PARALLEL_LIMIT = 4;
+        for (let i = 0; i < rowIds.length; i++) {
+            const vec = vectors[i];
+            if (!vec || vec.length !== queryVec.length) continue;
 
-        for (let i = 0; i < fragmentEntries.length; i += PARALLEL_LIMIT) {
-            const batch = fragmentEntries.slice(i, i + PARALLEL_LIMIT);
-
-            await Promise.all(batch.map(async ([fragIdx, group]) => {
-                try {
-                    const file = await this.openFragment(fragIdx);
-                    const vectors = await file.readVectorsAtIndices(vectorColIdx, group.localIndices);
-
-                    for (let j = 0; j < group.localIndices.length; j++) {
-                        const vec = vectors[j];
-                        if (!vec || vec.length !== queryVec.length) continue;
-
-                        let dot = 0, normB = 0;
-                        for (let k = 0; k < queryVec.length; k++) {
-                            dot += queryVec[k] * vec[k];
-                            normB += vec[k] * vec[k];
-                        }
-                        const score = normB === 0 ? 0 : dot / Math.sqrt(normB);
-                        allResults.push({ index: group.globalIndices[j], score });
-                    }
-
-                    processedCount += group.localIndices.length;
-                    if (onProgress) onProgress(processedCount, allRowIds.length);
-                } catch (e) {
-                    console.error(`[VectorSearch] Fragment ${fragIdx} error:`, e.message);
-                }
-            }));
+            // Cosine similarity (vectors should be normalized)
+            let dot = 0;
+            for (let k = 0; k < queryVec.length; k++) {
+                dot += queryVec[k] * vec[k];
+            }
+            allResults.push({ index: rowIds[i], score: dot });
         }
 
         // Sort and take top-k
         allResults.sort((a, b) => b.score - a.score);
         const finalK = Math.min(topK, allResults.length);
 
+        if (onProgress) onProgress(100, 100);
+
         return {
             indices: allResults.slice(0, finalK).map(r => r.index),
             scores: allResults.slice(0, finalK).map(r => r.score),
             usedIndex: true,
-            searchedRows: allRowIds.length
+            searchedRows: rowIds.length
         };
     }
 
