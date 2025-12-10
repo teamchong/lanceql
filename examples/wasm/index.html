@@ -1932,12 +1932,15 @@
             }
         }
 
-        function formatNumber(n) {
+        function formatNumber(n, decimals = null) {
+            if (n === null || n === undefined) return 'N/A';
             // Convert BigInt to Number if needed
             const num = typeof n === 'bigint' ? Number(n) : n;
+            if (decimals !== null) return num.toFixed(decimals);
             if (Math.abs(num) >= 1e9) return (num / 1e9).toFixed(1) + 'B';
             if (Math.abs(num) >= 1e6) return (num / 1e6).toFixed(1) + 'M';
             if (Math.abs(num) >= 1e3) return (num / 1e3).toFixed(1) + 'K';
+            if (!Number.isInteger(num)) return num.toFixed(4);
             return num.toLocaleString();
         }
 
@@ -2104,12 +2107,6 @@
             } finally {
                 chip.classList.remove('loading');
             }
-        }
-
-        function formatNumber(n) {
-            if (n === null || n === undefined) return 'N/A';
-            if (Number.isInteger(n)) return n.toLocaleString();
-            return n.toFixed(4);
         }
 
         // Generate plain Python code from UI inputs
