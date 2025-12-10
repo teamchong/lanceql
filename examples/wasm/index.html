@@ -2221,6 +2221,9 @@
                         console.warn('Could not detect column types:', e);
                     }
 
+                    // Populate vector columns for vector search tab
+                    await populateVectorColumns();
+
                     // Populate DataFrame builder selects
                     document.getElementById('run-df-btn').disabled = false;
                     const filterCol = document.getElementById('df-filter-col');
@@ -3099,6 +3102,12 @@
                 noticeEl.style.display = 'inline';
                 noticeEl.style.color = '#22c55e';
                 noticeEl.style.background = 'rgba(34, 197, 94, 0.1)';
+            } else if (result.aggregationStats?.fromSearch && !append) {
+                const stats = result.aggregationStats;
+                noticeEl.textContent = `✓ Aggregated over ${stats.scannedRows.toLocaleString()} vector search results`;
+                noticeEl.style.display = 'inline';
+                noticeEl.style.color = '#22c55e';
+                noticeEl.style.background = 'rgba(34, 197, 94, 0.1)';
             } else if (result.aggregationStats?.isPartialScan && !append) {
                 const stats = result.aggregationStats;
                 noticeEl.textContent = `⚠ Aggregated over ${stats.scannedRows.toLocaleString()} of ${stats.totalRows.toLocaleString()} rows (${stats.coveragePercent}% coverage)`;
@@ -3800,11 +3809,10 @@
 
             if (!currentFile || !currentFile._isRemote) return;
 
-            // Get column names from schema if available
             const colNames = currentFile.columnNames || [];
 
             // Check each column for vector data
-            // Only consider it a vector if dimension > 2 (to exclude scalar types that return small dimensions)
+            // Only consider it a vector if dimension > 2 (to exclude scalar types)
             for (let i = 0; i < currentFile.numColumns; i++) {
                 try {
                     const type = columnTypes[i];
@@ -3814,7 +3822,7 @@
                     const info = await currentFile.getVectorInfo(i);
                     if (info.dimension > 2) {
                         const name = colNames[i] || `column_${i}`;
-                        vectorCol.innerHTML += `<option value="${i}">${name} (${info.dimension}D vectors, ${info.rows} rows)</option>`;
+                        vectorCol.innerHTML += `<option value="${i}">${name} (${info.dimension}D vectors, ${info.rows.toLocaleString()} rows)</option>`;
                     }
                 } catch (e) {
                     // Not a vector column
@@ -4026,6 +4034,12 @@
             const { query, encoder, column } = ast.search;
             const topK = ast.limit || 20;
 
+            // Check if this is an aggregation query (COUNT, SUM, etc. with SEARCH)
+            const isAggregation = ast.columns.some(col =>
+                col.type === 'expr' && col.expr.type === 'call' &&
+                ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'].includes(col.expr.name.toUpperCase())
+            );
+
             showStatus(`Encoding "${query}" with ${encoder.toUpperCase()}...`, 'info');
             showSearchLoading();
 
@@ -4144,10 +4158,95 @@
                 rows.push(row);
             }
 
+            // Handle aggregation queries (COUNT, SUM, etc. after SEARCH)
+            if (isAggregation) {
+                const aggResults = computeAggregationsOnSearchResults(ast, columnData, results);
+                document.getElementById('results-section').style.display = 'block';
+                displayResults({
+                    columns: aggResults.columns,
+                    rows: aggResults.rows,
+                    total: 1,
+                    aggregationStats: {
+                        scannedRows: results.indices.length,
+                        totalRows: targetFile.rowCount || results.indices.length,
+                        coveragePercent: '100.00',
+                        isPartialScan: false,
+                        fromSearch: true
+                    }
+                });
+                showStatus(`Aggregation over ${results.indices.length} search results for "${query}"`, 'success');
+                setLoading(false);
+                return;
+            }
+
             document.getElementById('results-section').style.display = 'block';
             displayResults({ columns, rows, total: results.indices.length });
             showStatus(`Found ${results.indices.length} similar items for "${query}"`, 'success');
             setLoading(false);
+        }
+
+        // Compute aggregations over search results
+        function computeAggregationsOnSearchResults(ast, columnData, results) {
+            const aggColumns = [];
+            const aggValues = [];
+
+            for (const col of ast.columns) {
+                if (col.type !== 'expr' || col.expr.type !== 'call') continue;
+
+                const funcName = col.expr.name.toUpperCase();
+                const alias = col.alias || `${funcName}(${col.expr.args?.[0]?.name || '*'})`;
+                aggColumns.push(alias);
+
+                const arg = col.expr.args?.[0];
+                let values = [];
+
+                if (arg?.type === 'star' || !arg) {
+                    // COUNT(*) - just count results
+                    if (funcName === 'COUNT') {
+                        aggValues.push(results.indices.length);
+                        continue;
+                    }
+                } else if (arg?.type === 'column') {
+                    // Get column data
+                    const colName = arg.name.toLowerCase();
+                    const colNames = Object.keys(columnData).map(k => parseInt(k));
+                    for (const [idx, data] of Object.entries(columnData)) {
+                        // Match column by name
+                        const fileColNames = currentFile?.columnNames || [];
+                        if (fileColNames[parseInt(idx)]?.toLowerCase() === colName) {
+                            values = Array.isArray(data) ? data : [];
+                            break;
+                        }
+                    }
+                }
+
+                // Compute aggregation
+                const numericValues = values.filter(v => typeof v === 'number' && !isNaN(v));
+                switch (funcName) {
+                    case 'COUNT':
+                        aggValues.push(values.length);
+                        break;
+                    case 'SUM':
+                        aggValues.push(numericValues.reduce((a, b) => a + b, 0));
+                        break;
+                    case 'AVG':
+                        aggValues.push(numericValues.length > 0 ? numericValues.reduce((a, b) => a + b, 0) / numericValues.length : null);
+                        break;
+                    case 'MIN':
+                        aggValues.push(numericValues.length > 0 ? Math.min(...numericValues) : null);
+                        break;
+                    case 'MAX':
+                        aggValues.push(numericValues.length > 0 ? Math.max(...numericValues) : null);
+                        break;
+                    default:
+                        aggValues.push(null);
+                }
+            }
+
+            return {
+                columns: aggColumns,
+                rows: [aggValues.map(v => v === null ? '' : (typeof v === 'number' ? (Number.isInteger(v) ? v.toString() : v.toFixed(4)) : String(v)))]
+            };
         }
 
         async function runClipSearch() {
