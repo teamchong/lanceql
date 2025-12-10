@@ -4970,7 +4970,156 @@ export class RemoteLanceDataset {
             return [];
         }
         const file = await this.openFragment(0);
-        return await file.detectColumnTypes();
+        const types = await file.detectColumnTypes();
+        this._columnTypes = types;
+        return types;
+    }
+
+    /**
+     * Helper to determine which fragment contains a given row index.
+     * @private
+     */
+    _getFragmentForRow(rowIdx) {
+        let offset = 0;
+        for (let i = 0; i < this._fragments.length; i++) {
+            const frag = this._fragments[i];
+            if (rowIdx < offset + frag.numRows) {
+                return { fragmentIndex: i, localIndex: rowIdx - offset };
+            }
+            offset += frag.numRows;
+        }
+        return null;
+    }
+
+    /**
+     * Group indices by fragment for efficient batch reading.
+     * @private
+     */
+    _groupIndicesByFragment(indices) {
+        const groups = new Map();
+        for (const globalIdx of indices) {
+            const loc = this._getFragmentForRow(globalIdx);
+            if (!loc) continue;
+
+            if (!groups.has(loc.fragmentIndex)) {
+                groups.set(loc.fragmentIndex, { localIndices: [], globalIndices: [] });
+            }
+            groups.get(loc.fragmentIndex).localIndices.push(loc.localIndex);
+            groups.get(loc.fragmentIndex).globalIndices.push(globalIdx);
+        }
+        return groups;
+    }
+
+    /**
+     * Read strings at specific indices across fragments.
+     */
+    async readStringsAtIndices(colIdx, indices) {
+        const groups = this._groupIndicesByFragment(indices);
+        const results = new Map();
+
+        // Fetch from each fragment in parallel
+        const fetchPromises = [];
+        for (const [fragIdx, group] of groups) {
+            fetchPromises.push((async () => {
+                const file = await this.openFragment(fragIdx);
+                const data = await file.readStringsAtIndices(colIdx, group.localIndices);
+                for (let i = 0; i < group.globalIndices.length; i++) {
+                    results.set(group.globalIndices[i], data[i]);
+                }
+            })());
+        }
+        await Promise.all(fetchPromises);
+
+        // Return in original order
+        return indices.map(idx => results.get(idx) || null);
+    }
+
+    /**
+     * Read int64 values at specific indices across fragments.
+     */
+    async readInt64AtIndices(colIdx, indices) {
+        const groups = this._groupIndicesByFragment(indices);
+        const results = new Map();
+
+        const fetchPromises = [];
+        for (const [fragIdx, group] of groups) {
+            fetchPromises.push((async () => {
+                const file = await this.openFragment(fragIdx);
+                const data = await file.readInt64AtIndices(colIdx, group.localIndices);
+                for (let i = 0; i < group.globalIndices.length; i++) {
+                    results.set(group.globalIndices[i], data[i]);
+                }
+            })());
+        }
+        await Promise.all(fetchPromises);
+
+        return new BigInt64Array(indices.map(idx => results.get(idx) || 0n));
+    }
+
+    /**
+     * Read float64 values at specific indices across fragments.
+     */
+    async readFloat64AtIndices(colIdx, indices) {
+        const groups = this._groupIndicesByFragment(indices);
+        const results = new Map();
+
+        const fetchPromises = [];
+        for (const [fragIdx, group] of groups) {
+            fetchPromises.push((async () => {
+                const file = await this.openFragment(fragIdx);
+                const data = await file.readFloat64AtIndices(colIdx, group.localIndices);
+                for (let i = 0; i < group.globalIndices.length; i++) {
+                    results.set(group.globalIndices[i], data[i]);
+                }
+            })());
+        }
+        await Promise.all(fetchPromises);
+
+        return new Float64Array(indices.map(idx => results.get(idx) || 0));
+    }
+
+    /**
+     * Read int32 values at specific indices across fragments.
+     */
+    async readInt32AtIndices(colIdx, indices) {
+        const groups = this._groupIndicesByFragment(indices);
+        const results = new Map();
+
+        const fetchPromises = [];
+        for (const [fragIdx, group] of groups) {
+            fetchPromises.push((async () => {
+                const file = await this.openFragment(fragIdx);
+                const data = await file.readInt32AtIndices(colIdx, group.localIndices);
+                for (let i = 0; i < group.globalIndices.length; i++) {
+                    results.set(group.globalIndices[i], data[i]);
+                }
+            })());
+        }
+        await Promise.all(fetchPromises);
+
+        return new Int32Array(indices.map(idx => results.get(idx) || 0));
+    }
+
+    /**
+     * Read float32 values at specific indices across fragments.
+     */
+    async readFloat32AtIndices(colIdx, indices) {
+        const groups = this._groupIndicesByFragment(indices);
+        const results = new Map();
+
+        const fetchPromises = [];
+        for (const [fragIdx, group] of groups) {
+            fetchPromises.push((async () => {
+                const file = await this.openFragment(fragIdx);
+                const data = await file.readFloat32AtIndices(colIdx, group.localIndices);
+                for (let i = 0; i < group.globalIndices.length; i++) {
+                    results.set(group.globalIndices[i], data[i]);
+                }
+            })());
+        }
+        await Promise.all(fetchPromises);
+
+        return new Float32Array(indices.map(idx => results.get(idx) || 0));
     }
 
     /**
