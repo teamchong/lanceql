@@ -37,6 +37,7 @@ jobs:
           mkdir -p _site
           cp examples/wasm/index.html _site/
           cp examples/wasm/lanceql.js _site/
+          cp examples/wasm/clip.wasm _site/
           cp zig-out/bin/lanceql.wasm _site/
 
       - name: Upload artifact
