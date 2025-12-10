@@ -56,6 +56,16 @@ export class LanceQL {
     }
 
     /**
+     * Open a Lance dataset from a base URL using HTTP Range requests.
+     * Loads manifest to discover all fragments and enables parallel querying.
+     * @param {string} baseUrl - Base URL to the Lance dataset (e.g., https://host/dataset.lance)
+     * @returns {Promise<RemoteLanceDataset>}
+     */
+    async openDataset(baseUrl) {
+        return await RemoteLanceDataset.open(this, baseUrl);
+    }
+
+    /**
      * Parse footer from Lance file data (without opening).
      * @param {ArrayBuffer} data
      * @returns {{numColumns: number, majorVersion: number, minorVersion: number} | null}
@@ -4533,6 +4543,480 @@ export function parseSQL(sql) {
     const tokens = lexer.tokenize();
     const parser = new SQLParser(tokens);
     return parser.parse();
+}
+
+/**
+ * Represents a remote Lance dataset with multiple fragments.
+ * Loads manifest to discover fragments and fetches data in parallel.
+ */
+export class RemoteLanceDataset {
+    constructor(lanceql, baseUrl) {
+        this.lanceql = lanceql;
+        this.baseUrl = baseUrl.replace(/\/$/, ''); // Remove trailing slash
+        this._fragments = [];
+        this._schema = null;
+        this._totalRows = 0;
+        this._numColumns = 0;
+        this._onFetch = null;
+        this._fragmentFiles = new Map(); // Cache of opened RemoteLanceFile per fragment
+        this._isRemote = true;
+    }
+
+    /**
+     * Open a remote Lance dataset.
+     * @param {LanceQL} lanceql - LanceQL instance
+     * @param {string} baseUrl - Base URL to the dataset
+     * @returns {Promise<RemoteLanceDataset>}
+     */
+    static async open(lanceql, baseUrl) {
+        const dataset = new RemoteLanceDataset(lanceql, baseUrl);
+        await dataset._loadManifest();
+        return dataset;
+    }
+
+    /**
+     * Load and parse the manifest to discover fragments.
+     * @private
+     */
+    async _loadManifest() {
+        // Find the latest manifest version
+        let manifestData = null;
+        let manifestVersion = 0;
+
+        // Try versions 1-100 to find the latest
+        for (let v = 1; v <= 100; v++) {
+            try {
+                const url = `${this.baseUrl}/_versions/${v}.manifest`;
+                const response = await fetch(url, { method: 'HEAD' });
+                if (response.ok) {
+                    manifestVersion = v;
+                } else {
+                    break;
+                }
+            } catch {
+                break;
+            }
+        }
+
+        if (manifestVersion === 0) {
+            throw new Error('No manifest found in dataset');
+        }
+
+        // Fetch the latest manifest
+        const manifestUrl = `${this.baseUrl}/_versions/${manifestVersion}.manifest`;
+        const response = await fetch(manifestUrl);
+        if (!response.ok) {
+            throw new Error(`Failed to fetch manifest: ${response.status}`);
+        }
+
+        manifestData = new Uint8Array(await response.arrayBuffer());
+        this._parseManifest(manifestData);
+
+        console.log(`[LanceQL Dataset] Loaded: ${this._fragments.length} fragments, ${this._totalRows.toLocaleString()} rows, ${this._numColumns} columns`);
+    }
+
+    /**
+     * Parse manifest protobuf to extract schema and fragment info.
+     * @private
+     */
+    _parseManifest(bytes) {
+        // Read content length from first 4 bytes
+        const contentLen = new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, true);
+        const protoData = bytes.slice(4, 4 + contentLen);
+
+        let pos = 0;
+        const fields = [];
+        const fragments = [];
+
+        const readVarint = () => {
+            let result = 0;
+            let shift = 0;
+            while (pos < protoData.length) {
+                const byte = protoData[pos++];
+                result |= (byte & 0x7F) << shift;
+                if ((byte & 0x80) === 0) break;
+                shift += 7;
+            }
+            return result;
+        };
+
+        const skipField = (wireType) => {
+            if (wireType === 0) {
+                readVarint();
+            } else if (wireType === 2) {
+                const len = readVarint();
+                pos += len;
+            } else if (wireType === 5) {
+                pos += 4;
+            } else if (wireType === 1) {
+                pos += 8;
+            }
+        };
+
+        // Parse top-level Manifest message
+        while (pos < protoData.length) {
+            const tag = readVarint();
+            const fieldNum = tag >> 3;
+            const wireType = tag & 0x7;
+
+            if (fieldNum === 1 && wireType === 2) {
+                // Field 1 = schema (repeated Field message)
+                const fieldLen = readVarint();
+                const fieldEnd = pos + fieldLen;
+
+                let name = null;
+                let id = null;
+                let logicalType = null;
+
+                while (pos < fieldEnd) {
+                    const fTag = readVarint();
+                    const fNum = fTag >> 3;
+                    const fWire = fTag & 0x7;
+
+                    if (fWire === 0) {
+                        const val = readVarint();
+                        if (fNum === 3) id = val;
+                    } else if (fWire === 2) {
+                        const len = readVarint();
+                        const content = protoData.slice(pos, pos + len);
+                        pos += len;
+
+                        if (fNum === 2) {
+                            name = new TextDecoder().decode(content);
+                        } else if (fNum === 5) {
+                            logicalType = new TextDecoder().decode(content);
+                        }
+                    } else {
+                        skipField(fWire);
+                    }
+                }
+
+                if (name) {
+                    fields.push({ name, id, type: logicalType });
+                }
+            } else if (fieldNum === 2 && wireType === 2) {
+                // Field 2 = fragments (repeated Fragment message)
+                const fragLen = readVarint();
+                const fragEnd = pos + fragLen;
+
+                let fragId = null;
+                let filePath = null;
+                let numRows = 0;
+
+                while (pos < fragEnd) {
+                    const fTag = readVarint();
+                    const fNum = fTag >> 3;
+                    const fWire = fTag & 0x7;
+
+                    if (fWire === 0) {
+                        const val = readVarint();
+                        if (fNum === 1) fragId = val;  // Fragment.id
+                        else if (fNum === 4) numRows = val;  // Fragment.num_rows (physical_rows)
+                    } else if (fWire === 2) {
+                        const len = readVarint();
+                        const content = protoData.slice(pos, pos + len);
+                        pos += len;
+
+                        if (fNum === 2) {
+                            // Fragment.files - parse DataFile message
+                            let innerPos = 0;
+                            while (innerPos < content.length) {
+                                const iTag = content[innerPos++];
+                                const iNum = iTag >> 3;
+                                const iWire = iTag & 0x7;
+
+                                if (iWire === 2) {
+                                    // Length-delimited
+                                    let iLen = 0;
+                                    let iShift = 0;
+                                    while (innerPos < content.length) {
+                                        const b = content[innerPos++];
+                                        iLen |= (b & 0x7F) << iShift;
+                                        if ((b & 0x80) === 0) break;
+                                        iShift += 7;
+                                    }
+                                    const iContent = content.slice(innerPos, innerPos + iLen);
+                                    innerPos += iLen;
+
+                                    if (iNum === 1) {
+                                        // DataFile.path
+                                        filePath = new TextDecoder().decode(iContent);
+                                    }
+                                } else if (iWire === 0) {
+                                    // Varint - skip
+                                    while (innerPos < content.length && (content[innerPos++] & 0x80) !== 0);
+                                } else if (iWire === 5) {
+                                    innerPos += 4;
+                                } else if (iWire === 1) {
+                                    innerPos += 8;
+                                }
+                            }
+                        }
+                    } else {
+                        skipField(fWire);
+                    }
+                }
+
+                if (filePath) {
+                    fragments.push({
+                        id: fragId,
+                        path: filePath,
+                        numRows: numRows,
+                        url: `${this.baseUrl}/data/${filePath}`
+                    });
+                }
+            } else {
+                skipField(wireType);
+            }
+        }
+
+        this._schema = fields;
+        this._fragments = fragments;
+        this._numColumns = fields.length;
+        this._totalRows = fragments.reduce((sum, f) => sum + f.numRows, 0);
+    }
+
+    /**
+     * Get number of columns.
+     */
+    get numColumns() {
+        return this._numColumns;
+    }
+
+    /**
+     * Get total row count across all fragments.
+     */
+    get rowCount() {
+        return this._totalRows;
+    }
+
+    /**
+     * Get column names from schema.
+     */
+    get columnNames() {
+        return this._schema ? this._schema.map(f => f.name) : [];
+    }
+
+    /**
+     * Get full schema.
+     */
+    get schema() {
+        return this._schema;
+    }
+
+    /**
+     * Get fragment list.
+     */
+    get fragments() {
+        return this._fragments;
+    }
+
+    /**
+     * Get total size (sum of all fragment files).
+     */
+    get size() {
+        // Estimate based on fragments
+        return this._fragments.length * 100 * 1024 * 1024; // ~100MB per fragment estimate
+    }
+
+    /**
+     * Set callback for network fetch events.
+     */
+    onFetch(callback) {
+        this._onFetch = callback;
+    }
+
+    /**
+     * Open a specific fragment as RemoteLanceFile.
+     * @param {number} fragmentIndex - Index of fragment to open
+     * @returns {Promise<RemoteLanceFile>}
+     */
+    async openFragment(fragmentIndex) {
+        if (fragmentIndex < 0 || fragmentIndex >= this._fragments.length) {
+            throw new Error(`Invalid fragment index: ${fragmentIndex}`);
+        }
+
+        // Check cache
+        if (this._fragmentFiles.has(fragmentIndex)) {
+            return this._fragmentFiles.get(fragmentIndex);
+        }
+
+        const fragment = this._fragments[fragmentIndex];
+        const file = await RemoteLanceFile.open(this.lanceql, fragment.url);
+
+        // Propagate fetch callback
+        if (this._onFetch) {
+            file.onFetch(this._onFetch);
+        }
+
+        this._fragmentFiles.set(fragmentIndex, file);
+        return file;
+    }
+
+    /**
+     * Read rows from the dataset with pagination.
+     * Fetches from multiple fragments in parallel.
+     * @param {Object} options - Query options
+     * @param {number} options.offset - Starting row offset
+     * @param {number} options.limit - Maximum rows to return
+     * @param {number[]} options.columns - Column indices to read (optional)
+     * @returns {Promise<{columns: Array[], columnNames: string[], total: number}>}
+     */
+    async readRows({ offset = 0, limit = 50, columns = null } = {}) {
+        // Determine which fragments contain the requested rows
+        const fragmentRanges = [];
+        let currentOffset = 0;
+
+        for (let i = 0; i < this._fragments.length; i++) {
+            const frag = this._fragments[i];
+            const fragStart = currentOffset;
+            const fragEnd = currentOffset + frag.numRows;
+
+            // Check if this fragment overlaps with requested range
+            if (fragEnd > offset && fragStart < offset + limit) {
+                const localStart = Math.max(0, offset - fragStart);
+                const localEnd = Math.min(frag.numRows, offset + limit - fragStart);
+
+                fragmentRanges.push({
+                    fragmentIndex: i,
+                    localOffset: localStart,
+                    localLimit: localEnd - localStart,
+                    globalStart: fragStart + localStart
+                });
+            }
+
+            currentOffset = fragEnd;
+            if (currentOffset >= offset + limit) break;
+        }
+
+        if (fragmentRanges.length === 0) {
+            return { columns: [], columnNames: this.columnNames, total: this._totalRows };
+        }
+
+        // Fetch from fragments in parallel
+        const fetchPromises = fragmentRanges.map(async (range) => {
+            const file = await this.openFragment(range.fragmentIndex);
+            const result = await file.readRows({
+                offset: range.localOffset,
+                limit: range.localLimit,
+                columns: columns
+            });
+            return { ...range, result };
+        });
+
+        const results = await Promise.all(fetchPromises);
+
+        // Merge results in order
+        results.sort((a, b) => a.globalStart - b.globalStart);
+
+        const mergedColumns = [];
+        const colNames = results[0]?.result.columnNames || this.columnNames;
+        const numCols = columns ? columns.length : this._numColumns;
+
+        for (let c = 0; c < numCols; c++) {
+            const colData = [];
+            for (const r of results) {
+                if (r.result.columns[c]) {
+                    colData.push(...r.result.columns[c]);
+                }
+            }
+            mergedColumns.push(colData);
+        }
+
+        return {
+            columns: mergedColumns,
+            columnNames: colNames,
+            total: this._totalRows
+        };
+    }
+
+    /**
+     * Detect column types by sampling from first fragment.
+     * @returns {Promise<string[]>}
+     */
+    async detectColumnTypes() {
+        if (this._fragments.length === 0) {
+            return [];
+        }
+        const file = await this.openFragment(0);
+        return await file.detectColumnTypes();
+    }
+
+    /**
+     * Execute SQL query across all fragments in parallel.
+     * @param {string} sql - SQL query
+     * @returns {Promise<{columns: Array[], columnNames: string[], total: number}>}
+     */
+    async executeSQL(sql) {
+        // Parse the SQL to understand what's needed
+        const ast = parseSQL(sql);
+
+        // For simple SELECT * with LIMIT, use readRows
+        if (ast.type === 'SELECT' && ast.columns === '*' && !ast.where) {
+            const limit = ast.limit || 50;
+            const offset = ast.offset || 0;
+            return await this.readRows({ offset, limit });
+        }
+
+        // For queries with WHERE or complex operations, execute on each fragment in parallel
+        const fetchPromises = this._fragments.map(async (frag, idx) => {
+            const file = await this.openFragment(idx);
+            try {
+                return await file.executeSQL(sql);
+            } catch (e) {
+                console.warn(`Fragment ${idx} query failed:`, e);
+                return { columns: [], columnNames: [], total: 0 };
+            }
+        });
+
+        const results = await Promise.all(fetchPromises);
+
+        // Merge results
+        if (results.length === 0 || results.every(r => r.columns.length === 0)) {
+            return { columns: [], columnNames: this.columnNames, total: 0 };
+        }
+
+        const firstValid = results.find(r => r.columns.length > 0);
+        if (!firstValid) {
+            return { columns: [], columnNames: this.columnNames, total: 0 };
+        }
+
+        const numCols = firstValid.columns.length;
+        const colNames = firstValid.columnNames;
+        const mergedColumns = Array.from({ length: numCols }, () => []);
+
+        let totalRows = 0;
+        for (const r of results) {
+            for (let c = 0; c < numCols && c < r.columns.length; c++) {
+                mergedColumns[c].push(...r.columns[c]);
+            }
+            totalRows += r.total;
+        }
+
+        // Apply LIMIT if present (after merging)
+        if (ast.limit) {
+            const offset = ast.offset || 0;
+            for (let c = 0; c < numCols; c++) {
+                mergedColumns[c] = mergedColumns[c].slice(offset, offset + ast.limit);
+            }
+        }
+
+        return {
+            columns: mergedColumns,
+            columnNames: colNames,
+            total: totalRows
+        };
+    }
+
+    /**
+     * Close all cached fragment files.
+     */
+    close() {
+        for (const file of this._fragmentFiles.values()) {
+            if (file.close) file.close();
+        }
+        this._fragmentFiles.clear();
+    }
 }
 
 // Default export for convenience

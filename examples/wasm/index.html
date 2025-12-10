@@ -1299,7 +1299,7 @@
         const PAGE_SIZE = 50;
 
         // Default demo dataset URL - LAION 1M images dataset
-        const DEFAULT_DATASET_URL = 'https://data.metal0.dev/laion-1m/images.lance/data/00010100101110111010000043aad6414583c208d6294ff2ef.lance';
+        const DEFAULT_DATASET_URL = 'https://data.metal0.dev/laion-1m/images.lance';
         const DEFAULT_QUERY = "SELECT * FROM data LIMIT 50";
 
         // Initialize
@@ -2799,8 +2799,21 @@
             setLoading(true);
 
             try {
-                // Use RemoteLanceFile for lazy loading via Range requests
-                const remoteFile = await lanceql.openUrl(url);
+                let remoteFile;
+                let isDataset = false;
+
+                // Check if URL is a dataset base (ends with .lance but not in /data/)
+                // Dataset URL: https://host/path/dataset.lance
+                // File URL: https://host/path/dataset.lance/data/file.lance
+                if (url.endsWith('.lance') && !url.includes('/data/')) {
+                    // Load as full dataset with all fragments
+                    showStatus('Loading dataset manifest...', 'info');
+                    remoteFile = await lanceql.openDataset(url);
+                    isDataset = true;
+                } else {
+                    // Load as single file
+                    remoteFile = await lanceql.openUrl(url);
+                }
 
                 // Store as current file with remote flag
                 if (currentFile && currentFile.close) currentFile.close();
@@ -2808,6 +2821,7 @@
                 window.currentFile = currentFile;
                 currentFile._isRemote = true;
                 currentFile._url = url;
+                currentFile._isDataset = isDataset;
 
                 // Set up network stats callback
                 currentFile.onFetch((bytes, requests) => {
@@ -2815,7 +2829,7 @@
                 });
 
                 columnTypes = [];
-                rowCount = 0; // Will be determined per column
+                rowCount = isDataset ? remoteFile.rowCount : 0;
 
                 // Clear cached column types to force re-detection
                 if (remoteFile._columnTypes) {
@@ -2825,10 +2839,11 @@
                 // Update UI
                 document.getElementById('file-info').classList.remove('hidden');
                 collapseFileLoader();
-                document.getElementById('file-name').textContent = url.split('/').pop() || 'remote.lance';
+                const displayName = isDataset ? url.split('/').pop() : (url.split('/').pop() || 'remote.lance');
+                document.getElementById('file-name').textContent = displayName + (isDataset ? ' (dataset)' : '');
                 document.getElementById('file-size').textContent = (remoteFile.size / 1024 / 1024).toFixed(2) + ' MB';
                 document.getElementById('col-count').textContent = remoteFile.numColumns;
-                document.getElementById('row-count').textContent = 'Lazy';
+                document.getElementById('row-count').textContent = isDataset ? rowCount.toLocaleString() : 'Lazy';
 
                 // Reset network stats for new file
                 resetNetworkStats();
@@ -2875,7 +2890,10 @@
                 // Hide aggregation bar for remote files (would need full scan)
                 document.getElementById('agg-bar').style.display = 'none';
 
-                showStatus(`Connected! ${remoteFile.numColumns} columns, ${(remoteFile.size / 1024 / 1024).toFixed(1)}MB file (lazy loading via Range requests)`, 'success');
+                const statusMsg = isDataset
+                    ? `Dataset loaded! ${remoteFile.numColumns} columns, ${rowCount.toLocaleString()} rows across ${remoteFile.fragments.length} fragments (parallel Range requests)`
+                    : `Connected! ${remoteFile.numColumns} columns, ${(remoteFile.size / 1024 / 1024).toFixed(1)}MB file (lazy loading via Range requests)`;
+                showStatus(statusMsg, 'success');
                 updateDfPreview();
 
             } catch (err) {
