@@ -256,7 +256,7 @@
             word-wrap: break-word;
             overflow: auto;
             pointer-events: none;
-            color: transparent;
+            z-index: 0;
         }
         .sql-textarea {
             position: relative;
@@ -264,7 +264,7 @@
             height: 150px;
             padding: 15px;
             background: transparent;
-            border: 1px solid #334155;
+            border: 1px solid transparent;
             border-radius: 8px;
             color: transparent;
             caret-color: #e2e8f0;
@@ -272,7 +272,7 @@
             font-size: 14px;
             line-height: 1.5;
             resize: vertical;
-            z-index: 1;
+            z-index: 2;
         }
         .sql-textarea:focus {
             outline: none;
@@ -2346,6 +2346,121 @@
             };
         }
 
+        // Run DataFrame vector search
+        async function runDfVectorSearch(query, encoder, selectedCols, limit) {
+            showStatus(`Encoding "${query}" with ${encoder}...`, 'info');
+            showSearchLoading();
+
+            // Get query vector
+            let queryVec;
+            const isClipModel = encoder.startsWith('clip');
+
+            if (isClipModel) {
+                const clipModelUrl = encoder === 'clip-openai'
+                    ? 'https://data.metal0.dev/models/clip-vit-b32-openai.gguf'
+                    : 'https://data.metal0.dev/models/clip-vit-b32.gguf';
+
+                if (clipModelLoaded && window._loadedClipModelUrl !== clipModelUrl) {
+                    clipModelLoaded = false;
+                }
+                window._loadedClipModelUrl = clipModelUrl;
+                window._clipModelUrlOverride = clipModelUrl;
+
+                if (!clipModelLoaded) {
+                    const loaded = await ensureClipModelLoaded();
+                    if (!loaded) {
+                        setLoading(false);
+                        return;
+                    }
+                }
+                queryVec = encodeTextWithClip(query);
+            } else {
+                if (!minilmModelLoaded) {
+                    const loaded = await ensureMinilmModelLoaded();
+                    if (!loaded) {
+                        setLoading(false);
+                        return;
+                    }
+                }
+                queryVec = encodeTextWithMinilm(query);
+            }
+
+            if (!queryVec) {
+                showStatus(`Failed to encode text`, 'error');
+                setLoading(false);
+                return;
+            }
+
+            // Find vector column
+            let vectorColIdx = -1;
+            for (let i = 0; i < columnTypes.length; i++) {
+                if (columnTypes[i] === 'vector') {
+                    vectorColIdx = i;
+                    break;
+                }
+            }
+            if (vectorColIdx === -1) {
+                showStatus('No vector column found', 'error');
+                setLoading(false);
+                return;
+            }
+
+            showStatus('Searching vectors...', 'info');
+
+            const results = await currentFile.vectorSearch(
+                vectorColIdx,
+                queryVec,
+                limit,
+                (current, total) => {
+                    showProgress('Scanning vectors...', current, total);
+                }
+            );
+
+            hideProgress();
+
+            // Fetch column data
+            const colNames = currentFile.columnNames || [];
+            const cols = selectedCols.length > 0 ? selectedCols : Array.from({length: currentFile.numColumns}, (_, i) => i);
+            const columns = ['score', ...cols.map(c => colNames[c] || `column_${c}`)];
+            const columnData = {};
+
+            for (const c of cols) {
+                const type = columnTypes[c];
+                if (type === 'string') {
+                    columnData[c] = await currentFile.readStringsAtIndices(c, results.indices);
+                } else if (type === 'int64' || type === 'int32') {
+                    columnData[c] = await currentFile.readInt64AtIndices(c, results.indices);
+                } else if (type === 'float64' || type === 'float32' || type === 'double') {
+                    columnData[c] = await currentFile.readFloat64AtIndices(c, results.indices);
+                } else if (type === 'vector') {
+                    columnData[c] = results.indices.map(() => '[vector]');
+                } else {
+                    columnData[c] = results.indices.map(() => '');
+                }
+            }
+
+            const rows = [];
+            for (let i = 0; i < results.indices.length; i++) {
+                const row = [results.scores[i].toFixed(4)];
+                for (const c of cols) {
+                    const val = columnData[c][i];
+                    if (val === null || val === undefined) {
+                        row.push('');
+                    } else if (typeof val === 'number') {
+                        row.push(Number.isInteger(val) ? val.toString() : val.toFixed(4));
+                    } else {
+                        row.push(val);
+                    }
+                }
+                rows.push(row);
+            }
+
+            document.getElementById('results-section').style.display = 'block';
+            displayResults({ columns, rows, total: results.indices.length });
+            showStatus(`Found ${results.indices.length} results for "${query}"`, 'success');
+            setLoading(false);
+        }
+
         // Run DataFrame query
         async function runDfQuery() {
             if (!currentFile) return;
@@ -2354,11 +2469,19 @@
                 setLoading(true);
                 showStatus('Executing query...', 'info');
 
+                const searchQuery = document.getElementById('df-search-query').value.trim();
+                const searchEncoder = document.getElementById('df-search-encoder').value;
                 const filterCol = document.getElementById('df-filter-col').value;
                 const filterOp = document.getElementById('df-filter-op').value;
                 const filterVal = parseFloat(document.getElementById('df-filter-value').value);
                 const selectedCols = Array.from(document.getElementById('df-select-cols').selectedOptions).map(o => parseInt(o.value));
                 const limit = parseInt(document.getElementById('df-limit').value);
+
+                // If search query is specified, run vector search instead
+                if (searchQuery && searchEncoder) {
+                    await runDfVectorSearch(searchQuery, searchEncoder, selectedCols, limit);
+                    return;
+                }
 
                 console.log('runDfQuery called:', {
                     isRemote: currentFile._isRemote,
