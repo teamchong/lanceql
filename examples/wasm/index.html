@@ -2402,6 +2402,15 @@
                     // Populate vector columns for vector search tab
                     await populateVectorColumns();
 
+                    // Show dataset hint for default dataset
+                    const hintEl = document.getElementById('dataset-hint');
+                    if (url.includes('data.metal0.dev/laion-1m/images.lance')) {
+                        hintEl.innerHTML = `<strong>ℹ️ Default dataset:</strong> 1M LAION images with <strong>text embeddings</strong> (all-MiniLM-L6-v2, 384-dim). Use <strong>MiniLM encoder</strong> for vector search.`;
+                        hintEl.style.display = 'block';
+                    } else {
+                        hintEl.style.display = 'none';
+                    }
+
                     // Populate DataFrame builder selects
                     document.getElementById('run-df-btn').disabled = false;
                     const filterCol = document.getElementById('df-filter-col');
