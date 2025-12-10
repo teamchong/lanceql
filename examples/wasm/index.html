@@ -235,22 +235,60 @@
         .sql-editor {
             position: relative;
         }
-        .sql-textarea {
+        .sql-editor-container {
+            position: relative;
             width: 100%;
-            height: 150px;
+        }
+        .sql-highlight {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
             padding: 15px;
             background: #0f172a;
             border: 1px solid #334155;
             border-radius: 8px;
-            color: #e2e8f0;
             font-family: 'Monaco', 'Consolas', monospace;
             font-size: 14px;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow: auto;
+            pointer-events: none;
+            color: transparent;
+        }
+        .sql-textarea {
+            position: relative;
+            width: 100%;
+            height: 150px;
+            padding: 15px;
+            background: transparent;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            color: transparent;
+            caret-color: #e2e8f0;
+            font-family: 'Monaco', 'Consolas', monospace;
+            font-size: 14px;
+            line-height: 1.5;
             resize: vertical;
+            z-index: 1;
         }
         .sql-textarea:focus {
             outline: none;
             border-color: #3b82f6;
         }
+        .sql-textarea:focus + .sql-highlight {
+            border-color: #3b82f6;
+        }
+        /* SQL syntax highlighting colors */
+        .sql-keyword { color: #c084fc; font-weight: 500; }
+        .sql-function { color: #60a5fa; }
+        .sql-string { color: #4ade80; }
+        .sql-number { color: #fbbf24; }
+        .sql-operator { color: #f472b6; }
+        .sql-comment { color: #64748b; font-style: italic; }
+        .sql-identifier { color: #e2e8f0; }
         .sql-examples {
             margin-top: 10px;
             display: flex;
@@ -1087,7 +1125,10 @@
             <!-- SQL Tab -->
             <div class="tab-content active" id="tab-sql">
                 <div class="sql-editor">
-                    <textarea class="sql-textarea" id="sql-input" placeholder="SELECT * FROM read_lance('https://...') LIMIT 50">SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50</textarea>
+                    <div class="sql-editor-container">
+                        <textarea class="sql-textarea" id="sql-input" placeholder="SELECT * FROM read_lance('https://...') LIMIT 50">SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50</textarea>
+                        <pre class="sql-highlight" id="sql-highlight" aria-hidden="true"></pre>
+                    </div>
                     <div class="sql-examples">
                         <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50">First 50 rows</button>
                         <button class="sql-example" id="random-sample-btn">Random 20 rows</button>
@@ -1328,6 +1369,7 @@
 
                 // Set default query and run it (query contains its own data source)
                 document.getElementById('sql-input').value = DEFAULT_QUERY;
+                updateSQLHighlight();
                 setTimeout(runSqlQuery, 100);
             } catch (err) {
                 showStatus('Failed to load WASM: ' + err.message, 'error');
@@ -1357,10 +1399,52 @@
             });
         });
 
+        // SQL syntax highlighting
+        function highlightSQL(sql) {
+            const keywords = /\b(SELECT|FROM|WHERE|AND|OR|NOT|ORDER|BY|ASC|DESC|LIMIT|OFFSET|AS|NULL|IS|IN|BETWEEN|LIKE|TRUE|FALSE|GROUP|HAVING|DISTINCT|JOIN|LEFT|RIGHT|INNER|OUTER|ON|UNION|ALL|INSERT|UPDATE|DELETE|CREATE|DROP|TABLE|INDEX|VIEW)\b/gi;
+            const functions = /\b(read_lance|COUNT|SUM|AVG|MIN|MAX|COALESCE|CAST|UPPER|LOWER|LENGTH|SUBSTRING|CONCAT|ABS|ROUND|FLOOR|CEIL)\b/gi;
+            const strings = /('(?:[^'\\]|\\.)*')/g;
+            const numbers = /\b(\d+\.?\d*)\b/g;
+            const operators = /([=<>!]+|[+\-*\/])/g;
+            const comments = /(--.*$|\/\*[\s\S]*?\*\/)/gm;
+
+            // Escape HTML first
+            let html = sql.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+            // Apply highlighting (order matters - strings first to avoid matching keywords inside strings)
+            html = html.replace(comments, '<span class="sql-comment">$1</span>');
+            html = html.replace(strings, '<span class="sql-string">$1</span>');
+            html = html.replace(functions, '<span class="sql-function">$1</span>');
+            html = html.replace(keywords, '<span class="sql-keyword">$1</span>');
+            html = html.replace(numbers, '<span class="sql-number">$1</span>');
+
+            return html;
+        }
+
+        function updateSQLHighlight() {
+            const textarea = document.getElementById('sql-input');
+            const highlight = document.getElementById('sql-highlight');
+            highlight.innerHTML = highlightSQL(textarea.value) + '\n'; // Extra newline for proper height
+        }
+
+        // Set up SQL editor with syntax highlighting
+        const sqlInput = document.getElementById('sql-input');
+        const sqlHighlight = document.getElementById('sql-highlight');
+
+        sqlInput.addEventListener('input', updateSQLHighlight);
+        sqlInput.addEventListener('scroll', () => {
+            sqlHighlight.scrollTop = sqlInput.scrollTop;
+            sqlHighlight.scrollLeft = sqlInput.scrollLeft;
+        });
+
+        // Initial highlight
+        updateSQLHighlight();
+
         // SQL examples
         document.querySelectorAll('.sql-example').forEach(btn => {
             btn.addEventListener('click', () => {
                 document.getElementById('sql-input').value = btn.dataset.sql;
+                updateSQLHighlight();
             });
         });
 
