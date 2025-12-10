@@ -1853,6 +1853,16 @@ const CLIP_NUM_LAYERS: usize = 12;
 const CLIP_MLP_DIM: usize = 2048;
 const CLIP_HEAD_DIM: usize = CLIP_EMBED_DIM / CLIP_NUM_HEADS; // 64
 
+// SIMD width for vectorized operations (WASM SIMD 128-bit = 4x f32)
+const SIMD_WIDTH: usize = 4;
+
+// Comptime assertions for SIMD alignment
+comptime {
+    if (CLIP_EMBED_DIM % SIMD_WIDTH != 0) @compileError("CLIP_EMBED_DIM must be divisible by SIMD_WIDTH");
+    if (CLIP_HEAD_DIM % SIMD_WIDTH != 0) @compileError("CLIP_HEAD_DIM must be divisible by SIMD_WIDTH");
+    if (CLIP_MLP_DIM % SIMD_WIDTH != 0) @compileError("CLIP_MLP_DIM must be divisible by SIMD_WIDTH");
+}
+
 // CLIP state
 var clip_initialized: bool = false;
 var clip_model_loaded: bool = false;
@@ -2085,6 +2095,111 @@ fn readWeight(idx: usize, i: usize) f32 {
     } else {
         const ptr: [*]const f32 = @ptrCast(@alignCast(model_data + offset));
         return ptr[i];
+    }
+}
+
+// SIMD dot product of two slices (must be multiple of 4)
+inline fn simdDot(comptime N: usize, a: *const [N]f32, b: *const [N]f32) f32 {
+    comptime {
+        if (N % SIMD_WIDTH != 0) @compileError("N must be divisible by SIMD_WIDTH");
+    }
+    var acc: Vec4 = @splat(0);
+    inline for (0..N / SIMD_WIDTH) |i| {
+        const va: Vec4 = a[i * SIMD_WIDTH ..][0..SIMD_WIDTH].*;
+        const vb: Vec4 = b[i * SIMD_WIDTH ..][0..SIMD_WIDTH].*;
+        acc += va * vb;
+    }
+    return @reduce(.Add, acc);
+}
+
+// SIMD vector add: dst += src
+inline fn simdAdd(comptime N: usize, dst: *[N]f32, src: *const [N]f32) void {
+    comptime {
+        if (N % SIMD_WIDTH != 0) @compileError("N must be divisible by SIMD_WIDTH");
+    }
+    inline for (0..N / SIMD_WIDTH) |i| {
+        const vd: Vec4 = dst[i * SIMD_WIDTH ..][0..SIMD_WIDTH].*;
+        const vs: Vec4 = src[i * SIMD_WIDTH ..][0..SIMD_WIDTH].*;
+        dst[i * SIMD_WIDTH ..][0..SIMD_WIDTH].* = vd + vs;
+    }
+}
+
+// SIMD scalar multiply and add: dst += scalar * src
+inline fn simdScalarMulAdd(comptime N: usize, dst: *[N]f32, scalar: f32, src: *const [N]f32) void {
+    comptime {
+        if (N % SIMD_WIDTH != 0) @compileError("N must be divisible by SIMD_WIDTH");
+    }
+    const vs: Vec4 = @splat(scalar);
+    inline for (0..N / SIMD_WIDTH) |i| {
+        const vd: Vec4 = dst[i * SIMD_WIDTH ..][0..SIMD_WIDTH].*;
+        const vsrc: Vec4 = src[i * SIMD_WIDTH ..][0..SIMD_WIDTH].*;
+        dst[i * SIMD_WIDTH ..][0..SIMD_WIDTH].* = vd + vs * vsrc;
+    }
+}
+
+// SIMD zero array
+inline fn simdZero(comptime N: usize, dst: *[N]f32) void {
+    comptime {
+        if (N % SIMD_WIDTH != 0) @compileError("N must be divisible by SIMD_WIDTH");
+    }
+    const zero: Vec4 = @splat(0);
+    inline for (0..N / SIMD_WIDTH) |i| {
+        dst[i * SIMD_WIDTH ..][0..SIMD_WIDTH].* = zero;
+    }
+}
+
+// SIMD copy
+inline fn simdCopy(comptime N: usize, dst: *[N]f32, src: *const [N]f32) void {
+    comptime {
+        if (N % SIMD_WIDTH != 0) @compileError("N must be divisible by SIMD_WIDTH");
+    }
+    inline for (0..N / SIMD_WIDTH) |i| {
+        dst[i * SIMD_WIDTH ..][0..SIMD_WIDTH].* = src[i * SIMD_WIDTH ..][0..SIMD_WIDTH].*;
+    }
+}
+
+// Batch read weights into buffer (for SIMD operations)
+// Returns pointer to start of row in weight matrix
+fn getWeightRowF32(idx: usize, row: usize, row_len: usize, buf: []f32) void {
+    const model_data = clip_model_buffer orelse return;
+    const offset: usize = gguf_data_offset + @as(usize, @intCast(tensor_offsets[idx]));
+    const row_offset = row * row_len;
+
+    if (tensor_types[idx] == GGML_TYPE_F16) {
+        const ptr: [*]const u16 = @ptrCast(@alignCast(model_data + offset));
+        // Convert F16 row to F32 using SIMD
+        var i: usize = 0;
+        while (i + 4 <= row_len) : (i += 4) {
+            buf[i] = f16ToF32(ptr[row_offset + i]);
+            buf[i + 1] = f16ToF32(ptr[row_offset + i + 1]);
+            buf[i + 2] = f16ToF32(ptr[row_offset + i + 2]);
+            buf[i + 3] = f16ToF32(ptr[row_offset + i + 3]);
+        }
+        while (i < row_len) : (i += 1) {
+            buf[i] = f16ToF32(ptr[row_offset + i]);
+        }
+    } else {
+        const ptr: [*]const f32 = @ptrCast(@alignCast(model_data + offset));
+        @memcpy(buf[0..row_len], ptr[row_offset .. row_offset + row_len]);
+    }
+}
+
+// Linear layer with SIMD: out = in @ W^T + b
+// W is [out_dim, in_dim], stored row-major
+fn linearLayerSimd(
+    comptime in_dim: usize,
+    comptime out_dim: usize,
+    input: *const [in_dim]f32,
+    w_idx: usize,
+    b_idx: usize,
+    output: *[out_dim]f32,
+    weight_buf: *[in_dim]f32,
+) void {
+    for (0..out_dim) |i| {
+        // Load weight row i into buffer
+        getWeightRowF32(w_idx, i, in_dim, weight_buf);
+        // SIMD dot product
+        output[i] = readWeight(b_idx, i) + simdDot(in_dim, input, weight_buf);
     }
 }
 
@@ -2483,7 +2598,10 @@ fn tokenize(text: []const u8, tokens: []u32) usize {
     return final_len;
 }
 
-// Multi-head self-attention
+// Scratch buffer for weight row loading (reused across calls)
+var weight_row_buf: [CLIP_MLP_DIM]f32 = undefined; // MLP_DIM is largest
+
+// Multi-head self-attention with SIMD optimization
 // input: normalized hidden states
 // residual: original hidden states to add output to
 fn multiHeadAttention(
@@ -2507,112 +2625,91 @@ fn multiHeadAttention(
 
     const scale: f32 = 1.0 / @sqrt(@as(f32, CLIP_HEAD_DIM));
 
-    // Compute Q, K, V for all positions from normalized input
-    // Linear layer: y = x @ W^T + b, where W is [out, in]
-    // So y[i] = sum_j(x[j] * W[i,j]) + b[i], access W[i,j] = W[i * in + j]
+    // Compute Q, K, V using SIMD linear layers
     for (0..seq_len) |pos| {
-        const h = input[pos * CLIP_EMBED_DIM ..][0..CLIP_EMBED_DIM];
+        const h: *const [CLIP_EMBED_DIM]f32 = @ptrCast(input[pos * CLIP_EMBED_DIM ..][0..CLIP_EMBED_DIM]);
+        const q: *[CLIP_EMBED_DIM]f32 = @ptrCast(q_out[pos * CLIP_EMBED_DIM ..][0..CLIP_EMBED_DIM]);
+        const k: *[CLIP_EMBED_DIM]f32 = @ptrCast(k_out[pos * CLIP_EMBED_DIM ..][0..CLIP_EMBED_DIM]);
+        const v: *[CLIP_EMBED_DIM]f32 = @ptrCast(v_out[pos * CLIP_EMBED_DIM ..][0..CLIP_EMBED_DIM]);
 
-        // Q = h @ Wq^T + bq
-        for (0..CLIP_EMBED_DIM) |i| {
-            var sum: f32 = readWeight(q_b_idx, i);
-            for (0..CLIP_EMBED_DIM) |j| {
-                sum += h[j] * readWeight(q_w_idx, i * CLIP_EMBED_DIM + j);
-            }
-            q_out[pos * CLIP_EMBED_DIM + i] = sum;
-        }
-
-        // K = h @ Wk^T + bk
-        for (0..CLIP_EMBED_DIM) |i| {
-            var sum: f32 = readWeight(k_b_idx, i);
-            for (0..CLIP_EMBED_DIM) |j| {
-                sum += h[j] * readWeight(k_w_idx, i * CLIP_EMBED_DIM + j);
-            }
-            k_out[pos * CLIP_EMBED_DIM + i] = sum;
-        }
-
-        // V = h @ Wv^T + bv
-        for (0..CLIP_EMBED_DIM) |i| {
-            var sum: f32 = readWeight(v_b_idx, i);
-            for (0..CLIP_EMBED_DIM) |j| {
-                sum += h[j] * readWeight(v_w_idx, i * CLIP_EMBED_DIM + j);
-            }
-            v_out[pos * CLIP_EMBED_DIM + i] = sum;
-        }
+        linearLayerSimd(CLIP_EMBED_DIM, CLIP_EMBED_DIM, h, q_w_idx, q_b_idx, q, weight_row_buf[0..CLIP_EMBED_DIM]);
+        linearLayerSimd(CLIP_EMBED_DIM, CLIP_EMBED_DIM, h, k_w_idx, k_b_idx, k, weight_row_buf[0..CLIP_EMBED_DIM]);
+        linearLayerSimd(CLIP_EMBED_DIM, CLIP_EMBED_DIM, h, v_w_idx, v_b_idx, v, weight_row_buf[0..CLIP_EMBED_DIM]);
     }
 
-    // Compute attention for each head
+    // Compute attention scores with SIMD dot products
     for (0..CLIP_NUM_HEADS) |head| {
         const head_offset = head * CLIP_HEAD_DIM;
 
-        // Compute attention scores: Q @ K^T / sqrt(d)
         for (0..seq_len) |i| {
+            const qi: *const [CLIP_HEAD_DIM]f32 = @ptrCast(q_out[i * CLIP_EMBED_DIM + head_offset ..][0..CLIP_HEAD_DIM]);
+
             for (0..seq_len) |j| {
-                var dot: f32 = 0;
-                for (0..CLIP_HEAD_DIM) |d| {
-                    dot += q_out[i * CLIP_EMBED_DIM + head_offset + d] *
-                        k_out[j * CLIP_EMBED_DIM + head_offset + d];
-                }
                 // Causal mask: only attend to previous positions
                 if (j > i) {
                     attn_out[head * seq_len * seq_len + i * seq_len + j] = -1e9;
                 } else {
-                    attn_out[head * seq_len * seq_len + i * seq_len + j] = dot * scale;
+                    const kj: *const [CLIP_HEAD_DIM]f32 = @ptrCast(k_out[j * CLIP_EMBED_DIM + head_offset ..][0..CLIP_HEAD_DIM]);
+                    attn_out[head * seq_len * seq_len + i * seq_len + j] = simdDot(CLIP_HEAD_DIM, qi, kj) * scale;
                 }
             }
         }
 
-        // Softmax per row
+        // Softmax per row (SIMD for exp and normalization)
         for (0..seq_len) |i| {
             const row_start = head * seq_len * seq_len + i * seq_len;
+
+            // Find max
             var max_val: f32 = attn_out[row_start];
             for (1..seq_len) |j| {
                 if (attn_out[row_start + j] > max_val) max_val = attn_out[row_start + j];
             }
+
+            // Exp and sum
             var sum: f32 = 0;
             for (0..seq_len) |j| {
                 attn_out[row_start + j] = @exp(attn_out[row_start + j] - max_val);
                 sum += attn_out[row_start + j];
             }
+
+            // Normalize
+            const inv_sum = 1.0 / sum;
             for (0..seq_len) |j| {
-                attn_out[row_start + j] /= sum;
+                attn_out[row_start + j] *= inv_sum;
             }
         }
     }
 
-    // Compute attention output: softmax(QK^T/sqrt(d)) @ V and add to residual
-    // Use a temp buffer for attention output before projection
+    // Compute attention output with SIMD
     var attn_output: [CLIP_MAX_SEQ_LEN * CLIP_EMBED_DIM]f32 = undefined;
 
     for (0..seq_len) |pos| {
-        // Zero output first
-        for (0..CLIP_EMBED_DIM) |i| {
-            attn_output[pos * CLIP_EMBED_DIM + i] = 0;
-        }
+        const out_vec: *[CLIP_EMBED_DIM]f32 = @ptrCast(attn_output[pos * CLIP_EMBED_DIM ..][0..CLIP_EMBED_DIM]);
+        simdZero(CLIP_EMBED_DIM, out_vec);
 
         for (0..CLIP_NUM_HEADS) |head| {
             const head_offset = head * CLIP_HEAD_DIM;
+            const head_out: *[CLIP_HEAD_DIM]f32 = @ptrCast(attn_output[pos * CLIP_EMBED_DIM + head_offset ..][0..CLIP_HEAD_DIM]);
+
             for (0..seq_len) |j| {
                 const attn_weight = attn_out[head * seq_len * seq_len + pos * seq_len + j];
-                for (0..CLIP_HEAD_DIM) |d| {
-                    attn_output[pos * CLIP_EMBED_DIM + head_offset + d] +=
-                        attn_weight * v_out[j * CLIP_EMBED_DIM + head_offset + d];
-                }
+                const vj: *const [CLIP_HEAD_DIM]f32 = @ptrCast(v_out[j * CLIP_EMBED_DIM + head_offset ..][0..CLIP_HEAD_DIM]);
+                simdScalarMulAdd(CLIP_HEAD_DIM, head_out, attn_weight, vj);
             }
         }
 
-        // Output projection: attn_output @ Wo^T + bo, add to residual
-        for (0..CLIP_EMBED_DIM) |i| {
-            var sum: f32 = readWeight(out_b_idx, i);
-            for (0..CLIP_EMBED_DIM) |j| {
-                sum += attn_output[pos * CLIP_EMBED_DIM + j] * readWeight(out_w_idx, i * CLIP_EMBED_DIM + j);
-            }
-            residual[pos * CLIP_EMBED_DIM + i] += sum;
-        }
+        // Output projection with SIMD
+        const attn_vec: *const [CLIP_EMBED_DIM]f32 = @ptrCast(attn_output[pos * CLIP_EMBED_DIM ..][0..CLIP_EMBED_DIM]);
+        var proj_out: [CLIP_EMBED_DIM]f32 = undefined;
+        linearLayerSimd(CLIP_EMBED_DIM, CLIP_EMBED_DIM, attn_vec, out_w_idx, out_b_idx, &proj_out, weight_row_buf[0..CLIP_EMBED_DIM]);
+
+        // Add to residual
+        const res: *[CLIP_EMBED_DIM]f32 = @ptrCast(residual[pos * CLIP_EMBED_DIM ..][0..CLIP_EMBED_DIM]);
+        simdAdd(CLIP_EMBED_DIM, res, &proj_out);
     }
 }
 
-// MLP block: FFN(x) = GELU(x @ W1 + b1) @ W2 + b2
+// MLP block with SIMD: FFN(x) = GELU(x @ W1^T + b1) @ W2^T + b2
 // input: normalized hidden states
 // residual: original hidden states to add output to
 fn mlpBlock(input: []f32, residual: []f32, seq_len: usize, layer: usize) void {
@@ -2621,57 +2718,77 @@ fn mlpBlock(input: []f32, residual: []f32, seq_len: usize, layer: usize) void {
     const fc2_w_idx = layer_mlp_fc2_weight_idx[layer] orelse return;
     const fc2_b_idx = layer_mlp_fc2_bias_idx[layer] orelse return;
 
-    // Linear layer: y = x @ W^T + b, W is [out, in]
     for (0..seq_len) |pos| {
-        const h = input[pos * CLIP_EMBED_DIM ..][0..CLIP_EMBED_DIM];
+        const h: *const [CLIP_EMBED_DIM]f32 = @ptrCast(input[pos * CLIP_EMBED_DIM ..][0..CLIP_EMBED_DIM]);
 
-        // First linear: embed_dim -> mlp_dim with GELU
-        // fc1_w is [mlp_dim, embed_dim]
-        for (0..CLIP_MLP_DIM) |i| {
-            var sum: f32 = readWeight(fc1_b_idx, i);
-            for (0..CLIP_EMBED_DIM) |j| {
-                sum += h[j] * readWeight(fc1_w_idx, i * CLIP_EMBED_DIM + j);
+        // First linear: embed_dim -> mlp_dim using SIMD
+        var mlp_hidden: [CLIP_MLP_DIM]f32 = undefined;
+        linearLayerSimd(CLIP_EMBED_DIM, CLIP_MLP_DIM, h, fc1_w_idx, fc1_b_idx, &mlp_hidden, weight_row_buf[0..CLIP_EMBED_DIM]);
+
+        // GELU activation with SIMD
+        var i: usize = 0;
+        while (i < CLIP_MLP_DIM) : (i += SIMD_WIDTH) {
+            const x: Vec4 = mlp_hidden[i..][0..SIMD_WIDTH].*;
+            const neg_x = -x * @as(Vec4, @splat(1.702));
+            // exp approximation or use @exp element-wise
+            var exp_neg: Vec4 = undefined;
+            inline for (0..SIMD_WIDTH) |k| {
+                exp_neg[k] = @exp(neg_x[k]);
             }
-            // GELU activation (quick approximation)
-            const x = sum;
-            scratch_mlp[pos * CLIP_MLP_DIM + i] = x * (1.0 / (1.0 + @exp(-1.702 * x)));
+            const sigmoid = @as(Vec4, @splat(1.0)) / (@as(Vec4, @splat(1.0)) + exp_neg);
+            mlp_hidden[i..][0..SIMD_WIDTH].* = x * sigmoid;
         }
 
-        // Second linear: mlp_dim -> embed_dim, add to residual
-        // fc2_w is [embed_dim, mlp_dim]
-        for (0..CLIP_EMBED_DIM) |i| {
-            var sum: f32 = readWeight(fc2_b_idx, i);
-            for (0..CLIP_MLP_DIM) |j| {
-                sum += scratch_mlp[pos * CLIP_MLP_DIM + j] * readWeight(fc2_w_idx, i * CLIP_MLP_DIM + j);
-            }
-            residual[pos * CLIP_EMBED_DIM + i] += sum;
-        }
+        // Second linear: mlp_dim -> embed_dim using SIMD
+        var fc2_out: [CLIP_EMBED_DIM]f32 = undefined;
+        linearLayerSimd(CLIP_MLP_DIM, CLIP_EMBED_DIM, &mlp_hidden, fc2_w_idx, fc2_b_idx, &fc2_out, &weight_row_buf);
+
+        // Add to residual with SIMD
+        const res: *[CLIP_EMBED_DIM]f32 = @ptrCast(residual[pos * CLIP_EMBED_DIM ..][0..CLIP_EMBED_DIM]);
+        simdAdd(CLIP_EMBED_DIM, res, &fc2_out);
     }
 }
 
-// Layer norm in-place using tensor indices
+// Layer norm in-place using tensor indices with SIMD
 fn layerNormInPlace(hidden: []f32, seq_len: usize, weight_idx: usize, bias_idx: usize) void {
     const eps: f32 = 1e-5;
+
     for (0..seq_len) |pos| {
-        const h = hidden[pos * CLIP_EMBED_DIM ..][0..CLIP_EMBED_DIM];
+        var h: *[CLIP_EMBED_DIM]f32 = @ptrCast(hidden[pos * CLIP_EMBED_DIM ..][0..CLIP_EMBED_DIM]);
 
-        // Mean
-        var mean: f32 = 0;
-        for (h) |v| mean += v;
-        mean /= CLIP_EMBED_DIM;
-
-        // Variance
-        var variance: f32 = 0;
-        for (h) |v| {
-            const diff = v - mean;
-            variance += diff * diff;
+        // Mean using SIMD
+        var sum_vec: Vec4 = @splat(0);
+        var i: usize = 0;
+        while (i < CLIP_EMBED_DIM) : (i += SIMD_WIDTH) {
+            sum_vec += h[i..][0..SIMD_WIDTH].*;
         }
-        variance /= CLIP_EMBED_DIM;
+        const mean = @reduce(.Add, sum_vec) / @as(f32, CLIP_EMBED_DIM);
 
-        // Normalize
+        // Variance using SIMD
+        const mean_vec: Vec4 = @splat(mean);
+        var var_vec: Vec4 = @splat(0);
+        i = 0;
+        while (i < CLIP_EMBED_DIM) : (i += SIMD_WIDTH) {
+            const diff = h[i..][0..SIMD_WIDTH].* - mean_vec;
+            var_vec += diff * diff;
+        }
+        const variance = @reduce(.Add, var_vec) / @as(f32, CLIP_EMBED_DIM);
         const inv_std = 1.0 / @sqrt(variance + eps);
-        for (0..CLIP_EMBED_DIM) |i| {
-            h[i] = (h[i] - mean) * inv_std * readWeight(weight_idx, i) + readWeight(bias_idx, i);
+
+        // Normalize with weight and bias
+        // Load weight and bias rows
+        var weight_buf: [CLIP_EMBED_DIM]f32 = undefined;
+        var bias_buf: [CLIP_EMBED_DIM]f32 = undefined;
+        getWeightRowF32(weight_idx, 0, CLIP_EMBED_DIM, &weight_buf);
+        getWeightRowF32(bias_idx, 0, CLIP_EMBED_DIM, &bias_buf);
+
+        const inv_std_vec: Vec4 = @splat(inv_std);
+        i = 0;
+        while (i < CLIP_EMBED_DIM) : (i += SIMD_WIDTH) {
+            const x = h[i..][0..SIMD_WIDTH].*;
+            const w: Vec4 = weight_buf[i..][0..SIMD_WIDTH].*;
+            const b: Vec4 = bias_buf[i..][0..SIMD_WIDTH].*;
+            h[i..][0..SIMD_WIDTH].* = (x - mean_vec) * inv_std_vec * w + b;
         }
     }
 }
