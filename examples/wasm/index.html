@@ -370,6 +370,7 @@
         .df-code-preview .string { color: #fcd34d; }
         .df-code-preview .number { color: #86efac; }
         .df-code-preview .method { color: #c4b5fd; }
+        .df-code-preview .comment { color: #64748b; font-style: italic; }
 
         /* Run button */
         .run-section {
@@ -1886,19 +1887,34 @@
             const selectedCols = Array.from(document.getElementById('df-select-cols').selectedOptions).map(o => o.value);
             const limit = document.getElementById('df-limit').value;
 
-            let code = `<span class="keyword">const</span> result = file.<span class="method">df</span>()`;
+            // Show data source based on how file was loaded
+            let code = '';
+            if (currentFile?._isRemote && currentFile?._url) {
+                const url = currentFile._url;
+                if (currentFile._isDataset) {
+                    code = `<span class="keyword">const</span> file = <span class="keyword">await</span> lanceql.<span class="method">openDataset</span>(<span class="string">'${url}'</span>);\n`;
+                } else {
+                    code = `<span class="keyword">const</span> file = <span class="keyword">await</span> lanceql.<span class="method">openUrl</span>(<span class="string">'${url}'</span>);\n`;
+                }
+            } else if (currentFile) {
+                code = `<span class="keyword">const</span> file = lanceql.<span class="method">open</span>(arrayBuffer);\n`;
+            } else {
+                code = `<span class="comment">// Load a file first</span>\n`;
+            }
+
+            code += `<span class="keyword">const</span> result = file.<span class="method">df</span>()`;
 
             if (filterCol !== '') {
                 const type = columnTypes[parseInt(filterCol)] || 'int64';
-                code += `<br>  .<span class="method">filter</span>(<span class="number">${filterCol}</span>, <span class="string">'${filterOp}'</span>, <span class="number">${filterVal}</span>, <span class="string">'${type}'</span>)`;
+                code += `\n  .<span class="method">filter</span>(<span class="number">${filterCol}</span>, <span class="string">'${filterOp}'</span>, <span class="number">${filterVal}</span>, <span class="string">'${type}'</span>)`;
             }
 
             if (selectedCols.length > 0 && selectedCols.length < currentFile?.numColumns) {
-                code += `<br>  .<span class="method">select</span>(${selectedCols.map(c => `<span class="number">${c}</span>`).join(', ')})`;
+                code += `\n  .<span class="method">select</span>(${selectedCols.map(c => `<span class="number">${c}</span>`).join(', ')})`;
             }
 
-            code += `<br>  .<span class="method">limit</span>(<span class="number">${limit}</span>)`;
-            code += `<br>  .<span class="method">collect</span>();`;
+            code += `\n  .<span class="method">limit</span>(<span class="number">${limit}</span>)`;
+            code += `\n  .<span class="method">collect</span>();`;
 
             document.getElementById('df-preview').innerHTML = code;
         }
