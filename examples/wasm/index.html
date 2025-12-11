@@ -3641,8 +3641,20 @@
 
         document.getElementById('run-sql-btn').addEventListener('click', runSqlQuery);
         document.getElementById('run-df-btn').addEventListener('click', async () => {
-            // Sync DataFrame to SQL, then run SQL query
-            updateDfPreview(false);
+            // Parse DataFrame code and sync to SQL, then run SQL query
+            const code = document.getElementById('df-input').value;
+            const ops = parseDfCode(code);
+            const query = {
+                url: ops.url,
+                version: ops.version,
+                search: ops.search,
+                encoder: ops.searchEncoder,
+                topK: ops.topK,
+                filter: ops.filter ? { column: ops.filter.column, op: ops.filter.op, value: ops.filter.value } : null,
+                select: ops.select,
+                limit: ops.limit
+            };
+            syncQueryTabs(query, 'df');
             await runSqlQuery();
         });
 
