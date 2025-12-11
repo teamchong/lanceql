@@ -2195,6 +2195,126 @@
             return code;
         }
 
+        /**
+         * Sync all query tabs (SQL, DataFrame, Vector Search) and URL hash.
+         * @param {Object} query - Normalized query object
+         * @param {string} query.url - Dataset URL
+         * @param {number} query.version - Version number (optional)
+         * @param {string} query.search - Search query text (optional)
+         * @param {string} query.encoder - Encoder name (optional, default 'minilm')
+         * @param {Object} query.filter - Filter {column, op, value} (optional)
+         * @param {string[]} query.select - Column names to select (optional)
+         * @param {number} query.limit - Row limit (optional)
+         * @param {string} source - Which tab initiated the sync ('sql', 'df', 'vector')
+         */
+        function syncQueryTabs(query, source) {
+            const url = query.url || currentFile?._url || '';
+            const version = query.version || currentFile?.version || null;
+
+            // Generate SQL
+            let sql = 'SELECT ';
+            if (query.select && query.select.length > 0) {
+                sql += query.select.join(', ');
+            } else {
+                sql += '*';
+            }
+            sql += ` FROM read_lance('${url}')`;
+            if (version) {
+                sql += ` AT VERSION ${version}`;
+            }
+            if (query.filter) {
+                sql += ` WHERE ${query.filter.column} ${query.filter.op} ${query.filter.value}`;
+            }
+            if (query.search) {
+                sql += ` SEARCH '${query.search}'`;
+            }
+            if (query.limit) {
+                sql += ` LIMIT ${query.limit}`;
+            }
+
+            // Generate DataFrame code
+            let dfCode = `import lanceql\n\n`;
+            const versionArg = version ? `, version=${version}` : '';
+            dfCode += `dataset = lanceql.open("${url}"${versionArg})\n\n`;
+            dfCode += `result = (\n`;
+            dfCode += `    dataset.df()\n`;
+            if (query.search) {
+                const encoder = query.encoder || 'minilm';
+                dfCode += `    .search("${query.search}", encoder="${encoder}")\n`;
+            }
+            if (query.filter) {
+                dfCode += `    .filter("${query.filter.column}", "${query.filter.op}", ${query.filter.value})\n`;
+            }
+            if (query.select && query.select.length > 0) {
+                dfCode += `    .select([${query.select.map(c => `"${c}"`).join(', ')}])\n`;
+            }
+            if (query.limit) {
+                dfCode += `    .limit(${query.limit})\n`;
+            }
+            dfCode += `    .collect()\n`;
+            dfCode += `)`;
+
+            // Update SQL tab (if not source)
+            if (source !== 'sql') {
+                document.getElementById('sql-input').value = sql;
+                updateSQLHighlight();
+            }
+
+            // Update DataFrame tab (if not source)
+            if (source !== 'df') {
+                document.getElementById('df-input').value = dfCode;
+                document.getElementById('df-input').dataset.userEdited = 'false';
+                document.getElementById('df-highlight').innerHTML = highlightDfCode(dfCode) + '\n';
+            }
+
+            // Update URL hash
+            const newHash = `sql=${encodeURIComponent(sql)}`;
+            history.replaceState(null, '', `#${newHash}`);
+        }
+
+        /**
+         * Parse SQL to extract query components.
+         * @param {string} sql - SQL query string
+         * @returns {Object} Normalized query object
+         */
+        function sqlToQuery(sql) {
+            const query = {};
+
+            // Extract URL from read_lance('...')
+            const urlMatch = sql.match(/read_lance\s*\(\s*['"]([^'"]+)['"]\s*\)/i);
+            if (urlMatch) query.url = urlMatch[1];
+
+            // Extract version from AT VERSION N
+            const versionMatch = sql.match(/AT\s+VERSION\s+(\d+)/i);
+            if (versionMatch) query.version = parseInt(versionMatch[1]);
+
+            // Extract search from SEARCH '...'
+            const searchMatch = sql.match(/SEARCH\s+['"]([^'"]+)['"]/i);
+            if (searchMatch) query.search = searchMatch[1];
+
+            // Extract limit from LIMIT N
+            const limitMatch = sql.match(/LIMIT\s+(\d+)/i);
+            if (limitMatch) query.limit = parseInt(limitMatch[1]);
+
+            // Extract columns from SELECT (if not *)
+            const selectMatch = sql.match(/SELECT\s+(.+?)\s+FROM/i);
+            if (selectMatch && selectMatch[1].trim() !== '*') {
+                query.select = selectMatch[1].split(',').map(c => c.trim());
+            }
+
+            // Extract WHERE clause (simplified - just column op value)
+            const whereMatch = sql.match(/WHERE\s+(\w+)\s*(>|<|>=|<=|=|!=)\s*([\d.]+)/i);
+            if (whereMatch) {
+                query.filter = {
+                    column: whereMatch[1],
+                    op: whereMatch[2],
+                    value: parseFloat(whereMatch[3])
+                };
+            }
+
+            return query;
+        }
+
         // Syntax highlight Python-like DataFrame code
         function highlightDfCode(code) {
             // Use a unique marker that can't appear in user input after HTML escaping
@@ -2364,9 +2484,9 @@
                 return;
             }
 
-            // Update URL hash for sharing (without triggering page reload)
-            const newHash = `sql=${encodeURIComponent(sql)}`;
-            history.replaceState(null, '', `#${newHash}`);
+            // Sync other tabs with this SQL query
+            const query = sqlToQuery(sql);
+            syncQueryTabs(query, 'sql');
 
             try {
                 setLoading(true);
@@ -2895,6 +3015,18 @@
                 const ops = parseDfCode(code);
 
                 console.log('Parsed DataFrame ops:', ops);
+
+                // Sync other tabs with this DataFrame query
+                const query = {
+                    url: ops.url,
+                    version: ops.version,
+                    search: ops.search,
+                    encoder: ops.searchEncoder,
+                    filter: ops.filter ? { column: ops.filter.column, op: ops.filter.op, value: ops.filter.value } : null,
+                    select: ops.select,
+                    limit: ops.limit
+                };
+                syncQueryTabs(query, 'df');
 
                 // If URL specified in code and different from current file (or version changed), load it
                 const needsReload = ops.url && (!currentFile || currentFile._url !== ops.url ||
@@ -4520,6 +4652,16 @@
 
             const topK = parseInt(document.getElementById('top-k').value) || 20;
             const encoder = document.getElementById('clip-model-select').value;
+
+            // Sync other tabs with this vector search query
+            const query = {
+                url: currentFile?._url,
+                version: currentFile?.version,
+                search: text,
+                encoder: encoder,
+                limit: topK
+            };
+            syncQueryTabs(query, 'vector');
 
             try {
                 setLoading(true);
