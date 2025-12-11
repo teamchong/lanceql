@@ -2899,7 +2899,7 @@
 
                 // If FROM clause has URL, load dataset first
                 let targetFile = currentFile;
-                if (ast.from && ast.from.type === 'url') {
+                if (ast.from && ast.from.type === 'url' && ast.from.url) {
                     const url = ast.from.url;
                     const version = ast.from.version || null;
                     const versionMsg = version ? ` (v${version})` : '';
