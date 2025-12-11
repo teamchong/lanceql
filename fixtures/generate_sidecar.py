@@ -3,17 +3,22 @@
 Generate sidecar manifest (.meta.json) for Lance datasets.
 
 This script creates a JSON file with pre-calculated metadata that browsers
-can fetch in parallel with the manifest, avoiding extra RTTs for column info.
+can fetch in parallel with the manifest, reducing RTTs for column info.
 
 Usage:
     python generate_sidecar.py <dataset_path> [output_path]
 
 Example:
+    # Local dataset
     python generate_sidecar.py /path/to/images.lance
     # Creates /path/to/images.lance/.meta.json
 
     python generate_sidecar.py /path/to/images.lance ./meta.json
     # Creates ./meta.json
+
+    # Remote dataset (HTTP/S3)
+    python generate_sidecar.py https://data.metal0.dev/laion-1m/images.lance ./meta.json
+    python generate_sidecar.py s3://bucket/dataset.lance ./meta.json
 
 The sidecar file contains:
 - Schema with column names, types, and field IDs
@@ -26,6 +31,7 @@ import json
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import lance
 import pyarrow as pa
@@ -83,9 +89,51 @@ def get_column_stats(ds: lance.LanceDataset, col_name: str) -> dict[str, Any]:
     return stats
 
 
+def get_storage_options(dataset_path: str) -> dict | None:
+    """Get storage options for S3/R2 access if needed."""
+    parsed = urlparse(dataset_path)
+    if parsed.scheme != "s3":
+        return None
+
+    # Check for R2 endpoint in environment or use known endpoint
+    import subprocess
+
+    # Try to get R2 credentials from aws profile
+    try:
+        result = subprocess.run(
+            ["aws", "configure", "get", "aws_access_key_id", "--profile", "r2"],
+            capture_output=True,
+            text=True,
+        )
+        access_key = result.stdout.strip()
+
+        result = subprocess.run(
+            ["aws", "configure", "get", "aws_secret_access_key", "--profile", "r2"],
+            capture_output=True,
+            text=True,
+        )
+        secret_key = result.stdout.strip()
+
+        if access_key and secret_key:
+            return {
+                "endpoint": "https://36498dc359676cbbcf8c3616e6c07e94.r2.cloudflarestorage.com",
+                "region": "auto",
+                "aws_access_key_id": access_key,
+                "aws_secret_access_key": secret_key,
+            }
+    except Exception:
+        pass
+
+    return None
+
+
 def generate_sidecar(dataset_path: str, output_path: str | None = None) -> dict:
     """Generate sidecar manifest for a Lance dataset."""
-    ds = lance.dataset(dataset_path)
+    storage_options = get_storage_options(dataset_path)
+    if storage_options:
+        ds = lance.dataset(dataset_path, storage_options=storage_options)
+    else:
+        ds = lance.dataset(dataset_path)
 
     # Schema info
     schema_info = []
@@ -154,6 +202,12 @@ def generate_sidecar(dataset_path: str, output_path: str | None = None) -> dict:
     return sidecar
 
 
+def is_remote_path(path: str) -> bool:
+    """Check if path is a remote URL (HTTP, S3, etc.)."""
+    parsed = urlparse(path)
+    return parsed.scheme in ("http", "https", "s3", "gs", "az")
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -163,7 +217,13 @@ def main():
     dataset_path = sys.argv[1]
     output_path = sys.argv[2] if len(sys.argv) > 2 else None
 
-    if not Path(dataset_path).exists():
+    # For remote paths, require explicit output path
+    if is_remote_path(dataset_path):
+        if output_path is None:
+            print("Error: Remote datasets require an explicit output path")
+            print(f"  Example: python {sys.argv[0]} {dataset_path} ./meta.json")
+            sys.exit(1)
+    elif not Path(dataset_path).exists():
         print(f"Error: Dataset not found: {dataset_path}")
         sys.exit(1)
 
