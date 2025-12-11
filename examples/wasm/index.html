@@ -2122,6 +2122,10 @@
                 vectorCol.selectedIndex = 1;
             }
 
+            // Update SQL to use FILE for local files
+            document.getElementById('sql-input').value = 'SELECT * FROM read_lance(FILE) LIMIT 50';
+            updateSQLHighlight();
+
             // Run initial query to show sample data
             updateDfPreview(false);
             runSqlQuery();
