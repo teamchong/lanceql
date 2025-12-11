@@ -2354,8 +2354,8 @@
                             break;
                         }
                     }
-                } else if (vectorColSelect.options.length > 1) {
-                    vectorColSelect.selectedIndex = 1; // Auto-select first vector column
+                } else if (vectorColSelect.options.length > 0) {
+                    vectorColSelect.selectedIndex = 0; // Auto-select first vector column
                 }
             }
 
@@ -4421,9 +4421,10 @@
             const hasVectorCols = vectorCol.options.length > 1;
             document.getElementById('run-vector-btn').disabled = !hasVectorCols;
 
-            // Auto-select first vector column
+            // If we have vector columns, remove "Select column..." and auto-select first
             if (hasVectorCols) {
-                vectorCol.selectedIndex = 1;
+                vectorCol.remove(0); // Remove "Select column..." option
+                vectorCol.selectedIndex = 0; // Select first actual column
             }
         }
 
