@@ -2277,8 +2277,7 @@
                     sql += ` TOPK ${query.topK}`;
                 }
             }
-            // LIMIT only when no NEAR (NEAR uses TOPK)
-            if (query.limit && (query.searchRow === undefined || query.searchRow === null) && !query.search) {
+            if (query.limit) {
                 sql += ` LIMIT ${query.limit}`;
             }
 
