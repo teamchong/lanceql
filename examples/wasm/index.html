@@ -2936,6 +2936,11 @@
                     document.getElementById('run-df-btn').disabled = false;
                     const filterCol = document.getElementById('df-filter-col');
                     const selectCols = document.getElementById('df-select-cols');
+
+                    // Preserve current filter selection before repopulating
+                    const prevFilterValue = filterCol.value;
+                    const prevFilterColName = prevFilterValue ? filterCol.options[filterCol.selectedIndex]?.text.split(' (')[0] : null;
+
                     filterCol.innerHTML = '<option value="">No filter</option>';
                     selectCols.innerHTML = '';
 
@@ -2951,10 +2956,10 @@
                     }
 
                     // Apply pending column value now that options exist
-                    const pendingColumn = filterCol.getAttribute('data-pending-column');
+                    const pendingColumn = filterCol.getAttribute('data-pending-column') || prevFilterColName;
                     if (pendingColumn) {
                         const colIdx = colNames.findIndex(n => n.toLowerCase() === pendingColumn.toLowerCase());
-                        if (colIdx >= 0) {
+                        if (colIdx >= 0 && filterCol.querySelector(`option[value="${colIdx}"]`)) {
                             filterCol.value = colIdx;
                         }
                         filterCol.removeAttribute('data-pending-column');
