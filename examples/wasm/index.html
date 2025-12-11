@@ -2053,6 +2053,8 @@
                 detectedTypes[i] = type;
             }
             $columnTypes.set(detectedTypes);
+            // Also store on file object for SQLExecutor
+            currentFile._columnTypes = detectedTypes;
 
             // Update UI via Alpine store
             Alpine.store('app').fileName = filename;
@@ -3066,6 +3068,11 @@
                 showStatus('Executing query...', 'info');
 
                 // Use the new SQL executor for proper parsing
+                console.log('Creating SQLExecutor with targetFile:', {
+                    numColumns: targetFile.numColumns,
+                    columnNames: targetFile.columnNames,
+                    columnTypes: targetFile._columnTypes || columnTypes
+                });
                 const executor = new SQLExecutor(targetFile);
                 const result = await executor.execute(sql, (msg, current, total) => {
                     showProgress(msg, current, total);
