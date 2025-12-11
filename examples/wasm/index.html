@@ -1264,11 +1264,11 @@
                     </div>
                     <div class="sql-examples">
                         <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50">First 50</button>
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') ORDER BY aesthetic DESC LIMIT 50">Top aesthetic</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') WHERE aesthetic > 0.5 LIMIT 50">aesthetic > 0.5</button>
                         <button class="sql-example" data-sql="SELECT COUNT(*) FROM read_lance('https://data.metal0.dev/laion-1m/images.lance')">COUNT(*)</button>
                         <button class="sql-example" data-sql="SELECT AVG(aesthetic), MIN(aesthetic), MAX(aesthetic) FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 10000">Stats 10K</button>
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'cat' LIMIT 20">Search 'cat'</button>
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') AT VERSION 1 LIMIT 50">Version 1</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') NEAR 'cat' TOPK 20">NEAR 'cat'</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance', 1) LIMIT 50">Version 1</button>
                         <button class="sql-example copy-link-btn" id="copy-link-btn" title="Copy shareable link">
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
@@ -2349,9 +2349,11 @@
                 }
             }
 
-            // Update URL hash
-            const newHash = `sql=${encodeURIComponent(sql)}`;
-            history.replaceState(null, '', `#${newHash}`);
+            // Update URL hash (only if sql is valid)
+            if (sql && !sql.includes('undefined')) {
+                const newHash = `sql=${encodeURIComponent(sql)}`;
+                history.replaceState(null, '', `#${newHash}`);
+            }
         }
 
         /**
