@@ -175,8 +175,8 @@ export const wasmUtils = {
     getExports: () => _w,
 };
 
-// LanceQL high-level methods (added to proxy)
-const _lanceqlMethods = {
+// LanceQL high-level methods factory (needs proxy reference)
+const _createLanceqlMethods = (proxy) => ({
     /**
      * Get the library version.
      * @returns {string} Version string like "0.1.0"
@@ -195,7 +195,7 @@ const _lanceqlMethods = {
      * @returns {LanceFile}
      */
     open(data) {
-        return new LanceFile(this, data);
+        return new LanceFile(proxy, data);
     },
 
     /**
@@ -204,7 +204,7 @@ const _lanceqlMethods = {
      * @returns {Promise<RemoteLanceFile>}
      */
     async openUrl(url) {
-        return await RemoteLanceFile.open(this, url);
+        return await RemoteLanceFile.open(proxy, url);
     },
 
     /**
@@ -215,7 +215,7 @@ const _lanceqlMethods = {
      * @returns {Promise<RemoteLanceDataset>}
      */
     async openDataset(baseUrl, options = {}) {
-        return await RemoteLanceDataset.open(this, baseUrl, options);
+        return await RemoteLanceDataset.open(proxy, baseUrl, options);
     },
 
     /**
@@ -262,7 +262,7 @@ const _lanceqlMethods = {
             _w.free(ptr, bytes.length);
         }
     }
-};
+});
 
 export class LanceQL {
     /**
@@ -281,10 +281,13 @@ export class LanceQL {
 
         // Create Immer-style proxy that auto-marshals string/bytes arguments
         // Also includes high-level LanceQL methods
-        return new Proxy({}, {
+        let _methods = null;
+        const proxy = new Proxy({}, {
             get(_, n) {
+                // Lazy init methods with proxy reference
+                if (!_methods) _methods = _createLanceqlMethods(proxy);
                 // High-level LanceQL methods
-                if (n in _lanceqlMethods) return _lanceqlMethods[n].bind(_lanceqlMethods);
+                if (n in _methods) return _methods[n];
                 // Special properties
                 if (n === 'memory') return _m;
                 if (n === 'raw') return _w;  // Raw WASM exports
@@ -296,6 +299,7 @@ export class LanceQL {
                 return _w[n];
             }
         });
+        return proxy;
     }
 }
 
