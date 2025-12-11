@@ -1701,9 +1701,7 @@
 
         // Toggle file loader visibility (make global for onclick)
         window.toggleFileLoader = function() {
-            const loader = document.getElementById('file-loader-section');
-            loader.classList.toggle('collapsed');
-            console.log('Toggled file loader, collapsed:', loader.classList.contains('collapsed'));
+            Alpine.store('app').fileLoaderCollapsed = !Alpine.store('app').fileLoaderCollapsed;
         };
 
         // Collapse file loader when file is loaded
@@ -3958,7 +3956,9 @@
             const data = result.rows.map(row => {
                 const obj = {};
                 result.columns.forEach((col, i) => {
-                    obj[col] = row[i];
+                    // Convert BigInt to Number for JSON serialization
+                    const val = row[i];
+                    obj[col] = typeof val === 'bigint' ? Number(val) : val;
                 });
                 return obj;
             });
