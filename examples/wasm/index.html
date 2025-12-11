@@ -2224,12 +2224,12 @@
                 sql += '*';
             }
             // Build read_lance args
-            // Only use read_lance() for local files, always include URL for remote
+            // read_lance(FILE) for local files, read_lance('url') for remote
             const isLocalFile = !url && !currentFile?._isRemote;
-            if (isLocalFile && !version) {
-                sql += ` FROM read_lance()`;
-            } else if (isLocalFile && version) {
-                sql += ` FROM read_lance(${version})`;
+            if (isLocalFile && version) {
+                sql += ` FROM read_lance(FILE, ${version})`;
+            } else if (isLocalFile) {
+                sql += ` FROM read_lance(FILE)`;
             } else if (url && version) {
                 sql += ` FROM read_lance('${url}', ${version})`;
             } else if (url) {
@@ -2242,7 +2242,7 @@
                 } else if (fallbackUrl) {
                     sql += ` FROM read_lance('${fallbackUrl}')`;
                 } else {
-                    sql += ` FROM read_lance()`;
+                    sql += ` FROM read_lance(FILE)`;
                 }
             }
             // WHERE clause
@@ -2271,7 +2271,7 @@
                 }
             }
             // LIMIT only when no NEAR (NEAR uses TOPK)
-            if (query.limit && query.searchRow === undefined && query.searchRow === null && !query.search) {
+            if (query.limit && (query.searchRow === undefined || query.searchRow === null) && !query.search) {
                 sql += ` LIMIT ${query.limit}`;
             }
 
@@ -2472,15 +2472,11 @@
             const textarea = document.getElementById('df-input');
             const highlight = document.getElementById('df-highlight');
 
-            // Only update if textarea is empty or matches last generated code
-            const currentCode = textarea.value;
+            // Always regenerate and update DataFrame code from builder fields
             const generatedCode = generateDfCode();
-
-            // If user hasn't edited, update with generated code
-            if (!textarea.dataset.userEdited || currentCode === textarea.dataset.lastGenerated) {
-                textarea.value = generatedCode;
-                textarea.dataset.lastGenerated = generatedCode;
-            }
+            textarea.value = generatedCode;
+            textarea.dataset.lastGenerated = generatedCode;
+            textarea.dataset.userEdited = '';
 
             // Always update highlighting to match current textarea content
             highlight.innerHTML = highlightDfCode(textarea.value) + '\n';
@@ -4233,8 +4229,8 @@
         ['df-search-query', 'df-search-encoder', 'df-filter-col', 'df-filter-op', 'df-filter-value', 'df-limit'].forEach(id => {
             const el = document.getElementById(id);
             if (el) {
-                el.addEventListener('change', updateDfPreview);
-                el.addEventListener('input', updateDfPreview);
+                el.addEventListener('change', () => updateDfPreview(false));
+                el.addEventListener('input', () => updateDfPreview(false));
             }
         });
         // Multi-select needs special handling - use setTimeout to ensure selection is complete
@@ -4243,7 +4239,7 @@
             const handleSelectChange = () => {
                 // Reset userEdited flag so DataFrame code updates
                 document.getElementById('df-input').dataset.userEdited = '';
-                setTimeout(updateDfPreview, 0);
+                setTimeout(() => updateDfPreview(false), 0);
             };
             dfSelectCols.addEventListener('change', handleSelectChange);
             dfSelectCols.addEventListener('mouseup', handleSelectChange);

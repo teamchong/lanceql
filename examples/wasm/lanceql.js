@@ -4222,12 +4222,10 @@ const TokenType = {
     MIN: 'MIN',
     MAX: 'MAX',
     // Vector search keywords
-    SEARCH: 'SEARCH',
-    USING: 'USING',
-    ON: 'ON',
-    // Time-travel keywords
-    AT: 'AT',
-    VERSION: 'VERSION',
+    NEAR: 'NEAR',
+    TOPK: 'TOPK',
+    // File reference
+    FILE: 'FILE',
 
     // Literals
     IDENTIFIER: 'IDENTIFIER',
@@ -4283,11 +4281,9 @@ const KEYWORDS = {
     'AVG': TokenType.AVG,
     'MIN': TokenType.MIN,
     'MAX': TokenType.MAX,
-    'SEARCH': TokenType.SEARCH,
-    'USING': TokenType.USING,
-    'ON': TokenType.ON,
-    'AT': TokenType.AT,
-    'VERSION': TokenType.VERSION,
+    'NEAR': TokenType.NEAR,
+    'TOPK': TokenType.TOPK,
+    'FILE': TokenType.FILE,
 };
 
 /**
@@ -4523,34 +4519,44 @@ export class SQLParser {
             having = this.parseExpr();
         }
 
-        // SEARCH - vector similarity search
-        // Syntax: SEARCH 'query' [USING minilm|clip] [ON column]
+        // NEAR - vector similarity search
+        // Syntax: NEAR [column] <'text'|row_num> [TOPK n]
         let search = null;
-        if (this.match(TokenType.SEARCH)) {
-            const query = this.expect(TokenType.STRING).value;
-            let encoder = 'minilm'; // default
+        if (this.match(TokenType.NEAR)) {
             let column = null;
+            let query = null;
+            let searchRow = null;
+            let topK = 20; // default
+            let encoder = 'minilm'; // default
 
-            // USING encoder (minilm, clip-openai, clip-laion)
-            if (this.match(TokenType.USING)) {
-                let encoderName = this.expect(TokenType.IDENTIFIER).value.toLowerCase();
-                // Handle hyphenated names like clip-openai
-                if (this.match(TokenType.MINUS)) {
-                    encoderName += '-' + this.expect(TokenType.IDENTIFIER).value.toLowerCase();
-                }
-                encoder = encoderName;
-                const validEncoders = ['minilm', 'clip', 'clip-openai', 'clip-laion'];
-                if (!validEncoders.includes(encoder)) {
-                    throw new Error(`Unknown encoder: ${encoder}. Supported: minilm, clip-openai, clip-laion`);
+            // First token after NEAR: could be column name, string, or number
+            if (this.check(TokenType.IDENTIFIER)) {
+                // Could be column name - peek ahead
+                const ident = this.advance().value;
+                if (this.check(TokenType.STRING) || this.check(TokenType.NUMBER)) {
+                    // It was a column name
+                    column = ident;
+                } else {
+                    // It was a search term without quotes (error)
+                    throw new Error(`NEAR requires quoted text or row number. Did you mean: NEAR '${ident}'?`);
                 }
             }
 
-            // ON column
-            if (this.match(TokenType.ON)) {
-                column = this.expect(TokenType.IDENTIFIER).value;
+            // Now expect string (text search) or number (row search)
+            if (this.check(TokenType.STRING)) {
+                query = this.advance().value;
+            } else if (this.check(TokenType.NUMBER)) {
+                searchRow = parseInt(this.advance().value, 10);
+            } else {
+                throw new Error('NEAR requires a quoted text string or row number');
             }
 
-            search = { query, encoder, column };
+            // Optional TOPK
+            if (this.match(TokenType.TOPK)) {
+                topK = parseInt(this.expect(TokenType.NUMBER).value, 10);
+            }
+
+            search = { query, searchRow, column, topK, encoder };
         }
 
         // ORDER BY and LIMIT can appear in either order
@@ -4651,23 +4657,27 @@ export class SQLParser {
             if (this.match(TokenType.LPAREN)) {
                 const funcName = name.toLowerCase();
                 if (funcName === 'read_lance') {
-                    // read_lance() - no args, use current file
-                    // read_lance(24) - version only
-                    // read_lance('url') - url only
-                    // read_lance('url', 24) - url and version
+                    // read_lance(FILE) - local uploaded file
+                    // read_lance(FILE, 24) - local file with version
+                    // read_lance('url') - remote url
+                    // read_lance('url', 24) - remote url with version
                     from = { type: 'url', function: 'read_lance' };
 
                     if (!this.check(TokenType.RPAREN)) {
-                        // First arg: string (url) or number (version)
-                        if (this.check(TokenType.STRING)) {
+                        // First arg: FILE keyword, string (url)
+                        if (this.match(TokenType.FILE)) {
+                            // Local file - mark as file reference
+                            from.isFile = true;
+                            // Check for second arg (version)
+                            if (this.match(TokenType.COMMA)) {
+                                from.version = parseInt(this.expect(TokenType.NUMBER).value, 10);
+                            }
+                        } else if (this.check(TokenType.STRING)) {
                             from.url = this.advance().value;
                             // Check for second arg (version)
                             if (this.match(TokenType.COMMA)) {
                                 from.version = parseInt(this.expect(TokenType.NUMBER).value, 10);
                             }
-                        } else if (this.check(TokenType.NUMBER)) {
-                            // Just version, no url (use current file)
-                            from.version = parseInt(this.advance().value, 10);
                         }
                     }
                     this.expect(TokenType.RPAREN);
@@ -4680,13 +4690,6 @@ export class SQLParser {
             }
         } else {
             throw new Error('Expected table name, URL string, or read_lance() after FROM');
-        }
-
-        // Check for AT VERSION (time-travel) - legacy support
-        if (this.match(TokenType.AT)) {
-            this.expect(TokenType.VERSION);
-            const version = parseInt(this.expect(TokenType.NUMBER).value, 10);
-            from.version = version;
         }
 
         return from;

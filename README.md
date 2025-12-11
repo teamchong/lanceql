@@ -27,38 +27,36 @@ Default dataset: 1M LAION images with text embeddings at `https://data.metal0.de
 ## SQL Examples
 
 ```sql
--- Basic query (current loaded file)
-SELECT * FROM read_lance() LIMIT 50
+-- Local uploaded file
+SELECT * FROM read_lance(FILE) LIMIT 50
+SELECT * FROM read_lance(FILE, 24) LIMIT 50  -- with version
 
 -- Remote URL
 SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50
+SELECT * FROM read_lance('https://...', 24) LIMIT 50  -- with version
 
 -- Filter
-SELECT url, text, aesthetic FROM read_lance()
+SELECT url, text, aesthetic FROM read_lance(FILE)
 WHERE aesthetic > 0.5
 LIMIT 100
 
 -- Aggregations
-SELECT COUNT(*), AVG(aesthetic), MAX(aesthetic) FROM read_lance()
+SELECT COUNT(*), AVG(aesthetic), MAX(aesthetic) FROM read_lance(FILE)
 
 -- Vector search by text (TOPK optional, default 20)
-SELECT * FROM read_lance() NEAR 'sunset beach'
-SELECT * FROM read_lance() NEAR 'cat' TOPK 50
+SELECT * FROM read_lance(FILE) NEAR 'sunset beach'
+SELECT * FROM read_lance(FILE) NEAR 'cat' TOPK 50
 
 -- Vector search by row
-SELECT * FROM read_lance() NEAR 0 TOPK 10
+SELECT * FROM read_lance(FILE) NEAR 0 TOPK 10
 
 -- Specify vector column
-SELECT * FROM read_lance() NEAR embedding 'sunset'
+SELECT * FROM read_lance(FILE) NEAR embedding 'sunset'
 
 -- Combined with WHERE
-SELECT * FROM read_lance()
+SELECT * FROM read_lance(FILE)
 WHERE aesthetic > 0.5
 NEAR 'beach sunset' TOPK 30
-
--- Time travel (version as second arg)
-SELECT * FROM read_lance(24) LIMIT 50
-SELECT * FROM read_lance('https://...', 24) LIMIT 50
 ```
 
 ## DataFrame Examples
