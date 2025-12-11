@@ -3853,6 +3853,16 @@
             await runSqlQuery();
         });
 
+        // DataFrame inputs - Enter key triggers search
+        ['df-search-query', 'df-filter-value', 'df-limit'].forEach(id => {
+            document.getElementById(id).addEventListener('keypress', (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    runSqlQuery();
+                }
+            });
+        });
+
         // Share button - copy link to clipboard
         document.getElementById('copy-link-btn').addEventListener('click', async () => {
             const sql = document.getElementById('sql-input').value.trim();
