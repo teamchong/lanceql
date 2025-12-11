@@ -2231,7 +2231,7 @@
                     sql += ` COLUMN ${query.vectorColumn}`;
                 }
                 if (query.topK) {
-                    sql += ` TOP ${query.topK}`;
+                    sql += ` TOPK ${query.topK}`;
                 }
             } else if (query.search) {
                 sql += ` SEARCH '${query.search}'`;
@@ -2239,7 +2239,7 @@
                     sql += ` COLUMN ${query.vectorColumn}`;
                 }
                 if (query.topK) {
-                    sql += ` TOP ${query.topK}`;
+                    sql += ` TOPK ${query.topK}`;
                 }
             }
             if (query.limit && !query.searchRow && !query.search) {
@@ -2373,7 +2373,7 @@
             if (columnMatch) query.vectorColumn = columnMatch[1];
 
             // Extract TOP K
-            const topKMatch = sql.match(/TOP\s+(\d+)/i);
+            const topKMatch = sql.match(/TOPK\s+(\d+)/i);
             if (topKMatch) query.topK = parseInt(topKMatch[1]);
 
             return query;
