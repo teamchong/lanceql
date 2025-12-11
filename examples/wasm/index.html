@@ -1592,8 +1592,9 @@
         // Initial highlight
         updateSQLHighlight();
 
-        // SQL examples
+        // SQL examples (skip share button which has no data-sql)
         document.querySelectorAll('.sql-example').forEach(btn => {
+            if (!btn.dataset.sql) return; // Skip buttons without data-sql (like share button)
             btn.addEventListener('click', () => {
                 document.getElementById('sql-input').value = btn.dataset.sql;
                 updateSQLHighlight();
