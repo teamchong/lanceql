@@ -2180,8 +2180,7 @@
             code += `    dataset.df()\n`;
 
             if (searchQuery) {
-                const topK = limit || 20;
-                code += `    .search("${searchQuery}", encoder="${searchEncoder}", top_k=${topK})\n`;
+                code += `    .search("${searchQuery}", encoder="${searchEncoder}", top_k=20)\n`;
             }
 
             if (filterCol !== '') {
@@ -2197,8 +2196,7 @@
                 code += `    .select([${colNames}])\n`;
             }
 
-            // Only add .limit() if no search (search uses top_k)
-            if (limit && !searchQuery) {
+            if (limit) {
                 code += `    .limit(${limit})\n`;
             }
             code += `    .collect()\n`;
@@ -2306,8 +2304,7 @@
             if (query.select && query.select.length > 0) {
                 dfCode += `    .select([${query.select.map(c => `"${c}"`).join(', ')}])\n`;
             }
-            // Only add .limit() if no search (search uses top_k)
-            if (query.limit && !query.search && query.searchRow === undefined) {
+            if (query.limit) {
                 dfCode += `    .limit(${query.limit})\n`;
             }
             dfCode += `    .collect()\n`;
