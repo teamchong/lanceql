@@ -769,13 +769,15 @@
 
         /* Loading spinner */
         .spinner {
-            width: 20px;
-            height: 20px;
+            width: 16px;
+            height: 16px;
             border: 2px solid transparent;
             border-top-color: currentColor;
             border-radius: 50%;
             animation: spin 0.8s linear infinite;
             display: inline-block;
+            vertical-align: middle;
+            margin-right: 6px;
         }
         @keyframes spin {
             to { transform: rotate(360deg); }
@@ -1210,7 +1212,7 @@
                 <div class="divider">or load from URL</div>
                 <div class="url-input-group">
                     <input type="text" id="url-input" placeholder="Enter Lance file URL (requires CORS headers)">
-                    <button class="btn btn-primary" id="load-url-btn">Load URL</button>
+                    <button class="btn btn-primary" id="load-url-btn" :disabled="$store.app.isLoading">Load URL</button>
                 </div>
             </div>
             <div class="file-info"
@@ -1324,11 +1326,20 @@
                     <div class="dataset-hint" id="dataset-hint" style="display: none;"></div>
                 </div>
                 <div class="run-section">
-                    <button class="btn btn-primary" id="run-sql-btn" disabled title="⌘/Ctrl+Enter">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-                            <polygon points="5,3 19,12 5,21"/>
-                        </svg>
-                        Run Query
+                    <button class="btn btn-primary" id="run-sql-btn"
+                            :disabled="$store.app.isLoading"
+                            title="⌘/Ctrl+Enter">
+                        <template x-if="$store.app.isLoading">
+                            <span><span class="spinner"></span> Loading...</span>
+                        </template>
+                        <template x-if="!$store.app.isLoading">
+                            <span>
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                                    <polygon points="5,3 19,12 5,21"/>
+                                </svg>
+                                Run Query
+                            </span>
+                        </template>
                     </button>
                 </div>
             </div>
@@ -1381,11 +1392,20 @@
                     </div>
                 </div>
                 <div class="run-section">
-                    <button class="btn btn-primary" id="run-df-btn" disabled title="⌘/Ctrl+Enter">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-                            <polygon points="5,3 19,12 5,21"/>
-                        </svg>
-                        Execute
+                    <button class="btn btn-primary" id="run-df-btn"
+                            :disabled="$store.app.isLoading"
+                            title="⌘/Ctrl+Enter">
+                        <template x-if="$store.app.isLoading">
+                            <span><span class="spinner"></span> Loading...</span>
+                        </template>
+                        <template x-if="!$store.app.isLoading">
+                            <span>
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+                                    <polygon points="5,3 19,12 5,21"/>
+                                </svg>
+                                Execute
+                            </span>
+                        </template>
                     </button>
                 </div>
             </div>
@@ -1403,7 +1423,9 @@
                             <option value="">No vector columns</option>
                         </select>
                         <label>Query Row:</label>
-                        <input type="number" id="query-row" min="0" placeholder="Enter a row number">
+                        <input type="number" id="query-row" min="0" placeholder="Enter a row number"
+                               x-model="$store.app.queryRow"
+                               @input="$store.app.queryRow = $event.target.value">
                         <label>Top K:</label>
                         <input type="number" id="top-k" value="20" min="1" max="100">
                     </div>
@@ -1415,12 +1437,21 @@
                     </div>
                 </div>
                 <div class="run-section">
-                    <button class="btn btn-primary" id="run-vector-btn" disabled style="background: #7c3aed;">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <circle cx="11" cy="11" r="8"/>
-                            <line x1="21" y1="21" x2="16.65" y2="16.65"/>
-                        </svg>
-                        Search by Row
+                    <button class="btn btn-primary" id="run-vector-btn"
+                            :disabled="$store.app.isLoading || !$store.app.queryRow"
+                            style="background: #7c3aed;">
+                        <template x-if="$store.app.isLoading">
+                            <span><span class="spinner"></span> Searching...</span>
+                        </template>
+                        <template x-if="!$store.app.isLoading">
+                            <span>
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="11" cy="11" r="8"/>
+                                    <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                                </svg>
+                                Search by Row
+                            </span>
+                        </template>
                     </button>
                 </div>
 
@@ -1455,12 +1486,20 @@
                         <button class="clip-example" data-text="city">city</button>
                     </div>
                     <div class="run-section">
-                        <button class="btn btn-primary btn-clip-search" id="run-clip-btn">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <circle cx="11" cy="11" r="8"/>
-                                <line x1="21" y1="21" x2="16.65" y2="16.65"/>
-                            </svg>
-                            Search by Text
+                        <button class="btn btn-primary btn-clip-search" id="run-clip-btn"
+                                :disabled="$store.app.isLoading">
+                            <template x-if="$store.app.isLoading">
+                                <span><span class="spinner"></span> Searching...</span>
+                            </template>
+                            <template x-if="!$store.app.isLoading">
+                                <span>
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <circle cx="11" cy="11" r="8"/>
+                                        <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                                    </svg>
+                                    Search by Text
+                                </span>
+                            </template>
                         </button>
                     </div>
                 </div>
@@ -1579,6 +1618,8 @@
                 resultsCount: '',
                 resultsNotice: '',
                 resultsNoticeType: '',
+                isLoading: false,
+                queryRow: '',
                 formatBytes(bytes) {
                     if (bytes === 0) return '0 B';
                     const k = 1024;
@@ -2506,8 +2547,10 @@
                 // Clear query-row if no searchRow (don't persist row search when cleared)
                 if (query.searchRow !== undefined && query.searchRow !== null) {
                     document.getElementById('query-row').value = query.searchRow;
+                    Alpine.store('app').queryRow = String(query.searchRow);
                 } else {
                     document.getElementById('query-row').value = '';
+                    Alpine.store('app').queryRow = '';
                 }
                 // Update vector column dropdown if specified, reset if not
                 const vectorColSelect = document.getElementById('vector-col');
@@ -2800,25 +2843,7 @@
 
         // Set loading state for buttons
         function setLoading(isLoading) {
-            const sqlBtn = document.getElementById('run-sql-btn');
-            const dfBtn = document.getElementById('run-df-btn');
-            const urlBtn = document.getElementById('load-url-btn');
-            const clipBtn = document.getElementById('run-clip-btn');
-
-            sqlBtn.disabled = isLoading;
-            dfBtn.disabled = isLoading;
-            urlBtn.disabled = isLoading;
-            clipBtn.disabled = isLoading;
-
-            if (isLoading) {
-                sqlBtn.innerHTML = '<span class="spinner"></span> Loading...';
-                dfBtn.innerHTML = '<span class="spinner"></span> Loading...';
-                clipBtn.innerHTML = '<span class="spinner"></span> Searching...';
-            } else {
-                sqlBtn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg> Run Query`;
-                dfBtn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5,3 19,12 5,21"/></svg> Execute`;
-                clipBtn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> Search by Text`;
-            }
+            Alpine.store('app').isLoading = isLoading;
         }
 
         // Run SQL query
@@ -4033,6 +4058,7 @@
             const searchText = document.getElementById('clip-text-input').value.trim();
             if (searchText) {
                 document.getElementById('query-row').value = '';
+                Alpine.store('app').queryRow = '';
             }
             updateVectorSearchSync();
         });
@@ -4059,15 +4085,18 @@
         document.querySelectorAll('.search-example').forEach(btn => {
             btn.addEventListener('click', () => {
                 const row = btn.dataset.row;
+                let val;
                 if (row === 'random') {
                     // Generate random row
                     const totalRows = currentFile?._isRemote
                         ? currentFile._numColumns > 0 ? 100000 : 0  // Estimate for remote
                         : rowCount;
-                    document.getElementById('query-row').value = Math.floor(Math.random() * totalRows);
+                    val = Math.floor(Math.random() * totalRows);
                 } else {
-                    document.getElementById('query-row').value = row;
+                    val = row;
                 }
+                document.getElementById('query-row').value = val;
+                Alpine.store('app').queryRow = String(val);
             });
         });
 
@@ -4121,6 +4150,7 @@
             // Update the vector search UI and run search
             document.getElementById('vector-col').value = colIdx;
             document.getElementById('query-row').value = rowIdx;
+            Alpine.store('app').queryRow = String(rowIdx);
             // Clear text search since we're doing row-based search
             document.getElementById('clip-text-input').value = '';
             // Sync to SQL/DataFrame
@@ -4874,7 +4904,8 @@
         document.querySelectorAll('.clip-example').forEach(btn => {
             btn.addEventListener('click', () => {
                 document.getElementById('clip-text-input').value = btn.dataset.text;
-                document.getElementById('query-row').value = '';  // Clear row field
+                document.getElementById('query-row').value = '';
+                Alpine.store('app').queryRow = '';
                 updateVectorSearchSync();
                 runSqlQuery();
             });
