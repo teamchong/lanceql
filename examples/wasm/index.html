@@ -3890,6 +3890,7 @@
         dropZone.addEventListener('drop', async (e) => {
             e.preventDefault();
             dropZone.classList.remove('dragover');
+            urlInput.value = ''; // Clear URL when file dropped
             // Handle folder drop via DataTransferItemList
             if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
                 const item = e.dataTransfer.items[0];
@@ -3907,12 +3908,14 @@
         fileInputFolder.addEventListener('change', () => {
             // With webkitdirectory, files contains all files in the folder
             if (fileInputFolder.files && fileInputFolder.files.length > 0) {
+                urlInput.value = ''; // Clear URL when file selected
                 handleLanceFiles(Array.from(fileInputFolder.files));
             }
         });
         fileInputFile.addEventListener('change', () => {
             // Single file selection
             if (fileInputFile.files && fileInputFile.files.length > 0) {
+                urlInput.value = ''; // Clear URL when file selected
                 handleFile(fileInputFile.files[0]);
             }
         });
