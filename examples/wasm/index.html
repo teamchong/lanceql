@@ -2354,8 +2354,8 @@
                             break;
                         }
                     }
-                } else {
-                    vectorColSelect.selectedIndex = 0; // Reset to first option
+                } else if (vectorColSelect.options.length > 1) {
+                    vectorColSelect.selectedIndex = 1; // Auto-select first vector column
                 }
             }
 
