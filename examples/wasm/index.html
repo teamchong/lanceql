@@ -1514,8 +1514,8 @@
                 const sharedSql = hashParams.get('sql');
 
                 if (sharedSql) {
-                    // Use shared query from URL
-                    document.getElementById('sql-input').value = decodeURIComponent(sharedSql);
+                    // Use shared query from URL (URLSearchParams already decodes)
+                    document.getElementById('sql-input').value = sharedSql;
                     showStatus('Loaded shared query from URL', 'info');
                 } else {
                     // Use default query
