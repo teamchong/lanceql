@@ -194,20 +194,22 @@ export class RemoteLanceDataset {
   vectorSearch(colIdx: number, query: Float32Array, k: number): Promise<{ indices: number[]; scores: number[] }>;
 }
 
-/** Main LanceQL class */
-export class LanceQL {
-  /** WASM exports with Immer-style auto marshalling (strings/bytes auto-copied to WASM memory) */
-  readonly wasm: LanceQLWasm;
+/**
+ * LanceQL - Immer-style proxy with auto string/bytes marshalling
+ *
+ * Usage:
+ *   const lanceql = await LanceQL.load('./lanceql.wasm');
+ *   lanceql.someFunc("hello");       // strings auto-copied to WASM memory
+ *   lanceql.parseData(bytes);        // Uint8Array auto-copied too
+ *   lanceql.raw.someFunc(ptr, len);  // raw access when needed
+ */
+export interface LanceQL extends LanceQLWasm {
   /** Raw WASM exports without auto marshalling */
-  readonly _raw: LanceQLWasm;
+  readonly raw: LanceQLWasm;
+  /** WASM exports (backward compatibility, same as raw) */
+  readonly wasm: LanceQLWasm;
   /** WASM memory */
   readonly memory: WebAssembly.Memory;
-
-  /**
-   * Load LanceQL from WASM file
-   * @param wasmPath Path to lanceql.wasm file
-   */
-  static load(wasmPath?: string): Promise<LanceQL>;
 
   /** Get library version string (e.g., "0.1.0") */
   getVersion(): string;
@@ -227,5 +229,13 @@ export class LanceQL {
   /** Check if data is a valid Lance file */
   isValidLanceFile(data: ArrayBuffer): boolean;
 }
+
+export const LanceQL: {
+  /**
+   * Load LanceQL from WASM file
+   * @param wasmPath Path to lanceql.wasm file
+   */
+  load(wasmPath?: string): Promise<LanceQL>;
+};
 
 export default LanceQL;

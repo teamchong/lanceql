@@ -120,11 +120,12 @@ mem.set(encoder.encode(str), ptr);
 const result = wasm.someFunc(ptr, str.length);
 wasm.free(ptr);
 
-// Immer-style - auto marshalling via Proxy
+// Immer-style - auto marshalling via Proxy (like metal0)
 const lanceql = await LanceQL.load('./lanceql.wasm');
-lanceql.wasm.someFunc("hello");   // strings auto-copied to WASM memory
-lanceql.wasm.parseData(bytes);    // Uint8Array auto-copied too
-lanceql._raw.someFunc(ptr, len);  // raw access when needed
+lanceql.someFunc("hello");       // strings auto-copied to WASM memory
+lanceql.parseData(bytes);        // Uint8Array auto-copied too
+lanceql.raw.someFunc(ptr, len);  // raw access when needed
+lanceql.memory;                  // WASM memory
 ```
 
 **How it works:**

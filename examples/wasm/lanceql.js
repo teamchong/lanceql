@@ -175,16 +175,99 @@ export const wasmUtils = {
     getExports: () => _w,
 };
 
-export class LanceQL {
-    constructor(wasmProxy, rawExports, memory) {
-        this.wasm = wasmProxy;  // Immer-style proxy with auto marshalling
-        this._raw = rawExports; // Raw exports for direct access when needed
-        this.memory = memory;
-    }
+// LanceQL high-level methods (added to proxy)
+const _lanceqlMethods = {
+    /**
+     * Get the library version.
+     * @returns {string} Version string like "0.1.0"
+     */
+    getVersion() {
+        const v = _w.getVersion();
+        const major = (v >> 16) & 0xFF;
+        const minor = (v >> 8) & 0xFF;
+        const patch = v & 0xFF;
+        return `${major}.${minor}.${patch}`;
+    },
 
     /**
+     * Open a Lance file from an ArrayBuffer (local file).
+     * @param {ArrayBuffer} data - The Lance file data
+     * @returns {LanceFile}
+     */
+    open(data) {
+        return new LanceFile(this, data);
+    },
+
+    /**
+     * Open a Lance file from a URL using HTTP Range requests.
+     * @param {string} url - URL to the Lance file
+     * @returns {Promise<RemoteLanceFile>}
+     */
+    async openUrl(url) {
+        return await RemoteLanceFile.open(this, url);
+    },
+
+    /**
+     * Open a Lance dataset from a base URL using HTTP Range requests.
+     * @param {string} baseUrl - Base URL to the Lance dataset
+     * @param {object} [options] - Options for opening
+     * @param {number} [options.version] - Specific version to load
+     * @returns {Promise<RemoteLanceDataset>}
+     */
+    async openDataset(baseUrl, options = {}) {
+        return await RemoteLanceDataset.open(this, baseUrl, options);
+    },
+
+    /**
+     * Parse footer from Lance file data.
+     * @param {ArrayBuffer} data
+     * @returns {{numColumns: number, majorVersion: number, minorVersion: number} | null}
+     */
+    parseFooter(data) {
+        const bytes = new Uint8Array(data);
+        const ptr = _w.alloc(bytes.length);
+        if (!ptr) return null;
+
+        try {
+            new Uint8Array(_m.buffer).set(bytes, ptr);
+
+            const numColumns = _w.parseFooterGetColumns(ptr, bytes.length);
+            const majorVersion = _w.parseFooterGetMajorVersion(ptr, bytes.length);
+            const minorVersion = _w.parseFooterGetMinorVersion(ptr, bytes.length);
+
+            if (numColumns === 0 && majorVersion === 0) {
+                return null;
+            }
+
+            return { numColumns, majorVersion, minorVersion };
+        } finally {
+            _w.free(ptr, bytes.length);
+        }
+    },
+
+    /**
+     * Check if data is a valid Lance file.
+     * @param {ArrayBuffer} data
+     * @returns {boolean}
+     */
+    isValidLanceFile(data) {
+        const bytes = new Uint8Array(data);
+        const ptr = _w.alloc(bytes.length);
+        if (!ptr) return false;
+
+        try {
+            new Uint8Array(_m.buffer).set(bytes, ptr);
+            return _w.isValidLanceFile(ptr, bytes.length) === 1;
+        } finally {
+            _w.free(ptr, bytes.length);
+        }
+    }
+};
+
+export class LanceQL {
+    /**
      * Load LanceQL from a WASM file path or URL.
-     * Uses Immer-style proxy for auto string/bytes marshalling.
+     * Returns Immer-style proxy with auto string/bytes marshalling.
      * @param {string} wasmPath - Path to the lanceql.wasm file
      * @returns {Promise<LanceQL>}
      */
@@ -197,105 +280,22 @@ export class LanceQL {
         _m = _w.memory;
 
         // Create Immer-style proxy that auto-marshals string/bytes arguments
-        const proxy = new Proxy({}, {
+        // Also includes high-level LanceQL methods
+        return new Proxy({}, {
             get(_, n) {
+                // High-level LanceQL methods
+                if (n in _lanceqlMethods) return _lanceqlMethods[n].bind(_lanceqlMethods);
+                // Special properties
                 if (n === 'memory') return _m;
+                if (n === 'raw') return _w;  // Raw WASM exports
+                if (n === 'wasm') return _w; // Backward compatibility
+                // WASM functions with auto-marshalling
                 if (typeof _w[n] === 'function') {
                     return (...a) => _w[n](...a.flatMap(_x));
                 }
                 return _w[n];
             }
         });
-
-        return new LanceQL(proxy, _w, _m);
-    }
-
-    /**
-     * Get the library version.
-     * @returns {string} Version string like "0.1.0"
-     */
-    getVersion() {
-        const v = this.wasm.getVersion();
-        const major = (v >> 16) & 0xFF;
-        const minor = (v >> 8) & 0xFF;
-        const patch = v & 0xFF;
-        return `${major}.${minor}.${patch}`;
-    }
-
-    /**
-     * Open a Lance file from an ArrayBuffer (local file).
-     * @param {ArrayBuffer} data - The Lance file data
-     * @returns {LanceFile}
-     */
-    open(data) {
-        return new LanceFile(this, data);
-    }
-
-    /**
-     * Open a Lance file from a URL using HTTP Range requests.
-     * Only fetches metadata initially - column data is fetched on demand.
-     * @param {string} url - URL to the Lance file
-     * @returns {Promise<RemoteLanceFile>}
-     */
-    async openUrl(url) {
-        return await RemoteLanceFile.open(this, url);
-    }
-
-    /**
-     * Open a Lance dataset from a base URL using HTTP Range requests.
-     * Loads manifest to discover all fragments and enables parallel querying.
-     * @param {string} baseUrl - Base URL to the Lance dataset (e.g., https://host/dataset.lance)
-     * @param {object} [options] - Options for opening
-     * @param {number} [options.version] - Specific version to load (time-travel)
-     * @returns {Promise<RemoteLanceDataset>}
-     */
-    async openDataset(baseUrl, options = {}) {
-        return await RemoteLanceDataset.open(this, baseUrl, options);
-    }
-
-    /**
-     * Parse footer from Lance file data (without opening).
-     * @param {ArrayBuffer} data
-     * @returns {{numColumns: number, majorVersion: number, minorVersion: number} | null}
-     */
-    parseFooter(data) {
-        const bytes = new Uint8Array(data);
-        const ptr = this.wasm.alloc(bytes.length);
-        if (!ptr) return null;
-
-        try {
-            new Uint8Array(this.memory.buffer).set(bytes, ptr);
-
-            const numColumns = this.wasm.parseFooterGetColumns(ptr, bytes.length);
-            const majorVersion = this.wasm.parseFooterGetMajorVersion(ptr, bytes.length);
-            const minorVersion = this.wasm.parseFooterGetMinorVersion(ptr, bytes.length);
-
-            if (numColumns === 0 && majorVersion === 0) {
-                return null; // Invalid file
-            }
-
-            return { numColumns, majorVersion, minorVersion };
-        } finally {
-            this.wasm.free(ptr, bytes.length);
-        }
-    }
-
-    /**
-     * Check if data is a valid Lance file.
-     * @param {ArrayBuffer} data
-     * @returns {boolean}
-     */
-    isValid(data) {
-        const bytes = new Uint8Array(data);
-        const ptr = this.wasm.alloc(bytes.length);
-        if (!ptr) return false;
-
-        try {
-            new Uint8Array(this.memory.buffer).set(bytes, ptr);
-            return this.wasm.isValidLanceFile(ptr, bytes.length) === 1;
-        } finally {
-            this.wasm.free(ptr, bytes.length);
-        }
     }
 }
 
