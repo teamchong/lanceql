@@ -1507,22 +1507,45 @@
     </div>
 
     <script type="module">
+        import van from 'https://esm.sh/vanjs-core@1.5.2';
+        import { atom, computed } from 'https://esm.sh/nanostores@0.10.3';
         import LanceQL, { SQLExecutor, SQLLexer, SQLParser } from './lanceql.js';
 
         let lanceql;
+
+        // Nanostores state
+        const $currentFile = atom(null);
+        const $columnTypes = atom([]);
+        const $rowCount = atom(0);
+        const $totalBytesDownloaded = atom(0);
+        const $totalRequests = atom(0);
+        const $lastResult = atom(null);
+        const $infiniteScrollState = atom(null);
+        const $isLoadingMore = atom(false);
+
+        // Expose for debugging
+        window.$currentFile = $currentFile;
+
+        // Legacy getters/setters for gradual migration
         let currentFile = null;
-        window.currentFile = null; // Expose for debugging
         let columnTypes = [];
         let rowCount = 0;
         let totalBytesDownloaded = 0;
         let totalRequests = 0;
-
-        // Store last result for export
         let lastResult = null;
-
-        // Infinite scroll state
         let infiniteScrollState = null;
         let isLoadingMore = false;
+
+        // Sync atoms to legacy vars
+        $currentFile.subscribe(v => { currentFile = v; window.currentFile = v; });
+        $columnTypes.subscribe(v => { columnTypes = v; });
+        $rowCount.subscribe(v => { rowCount = v; });
+        $totalBytesDownloaded.subscribe(v => { totalBytesDownloaded = v; });
+        $totalRequests.subscribe(v => { totalRequests = v; });
+        $lastResult.subscribe(v => { lastResult = v; });
+        $infiniteScrollState.subscribe(v => { infiniteScrollState = v; });
+        $isLoadingMore.subscribe(v => { isLoadingMore = v; });
+
         const PAGE_SIZE = 50;
 
         // Default demo dataset URL - LAION 1M images dataset
@@ -1860,18 +1883,19 @@
             document.getElementById('url-input').value = '';
 
             if (currentFile) currentFile.close();
-            currentFile = lanceql.open(data);
-            currentFile.columnNames = columnNames; // Store column names from manifest
-            window.currentFile = currentFile;
-            columnTypes = [];
+            const newFile = lanceql.open(data);
+            newFile.columnNames = columnNames; // Store column names from manifest
+            $currentFile.set(newFile);
+            $columnTypes.set([]);
 
             // Get row count from first column
             const debug = currentFile.getColumnDebugInfo(0);
-            rowCount = Number(debug.rows);
+            $rowCount.set(Number(debug.rows));
 
             // Detect column types
             // Check vector FIRST since vectors can also be read as numeric arrays
             console.log('Detecting column types for', currentFile.numColumns, 'columns');
+            const detectedTypes = [];
             for (let i = 0; i < currentFile.numColumns; i++) {
                 let type = 'unknown';
                 // Check vector first - dimension > 2 indicates a real vector column
@@ -1901,8 +1925,9 @@
                     } catch (e) { console.log('Column', i, 'not float64:', e.message); }
                 }
                 console.log('Column', i, 'detected as:', type);
-                columnTypes[i] = type;
+                detectedTypes[i] = type;
             }
+            $columnTypes.set(detectedTypes);
 
             // Update UI
             document.getElementById('file-info').classList.remove('hidden');
@@ -2075,8 +2100,8 @@
 
         // Network stats functions
         function updateNetworkStats(bytes, requests) {
-            totalBytesDownloaded += bytes;
-            totalRequests += requests;
+            $totalBytesDownloaded.set($totalBytesDownloaded.get() + bytes);
+            $totalRequests.set($totalRequests.get() + requests);
 
             const statsEl = document.getElementById('network-stats');
             statsEl.classList.remove('hidden');
@@ -2085,8 +2110,8 @@
         }
 
         function resetNetworkStats() {
-            totalBytesDownloaded = 0;
-            totalRequests = 0;
+            $totalBytesDownloaded.set(0);
+            $totalRequests.set(0);
             document.getElementById('bytes-downloaded').textContent = '0 KB';
             document.getElementById('request-count').textContent = '0';
         }
@@ -2781,9 +2806,8 @@
 
                     // Update UI to show the loaded file
                     if (currentFile && currentFile.close) currentFile.close();
-                    currentFile = remoteFile;
-                    window.currentFile = currentFile;
-                    currentFile._isRemote = true;
+                    remoteFile._isRemote = true;
+                    $currentFile.set(remoteFile);
                     currentFile._url = url;
                     currentFile._isDataset = url.endsWith('.lance') && !url.includes('/data/');
 
@@ -2792,8 +2816,8 @@
                         updateNetworkStats(bytes, requests);
                     });
 
-                    columnTypes = [];
-                    rowCount = currentFile._isDataset ? currentFile.rowCount : 0;
+                    $columnTypes.set([]);
+                    $rowCount.set(currentFile._isDataset ? currentFile.rowCount : 0);
 
                     // Update UI
                     document.getElementById('file-info').classList.remove('hidden');
@@ -2811,7 +2835,7 @@
 
                     // Detect column types
                     try {
-                        columnTypes = await currentFile.detectColumnTypes();
+                        $columnTypes.set(await currentFile.detectColumnTypes());
                         showColumnChips();
                     } catch (e) {
                         console.warn('Could not detect column types:', e);
@@ -3250,9 +3274,9 @@
         function displayResults(result, append = false) {
             // Store result for export (merge if appending)
             if (append && lastResult) {
-                lastResult.rows = [...lastResult.rows, ...result.rows];
+                $lastResult.set({ ...lastResult, rows: [...lastResult.rows, ...result.rows] });
             } else {
-                lastResult = { columns: result.columns, rows: [...result.rows] };
+                $lastResult.set({ columns: result.columns, rows: [...result.rows] });
             }
 
             const body = document.getElementById('results-body');
@@ -3288,7 +3312,7 @@
             }
 
             if (result.rows.length === 0 && !append) {
-                infiniteScrollState = null;
+                $infiniteScrollState.set(null);
                 body.innerHTML = `
                     <div class="empty-state">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -3384,12 +3408,12 @@
             body.innerHTML = html;
 
             // Store state for infinite scroll
-            infiniteScrollState = {
+            $infiniteScrollState.set({
                 columns: result.columns,
                 total: result.total,
                 loadedCount: result.rows.length,
                 nextOffset: result.rows.length
-            };
+            });
         }
 
         // Load more rows for infinite scroll
@@ -3398,7 +3422,7 @@
             if (isLoadingMore) return;
             if (infiniteScrollState.loadedCount >= infiniteScrollState.total) return;
 
-            isLoadingMore = true;
+            $isLoadingMore.set(true);
             const loader = document.getElementById('scroll-loader');
             if (loader) loader.style.display = 'flex';
 
@@ -3408,7 +3432,7 @@
                     .filter(i => i < infiniteScrollState.total);
 
                 if (indices.length === 0) {
-                    isLoadingMore = false;
+                    $isLoadingMore.set(false);
                     if (loader) loader.style.display = 'none';
                     return;
                 }
@@ -3533,7 +3557,7 @@
             } catch (err) {
                 console.error('Error loading more rows:', err);
             } finally {
-                isLoadingMore = false;
+                $isLoadingMore.set(false);
                 const loader = document.getElementById('scroll-loader');
                 if (loader) loader.style.display = 'none';
             }
@@ -3590,19 +3614,18 @@
 
                 // Store as current file with remote flag
                 if (currentFile && currentFile.close) currentFile.close();
-                currentFile = remoteFile;
-                window.currentFile = currentFile;
-                currentFile._isRemote = true;
-                currentFile._url = url;
-                currentFile._isDataset = isDataset;
+                remoteFile._isRemote = true;
+                remoteFile._url = url;
+                remoteFile._isDataset = isDataset;
+                $currentFile.set(remoteFile);
 
                 // Set up network stats callback
                 currentFile.onFetch((bytes, requests) => {
                     updateNetworkStats(bytes, requests);
                 });
 
-                columnTypes = [];
-                rowCount = isDataset ? remoteFile.rowCount : 0;
+                $columnTypes.set([]);
+                $rowCount.set(isDataset ? remoteFile.rowCount : 0);
 
                 // Clear cached column types to force re-detection
                 if (remoteFile._columnTypes) {
@@ -3627,10 +3650,10 @@
                 // Detect column types
                 showStatus('Detecting column types...', 'info');
                 try {
-                    columnTypes = await remoteFile.detectColumnTypes();
+                    $columnTypes.set(await remoteFile.detectColumnTypes());
                     showColumnChips();
                 } catch (e) {
-                    columnTypes = Array(remoteFile.numColumns).fill('unknown');
+                    $columnTypes.set(Array(remoteFile.numColumns).fill('unknown'));
                 }
 
                 // Populate vector columns for vector search
