@@ -1895,7 +1895,8 @@
             document.getElementById('results-section').style.display = 'block';
 
             showStatus('Loaded successfully - ' + currentFile.numColumns + ' columns, ' + rowCount.toLocaleString() + ' rows', 'success');
-            updateDfPreview();
+            // Update DataFrame preview but don't sync to SQL (preserve user's SQL)
+            updateDfPreview(true);
 
             // Show column chips
             showColumnChips();
@@ -2467,7 +2468,7 @@
             return html;
         }
 
-        function updateDfPreview() {
+        function updateDfPreview(skipSync = false) {
             const textarea = document.getElementById('df-input');
             const highlight = document.getElementById('df-highlight');
 
@@ -2483,6 +2484,9 @@
 
             // Always update highlighting to match current textarea content
             highlight.innerHTML = highlightDfCode(textarea.value) + '\n';
+
+            // Skip sync if requested (e.g., on initial load to preserve SQL from URL hash)
+            if (skipSync) return;
 
             // Sync SQL and URL hash with current DataFrame builder state
             const searchQuery = document.getElementById('df-search-query').value.trim();
@@ -2502,7 +2506,7 @@
 
             const query = {
                 url: currentFile?._url,
-                version: currentFile?.version,
+                // Don't auto-include version - only if user explicitly sets it
                 search: searchQuery || null,
                 encoder: searchEncoder,
                 limit: limit ? parseInt(limit) : null,
