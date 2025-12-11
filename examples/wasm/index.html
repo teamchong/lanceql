@@ -4586,14 +4586,21 @@
             // Determine which columns to display (SELECT clause)
             let displayColIndices = [];
             let displayColNames = [];
-            const isSelectAll = ast.columns.length === 1 && ast.columns[0].type === 'star';
+            const isSelectAll = ast.columns.length === 1 && (ast.columns[0].type === 'star' || (ast.columns[0].type === 'expr' && ast.columns[0].expr?.type === 'star'));
             if (isSelectAll) {
                 displayColIndices = colNames.map((_, i) => i);
                 displayColNames = colNames;
             } else {
                 for (const col of ast.columns) {
-                    // Handle both 'column' type and 'identifier' type
-                    const colName = col.type === 'column' ? col.name : (col.type === 'identifier' ? col.value : col.name);
+                    // Handle wrapped expr type: { type: 'expr', expr: { type: 'column', name: 'width' } }
+                    let colName = null;
+                    if (col.type === 'expr' && col.expr?.type === 'column') {
+                        colName = col.expr.name;
+                    } else if (col.type === 'column') {
+                        colName = col.name;
+                    } else if (col.type === 'identifier') {
+                        colName = col.value;
+                    }
                     if (colName) {
                         const idx = colNames.findIndex(n => n.toLowerCase() === colName.toLowerCase());
                         if (idx >= 0) {
