@@ -1436,24 +1436,6 @@
                         <button class="search-example" data-row="random">Random</button>
                     </div>
                 </div>
-                <div class="run-section">
-                    <button class="btn btn-primary" id="run-vector-btn"
-                            :disabled="$store.app.isLoading || !$store.app.queryRow"
-                            style="background: #7c3aed;">
-                        <template x-if="$store.app.isLoading">
-                            <span><span class="spinner"></span> Searching...</span>
-                        </template>
-                        <template x-if="!$store.app.isLoading">
-                            <span>
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                    <circle cx="11" cy="11" r="8"/>
-                                    <line x1="21" y1="21" x2="16.65" y2="16.65"/>
-                                </svg>
-                                Search by Row
-                            </span>
-                        </template>
-                    </button>
-                </div>
 
                 <!-- Text Search Section -->
                 <div class="clip-section" id="clip-section">
@@ -1475,7 +1457,9 @@
                         </div>
                     </div>
                     <div class="clip-text-input">
-                        <input type="text" id="clip-text-input" placeholder="Search for text... (e.g., 'cat', 'sunset beach')">
+                        <input type="text" id="clip-text-input" placeholder="Search for text... (e.g., 'cat', 'sunset beach')"
+                               x-model="$store.app.searchText"
+                               @input="$store.app.searchText = $event.target.value">
                     </div>
                     <div class="clip-examples">
                         <button class="clip-example" data-text="car">car</button>
@@ -1485,23 +1469,25 @@
                         <button class="clip-example" data-text="food">food</button>
                         <button class="clip-example" data-text="city">city</button>
                     </div>
-                    <div class="run-section">
-                        <button class="btn btn-primary btn-clip-search" id="run-clip-btn"
-                                :disabled="$store.app.isLoading">
-                            <template x-if="$store.app.isLoading">
-                                <span><span class="spinner"></span> Searching...</span>
-                            </template>
-                            <template x-if="!$store.app.isLoading">
-                                <span>
-                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                        <circle cx="11" cy="11" r="8"/>
-                                        <line x1="21" y1="21" x2="16.65" y2="16.65"/>
-                                    </svg>
-                                    Search by Text
-                                </span>
-                            </template>
-                        </button>
-                    </div>
+                </div>
+
+                <div class="run-section">
+                    <button class="btn btn-primary" id="run-vector-btn"
+                            :disabled="$store.app.isLoading || (!$store.app.queryRow && !$store.app.searchText)"
+                            style="background: #7c3aed;">
+                        <template x-if="$store.app.isLoading">
+                            <span><span class="spinner"></span> Searching...</span>
+                        </template>
+                        <template x-if="!$store.app.isLoading">
+                            <span>
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <circle cx="11" cy="11" r="8"/>
+                                    <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                                </svg>
+                                Search
+                            </span>
+                        </template>
+                    </button>
                 </div>
             </div>
 
@@ -1636,6 +1622,7 @@
                 resultsNoticeType: '',
                 isLoading: false,
                 queryRow: '',
+                searchText: '',
                 formatBytes(bytes) {
                     if (bytes === 0) return '0 B';
                     const k = 1024;
@@ -2554,6 +2541,7 @@
             // Update Vector Search tab (if not source)
             if (source !== 'vector') {
                 document.getElementById('clip-text-input').value = query.search || '';
+                Alpine.store('app').searchText = query.search || '';
                 if (query.encoder) {
                     document.getElementById('clip-model-select').value = query.encoder;
                 }
@@ -4081,6 +4069,7 @@
         // Text search clears query row when changed
         document.getElementById('clip-text-input').addEventListener('input', () => {
             const searchText = document.getElementById('clip-text-input').value.trim();
+            Alpine.store('app').searchText = searchText;
             if (searchText) {
                 document.getElementById('query-row').value = '';
                 Alpine.store('app').queryRow = '';
@@ -4093,6 +4082,7 @@
             const queryRowVal = document.getElementById('query-row').value;
             if (queryRowVal !== '') {
                 document.getElementById('clip-text-input').value = '';
+                Alpine.store('app').searchText = '';
             }
             updateVectorSearchSync();
         });
@@ -4178,6 +4168,7 @@
             Alpine.store('app').queryRow = String(rowIdx);
             // Clear text search since we're doing row-based search
             document.getElementById('clip-text-input').value = '';
+            Alpine.store('app').searchText = '';
             // Sync to SQL/DataFrame
             updateVectorSearchSync();
 
@@ -4926,18 +4917,18 @@
             return new Float32Array(wasm.memory.buffer, outputBuf, outputDim).slice();
         }
 
-        // CLIP event listeners
-        document.getElementById('run-clip-btn').addEventListener('click', runClipSearch);
-
+        // Text search Enter key triggers unified search
         document.getElementById('clip-text-input').addEventListener('keypress', (e) => {
             if (e.key === 'Enter') {
-                runClipSearch();
+                updateVectorSearchSync();
+                runSqlQuery();
             }
         });
 
         document.querySelectorAll('.clip-example').forEach(btn => {
             btn.addEventListener('click', () => {
                 document.getElementById('clip-text-input').value = btn.dataset.text;
+                Alpine.store('app').searchText = btn.dataset.text;
                 document.getElementById('query-row').value = '';
                 Alpine.store('app').queryRow = '';
                 updateVectorSearchSync();
