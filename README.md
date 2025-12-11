@@ -122,8 +122,9 @@ wasm.free(ptr);
 
 // Immer-style - auto marshalling via Proxy
 const lanceql = await LanceQL.load('./lanceql.wasm');
-lanceql._proxy.someFunc("hello");  // strings auto-copied to WASM memory
-lanceql._proxy.parseData(bytes);   // Uint8Array auto-copied too
+lanceql.wasm.someFunc("hello");   // strings auto-copied to WASM memory
+lanceql.wasm.parseData(bytes);    // Uint8Array auto-copied too
+lanceql._raw.someFunc(ptr, len);  // raw access when needed
 ```
 
 **How it works:**
