@@ -3956,9 +3956,9 @@
             const data = result.rows.map(row => {
                 const obj = {};
                 result.columns.forEach((col, i) => {
-                    // Convert BigInt to Number for JSON serialization
+                    // Convert BigInt to String for JSON serialization (Number can overflow)
                     const val = row[i];
-                    obj[col] = typeof val === 'bigint' ? Number(val) : val;
+                    obj[col] = typeof val === 'bigint' ? String(val) : val;
                 });
                 return obj;
             });
