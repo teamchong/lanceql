@@ -2531,6 +2531,28 @@
                     document.getElementById('df-filter-value').value = '';
                     filterColEl.removeAttribute('data-pending-column');
                 }
+
+                // Update selected columns
+                const selectColsEl = document.getElementById('df-select-cols');
+                if (query.select && query.select.length > 0) {
+                    // Store pending selection for when options load
+                    selectColsEl.setAttribute('data-pending-columns', JSON.stringify(query.select));
+                    // Try to apply now if options exist
+                    const colNames = currentFile?.columnNames || [];
+                    if (selectColsEl.options.length > 0) {
+                        for (let opt of selectColsEl.options) {
+                            const optColName = opt.text;
+                            opt.selected = query.select.some(c => c.toLowerCase() === optColName.toLowerCase());
+                        }
+                        selectColsEl.removeAttribute('data-pending-columns');
+                    }
+                } else {
+                    // Select all columns (no specific selection = *)
+                    selectColsEl.removeAttribute('data-pending-columns');
+                    for (let opt of selectColsEl.options) {
+                        opt.selected = true;
+                    }
+                }
             }
 
             // Update Vector Search tab (if not source)
@@ -2965,8 +2987,8 @@
                         if (type !== 'string' && type !== 'vector') {
                             filterCol.innerHTML += `<option value="${i}">${name} (${type})</option>`;
                         }
-                        // Preserve selection if column name matches, default to all if no previous selection
-                        const isSelected = prevSelectedCols.length === 0 || prevSelectedCols.includes(name);
+                        // Preserve selection if column name matches (case-insensitive), default to all if no previous selection
+                        const isSelected = prevSelectedCols.length === 0 || prevSelectedCols.some(c => c.toLowerCase() === name.toLowerCase());
                         selectCols.innerHTML += `<option value="${i}" ${isSelected ? 'selected' : ''}>${name}</option>`;
                     }
 
