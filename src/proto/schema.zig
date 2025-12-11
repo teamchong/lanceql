@@ -1,7 +1,7 @@
 //! Lance schema protobuf parser.
 //!
 //! Based on Lance file.proto:
-//! https://github.com/lancedb/lance/blob/main/protos/file.proto
+//! https://github.com/lance-format/lance/blob/main/protos/file.proto
 
 const std = @import("std");
 const decoder = @import("decoder.zig");

@@ -196,4 +196,4 @@ python generate_sidecar.py /path/to/dataset.lance
 
 ## License
 
-Apache-2.0 (same as [Lance](https://github.com/lancedb/lance))
+Apache-2.0 (same as [Lance](https://github.com/lance-format/lance))
