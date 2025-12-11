@@ -4185,13 +4185,20 @@
         });
 
         // DataFrame preview updates
-        ['df-search-query', 'df-search-encoder', 'df-filter-col', 'df-filter-op', 'df-filter-value', 'df-select-cols', 'df-limit'].forEach(id => {
+        ['df-search-query', 'df-search-encoder', 'df-filter-col', 'df-filter-op', 'df-filter-value', 'df-limit'].forEach(id => {
             const el = document.getElementById(id);
             if (el) {
                 el.addEventListener('change', updateDfPreview);
                 el.addEventListener('input', updateDfPreview);
             }
         });
+        // Multi-select needs mouseup/keyup to catch selection changes
+        const dfSelectCols = document.getElementById('df-select-cols');
+        if (dfSelectCols) {
+            dfSelectCols.addEventListener('change', updateDfPreview);
+            dfSelectCols.addEventListener('mouseup', updateDfPreview);
+            dfSelectCols.addEventListener('keyup', updateDfPreview);
+        }
 
         // Vector Search
         document.getElementById('run-vector-btn').addEventListener('click', runVectorSearch);
