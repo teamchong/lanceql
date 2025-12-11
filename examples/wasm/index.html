@@ -1879,6 +1879,7 @@
             // Populate DataFrame builder selects
             const filterCol = document.getElementById('df-filter-col');
             const selectCols = document.getElementById('df-select-cols');
+
             filterCol.innerHTML = '<option value="">No filter</option>';
             selectCols.innerHTML = '';
 
@@ -1891,6 +1892,16 @@
                     filterCol.innerHTML += `<option value="${i}">${name} (${type})</option>`;
                 }
                 selectCols.innerHTML += `<option value="${i}" selected>${name}</option>`;
+            }
+
+            // Apply pending column value now that options exist (read from data attribute)
+            const pendingColumn = filterCol.getAttribute('data-pending-column');
+            if (pendingColumn) {
+                const colIdx = colNames.findIndex(n => n.toLowerCase() === pendingColumn.toLowerCase());
+                if (colIdx >= 0) {
+                    filterCol.value = colIdx;
+                }
+                filterCol.removeAttribute('data-pending-column');
             }
 
             // Populate vector column dropdown for local files
@@ -1916,20 +1927,6 @@
             showStatus('Loaded successfully - ' + currentFile.numColumns + ' columns, ' + rowCount.toLocaleString() + ' rows', 'success');
             // Update DataFrame preview but don't sync to SQL (preserve user's SQL)
             updateDfPreview(true);
-
-            // Now that filter columns are populated, sync filter from SQL WHERE clause
-            const sql = document.getElementById('sql-input').value.trim();
-            if (sql) {
-                const query = sqlToQuery(sql);
-                if (query.filter) {
-                    const colIdx = colNames.findIndex(n => n === query.filter.column);
-                    if (colIdx >= 0) {
-                        document.getElementById('df-filter-col').value = colIdx;
-                    }
-                    document.getElementById('df-filter-op').value = query.filter.op;
-                    document.getElementById('df-filter-value').value = query.filter.value;
-                }
-            }
 
             // Show column chips
             showColumnChips();
@@ -2355,19 +2352,25 @@
                 } else {
                     document.getElementById('df-limit').value = '';
                 }
-                // Update filter fields
+                // Update filter fields - store pending column in data attribute if options not loaded yet
+                const filterColEl = document.getElementById('df-filter-col');
                 if (query.filter) {
-                    const colNames = currentFile?.columnNames || [];
-                    const colIdx = colNames.findIndex(n => n === query.filter.column);
-                    if (colIdx >= 0) {
-                        document.getElementById('df-filter-col').value = colIdx;
-                    }
+                    // Always set op and value immediately (they don't depend on column options)
                     document.getElementById('df-filter-op').value = query.filter.op;
                     document.getElementById('df-filter-value').value = query.filter.value;
+                    // For column: store in data attribute for later, try to apply now if options exist
+                    filterColEl.setAttribute('data-pending-column', query.filter.column);
+                    const colNames = currentFile?.columnNames || [];
+                    const colIdx = colNames.findIndex(n => n.toLowerCase() === query.filter.column.toLowerCase());
+                    if (colIdx >= 0 && filterColEl.querySelector(`option[value="${colIdx}"]`)) {
+                        filterColEl.value = colIdx;
+                        filterColEl.removeAttribute('data-pending-column');
+                    }
                 } else {
-                    document.getElementById('df-filter-col').value = '';
+                    filterColEl.value = '';
                     document.getElementById('df-filter-op').value = '>';
                     document.getElementById('df-filter-value').value = '';
+                    filterColEl.removeAttribute('data-pending-column');
                 }
             }
 
@@ -2793,6 +2796,16 @@
                             filterCol.innerHTML += `<option value="${i}">${name} (${type})</option>`;
                         }
                         selectCols.innerHTML += `<option value="${i}" selected>${name}</option>`;
+                    }
+
+                    // Apply pending column value now that options exist
+                    const pendingColumn = filterCol.getAttribute('data-pending-column');
+                    if (pendingColumn) {
+                        const colIdx = colNames.findIndex(n => n.toLowerCase() === pendingColumn.toLowerCase());
+                        if (colIdx >= 0) {
+                            filterCol.value = colIdx;
+                        }
+                        filterCol.removeAttribute('data-pending-column');
                     }
 
                     // Populate vector column dropdown
@@ -3582,6 +3595,7 @@
                 // Populate DataFrame builder selects with type info
                 const filterCol = document.getElementById('df-filter-col');
                 const selectCols = document.getElementById('df-select-cols');
+
                 filterCol.innerHTML = '<option value="">No filter</option>';
                 selectCols.innerHTML = '';
 
@@ -3598,6 +3612,16 @@
                     selectCols.innerHTML += `<option value="${i}" selected>${name}</option>`;
                 }
 
+                // Apply pending column value now that options exist (read from data attribute)
+                const pendingColumn = filterCol.getAttribute('data-pending-column');
+                if (pendingColumn) {
+                    const colIdx = colNames.findIndex(n => n.toLowerCase() === pendingColumn.toLowerCase());
+                    if (colIdx >= 0) {
+                        filterCol.value = colIdx;
+                    }
+                    filterCol.removeAttribute('data-pending-column');
+                }
+
                 // Show results section
                 document.getElementById('results-section').style.display = 'block';
 
@@ -3608,22 +3632,9 @@
                     ? `Dataset loaded! ${remoteFile.numColumns} columns, ${rowCount.toLocaleString()} rows across ${remoteFile.fragments.length} fragments (parallel Range requests)`
                     : `Connected! ${remoteFile.numColumns} columns, ${(remoteFile.size / 1024 / 1024).toFixed(1)}MB file (lazy loading via Range requests)`;
                 showStatus(statusMsg, 'success');
+
                 // Update DataFrame preview (skip sync to preserve SQL)
                 updateDfPreview(true);
-
-                // Now that filter columns are populated, sync filter from SQL WHERE clause
-                const sql = document.getElementById('sql-input').value.trim();
-                if (sql) {
-                    const query = sqlToQuery(sql);
-                    if (query.filter) {
-                        const filterColIdx = colNames.findIndex(n => n === query.filter.column);
-                        if (filterColIdx >= 0) {
-                            document.getElementById('df-filter-col').value = filterColIdx;
-                        }
-                        document.getElementById('df-filter-op').value = query.filter.op;
-                        document.getElementById('df-filter-value').value = query.filter.value;
-                    }
-                }
 
                 // Show dataset hint for default dataset
                 const hintEl = document.getElementById('dataset-hint');
