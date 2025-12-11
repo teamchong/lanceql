@@ -3079,6 +3079,11 @@
                 });
 
                 // Format the result for display
+                console.log('Raw result from SQLExecutor:', {
+                    columns: result.columns,
+                    firstRow: result.rows[0],
+                    rowCount: result.rows.length
+                });
                 const formattedResult = {
                     columns: result.columns,
                     rows: result.rows.map(row => row.map(cell => {
