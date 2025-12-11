@@ -4162,6 +4162,9 @@
                 }
                 document.getElementById('query-row').value = val;
                 Alpine.store('app').queryRow = String(val);
+                // Clear text search since we're doing row-based search
+                document.getElementById('clip-text-input').value = '';
+                Alpine.store('app').searchText = '';
             });
         });
 
