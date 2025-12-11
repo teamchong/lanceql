@@ -4272,7 +4272,9 @@
             const encoder = document.getElementById('clip-model-select').value;
             const topK = document.getElementById('top-k').value;
             const vectorColSelect = document.getElementById('vector-col');
-            const vectorCol = vectorColSelect.selectedOptions[0]?.text || null;
+            const vectorColText = vectorColSelect.selectedOptions[0]?.text || null;
+            // Extract just the column name (before the parenthesis)
+            const vectorCol = vectorColText ? vectorColText.split(' (')[0] : null;
             // Don't include query-row if there's text search
             const queryRowVal = document.getElementById('query-row').value;
             // Preserve limit from DataFrame
@@ -4297,8 +4299,26 @@
             syncQueryTabs(query, 'vector');
         }
 
-        // Add event listeners for Vector Search fields
-        ['clip-text-input', 'clip-model-select', 'top-k', 'vector-col', 'query-row'].forEach(id => {
+        // Text search clears query row when changed
+        document.getElementById('clip-text-input').addEventListener('input', () => {
+            const searchText = document.getElementById('clip-text-input').value.trim();
+            if (searchText) {
+                document.getElementById('query-row').value = '';
+            }
+            updateVectorSearchSync();
+        });
+
+        // Query row clears text search when changed
+        document.getElementById('query-row').addEventListener('input', () => {
+            const queryRowVal = document.getElementById('query-row').value;
+            if (queryRowVal !== '') {
+                document.getElementById('clip-text-input').value = '';
+            }
+            updateVectorSearchSync();
+        });
+
+        // Add event listeners for other Vector Search fields
+        ['clip-model-select', 'top-k', 'vector-col'].forEach(id => {
             const el = document.getElementById(id);
             if (el) {
                 el.addEventListener('change', updateVectorSearchSync);
