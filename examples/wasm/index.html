@@ -2485,6 +2485,8 @@
             const selectedColumns = selectedColumnIndices.map(idx =>
                 currentFile?.columnNames?.[parseInt(idx)] || `col_${idx}`
             );
+            // Only include select if NOT all columns selected (otherwise use *)
+            const allSelected = selectedColumnIndices.length >= (currentFile?.numColumns || 0);
 
             const query = {
                 url: currentFile?._url,
@@ -2492,7 +2494,7 @@
                 search: searchQuery || null,
                 encoder: searchEncoder,
                 limit: limit ? parseInt(limit) : null,
-                select: selectedColumns.length > 0 ? selectedColumns : null
+                select: (!allSelected && selectedColumns.length > 0) ? selectedColumns : null
             };
 
             // Add filter if specified
