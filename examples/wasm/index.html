@@ -1207,7 +1207,9 @@
                     <button class="btn btn-primary" id="load-url-btn">Load URL</button>
                 </div>
             </div>
-            <div class="file-info hidden" id="file-info">
+            <div class="file-info"
+                 :class="{ 'hidden': !$store.app.fileName }"
+                 id="file-info">
                 <div class="file-icon">
                     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
@@ -1215,16 +1217,16 @@
                     </svg>
                 </div>
                 <div class="file-details">
-                    <h3 id="file-name">filename.lance</h3>
-                    <p id="file-size">0 KB</p>
+                    <h3 x-text="$store.app.fileName" id="file-name">filename.lance</h3>
+                    <p x-text="$store.app.fileSize" id="file-size">0 KB</p>
                 </div>
                 <div class="file-stats">
                     <div class="stat">
-                        <div class="stat-value" id="col-count">0</div>
+                        <div class="stat-value" x-text="$store.app.colCount" id="col-count">0</div>
                         <div class="stat-label">Columns</div>
                     </div>
                     <div class="stat">
-                        <div class="stat-value" id="row-count">0</div>
+                        <div class="stat-value" x-text="$store.app.rowCount" id="row-count">0</div>
                         <div class="stat-label">Rows</div>
                     </div>
                 </div>
@@ -1553,6 +1555,11 @@
             Alpine.store('app', {
                 bytesDownloaded: 0,
                 requests: 0,
+                file: null,
+                fileName: '',
+                fileSize: '',
+                colCount: 0,
+                rowCount: '',
                 formatBytes(bytes) {
                     if (bytes === 0) return '0 B';
                     const k = 1024;
@@ -1565,6 +1572,8 @@
             // Sync Nanostores → Alpine store
             $totalBytesDownloaded.subscribe(v => Alpine.store('app').bytesDownloaded = v);
             $totalRequests.subscribe(v => Alpine.store('app').requests = v);
+            $currentFile.subscribe(v => Alpine.store('app').file = v);
+            $rowCount.subscribe(v => Alpine.store('app').rowCount = v ? v.toLocaleString() : '0');
         });
 
         // Start Alpine
@@ -1953,13 +1962,11 @@
             }
             $columnTypes.set(detectedTypes);
 
-            // Update UI
-            document.getElementById('file-info').classList.remove('hidden');
+            // Update UI via Alpine store
+            Alpine.store('app').fileName = filename;
+            Alpine.store('app').fileSize = (data.byteLength / 1024).toFixed(2) + ' KB';
+            Alpine.store('app').colCount = currentFile.numColumns;
             collapseFileLoader();
-            document.getElementById('file-name').textContent = filename;
-            document.getElementById('file-size').textContent = (data.byteLength / 1024).toFixed(2) + ' KB';
-            document.getElementById('col-count').textContent = currentFile.numColumns;
-            document.getElementById('row-count').textContent = rowCount.toLocaleString();
 
             // Show query section
             document.getElementById('query-section').style.display = 'block';
@@ -2836,19 +2843,17 @@
                     $columnTypes.set([]);
                     $rowCount.set(currentFile._isDataset ? currentFile.rowCount : 0);
 
-                    // Update UI
-                    document.getElementById('file-info').classList.remove('hidden');
-                    collapseFileLoader();
+                    // Update UI via Alpine store
                     const displayName = url.split('/').pop() || 'remote.lance';
                     const versionSuffix = currentFile.version ? ` v${currentFile.version}` : '';
-                    document.getElementById('file-name').textContent = displayName + (currentFile._isDataset ? ` (dataset${versionSuffix})` : '');
-                    document.getElementById('file-size').textContent = (currentFile.size / 1024 / 1024).toFixed(2) + ' MB';
-                    document.getElementById('col-count').textContent = currentFile.numColumns;
-                    document.getElementById('row-count').textContent = currentFile._isDataset ? rowCount.toLocaleString() : 'Lazy';
+                    Alpine.store('app').fileName = displayName + (currentFile._isDataset ? ` (dataset${versionSuffix})` : '');
+                    Alpine.store('app').fileSize = (currentFile.size / 1024 / 1024).toFixed(2) + ' MB';
+                    Alpine.store('app').colCount = currentFile.numColumns;
+                    Alpine.store('app').rowCount = currentFile._isDataset ? rowCount.toLocaleString() : 'Lazy';
+                    collapseFileLoader();
 
                     // Reset network stats
                     resetNetworkStats();
-                    document.getElementById('network-stats').classList.remove('hidden');
 
                     // Detect column types
                     try {
@@ -3649,20 +3654,16 @@
                     remoteFile._columnTypes = null;
                 }
 
-                // Update UI
-                document.getElementById('file-info').classList.remove('hidden');
-                collapseFileLoader();
+                // Update UI via Alpine store
                 const displayName = isDataset ? url.split('/').pop() : (url.split('/').pop() || 'remote.lance');
-                document.getElementById('file-name').textContent = displayName + (isDataset ? ' (dataset)' : '');
-                document.getElementById('file-size').textContent = (remoteFile.size / 1024 / 1024).toFixed(2) + ' MB';
-                document.getElementById('col-count').textContent = remoteFile.numColumns;
-                document.getElementById('row-count').textContent = isDataset ? rowCount.toLocaleString() : 'Lazy';
+                Alpine.store('app').fileName = displayName + (isDataset ? ' (dataset)' : '');
+                Alpine.store('app').fileSize = (remoteFile.size / 1024 / 1024).toFixed(2) + ' MB';
+                Alpine.store('app').colCount = remoteFile.numColumns;
+                Alpine.store('app').rowCount = isDataset ? rowCount.toLocaleString() : 'Lazy';
+                collapseFileLoader();
 
                 // Reset network stats for new file
                 resetNetworkStats();
-
-                // Show network stats
-                document.getElementById('network-stats').classList.remove('hidden');
 
                 // Detect column types
                 showStatus('Detecting column types...', 'info');
