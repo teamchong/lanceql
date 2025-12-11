@@ -1476,7 +1476,7 @@
                             :disabled="$store.app.isLoading || (!$store.app.queryRow && !$store.app.searchText)"
                             style="background: #7c3aed;">
                         <template x-if="$store.app.isLoading">
-                            <span><span class="spinner"></span> Searching...</span>
+                            <span><span class="spinner"></span> <span x-text="$store.app.queryRow ? 'Searching Row...' : 'Searching Text...'"></span></span>
                         </template>
                         <template x-if="!$store.app.isLoading">
                             <span>
