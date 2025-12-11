@@ -2937,9 +2937,10 @@
                     const filterCol = document.getElementById('df-filter-col');
                     const selectCols = document.getElementById('df-select-cols');
 
-                    // Preserve current filter selection before repopulating
+                    // Preserve current selections before repopulating
                     const prevFilterValue = filterCol.value;
                     const prevFilterColName = prevFilterValue ? filterCol.options[filterCol.selectedIndex]?.text.split(' (')[0] : null;
+                    const prevSelectedCols = Array.from(selectCols.selectedOptions).map(opt => opt.text);
 
                     filterCol.innerHTML = '<option value="">No filter</option>';
                     selectCols.innerHTML = '';
@@ -2952,7 +2953,9 @@
                         if (type !== 'string' && type !== 'vector') {
                             filterCol.innerHTML += `<option value="${i}">${name} (${type})</option>`;
                         }
-                        selectCols.innerHTML += `<option value="${i}" selected>${name}</option>`;
+                        // Preserve selection if column name matches
+                        const isSelected = prevSelectedCols.length === 0 || prevSelectedCols.includes(name);
+                        selectCols.innerHTML += `<option value="${i}" ${isSelected ? 'selected' : ''}>${name}</option>`;
                     }
 
                     // Apply pending column value now that options exist
