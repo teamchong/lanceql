@@ -1583,7 +1583,15 @@
         const sqlInput = document.getElementById('sql-input');
         const sqlHighlight = document.getElementById('sql-highlight');
 
-        sqlInput.addEventListener('input', updateSQLHighlight);
+        sqlInput.addEventListener('input', () => {
+            updateSQLHighlight();
+            // Sync SQL changes to other tabs
+            const sql = sqlInput.value.trim();
+            if (sql) {
+                const query = sqlToQuery(sql);
+                syncQueryTabs(query, 'sql');
+            }
+        });
         sqlInput.addEventListener('scroll', () => {
             sqlHighlight.scrollTop = sqlInput.scrollTop;
             sqlHighlight.scrollLeft = sqlInput.scrollLeft;
