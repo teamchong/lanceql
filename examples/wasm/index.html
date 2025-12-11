@@ -2542,6 +2542,21 @@
             textarea.addEventListener('input', () => {
                 textarea.dataset.userEdited = 'true';
                 highlight.innerHTML = highlightDfCode(textarea.value) + '\n';
+
+                // Parse the code and sync to SQL/Vector Search/URL hash
+                const code = textarea.value;
+                const ops = parseDfCode(code);
+                const query = {
+                    url: ops.url,
+                    version: ops.version,
+                    search: ops.search,
+                    encoder: ops.searchEncoder,
+                    topK: ops.topK,
+                    filter: ops.filter ? { column: ops.filter.column, op: ops.filter.op, value: ops.filter.value } : null,
+                    select: ops.select,
+                    limit: ops.limit
+                };
+                syncQueryTabs(query, 'df');
             });
 
             textarea.addEventListener('scroll', () => {
