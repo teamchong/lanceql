@@ -4270,13 +4270,16 @@
             const vectorCol = vectorColSelect.selectedOptions[0]?.text || null;
             // Don't include query-row if there's text search
             const queryRowVal = document.getElementById('query-row').value;
+            // Preserve limit from DataFrame
+            const limit = document.getElementById('df-limit').value;
 
             const query = {
                 url: currentFile?._url,
                 // Don't auto-include version
                 encoder: encoder,
                 topK: topK ? parseInt(topK) : 20,
-                vectorColumn: vectorCol !== 'Select column...' ? vectorCol : null
+                vectorColumn: vectorCol !== 'Select column...' ? vectorCol : null,
+                limit: limit ? parseInt(limit) : null
             };
 
             // Text search takes priority over row search
