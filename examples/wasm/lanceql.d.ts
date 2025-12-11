@@ -196,8 +196,10 @@ export class RemoteLanceDataset {
 
 /** Main LanceQL class */
 export class LanceQL {
-  /** WASM exports */
+  /** WASM exports with Immer-style auto marshalling (strings/bytes auto-copied to WASM memory) */
   readonly wasm: LanceQLWasm;
+  /** Raw WASM exports without auto marshalling */
+  readonly _raw: LanceQLWasm;
   /** WASM memory */
   readonly memory: WebAssembly.Memory;
 

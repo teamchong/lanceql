@@ -176,13 +176,15 @@ export const wasmUtils = {
 };
 
 export class LanceQL {
-    constructor(wasmInstance) {
-        this.wasm = wasmInstance.exports;
-        this.memory = this.wasm.memory;
+    constructor(wasmProxy, rawExports, memory) {
+        this.wasm = wasmProxy;  // Immer-style proxy with auto marshalling
+        this._raw = rawExports; // Raw exports for direct access when needed
+        this.memory = memory;
     }
 
     /**
      * Load LanceQL from a WASM file path or URL.
+     * Uses Immer-style proxy for auto string/bytes marshalling.
      * @param {string} wasmPath - Path to the lanceql.wasm file
      * @returns {Promise<LanceQL>}
      */
@@ -194,7 +196,18 @@ export class LanceQL {
         _w = wasmModule.instance.exports;
         _m = _w.memory;
 
-        return new LanceQL(wasmModule.instance);
+        // Create Immer-style proxy that auto-marshals string/bytes arguments
+        const proxy = new Proxy({}, {
+            get(_, n) {
+                if (n === 'memory') return _m;
+                if (typeof _w[n] === 'function') {
+                    return (...a) => _w[n](...a.flatMap(_x));
+                }
+                return _w[n];
+            }
+        });
+
+        return new LanceQL(proxy, _w, _m);
     }
 
     /**
