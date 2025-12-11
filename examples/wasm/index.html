@@ -2211,7 +2211,8 @@
          */
         function syncQueryTabs(query, source) {
             const url = query.url || currentFile?._url || '';
-            const version = query.version || currentFile?.version || null;
+            // Only include version if explicitly set in query, not from currentFile
+            const version = query.version || null;
 
             // Generate SQL
             // read_lance() = current file, read_lance(24) = version 24, read_lance('url') = remote, read_lance('url', 24) = remote with version
