@@ -2222,15 +2222,26 @@
                 sql += '*';
             }
             // Build read_lance args
-            const isCurrentFile = !url || url === currentFile?._url;
-            if (isCurrentFile && !version) {
+            // Only use read_lance() for local files, always include URL for remote
+            const isLocalFile = !url && !currentFile?._isRemote;
+            if (isLocalFile && !version) {
                 sql += ` FROM read_lance()`;
-            } else if (isCurrentFile && version) {
+            } else if (isLocalFile && version) {
                 sql += ` FROM read_lance(${version})`;
             } else if (url && version) {
                 sql += ` FROM read_lance('${url}', ${version})`;
-            } else {
+            } else if (url) {
                 sql += ` FROM read_lance('${url}')`;
+            } else {
+                // Fallback: use current file URL if available
+                const fallbackUrl = currentFile?._url || '';
+                if (fallbackUrl && version) {
+                    sql += ` FROM read_lance('${fallbackUrl}', ${version})`;
+                } else if (fallbackUrl) {
+                    sql += ` FROM read_lance('${fallbackUrl}')`;
+                } else {
+                    sql += ` FROM read_lance()`;
+                }
             }
             // WHERE clause
             if (query.filter) {
