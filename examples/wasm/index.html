@@ -1522,6 +1522,12 @@
                     document.getElementById('sql-input').value = DEFAULT_QUERY;
                 }
                 updateSQLHighlight();
+                // Sync SQL to DataFrame/Vector Search tabs
+                const sql = document.getElementById('sql-input').value.trim();
+                if (sql) {
+                    const query = sqlToQuery(sql);
+                    syncQueryTabs(query, 'sql');
+                }
                 setTimeout(runSqlQuery, 100);
             } catch (err) {
                 showStatus('Failed to load WASM: ' + err.message, 'error');
