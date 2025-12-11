@@ -123,6 +123,17 @@
             background: #0f172a;
             border-radius: 8px;
             margin-top: 15px;
+            overflow: hidden;
+        }
+        .file-info .file-details {
+            flex: 1;
+            min-width: 0; /* Allow flex item to shrink below content size */
+            overflow: hidden;
+        }
+        .file-info .file-details h3 {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
         .file-info.hidden {
             display: none;
@@ -135,6 +146,8 @@
             border-radius: 6px;
             color: #94a3b8;
             font-size: 13px;
+            flex-shrink: 0; /* Don't shrink the button */
+            white-space: nowrap;
             cursor: pointer;
             transition: all 0.2s;
         }
