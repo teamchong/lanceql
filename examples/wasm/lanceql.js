@@ -127,20 +127,34 @@ const metadataCache = new MetadataCache();
 // Immer-style WASM runtime - auto string/bytes marshalling
 const E = new TextEncoder();
 const D = new TextDecoder();
-let _w, _m, _p, _M = 1 << 20;
+let _w, _m, _p = 0, _M = 0;
 
-const _g = () => new Uint8Array(_m.buffer, _p, _M);
+// Get shared buffer view (lazy allocation)
+const _g = () => {
+    if (!_p || !_M) return null;
+    return new Uint8Array(_m.buffer, _p, _M);
+};
+
+// Ensure shared buffer is large enough
+const _ensure = (size) => {
+    if (_p && size <= _M) return true;
+    // Free old buffer if exists
+    if (_p && _w.free) _w.free(_p, _M);
+    _M = Math.max(size + 1024, 4096); // At least 4KB
+    _p = _w.alloc(_M);
+    return _p !== 0;
+};
 
 // Marshal JS value to WASM args (strings and Uint8Array auto-copied to WASM memory)
 const _x = a => {
     if (a instanceof Uint8Array) {
-        if (a.length > _M) { _M = a.length + 1024; _p = _w.alloc(_M) }
+        if (!_ensure(a.length)) return [a]; // Fallback if alloc fails
         _g().set(a);
         return [_p, a.length];
     }
     if (typeof a !== 'string') return [a];
     const b = E.encode(a);
-    if (b.length > _M) { _M = b.length + 1024; _p = _w.alloc(_M) }
+    if (!_ensure(b.length)) return [a]; // Fallback if alloc fails
     _g().set(b);
     return [_p, b.length];
 };
@@ -181,7 +195,7 @@ export class LanceQL {
 
         _w = wasmModule.instance.exports;
         _m = _w.memory;
-        if (_w.alloc) { _p = _w.alloc(_M) }
+        // Lazy allocation - don't pre-allocate shared buffer
 
         // Create Immer-style proxy that auto-marshals arguments
         const proxy = new Proxy({}, {
