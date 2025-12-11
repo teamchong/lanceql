@@ -1359,7 +1359,7 @@
                             <option value="">No vector columns</option>
                         </select>
                         <label>Query Row:</label>
-                        <input type="number" id="query-row" value="0" min="0" placeholder="Row idx">
+                        <input type="number" id="query-row" min="0" placeholder="Enter a row number">
                         <label>Top K:</label>
                         <input type="number" id="top-k" value="20" min="1" max="100">
                     </div>
@@ -3832,7 +3832,7 @@
 
             // Don't run if no search query or row specified
             if (!searchText && queryRowVal === '') {
-                showStatus('Please enter a search query or row number', 'error');
+                showStatus('Enter a text description or a row number', 'error');
                 return;
             }
 
