@@ -156,7 +156,7 @@ const marshal = arg => {
 
 **Benefits:**
 - **Zero boilerplate** - No manual `alloc`/`free`/copy for each call
-- **Type-safe** - Strings and bytes automatically handled
+- **Auto marshalling** - Strings and Uint8Array automatically copied to WASM memory
 - **Tiny runtime** - ~30 lines, no dependencies
 - **JS debugging** - All logic stays in JS where DevTools works
 
