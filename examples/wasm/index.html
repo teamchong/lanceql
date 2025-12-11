@@ -4672,6 +4672,35 @@
             `;
         }
 
+        // Evaluate WHERE clause expression against a row of data
+        function evaluateWhereClause(expr, rowData) {
+            if (!expr) return true;
+
+            if (expr.type === 'binary') {
+                const left = evaluateWhereClause(expr.left, rowData);
+                const right = evaluateWhereClause(expr.right, rowData);
+                switch (expr.op) {
+                    case 'AND': return left && right;
+                    case 'OR': return left || right;
+                    case '=': case '==': return left === right;
+                    case '!=': case '<>': return left !== right;
+                    case '<': return left < right;
+                    case '>': return left > right;
+                    case '<=': return left <= right;
+                    case '>=': return left >= right;
+                    default: return true;
+                }
+            } else if (expr.type === 'column') {
+                return rowData[expr.name];
+            } else if (expr.type === 'literal') {
+                return expr.value;
+            } else if (expr.type === 'unary' && expr.op === 'NOT') {
+                return !evaluateWhereClause(expr.operand, rowData);
+            }
+
+            return true;
+        }
+
         // Run vector search from SQL SEARCH clause
         async function runVectorSearchQuery(ast, targetFile) {
             const { query, encoder, column } = ast.search;
@@ -4783,13 +4812,60 @@
                 }
             }
 
-            // Build rows from column data
-            for (let i = 0; i < results.indices.length; i++) {
-                const score = results.scores[i];
+            // Apply WHERE filter if present
+            let filteredIndices = [];
+            let filteredScores = [];
+            if (ast.where) {
+                // Evaluate WHERE clause for each result
+                for (let i = 0; i < results.indices.length; i++) {
+                    const rowData = {};
+                    for (let c = 0; c < colNames.length; c++) {
+                        rowData[colNames[c]] = columnData[c][i];
+                    }
+                    if (evaluateWhereClause(ast.where, rowData)) {
+                        filteredIndices.push(i);
+                        filteredScores.push(results.scores[i]);
+                    }
+                }
+            } else {
+                filteredIndices = results.indices.map((_, i) => i);
+                filteredScores = [...results.scores];
+            }
+
+            // Apply LIMIT if specified (different from TOPK - TOPK controls search, LIMIT controls output)
+            if (ast.limit && filteredIndices.length > ast.limit) {
+                filteredIndices = filteredIndices.slice(0, ast.limit);
+                filteredScores = filteredScores.slice(0, ast.limit);
+            }
+
+            // Determine which columns to display (SELECT clause)
+            let displayColIndices = [];
+            let displayColNames = [];
+            const isSelectAll = ast.columns.length === 1 && ast.columns[0].type === 'star';
+            if (isSelectAll) {
+                displayColIndices = colNames.map((_, i) => i);
+                displayColNames = colNames;
+            } else {
+                for (const col of ast.columns) {
+                    if (col.type === 'column') {
+                        const idx = colNames.findIndex(n => n.toLowerCase() === col.name.toLowerCase());
+                        if (idx >= 0) {
+                            displayColIndices.push(idx);
+                            displayColNames.push(colNames[idx]);
+                        }
+                    }
+                }
+            }
+
+            // Build rows from filtered column data with selected columns only
+            const displayColumns = ['score', ...displayColNames];
+            for (let i = 0; i < filteredIndices.length; i++) {
+                const dataIdx = filteredIndices[i];
+                const score = filteredScores[i];
                 const row = [score.toFixed(4)];
 
-                for (let c = 0; c < colNames.length; c++) {
-                    const val = columnData[c][i];
+                for (const c of displayColIndices) {
+                    const val = columnData[c][dataIdx];
                     if (val === null || val === undefined) {
                         row.push('');
                     } else if (typeof val === 'number') {
@@ -4823,8 +4899,9 @@
             }
 
             document.getElementById('results-section').style.display = 'block';
-            displayResults({ columns, rows, total: results.indices.length });
-            showStatus(`Found ${results.indices.length} similar items for "${query}"`, 'success');
+            displayResults({ columns: displayColumns, rows, total: filteredIndices.length });
+            const filterMsg = ast.where ? ` (filtered from ${results.indices.length})` : '';
+            showStatus(`Found ${filteredIndices.length} similar items for "${query}"${filterMsg}`, 'success');
             setLoading(false);
         }
 
