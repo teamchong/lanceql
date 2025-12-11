@@ -6,9 +6,9 @@ A browser-based Lance file reader with SQL and vector search support. Query Lanc
 
 ## Features
 
-- **SQL Queries** - `SELECT`, `WHERE`, `ORDER BY`, `LIMIT`, aggregations (`COUNT`, `SUM`, `AVG`)
-- **Vector Search** - Semantic search using MiniLM text embeddings with IVF index support
-- **Time Travel** - Query historical versions with `AT VERSION N`
+- **SQL Queries** - `SELECT`, `WHERE`, `LIMIT`, aggregations (`COUNT`, `SUM`, `AVG`)
+- **Vector Search** - Semantic search with `NEAR` clause using MiniLM/CLIP embeddings
+- **Time Travel** - Query historical versions with `read_lance(version)`
 - **DataFrame API** - Python-like syntax: `dataset.df().filter(...).select(...).limit(50)`
 - **HTTP Range Requests** - Only fetch the bytes you need, not the entire file
 - **Local + Remote** - Drag & drop local files or load from URL
@@ -27,23 +27,38 @@ Default dataset: 1M LAION images with text embeddings at `https://data.metal0.de
 ## SQL Examples
 
 ```sql
--- Basic query
+-- Basic query (current loaded file)
+SELECT * FROM read_lance() LIMIT 50
+
+-- Remote URL
 SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50
 
--- Filter and sort
-SELECT url, text, aesthetic FROM read_lance('...')
+-- Filter
+SELECT url, text, aesthetic FROM read_lance()
 WHERE aesthetic > 0.5
-ORDER BY aesthetic DESC
 LIMIT 100
 
 -- Aggregations
-SELECT COUNT(*), AVG(aesthetic), MAX(aesthetic) FROM read_lance('...')
+SELECT COUNT(*), AVG(aesthetic), MAX(aesthetic) FROM read_lance()
 
--- Vector search
-SELECT * FROM read_lance('...') SEARCH 'sunset beach' LIMIT 20
+-- Vector search by text (TOPK optional, default 20)
+SELECT * FROM read_lance() NEAR 'sunset beach'
+SELECT * FROM read_lance() NEAR 'cat' TOPK 50
 
--- Time travel
-SELECT * FROM read_lance('...') AT VERSION 1 LIMIT 50
+-- Vector search by row
+SELECT * FROM read_lance() NEAR 0 TOPK 10
+
+-- Specify vector column
+SELECT * FROM read_lance() NEAR embedding 'sunset'
+
+-- Combined with WHERE
+SELECT * FROM read_lance()
+WHERE aesthetic > 0.5
+NEAR 'beach sunset' TOPK 30
+
+-- Time travel (version as second arg)
+SELECT * FROM read_lance(24) LIMIT 50
+SELECT * FROM read_lance('https://...', 24) LIMIT 50
 ```
 
 ## DataFrame Examples
@@ -53,12 +68,18 @@ import lanceql
 
 dataset = lanceql.open("https://data.metal0.dev/laion-1m/images.lance")
 
-# Vector search
+# Vector search by text
 result = (
     dataset.df()
-    .search("cat playing", encoder="minilm")
+    .search("cat playing", encoder="minilm", top_k=20)
     .select(["url", "text"])
-    .limit(20)
+    .collect()
+)
+
+# Vector search by row
+result = (
+    dataset.df()
+    .search_by_row(0, column="embedding", top_k=10)
     .collect()
 )
 
@@ -69,6 +90,9 @@ result = (
     .limit(50)
     .collect()
 )
+
+# Time travel
+dataset = lanceql.open("https://...", version=24)
 ```
 
 ## Architecture

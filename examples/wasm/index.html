@@ -2170,7 +2170,8 @@
             code += `    dataset.df()\n`;
 
             if (searchQuery) {
-                code += `    .search("${searchQuery}", encoder="${searchEncoder}")\n`;
+                const topK = limit || 20;
+                code += `    .search("${searchQuery}", encoder="${searchEncoder}", top_k=${topK})\n`;
             }
 
             if (filterCol !== '') {
@@ -2186,7 +2187,8 @@
                 code += `    .select([${colNames}])\n`;
             }
 
-            if (limit) {
+            // Only add .limit() if no search (search uses top_k)
+            if (limit && !searchQuery) {
                 code += `    .limit(${limit})\n`;
             }
             code += `    .collect()\n`;
@@ -2212,37 +2214,51 @@
             const version = query.version || currentFile?.version || null;
 
             // Generate SQL
+            // read_lance() = current file, read_lance(24) = version 24, read_lance('url') = remote, read_lance('url', 24) = remote with version
             let sql = 'SELECT ';
             if (query.select && query.select.length > 0) {
                 sql += query.select.join(', ');
             } else {
                 sql += '*';
             }
-            sql += ` FROM read_lance('${url}')`;
-            if (version) {
-                sql += ` AT VERSION ${version}`;
+            // Build read_lance args
+            const isCurrentFile = !url || url === currentFile?._url;
+            if (isCurrentFile && !version) {
+                sql += ` FROM read_lance()`;
+            } else if (isCurrentFile && version) {
+                sql += ` FROM read_lance(${version})`;
+            } else if (url && version) {
+                sql += ` FROM read_lance('${url}', ${version})`;
+            } else {
+                sql += ` FROM read_lance('${url}')`;
             }
+            // WHERE clause
             if (query.filter) {
                 sql += ` WHERE ${query.filter.column} ${query.filter.op} ${query.filter.value}`;
             }
+            // NEAR clause (after WHERE, like ORDER BY position)
+            // NEAR [column] <'text'|row_num> [TOPK n]
             if (query.searchRow !== undefined && query.searchRow !== null) {
-                sql += ` SEARCH ROW ${query.searchRow}`;
+                sql += ' NEAR';
                 if (query.vectorColumn) {
-                    sql += ` COLUMN ${query.vectorColumn}`;
+                    sql += ` ${query.vectorColumn}`;
                 }
-                if (query.topK) {
+                sql += ` ${query.searchRow}`;
+                if (query.topK && query.topK !== 20) {
                     sql += ` TOPK ${query.topK}`;
                 }
             } else if (query.search) {
-                sql += ` SEARCH '${query.search}'`;
+                sql += ' NEAR';
                 if (query.vectorColumn) {
-                    sql += ` COLUMN ${query.vectorColumn}`;
+                    sql += ` ${query.vectorColumn}`;
                 }
-                if (query.topK) {
+                sql += ` '${query.search}'`;
+                if (query.topK && query.topK !== 20) {
                     sql += ` TOPK ${query.topK}`;
                 }
             }
-            if (query.limit && !query.searchRow && !query.search) {
+            // LIMIT only when no NEAR (NEAR uses TOPK)
+            if (query.limit && query.searchRow === undefined && query.searchRow === null && !query.search) {
                 sql += ` LIMIT ${query.limit}`;
             }
 
@@ -2268,7 +2284,8 @@
             if (query.select && query.select.length > 0) {
                 dfCode += `    .select([${query.select.map(c => `"${c}"`).join(', ')}])\n`;
             }
-            if (query.limit) {
+            // Only add .limit() if no search (search uses top_k)
+            if (query.limit && !query.search && query.searchRow === undefined) {
                 dfCode += `    .limit(${query.limit})\n`;
             }
             dfCode += `    .collect()\n`;
@@ -2332,17 +2349,28 @@
         function sqlToQuery(sql) {
             const query = {};
 
-            // Extract URL from read_lance('...')
-            const urlMatch = sql.match(/read_lance\s*\(\s*['"]([^'"]+)['"]\s*\)/i);
-            if (urlMatch) query.url = urlMatch[1];
-
-            // Extract version from AT VERSION N
-            const versionMatch = sql.match(/AT\s+VERSION\s+(\d+)/i);
-            if (versionMatch) query.version = parseInt(versionMatch[1]);
-
-            // Extract search from SEARCH '...'
-            const searchMatch = sql.match(/SEARCH\s+['"]([^'"]+)['"]/i);
-            if (searchMatch) query.search = searchMatch[1];
+            // Extract URL and version from read_lance()
+            // read_lance() = current file
+            // read_lance(24) = current file, version 24
+            // read_lance('url') = remote, latest
+            // read_lance('url', 24) = remote, version 24
+            const lanceFuncMatch = sql.match(/read_lance\s*\(\s*([^)]*)\s*\)/i);
+            if (lanceFuncMatch) {
+                const args = lanceFuncMatch[1].trim();
+                if (args === '') {
+                    // read_lance() - current file
+                } else if (/^\d+$/.test(args)) {
+                    // read_lance(24) - version only
+                    query.version = parseInt(args);
+                } else {
+                    // read_lance('url') or read_lance('url', 24)
+                    const urlVerMatch = args.match(/['"]([^'"]+)['"]\s*(?:,\s*(\d+))?/);
+                    if (urlVerMatch) {
+                        query.url = urlVerMatch[1];
+                        if (urlVerMatch[2]) query.version = parseInt(urlVerMatch[2]);
+                    }
+                }
+            }
 
             // Extract limit from LIMIT N
             const limitMatch = sql.match(/LIMIT\s+(\d+)/i);
@@ -2364,17 +2392,15 @@
                 };
             }
 
-            // Extract SEARCH ROW N
-            const searchRowMatch = sql.match(/SEARCH\s+ROW\s+(\d+)/i);
-            if (searchRowMatch) query.searchRow = parseInt(searchRowMatch[1]);
-
-            // Extract COLUMN name (for vector search)
-            const columnMatch = sql.match(/COLUMN\s+(\w+)/i);
-            if (columnMatch) query.vectorColumn = columnMatch[1];
-
-            // Extract TOP K
-            const topKMatch = sql.match(/TOPK\s+(\d+)/i);
-            if (topKMatch) query.topK = parseInt(topKMatch[1]);
+            // Extract NEAR clause: NEAR [column] <'text'|row_num> [TOPK n]
+            // NEAR 'text' or NEAR column 'text' or NEAR 0 or NEAR column 0
+            const nearMatch = sql.match(/NEAR\s+(?:(\w+)\s+)?(?:'([^']+)'|(\d+))(?:\s+TOPK\s+(\d+))?/i);
+            if (nearMatch) {
+                if (nearMatch[1]) query.vectorColumn = nearMatch[1];
+                if (nearMatch[2]) query.search = nearMatch[2];
+                if (nearMatch[3]) query.searchRow = parseInt(nearMatch[3]);
+                query.topK = nearMatch[4] ? parseInt(nearMatch[4]) : 20;
+            }
 
             return query;
         }
@@ -4192,12 +4218,17 @@
                 el.addEventListener('input', updateDfPreview);
             }
         });
-        // Multi-select needs mouseup/keyup to catch selection changes
+        // Multi-select needs special handling - use setTimeout to ensure selection is complete
         const dfSelectCols = document.getElementById('df-select-cols');
         if (dfSelectCols) {
-            dfSelectCols.addEventListener('change', updateDfPreview);
-            dfSelectCols.addEventListener('mouseup', updateDfPreview);
-            dfSelectCols.addEventListener('keyup', updateDfPreview);
+            const handleSelectChange = () => {
+                // Reset userEdited flag so DataFrame code updates
+                document.getElementById('df-input').dataset.userEdited = '';
+                setTimeout(updateDfPreview, 0);
+            };
+            dfSelectCols.addEventListener('change', handleSelectChange);
+            dfSelectCols.addEventListener('mouseup', handleSelectChange);
+            dfSelectCols.addEventListener('keyup', handleSelectChange);
         }
 
         // Vector Search
