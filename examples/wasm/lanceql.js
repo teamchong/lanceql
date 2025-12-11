@@ -4643,7 +4643,7 @@ export class SQLParser {
             const url = this.advance().value;
             from = { type: 'url', url };
         }
-        // Check for function call like read_lance('url')
+        // Check for function call like read_lance(), read_lance(24), read_lance('url'), read_lance('url', 24)
         else if (this.check(TokenType.IDENTIFIER)) {
             const name = this.advance().value;
 
@@ -4651,9 +4651,26 @@ export class SQLParser {
             if (this.match(TokenType.LPAREN)) {
                 const funcName = name.toLowerCase();
                 if (funcName === 'read_lance') {
-                    const url = this.expect(TokenType.STRING).value;
+                    // read_lance() - no args, use current file
+                    // read_lance(24) - version only
+                    // read_lance('url') - url only
+                    // read_lance('url', 24) - url and version
+                    from = { type: 'url', function: 'read_lance' };
+
+                    if (!this.check(TokenType.RPAREN)) {
+                        // First arg: string (url) or number (version)
+                        if (this.check(TokenType.STRING)) {
+                            from.url = this.advance().value;
+                            // Check for second arg (version)
+                            if (this.match(TokenType.COMMA)) {
+                                from.version = parseInt(this.expect(TokenType.NUMBER).value, 10);
+                            }
+                        } else if (this.check(TokenType.NUMBER)) {
+                            // Just version, no url (use current file)
+                            from.version = parseInt(this.advance().value, 10);
+                        }
+                    }
                     this.expect(TokenType.RPAREN);
-                    from = { type: 'url', url, function: 'read_lance' };
                 } else {
                     throw new Error(`Unknown table function: ${name}. Supported: read_lance()`);
                 }
@@ -4665,7 +4682,7 @@ export class SQLParser {
             throw new Error('Expected table name, URL string, or read_lance() after FROM');
         }
 
-        // Check for AT VERSION (time-travel)
+        // Check for AT VERSION (time-travel) - legacy support
         if (this.match(TokenType.AT)) {
             this.expect(TokenType.VERSION);
             const version = parseInt(this.expect(TokenType.NUMBER).value, 10);
