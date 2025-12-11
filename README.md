@@ -211,7 +211,12 @@ import { LanceQL } from './lanceql.js';
 Generate sidecar manifest:
 ```bash
 cd fixtures
+# Local dataset
 python generate_sidecar.py /path/to/dataset.lance
+
+# Remote S3/R2 dataset (requires aws profile 'r2')
+python generate_sidecar.py s3://bucket/dataset.lance ./meta.json
+aws s3 cp ./meta.json s3://bucket/dataset.lance/.meta.json --profile r2 --endpoint-url https://...
 ```
 
 ## Lance Format Support
