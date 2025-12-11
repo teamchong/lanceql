@@ -1697,6 +1697,10 @@
                     syncQueryTabs(query, 'sql');
                 }
                 setTimeout(runSqlQuery, 100);
+
+                // Initialize CLIP and MiniLM after lanceql is loaded
+                initClipWasm();
+                initMinilmWasm();
             } catch (err) {
                 showStatus('Failed to load WASM: ' + err.message, 'error');
                 console.error(err);
@@ -1978,7 +1982,7 @@
         }
 
         function processLanceFile(data, filename, columnNames = null) {
-            if (!lanceql.isValid(data)) {
+            if (!lanceql.isValidLanceFile(data)) {
                 showStatus('Invalid Lance file - missing LANC magic bytes', 'error');
                 return;
             }
@@ -4874,10 +4878,6 @@
                 runSqlQuery();
             });
         });
-
-        // Initialize CLIP WASM on page load
-        initClipWasm();
-        initMinilmWasm();
 
         // Initialize
         init();
