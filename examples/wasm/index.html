@@ -3827,6 +3827,15 @@
 
         // Vector Search
         document.getElementById('run-vector-btn').addEventListener('click', async () => {
+            const searchText = document.getElementById('clip-text-input').value.trim();
+            const queryRowVal = document.getElementById('query-row').value;
+
+            // Don't run if no search query or row specified
+            if (!searchText && queryRowVal === '') {
+                showStatus('Please enter a search query or row number', 'error');
+                return;
+            }
+
             // Sync vector search fields to SQL, then run SQL query
             updateVectorSearchSync();
             await runSqlQuery();
