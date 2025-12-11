@@ -4179,8 +4179,8 @@
 
         // Run vector search from SQL SEARCH clause
         async function runVectorSearchQuery(ast, targetFile) {
-            const { query, encoder, column } = ast.search;
-            const topK = ast.limit || 20;
+            const { query, searchRow, encoder, column, topK: searchTopK } = ast.search;
+            const topK = searchTopK || ast.limit || 20;
 
             // Check if this is an aggregation query (COUNT, SUM, etc. with SEARCH)
             const isAggregation = ast.columns.some(col =>
@@ -4188,47 +4188,7 @@
                 ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'].includes(col.expr.name.toUpperCase())
             );
 
-            showStatus(`Encoding "${query}" with ${encoder.toUpperCase()}...`, 'info');
-            showSearchLoading();
-
-            // Get query vector using appropriate encoder
-            let queryVec;
-            if (encoder === 'clip' || encoder === 'clip-openai' || encoder === 'clip-laion') {
-                // Select CLIP model URL based on encoder
-                const clipModelSelect = document.getElementById('clip-model-select');
-                if (encoder === 'clip-openai') {
-                    clipModelSelect.value = 'https://data.metal0.dev/models/clip-vit-b32-openai.gguf';
-                } else if (encoder === 'clip-laion') {
-                    clipModelSelect.value = 'https://data.metal0.dev/models/clip-vit-b32.gguf';
-                }
-
-                if (!clipModelLoaded) {
-                    const loaded = await ensureClipModelLoaded();
-                    if (!loaded) {
-                        setLoading(false);
-                        return;
-                    }
-                }
-                queryVec = encodeTextWithClip(query);
-            } else {
-                // Default: minilm
-                if (!minilmModelLoaded) {
-                    const loaded = await ensureMinilmModelLoaded();
-                    if (!loaded) {
-                        setLoading(false);
-                        return;
-                    }
-                }
-                queryVec = encodeTextWithMinilm(query);
-            }
-
-            if (!queryVec) {
-                showStatus(`Failed to encode text with ${encoder}`, 'error');
-                setLoading(false);
-                return;
-            }
-
-            // Find vector column (by name or auto-detect)
+            // Find vector column first (needed for both row and text search)
             let vectorColIdx = -1;
             const colNames = targetFile.columnNames || [];
             if (column) {
@@ -4247,7 +4207,66 @@
                     }
                 }
                 if (vectorColIdx === -1) {
-                    showStatus('No vector column found. Use ON column_name to specify.', 'error');
+                    showStatus('No vector column found', 'error');
+                    setLoading(false);
+                    return;
+                }
+            }
+
+            let queryVec;
+
+            // Row-based search: read vector from specified row
+            if (searchRow !== undefined && searchRow !== null) {
+                showStatus(`Reading vector from row ${searchRow}...`, 'info');
+                showSearchLoading();
+
+                try {
+                    queryVec = await targetFile.readVectorAt(vectorColIdx, searchRow);
+                    if (!queryVec || queryVec.length === 0) {
+                        showStatus(`Failed to read vector from row ${searchRow}`, 'error');
+                        setLoading(false);
+                        return;
+                    }
+                } catch (e) {
+                    showStatus(`Error reading vector from row ${searchRow}: ${e.message}`, 'error');
+                    setLoading(false);
+                    return;
+                }
+            } else {
+                // Text-based search: encode text with model
+                showStatus(`Encoding "${query}" with ${encoder.toUpperCase()}...`, 'info');
+                showSearchLoading();
+
+                if (encoder === 'clip' || encoder === 'clip-openai' || encoder === 'clip-laion') {
+                    const clipModelSelect = document.getElementById('clip-model-select');
+                    if (encoder === 'clip-openai') {
+                        clipModelSelect.value = 'https://data.metal0.dev/models/clip-vit-b32-openai.gguf';
+                    } else if (encoder === 'clip-laion') {
+                        clipModelSelect.value = 'https://data.metal0.dev/models/clip-vit-b32.gguf';
+                    }
+
+                    if (!clipModelLoaded) {
+                        const loaded = await ensureClipModelLoaded();
+                        if (!loaded) {
+                            setLoading(false);
+                            return;
+                        }
+                    }
+                    queryVec = encodeTextWithClip(query);
+                } else {
+                    // Default: minilm
+                    if (!minilmModelLoaded) {
+                        const loaded = await ensureMinilmModelLoaded();
+                        if (!loaded) {
+                            setLoading(false);
+                            return;
+                        }
+                    }
+                    queryVec = encodeTextWithMinilm(query);
+                }
+
+                if (!queryVec) {
+                    showStatus(`Failed to encode text with ${encoder}`, 'error');
                     setLoading(false);
                     return;
                 }
@@ -4377,7 +4396,8 @@
             document.getElementById('results-section').style.display = 'block';
             displayResults({ columns: displayColumns, rows, total: filteredIndices.length });
             const filterMsg = ast.where ? ` (filtered from ${results.indices.length})` : '';
-            showStatus(`Found ${filteredIndices.length} similar items for "${query}"${filterMsg}`, 'success');
+            const searchDesc = searchRow !== undefined && searchRow !== null ? `row ${searchRow}` : `"${query}"`;
+            showStatus(`Found ${filteredIndices.length} similar items for ${searchDesc}${filterMsg}`, 'success');
             setLoading(false);
         }
 
