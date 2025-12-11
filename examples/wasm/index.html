@@ -491,12 +491,18 @@
             color: #64748b;
         }
         .results-notice {
-            color: #f59e0b;
             font-size: 12px;
-            background: rgba(245, 158, 11, 0.1);
             padding: 4px 8px;
             border-radius: 4px;
             margin-left: 8px;
+        }
+        .results-notice.notice-success {
+            color: #22c55e;
+            background: rgba(34, 197, 94, 0.1);
+        }
+        .results-notice.notice-warning {
+            color: #f59e0b;
+            background: rgba(245, 158, 11, 0.1);
         }
         .dataset-hint {
             color: #94a3b8;
@@ -1478,8 +1484,12 @@
                     Results
                 </h3>
                 <div class="results-actions">
-                    <span class="results-count" id="results-count"></span>
-                    <span class="results-notice" id="results-notice" style="display: none;"></span>
+                    <span class="results-count" x-text="$store.app.resultsCount" id="results-count"></span>
+                    <span class="results-notice"
+                          :class="$store.app.resultsNoticeType"
+                          :style="{ display: $store.app.resultsNotice ? 'inline' : 'none' }"
+                          x-text="$store.app.resultsNotice"
+                          id="results-notice"></span>
                     <button class="export-btn" id="export-csv" title="Export as CSV">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
@@ -1566,6 +1576,9 @@
                 statusMessage: '',
                 statusType: '',
                 statusTimeout: null,
+                resultsCount: '',
+                resultsNotice: '',
+                resultsNoticeType: '',
                 formatBytes(bytes) {
                     if (bytes === 0) return '0 B';
                     const k = 1024;
@@ -3320,34 +3333,26 @@
 
             const body = document.getElementById('results-body');
             const loadedCount = append ? (infiniteScrollState?.loadedCount || 0) + result.rows.length : result.rows.length;
-            document.getElementById('results-count').textContent = `${loadedCount.toLocaleString()} of ${result.total.toLocaleString()} rows`;
+            Alpine.store('app').resultsCount = `${loadedCount.toLocaleString()} of ${result.total.toLocaleString()} rows`;
 
             // Show notice if ORDER BY was applied on a subset or aggregation on partial data
-            const noticeEl = document.getElementById('results-notice');
             if (result.aggregationStats?.fromMetadata && !append) {
-                noticeEl.textContent = `✓ Row count from metadata (no scan required)`;
-                noticeEl.style.display = 'inline';
-                noticeEl.style.color = '#22c55e';
-                noticeEl.style.background = 'rgba(34, 197, 94, 0.1)';
+                Alpine.store('app').resultsNotice = `✓ Row count from metadata (no scan required)`;
+                Alpine.store('app').resultsNoticeType = 'notice-success';
             } else if (result.aggregationStats?.fromSearch && !append) {
                 const stats = result.aggregationStats;
-                noticeEl.textContent = `✓ Aggregated over ${stats.scannedRows.toLocaleString()} vector search results`;
-                noticeEl.style.display = 'inline';
-                noticeEl.style.color = '#22c55e';
-                noticeEl.style.background = 'rgba(34, 197, 94, 0.1)';
+                Alpine.store('app').resultsNotice = `✓ Aggregated over ${stats.scannedRows.toLocaleString()} vector search results`;
+                Alpine.store('app').resultsNoticeType = 'notice-success';
             } else if (result.aggregationStats?.isPartialScan && !append) {
                 const stats = result.aggregationStats;
-                noticeEl.textContent = `⚠ Aggregated over ${stats.scannedRows.toLocaleString()} of ${stats.totalRows.toLocaleString()} rows (${stats.coveragePercent}% coverage)`;
-                noticeEl.style.display = 'inline';
-                noticeEl.style.color = '#f59e0b';
-                noticeEl.style.background = 'rgba(245, 158, 11, 0.1)';
+                Alpine.store('app').resultsNotice = `⚠ Aggregated over ${stats.scannedRows.toLocaleString()} of ${stats.totalRows.toLocaleString()} rows (${stats.coveragePercent}% coverage)`;
+                Alpine.store('app').resultsNoticeType = 'notice-warning';
             } else if (result.orderByOnSubset && !append) {
-                noticeEl.textContent = `⚠ Sorted within ${loadedCount} fetched rows only, not full dataset`;
-                noticeEl.style.display = 'inline';
-                noticeEl.style.color = '#f59e0b';
-                noticeEl.style.background = 'rgba(245, 158, 11, 0.1)';
+                Alpine.store('app').resultsNotice = `⚠ Sorted within ${loadedCount} fetched rows only, not full dataset`;
+                Alpine.store('app').resultsNoticeType = 'notice-warning';
             } else if (!append) {
-                noticeEl.style.display = 'none';
+                Alpine.store('app').resultsNotice = '';
+                Alpine.store('app').resultsNoticeType = '';
             }
 
             if (result.rows.length === 0 && !append) {
@@ -4285,7 +4290,7 @@
 
         function showSearchLoading() {
             const body = document.getElementById('results-body');
-            document.getElementById('results-count').textContent = 'Searching...';
+            Alpine.store('app').resultsCount = 'Searching...';
             body.innerHTML = `
                 <div class="empty-state">
                     <svg class="spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="animation: spin 1s linear infinite;">
