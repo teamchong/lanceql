@@ -1356,7 +1356,7 @@
                     <div class="vector-config">
                         <label>Vector Column:</label>
                         <select id="vector-col">
-                            <option value="">Select column...</option>
+                            <option value="">No vector columns</option>
                         </select>
                         <label>Query Row:</label>
                         <input type="number" id="query-row" value="0" min="0" placeholder="Row idx">
@@ -1889,7 +1889,7 @@
 
             // Populate vector column dropdown for local files
             const vectorCol = document.getElementById('vector-col');
-            vectorCol.innerHTML = '<option value="">Select column...</option>';
+            vectorCol.innerHTML = '';
             for (let i = 0; i < currentFile.numColumns; i++) {
                 if (columnTypes[i] === 'vector') {
                     try {
@@ -1898,6 +1898,10 @@
                         vectorCol.innerHTML += `<option value="${i}">${name} (${info.dimension}D vectors, ${info.rows} rows)</option>`;
                     } catch (e) {}
                 }
+            }
+            // If no vector columns found, show placeholder
+            if (vectorCol.options.length === 0) {
+                vectorCol.innerHTML = '<option value="">No vector columns</option>';
             }
 
             // Show results section
@@ -2730,15 +2734,16 @@
 
                     // Populate vector column dropdown
                     const vectorCol = document.getElementById('vector-col');
-                    vectorCol.innerHTML = '<option value="">Select column...</option>';
+                    vectorCol.innerHTML = '';
                     for (let i = 0; i < currentFile.numColumns; i++) {
                         if (columnTypes[i] === 'vector') {
                             const name = colNames[i] || `column_${i}`;
                             vectorCol.innerHTML += `<option value="${i}">${name}</option>`;
                         }
                     }
-                    if (vectorCol.options.length > 1) {
-                        vectorCol.selectedIndex = 1;
+                    // If no vector columns found, show placeholder
+                    if (vectorCol.options.length === 0) {
+                        vectorCol.innerHTML = '<option value="">No vector columns</option>';
                     }
 
                     // Update DataFrame code preview (skip sync to preserve SQL)
@@ -4278,7 +4283,7 @@
                 // Don't auto-include version
                 encoder: encoder,
                 topK: topK ? parseInt(topK) : 20,
-                vectorColumn: vectorCol !== 'Select column...' ? vectorCol : null,
+                vectorColumn: vectorCol && !vectorCol.includes('No vector') ? vectorCol : null,
                 limit: limit ? parseInt(limit) : null
             };
 
@@ -4393,7 +4398,7 @@
         // Populate vector column select when remote file loads
         async function populateVectorColumns() {
             const vectorCol = document.getElementById('vector-col');
-            vectorCol.innerHTML = '<option value="">Select column...</option>';
+            vectorCol.innerHTML = '';
 
             if (!currentFile || !currentFile._isRemote) return;
 
@@ -4418,13 +4423,12 @@
             }
 
             // Enable vector search button if we have vector columns
-            const hasVectorCols = vectorCol.options.length > 1;
+            const hasVectorCols = vectorCol.options.length > 0;
             document.getElementById('run-vector-btn').disabled = !hasVectorCols;
 
-            // If we have vector columns, remove "Select column..." and auto-select first
-            if (hasVectorCols) {
-                vectorCol.remove(0); // Remove "Select column..." option
-                vectorCol.selectedIndex = 0; // Select first actual column
+            // If no vector columns found, show placeholder
+            if (!hasVectorCols) {
+                vectorCol.innerHTML = '<option value="">No vector columns</option>';
             }
         }
 
