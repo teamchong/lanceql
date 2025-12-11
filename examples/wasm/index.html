@@ -1495,7 +1495,7 @@
                  :class="{ 'show': $store.app.statusMessage, [$store.app.statusType]: true }"
                  id="query-status">
                 <span x-text="$store.app.statusMessage"></span>
-                <a x-show="$store.app.showResetLink" href="./" style="color: inherit; text-decoration: underline; margin-left: 8px;">Reset</a>
+                <a x-show="$store.app.showResetLink" href="./" style="color: inherit; text-decoration: underline; margin-left: 8px;">(Restart)</a>
             </div>
         </section>
 
@@ -1640,7 +1640,7 @@
                 showStatus(message, type) {
                     // Add reset link for errors
                     if (type === 'error') {
-                        this.statusMessage = message + ' — ';
+                        this.statusMessage = message;
                         this.showResetLink = true;
                     } else {
                         this.statusMessage = message;
@@ -3423,6 +3423,8 @@
 
         // Display results with infinite scroll support
         function displayResults(result, append = false) {
+            console.log('displayResults:', { columns: result.columns, rowCount: result.rows?.length, total: result.total, firstRow: result.rows?.[0] });
+
             // Store result for export (merge if appending)
             if (append && lastResult) {
                 $lastResult.set({ ...lastResult, rows: [...lastResult.rows, ...result.rows] });
