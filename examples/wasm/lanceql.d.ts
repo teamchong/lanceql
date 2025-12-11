@@ -196,12 +196,10 @@ export class RemoteLanceDataset {
 
 /** Main LanceQL class */
 export class LanceQL {
-  /** Raw WASM exports (no auto-marshalling) */
+  /** WASM exports */
   readonly wasm: LanceQLWasm;
   /** WASM memory */
   readonly memory: WebAssembly.Memory;
-  /** Immer-style proxy with auto string/bytes marshalling */
-  readonly _proxy: LanceQLWasm;
 
   /**
    * Load LanceQL from WASM file
