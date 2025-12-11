@@ -2381,6 +2381,30 @@
 
             // Always update highlighting to match current textarea content
             highlight.innerHTML = highlightDfCode(textarea.value) + '\n';
+
+            // Sync SQL and URL hash with current DataFrame builder state
+            const searchQuery = document.getElementById('df-search-query').value.trim();
+            const searchEncoder = document.getElementById('df-search-encoder').value;
+            const filterCol = document.getElementById('df-filter-col').value;
+            const filterOp = document.getElementById('df-filter-op').value;
+            const filterVal = document.getElementById('df-filter-value').value;
+            const limit = document.getElementById('df-limit').value;
+
+            const query = {
+                url: currentFile?._url,
+                version: currentFile?.version,
+                search: searchQuery || null,
+                encoder: searchEncoder,
+                limit: limit ? parseInt(limit) : null
+            };
+
+            // Add filter if specified
+            if (filterCol !== '' && filterVal) {
+                const colName = currentFile?.columnNames?.[parseInt(filterCol)] || `col_${filterCol}`;
+                query.filter = { column: colName, op: filterOp, value: parseFloat(filterVal) };
+            }
+
+            syncQueryTabs(query, 'df');
         }
 
         // Sync textarea scroll with highlight
