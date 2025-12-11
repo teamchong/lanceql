@@ -2332,6 +2332,22 @@
                 }
                 if (query.limit) {
                     document.getElementById('df-limit').value = query.limit;
+                } else {
+                    document.getElementById('df-limit').value = '';
+                }
+                // Update filter fields
+                if (query.filter) {
+                    const colNames = currentFile?.columnNames || [];
+                    const colIdx = colNames.findIndex(n => n === query.filter.column);
+                    if (colIdx >= 0) {
+                        document.getElementById('df-filter-col').value = colIdx;
+                    }
+                    document.getElementById('df-filter-op').value = query.filter.op;
+                    document.getElementById('df-filter-value').value = query.filter.value;
+                } else {
+                    document.getElementById('df-filter-col').value = '';
+                    document.getElementById('df-filter-op').value = '>';
+                    document.getElementById('df-filter-value').value = '';
                 }
             }
 
