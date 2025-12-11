@@ -4496,14 +4496,14 @@
             // Sync to SQL/DataFrame
             updateVectorSearchSync();
 
-            // Switch to vector search tab
+            // Switch to SQL tab and run the query (SQL now has full SELECT/WHERE/LIMIT support)
             document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
             document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            document.querySelector('[data-tab="vector"]').classList.add('active');
-            document.getElementById('tab-vector').classList.add('active');
+            document.querySelector('[data-tab="sql"]').classList.add('active');
+            document.getElementById('tab-sql').classList.add('active');
 
-            // Run the search
-            await runVectorSearch();
+            // Run the SQL query (which honors SELECT *, WHERE, LIMIT etc.)
+            await runSqlQuery();
         });
 
         // =============================================
