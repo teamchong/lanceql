@@ -4720,7 +4720,9 @@
         document.querySelectorAll('.clip-example').forEach(btn => {
             btn.addEventListener('click', () => {
                 document.getElementById('clip-text-input').value = btn.dataset.text;
-                runClipSearch();
+                document.getElementById('query-row').value = '';  // Clear row field
+                updateVectorSearchSync();
+                runSqlQuery();
             });
         });
 
