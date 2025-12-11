@@ -1917,6 +1917,20 @@
             // Update DataFrame preview but don't sync to SQL (preserve user's SQL)
             updateDfPreview(true);
 
+            // Now that filter columns are populated, sync filter from SQL WHERE clause
+            const sql = document.getElementById('sql-input').value.trim();
+            if (sql) {
+                const query = sqlToQuery(sql);
+                if (query.filter) {
+                    const colIdx = colNames.findIndex(n => n === query.filter.column);
+                    if (colIdx >= 0) {
+                        document.getElementById('df-filter-col').value = colIdx;
+                    }
+                    document.getElementById('df-filter-op').value = query.filter.op;
+                    document.getElementById('df-filter-value').value = query.filter.value;
+                }
+            }
+
             // Show column chips
             showColumnChips();
 
@@ -3596,6 +3610,20 @@
                 showStatus(statusMsg, 'success');
                 // Update DataFrame preview (skip sync to preserve SQL)
                 updateDfPreview(true);
+
+                // Now that filter columns are populated, sync filter from SQL WHERE clause
+                const sql = document.getElementById('sql-input').value.trim();
+                if (sql) {
+                    const query = sqlToQuery(sql);
+                    if (query.filter) {
+                        const filterColIdx = colNames.findIndex(n => n === query.filter.column);
+                        if (filterColIdx >= 0) {
+                            document.getElementById('df-filter-col').value = filterColIdx;
+                        }
+                        document.getElementById('df-filter-op').value = query.filter.op;
+                        document.getElementById('df-filter-value').value = query.filter.value;
+                    }
+                }
 
                 // Show dataset hint for default dataset
                 const hintEl = document.getElementById('dataset-hint');
