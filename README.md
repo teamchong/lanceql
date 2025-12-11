@@ -8,7 +8,7 @@ A browser-based Lance file reader with SQL and vector search support. Query Lanc
 
 - **SQL Queries** - `SELECT`, `WHERE`, `LIMIT`, aggregations (`COUNT`, `SUM`, `AVG`)
 - **Vector Search** - Semantic search with `NEAR` clause using MiniLM/CLIP embeddings
-- **Time Travel** - Query historical versions with `read_lance(version)`
+- **Time Travel** - Query historical versions with `read_lance(url, version)`
 - **DataFrame API** - Python-like syntax: `dataset.df().filter(...).select(...).limit(50)`
 - **HTTP Range Requests** - Only fetch the bytes you need, not the entire file
 - **Local + Remote** - Drag & drop local files or load from URL
