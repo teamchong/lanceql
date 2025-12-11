@@ -4465,6 +4465,10 @@
             // Update the vector search UI and run search
             document.getElementById('vector-col').value = colIdx;
             document.getElementById('query-row').value = rowIdx;
+            // Clear text search since we're doing row-based search
+            document.getElementById('clip-text-input').value = '';
+            // Sync to SQL/DataFrame
+            updateVectorSearchSync();
 
             // Switch to vector search tab
             document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
