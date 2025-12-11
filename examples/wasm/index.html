@@ -3919,19 +3919,21 @@
 
         // Export buttons
         document.getElementById('export-csv').addEventListener('click', () => {
-            if (!lastResult || lastResult.rows.length === 0) {
+            const result = $lastResult.get();
+            if (!result || result.rows.length === 0) {
                 showStatus('No data to export', 'error');
                 return;
             }
-            exportAsCSV(lastResult);
+            exportAsCSV(result);
         });
 
         document.getElementById('export-json').addEventListener('click', () => {
-            if (!lastResult || lastResult.rows.length === 0) {
+            const result = $lastResult.get();
+            if (!result || result.rows.length === 0) {
                 showStatus('No data to export', 'error');
                 return;
             }
-            exportAsJSON(lastResult);
+            exportAsJSON(result);
         });
 
         function exportAsCSV(result) {
