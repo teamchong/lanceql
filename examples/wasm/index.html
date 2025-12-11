@@ -2408,13 +2408,16 @@
             const filterOp = document.getElementById('df-filter-op').value;
             const filterVal = document.getElementById('df-filter-value').value;
             const limit = document.getElementById('df-limit').value;
+            const selectCols = document.getElementById('df-select-cols');
+            const selectedColumns = Array.from(selectCols.selectedOptions).map(opt => opt.value);
 
             const query = {
                 url: currentFile?._url,
                 version: currentFile?.version,
                 search: searchQuery || null,
                 encoder: searchEncoder,
-                limit: limit ? parseInt(limit) : null
+                limit: limit ? parseInt(limit) : null,
+                select: selectedColumns.length > 0 ? selectedColumns : null
             };
 
             // Add filter if specified
