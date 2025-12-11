@@ -1326,9 +1326,7 @@
                     <div class="dataset-hint" id="dataset-hint" style="display: none;"></div>
                 </div>
                 <div class="run-section">
-                    <button class="btn btn-primary" id="run-sql-btn"
-                            :disabled="$store.app.isLoading"
-                            title="⌘/Ctrl+Enter">
+                    <button class="btn btn-primary" id="run-sql-btn" title="⌘/Ctrl+Enter">
                         <template x-if="$store.app.isLoading">
                             <span><span class="spinner"></span> Running...</span>
                         </template>
@@ -1392,9 +1390,7 @@
                     </div>
                 </div>
                 <div class="run-section">
-                    <button class="btn btn-primary" id="run-df-btn"
-                            :disabled="$store.app.isLoading"
-                            title="⌘/Ctrl+Enter">
+                    <button class="btn btn-primary" id="run-df-btn" title="⌘/Ctrl+Enter">
                         <template x-if="$store.app.isLoading">
                             <span><span class="spinner"></span> Executing...</span>
                         </template>
@@ -1473,7 +1469,7 @@
 
                 <div class="run-section">
                     <button class="btn btn-primary" id="run-vector-btn"
-                            :disabled="$store.app.isLoading || (!$store.app.queryRow && !$store.app.searchText)"
+                            :disabled="!$store.app.queryRow && !$store.app.searchText"
                             style="background: #7c3aed;">
                         <template x-if="$store.app.isLoading">
                             <span><span class="spinner"></span> <span x-text="$store.app.queryRow ? 'Searching Row...' : 'Searching Text...'"></span></span>
