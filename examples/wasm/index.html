@@ -2339,18 +2339,23 @@
                 if (query.topK) {
                     document.getElementById('top-k').value = query.topK;
                 }
+                // Clear query-row if no searchRow (don't persist row search when cleared)
                 if (query.searchRow !== undefined && query.searchRow !== null) {
                     document.getElementById('query-row').value = query.searchRow;
+                } else {
+                    document.getElementById('query-row').value = '';
                 }
-                // Update vector column dropdown if specified
+                // Update vector column dropdown if specified, reset if not
+                const vectorColSelect = document.getElementById('vector-col');
                 if (query.vectorColumn) {
-                    const vectorColSelect = document.getElementById('vector-col');
                     for (let opt of vectorColSelect.options) {
                         if (opt.text === query.vectorColumn) {
                             vectorColSelect.value = opt.value;
                             break;
                         }
                     }
+                } else {
+                    vectorColSelect.selectedIndex = 0; // Reset to first option
                 }
             }
 
