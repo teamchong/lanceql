@@ -1460,7 +1460,10 @@
                 </div>
             </div>
 
-            <div class="status" id="query-status"></div>
+            <div class="status"
+                 :class="{ 'show': $store.app.statusMessage, [$store.app.statusType]: true }"
+                 x-text="$store.app.statusMessage"
+                 id="query-status"></div>
         </section>
 
         <!-- Results -->
@@ -1560,12 +1563,26 @@
                 fileSize: '',
                 colCount: 0,
                 rowCount: '',
+                statusMessage: '',
+                statusType: '',
+                statusTimeout: null,
                 formatBytes(bytes) {
                     if (bytes === 0) return '0 B';
                     const k = 1024;
                     const sizes = ['B', 'KB', 'MB', 'GB'];
                     const i = Math.floor(Math.log(bytes) / Math.log(k));
                     return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+                },
+                showStatus(message, type) {
+                    this.statusMessage = message;
+                    this.statusType = type;
+                    if (this.statusTimeout) clearTimeout(this.statusTimeout);
+                    if (type === 'success') {
+                        this.statusTimeout = setTimeout(() => {
+                            this.statusMessage = '';
+                            this.statusType = '';
+                        }, 3000);
+                    }
                 }
             });
 
@@ -3603,13 +3620,7 @@
         }
 
         function showStatus(message, type) {
-            const status = document.getElementById('query-status');
-            status.textContent = message;
-            status.className = 'status show ' + type;
-
-            if (type === 'success') {
-                setTimeout(() => status.classList.remove('show'), 3000);
-            }
+            Alpine.store('app').showStatus(message, type);
         }
 
         // Load from URL using HTTP Range requests (lazy loading)
