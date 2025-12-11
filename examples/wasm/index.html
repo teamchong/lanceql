@@ -374,7 +374,7 @@
         .df-editor-container {
             position: relative;
             width: 100%;
-            height: 200px;
+            height: 300px;
         }
         .df-highlight, .df-textarea {
             position: absolute;
@@ -1138,6 +1138,40 @@
             from { transform: rotate(0deg); }
             to { transform: rotate(360deg); }
         }
+
+        /* Mobile responsive */
+        @media (max-width: 768px) {
+            .container { padding: 8px; }
+            header { gap: 8px; }
+            .logo { font-size: 16px; }
+            .file-section { padding: 12px; }
+            .drop-zone { padding: 20px; }
+            .url-input-group { flex-direction: column; }
+            .url-input-group input { width: 100%; }
+            .file-info { flex-wrap: wrap; gap: 8px; }
+            .file-info .file-icon { display: none; }
+            .file-info .file-details { flex: 1; min-width: 150px; }
+            .file-info .file-stats { flex: 1; min-width: 100px; }
+            .file-info .btn-change-file { width: 100%; margin-top: 8px; }
+            .tabs-header { flex-wrap: wrap; gap: 4px; }
+            .tab-btn { padding: 8px 10px; font-size: 12px; flex: 1; min-width: 100px; }
+            .tab-btn svg { display: none; }
+            .df-builder { flex-direction: column; gap: 12px; }
+            .df-step { min-width: 100%; flex-wrap: wrap; }
+            .df-step-num, .df-step-label { flex-shrink: 0; }
+            .df-step select, .df-step input { flex: 1; min-width: 150px; width: auto; }
+            .results-table { font-size: 11px; }
+            .results-table th, .results-table td { padding: 4px 6px; }
+            .clip-examples, .search-examples { flex-wrap: wrap; gap: 4px; }
+            .clip-example, .search-example { padding: 4px 8px; font-size: 11px; }
+            .vector-search-settings { flex-direction: column; gap: 8px; align-items: stretch; }
+            .vector-search-settings label { min-width: auto; }
+            .vector-search-settings select, .vector-search-settings input { width: 100%; }
+            .clip-text-input input { width: 100%; }
+            .run-section { justify-content: stretch; }
+            .run-section .btn { width: 100%; }
+            .column-chips { flex-wrap: wrap; }
+        }
     </style>
 </head>
 <body>
@@ -1280,7 +1314,7 @@
                     <div class="dataset-hint" id="dataset-hint" style="display: none;"></div>
                 </div>
                 <div class="run-section">
-                    <button class="btn btn-primary" id="run-sql-btn" disabled>
+                    <button class="btn btn-primary" id="run-sql-btn" disabled title="⌘/Ctrl+Enter">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                             <polygon points="5,3 19,12 5,21"/>
                         </svg>
@@ -1321,7 +1355,7 @@
                     <div class="df-step">
                         <div class="df-step-num">3</div>
                         <div class="df-step-label">Select</div>
-                        <select id="df-select-cols" multiple size="2" style="min-width: 200px;">
+                        <select id="df-select-cols" multiple size="6" style="min-width: 200px;">
                         </select>
                         <span style="color: #64748b; font-size: 12px;">Cmd/Ctrl+click for multiple</span>
                     </div>
@@ -1337,7 +1371,7 @@
                     </div>
                 </div>
                 <div class="run-section">
-                    <button class="btn btn-primary" id="run-df-btn" disabled>
+                    <button class="btn btn-primary" id="run-df-btn" disabled title="⌘/Ctrl+Enter">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
                             <polygon points="5,3 19,12 5,21"/>
                         </svg>
@@ -1601,6 +1635,13 @@
         sqlInput.addEventListener('scroll', () => {
             sqlHighlight.scrollTop = sqlInput.scrollTop;
             sqlHighlight.scrollLeft = sqlInput.scrollLeft;
+        });
+        // Cmd/Ctrl+Enter to run query
+        sqlInput.addEventListener('keydown', (e) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                e.preventDefault();
+                runSqlQuery();
+            }
         });
 
         // Initial highlight
@@ -2612,6 +2653,14 @@
             textarea.addEventListener('scroll', () => {
                 highlight.scrollTop = textarea.scrollTop;
                 highlight.scrollLeft = textarea.scrollLeft;
+            });
+
+            // Cmd/Ctrl+Enter to run query
+            textarea.addEventListener('keydown', (e) => {
+                if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+                    e.preventDefault();
+                    runSqlQuery();
+                }
             });
         }
 
