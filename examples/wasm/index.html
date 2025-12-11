@@ -1495,7 +1495,7 @@
                  :class="{ 'show': $store.app.statusMessage, [$store.app.statusType]: true }"
                  id="query-status">
                 <span x-text="$store.app.statusMessage"></span>
-                <a x-show="$store.app.showResetLink" href="./" style="color: inherit; text-decoration: underline; margin-left: 8px;">(Restart)</a>
+                <span x-show="$store.app.showResetLink" style="margin-left: 8px;">(<a href="./" style="color: inherit;">Restart</a>)</span>
             </div>
         </section>
 
@@ -2003,7 +2003,13 @@
 
             if (currentFile) currentFile.close();
             const newFile = lanceql.open(data);
-            newFile.columnNames = columnNames; // Store column names from manifest
+            // Use provided column names or generate defaults
+            if (columnNames) {
+                newFile.columnNames = columnNames;
+            } else {
+                // Generate default column names if none provided
+                newFile.columnNames = Array.from({ length: newFile.numColumns }, (_, i) => `column_${i}`);
+            }
             $currentFile.set(newFile);
             $columnTypes.set([]);
 
