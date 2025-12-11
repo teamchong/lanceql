@@ -2265,6 +2265,25 @@
                 document.getElementById('df-input').value = dfCode;
                 document.getElementById('df-input').dataset.userEdited = 'false';
                 document.getElementById('df-highlight').innerHTML = highlightDfCode(dfCode) + '\n';
+                // Also update DataFrame builder fields
+                document.getElementById('df-search-query').value = query.search || '';
+                if (query.encoder) {
+                    document.getElementById('df-search-encoder').value = query.encoder;
+                }
+                if (query.limit) {
+                    document.getElementById('df-limit').value = query.limit;
+                }
+            }
+
+            // Update Vector Search tab (if not source)
+            if (source !== 'vector') {
+                document.getElementById('clip-text-input').value = query.search || '';
+                if (query.encoder) {
+                    document.getElementById('clip-model-select').value = query.encoder;
+                }
+                if (query.limit) {
+                    document.getElementById('top-k').value = query.limit;
+                }
             }
 
             // Update URL hash
@@ -4124,6 +4143,32 @@
 
         // Vector Search
         document.getElementById('run-vector-btn').addEventListener('click', runVectorSearch);
+
+        // Vector Search field sync - update SQL/DataFrame when fields change
+        function updateVectorSearchSync() {
+            const searchText = document.getElementById('clip-text-input').value.trim();
+            const encoder = document.getElementById('clip-model-select').value;
+            const topK = document.getElementById('top-k').value;
+
+            const query = {
+                url: currentFile?._url,
+                version: currentFile?.version,
+                search: searchText || null,
+                encoder: encoder,
+                limit: topK ? parseInt(topK) : 20
+            };
+
+            syncQueryTabs(query, 'vector');
+        }
+
+        // Add event listeners for Vector Search fields
+        ['clip-text-input', 'clip-model-select', 'top-k'].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) {
+                el.addEventListener('change', updateVectorSearchSync);
+                el.addEventListener('input', updateVectorSearchSync);
+            }
+        });
 
         // Search example buttons
         document.querySelectorAll('.search-example').forEach(btn => {
