@@ -2571,11 +2571,12 @@
                 }
             }
 
-            // Extract .search("query", encoder="encoder")
-            const searchMatch = code.match(/\.search\s*\(\s*["']([^"']+)["'](?:\s*,\s*encoder\s*=\s*["']([^"']+)["'])?\s*\)/);
+            // Extract .search("query", encoder="encoder", top_k=N)
+            const searchMatch = code.match(/\.search\s*\(\s*["']([^"']+)["'](?:\s*,\s*encoder\s*=\s*["']([^"']+)["'])?(?:\s*,\s*top_k\s*=\s*(\d+))?\s*\)/);
             if (searchMatch) {
                 ops.search = searchMatch[1];
                 ops.searchEncoder = searchMatch[2] || 'minilm';
+                ops.topK = searchMatch[3] ? parseInt(searchMatch[3]) : 20;
             }
 
             // Extract .filter("col", "op", value)
