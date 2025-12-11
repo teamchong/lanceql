@@ -4290,7 +4290,11 @@
         }
 
         // Vector Search
-        document.getElementById('run-vector-btn').addEventListener('click', runVectorSearch);
+        document.getElementById('run-vector-btn').addEventListener('click', async () => {
+            // Sync vector search fields to SQL, then run SQL query
+            updateVectorSearchSync();
+            await runSqlQuery();
+        });
 
         // Vector Search field sync - update SQL/DataFrame when fields change
         function updateVectorSearchSync() {
@@ -4367,79 +4371,6 @@
                 }
             });
         });
-
-        async function runVectorSearch() {
-            if (!currentFile || !currentFile._isRemote) {
-                showStatus('Vector search requires a remote file', 'error');
-                return;
-            }
-
-            const vectorColIdx = parseInt(document.getElementById('vector-col').value);
-            const queryRowIdx = parseInt(document.getElementById('query-row').value);
-            const topK = parseInt(document.getElementById('top-k').value) || 20;
-
-            if (isNaN(vectorColIdx)) {
-                showStatus('Please select a vector column', 'error');
-                return;
-            }
-
-            try {
-                setLoading(true);
-                showStatus('Reading query vector...', 'info');
-
-                // Get query vector from the specified row
-                const queryVec = await currentFile.readVectorAt(vectorColIdx, queryRowIdx);
-
-                if (queryVec.length === 0) {
-                    showStatus('Failed to read query vector', 'error');
-                    setLoading(false);
-                    return;
-                }
-
-                const hasIndex = currentFile.hasIndex?.() || false;
-                const searchMode = hasIndex ? 'ANN (IVF index)' : 'brute-force';
-                showStatus(`Searching with ${queryVec.length}-dim vector from row ${queryRowIdx} [${searchMode}]...`, 'info');
-
-                // Run vector search
-                const results = await currentFile.vectorSearch(
-                    vectorColIdx,
-                    queryVec,
-                    topK,
-                    (current, total) => {
-                        showProgress(`Scanning vectors...`, current, total);
-                    }
-                );
-
-                hideProgress();
-
-                // Get the image URLs (assuming column 0 is URL)
-                const urlColIdx = 0;  // Assuming first column has URLs
-                const urls = await currentFile.readStringsAtIndices(urlColIdx, results.indices);
-
-                // Build results
-                const columns = ['rank', 'row_idx', 'similarity', 'image'];
-                const rows = results.indices.map((idx, i) => [
-                    (i + 1).toString(),
-                    idx.toString(),
-                    results.scores[i].toFixed(4),
-                    urls[i] || ''
-                ]);
-
-                // Display results
-                displayResults({
-                    columns,
-                    rows,
-                    total: results.indices.length
-                });
-
-                showStatus(`Found ${results.indices.length} similar images (query: row ${queryRowIdx})`, 'success');
-            } catch (err) {
-                showStatus('Vector search error: ' + err.message, 'error');
-                console.error(err);
-            } finally {
-                setLoading(false);
-            }
-        }
 
         // Populate vector column select when remote file loads
         async function populateVectorColumns() {
