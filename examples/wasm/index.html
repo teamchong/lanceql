@@ -1202,8 +1202,8 @@
         </header>
 
         <!-- File Loader -->
-        <section class="file-section">
-            <div id="file-loader-section">
+        <section class="file-section" :class="{ 'collapsed': $store.app.fileLoaderCollapsed }">
+            <div id="file-loader-section" x-show="!$store.app.fileLoaderCollapsed">
                 <div class="drop-zone" id="drop-zone">
                     <p>Drop a .lance folder here or click to select</p>
                     <p style="font-size: 12px;">Select the dataset_name.lance folder</p>
@@ -1274,16 +1274,16 @@
         </section>
 
         <!-- Query Interface -->
-        <section class="tabs-container" id="query-section" style="display: none;">
+        <section class="tabs-container" id="query-section" x-show="$store.app.showQuery" style="display: none;">
             <div class="tabs-header">
-                <button class="tab-btn active" data-tab="sql">
+                <button class="tab-btn" :class="{ 'active': $store.app.activeTab === 'sql' }" @click="$store.app.activeTab = 'sql'" data-tab="sql">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <polyline points="16,18 22,12 16,6"/>
                         <polyline points="8,6 2,12 8,18"/>
                     </svg>
                     SQL Query
                 </button>
-                <button class="tab-btn" data-tab="dataframe">
+                <button class="tab-btn" :class="{ 'active': $store.app.activeTab === 'dataframe' }" @click="$store.app.activeTab = 'dataframe'" data-tab="dataframe">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <rect x="3" y="3" width="7" height="7"/>
                         <rect x="14" y="3" width="7" height="7"/>
@@ -1292,7 +1292,7 @@
                     </svg>
                     DataFrame Builder
                 </button>
-                <button class="tab-btn" data-tab="vector">
+                <button class="tab-btn" :class="{ 'active': $store.app.activeTab === 'vector' }" @click="$store.app.activeTab = 'vector'" data-tab="vector">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <circle cx="11" cy="11" r="8"/>
                         <line x1="21" y1="21" x2="16.65" y2="16.65"/>
@@ -1302,7 +1302,7 @@
             </div>
 
             <!-- SQL Tab -->
-            <div class="tab-content active" id="tab-sql">
+            <div class="tab-content" :class="{ 'active': $store.app.activeTab === 'sql' }" id="tab-sql">
                 <div class="sql-editor">
                     <div class="sql-editor-container">
                         <textarea class="sql-textarea" id="sql-input" placeholder="SELECT * FROM read_lance('https://...') LIMIT 50">SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50</textarea>
@@ -1343,7 +1343,7 @@
             </div>
 
             <!-- DataFrame Tab -->
-            <div class="tab-content" id="tab-dataframe">
+            <div class="tab-content" :class="{ 'active': $store.app.activeTab === 'dataframe' }" id="tab-dataframe">
                 <div class="df-builder">
                     <div class="df-step">
                         <div class="df-step-num">1</div>
@@ -1407,7 +1407,7 @@
             </div>
 
             <!-- Vector Search Tab -->
-            <div class="tab-content" id="tab-vector">
+            <div class="tab-content" :class="{ 'active': $store.app.activeTab === 'vector' }" id="tab-vector">
                 <div class="vector-search">
                     <div class="vector-notice">
                         <strong>Semantic Search:</strong> Find similar images by searching with a reference image's embedding.
@@ -1494,7 +1494,7 @@
         </section>
 
         <!-- Results -->
-        <section class="results-section" id="results-section" style="display: none;">
+        <section class="results-section" id="results-section" x-show="$store.app.showResults" style="display: none;">
             <div class="results-header">
                 <h3>
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1619,6 +1619,10 @@
                 isLoading: false,
                 queryRow: '',
                 searchText: '',
+                showResults: false,
+                showQuery: false,
+                fileLoaderCollapsed: false,
+                activeTab: 'sql',
                 formatBytes(bytes) {
                     if (bytes === 0) return '0 B';
                     const k = 1024;
@@ -1663,7 +1667,7 @@
                 console.log('LanceQL loaded:', lanceql.getVersion());
 
                 // Show query section immediately - queries can load their own data via read_lance()
-                document.getElementById('query-section').style.display = 'block';
+                Alpine.store('app').showQuery = true;
                 document.getElementById('run-sql-btn').disabled = false;
 
                 // Set default URL in input for reference
@@ -1704,18 +1708,13 @@
 
         // Collapse file loader when file is loaded
         function collapseFileLoader() {
-            document.getElementById('file-loader-section').classList.add('collapsed');
+            Alpine.store('app').fileLoaderCollapsed = true;
         }
 
-        // Tab switching
-        document.querySelectorAll('.tab-btn').forEach(btn => {
-            btn.addEventListener('click', () => {
-                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-                btn.classList.add('active');
-                document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
-            });
-        });
+        // Tab switching helper for programmatic switches
+        function switchTab(tabName) {
+            Alpine.store('app').activeTab = tabName;
+        }
 
         // SQL syntax highlighting
         function highlightSQL(sql) {
@@ -2039,7 +2038,7 @@
             collapseFileLoader();
 
             // Show query section
-            document.getElementById('query-section').style.display = 'block';
+            Alpine.store('app').showQuery = true;
             document.getElementById('run-sql-btn').disabled = false;
             document.getElementById('run-df-btn').disabled = false;
 
@@ -2089,7 +2088,7 @@
             }
 
             // Show results section
-            document.getElementById('results-section').style.display = 'block';
+            Alpine.store('app').showResults = true;
 
             showStatus('Loaded successfully - ' + currentFile.numColumns + ' columns, ' + rowCount.toLocaleString() + ' rows', 'success');
             // Update DataFrame preview but don't sync to SQL (preserve user's SQL)
@@ -3015,7 +3014,7 @@
                     orderByOnSubset: result.orderByOnSubset
                 };
 
-                document.getElementById('results-section').style.display = 'block';
+                Alpine.store('app').showResults = true;
                 displayResults(formattedResult);
                 hideProgress();
                 showStatus(`Query completed: ${result.rows.length} rows`, 'success');
@@ -3728,7 +3727,7 @@
                 await populateVectorColumns();
 
                 // Show query section
-                document.getElementById('query-section').style.display = 'block';
+                Alpine.store('app').showQuery = true;
                 document.getElementById('run-sql-btn').disabled = false;
                 document.getElementById('run-df-btn').disabled = false;
 
@@ -3763,7 +3762,7 @@
                 }
 
                 // Show results section
-                document.getElementById('results-section').style.display = 'block';
+                Alpine.store('app').showResults = true;
 
                 // Hide aggregation bar for remote files (would need full scan)
                 document.getElementById('agg-bar').style.display = 'none';
@@ -4169,10 +4168,7 @@
             updateVectorSearchSync();
 
             // Switch to SQL tab and run the query (SQL now has full SELECT/WHERE/LIMIT support)
-            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-            document.querySelector('[data-tab="sql"]').classList.add('active');
-            document.getElementById('tab-sql').classList.add('active');
+            switchTab('sql');
 
             // Run the SQL query (which honors SELECT *, WHERE, LIMIT etc.)
             await runSqlQuery();
@@ -4571,7 +4567,7 @@
             // Handle aggregation queries (COUNT, SUM, etc. after SEARCH)
             if (isAggregation) {
                 const aggResults = computeAggregationsOnSearchResults(ast, columnData, results);
-                document.getElementById('results-section').style.display = 'block';
+                Alpine.store('app').showResults = true;
                 displayResults({
                     columns: aggResults.columns,
                     rows: aggResults.rows,
@@ -4589,7 +4585,7 @@
                 return;
             }
 
-            document.getElementById('results-section').style.display = 'block';
+            Alpine.store('app').showResults = true;
             displayResults({ columns: displayColumns, rows, total: filteredIndices.length });
             const filterMsg = ast.where ? ` (filtered from ${results.indices.length})` : '';
             const searchDesc = searchRow !== undefined && searchRow !== null ? `row ${searchRow}` : `"${query}"`;
@@ -4659,156 +4655,6 @@
                 columns: aggColumns,
                 rows: [aggValues.map(v => v === null ? '' : (typeof v === 'number' ? (Number.isInteger(v) ? v.toString() : v.toFixed(4)) : String(v)))]
             };
-        }
-
-        async function runClipSearch() {
-            const text = document.getElementById('clip-text-input').value.trim();
-            if (!text) {
-                showStatus('Enter a text description', 'error');
-                return;
-            }
-
-            const vectorColIdx = parseInt(document.getElementById('vector-col').value);
-            if (isNaN(vectorColIdx)) {
-                showStatus('Select a vector column first', 'error');
-                return;
-            }
-
-            // Start new search (cancels any in-progress)
-            const signal = startSearch();
-
-            const topK = parseInt(document.getElementById('top-k').value) || 20;
-            const encoder = document.getElementById('clip-model-select').value;
-
-            // Sync other tabs with this vector search query
-            const query = {
-                url: currentFile?._url,
-                version: currentFile?.version,
-                search: text,
-                encoder: encoder,
-                limit: topK
-            };
-            syncQueryTabs(query, 'vector');
-
-            try {
-                setLoading(true);
-                showSearchLoading();
-
-                let queryVec;
-                const isClipModel = encoder.startsWith('clip');
-                const modelName = encoder === 'minilm' ? 'MiniLM' : encoder === 'clip-openai' ? 'CLIP OpenAI' : 'CLIP LAION';
-
-                if (isClipModel) {
-                    // Set the correct CLIP model URL
-                    const clipModelUrl = encoder === 'clip-openai'
-                        ? 'https://data.metal0.dev/models/clip-vit-b32-openai.gguf'
-                        : 'https://data.metal0.dev/models/clip-vit-b32.gguf';
-
-                    // Force reload if different model selected
-                    if (clipModelLoaded && window._loadedClipModelUrl !== clipModelUrl) {
-                        clipModelLoaded = false;
-                    }
-                    window._loadedClipModelUrl = clipModelUrl;
-                    window._clipModelUrlOverride = clipModelUrl;
-
-                    if (!clipModelLoaded) {
-                        const loaded = await ensureClipModelLoaded();
-                        if (!loaded) {
-                            setLoading(false);
-                            return;
-                        }
-                    }
-                    showStatus(`Encoding "${text}" with ${modelName}...`, 'info');
-                    queryVec = encodeTextWithClip(text);
-                } else {
-                    // MiniLM
-                    if (!minilmModelLoaded) {
-                        const loaded = await ensureMinilmModelLoaded();
-                        if (!loaded) {
-                            setLoading(false);
-                            return;
-                        }
-                    }
-                    showStatus(`Encoding "${text}" with MiniLM...`, 'info');
-                    queryVec = encodeTextWithMinilm(text);
-                }
-
-                if (!queryVec) {
-                    showStatus(`Failed to encode text with ${modelName}`, 'error');
-                    setLoading(false);
-                    return;
-                }
-
-                console.log(`${modelName} query embedding (first 8):`, Array.from(queryVec.slice(0, 8)).map(v => v.toFixed(4)));
-                console.log('Query embedding L2 norm:', Math.sqrt(queryVec.reduce((sum, v) => sum + v*v, 0)).toFixed(4));
-                showStatus(`Searching embeddings...`, 'info');
-
-                // Run vector search
-                const results = await currentFile.vectorSearch(
-                    vectorColIdx,
-                    queryVec,
-                    topK,
-                    (current, total) => {
-                        showProgress(`Scanning vectors...`, current, total);
-                    }
-                );
-
-                hideProgress();
-
-                // Fetch all columns for results
-                const colNames = currentFile.columnNames || [];
-                const columns = ['score', ...colNames];
-                const columnData = {};
-
-                for (let c = 0; c < colNames.length; c++) {
-                    const type = columnTypes[c];
-                    if (type === 'string') {
-                        columnData[c] = await currentFile.readStringsAtIndices(c, results.indices);
-                    } else if (type === 'int64' || type === 'int32') {
-                        columnData[c] = await currentFile.readInt64AtIndices(c, results.indices);
-                    } else if (type === 'float64' || type === 'float32' || type === 'double') {
-                        columnData[c] = await currentFile.readFloat64AtIndices(c, results.indices);
-                    } else if (type === 'vector') {
-                        columnData[c] = results.indices.map(() => '[vector]');
-                    } else {
-                        columnData[c] = results.indices.map(() => '');
-                    }
-                }
-
-                // Build rows from column data
-                const rows = [];
-                for (let i = 0; i < results.indices.length; i++) {
-                    const score = results.scores[i];
-                    const row = [score.toFixed(4)];
-
-                    for (let c = 0; c < colNames.length; c++) {
-                        const val = columnData[c][i];
-                        if (val === null || val === undefined) {
-                            row.push('');
-                        } else if (typeof val === 'number') {
-                            row.push(Number.isInteger(val) ? val.toString() : val.toFixed(4));
-                        } else {
-                            row.push(val);
-                        }
-                    }
-                    rows.push(row);
-                }
-
-                console.log('Search results - top scores:', results.scores.slice(0, 5));
-                displayResults({ columns, rows, total: results.indices.length });
-                showStatus(`Found ${results.indices.length} results for "${text}" (top score: ${results.scores[0]?.toFixed(4) || 'N/A'})`, 'success');
-            } catch (err) {
-                if (err.name === 'AbortError' || isSearchCancelled(signal)) {
-                    console.log('Search cancelled');
-                    return;
-                }
-                showStatus('Text search error: ' + err.message, 'error');
-                console.error(err);
-            } finally {
-                if (!isSearchCancelled(signal)) {
-                    setLoading(false);
-                }
-            }
         }
 
         // =============================================
