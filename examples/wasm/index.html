@@ -2225,10 +2225,24 @@
             if (query.filter) {
                 sql += ` WHERE ${query.filter.column} ${query.filter.op} ${query.filter.value}`;
             }
-            if (query.search) {
+            if (query.searchRow !== undefined && query.searchRow !== null) {
+                sql += ` SEARCH ROW ${query.searchRow}`;
+                if (query.vectorColumn) {
+                    sql += ` COLUMN ${query.vectorColumn}`;
+                }
+                if (query.topK) {
+                    sql += ` TOP ${query.topK}`;
+                }
+            } else if (query.search) {
                 sql += ` SEARCH '${query.search}'`;
+                if (query.vectorColumn) {
+                    sql += ` COLUMN ${query.vectorColumn}`;
+                }
+                if (query.topK) {
+                    sql += ` TOP ${query.topK}`;
+                }
             }
-            if (query.limit) {
+            if (query.limit && !query.searchRow && !query.search) {
                 sql += ` LIMIT ${query.limit}`;
             }
 
@@ -2238,9 +2252,15 @@
             dfCode += `dataset = lanceql.open("${url}"${versionArg})\n\n`;
             dfCode += `result = (\n`;
             dfCode += `    dataset.df()\n`;
-            if (query.search) {
+            if (query.searchRow !== undefined && query.searchRow !== null) {
+                const topK = query.topK || 20;
+                const colArg = query.vectorColumn ? `, column="${query.vectorColumn}"` : '';
+                dfCode += `    .search_by_row(${query.searchRow}${colArg}, top_k=${topK})\n`;
+            } else if (query.search) {
                 const encoder = query.encoder || 'minilm';
-                dfCode += `    .search("${query.search}", encoder="${encoder}")\n`;
+                const topK = query.topK || 20;
+                const colArg = query.vectorColumn ? `, column="${query.vectorColumn}"` : '';
+                dfCode += `    .search("${query.search}", encoder="${encoder}"${colArg}, top_k=${topK})\n`;
             }
             if (query.filter) {
                 dfCode += `    .filter("${query.filter.column}", "${query.filter.op}", ${query.filter.value})\n`;
@@ -2281,8 +2301,21 @@
                 if (query.encoder) {
                     document.getElementById('clip-model-select').value = query.encoder;
                 }
-                if (query.limit) {
-                    document.getElementById('top-k').value = query.limit;
+                if (query.topK) {
+                    document.getElementById('top-k').value = query.topK;
+                }
+                if (query.searchRow !== undefined && query.searchRow !== null) {
+                    document.getElementById('query-row').value = query.searchRow;
+                }
+                // Update vector column dropdown if specified
+                if (query.vectorColumn) {
+                    const vectorColSelect = document.getElementById('vector-col');
+                    for (let opt of vectorColSelect.options) {
+                        if (opt.text === query.vectorColumn) {
+                            vectorColSelect.value = opt.value;
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -2330,6 +2363,18 @@
                     value: parseFloat(whereMatch[3])
                 };
             }
+
+            // Extract SEARCH ROW N
+            const searchRowMatch = sql.match(/SEARCH\s+ROW\s+(\d+)/i);
+            if (searchRowMatch) query.searchRow = parseInt(searchRowMatch[1]);
+
+            // Extract COLUMN name (for vector search)
+            const columnMatch = sql.match(/COLUMN\s+(\w+)/i);
+            if (columnMatch) query.vectorColumn = columnMatch[1];
+
+            // Extract TOP K
+            const topKMatch = sql.match(/TOP\s+(\d+)/i);
+            if (topKMatch) query.topK = parseInt(topKMatch[1]);
 
             return query;
         }
@@ -2409,7 +2454,11 @@
             const filterVal = document.getElementById('df-filter-value').value;
             const limit = document.getElementById('df-limit').value;
             const selectCols = document.getElementById('df-select-cols');
-            const selectedColumns = Array.from(selectCols.selectedOptions).map(opt => opt.value);
+            const selectedColumnIndices = Array.from(selectCols.selectedOptions).map(opt => opt.value);
+            // Convert indices to column names
+            const selectedColumns = selectedColumnIndices.map(idx =>
+                currentFile?.columnNames?.[parseInt(idx)] || `col_${idx}`
+            );
 
             const query = {
                 url: currentFile?._url,
@@ -4152,20 +4201,25 @@
             const searchText = document.getElementById('clip-text-input').value.trim();
             const encoder = document.getElementById('clip-model-select').value;
             const topK = document.getElementById('top-k').value;
+            const vectorColSelect = document.getElementById('vector-col');
+            const vectorCol = vectorColSelect.selectedOptions[0]?.text || null;
+            const queryRow = document.getElementById('query-row').value;
 
             const query = {
                 url: currentFile?._url,
                 version: currentFile?.version,
                 search: searchText || null,
                 encoder: encoder,
-                limit: topK ? parseInt(topK) : 20
+                topK: topK ? parseInt(topK) : 20,
+                vectorColumn: vectorCol,
+                searchRow: queryRow ? parseInt(queryRow) : null
             };
 
             syncQueryTabs(query, 'vector');
         }
 
         // Add event listeners for Vector Search fields
-        ['clip-text-input', 'clip-model-select', 'top-k'].forEach(id => {
+        ['clip-text-input', 'clip-model-select', 'top-k', 'vector-col', 'query-row'].forEach(id => {
             const el = document.getElementById(id);
             if (el) {
                 el.addEventListener('change', updateVectorSearchSync);
