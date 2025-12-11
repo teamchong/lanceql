@@ -311,6 +311,17 @@
             background: #475569;
             color: #e2e8f0;
         }
+        .sql-example.copy-link-btn {
+            background: #1e3a5f;
+            color: #60a5fa;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        .sql-example.copy-link-btn:hover {
+            background: #1e40af;
+            color: #93c5fd;
+        }
 
         /* DataFrame Builder */
         .df-builder {
@@ -1258,6 +1269,13 @@
                         <button class="sql-example" data-sql="SELECT AVG(aesthetic), MIN(aesthetic), MAX(aesthetic) FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 10000">Stats 10K</button>
                         <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') SEARCH 'cat' LIMIT 20">Search 'cat'</button>
                         <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') AT VERSION 1 LIMIT 50">Version 1</button>
+                        <button class="sql-example copy-link-btn" id="copy-link-btn" title="Copy shareable link">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
+                                <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+                            </svg>
+                            Share
+                        </button>
                     </div>
                     <div class="dataset-hint" id="dataset-hint" style="display: none;"></div>
                 </div>
@@ -1491,8 +1509,18 @@
                 // Set default URL in input for reference
                 document.getElementById('url-input').value = DEFAULT_DATASET_URL;
 
-                // Set default query and run it (query contains its own data source)
-                document.getElementById('sql-input').value = DEFAULT_QUERY;
+                // Check URL hash for shared query
+                const hashParams = new URLSearchParams(window.location.hash.slice(1));
+                const sharedSql = hashParams.get('sql');
+
+                if (sharedSql) {
+                    // Use shared query from URL
+                    document.getElementById('sql-input').value = decodeURIComponent(sharedSql);
+                    showStatus('Loaded shared query from URL', 'info');
+                } else {
+                    // Use default query
+                    document.getElementById('sql-input').value = DEFAULT_QUERY;
+                }
                 updateSQLHighlight();
                 setTimeout(runSqlQuery, 100);
             } catch (err) {
@@ -2335,6 +2363,10 @@
                 showStatus('Please enter a SQL query', 'error');
                 return;
             }
+
+            // Update URL hash for sharing (without triggering page reload)
+            const newHash = `sql=${encodeURIComponent(sql)}`;
+            history.replaceState(null, '', `#${newHash}`);
 
             try {
                 setLoading(true);
@@ -3778,6 +3810,23 @@
 
         document.getElementById('run-sql-btn').addEventListener('click', runSqlQuery);
         document.getElementById('run-df-btn').addEventListener('click', runDfQuery);
+
+        // Share button - copy link to clipboard
+        document.getElementById('copy-link-btn').addEventListener('click', async () => {
+            const sql = document.getElementById('sql-input').value.trim();
+            if (!sql) {
+                showStatus('No query to share', 'error');
+                return;
+            }
+            const shareUrl = `${window.location.origin}${window.location.pathname}#sql=${encodeURIComponent(sql)}`;
+            try {
+                await navigator.clipboard.writeText(shareUrl);
+                showStatus('Link copied to clipboard!', 'success');
+            } catch (e) {
+                // Fallback for older browsers
+                prompt('Copy this link:', shareUrl);
+            }
+        });
 
         // Export buttons
         document.getElementById('export-csv').addEventListener('click', () => {
