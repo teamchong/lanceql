@@ -1493,8 +1493,10 @@
 
             <div class="status"
                  :class="{ 'show': $store.app.statusMessage, [$store.app.statusType]: true }"
-                 x-text="$store.app.statusMessage"
-                 id="query-status"></div>
+                 id="query-status">
+                <span x-text="$store.app.statusMessage"></span>
+                <a x-show="$store.app.showResetLink" href="./" style="color: inherit; text-decoration: underline;">Reset</a>
+            </div>
         </section>
 
         <!-- Results -->
@@ -1617,6 +1619,7 @@
                 statusMessage: '',
                 statusType: '',
                 statusTimeout: null,
+                showResetLink: false,
                 resultsCount: '',
                 resultsNotice: '',
                 resultsNoticeType: '',
@@ -1635,13 +1638,21 @@
                     return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
                 },
                 showStatus(message, type) {
-                    this.statusMessage = message;
+                    // Add reset link for errors
+                    if (type === 'error') {
+                        this.statusMessage = message + ' — ';
+                        this.showResetLink = true;
+                    } else {
+                        this.statusMessage = message;
+                        this.showResetLink = false;
+                    }
                     this.statusType = type;
                     if (this.statusTimeout) clearTimeout(this.statusTimeout);
                     if (type === 'success') {
                         this.statusTimeout = setTimeout(() => {
                             this.statusMessage = '';
                             this.statusType = '';
+                            this.showResetLink = false;
                         }, 8000);
                     }
                 }
