@@ -4592,14 +4592,22 @@
                 displayColNames = colNames;
             } else {
                 for (const col of ast.columns) {
-                    if (col.type === 'column') {
-                        const idx = colNames.findIndex(n => n.toLowerCase() === col.name.toLowerCase());
+                    // Handle both 'column' type and 'identifier' type
+                    const colName = col.type === 'column' ? col.name : (col.type === 'identifier' ? col.value : col.name);
+                    if (colName) {
+                        const idx = colNames.findIndex(n => n.toLowerCase() === colName.toLowerCase());
                         if (idx >= 0) {
                             displayColIndices.push(idx);
                             displayColNames.push(colNames[idx]);
                         }
                     }
                 }
+            }
+
+            // Fallback to all columns if none matched
+            if (displayColIndices.length === 0) {
+                displayColIndices = colNames.map((_, i) => i);
+                displayColNames = colNames;
             }
 
             // Build rows from filtered column data with selected columns only
