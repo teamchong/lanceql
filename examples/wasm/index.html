@@ -3068,22 +3068,12 @@
                 showStatus('Executing query...', 'info');
 
                 // Use the new SQL executor for proper parsing
-                console.log('Creating SQLExecutor with targetFile:', {
-                    numColumns: targetFile.numColumns,
-                    columnNames: targetFile.columnNames,
-                    columnTypes: targetFile._columnTypes || columnTypes
-                });
                 const executor = new SQLExecutor(targetFile);
                 const result = await executor.execute(sql, (msg, current, total) => {
                     showProgress(msg, current, total);
                 });
 
                 // Format the result for display
-                console.log('Raw result from SQLExecutor:', {
-                    columns: result.columns,
-                    firstRow: result.rows[0],
-                    rowCount: result.rows.length
-                });
                 const formattedResult = {
                     columns: result.columns,
                     rows: result.rows.map(row => row.map(cell => {
@@ -3441,8 +3431,6 @@
 
         // Display results with infinite scroll support
         function displayResults(result, append = false) {
-            console.log('displayResults:', { columns: result.columns, rowCount: result.rows?.length, total: result.total, firstRow: result.rows?.[0] });
-
             // Store result for export (merge if appending)
             if (append && lastResult) {
                 $lastResult.set({ ...lastResult, rows: [...lastResult.rows, ...result.rows] });
