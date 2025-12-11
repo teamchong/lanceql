@@ -947,6 +947,59 @@ export class LanceFile {
     // ========================================================================
 
     /**
+     * Debug: Get string column buffer info
+     * @param {number} colIdx - Column index
+     * @returns {{offsetsSize: number, dataSize: number}}
+     */
+    debugStringColInfo(colIdx) {
+        const packed = this.wasm.debugStringColInfo(colIdx);
+        return {
+            offsetsSize: Number(BigInt(packed) >> 32n),
+            dataSize: Number(BigInt(packed) & 0xFFFFFFFFn)
+        };
+    }
+
+    /**
+     * Debug: Get string read info for a specific row
+     * @param {number} colIdx - Column index
+     * @param {number} rowIdx - Row index
+     * @returns {{strStart: number, strLen: number} | {error: string}}
+     */
+    debugReadStringInfo(colIdx, rowIdx) {
+        const packed = this.wasm.debugReadStringInfo(colIdx, rowIdx);
+        // Check for error codes (0xDEAD00XX)
+        if ((packed & 0xFFFF0000n) === 0xDEAD0000n) {
+            const errCode = Number(packed & 0xFFFFn);
+            const errors = {
+                1: 'No file data',
+                2: 'No column entry',
+                3: 'Col meta out of bounds',
+                4: 'Not a string column',
+                5: 'Row out of bounds',
+                6: 'Invalid offset size'
+            };
+            return { error: errors[errCode] || `Unknown error ${errCode}` };
+        }
+        return {
+            strStart: Number(BigInt(packed) >> 32n),
+            strLen: Number(BigInt(packed) & 0xFFFFFFFFn)
+        };
+    }
+
+    /**
+     * Debug: Get data_start position for string column
+     * @param {number} colIdx - Column index
+     * @returns {{dataStart: number, fileLen: number}}
+     */
+    debugStringDataStart(colIdx) {
+        const packed = this.wasm.debugStringDataStart(colIdx);
+        return {
+            dataStart: Number(BigInt(packed) >> 32n),
+            fileLen: Number(BigInt(packed) & 0xFFFFFFFFn)
+        };
+    }
+
+    /**
      * Get the number of strings in a column.
      * @param {number} colIdx - Column index
      * @returns {number}
@@ -1003,7 +1056,9 @@ export class LanceFile {
     readStringsAtIndices(colIdx, indices) {
         if (indices.length === 0) return [];
 
-        const maxTotalLen = 1024 * 1024; // 1MB total buffer
+        // Use smaller buffer - estimate based on indices count
+        // Assume average string is ~256 bytes, capped at 256KB to avoid WASM memory issues
+        const maxTotalLen = Math.min(indices.length * 256, 256 * 1024);
         const idxPtr = this.wasm.allocIndexBuffer(indices.length);
         if (!idxPtr) throw new Error('Failed to allocate index buffer');
 

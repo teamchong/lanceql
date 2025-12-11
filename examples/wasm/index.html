@@ -2019,37 +2019,34 @@
 
             // Detect column types
             // Check vector FIRST since vectors can also be read as numeric arrays
-            console.log('Detecting column types for', currentFile.numColumns, 'columns');
             const detectedTypes = [];
             for (let i = 0; i < currentFile.numColumns; i++) {
                 let type = 'unknown';
                 // Check vector first - dimension > 2 indicates a real vector column
                 try {
                     const info = currentFile.getVectorInfo(i);
-                    console.log('Column', i, 'vector info:', info);
                     if (info && info.dimension > 2) {
                         type = 'vector';
                     }
-                } catch (e) { console.log('Column', i, 'not vector:', e.message); }
+                } catch (e) { /* not a vector */ }
                 if (type === 'unknown') {
                     try {
                         const strCount = currentFile.getStringCount(i);
                         if (strCount > 0) type = 'string';
-                    } catch (e) { console.log('Column', i, 'not string:', e.message); }
+                    } catch (e) { /* not a string */ }
                 }
                 if (type === 'unknown') {
                     try {
                         const int64Data = currentFile.readInt64Column(i);
                         if (int64Data.length > 0) type = 'int64';
-                    } catch (e) { console.log('Column', i, 'not int64:', e.message); }
+                    } catch (e) { /* not int64 */ }
                 }
                 if (type === 'unknown') {
                     try {
                         const float64Data = currentFile.readFloat64Column(i);
                         if (float64Data.length > 0) type = 'float64';
-                    } catch (e) { console.log('Column', i, 'not float64:', e.message); }
+                    } catch (e) { /* not float64 */ }
                 }
-                console.log('Column', i, 'detected as:', type);
                 detectedTypes[i] = type;
             }
             $columnTypes.set(detectedTypes);

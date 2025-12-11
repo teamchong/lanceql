@@ -1302,6 +1302,24 @@ fn getStringBufferInfo(col_meta: []const u8) struct {
     };
 }
 
+/// Debug: Get string column buffer info
+/// Returns packed: high32=offsets_size, low32=data_size (both 0 if not a string column)
+export fn debugStringColInfo(col_idx: u32) u64 {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getStringBufferInfo(col_meta);
+
+    // Return packed: high 32 bits = offsets_size, low 32 bits = data_size
+    return (info.offsets_size << 32) | (info.data_size & 0xFFFFFFFF);
+}
+
 /// Get number of strings in column
 /// Returns 0 if not a string column (string columns have 2 buffers: offsets + data)
 export fn getStringCount(col_idx: u32) u64 {
@@ -1321,6 +1339,69 @@ export fn getStringCount(col_idx: u32) u64 {
     if (info.data_size == 0) return 0;
 
     return info.rows;
+}
+
+/// Debug: Get detailed string read info for a specific row
+/// Returns packed debug info for troubleshooting
+export fn debugReadStringInfo(col_idx: u32, row_idx: u32) u64 {
+    const data = file_data orelse return 0xDEAD0001; // No file data
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0xDEAD0002; // No column entry
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0xDEAD0003; // Col meta out of bounds
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getStringBufferInfo(col_meta);
+
+    if (info.offsets_size == 0 or info.data_size == 0) return 0xDEAD0004; // Not a string column
+    if (row_idx >= info.rows) return 0xDEAD0005; // Row out of bounds
+
+    const offset_size = info.offsets_size / info.rows;
+    if (offset_size != 4 and offset_size != 8) return 0xDEAD0006; // Invalid offset size
+
+    const offsets_start: usize = @intCast(info.offsets_start);
+    _ = info.data_start; // Used in actual read
+
+    var str_start: usize = 0;
+    var str_end: usize = 0;
+
+    if (offset_size == 4) {
+        str_end = readU32LE(data, offsets_start + row_idx * 4);
+        if (row_idx > 0) {
+            str_start = readU32LE(data, offsets_start + (row_idx - 1) * 4);
+        }
+    } else {
+        str_end = @intCast(readU64LE(data, offsets_start + row_idx * 8));
+        if (row_idx > 0) {
+            str_start = @intCast(readU64LE(data, offsets_start + (row_idx - 1) * 8));
+        }
+    }
+
+    // Return: high 32 = str_start, low 32 = str_len
+    const str_len = if (str_end >= str_start) str_end - str_start else 0;
+    return (@as(u64, @intCast(str_start)) << 32) | @as(u64, @intCast(str_len));
+}
+
+/// Debug: Get data_start position for string column
+export fn debugStringDataStart(col_idx: u32) u64 {
+    const data = file_data orelse return 0;
+    const entry = getColumnOffsetEntry(col_idx);
+    if (entry.len == 0) return 0;
+
+    const col_meta_start: usize = @intCast(entry.pos);
+    const col_meta_len: usize = @intCast(entry.len);
+    if (col_meta_start + col_meta_len > data.len) return 0;
+
+    const col_meta = data[col_meta_start..][0..col_meta_len];
+    const info = getStringBufferInfo(col_meta);
+
+    // Return data_start and file length in packed format for debug
+    // High 32 = data_start, low 32 = file_len (capped)
+    const ds: u32 = @intCast(@min(info.data_start, 0xFFFFFFFF));
+    const fl: u32 = @intCast(@min(data.len, 0xFFFFFFFF));
+    return (@as(u64, ds) << 32) | @as(u64, fl);
 }
 
 /// Read a single string at index into output buffer
