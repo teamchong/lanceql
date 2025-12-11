@@ -1174,7 +1174,7 @@
         }
     </style>
 </head>
-<body>
+<body x-data>
     <div class="container">
         <header>
             <a href="./" class="logo" style="text-decoration: none; color: inherit;">
@@ -1233,21 +1233,23 @@
                 </button>
             </div>
             <div class="column-chips" id="column-chips"></div>
-            <div class="network-stats hidden" id="network-stats">
+            <div class="network-stats"
+                 :class="{ 'hidden': $store.app.bytesDownloaded === 0 }"
+                 id="network-stats">
                 <div class="network-stat">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
                         <polyline points="7 10 12 15 17 10"/>
                         <line x1="12" y1="15" x2="12" y2="3"/>
                     </svg>
-                    <span>Downloaded: <strong id="bytes-downloaded">0 KB</strong></span>
+                    <span>Downloaded: <strong x-text="$store.app.formatBytes($store.app.bytesDownloaded)">0 KB</strong></span>
                 </div>
                 <div class="network-stat">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <circle cx="12" cy="12" r="10"/>
                         <polyline points="12 6 12 12 16 14"/>
                     </svg>
-                    <span>Requests: <strong id="request-count">0</strong></span>
+                    <span>Requests: <strong x-text="$store.app.requests">0</strong></span>
                 </div>
             </div>
             <div class="progress-container" id="progress-container">
@@ -1507,7 +1509,7 @@
     </div>
 
     <script type="module">
-        import van from 'https://esm.sh/vanjs-core@1.5.2';
+        import Alpine from 'https://esm.sh/alpinejs@3.14.3';
         import { atom, computed } from 'https://esm.sh/nanostores@0.10.3';
         import LanceQL, { SQLExecutor, SQLLexer, SQLParser } from './lanceql.js';
 
@@ -1545,6 +1547,28 @@
         $lastResult.subscribe(v => { lastResult = v; });
         $infiniteScrollState.subscribe(v => { infiniteScrollState = v; });
         $isLoadingMore.subscribe(v => { isLoadingMore = v; });
+
+        // Alpine.js global store - bridges Nanostores to Alpine reactivity
+        document.addEventListener('alpine:init', () => {
+            Alpine.store('app', {
+                bytesDownloaded: 0,
+                requests: 0,
+                formatBytes(bytes) {
+                    if (bytes === 0) return '0 B';
+                    const k = 1024;
+                    const sizes = ['B', 'KB', 'MB', 'GB'];
+                    const i = Math.floor(Math.log(bytes) / Math.log(k));
+                    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+                }
+            });
+
+            // Sync Nanostores → Alpine store
+            $totalBytesDownloaded.subscribe(v => Alpine.store('app').bytesDownloaded = v);
+            $totalRequests.subscribe(v => Alpine.store('app').requests = v);
+        });
+
+        // Start Alpine
+        Alpine.start();
 
         const PAGE_SIZE = 50;
 
@@ -2102,18 +2126,11 @@
         function updateNetworkStats(bytes, requests) {
             $totalBytesDownloaded.set($totalBytesDownloaded.get() + bytes);
             $totalRequests.set($totalRequests.get() + requests);
-
-            const statsEl = document.getElementById('network-stats');
-            statsEl.classList.remove('hidden');
-            document.getElementById('bytes-downloaded').textContent = formatBytes(totalBytesDownloaded);
-            document.getElementById('request-count').textContent = totalRequests;
         }
 
         function resetNetworkStats() {
             $totalBytesDownloaded.set(0);
             $totalRequests.set(0);
-            document.getElementById('bytes-downloaded').textContent = '0 KB';
-            document.getElementById('request-count').textContent = '0';
         }
 
         // Column chips display
