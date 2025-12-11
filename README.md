@@ -110,7 +110,7 @@ examples/wasm/
 
 ## WASM Runtime
 
-LanceQL uses an **Immer-style Proxy pattern** for WASM interop (inspired by [metal0](https://github.com/teamchong/metal0)):
+LanceQL uses an **Immer-style Proxy pattern** for WASM interop:
 
 ```javascript
 // Traditional WASM interop - verbose, error-prone
