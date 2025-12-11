@@ -108,6 +108,58 @@ examples/wasm/
 └── lanceql.js           # JS wrapper, SQL parser, vector search
 ```
 
+## WASM Runtime
+
+LanceQL uses an **Immer-style Proxy pattern** for WASM interop (inspired by [metal0](https://github.com/teamchong/metal0)):
+
+```javascript
+// Traditional WASM interop - verbose, error-prone
+const ptr = wasm.alloc(str.length);
+const mem = new Uint8Array(wasm.memory.buffer);
+mem.set(encoder.encode(str), ptr);
+const result = wasm.someFunc(ptr, str.length);
+wasm.free(ptr);
+
+// Immer-style - auto marshalling via Proxy
+const lanceql = await LanceQL.load('./lanceql.wasm');
+lanceql._proxy.someFunc("hello");  // strings auto-copied to WASM memory
+lanceql._proxy.parseData(bytes);   // Uint8Array auto-copied too
+```
+
+**How it works:**
+
+```javascript
+// ~30 lines of runtime code handles all marshalling
+const proxy = new Proxy({}, {
+    get(_, name) {
+        if (typeof wasm[name] === 'function') {
+            return (...args) => wasm[name](...args.flatMap(marshal));
+        }
+        return wasm[name];
+    }
+});
+
+// Marshal function - auto-converts strings and Uint8Array
+const marshal = arg => {
+    if (arg instanceof Uint8Array) {
+        // Copy bytes to WASM memory, return [ptr, len]
+        buffer.set(arg); return [ptr, arg.length];
+    }
+    if (typeof arg === 'string') {
+        // Encode string to WASM memory, return [ptr, len]
+        const bytes = encoder.encode(arg);
+        buffer.set(bytes); return [ptr, bytes.length];
+    }
+    return [arg];  // Numbers pass through
+};
+```
+
+**Benefits:**
+- **Zero boilerplate** - No manual `alloc`/`free`/copy for each call
+- **Type-safe** - Strings and bytes automatically handled
+- **Tiny runtime** - ~30 lines, no dependencies
+- **JS debugging** - All logic stays in JS where DevTools works
+
 ## Build
 
 ```bash

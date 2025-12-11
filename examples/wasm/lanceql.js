@@ -124,14 +124,53 @@ class MetadataCache {
 // Global cache instance
 const metadataCache = new MetadataCache();
 
+// Immer-style WASM runtime - auto string/bytes marshalling
+const E = new TextEncoder();
+const D = new TextDecoder();
+let _w, _m, _p, _M = 1 << 20;
+
+const _g = () => new Uint8Array(_m.buffer, _p, _M);
+
+// Marshal JS value to WASM args (strings and Uint8Array auto-copied to WASM memory)
+const _x = a => {
+    if (a instanceof Uint8Array) {
+        if (a.length > _M) { _M = a.length + 1024; _p = _w.alloc(_M) }
+        _g().set(a);
+        return [_p, a.length];
+    }
+    if (typeof a !== 'string') return [a];
+    const b = E.encode(a);
+    if (b.length > _M) { _M = b.length + 1024; _p = _w.alloc(_M) }
+    _g().set(b);
+    return [_p, b.length];
+};
+
+// Read string from WASM memory
+const readStr = (ptr, len) => D.decode(new Uint8Array(_m.buffer, ptr, len));
+
+// Read bytes from WASM memory (returns copy)
+const readBytes = (ptr, len) => new Uint8Array(_m.buffer, ptr, len).slice();
+
+// WASM utils exported for advanced usage
+export const wasmUtils = {
+    readStr,
+    readBytes,
+    encoder: E,
+    decoder: D,
+    getMemory: () => _m,
+    getExports: () => _w,
+};
+
 export class LanceQL {
-    constructor(wasmInstance) {
-        this.wasm = wasmInstance.exports;
-        this.memory = this.wasm.memory;
+    constructor(wasmProxy) {
+        this.wasm = wasmProxy._raw;  // Raw WASM exports
+        this.memory = wasmProxy.memory;
+        this._proxy = wasmProxy;  // Immer-style proxy with auto marshalling
     }
 
     /**
      * Load LanceQL from a WASM file path or URL.
+     * Uses Immer-style runtime for auto string/bytes marshalling.
      * @param {string} wasmPath - Path to the lanceql.wasm file
      * @returns {Promise<LanceQL>}
      */
@@ -139,7 +178,24 @@ export class LanceQL {
         const response = await fetch(wasmPath);
         const wasmBytes = await response.arrayBuffer();
         const wasmModule = await WebAssembly.instantiate(wasmBytes, {});
-        return new LanceQL(wasmModule.instance);
+
+        _w = wasmModule.instance.exports;
+        _m = _w.memory;
+        if (_w.alloc) { _p = _w.alloc(_M) }
+
+        // Create Immer-style proxy that auto-marshals arguments
+        const proxy = new Proxy({}, {
+            get(_, n) {
+                if (n === 'memory') return _m;
+                if (n === '_raw') return _w;
+                if (typeof _w[n] === 'function') {
+                    return (...a) => _w[n](...a.flatMap(_x));
+                }
+                return _w[n];
+            }
+        });
+
+        return new LanceQL(proxy);
     }
 
     /**
