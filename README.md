@@ -164,15 +164,41 @@ const marshal = arg => {
 
 ## Build
 
+Requires [Zig](https://ziglang.org/download/) 0.13.0+
+
 ```bash
 # Build WASM module
 zig build wasm
+# Output: zig-out/bin/lanceql.wasm
 
-# Copy to examples
+# Copy to demo
 cp zig-out/bin/lanceql.wasm examples/wasm/
 
 # Run tests
 zig build test
+```
+
+## Usage
+
+```html
+<script type="module">
+import { LanceQL } from './lanceql.js';
+
+const lanceql = await LanceQL.load('./lanceql.wasm');
+
+// Open remote dataset
+const dataset = await lanceql.openDataset('https://data.metal0.dev/laion-1m/images.lance');
+
+// Query
+const strings = await dataset.readStrings(0, 50);  // First 50 rows of column 0
+</script>
+```
+
+For TypeScript, the `lanceql.d.ts` file provides type definitions:
+
+```typescript
+import { LanceQL } from './lanceql.js';
+// Types are automatically picked up from lanceql.d.ts
 ```
 
 ## Performance Optimizations
