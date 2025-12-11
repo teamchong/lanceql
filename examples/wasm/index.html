@@ -2940,7 +2940,19 @@
                     // Preserve current selections before repopulating
                     const prevFilterValue = filterCol.value;
                     const prevFilterColName = prevFilterValue ? filterCol.options[filterCol.selectedIndex]?.text.split(' (')[0] : null;
-                    const prevSelectedCols = Array.from(selectCols.selectedOptions).map(opt => opt.text);
+
+                    // Get selected columns - check pending attribute first, then current selection
+                    const pendingSelectCols = selectCols.getAttribute('data-pending-columns');
+                    let prevSelectedCols;
+                    if (pendingSelectCols) {
+                        prevSelectedCols = JSON.parse(pendingSelectCols);
+                    } else {
+                        prevSelectedCols = Array.from(selectCols.selectedOptions).map(opt => opt.text);
+                        // Save to pending if we have selections (will be used after repopulate)
+                        if (prevSelectedCols.length > 0) {
+                            selectCols.setAttribute('data-pending-columns', JSON.stringify(prevSelectedCols));
+                        }
+                    }
 
                     filterCol.innerHTML = '<option value="">No filter</option>';
                     selectCols.innerHTML = '';
@@ -2953,10 +2965,13 @@
                         if (type !== 'string' && type !== 'vector') {
                             filterCol.innerHTML += `<option value="${i}">${name} (${type})</option>`;
                         }
-                        // Preserve selection if column name matches
+                        // Preserve selection if column name matches, default to all if no previous selection
                         const isSelected = prevSelectedCols.length === 0 || prevSelectedCols.includes(name);
                         selectCols.innerHTML += `<option value="${i}" ${isSelected ? 'selected' : ''}>${name}</option>`;
                     }
+
+                    // Clear pending after successfully applying
+                    selectCols.removeAttribute('data-pending-columns');
 
                     // Apply pending column value now that options exist
                     const pendingColumn = filterCol.getAttribute('data-pending-column') || prevFilterColName;
