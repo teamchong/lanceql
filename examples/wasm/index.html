@@ -1205,9 +1205,13 @@
         <section class="file-section" :class="{ 'collapsed': $store.app.fileLoaderCollapsed }">
             <div id="file-loader-section" x-show="!$store.app.fileLoaderCollapsed">
                 <div class="drop-zone" id="drop-zone">
-                    <p>Drop a .lance folder here or click to select</p>
-                    <p style="font-size: 12px;">Select the dataset_name.lance folder</p>
-                    <input type="file" id="file-input" webkitdirectory directory>
+                    <p>Drop a .lance folder/file here or click to select</p>
+                    <div style="display: flex; gap: 8px; justify-content: center; margin-top: 8px;">
+                        <button class="btn btn-secondary" id="select-folder-btn" style="font-size: 12px;">Select Folder</button>
+                        <button class="btn btn-secondary" id="select-file-btn" style="font-size: 12px;">Select File</button>
+                    </div>
+                    <input type="file" id="file-input-folder" webkitdirectory directory style="display: none;">
+                    <input type="file" id="file-input-file" accept=".lance" style="display: none;">
                 </div>
                 <div class="divider">or load from URL</div>
                 <div class="url-input-group">
@@ -3837,11 +3841,23 @@
 
         // Event listeners
         const dropZone = document.getElementById('drop-zone');
-        const fileInput = document.getElementById('file-input');
+        const fileInputFolder = document.getElementById('file-input-folder');
+        const fileInputFile = document.getElementById('file-input-file');
+        const selectFolderBtn = document.getElementById('select-folder-btn');
+        const selectFileBtn = document.getElementById('select-file-btn');
         const urlInput = document.getElementById('url-input');
         const loadUrlBtn = document.getElementById('load-url-btn');
 
-        dropZone.addEventListener('click', () => fileInput.click());
+        // Button clicks trigger respective file inputs
+        selectFolderBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            fileInputFolder.click();
+        });
+        selectFileBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            fileInputFile.click();
+        });
+
         dropZone.addEventListener('dragover', (e) => {
             e.preventDefault();
             dropZone.classList.add('dragover');
@@ -3864,10 +3880,16 @@
             // Fallback to single file
             if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
         });
-        fileInput.addEventListener('change', () => {
+        fileInputFolder.addEventListener('change', () => {
             // With webkitdirectory, files contains all files in the folder
-            if (fileInput.files && fileInput.files.length > 0) {
-                handleLanceFiles(Array.from(fileInput.files));
+            if (fileInputFolder.files && fileInputFolder.files.length > 0) {
+                handleLanceFiles(Array.from(fileInputFolder.files));
+            }
+        });
+        fileInputFile.addEventListener('change', () => {
+            // Single file selection
+            if (fileInputFile.files && fileInputFile.files.length > 0) {
+                handleFile(fileInputFile.files[0]);
             }
         });
 
