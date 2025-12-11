@@ -2733,8 +2733,8 @@
                         vectorCol.selectedIndex = 1;
                     }
 
-                    // Update DataFrame code preview
-                    updateDfPreview();
+                    // Update DataFrame code preview (skip sync to preserve SQL)
+                    updateDfPreview(true);
 
                     targetFile = currentFile;
                 }
@@ -4013,7 +4013,8 @@
                     ? `Dataset loaded! ${remoteFile.numColumns} columns, ${rowCount.toLocaleString()} rows across ${remoteFile.fragments.length} fragments (parallel Range requests)`
                     : `Connected! ${remoteFile.numColumns} columns, ${(remoteFile.size / 1024 / 1024).toFixed(1)}MB file (lazy loading via Range requests)`;
                 showStatus(statusMsg, 'success');
-                updateDfPreview();
+                // Update DataFrame preview (skip sync to preserve SQL)
+                updateDfPreview(true);
 
                 // Show dataset hint for default dataset
                 const hintEl = document.getElementById('dataset-hint');
