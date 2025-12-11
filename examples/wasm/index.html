@@ -2556,6 +2556,16 @@
                     select: ops.select,
                     limit: ops.limit
                 };
+
+                // Update DataFrame builder fields from parsed code
+                document.getElementById('df-search-query').value = ops.search || '';
+                if (ops.searchEncoder) {
+                    document.getElementById('df-search-encoder').value = ops.searchEncoder;
+                }
+                if (ops.limit) {
+                    document.getElementById('df-limit').value = ops.limit;
+                }
+
                 syncQueryTabs(query, 'df');
             });
 
