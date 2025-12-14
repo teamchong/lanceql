@@ -26,6 +26,8 @@ pub const TableError = error{
     UnsupportedVersion,
     ReadError,
     ColumnOutOfBounds,
+    NoPages,
+    InvalidBufferIndex,
 };
 
 /// High-level table reader for Lance files.
@@ -84,17 +86,34 @@ pub const Table = struct {
         return self.schema;
     }
 
-    /// Get column index by name.
+    /// Get column index by name (returns field array index).
     pub fn columnIndex(self: Self, name: []const u8) ?usize {
         const schema = self.schema orelse return null;
         return schema.fieldIndex(name);
     }
 
-    /// Get field info by column index.
+    /// Get physical column ID by name (for use with column metadata).
+    pub fn physicalColumnId(self: Self, name: []const u8) ?u32 {
+        const schema = self.schema orelse return null;
+        return schema.physicalColumnId(name);
+    }
+
+    /// Get field info by column index (array index in schema.fields).
     pub fn getField(self: Self, col_idx: usize) ?Field {
         const schema = self.schema orelse return null;
         if (col_idx >= schema.fields.len) return null;
         return schema.fields[col_idx];
+    }
+
+    /// Get field info by physical column ID.
+    pub fn getFieldById(self: Self, field_id: u32) ?Field {
+        const schema = self.schema orelse return null;
+        for (schema.fields) |field| {
+            if (field.id >= 0 and @as(u32, @intCast(field.id)) == field_id) {
+                return field;
+            }
+        }
+        return null;
     }
 
     /// Get row count for a column.
@@ -167,6 +186,131 @@ pub const Table = struct {
         return self.lance_file.readBytes(buffer_offset, buffer_size) catch {
             return TableError.InvalidMetadata;
         };
+    }
+
+    /// Get multiple buffers for a column (needed for variable-length types like strings).
+    /// Returns a slice of buffers corresponding to the requested buffer indices.
+    fn getColumnBuffers(self: Self, col_idx: u32, buffer_indices: []const usize) TableError![][]const u8 {
+        const col_meta_bytes = self.lance_file.getColumnMetadataBytes(col_idx) catch {
+            return TableError.ColumnOutOfBounds;
+        };
+
+        var col_meta = ColumnMetadata.parse(self.allocator, col_meta_bytes) catch {
+            return TableError.InvalidMetadata;
+        };
+        defer col_meta.deinit(self.allocator);
+
+        if (col_meta.pages.len == 0) return TableError.NoPages;
+        const page = col_meta.pages[0];
+
+        var buffers = try self.allocator.alloc([]const u8, buffer_indices.len);
+        errdefer self.allocator.free(buffers);
+
+        for (buffer_indices, 0..) |buf_idx, i| {
+            if (buf_idx >= page.buffer_offsets.len) return TableError.InvalidBufferIndex;
+
+            const buffer_offset = page.buffer_offsets[buf_idx];
+            const buffer_size = page.buffer_sizes[buf_idx];
+
+            buffers[i] = self.lance_file.readBytes(buffer_offset, buffer_size) catch {
+                return TableError.InvalidMetadata;
+            };
+        }
+
+        return buffers;
+    }
+
+    /// Get the number of rows in a specific column.
+    /// Reads the column metadata and sums the length across all pages.
+    fn numRows(self: Self, col_idx: u32) TableError!usize {
+        const col_meta_bytes = self.lance_file.getColumnMetadataBytes(col_idx) catch {
+            return TableError.ColumnOutOfBounds;
+        };
+
+        var col_meta = ColumnMetadata.parse(self.allocator, col_meta_bytes) catch {
+            return TableError.InvalidMetadata;
+        };
+        defer col_meta.deinit(self.allocator);
+
+        // Sum length across all pages
+        var total_rows: usize = 0;
+        for (col_meta.pages) |page| {
+            total_rows += @intCast(page.length);
+        }
+
+        return total_rows;
+    }
+
+    /// Read a string column by index.
+    /// Returns a slice of allocated strings (UTF-8 byte slices).
+    /// Caller must free each string AND the slice itself using the same allocator.
+    pub fn readStringColumn(self: Self, col_idx: u32) TableError![][]const u8 {
+        // Get column metadata
+        const col_meta_bytes = self.lance_file.getColumnMetadataBytes(col_idx) catch {
+            return TableError.ColumnOutOfBounds;
+        };
+
+        var col_meta = ColumnMetadata.parse(self.allocator, col_meta_bytes) catch {
+            return TableError.InvalidMetadata;
+        };
+        defer col_meta.deinit(self.allocator);
+
+        if (col_meta.pages.len == 0) return TableError.NoPages;
+        const page = col_meta.pages[0];
+
+        // Lance stores string columns with TWO separate buffers per page:
+        // - Buffer 0: offsets array (uint32 or uint64, marking END positions)
+        // - Buffer 1: string data (concatenated UTF-8 bytes)
+        if (page.buffer_offsets.len < 2) return TableError.InvalidMetadata;
+
+        // Buffer 0 = offsets array
+        const offsets_offset = page.buffer_offsets[0];
+        const offsets_size = page.buffer_sizes[0];
+        const offsets_buffer = self.lance_file.readBytes(offsets_offset, offsets_size) catch {
+            return TableError.InvalidMetadata;
+        };
+
+        // Buffer 1 = string data
+        const data_offset = page.buffer_offsets[1];
+        const data_size = page.buffer_sizes[1];
+        const data_buffer = self.lance_file.readBytes(data_offset, data_size) catch {
+            return TableError.InvalidMetadata;
+        };
+
+        // Decode strings (returns slices into data_buffer, not owned copies)
+        const string_slices = PlainDecoder.readAllStrings(offsets_buffer, data_buffer, self.allocator) catch {
+            return TableError.InvalidMetadata;
+        };
+        defer self.allocator.free(string_slices);
+
+        // Copy each string into owned memory so caller can safely free
+        var owned_strings = self.allocator.alloc([]const u8, string_slices.len) catch {
+            return TableError.OutOfMemory;
+        };
+        errdefer {
+            for (owned_strings) |str| {
+                if (str.len > 0) self.allocator.free(str);
+            }
+            self.allocator.free(owned_strings);
+        }
+
+        for (string_slices, 0..) |slice, i| {
+            const copy = self.allocator.alloc(u8, slice.len) catch {
+                // Mark how many we successfully allocated for errdefer
+                owned_strings = owned_strings[0..i];
+                return TableError.OutOfMemory;
+            };
+            @memcpy(copy, slice);
+            owned_strings[i] = copy;
+        }
+
+        return owned_strings;
+    }
+
+    /// Read a string column by name.
+    pub fn readStringColumnByName(self: Self, name: []const u8) TableError![][]const u8 {
+        const idx = self.columnIndex(name) orelse return TableError.ColumnNotFound;
+        return self.readStringColumn(@intCast(idx));
     }
 };
 

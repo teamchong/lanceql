@@ -51,7 +51,7 @@ pub const PlainDecoder = struct {
         errdefer allocator.free(result);
 
         for (0..count) |i| {
-            result[i] = self.readInt64(i) catch unreachable;
+            result[i] = self.readInt64(i) catch return error.IndexOutOfBounds;
         }
         return result;
     }
@@ -100,7 +100,7 @@ pub const PlainDecoder = struct {
         errdefer allocator.free(result);
 
         for (0..count) |i| {
-            result[i] = self.readFloat64(i) catch unreachable;
+            result[i] = self.readFloat64(i) catch return error.IndexOutOfBounds;
         }
         return result;
     }
@@ -161,6 +161,55 @@ pub const PlainDecoder = struct {
         }
 
         return (self.data[byte_index] >> bit_index) & 1 == 1;
+    }
+
+    // ========================================================================
+    // String decoding (variable-length)
+    // ========================================================================
+
+    /// Read all strings from Lance string column buffers.
+    /// Lance stores strings with:
+    ///   - offsets buffer: int32 or int64 array marking END positions
+    ///   - data buffer: concatenated UTF-8 bytes
+    /// This is a static function that doesn't need a PlainDecoder instance.
+    pub fn readAllStrings(
+        offsets_buffer: []const u8,
+        data_buffer: []const u8,
+        allocator: std.mem.Allocator,
+    ) ![][]const u8 {
+        if (offsets_buffer.len == 0) return &[_][]const u8{};
+
+        // Determine offset size (4 or 8 bytes) based on buffer length
+        // Row count = offsets_buffer.len / offset_size
+        const offset_size: usize = if (offsets_buffer.len % 8 == 0 and offsets_buffer.len / 8 > 0)
+            8
+        else if (offsets_buffer.len % 4 == 0)
+            4
+        else
+            return error.InvalidBufferSize;
+
+        const row_count = offsets_buffer.len / offset_size;
+        var strings = try allocator.alloc([]const u8, row_count);
+        errdefer allocator.free(strings);
+
+        var str_start: usize = 0;
+        for (0..row_count) |i| {
+            // Each offset marks the END position of that string
+            const str_end: usize = if (offset_size == 4)
+                std.mem.readInt(u32, offsets_buffer[i * 4 ..][0..4], .little)
+            else
+                @intCast(std.mem.readInt(u64, offsets_buffer[i * 8 ..][0..8], .little));
+
+            // Extract string slice from data buffer
+            if (str_end > data_buffer.len or str_start > str_end) {
+                return error.IndexOutOfBounds;
+            }
+
+            strings[i] = data_buffer[str_start..str_end];
+            str_start = str_end;
+        }
+
+        return strings;
     }
 };
 

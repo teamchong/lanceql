@@ -49,6 +49,9 @@ pub const Schema = struct {
     const Self = @This();
 
     /// Parse schema from protobuf bytes.
+    /// Lance v2 wraps the schema in an outer message:
+    ///   OuterWrapper { field 1: Schema { repeated Field fields = 1; } }
+    /// This function handles both the wrapper and direct schema formats.
     pub fn parse(allocator: std.mem.Allocator, data: []const u8) DecodeError!Self {
         var proto = ProtoDecoder.init(data);
 
@@ -65,10 +68,33 @@ pub const Schema = struct {
             const header = try proto.readFieldHeader();
 
             switch (header.field_num) {
-                1 => { // fields (repeated Field message)
+                1 => {
+                    // Field 1 is always wire_type 2 (length-delimited) in both cases:
+                    // - Direct: repeated Field (each Field is a nested message)
+                    // - Wrapper: Schema wrapper containing nested Schema bytes
+                    //
+                    // To distinguish: check if the content starts with field 1 wire_type 2.
+                    // In the wrapper case, the inner bytes also start with 0a (field 1, bytes).
+                    // In direct Field case, the inner bytes start with field definitions
+                    // like 08 (field 1 varint for type) or 12 (field 2 string for name).
                     const field_bytes = try proto.readBytes();
-                    const field = try parseField(allocator, field_bytes);
-                    fields.append(allocator, field) catch return DecodeError.OutOfMemory;
+
+                    if (field_bytes.len > 0) {
+                        const first_byte = field_bytes[0];
+                        const inner_field_num = first_byte >> 3;
+                        const inner_wire_type = first_byte & 0x7;
+
+                        // If inner message starts with field 1, wire_type 2 (bytes),
+                        // it's the wrapper format containing nested Field messages
+                        if (inner_field_num == 1 and inner_wire_type == 2) {
+                            // Wrapper format: parse the inner bytes as Schema
+                            try parseSchemaFields(allocator, field_bytes, &fields);
+                        } else {
+                            // Direct Field format: parse this as a single Field
+                            const field = try parseField(allocator, field_bytes);
+                            fields.append(allocator, field) catch return DecodeError.OutOfMemory;
+                        }
+                    }
                 },
                 else => {
                     try proto.skipField(header.wire_type);
@@ -80,6 +106,26 @@ pub const Schema = struct {
             .fields = fields.toOwnedSlice(allocator) catch return DecodeError.OutOfMemory,
             .allocator = allocator,
         };
+    }
+
+    /// Parse schema fields from nested bytes (handles wrapper format).
+    fn parseSchemaFields(allocator: std.mem.Allocator, data: []const u8, fields: *std.ArrayListUnmanaged(Field)) DecodeError!void {
+        var proto = ProtoDecoder.init(data);
+
+        while (proto.hasMore()) {
+            const header = try proto.readFieldHeader();
+
+            switch (header.field_num) {
+                1 => { // repeated Field message
+                    const field_bytes = try proto.readBytes();
+                    const field = try parseField(allocator, field_bytes);
+                    fields.append(allocator, field) catch return DecodeError.OutOfMemory;
+                },
+                else => {
+                    try proto.skipField(header.wire_type);
+                },
+            }
+        }
     }
 
     pub fn deinit(self: *Self) void {
@@ -129,6 +175,21 @@ pub const Schema = struct {
         for (self.fields, 0..) |field, i| {
             if (std.mem.eql(u8, field.name, name)) {
                 return i;
+            }
+        }
+        return null;
+    }
+
+    /// Get the physical column ID for a field by name.
+    /// Returns the field's id (physical column index) which can be used with column metadata.
+    pub fn physicalColumnId(self: Self, name: []const u8) ?u32 {
+        for (self.fields) |field| {
+            if (std.mem.eql(u8, field.name, name)) {
+                // field.id is i32 but physical column IDs should be non-negative
+                if (field.id >= 0) {
+                    return @intCast(field.id);
+                }
+                return null;
             }
         }
         return null;

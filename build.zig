@@ -36,12 +36,38 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // SQL modules
+    const sql_ast_mod = b.addModule("lanceql.sql.ast", .{
+        .root_source_file = b.path("src/sql/ast.zig"),
+    });
+
+    const sql_lexer_mod = b.addModule("lanceql.sql.lexer", .{
+        .root_source_file = b.path("src/sql/lexer.zig"),
+    });
+
+    const sql_parser_mod = b.addModule("lanceql.sql.parser", .{
+        .root_source_file = b.path("src/sql/parser.zig"),
+        .imports = &.{
+            .{ .name = "ast", .module = sql_ast_mod },
+            .{ .name = "lexer", .module = sql_lexer_mod },
+        },
+    });
+
     const table_mod = b.addModule("lanceql.table", .{
         .root_source_file = b.path("src/table.zig"),
         .imports = &.{
             .{ .name = "lanceql.format", .module = format_mod },
             .{ .name = "lanceql.proto", .module = proto_mod },
             .{ .name = "lanceql.encoding", .module = encoding_mod },
+        },
+    });
+
+    const sql_executor_mod = b.addModule("lanceql.sql.executor", .{
+        .root_source_file = b.path("src/sql/executor.zig"),
+        .imports = &.{
+            .{ .name = "ast", .module = sql_ast_mod },
+            .{ .name = "parser", .module = sql_parser_mod },
+            .{ .name = "lanceql.table", .module = table_mod },
         },
     });
 
@@ -179,6 +205,27 @@ pub fn build(b: *std.Build) void {
     const test_dataframe_step = b.step("test-dataframe", "Run DataFrame module tests");
     test_dataframe_step.dependOn(&run_test_dataframe.step);
 
+    // SQL executor tests
+    const test_sql_executor = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/test_sql_executor.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lanceql.table", .module = table_mod },
+                .{ .name = "lanceql.sql.ast", .module = sql_ast_mod },
+                .{ .name = "lanceql.sql.parser", .module = sql_parser_mod },
+                .{ .name = "lanceql.sql.executor", .module = sql_executor_mod },
+            },
+        }),
+    });
+
+    const run_test_sql_executor = b.addRunArtifact(test_sql_executor);
+    test_step.dependOn(&run_test_sql_executor.step);
+
+    const test_sql_step = b.step("test-sql", "Run SQL executor tests");
+    test_sql_step.dependOn(&run_test_sql_executor.step);
+
     // === WASM Build ===
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
@@ -212,4 +259,109 @@ pub fn build(b: *std.Build) void {
 
     // Add to main test step
     test_step.dependOn(&wasm_test.step);
+
+    // === Native Shared Library for Python ===
+    const lib = b.addLibrary(.{
+        .name = "lanceql",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/python.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lanceql", .module = lanceql_mod },
+                .{ .name = "lanceql.table", .module = table_mod },
+                .{ .name = "lanceql.format", .module = format_mod },
+                .{ .name = "lanceql.proto", .module = proto_mod },
+                .{ .name = "lanceql.io", .module = io_mod },
+                .{ .name = "lanceql.encoding", .module = encoding_mod },
+                .{ .name = "lanceql.value", .module = value_mod },
+            },
+        }),
+    });
+
+    const lib_step = b.step("lib", "Build native shared library for Python");
+    const install_lib = b.addInstallArtifact(lib, .{});
+    lib_step.dependOn(&install_lib.step);
+
+    // === Node.js Shared Library ===
+    const nodejs_lib = b.addLibrary(.{
+        .name = "lanceql",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/nodejs.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lanceql.format", .module = format_mod },
+                .{ .name = "lanceql.io", .module = io_mod },
+                .{ .name = "lanceql.proto", .module = proto_mod },
+                .{ .name = "lanceql.encoding", .module = encoding_mod },
+                .{ .name = "lanceql.table", .module = table_mod },
+                .{ .name = "lanceql.value", .module = value_mod },
+                .{ .name = "lanceql.sql.ast", .module = sql_ast_mod },
+                .{ .name = "lanceql.sql.lexer", .module = sql_lexer_mod },
+                .{ .name = "lanceql.sql.parser", .module = sql_parser_mod },
+                .{ .name = "lanceql.sql.executor", .module = sql_executor_mod },
+            },
+        }),
+    });
+
+    const nodejs_lib_step = b.step("lib-nodejs", "Build native shared library for Node.js");
+    const install_nodejs_lib = b.addInstallArtifact(nodejs_lib, .{});
+    nodejs_lib_step.dependOn(&install_nodejs_lib.step);
+
+    // Default build includes lib-nodejs
+    b.default_step.dependOn(&install_nodejs_lib.step);
+
+    // === Cross-compilation targets for NPM prebuilds ===
+    const prebuild_step = b.step("prebuild", "Build prebuilt binaries for all platforms");
+
+    // Cross-compilation targets
+    const cross_targets = [_]struct {
+        query: std.Target.Query,
+        name: []const u8,
+    }{
+        .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .macos }, .name = "darwin-x64" },
+        .{ .query = .{ .cpu_arch = .aarch64, .os_tag = .macos }, .name = "darwin-arm64" },
+        .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu }, .name = "linux-x64" },
+        .{ .query = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu }, .name = "linux-arm64" },
+        .{ .query = .{ .cpu_arch = .x86_64, .os_tag = .windows }, .name = "win32-x64" },
+    };
+
+    for (cross_targets) |cross_target| {
+        const resolved_target = b.resolveTargetQuery(cross_target.query);
+
+        const cross_lib = b.addLibrary(.{
+            .name = "lanceql",
+            .linkage = .dynamic,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/nodejs.zig"),
+                .target = resolved_target,
+                .optimize = .ReleaseFast,
+                .imports = &.{
+                    .{ .name = "lanceql.format", .module = format_mod },
+                    .{ .name = "lanceql.io", .module = io_mod },
+                    .{ .name = "lanceql.proto", .module = proto_mod },
+                    .{ .name = "lanceql.encoding", .module = encoding_mod },
+                    .{ .name = "lanceql.table", .module = table_mod },
+                    .{ .name = "lanceql.value", .module = value_mod },
+                    .{ .name = "lanceql.sql.ast", .module = sql_ast_mod },
+                    .{ .name = "lanceql.sql.lexer", .module = sql_lexer_mod },
+                    .{ .name = "lanceql.sql.parser", .module = sql_parser_mod },
+                    .{ .name = "lanceql.sql.executor", .module = sql_executor_mod },
+                },
+            }),
+        });
+
+        // Install to prebuilds/{platform}/
+        const install_cross = b.addInstallArtifact(cross_lib, .{
+            .dest_dir = .{ .override = .{ .custom = b.fmt("prebuilds/{s}", .{cross_target.name}) } },
+        });
+        prebuild_step.dependOn(&install_cross.step);
+
+        // Also create individual platform steps
+        const platform_step = b.step(b.fmt("prebuild-{s}", .{cross_target.name}), b.fmt("Build for {s}", .{cross_target.name}));
+        platform_step.dependOn(&install_cross.step);
+    }
 }
