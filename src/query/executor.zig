@@ -541,7 +541,7 @@ pub const Executor = struct {
         const order_by = self.stmt.order_by;
 
         // Sort rows
-        std.mem.sort([]Value, rows.*, struct {
+        const SortContext = struct {
             order_indices: []usize,
             order_by: []OrderBy,
 
@@ -558,7 +558,9 @@ pub const Executor = struct {
                 }
                 return false;
             }
-        }{ .order_indices = order_indices, .order_by = order_by });
+        };
+        const sort_ctx = SortContext{ .order_indices = order_indices, .order_by = order_by };
+        std.mem.sort([]Value, rows.*, sort_ctx, SortContext.lessThan);
     }
 };
 
