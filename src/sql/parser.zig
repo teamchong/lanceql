@@ -386,6 +386,13 @@ pub const Parser = struct {
                 };
             },
 
+            // Aggregate function keywords (COUNT, SUM, AVG, MIN, MAX)
+            .COUNT, .SUM, .AVG, .MIN, .MAX => {
+                const name = tok.lexeme;
+                self.advance();
+                return try self.parseFunctionCall(name);
+            },
+
             // Parenthesized expression
             .LPAREN => {
                 self.advance();

@@ -272,3 +272,203 @@ test "execute SELECT * on better-sqlite3 fixture" {
     try std.testing.expectEqual(@as(i64, 1), ints[0]);
     try std.testing.expectEqual(@as(i64, 2), ints[1]);
 }
+
+// ============================================================================
+// GROUP BY / Aggregate Tests
+// ============================================================================
+
+test "execute SELECT COUNT(*)" {
+    const allocator = std.testing.allocator;
+
+    // Open test Lance file
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // Parse SQL: SELECT COUNT(*) FROM table
+    const sql = "SELECT COUNT(*) FROM table";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    // Execute
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    // Verify results - should have 1 row with count 5
+    try std.testing.expectEqual(@as(usize, 1), result.columns.len);
+    try std.testing.expectEqual(@as(usize, 1), result.row_count);
+
+    try std.testing.expect(result.columns[0].data == .int64);
+    const values = result.columns[0].data.int64;
+    try std.testing.expectEqual(@as(i64, 5), values[0]);
+}
+
+test "execute SELECT SUM(id)" {
+    const allocator = std.testing.allocator;
+
+    // Open test Lance file
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // Parse SQL: SELECT SUM(id) FROM table
+    const sql = "SELECT SUM(id) FROM table";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    // Execute
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    // Verify results - should have 1 row with sum 15 (1+2+3+4+5)
+    try std.testing.expectEqual(@as(usize, 1), result.columns.len);
+    try std.testing.expectEqual(@as(usize, 1), result.row_count);
+
+    try std.testing.expect(result.columns[0].data == .int64);
+    const values = result.columns[0].data.int64;
+    try std.testing.expectEqual(@as(i64, 15), values[0]);
+}
+
+test "execute SELECT AVG(id)" {
+    const allocator = std.testing.allocator;
+
+    // Open test Lance file
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // Parse SQL: SELECT AVG(id) FROM table
+    const sql = "SELECT AVG(id) FROM table";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    // Execute
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    // Verify results - should have 1 row with avg 3 (15/5)
+    try std.testing.expectEqual(@as(usize, 1), result.columns.len);
+    try std.testing.expectEqual(@as(usize, 1), result.row_count);
+
+    try std.testing.expect(result.columns[0].data == .int64);
+    const values = result.columns[0].data.int64;
+    try std.testing.expectEqual(@as(i64, 3), values[0]);
+}
+
+test "execute SELECT MIN/MAX(id)" {
+    const allocator = std.testing.allocator;
+
+    // Open test Lance file
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // Test MIN
+    {
+        const sql = "SELECT MIN(id) FROM table";
+        var stmt = try parser.parseSQL(sql, allocator);
+        defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+        var executor = Executor.init(&table, allocator);
+        defer executor.deinit();
+        var result = try executor.execute(&stmt.select, &[_]Value{});
+        defer result.deinit();
+
+        try std.testing.expectEqual(@as(i64, 1), result.columns[0].data.int64[0]);
+    }
+
+    // Test MAX
+    {
+        const sql = "SELECT MAX(id) FROM table";
+        var stmt = try parser.parseSQL(sql, allocator);
+        defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+        var executor = Executor.init(&table, allocator);
+        defer executor.deinit();
+        var result = try executor.execute(&stmt.select, &[_]Value{});
+        defer result.deinit();
+
+        try std.testing.expectEqual(@as(i64, 5), result.columns[0].data.int64[0]);
+    }
+}
+
+test "execute SELECT with GROUP BY" {
+    const allocator = std.testing.allocator;
+
+    // Use better-sqlite3 fixture which has 'a' (string) and 'b' (int64)
+    // Values: a=['foo','bar','baz','qux','quux','corge','grault','garply','waldo','fred'], b=[1..10]
+    // All a values are unique, so GROUP BY a gives 10 groups
+    const data = @embedFile("fixtures/better-sqlite3/simple.lance/data/1010001110011001100010108ba1604433ac0cda4c27f6809f.lance");
+
+    var table = try Table.init(allocator, data);
+    defer table.deinit();
+
+    // Parse SQL: SELECT a, COUNT(*) FROM table GROUP BY a
+    const sql = "SELECT a, COUNT(*) FROM table GROUP BY a";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    // Execute
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    // Verify results - should have 10 groups (all unique strings)
+    try std.testing.expectEqual(@as(usize, 2), result.columns.len);
+    try std.testing.expectEqual(@as(usize, 10), result.row_count);
+
+    // Column 0 should be 'a' (string), Column 1 should be COUNT(*) (int64)
+    try std.testing.expect(result.columns[0].data == .string);
+    try std.testing.expect(result.columns[1].data == .int64);
+
+    // Each group should have exactly 1 row (all unique strings)
+    const counts = result.columns[1].data.int64;
+    for (counts) |c| {
+        try std.testing.expectEqual(@as(i64, 1), c);
+    }
+}
+
+test "execute SELECT with GROUP BY and SUM" {
+    const allocator = std.testing.allocator;
+
+    // Use better-sqlite3 fixture: a is unique strings, b=[1..10]
+    // Since each a value is unique, GROUP BY a gives 10 groups with SUM = b value for each
+    const data = @embedFile("fixtures/better-sqlite3/simple.lance/data/1010001110011001100010108ba1604433ac0cda4c27f6809f.lance");
+
+    var table = try Table.init(allocator, data);
+    defer table.deinit();
+
+    // Parse SQL: SELECT a, SUM(b) FROM table GROUP BY a
+    const sql = "SELECT a, SUM(b) FROM table GROUP BY a";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    // Execute
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    // Verify results - 10 groups
+    try std.testing.expectEqual(@as(usize, 2), result.columns.len);
+    try std.testing.expectEqual(@as(usize, 10), result.row_count);
+
+    // Check that we have string and int64 columns
+    try std.testing.expect(result.columns[0].data == .string);
+    try std.testing.expect(result.columns[1].data == .int64);
+
+    // Verify total sum of all SUM(b) values equals 1+2+3+...+10 = 55
+    const sums = result.columns[1].data.int64;
+    var total: i64 = 0;
+    for (sums) |s| {
+        total += s;
+    }
+    try std.testing.expectEqual(@as(i64, 55), total);
+}

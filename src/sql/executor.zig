@@ -12,6 +12,85 @@ const SelectStmt = ast.SelectStmt;
 const Value = ast.Value;
 const BinaryOp = ast.BinaryOp;
 
+/// Aggregate function types
+pub const AggregateType = enum {
+    count,
+    count_star,
+    sum,
+    avg,
+    min,
+    max,
+};
+
+/// Accumulator for aggregate computations
+pub const Accumulator = struct {
+    agg_type: AggregateType,
+    count: i64,
+    sum: f64,
+    min_int: ?i64,
+    max_int: ?i64,
+    min_float: ?f64,
+    max_float: ?f64,
+
+    pub fn init(agg_type: AggregateType) Accumulator {
+        return Accumulator{
+            .agg_type = agg_type,
+            .count = 0,
+            .sum = 0,
+            .min_int = null,
+            .max_int = null,
+            .min_float = null,
+            .max_float = null,
+        };
+    }
+
+    pub fn addInt(self: *Accumulator, value: i64) void {
+        self.count += 1;
+        self.sum += @as(f64, @floatFromInt(value));
+        if (self.min_int == null or value < self.min_int.?) {
+            self.min_int = value;
+        }
+        if (self.max_int == null or value > self.max_int.?) {
+            self.max_int = value;
+        }
+    }
+
+    pub fn addFloat(self: *Accumulator, value: f64) void {
+        self.count += 1;
+        self.sum += value;
+        if (self.min_float == null or value < self.min_float.?) {
+            self.min_float = value;
+        }
+        if (self.max_float == null or value > self.max_float.?) {
+            self.max_float = value;
+        }
+    }
+
+    pub fn addCount(self: *Accumulator) void {
+        self.count += 1;
+    }
+
+    pub fn getResult(self: Accumulator) f64 {
+        return switch (self.agg_type) {
+            .count, .count_star => @as(f64, @floatFromInt(self.count)),
+            .sum => self.sum,
+            .avg => if (self.count > 0) self.sum / @as(f64, @floatFromInt(self.count)) else 0,
+            .min => self.min_float orelse @as(f64, @floatFromInt(self.min_int orelse 0)),
+            .max => self.max_float orelse @as(f64, @floatFromInt(self.max_int orelse 0)),
+        };
+    }
+
+    pub fn getIntResult(self: Accumulator) i64 {
+        return switch (self.agg_type) {
+            .count, .count_star => self.count,
+            .sum => @as(i64, @intFromFloat(self.sum)),
+            .avg => if (self.count > 0) @as(i64, @intFromFloat(self.sum / @as(f64, @floatFromInt(self.count)))) else 0,
+            .min => self.min_int orelse 0,
+            .max => self.max_int orelse 0,
+        };
+    }
+};
+
 /// Query result in columnar format
 pub const Result = struct {
     columns: []Column,
@@ -160,15 +239,24 @@ pub const Executor = struct {
 
         defer self.allocator.free(indices);
 
-        // 3. Read columns based on SELECT list
+        // 3. Check if we need GROUP BY processing
+        const has_group_by = stmt.group_by != null;
+        const has_aggregates = self.hasAggregates(stmt.columns);
+
+        if (has_group_by or has_aggregates) {
+            // Execute with GROUP BY / aggregation
+            return self.executeWithGroupBy(stmt, indices);
+        }
+
+        // 4. Read columns based on SELECT list (non-aggregate path)
         const columns = try self.readColumns(stmt.columns, indices);
 
-        // 4. Apply ORDER BY (in-memory sorting)
+        // 5. Apply ORDER BY (in-memory sorting)
         if (stmt.order_by) |order_by| {
             try self.applyOrderBy(columns, order_by);
         }
 
-        // 5. Apply LIMIT and OFFSET
+        // 6. Apply LIMIT and OFFSET
         const final_row_count = self.applyLimitOffset(columns, stmt.limit, stmt.offset);
 
         return Result{
@@ -176,6 +264,430 @@ pub const Executor = struct {
             .row_count = final_row_count,
             .allocator = self.allocator,
         };
+    }
+
+    // ========================================================================
+    // GROUP BY / Aggregate Execution
+    // ========================================================================
+
+    /// Check if SELECT list contains any aggregate functions
+    fn hasAggregates(self: *Self, select_list: []const ast.SelectItem) bool {
+        _ = self;
+        for (select_list) |item| {
+            if (containsAggregate(&item.expr)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Recursively check if expression contains an aggregate function
+    fn containsAggregate(expr: *const Expr) bool {
+        return switch (expr.*) {
+            .call => |call| blk: {
+                // Check if this is an aggregate function
+                const is_agg = isAggregateFunction(call.name);
+                if (is_agg) break :blk true;
+
+                // Check arguments recursively
+                for (call.args) |*arg| {
+                    if (containsAggregate(arg)) break :blk true;
+                }
+                break :blk false;
+            },
+            .binary => |bin| containsAggregate(bin.left) or containsAggregate(bin.right),
+            .unary => |un| containsAggregate(un.operand),
+            else => false,
+        };
+    }
+
+    /// Check if function name is an aggregate function
+    fn isAggregateFunction(name: []const u8) bool {
+        // Case-insensitive comparison
+        if (name.len < 3 or name.len > 5) return false;
+
+        var upper_buf: [8]u8 = undefined;
+        const upper_name = std.ascii.upperString(&upper_buf, name);
+
+        return std.mem.eql(u8, upper_name, "COUNT") or
+            std.mem.eql(u8, upper_name, "SUM") or
+            std.mem.eql(u8, upper_name, "AVG") or
+            std.mem.eql(u8, upper_name, "MIN") or
+            std.mem.eql(u8, upper_name, "MAX");
+    }
+
+    /// Parse aggregate function name to AggregateType
+    fn parseAggregateType(name: []const u8, args: []const Expr) AggregateType {
+        var upper_buf: [8]u8 = undefined;
+        const upper_name = std.ascii.upperString(&upper_buf, name);
+
+        if (std.mem.eql(u8, upper_name, "COUNT")) {
+            // COUNT(*) vs COUNT(col)
+            if (args.len == 1 and args[0] == .column and
+                std.mem.eql(u8, args[0].column.name, "*"))
+            {
+                return .count_star;
+            }
+            return .count;
+        } else if (std.mem.eql(u8, upper_name, "SUM")) {
+            return .sum;
+        } else if (std.mem.eql(u8, upper_name, "AVG")) {
+            return .avg;
+        } else if (std.mem.eql(u8, upper_name, "MIN")) {
+            return .min;
+        } else if (std.mem.eql(u8, upper_name, "MAX")) {
+            return .max;
+        }
+        return .count; // Default fallback
+    }
+
+    /// Execute SELECT with GROUP BY and/or aggregates
+    fn executeWithGroupBy(self: *Self, stmt: *const SelectStmt, filtered_indices: []const u32) !Result {
+        // Preload all columns we'll need for grouping and aggregates
+        try self.preloadGroupByColumns(stmt);
+
+        // Get group by column names (empty if no GROUP BY but has aggregates)
+        const group_cols = if (stmt.group_by) |gb| gb.columns else &[_][]const u8{};
+
+        // Build groups: maps group key to list of row indices
+        var groups = std.StringHashMap(std.ArrayList(u32)).init(self.allocator);
+        defer {
+            var iter = groups.valueIterator();
+            while (iter.next()) |list| {
+                list.deinit(self.allocator);
+            }
+            groups.deinit();
+        }
+
+        // Also need to track key strings for proper cleanup
+        var key_strings = std.ArrayList([]const u8){};
+        defer {
+            for (key_strings.items) |key| {
+                self.allocator.free(key);
+            }
+            key_strings.deinit(self.allocator);
+        }
+
+        // Group rows by their group key
+        for (filtered_indices) |row_idx| {
+            const key = try self.buildGroupKey(group_cols, row_idx);
+
+            if (groups.getPtr(key)) |list| {
+                // Existing group - add row index and free the duplicate key
+                try list.append(self.allocator, row_idx);
+                self.allocator.free(key);
+            } else {
+                // New group
+                var list = std.ArrayList(u32){};
+                try list.append(self.allocator, row_idx);
+                try groups.put(key, list);
+                try key_strings.append(self.allocator, key);
+            }
+        }
+
+        // If no GROUP BY and no matching rows, return single row with 0/null for aggregates
+        const num_groups = if (groups.count() == 0 and group_cols.len == 0)
+            @as(usize, 1) // Single aggregate result
+        else
+            groups.count();
+
+        // Build result columns
+        var result_columns = std.ArrayList(Result.Column){};
+        errdefer {
+            for (result_columns.items) |col| {
+                switch (col.data) {
+                    .int64 => |data| self.allocator.free(data),
+                    .float64 => |data| self.allocator.free(data),
+                    .string => |data| {
+                        for (data) |str| self.allocator.free(str);
+                        self.allocator.free(data);
+                    },
+                }
+            }
+            result_columns.deinit(self.allocator);
+        }
+
+        // Process each SELECT item
+        for (stmt.columns) |item| {
+            const col = try self.evaluateSelectItemForGroups(item, &groups, group_cols, num_groups);
+            try result_columns.append(self.allocator, col);
+        }
+
+        var result = Result{
+            .columns = try result_columns.toOwnedSlice(self.allocator),
+            .row_count = num_groups,
+            .allocator = self.allocator,
+        };
+
+        // Apply HAVING clause
+        if (stmt.group_by) |gb| {
+            if (gb.having) |_| {
+                // TODO: Apply HAVING filter
+                // For now, skip HAVING
+            }
+        }
+
+        // Apply ORDER BY
+        if (stmt.order_by) |order_by| {
+            try self.applyOrderBy(result.columns, order_by);
+        }
+
+        // Apply LIMIT/OFFSET
+        result.row_count = self.applyLimitOffset(result.columns, stmt.limit, stmt.offset);
+
+        return result;
+    }
+
+    /// Preload columns needed for GROUP BY and aggregates
+    fn preloadGroupByColumns(self: *Self, stmt: *const SelectStmt) !void {
+        var col_names = std.ArrayList([]const u8){};
+        defer col_names.deinit(self.allocator);
+
+        // Add GROUP BY columns
+        if (stmt.group_by) |gb| {
+            for (gb.columns) |col| {
+                try col_names.append(self.allocator, col);
+            }
+        }
+
+        // Add columns referenced in SELECT expressions
+        for (stmt.columns) |item| {
+            try self.extractExprColumnNames(&item.expr, &col_names);
+        }
+
+        try self.preloadColumns(col_names.items);
+    }
+
+    /// Extract column names from any expression
+    fn extractExprColumnNames(self: *Self, expr: *const Expr, list: *std.ArrayList([]const u8)) anyerror!void {
+        switch (expr.*) {
+            .column => |col| {
+                if (!std.mem.eql(u8, col.name, "*")) {
+                    try list.append(self.allocator, col.name);
+                }
+            },
+            .binary => |bin| {
+                try self.extractExprColumnNames(bin.left, list);
+                try self.extractExprColumnNames(bin.right, list);
+            },
+            .unary => |un| {
+                try self.extractExprColumnNames(un.operand, list);
+            },
+            .call => |call| {
+                for (call.args) |*arg| {
+                    try self.extractExprColumnNames(arg, list);
+                }
+            },
+            else => {},
+        }
+    }
+
+    /// Build a group key string from GROUP BY column values for a row
+    fn buildGroupKey(self: *Self, group_cols: []const []const u8, row_idx: u32) ![]const u8 {
+        if (group_cols.len == 0) {
+            // No GROUP BY - all rows in one group
+            return try self.allocator.dupe(u8, "__all__");
+        }
+
+        var key = std.ArrayList(u8){};
+        errdefer key.deinit(self.allocator);
+
+        for (group_cols, 0..) |col_name, i| {
+            if (i > 0) try key.append(self.allocator, '|');
+
+            const cached = self.column_cache.get(col_name) orelse return error.ColumnNotCached;
+
+            switch (cached) {
+                .int64 => |data| {
+                    var buf: [32]u8 = undefined;
+                    const str = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch unreachable;
+                    try key.appendSlice(self.allocator, str);
+                },
+                .float64 => |data| {
+                    var buf: [32]u8 = undefined;
+                    const str = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch unreachable;
+                    try key.appendSlice(self.allocator, str);
+                },
+                .string => |data| {
+                    try key.appendSlice(self.allocator, data[row_idx]);
+                },
+            }
+        }
+
+        return key.toOwnedSlice(self.allocator);
+    }
+
+    /// Evaluate a SELECT item for all groups
+    fn evaluateSelectItemForGroups(
+        self: *Self,
+        item: ast.SelectItem,
+        groups: *std.StringHashMap(std.ArrayList(u32)),
+        group_cols: []const []const u8,
+        num_groups: usize,
+    ) !Result.Column {
+        const expr = &item.expr;
+
+        // Handle aggregate function
+        if (expr.* == .call and isAggregateFunction(expr.call.name)) {
+            return self.evaluateAggregateForGroups(item, groups, num_groups);
+        }
+
+        // Handle regular column (must be in GROUP BY)
+        if (expr.* == .column) {
+            const col_name = expr.column.name;
+
+            // Verify column is in GROUP BY
+            var in_group_by = false;
+            for (group_cols) |gb_col| {
+                if (std.mem.eql(u8, gb_col, col_name)) {
+                    in_group_by = true;
+                    break;
+                }
+            }
+            if (!in_group_by and group_cols.len > 0) {
+                return error.ColumnNotInGroupBy;
+            }
+
+            return self.evaluateGroupByColumnForGroups(item, groups, num_groups);
+        }
+
+        return error.UnsupportedExpression;
+    }
+
+    /// Evaluate an aggregate function for all groups
+    fn evaluateAggregateForGroups(
+        self: *Self,
+        item: ast.SelectItem,
+        groups: *std.StringHashMap(std.ArrayList(u32)),
+        num_groups: usize,
+    ) !Result.Column {
+        const call = item.expr.call;
+        const agg_type = parseAggregateType(call.name, call.args);
+
+        // Determine column name for the aggregate (if not COUNT(*))
+        const agg_col_name: ?[]const u8 = if (agg_type != .count_star and call.args.len > 0)
+            if (call.args[0] == .column) call.args[0].column.name else null
+        else
+            null;
+
+        // Allocate result array
+        const results = try self.allocator.alloc(i64, num_groups);
+        errdefer self.allocator.free(results);
+
+        // Handle case of no groups (aggregate over empty set or no GROUP BY with data)
+        if (groups.count() == 0) {
+            // Return 0 for COUNT, null would be better for others but use 0
+            results[0] = 0;
+            return Result.Column{
+                .name = item.alias orelse call.name,
+                .data = Result.ColumnData{ .int64 = results },
+            };
+        }
+
+        // Compute aggregate for each group
+        var group_idx: usize = 0;
+        var iter = groups.iterator();
+        while (iter.next()) |entry| {
+            const row_indices = entry.value_ptr.items;
+
+            var acc = Accumulator.init(agg_type);
+
+            for (row_indices) |row_idx| {
+                if (agg_type == .count_star) {
+                    acc.addCount();
+                } else if (agg_col_name) |col_name| {
+                    const cached = self.column_cache.get(col_name) orelse return error.ColumnNotCached;
+
+                    switch (cached) {
+                        .int64 => |data| acc.addInt(data[row_idx]),
+                        .float64 => |data| acc.addFloat(data[row_idx]),
+                        .string => acc.addCount(), // COUNT for strings
+                    }
+                } else {
+                    acc.addCount();
+                }
+            }
+
+            results[group_idx] = acc.getIntResult();
+            group_idx += 1;
+        }
+
+        return Result.Column{
+            .name = item.alias orelse call.name,
+            .data = Result.ColumnData{ .int64 = results },
+        };
+    }
+
+    /// Evaluate a GROUP BY column for all groups (return first value from each group)
+    fn evaluateGroupByColumnForGroups(
+        self: *Self,
+        item: ast.SelectItem,
+        groups: *std.StringHashMap(std.ArrayList(u32)),
+        num_groups: usize,
+    ) !Result.Column {
+        const col_name = item.expr.column.name;
+        const cached = self.column_cache.get(col_name) orelse return error.ColumnNotCached;
+
+        // Allocate based on column type
+        switch (cached) {
+            .int64 => |source_data| {
+                const results = try self.allocator.alloc(i64, num_groups);
+                errdefer self.allocator.free(results);
+
+                var group_idx: usize = 0;
+                var iter = groups.iterator();
+                while (iter.next()) |entry| {
+                    const row_indices = entry.value_ptr.items;
+                    if (row_indices.len > 0) {
+                        results[group_idx] = source_data[row_indices[0]];
+                    }
+                    group_idx += 1;
+                }
+
+                return Result.Column{
+                    .name = item.alias orelse col_name,
+                    .data = Result.ColumnData{ .int64 = results },
+                };
+            },
+            .float64 => |source_data| {
+                const results = try self.allocator.alloc(f64, num_groups);
+                errdefer self.allocator.free(results);
+
+                var group_idx: usize = 0;
+                var iter = groups.iterator();
+                while (iter.next()) |entry| {
+                    const row_indices = entry.value_ptr.items;
+                    if (row_indices.len > 0) {
+                        results[group_idx] = source_data[row_indices[0]];
+                    }
+                    group_idx += 1;
+                }
+
+                return Result.Column{
+                    .name = item.alias orelse col_name,
+                    .data = Result.ColumnData{ .float64 = results },
+                };
+            },
+            .string => |source_data| {
+                const results = try self.allocator.alloc([]const u8, num_groups);
+                errdefer self.allocator.free(results);
+
+                var group_idx: usize = 0;
+                var iter = groups.iterator();
+                while (iter.next()) |entry| {
+                    const row_indices = entry.value_ptr.items;
+                    if (row_indices.len > 0) {
+                        results[group_idx] = try self.allocator.dupe(u8, source_data[row_indices[0]]);
+                    }
+                    group_idx += 1;
+                }
+
+                return Result.Column{
+                    .name = item.alias orelse col_name,
+                    .data = Result.ColumnData{ .string = results },
+                };
+            },
+        }
     }
 
     // ========================================================================
@@ -756,225 +1268,4 @@ pub const Executor = struct {
     }
 };
 
-// ============================================================================
-// Tests
-// ============================================================================
-
-const parser = @import("parser");
-
-test "execute simple SELECT *" {
-    const allocator = std.testing.allocator;
-
-    // Open test Lance file
-    const lance_data = @embedFile("tests/fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
-    var table = try Table.init(lance_data, allocator);
-    defer table.deinit();
-
-    // Parse SQL
-    const sql = "SELECT * FROM table";
-    const stmt = try parser.parseSQL(sql, allocator);
-    defer {
-        // Free allocated memory
-        allocator.free(stmt.select.columns);
-    }
-
-    // Execute
-    var executor = Executor.init(&table, allocator);
-    var result = try executor.execute(&stmt.select, &[_]Value{});
-    defer result.deinit();
-
-    // Verify results
-    try std.testing.expectEqual(@as(usize, 1), result.columns.len);
-    try std.testing.expectEqual(@as(usize, 5), result.row_count);
-
-    // Check column data
-    const col = result.columns[0];
-    try std.testing.expect(col.data == .int64);
-    const values = col.data.int64;
-    try std.testing.expectEqual(@as(i64, 1), values[0]);
-    try std.testing.expectEqual(@as(i64, 2), values[1]);
-    try std.testing.expectEqual(@as(i64, 3), values[2]);
-    try std.testing.expectEqual(@as(i64, 4), values[3]);
-    try std.testing.expectEqual(@as(i64, 5), values[4]);
-}
-
-test "execute SELECT with WHERE clause" {
-    const allocator = std.testing.allocator;
-
-    // Open test Lance file
-    const lance_data = @embedFile("tests/fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
-    var table = try Table.init(lance_data, allocator);
-    defer table.deinit();
-
-    // Parse SQL: SELECT * FROM table WHERE id > 2
-    const sql = "SELECT * FROM table WHERE id > 2";
-    const stmt = try parser.parseSQL(sql, allocator);
-    defer {
-        allocator.free(stmt.select.columns);
-        // Note: WHERE expression cleanup not implemented yet
-    }
-
-    // Execute
-    var executor = Executor.init(&table, allocator);
-    var result = try executor.execute(&stmt.select, &[_]Value{});
-    defer result.deinit();
-
-    // Verify results - should have 3 rows (3, 4, 5)
-    try std.testing.expectEqual(@as(usize, 1), result.columns.len);
-    try std.testing.expectEqual(@as(usize, 3), result.row_count);
-
-    const values = result.columns[0].data.int64;
-    try std.testing.expectEqual(@as(i64, 3), values[0]);
-    try std.testing.expectEqual(@as(i64, 4), values[1]);
-    try std.testing.expectEqual(@as(i64, 5), values[2]);
-}
-
-test "execute SELECT with ORDER BY DESC" {
-    const allocator = std.testing.allocator;
-
-    // Open test Lance file
-    const lance_data = @embedFile("tests/fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
-    var table = try Table.init(lance_data, allocator);
-    defer table.deinit();
-
-    // Parse SQL: SELECT * FROM table ORDER BY id DESC
-    const sql = "SELECT * FROM table ORDER BY id DESC";
-    const stmt = try parser.parseSQL(sql, allocator);
-    defer {
-        allocator.free(stmt.select.columns);
-        if (stmt.select.order_by) |order_by| {
-            allocator.free(order_by);
-        }
-    }
-
-    // Execute
-    var executor = Executor.init(&table, allocator);
-    var result = try executor.execute(&stmt.select, &[_]Value{});
-    defer result.deinit();
-
-    // Verify results - should be reversed (5, 4, 3, 2, 1)
-    try std.testing.expectEqual(@as(usize, 5), result.row_count);
-
-    const values = result.columns[0].data.int64;
-    try std.testing.expectEqual(@as(i64, 5), values[0]);
-    try std.testing.expectEqual(@as(i64, 4), values[1]);
-    try std.testing.expectEqual(@as(i64, 3), values[2]);
-    try std.testing.expectEqual(@as(i64, 2), values[3]);
-    try std.testing.expectEqual(@as(i64, 1), values[4]);
-}
-
-test "execute SELECT with LIMIT" {
-    const allocator = std.testing.allocator;
-
-    // Open test Lance file
-    const lance_data = @embedFile("tests/fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
-    var table = try Table.init(lance_data, allocator);
-    defer table.deinit();
-
-    // Parse SQL: SELECT * FROM table LIMIT 3
-    const sql = "SELECT * FROM table LIMIT 3";
-    const stmt = try parser.parseSQL(sql, allocator);
-    defer {
-        allocator.free(stmt.select.columns);
-    }
-
-    // Execute
-    var executor = Executor.init(&table, allocator);
-    var result = try executor.execute(&stmt.select, &[_]Value{});
-    defer result.deinit();
-
-    // Verify results - should have 3 rows (1, 2, 3)
-    try std.testing.expectEqual(@as(usize, 3), result.row_count);
-
-    const values = result.columns[0].data.int64;
-    try std.testing.expectEqual(@as(i64, 1), values[0]);
-    try std.testing.expectEqual(@as(i64, 2), values[1]);
-    try std.testing.expectEqual(@as(i64, 3), values[2]);
-}
-
-test "execute SELECT with OFFSET" {
-    const allocator = std.testing.allocator;
-
-    // Open test Lance file
-    const lance_data = @embedFile("tests/fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
-    var table = try Table.init(lance_data, allocator);
-    defer table.deinit();
-
-    // Parse SQL: SELECT * FROM table LIMIT 2 OFFSET 2
-    const sql = "SELECT * FROM table LIMIT 2 OFFSET 2";
-    const stmt = try parser.parseSQL(sql, allocator);
-    defer {
-        allocator.free(stmt.select.columns);
-    }
-
-    // Execute
-    var executor = Executor.init(&table, allocator);
-    var result = try executor.execute(&stmt.select, &[_]Value{});
-    defer result.deinit();
-
-    // Verify results - should have 2 rows (3, 4)
-    try std.testing.expectEqual(@as(usize, 2), result.row_count);
-
-    const values = result.columns[0].data.int64;
-    try std.testing.expectEqual(@as(i64, 3), values[0]);
-    try std.testing.expectEqual(@as(i64, 4), values[1]);
-}
-
-test "execute SELECT with float64 column" {
-    const allocator = std.testing.allocator;
-
-    // Open test Lance file with float64
-    const lance_data = @embedFile("tests/fixtures/simple_float64.lance/data/1001011111000011101110011001df8d2b7e5cdba7b949fb6c85.lance");
-    var table = try Table.init(lance_data, allocator);
-    defer table.deinit();
-
-    // Parse SQL
-    const sql = "SELECT * FROM table WHERE value > 3.0";
-    const stmt = try parser.parseSQL(sql, allocator);
-    defer {
-        allocator.free(stmt.select.columns);
-    }
-
-    // Execute
-    var executor = Executor.init(&table, allocator);
-    var result = try executor.execute(&stmt.select, &[_]Value{});
-    defer result.deinit();
-
-    // Verify results - should have 3 rows (3.5, 4.5, 5.5)
-    try std.testing.expectEqual(@as(usize, 3), result.row_count);
-
-    const values = result.columns[0].data.float64;
-    try std.testing.expectEqual(@as(f64, 3.5), values[0]);
-    try std.testing.expectEqual(@as(f64, 4.5), values[1]);
-    try std.testing.expectEqual(@as(f64, 5.5), values[2]);
-}
-
-test "execute SELECT with mixed types" {
-    const allocator = std.testing.allocator;
-
-    // Open test Lance file with mixed types
-    const lance_data = @embedFile("tests/fixtures/mixed_types.lance/data/11100100001000010010010060d60b4085bd08dcf790581192.lance");
-    var table = try Table.init(lance_data, allocator);
-    defer table.deinit();
-
-    // Parse SQL
-    const sql = "SELECT * FROM table";
-    const stmt = try parser.parseSQL(sql, allocator);
-    defer {
-        allocator.free(stmt.select.columns);
-    }
-
-    // Execute
-    var executor = Executor.init(&table, allocator);
-    var result = try executor.execute(&stmt.select, &[_]Value{});
-    defer result.deinit();
-
-    // Verify results
-    try std.testing.expectEqual(@as(usize, 3), result.columns.len);
-    try std.testing.expectEqual(@as(usize, 3), result.row_count);
-
-    // Check column types
-    try std.testing.expect(result.columns[0].data == .int64);
-    try std.testing.expect(result.columns[1].data == .float64);
-    try std.testing.expect(result.columns[2].data == .string);
-}
+// Tests are in tests/test_sql_executor.zig
