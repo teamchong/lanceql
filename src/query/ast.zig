@@ -17,7 +17,7 @@ pub const SelectStmt = struct {
     where: ?*Expr,
 
     /// GROUP BY column names
-    group_by: [][]const u8,
+    group_by: []const []const u8,
 
     /// HAVING clause filter (applied after grouping)
     having: ?*Expr,
