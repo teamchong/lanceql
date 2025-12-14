@@ -38,6 +38,7 @@ const Statement = struct {
     stmt: ast.SelectStmt,
     table_handle: *Handle,
     allocator: std.mem.Allocator,
+    sql_copy: []const u8, // Owned copy of SQL string to keep AST slices valid
 };
 
 // ============================================================================
@@ -281,22 +282,32 @@ export fn lance_column_type(handle: *Handle, col_idx: u32, buf: [*]u8, buf_len: 
 
 /// Parse SQL and return a statement handle
 export fn lance_sql_parse(sql_ptr: [*]const u8, sql_len: usize, handle: *Handle) ?*SQLHandle {
-    const sql = sql_ptr[0..sql_len];
+    // Copy the SQL string so AST slices remain valid after JS releases the string
+    const sql_copy = allocator.alloc(u8, sql_len) catch return null;
+    @memcpy(sql_copy, sql_ptr[0..sql_len]);
 
-    // Parse SQL
-    const stmt = parser.parseSQL(sql, allocator) catch return null;
+    // Parse SQL using our owned copy
+    const stmt = parser.parseSQL(sql_copy, allocator) catch {
+        allocator.free(sql_copy);
+        return null;
+    };
 
     // Only SELECT is supported for now
     if (stmt != .select) {
+        allocator.free(sql_copy);
         return null;
     }
 
     // Create Statement wrapper
-    const stmt_ptr = allocator.create(Statement) catch return null;
+    const stmt_ptr = allocator.create(Statement) catch {
+        allocator.free(sql_copy);
+        return null;
+    };
     stmt_ptr.* = Statement{
         .stmt = stmt.select,
         .table_handle = handle,
         .allocator = allocator,
+        .sql_copy = sql_copy,
     };
 
     const sql_handle = stmtToHandle(stmt_ptr);
@@ -363,6 +374,8 @@ export fn lance_sql_close(sql_handle: *SQLHandle) void {
         const stmt_ptr = entry.value;
         // Free all AST allocations (columns, where, group_by, order_by)
         ast.deinitSelectStmt(&stmt_ptr.stmt, stmt_ptr.allocator);
+        // Free the SQL string copy
+        allocator.free(stmt_ptr.sql_copy);
         allocator.destroy(stmt_ptr);
     }
 }
@@ -600,6 +613,8 @@ export fn lance_cleanup() void {
         const stmt_ptr = entry.value_ptr.*;
         // Free all AST allocations (columns, where, group_by, order_by)
         ast.deinitSelectStmt(&stmt_ptr.stmt, stmt_ptr.allocator);
+        // Free the SQL string copy
+        allocator.free(stmt_ptr.sql_copy);
         allocator.destroy(stmt_ptr);
     }
     statements.clearAndFree();

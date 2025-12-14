@@ -37,7 +37,8 @@ class Database {
         }
 
         this._open = true;
-        this._readonly = options.readonly || false;
+        // Lance files are always read-only, default to true unless explicitly set to false
+        this._readonly = options.readonly !== false;
     }
 
     // Properties (getters matching better-sqlite3)
@@ -271,6 +272,15 @@ class Statement {
     safeIntegers(toggle = true) {
         // No-op for v0.1.0 (always uses JavaScript numbers)
         return this;
+    }
+
+    finalize() {
+        // Explicitly release native statement resources
+        // This is important for long-running applications or when creating many statements
+        if (this._stmt && typeof this._stmt.finalize === 'function') {
+            this._stmt.finalize();
+        }
+        this._stmt = null;
     }
 }
 

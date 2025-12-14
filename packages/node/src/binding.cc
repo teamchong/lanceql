@@ -148,6 +148,7 @@ public:
     Napi::Value All(const Napi::CallbackInfo& info);
     Napi::Value Get(const Napi::CallbackInfo& info);
     Napi::Value Run(const Napi::CallbackInfo& info);
+    Napi::Value FinalizeStmt(const Napi::CallbackInfo& info);
 };
 
 Statement::Statement(const Napi::CallbackInfo& info)
@@ -167,7 +168,19 @@ Statement::Statement(const Napi::CallbackInfo& info)
 Statement::~Statement() {
     if (sql_handle && lance_sql_close_fn) {
         lance_sql_close_fn(sql_handle);
+        sql_handle = nullptr;
     }
+}
+
+Napi::Value Statement::FinalizeStmt(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (sql_handle && lance_sql_close_fn) {
+        lance_sql_close_fn(sql_handle);
+        sql_handle = nullptr;
+    }
+
+    return env.Undefined();
 }
 
 Napi::Value Statement::All(const Napi::CallbackInfo& info) {
@@ -272,6 +285,7 @@ Napi::Object Statement::Init(Napi::Env env, Napi::Object exports) {
         InstanceMethod("all", &Statement::All),
         InstanceMethod("get", &Statement::Get),
         InstanceMethod("run", &Statement::Run),
+        InstanceMethod("finalize", &Statement::FinalizeStmt),
     });
 
     exports.Set("Statement", func);
