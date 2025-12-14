@@ -69,49 +69,6 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // === Server Module ===
-    const server_mod = b.addModule("lanceql.server", .{
-        .root_source_file = b.path("src/server/server.zig"),
-    });
-
-    // === Server Executable ===
-    const server_exe = b.addExecutable(.{
-        .name = "lanceql-server",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/server/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "lanceql.server", .module = server_mod },
-            },
-        }),
-    });
-
-    const install_server = b.addInstallArtifact(server_exe, .{});
-    b.getInstallStep().dependOn(&install_server.step);
-
-    const run_server = b.addRunArtifact(server_exe);
-    run_server.step.dependOn(&install_server.step);
-    if (b.args) |args| {
-        run_server.addArgs(args);
-    }
-
-    const run_server_step = b.step("run-server", "Run the MySQL-compatible server");
-    run_server_step.dependOn(&run_server.step);
-
-    // Server auth tests
-    const test_auth = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/server/auth.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_test_auth = b.addRunArtifact(test_auth);
-
-    const test_server_step = b.step("test-server", "Run server module tests");
-    test_server_step.dependOn(&run_test_auth.step);
-
     // === Tests ===
     const test_footer = b.addTest(.{
         .root_module = b.createModule(.{
