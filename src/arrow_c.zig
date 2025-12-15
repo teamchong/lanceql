@@ -378,10 +378,11 @@ pub fn createFloat64ArrayOwned(alloc: std.mem.Allocator, data: []f64) !*ArrowArr
 /// Lance stores: end-offsets (int32 or int64) + data buffer
 /// Arrow needs: start-offsets (int32, n+1 entries) + data buffer
 /// We convert end-offsets to start-offsets by prepending 0.
+/// NOTE: This copies the data buffer to ensure it remains valid after the source file is closed.
 pub fn createStringArrayFromLance(
     alloc: std.mem.Allocator,
     lance_offsets: []const u8, // Raw Lance end-offsets buffer (int32 or int64 little-endian)
-    data_buffer: []const u8, // String data (zero-copy reference)
+    data_buffer: []const u8, // String data (will be copied)
 ) !*ArrowArray {
     const array = try alloc.create(ArrowArray);
     errdefer alloc.destroy(array);
@@ -418,20 +419,26 @@ pub fn createStringArrayFromLance(
         arrow_offsets[i + 1] = lance_end;
     }
 
+    // Copy the data buffer to ensure it stays valid after source file is closed
+    // This is necessary because the Arrow array may outlive the Lance file handle
+    const data_copy = try alloc.alloc(u8, data_buffer.len);
+    errdefer alloc.free(data_copy);
+    @memcpy(data_copy, data_buffer);
+
     // Allocate buffers array (validity + offsets + data)
     const buffers = try alloc.alloc(?*const anyopaque, 3);
     errdefer alloc.free(buffers);
 
     buffers[0] = null; // No validity buffer (no nulls)
     buffers[1] = @ptrCast(arrow_offsets.ptr); // Offsets buffer
-    buffers[2] = @ptrCast(data_buffer.ptr); // Data buffer (zero-copy!)
+    buffers[2] = @ptrCast(data_copy.ptr); // Data buffer (owned copy)
 
     private.* = .{
         .allocator = alloc,
         .buffers_owned = buffers,
         .data_owned_i64 = null,
         .data_owned_f64 = null,
-        .data_owned_bytes = null, // We don't own the data buffer
+        .data_owned_bytes = data_copy, // We own the data buffer copy
         .offsets_owned_i32 = arrow_offsets, // We own the offsets
     };
 
