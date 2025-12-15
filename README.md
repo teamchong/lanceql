@@ -247,14 +247,22 @@ import { LanceQL } from './lanceql.js';
 
 ## Benchmarks
 
-LanceQL vs official lancedb Python library (M1 MacBook Pro):
+### LanceQL vs lancedb (Lance files)
 
 | Test | Dataset | lancedb | LanceQL | Speedup |
 |------|---------|---------|---------|---------|
-| Full Table Scan | 100K rows | 29.4ms | 1.7ms | **17x faster** |
-| Full Table Scan | 1M rows | 344ms | 16.3ms | **21x faster** |
-| Column Projection | 100K rows | 35.6ms | 2.0ms | **18x faster** |
-| Throughput | 1M rows | 2.9M rows/s | 61.5M rows/s | **21x faster** |
+| Full Table Scan | 100K rows | 24.2ms | 2.4ms | **10x faster** |
+| Full Table Scan | 1M rows | 492ms | 16.5ms | **30x faster** |
+| Throughput | 1M rows | 2.0M rows/s | 60.7M rows/s | **30x faster** |
+
+### LanceQL vs PyArrow (Parquet files)
+
+| Test | Dataset | pyarrow.parquet | lanceql.parquet | Speedup |
+|------|---------|-----------------|-----------------|---------|
+| read_table() | 100K rows | 5.6ms | 2.4ms | **2.3x faster** |
+| read_table() | 1M rows | 24.2ms | 16.5ms | **1.5x faster** |
+| iter_batches() | 100K rows | 6.2ms | 1.6ms | **3.8x faster** |
+| Throughput | 1M rows | 41.4M rows/s | 60.7M rows/s | **1.5x faster** |
 
 **Why so fast?**
 - **Zero-copy Arrow C Data Interface** - Data buffers shared directly between Zig and PyArrow
@@ -263,7 +271,8 @@ LanceQL vs official lancedb Python library (M1 MacBook Pro):
 
 Run benchmarks yourself:
 ```bash
-python benchmarks/06_read_performance.py  # Read performance
+python benchmarks/06_read_performance.py  # vs lancedb
+python benchmarks/10_parquet_api.py       # vs pyarrow.parquet (drop-in API)
 python benchmarks/08_scale_tests.py       # Scale tests (100K-10M rows)
 ```
 
