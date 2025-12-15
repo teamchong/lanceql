@@ -6,16 +6,60 @@ A browser-based Lance file reader with SQL and vector search support. Query Lanc
 
 ## Features
 
-- **SQL Queries** - `SELECT`, `WHERE`, `LIMIT`, aggregations (`COUNT`, `SUM`, `AVG`)
+### All Platforms
 - **Vector Search** - Semantic search with `NEAR` clause using MiniLM/CLIP embeddings
 - **Time Travel** - Query historical versions with `read_lance(url, version)`
-- **DataFrame API** - Python-like syntax: `dataset.df().filter(...).select(...).limit(50)`
+
+### Browser (WASM + JavaScript)
+- **SQL** - `SELECT`, `WHERE`, `ORDER BY`, `LIMIT`, aggregations (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`)
 - **HTTP Range Requests** - Only fetch the bytes you need, not the entire file
 - **Local + Remote** - Drag & drop local files or load from URL
-- **Column Statistics** - Click column chips to see min/max/avg/null count
+- **DataFrame API** - `dataset.df().filter(...).select(...).limit(50)`
+
+### Node.js/Python (Native)
+- **Full SQL** - `ORDER BY`, `GROUP BY`, `DISTINCT`, all aggregations
+- **Data Types** - int32/64, float32/64, bool, string, timestamp (s/ms/us/ns), date32/64
+- **Parameterized Queries** - Bind values with `?` placeholders
+- **Drop-in APIs** - better-sqlite3 (Node.js), pyarrow.parquet (Python)
+
+## Installation
+
+### Browser (WASM)
+```bash
+npm install lanceql  # WIP - not yet published
+```
+
+### Node.js (Native) - WIP
+```bash
+npm install @lanceql/node  # WIP - not yet published
+```
+
+Drop-in replacement for **better-sqlite3** with Lance columnar files:
+```javascript
+// Instead of: const Database = require('better-sqlite3');
+const Database = require('@lanceql/node');
+
+const db = new Database('dataset.lance');
+const rows = db.prepare('SELECT * FROM data WHERE id > ?').all(100);
+```
+
+### Python - WIP
+```bash
+pip install metal0-lanceql  # WIP - not yet published
+```
+
+Drop-in replacement for **pyarrow.parquet** with Lance columnar files:
+```python
+# Instead of: import pyarrow.parquet as pq
+import metal0.lanceql as pq
+
+table = pq.read_table('dataset.lance')
+df = table.to_pandas()
+```
 
 ## Quick Start
 
+### Browser Demo
 ```bash
 cd examples/wasm
 python -m http.server 3000
@@ -226,6 +270,7 @@ aws s3 cp ./meta.json s3://bucket/dataset.lance/.meta.json --profile r2 --endpoi
 - IVF-PQ vector indices
 - Deletion vectors (logical deletes)
 - Version/time-travel queries
+- Data types: int32/64, float32/64, bool, string, timestamp[s/ms/us/ns], date32/64
 
 ## License
 

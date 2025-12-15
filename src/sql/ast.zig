@@ -32,6 +32,7 @@ pub const BinaryOp = enum {
     subtract, // -
     multiply, // *
     divide,   // /
+    concat,   // || (string concatenation)
 
     // Comparison
     eq,  // =

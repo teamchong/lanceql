@@ -365,6 +365,94 @@ export fn lance_sql_execute(sql_handle: *SQLHandle, handle: *Handle) ?*ResultHan
     return result_handle;
 }
 
+/// Execute a parsed SQL statement with parameters
+/// param_types: array of type codes: 'i' = int64, 'f' = float64, 's' = string, 'n' = null
+/// param_count: number of parameters
+/// int_params: array of int64 values (indexed by position in param_types where type='i')
+/// float_params: array of float64 values (indexed by position in param_types where type='f')
+/// string_ptrs: array of string pointers (indexed by position in param_types where type='s')
+/// string_lens: array of string lengths (indexed by position in param_types where type='s')
+export fn lance_sql_execute_params(
+    sql_handle: *SQLHandle,
+    handle: *Handle,
+    param_types: [*]const u8,
+    param_count: u32,
+    int_params: [*]const i64,
+    float_params: [*]const f64,
+    string_ptrs: [*]const [*]const u8,
+    string_lens: [*]const usize,
+) ?*ResultHandle {
+    _ = handle; // Table handle is stored in Statement
+
+    statements_lock.lock();
+    const stmt_ptr = statements.get(sql_handle);
+    statements_lock.unlock();
+
+    if (stmt_ptr == null) return null;
+    const stmt = stmt_ptr.?;
+
+    // Get table from handle
+    tables_lock.lock();
+    const table_ptr = tables.get(stmt.table_handle);
+    tables_lock.unlock();
+
+    if (table_ptr == null) return null;
+
+    // Build Value array from parameters
+    const params = allocator.alloc(ast.Value, param_count) catch return null;
+    defer allocator.free(params);
+
+    var int_idx: usize = 0;
+    var float_idx: usize = 0;
+    var str_idx: usize = 0;
+
+    for (0..param_count) |i| {
+        params[i] = switch (param_types[i]) {
+            'i' => blk: {
+                const v = int_params[int_idx];
+                int_idx += 1;
+                break :blk ast.Value{ .integer = v };
+            },
+            'f' => blk: {
+                const v = float_params[float_idx];
+                float_idx += 1;
+                break :blk ast.Value{ .float = v };
+            },
+            's' => blk: {
+                const ptr = string_ptrs[str_idx];
+                const len = string_lens[str_idx];
+                str_idx += 1;
+                break :blk ast.Value{ .string = ptr[0..len] };
+            },
+            'n' => ast.Value{ .null = {} },
+            else => return null,
+        };
+    }
+
+    // Execute query with parameters
+    var exec = executor.Executor.init(table_ptr.?, allocator);
+    defer exec.deinit();
+
+    const result_ptr = allocator.create(executor.Result) catch return null;
+    result_ptr.* = exec.execute(&stmt.stmt, params) catch {
+        allocator.destroy(result_ptr);
+        return null;
+    };
+
+    const result_handle = resultToHandle(result_ptr);
+
+    // Store in global map
+    results_lock.lock();
+    defer results_lock.unlock();
+    results.put(result_handle, result_ptr) catch {
+        result_ptr.deinit();
+        allocator.destroy(result_ptr);
+        return null;
+    };
+
+    return result_handle;
+}
+
 /// Close a SQL statement and free resources
 export fn lance_sql_close(sql_handle: *SQLHandle) void {
     statements_lock.lock();
@@ -418,7 +506,7 @@ export fn lance_result_column_name(result: *ResultHandle, col_idx: u32, buf: [*]
     return len;
 }
 
-/// Get a column type from the result (0=int64, 1=float64, 2=string)
+/// Get a column type from the result (0=int64, 1=float64, 2=string, 3=int32, 4=float32, 5=bool)
 export fn lance_result_column_type(result: *ResultHandle, col_idx: u32) u32 {
     results_lock.lock();
     defer results_lock.unlock();
@@ -427,10 +515,22 @@ export fn lance_result_column_type(result: *ResultHandle, col_idx: u32) u32 {
     if (col_idx >= result_ptr.columns.len) return 999;
 
     const col = result_ptr.columns[col_idx];
+    // Type codes: 0=int64, 1=float64, 2=string, 3=int32, 4=float32, 5=bool,
+    //             6=timestamp_s, 7=timestamp_ms, 8=timestamp_us, 9=timestamp_ns,
+    //             10=date32, 11=date64
     return switch (col.data) {
         .int64 => 0,
         .float64 => 1,
         .string => 2,
+        .int32 => 3,
+        .float32 => 4,
+        .bool_ => 5,
+        .timestamp_s => 6,
+        .timestamp_ms => 7,
+        .timestamp_us => 8,
+        .timestamp_ns => 9,
+        .date32 => 10,
+        .date64 => 11,
     };
 }
 
@@ -499,6 +599,65 @@ export fn lance_result_read_string(
     for (0..count) |i| {
         out_strings[i] = data[i].ptr;
         out_lengths[i] = data[i].len;
+    }
+
+    return count;
+}
+
+/// Read int32 column data
+export fn lance_result_read_int32(result: *ResultHandle, col_idx: u32, out: [*]i32, max_count: usize) usize {
+    results_lock.lock();
+    defer results_lock.unlock();
+
+    const result_ptr = results.get(result) orelse return 0;
+    if (col_idx >= result_ptr.columns.len) return 0;
+
+    const col = result_ptr.columns[col_idx];
+    if (col.data != .int32) return 0;
+
+    const data = col.data.int32;
+    const count = @min(data.len, max_count);
+    const out_buf = out[0..count];
+    @memcpy(out_buf, data[0..count]);
+
+    return count;
+}
+
+/// Read float32 column data
+export fn lance_result_read_float32(result: *ResultHandle, col_idx: u32, out: [*]f32, max_count: usize) usize {
+    results_lock.lock();
+    defer results_lock.unlock();
+
+    const result_ptr = results.get(result) orelse return 0;
+    if (col_idx >= result_ptr.columns.len) return 0;
+
+    const col = result_ptr.columns[col_idx];
+    if (col.data != .float32) return 0;
+
+    const data = col.data.float32;
+    const count = @min(data.len, max_count);
+    const out_buf = out[0..count];
+    @memcpy(out_buf, data[0..count]);
+
+    return count;
+}
+
+/// Read bool column data (as u8: 0=false, 1=true)
+export fn lance_result_read_bool(result: *ResultHandle, col_idx: u32, out: [*]u8, max_count: usize) usize {
+    results_lock.lock();
+    defer results_lock.unlock();
+
+    const result_ptr = results.get(result) orelse return 0;
+    if (col_idx >= result_ptr.columns.len) return 0;
+
+    const col = result_ptr.columns[col_idx];
+    if (col.data != .bool_) return 0;
+
+    const data = col.data.bool_;
+    const count = @min(data.len, max_count);
+    const out_buf = out[0..count];
+    for (data[0..count], 0..) |b, i| {
+        out_buf[i] = if (b) 1 else 0;
     }
 
     return count;

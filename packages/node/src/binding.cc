@@ -83,6 +83,8 @@ typedef size_t (*lance_column_type_t)(void*, uint32_t, char*, size_t);
 
 typedef void* (*lance_sql_parse_t)(const char*, size_t, void*);
 typedef void* (*lance_sql_execute_t)(void*, void*);
+typedef void* (*lance_sql_execute_params_t)(void*, void*, const char*, uint32_t,
+    const int64_t*, const double*, const char**, const size_t*);
 typedef void (*lance_sql_close_t)(void*);
 
 typedef size_t (*lance_result_row_count_t)(void*);
@@ -92,6 +94,9 @@ typedef uint32_t (*lance_result_column_type_t)(void*, uint32_t);
 typedef size_t (*lance_result_read_int64_t)(void*, uint32_t, int64_t*, size_t);
 typedef size_t (*lance_result_read_float64_t)(void*, uint32_t, double*, size_t);
 typedef size_t (*lance_result_read_string_t)(void*, uint32_t, const char**, size_t*, size_t);
+typedef size_t (*lance_result_read_int32_t)(void*, uint32_t, int32_t*, size_t);
+typedef size_t (*lance_result_read_float32_t)(void*, uint32_t, float*, size_t);
+typedef size_t (*lance_result_read_bool_t)(void*, uint32_t, uint8_t*, size_t);
 typedef void (*lance_result_close_t)(void*);
 typedef void (*lance_cleanup_t)();
 
@@ -106,6 +111,7 @@ lance_column_type_t lance_column_type_fn = nullptr;
 
 lance_sql_parse_t lance_sql_parse_fn = nullptr;
 lance_sql_execute_t lance_sql_execute_fn = nullptr;
+lance_sql_execute_params_t lance_sql_execute_params_fn = nullptr;
 lance_sql_close_t lance_sql_close_fn = nullptr;
 
 lance_result_row_count_t lance_result_row_count_fn = nullptr;
@@ -115,6 +121,9 @@ lance_result_column_type_t lance_result_column_type_fn = nullptr;
 lance_result_read_int64_t lance_result_read_int64_fn = nullptr;
 lance_result_read_float64_t lance_result_read_float64_fn = nullptr;
 lance_result_read_string_t lance_result_read_string_fn = nullptr;
+lance_result_read_int32_t lance_result_read_int32_fn = nullptr;
+lance_result_read_float32_t lance_result_read_float32_fn = nullptr;
+lance_result_read_bool_t lance_result_read_bool_fn = nullptr;
 lance_result_close_t lance_result_close_fn = nullptr;
 lance_cleanup_t lance_cleanup_fn = nullptr;
 
@@ -124,10 +133,13 @@ lance_cleanup_t lance_cleanup_fn = nullptr;
 
 struct ColumnBuffer {
     std::string name;
-    uint32_t type; // 0=int64, 1=float64, 2=string
+    uint32_t type; // 0=int64, 1=float64, 2=string, 3=int32, 4=float32, 5=bool
     std::vector<int64_t> int64_data;
     std::vector<double> float64_data;
     std::vector<std::string> string_data;
+    std::vector<int32_t> int32_data;
+    std::vector<float> float32_data;
+    std::vector<uint8_t> bool_data;
 };
 
 // ============================================================================
@@ -186,8 +198,61 @@ Napi::Value Statement::FinalizeStmt(const Napi::CallbackInfo& info) {
 Napi::Value Statement::All(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
 
-    // Execute query
-    void* result_handle = lance_sql_execute_fn(this->sql_handle, this->table_handle);
+    void* result_handle = nullptr;
+
+    // Check if we have parameters
+    if (info.Length() > 0 && lance_sql_execute_params_fn) {
+        // Build parameter arrays
+        std::string param_types;
+        std::vector<int64_t> int_params;
+        std::vector<double> float_params;
+        std::vector<const char*> string_ptrs;
+        std::vector<size_t> string_lens;
+        std::vector<std::string> string_storage; // Keep strings alive
+
+        for (size_t i = 0; i < info.Length(); i++) {
+            if (info[i].IsNull() || info[i].IsUndefined()) {
+                param_types.push_back('n');
+            } else if (info[i].IsNumber()) {
+                Napi::Number num = info[i].As<Napi::Number>();
+                double val = num.DoubleValue();
+                // Check if it's an integer
+                if (val == static_cast<int64_t>(val) && val >= INT64_MIN && val <= INT64_MAX) {
+                    param_types.push_back('i');
+                    int_params.push_back(static_cast<int64_t>(val));
+                } else {
+                    param_types.push_back('f');
+                    float_params.push_back(val);
+                }
+            } else if (info[i].IsString()) {
+                param_types.push_back('s');
+                string_storage.push_back(info[i].As<Napi::String>().Utf8Value());
+                string_ptrs.push_back(string_storage.back().c_str());
+                string_lens.push_back(string_storage.back().length());
+            } else {
+                // Try to convert to string
+                param_types.push_back('s');
+                string_storage.push_back(info[i].ToString().Utf8Value());
+                string_ptrs.push_back(string_storage.back().c_str());
+                string_lens.push_back(string_storage.back().length());
+            }
+        }
+
+        result_handle = lance_sql_execute_params_fn(
+            this->sql_handle,
+            this->table_handle,
+            param_types.c_str(),
+            static_cast<uint32_t>(param_types.length()),
+            int_params.data(),
+            float_params.data(),
+            string_ptrs.data(),
+            string_lens.data()
+        );
+    } else {
+        // No parameters, use original execute
+        result_handle = lance_sql_execute_fn(this->sql_handle, this->table_handle);
+    }
+
     if (!result_handle) {
         Napi::Error::New(env, "Failed to execute SQL").ThrowAsJavaScriptException();
         return env.Null();
@@ -224,6 +289,25 @@ Napi::Value Statement::All(const Napi::CallbackInfo& info) {
             for (size_t i = 0; i < row_count; i++) {
                 columns[col_idx].string_data.emplace_back(str_ptrs[i], str_lens[i]);
             }
+        } else if (col_type == 3) { // int32
+            columns[col_idx].int32_data.resize(row_count);
+            lance_result_read_int32_fn(result_handle, col_idx, columns[col_idx].int32_data.data(), row_count);
+        } else if (col_type == 4) { // float32
+            columns[col_idx].float32_data.resize(row_count);
+            lance_result_read_float32_fn(result_handle, col_idx, columns[col_idx].float32_data.data(), row_count);
+        } else if (col_type == 5) { // bool
+            columns[col_idx].bool_data.resize(row_count);
+            lance_result_read_bool_fn(result_handle, col_idx, columns[col_idx].bool_data.data(), row_count);
+        } else if (col_type >= 6 && col_type <= 9) { // timestamp_s, timestamp_ms, timestamp_us, timestamp_ns
+            // All timestamp types stored as int64
+            columns[col_idx].int64_data.resize(row_count);
+            lance_result_read_int64_fn(result_handle, col_idx, columns[col_idx].int64_data.data(), row_count);
+        } else if (col_type == 10) { // date32 (days since epoch, stored as int32)
+            columns[col_idx].int32_data.resize(row_count);
+            lance_result_read_int32_fn(result_handle, col_idx, columns[col_idx].int32_data.data(), row_count);
+        } else if (col_type == 11) { // date64 (milliseconds since epoch, stored as int64)
+            columns[col_idx].int64_data.resize(row_count);
+            lance_result_read_int64_fn(result_handle, col_idx, columns[col_idx].int64_data.data(), row_count);
         }
     }
 
@@ -234,12 +318,34 @@ Napi::Value Statement::All(const Napi::CallbackInfo& info) {
 
         for (size_t col_idx = 0; col_idx < col_count; col_idx++) {
             const auto& col = columns[col_idx];
-            if (col.type == 0) {
-                row.Set(col.name, Napi::Number::New(env, col.int64_data[row_idx]));
-            } else if (col.type == 1) {
+            if (col.type == 0) { // int64
+                row.Set(col.name, Napi::Number::New(env, static_cast<double>(col.int64_data[row_idx])));
+            } else if (col.type == 1) { // float64
                 row.Set(col.name, Napi::Number::New(env, col.float64_data[row_idx]));
-            } else if (col.type == 2) {
+            } else if (col.type == 2) { // string
                 row.Set(col.name, Napi::String::New(env, col.string_data[row_idx]));
+            } else if (col.type == 3) { // int32
+                row.Set(col.name, Napi::Number::New(env, col.int32_data[row_idx]));
+            } else if (col.type == 4) { // float32
+                row.Set(col.name, Napi::Number::New(env, col.float32_data[row_idx]));
+            } else if (col.type == 5) { // bool
+                row.Set(col.name, Napi::Boolean::New(env, col.bool_data[row_idx] != 0));
+            } else if (col.type == 6) { // timestamp_s -> ms (multiply by 1000)
+                int64_t ms = col.int64_data[row_idx] * 1000LL;
+                row.Set(col.name, Napi::Number::New(env, static_cast<double>(ms)));
+            } else if (col.type == 7) { // timestamp_ms -> ms (direct)
+                row.Set(col.name, Napi::Number::New(env, static_cast<double>(col.int64_data[row_idx])));
+            } else if (col.type == 8) { // timestamp_us -> ms (divide by 1000)
+                int64_t ms = col.int64_data[row_idx] / 1000LL;
+                row.Set(col.name, Napi::Number::New(env, static_cast<double>(ms)));
+            } else if (col.type == 9) { // timestamp_ns -> ms (divide by 1000000)
+                int64_t ms = col.int64_data[row_idx] / 1000000LL;
+                row.Set(col.name, Napi::Number::New(env, static_cast<double>(ms)));
+            } else if (col.type == 10) { // date32 (days) -> ms (multiply by 86400000)
+                int64_t ms = static_cast<int64_t>(col.int32_data[row_idx]) * 86400000LL;
+                row.Set(col.name, Napi::Number::New(env, static_cast<double>(ms)));
+            } else if (col.type == 11) { // date64 -> ms (direct, already milliseconds)
+                row.Set(col.name, Napi::Number::New(env, static_cast<double>(col.int64_data[row_idx])));
             }
         }
 
@@ -451,6 +557,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
 
     lance_sql_parse_fn = (lance_sql_parse_t)dlsym(g_lib, "lance_sql_parse");
     lance_sql_execute_fn = (lance_sql_execute_t)dlsym(g_lib, "lance_sql_execute");
+    lance_sql_execute_params_fn = (lance_sql_execute_params_t)dlsym(g_lib, "lance_sql_execute_params");
     lance_sql_close_fn = (lance_sql_close_t)dlsym(g_lib, "lance_sql_close");
 
     lance_result_row_count_fn = (lance_result_row_count_t)dlsym(g_lib, "lance_result_row_count");
@@ -460,6 +567,9 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     lance_result_read_int64_fn = (lance_result_read_int64_t)dlsym(g_lib, "lance_result_read_int64");
     lance_result_read_float64_fn = (lance_result_read_float64_t)dlsym(g_lib, "lance_result_read_float64");
     lance_result_read_string_fn = (lance_result_read_string_t)dlsym(g_lib, "lance_result_read_string");
+    lance_result_read_int32_fn = (lance_result_read_int32_t)dlsym(g_lib, "lance_result_read_int32");
+    lance_result_read_float32_fn = (lance_result_read_float32_t)dlsym(g_lib, "lance_result_read_float32");
+    lance_result_read_bool_fn = (lance_result_read_bool_t)dlsym(g_lib, "lance_result_read_bool");
     lance_result_close_fn = (lance_result_close_t)dlsym(g_lib, "lance_result_close");
     lance_cleanup_fn = (lance_cleanup_t)dlsym(g_lib, "lance_cleanup");
 

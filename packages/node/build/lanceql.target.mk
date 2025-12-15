@@ -13,6 +13,7 @@ DEFS_Debug := \
 	'-D_FILE_OFFSET_BITS=64' \
 	'-DOPENSSL_NO_PINSHARED' \
 	'-DOPENSSL_THREADS' \
+	'-DNAPI_DISABLE_CPP_EXCEPTIONS' \
 	'-DBUILDING_NODE_EXTENSION' \
 	'-DDEBUG' \
 	'-D_DEBUG'
@@ -35,7 +36,7 @@ CFLAGS_C_Debug := \
 
 # Flags passed to only C++ files.
 CFLAGS_CC_Debug := \
-	-std=gnu++17 \
+	-std=c++17 \
 	-stdlib=libc++ \
 	-fno-rtti \
 	-fno-strict-aliasing
@@ -67,6 +68,7 @@ DEFS_Release := \
 	'-D_FILE_OFFSET_BITS=64' \
 	'-DOPENSSL_NO_PINSHARED' \
 	'-DOPENSSL_THREADS' \
+	'-DNAPI_DISABLE_CPP_EXCEPTIONS' \
 	'-DBUILDING_NODE_EXTENSION'
 
 # Flags passed to all source files.
@@ -87,7 +89,7 @@ CFLAGS_C_Release := \
 
 # Flags passed to only C++ files.
 CFLAGS_CC_Release := \
-	-std=gnu++17 \
+	-std=c++17 \
 	-stdlib=libc++ \
 	-fno-rtti \
 	-fno-strict-aliasing
@@ -138,7 +140,6 @@ $(obj).$(TOOLSET)/$(TARGET)/%.o: $(obj)/%.cc FORCE_DO_CMD
 # End of this set of suffix rules
 ### Rules for final target.
 LDFLAGS_Debug := \
-	-Wl,-rpath,@loader_path/../../zig-out/lib \
 	-undefined dynamic_lookup \
 	-Wl,-search_paths_first \
 	-mmacosx-version-min=10.15 \
@@ -148,12 +149,10 @@ LDFLAGS_Debug := \
 	-stdlib=libc++
 
 LIBTOOLFLAGS_Debug := \
-	-Wl,-rpath,@loader_path/../../zig-out/lib \
 	-undefined dynamic_lookup \
 	-Wl,-search_paths_first
 
 LDFLAGS_Release := \
-	-Wl,-rpath,@loader_path/../../zig-out/lib \
 	-undefined dynamic_lookup \
 	-Wl,-search_paths_first \
 	-mmacosx-version-min=10.15 \
@@ -163,14 +162,10 @@ LDFLAGS_Release := \
 	-stdlib=libc++
 
 LIBTOOLFLAGS_Release := \
-	-Wl,-rpath,@loader_path/../../zig-out/lib \
 	-undefined dynamic_lookup \
 	-Wl,-search_paths_first
 
-LIBS := \
-	/Users/steven_chong/Downloads/repos/lanceql/zig-out/lib/liblanceql.dylib \
-	-lc++ \
-	-Wl,-rpath,@loader_path/../../zig-out/lib
+LIBS :=
 
 $(builddir)/lanceql.node: GYP_LDFLAGS := $(LDFLAGS_$(BUILDTYPE))
 $(builddir)/lanceql.node: LIBS := $(LIBS)

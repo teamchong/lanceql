@@ -300,6 +300,12 @@ pub const Parser = struct {
                 const left_ptr = try self.allocator.create(Expr);
                 left_ptr.* = left;
                 left = Expr{ .binary = .{ .op = .subtract, .left = left_ptr, .right = right_ptr } };
+            } else if (self.match(&[_]TokenType{.CONCAT})) {
+                const right_ptr = try self.allocator.create(Expr);
+                right_ptr.* = try self.parseMulExpr();
+                const left_ptr = try self.allocator.create(Expr);
+                left_ptr.* = left;
+                left = Expr{ .binary = .{ .op = .concat, .left = left_ptr, .right = right_ptr } };
             } else {
                 break;
             }
@@ -360,7 +366,7 @@ pub const Parser = struct {
             },
 
             // Parameters (?)
-            .STAR => {
+            .PARAMETER => {
                 self.advance();
                 const param_idx = self.param_count;
                 self.param_count += 1;
@@ -415,10 +421,21 @@ pub const Parser = struct {
         var args = std.ArrayList(Expr){};
         errdefer args.deinit(self.allocator);
 
-        // Check for empty argument list
+        // Check for empty argument list or STAR (for COUNT(*))
         if (!self.check(.RPAREN)) {
             while (true) {
-                try args.append(self.allocator, try self.parseExpr());
+                // Special case: STAR inside function call means "all columns" (e.g., COUNT(*))
+                if (self.check(.STAR)) {
+                    self.advance();
+                    try args.append(self.allocator, Expr{
+                        .column = .{
+                            .table = null,
+                            .name = "*",
+                        },
+                    });
+                } else {
+                    try args.append(self.allocator, try self.parseExpr());
+                }
                 if (!self.match(&[_]TokenType{.COMMA})) break;
             }
         }
@@ -547,10 +564,42 @@ test "parse SELECT with WHERE" {
 }
 
 test "parse SELECT with parameter" {
-    const sql = "SELECT * FROM users WHERE id = *";
+    const sql = "SELECT * FROM users WHERE id = ?";
     const allocator = std.testing.allocator;
 
     const stmt = try parseSQL(sql, allocator);
     try std.testing.expect(stmt == .select);
     try std.testing.expect(stmt.select.where != null);
+
+    // Verify the WHERE clause contains a parameter
+    const where = stmt.select.where.?;
+    try std.testing.expect(where == .binary);
+    const right = where.binary.right.*;
+    try std.testing.expect(right == .value);
+    try std.testing.expect(right.value == .parameter);
+    try std.testing.expectEqual(@as(u32, 0), right.value.parameter);
+}
+
+test "parse SELECT with multiple parameters" {
+    const sql = "SELECT * FROM users WHERE id > ? AND name = ?";
+    const allocator = std.testing.allocator;
+
+    const stmt = try parseSQL(sql, allocator);
+    try std.testing.expect(stmt == .select);
+    try std.testing.expect(stmt.select.where != null);
+
+    // Verify there are two parameters with indices 0 and 1
+    const where = stmt.select.where.?;
+    try std.testing.expect(where == .binary); // AND expression
+    try std.testing.expectEqual(ast.BinaryOp.@"and", where.binary.op);
+
+    // Left side: id > ?  (param index 0)
+    const left_binary = where.binary.left.*.binary;
+    try std.testing.expectEqual(ast.BinaryOp.gt, left_binary.op);
+    try std.testing.expectEqual(@as(u32, 0), left_binary.right.*.value.parameter);
+
+    // Right side: name = ?  (param index 1)
+    const right_binary = where.binary.right.*.binary;
+    try std.testing.expectEqual(ast.BinaryOp.eq, right_binary.op);
+    try std.testing.expectEqual(@as(u32, 1), right_binary.right.*.value.parameter);
 }

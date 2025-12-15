@@ -123,6 +123,18 @@ pub const PlainDecoder = struct {
         return std.mem.readInt(i32, self.data[offset..][0..4], .little);
     }
 
+    /// Read all int32 values into an allocated slice.
+    pub fn readAllInt32(self: Self, allocator: std.mem.Allocator) ![]i32 {
+        const count = self.int32Count();
+        const result = try allocator.alloc(i32, count);
+        errdefer allocator.free(result);
+
+        for (0..count) |i| {
+            result[i] = self.readInt32(i) catch return error.IndexOutOfBounds;
+        }
+        return result;
+    }
+
     // ========================================================================
     // Float32 decoding
     // ========================================================================
@@ -140,6 +152,18 @@ pub const PlainDecoder = struct {
         }
         const bits = std.mem.readInt(u32, self.data[offset..][0..4], .little);
         return @bitCast(bits);
+    }
+
+    /// Read all float32 values into an allocated slice.
+    pub fn readAllFloat32(self: Self, allocator: std.mem.Allocator) ![]f32 {
+        const count = self.float32Count();
+        const result = try allocator.alloc(f32, count);
+        errdefer allocator.free(result);
+
+        for (0..count) |i| {
+            result[i] = self.readFloat32(i) catch return error.IndexOutOfBounds;
+        }
+        return result;
     }
 
     // ========================================================================
@@ -161,6 +185,18 @@ pub const PlainDecoder = struct {
         }
 
         return (self.data[byte_index] >> bit_index) & 1 == 1;
+    }
+
+    /// Read all boolean values into an allocated slice.
+    /// Note: row_count must be provided since booleans are packed (8 per byte).
+    pub fn readAllBool(self: Self, allocator: std.mem.Allocator, row_count: usize) ![]bool {
+        const result = try allocator.alloc(bool, row_count);
+        errdefer allocator.free(result);
+
+        for (0..row_count) |i| {
+            result[i] = self.readBool(i) catch return error.IndexOutOfBounds;
+        }
+        return result;
     }
 
     // ========================================================================

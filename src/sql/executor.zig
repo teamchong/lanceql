@@ -104,15 +104,28 @@ pub const Result = struct {
 
     pub const ColumnData = union(enum) {
         int64: []i64,
+        int32: []i32,
         float64: []f64,
+        float32: []f32,
+        bool_: []bool,
         string: [][]const u8,
+        // Timestamp types (all stored as integers, semantic meaning differs)
+        timestamp_s: []i64, // seconds since epoch
+        timestamp_ms: []i64, // milliseconds since epoch
+        timestamp_us: []i64, // microseconds since epoch
+        timestamp_ns: []i64, // nanoseconds since epoch
+        date32: []i32, // days since epoch
+        date64: []i64, // milliseconds since epoch
     };
 
     pub fn deinit(self: *Result) void {
         for (self.columns) |col| {
             switch (col.data) {
-                .int64 => |data| self.allocator.free(data),
+                .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| self.allocator.free(data),
+                .int32, .date32 => |data| self.allocator.free(data),
                 .float64 => |data| self.allocator.free(data),
+                .float32 => |data| self.allocator.free(data),
+                .bool_ => |data| self.allocator.free(data),
                 .string => |data| {
                     for (data) |str| {
                         self.allocator.free(str);
@@ -128,8 +141,18 @@ pub const Result = struct {
 /// Cached column data
 pub const CachedColumn = union(enum) {
     int64: []i64,
+    int32: []i32,
     float64: []f64,
+    float32: []f32,
+    bool_: []bool,
     string: [][]const u8,
+    // Timestamp types
+    timestamp_s: []i64,
+    timestamp_ms: []i64,
+    timestamp_us: []i64,
+    timestamp_ns: []i64,
+    date32: []i32,
+    date64: []i64,
 };
 
 /// SQL Query Executor
@@ -153,8 +176,11 @@ pub const Executor = struct {
         var iter = self.column_cache.valueIterator();
         while (iter.next()) |col| {
             switch (col.*) {
-                .int64 => |data| self.allocator.free(data),
+                .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| self.allocator.free(data),
+                .int32, .date32 => |data| self.allocator.free(data),
                 .float64 => |data| self.allocator.free(data),
+                .float32 => |data| self.allocator.free(data),
+                .bool_ => |data| self.allocator.free(data),
                 .string => |data| {
                     for (data) |str| {
                         self.allocator.free(str);
@@ -198,15 +224,55 @@ pub const Executor = struct {
             const field = self.table.getFieldById(physical_col_id) orelse return error.InvalidColumn;
 
             // Read and cache column based on type
-            if (std.mem.indexOf(u8, field.logical_type, "int") != null) {
+            // Precise type detection (order matters - check specific before general)
+            const logical_type = field.logical_type;
+
+            // Timestamp types (check before generic "int" matches)
+            if (std.mem.indexOf(u8, logical_type, "timestamp[ns") != null) {
+                const data = try self.table.readInt64Column(physical_col_id);
+                try self.column_cache.put(name, CachedColumn{ .timestamp_ns = data });
+            } else if (std.mem.indexOf(u8, logical_type, "timestamp[us") != null) {
+                const data = try self.table.readInt64Column(physical_col_id);
+                try self.column_cache.put(name, CachedColumn{ .timestamp_us = data });
+            } else if (std.mem.indexOf(u8, logical_type, "timestamp[ms") != null) {
+                const data = try self.table.readInt64Column(physical_col_id);
+                try self.column_cache.put(name, CachedColumn{ .timestamp_ms = data });
+            } else if (std.mem.indexOf(u8, logical_type, "timestamp[s") != null) {
+                const data = try self.table.readInt64Column(physical_col_id);
+                try self.column_cache.put(name, CachedColumn{ .timestamp_s = data });
+            } else if (std.mem.indexOf(u8, logical_type, "date32") != null) {
+                const data = try self.table.readInt32Column(physical_col_id);
+                try self.column_cache.put(name, CachedColumn{ .date32 = data });
+            } else if (std.mem.indexOf(u8, logical_type, "date64") != null) {
+                const data = try self.table.readInt64Column(physical_col_id);
+                try self.column_cache.put(name, CachedColumn{ .date64 = data });
+            } else if (std.mem.eql(u8, logical_type, "int32")) {
+                // Explicit int32 type
+                const data = try self.table.readInt32Column(physical_col_id);
+                try self.column_cache.put(name, CachedColumn{ .int32 = data });
+            } else if (std.mem.eql(u8, logical_type, "float") or
+                std.mem.indexOf(u8, logical_type, "float32") != null)
+            {
+                // float or float32 → f32
+                const data = try self.table.readFloat32Column(physical_col_id);
+                try self.column_cache.put(name, CachedColumn{ .float32 = data });
+            } else if (std.mem.eql(u8, logical_type, "bool") or
+                std.mem.indexOf(u8, logical_type, "boolean") != null)
+            {
+                // bool or boolean → bool
+                const data = try self.table.readBoolColumn(physical_col_id);
+                try self.column_cache.put(name, CachedColumn{ .bool_ = data });
+            } else if (std.mem.indexOf(u8, logical_type, "int") != null) {
+                // Default integers (int, int64, integer) to int64
                 const data = try self.table.readInt64Column(physical_col_id);
                 try self.column_cache.put(name, CachedColumn{ .int64 = data });
-            } else if (std.mem.indexOf(u8, field.logical_type, "float") != null or
-                       std.mem.indexOf(u8, field.logical_type, "double") != null) {
+            } else if (std.mem.indexOf(u8, logical_type, "double") != null) {
+                // double → float64
                 const data = try self.table.readFloat64Column(physical_col_id);
                 try self.column_cache.put(name, CachedColumn{ .float64 = data });
-            } else if (std.mem.indexOf(u8, field.logical_type, "utf8") != null or
-                       std.mem.indexOf(u8, field.logical_type, "string") != null) {
+            } else if (std.mem.indexOf(u8, logical_type, "utf8") != null or
+                std.mem.indexOf(u8, logical_type, "string") != null)
+            {
                 const data = try self.table.readStringColumn(physical_col_id);
                 try self.column_cache.put(name, CachedColumn{ .string = data });
             } else {
@@ -249,14 +315,22 @@ pub const Executor = struct {
         }
 
         // 4. Read columns based on SELECT list (non-aggregate path)
-        const columns = try self.readColumns(stmt.columns, indices);
+        var columns = try self.readColumns(stmt.columns, indices);
+        var row_count = indices.len;
 
-        // 5. Apply ORDER BY (in-memory sorting)
+        // 5. Apply DISTINCT if specified
+        if (stmt.distinct) {
+            const distinct_result = try self.applyDistinct(columns);
+            columns = distinct_result.columns;
+            row_count = distinct_result.row_count;
+        }
+
+        // 6. Apply ORDER BY (in-memory sorting)
         if (stmt.order_by) |order_by| {
             try self.applyOrderBy(columns, order_by);
         }
 
-        // 6. Apply LIMIT and OFFSET
+        // 7. Apply LIMIT and OFFSET
         const final_row_count = self.applyLimitOffset(columns, stmt.limit, stmt.offset);
 
         return Result{
@@ -396,8 +470,11 @@ pub const Executor = struct {
         errdefer {
             for (result_columns.items) |col| {
                 switch (col.data) {
-                    .int64 => |data| self.allocator.free(data),
+                    .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| self.allocator.free(data),
+                    .int32, .date32 => |data| self.allocator.free(data),
                     .float64 => |data| self.allocator.free(data),
+                    .float32 => |data| self.allocator.free(data),
+                    .bool_ => |data| self.allocator.free(data),
                     .string => |data| {
                         for (data) |str| self.allocator.free(str);
                         self.allocator.free(data);
@@ -498,7 +575,12 @@ pub const Executor = struct {
             const cached = self.column_cache.get(col_name) orelse return error.ColumnNotCached;
 
             switch (cached) {
-                .int64 => |data| {
+                .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| {
+                    var buf: [32]u8 = undefined;
+                    const str = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch unreachable;
+                    try key.appendSlice(self.allocator, str);
+                },
+                .int32, .date32 => |data| {
                     var buf: [32]u8 = undefined;
                     const str = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch unreachable;
                     try key.appendSlice(self.allocator, str);
@@ -506,6 +588,15 @@ pub const Executor = struct {
                 .float64 => |data| {
                     var buf: [32]u8 = undefined;
                     const str = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch unreachable;
+                    try key.appendSlice(self.allocator, str);
+                },
+                .float32 => |data| {
+                    var buf: [32]u8 = undefined;
+                    const str = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch unreachable;
+                    try key.appendSlice(self.allocator, str);
+                },
+                .bool_ => |data| {
+                    const str = if (data[row_idx]) "true" else "false";
                     try key.appendSlice(self.allocator, str);
                 },
                 .string => |data| {
@@ -599,8 +690,11 @@ pub const Executor = struct {
                     const cached = self.column_cache.get(col_name) orelse return error.ColumnNotCached;
 
                     switch (cached) {
-                        .int64 => |data| acc.addInt(data[row_idx]),
+                        .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| acc.addInt(data[row_idx]),
+                        .int32, .date32 => |data| acc.addInt(data[row_idx]),
                         .float64 => |data| acc.addFloat(data[row_idx]),
+                        .float32 => |data| acc.addFloat(data[row_idx]),
+                        .bool_ => acc.addCount(), // COUNT for bools
                         .string => acc.addCount(), // COUNT for strings
                     }
                 } else {
@@ -649,6 +743,139 @@ pub const Executor = struct {
                     .data = Result.ColumnData{ .int64 = results },
                 };
             },
+            .timestamp_s => |source_data| {
+                const results = try self.allocator.alloc(i64, num_groups);
+                errdefer self.allocator.free(results);
+
+                var group_idx: usize = 0;
+                var iter = groups.iterator();
+                while (iter.next()) |entry| {
+                    const row_indices = entry.value_ptr.items;
+                    if (row_indices.len > 0) {
+                        results[group_idx] = source_data[row_indices[0]];
+                    }
+                    group_idx += 1;
+                }
+
+                return Result.Column{
+                    .name = item.alias orelse col_name,
+                    .data = Result.ColumnData{ .timestamp_s = results },
+                };
+            },
+            .timestamp_ms => |source_data| {
+                const results = try self.allocator.alloc(i64, num_groups);
+                errdefer self.allocator.free(results);
+
+                var group_idx: usize = 0;
+                var iter = groups.iterator();
+                while (iter.next()) |entry| {
+                    const row_indices = entry.value_ptr.items;
+                    if (row_indices.len > 0) {
+                        results[group_idx] = source_data[row_indices[0]];
+                    }
+                    group_idx += 1;
+                }
+
+                return Result.Column{
+                    .name = item.alias orelse col_name,
+                    .data = Result.ColumnData{ .timestamp_ms = results },
+                };
+            },
+            .timestamp_us => |source_data| {
+                const results = try self.allocator.alloc(i64, num_groups);
+                errdefer self.allocator.free(results);
+
+                var group_idx: usize = 0;
+                var iter = groups.iterator();
+                while (iter.next()) |entry| {
+                    const row_indices = entry.value_ptr.items;
+                    if (row_indices.len > 0) {
+                        results[group_idx] = source_data[row_indices[0]];
+                    }
+                    group_idx += 1;
+                }
+
+                return Result.Column{
+                    .name = item.alias orelse col_name,
+                    .data = Result.ColumnData{ .timestamp_us = results },
+                };
+            },
+            .timestamp_ns => |source_data| {
+                const results = try self.allocator.alloc(i64, num_groups);
+                errdefer self.allocator.free(results);
+
+                var group_idx: usize = 0;
+                var iter = groups.iterator();
+                while (iter.next()) |entry| {
+                    const row_indices = entry.value_ptr.items;
+                    if (row_indices.len > 0) {
+                        results[group_idx] = source_data[row_indices[0]];
+                    }
+                    group_idx += 1;
+                }
+
+                return Result.Column{
+                    .name = item.alias orelse col_name,
+                    .data = Result.ColumnData{ .timestamp_ns = results },
+                };
+            },
+            .date64 => |source_data| {
+                const results = try self.allocator.alloc(i64, num_groups);
+                errdefer self.allocator.free(results);
+
+                var group_idx: usize = 0;
+                var iter = groups.iterator();
+                while (iter.next()) |entry| {
+                    const row_indices = entry.value_ptr.items;
+                    if (row_indices.len > 0) {
+                        results[group_idx] = source_data[row_indices[0]];
+                    }
+                    group_idx += 1;
+                }
+
+                return Result.Column{
+                    .name = item.alias orelse col_name,
+                    .data = Result.ColumnData{ .date64 = results },
+                };
+            },
+            .int32 => |source_data| {
+                const results = try self.allocator.alloc(i32, num_groups);
+                errdefer self.allocator.free(results);
+
+                var group_idx: usize = 0;
+                var iter = groups.iterator();
+                while (iter.next()) |entry| {
+                    const row_indices = entry.value_ptr.items;
+                    if (row_indices.len > 0) {
+                        results[group_idx] = source_data[row_indices[0]];
+                    }
+                    group_idx += 1;
+                }
+
+                return Result.Column{
+                    .name = item.alias orelse col_name,
+                    .data = Result.ColumnData{ .int32 = results },
+                };
+            },
+            .date32 => |source_data| {
+                const results = try self.allocator.alloc(i32, num_groups);
+                errdefer self.allocator.free(results);
+
+                var group_idx: usize = 0;
+                var iter = groups.iterator();
+                while (iter.next()) |entry| {
+                    const row_indices = entry.value_ptr.items;
+                    if (row_indices.len > 0) {
+                        results[group_idx] = source_data[row_indices[0]];
+                    }
+                    group_idx += 1;
+                }
+
+                return Result.Column{
+                    .name = item.alias orelse col_name,
+                    .data = Result.ColumnData{ .date32 = results },
+                };
+            },
             .float64 => |source_data| {
                 const results = try self.allocator.alloc(f64, num_groups);
                 errdefer self.allocator.free(results);
@@ -666,6 +893,44 @@ pub const Executor = struct {
                 return Result.Column{
                     .name = item.alias orelse col_name,
                     .data = Result.ColumnData{ .float64 = results },
+                };
+            },
+            .float32 => |source_data| {
+                const results = try self.allocator.alloc(f32, num_groups);
+                errdefer self.allocator.free(results);
+
+                var group_idx: usize = 0;
+                var iter = groups.iterator();
+                while (iter.next()) |entry| {
+                    const row_indices = entry.value_ptr.items;
+                    if (row_indices.len > 0) {
+                        results[group_idx] = source_data[row_indices[0]];
+                    }
+                    group_idx += 1;
+                }
+
+                return Result.Column{
+                    .name = item.alias orelse col_name,
+                    .data = Result.ColumnData{ .float32 = results },
+                };
+            },
+            .bool_ => |source_data| {
+                const results = try self.allocator.alloc(bool, num_groups);
+                errdefer self.allocator.free(results);
+
+                var group_idx: usize = 0;
+                var iter = groups.iterator();
+                while (iter.next()) |entry| {
+                    const row_indices = entry.value_ptr.items;
+                    if (row_indices.len > 0) {
+                        results[group_idx] = source_data[row_indices[0]];
+                    }
+                    group_idx += 1;
+                }
+
+                return Result.Column{
+                    .name = item.alias orelse col_name,
+                    .data = Result.ColumnData{ .bool_ = results },
                 };
             },
             .string => |source_data| {
@@ -732,9 +997,12 @@ pub const Executor = struct {
             .column => expr.*,
             .binary => |bin| blk: {
                 const left_ptr = try self.allocator.create(Expr);
+                errdefer self.allocator.destroy(left_ptr);
                 left_ptr.* = try self.bindParameters(bin.left, params);
+                errdefer self.freeExpr(left_ptr);
 
                 const right_ptr = try self.allocator.create(Expr);
+                errdefer self.allocator.destroy(right_ptr);
                 right_ptr.* = try self.bindParameters(bin.right, params);
 
                 break :blk Expr{
@@ -747,6 +1015,7 @@ pub const Executor = struct {
             },
             .unary => |un| blk: {
                 const operand_ptr = try self.allocator.create(Expr);
+                errdefer self.allocator.destroy(operand_ptr);
                 operand_ptr.* = try self.bindParameters(un.operand, params);
 
                 break :blk Expr{
@@ -756,7 +1025,67 @@ pub const Executor = struct {
                     },
                 };
             },
-            else => error.UnsupportedExpression,
+            .call => |call| blk: {
+                // Bind parameters in function arguments
+                const new_args = try self.allocator.alloc(Expr, call.args.len);
+                errdefer self.allocator.free(new_args);
+
+                for (call.args, 0..) |*arg, i| {
+                    new_args[i] = try self.bindParameters(arg, params);
+                }
+
+                break :blk Expr{
+                    .call = .{
+                        .name = call.name,
+                        .args = new_args,
+                        .distinct = call.distinct,
+                    },
+                };
+            },
+            .in_list => |in| blk: {
+                // Bind parameters in IN list
+                const new_expr = try self.allocator.create(Expr);
+                errdefer self.allocator.destroy(new_expr);
+                new_expr.* = try self.bindParameters(in.expr, params);
+                errdefer self.freeExpr(new_expr);
+
+                const new_values = try self.allocator.alloc(Expr, in.values.len);
+                errdefer self.allocator.free(new_values);
+
+                for (in.values, 0..) |*val, i| {
+                    new_values[i] = try self.bindParameters(val, params);
+                }
+
+                break :blk Expr{
+                    .in_list = .{
+                        .expr = new_expr,
+                        .values = new_values,
+                    },
+                };
+            },
+            .between => |bet| blk: {
+                const new_expr = try self.allocator.create(Expr);
+                errdefer self.allocator.destroy(new_expr);
+                new_expr.* = try self.bindParameters(bet.expr, params);
+                errdefer self.freeExpr(new_expr);
+
+                const new_low = try self.allocator.create(Expr);
+                errdefer self.allocator.destroy(new_low);
+                new_low.* = try self.bindParameters(bet.low, params);
+                errdefer self.freeExpr(new_low);
+
+                const new_high = try self.allocator.create(Expr);
+                errdefer self.allocator.destroy(new_high);
+                new_high.* = try self.bindParameters(bet.high, params);
+
+                break :blk Expr{
+                    .between = .{
+                        .expr = new_expr,
+                        .low = new_low,
+                        .high = new_high,
+                    },
+                };
+            },
         };
     }
 
@@ -772,6 +1101,28 @@ pub const Executor = struct {
             .unary => |un| {
                 self.freeExpr(un.operand);
                 self.allocator.destroy(un.operand);
+            },
+            .call => |call| {
+                for (call.args) |*arg| {
+                    self.freeExpr(arg);
+                }
+                self.allocator.free(call.args);
+            },
+            .in_list => |in| {
+                self.freeExpr(in.expr);
+                self.allocator.destroy(in.expr);
+                for (in.values) |*val| {
+                    self.freeExpr(val);
+                }
+                self.allocator.free(in.values);
+            },
+            .between => |bet| {
+                self.freeExpr(bet.expr);
+                self.allocator.destroy(bet.expr);
+                self.freeExpr(bet.low);
+                self.allocator.destroy(bet.low);
+                self.freeExpr(bet.high);
+                self.allocator.destroy(bet.high);
             },
             else => {},
         }
@@ -906,7 +1257,7 @@ pub const Executor = struct {
         };
     }
 
-    /// Evaluate expression to a concrete value
+    /// Evaluate expression to a concrete value (for WHERE clause comparisons)
     fn evaluateToValue(self: *Self, expr: *const Expr, row_idx: u32) !Value {
         return switch (expr.*) {
             .value => expr.value,
@@ -915,13 +1266,557 @@ pub const Executor = struct {
                 const cached = self.column_cache.get(col.name) orelse return error.ColumnNotCached;
 
                 break :blk switch (cached) {
-                    .int64 => |data| Value{ .integer = data[row_idx] },
+                    .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| Value{ .integer = data[row_idx] },
+                    .int32, .date32 => |data| Value{ .integer = data[row_idx] },
                     .float64 => |data| Value{ .float = data[row_idx] },
+                    .float32 => |data| Value{ .float = data[row_idx] },
+                    .bool_ => |data| Value{ .integer = if (data[row_idx]) 1 else 0 },
                     .string => |data| Value{ .string = data[row_idx] },
                 };
             },
             else => error.UnsupportedExpression,
         };
+    }
+
+    // ========================================================================
+    // Expression Evaluation (for SELECT clause)
+    // ========================================================================
+
+    /// Evaluate any expression to a concrete Value for a given row
+    /// This handles arithmetic, function calls, and nested expressions
+    fn evaluateExprToValue(self: *Self, expr: *const Expr, row_idx: u32) !Value {
+        return switch (expr.*) {
+            .value => expr.value,
+            .column => |col| blk: {
+                const cached = self.column_cache.get(col.name) orelse return error.ColumnNotCached;
+                break :blk switch (cached) {
+                    .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| Value{ .integer = data[row_idx] },
+                    .int32, .date32 => |data| Value{ .integer = data[row_idx] },
+                    .float64 => |data| Value{ .float = data[row_idx] },
+                    .float32 => |data| Value{ .float = data[row_idx] },
+                    .bool_ => |data| Value{ .integer = if (data[row_idx]) 1 else 0 },
+                    .string => |data| Value{ .string = data[row_idx] },
+                };
+            },
+            .binary => |bin| try self.evaluateBinaryToValue(bin, row_idx),
+            .unary => |un| try self.evaluateUnaryToValue(un, row_idx),
+            .call => |call| try self.evaluateScalarFunction(call, row_idx),
+            else => error.UnsupportedExpression,
+        };
+    }
+
+    /// Evaluate binary expression to a Value (arithmetic operations)
+    fn evaluateBinaryToValue(self: *Self, bin: anytype, row_idx: u32) anyerror!Value {
+        const left = try self.evaluateExprToValue(bin.left, row_idx);
+        const right = try self.evaluateExprToValue(bin.right, row_idx);
+
+        return switch (bin.op) {
+            .add => self.addValues(left, right),
+            .subtract => self.subtractValues(left, right),
+            .multiply => self.multiplyValues(left, right),
+            .divide => self.divideValues(left, right),
+            .concat => try self.concatStrings(left, right),
+            else => error.UnsupportedOperator,
+        };
+    }
+
+    /// Evaluate unary expression to a Value
+    fn evaluateUnaryToValue(self: *Self, un: anytype, row_idx: u32) anyerror!Value {
+        const operand = try self.evaluateExprToValue(un.operand, row_idx);
+
+        return switch (un.op) {
+            .minus => self.negateValue(operand),
+            .not => blk: {
+                // Boolean negation
+                const bool_val = switch (operand) {
+                    .integer => |i| i != 0,
+                    .float => |f| f != 0.0,
+                    .null => false,
+                    else => true,
+                };
+                break :blk Value{ .integer = if (bool_val) 0 else 1 };
+            },
+            else => error.UnsupportedOperator,
+        };
+    }
+
+    /// Negate a numeric value
+    fn negateValue(self: *Self, val: Value) Value {
+        _ = self;
+        return switch (val) {
+            .integer => |i| Value{ .integer = -i },
+            .float => |f| Value{ .float = -f },
+            else => Value{ .null = {} },
+        };
+    }
+
+    /// Add two values (int + int = int, int + float = float, float + float = float)
+    fn addValues(self: *Self, left: Value, right: Value) Value {
+        _ = self;
+        return switch (left) {
+            .integer => |l| switch (right) {
+                .integer => |r| Value{ .integer = l + r },
+                .float => |r| Value{ .float = @as(f64, @floatFromInt(l)) + r },
+                else => Value{ .null = {} },
+            },
+            .float => |l| switch (right) {
+                .integer => |r| Value{ .float = l + @as(f64, @floatFromInt(r)) },
+                .float => |r| Value{ .float = l + r },
+                else => Value{ .null = {} },
+            },
+            else => Value{ .null = {} },
+        };
+    }
+
+    /// Subtract two values
+    fn subtractValues(self: *Self, left: Value, right: Value) Value {
+        _ = self;
+        return switch (left) {
+            .integer => |l| switch (right) {
+                .integer => |r| Value{ .integer = l - r },
+                .float => |r| Value{ .float = @as(f64, @floatFromInt(l)) - r },
+                else => Value{ .null = {} },
+            },
+            .float => |l| switch (right) {
+                .integer => |r| Value{ .float = l - @as(f64, @floatFromInt(r)) },
+                .float => |r| Value{ .float = l - r },
+                else => Value{ .null = {} },
+            },
+            else => Value{ .null = {} },
+        };
+    }
+
+    /// Multiply two values
+    fn multiplyValues(self: *Self, left: Value, right: Value) Value {
+        _ = self;
+        return switch (left) {
+            .integer => |l| switch (right) {
+                .integer => |r| Value{ .integer = l * r },
+                .float => |r| Value{ .float = @as(f64, @floatFromInt(l)) * r },
+                else => Value{ .null = {} },
+            },
+            .float => |l| switch (right) {
+                .integer => |r| Value{ .float = l * @as(f64, @floatFromInt(r)) },
+                .float => |r| Value{ .float = l * r },
+                else => Value{ .null = {} },
+            },
+            else => Value{ .null = {} },
+        };
+    }
+
+    /// Divide two values (always returns float for precision)
+    fn divideValues(self: *Self, left: Value, right: Value) Value {
+        _ = self;
+        const left_f = switch (left) {
+            .integer => |i| @as(f64, @floatFromInt(i)),
+            .float => |f| f,
+            else => return Value{ .null = {} },
+        };
+        const right_f = switch (right) {
+            .integer => |i| @as(f64, @floatFromInt(i)),
+            .float => |f| f,
+            else => return Value{ .null = {} },
+        };
+
+        if (right_f == 0) return Value{ .null = {} }; // Division by zero
+        return Value{ .float = left_f / right_f };
+    }
+
+    /// Concatenate two strings (|| operator)
+    fn concatStrings(self: *Self, left: Value, right: Value) !Value {
+        const left_str = switch (left) {
+            .string => |s| s,
+            .integer => |i| blk: {
+                var buf: [32]u8 = undefined;
+                const str = std.fmt.bufPrint(&buf, "{d}", .{i}) catch return error.FormatError;
+                break :blk str;
+            },
+            .float => |f| blk: {
+                var buf: [32]u8 = undefined;
+                const str = std.fmt.bufPrint(&buf, "{d}", .{f}) catch return error.FormatError;
+                break :blk str;
+            },
+            else => return Value{ .null = {} },
+        };
+
+        const right_str = switch (right) {
+            .string => |s| s,
+            .integer => |i| blk: {
+                var buf: [32]u8 = undefined;
+                const str = std.fmt.bufPrint(&buf, "{d}", .{i}) catch return error.FormatError;
+                break :blk str;
+            },
+            .float => |f| blk: {
+                var buf: [32]u8 = undefined;
+                const str = std.fmt.bufPrint(&buf, "{d}", .{f}) catch return error.FormatError;
+                break :blk str;
+            },
+            else => return Value{ .null = {} },
+        };
+
+        // Allocate new concatenated string
+        const result = try self.allocator.alloc(u8, left_str.len + right_str.len);
+        @memcpy(result[0..left_str.len], left_str);
+        @memcpy(result[left_str.len..], right_str);
+
+        return Value{ .string = result };
+    }
+
+    /// Evaluate scalar function call
+    fn evaluateScalarFunction(self: *Self, call: anytype, row_idx: u32) anyerror!Value {
+        // Skip aggregates - handled elsewhere
+        if (isAggregateFunction(call.name)) {
+            return error.AggregateInScalarContext;
+        }
+
+        // Evaluate all arguments
+        var args: [8]Value = undefined;
+        const arg_count = @min(call.args.len, 8);
+        for (call.args[0..arg_count], 0..) |*arg, i| {
+            args[i] = try self.evaluateExprToValue(arg, row_idx);
+        }
+
+        // Dispatch by function name (case-insensitive)
+        var upper_buf: [32]u8 = undefined;
+        const upper_name = std.ascii.upperString(&upper_buf, call.name);
+
+        // String functions
+        if (std.mem.eql(u8, upper_name, "UPPER")) {
+            return self.funcUpper(args[0]);
+        }
+        if (std.mem.eql(u8, upper_name, "LOWER")) {
+            return self.funcLower(args[0]);
+        }
+        if (std.mem.eql(u8, upper_name, "LENGTH")) {
+            return self.funcLength(args[0]);
+        }
+        if (std.mem.eql(u8, upper_name, "TRIM")) {
+            return self.funcTrim(args[0]);
+        }
+
+        // Math functions
+        if (std.mem.eql(u8, upper_name, "ABS")) {
+            return self.funcAbs(args[0]);
+        }
+        if (std.mem.eql(u8, upper_name, "ROUND")) {
+            const precision: i32 = if (arg_count > 1) switch (args[1]) {
+                .integer => |i| @intCast(i),
+                else => 0,
+            } else 0;
+            return self.funcRound(args[0], precision);
+        }
+        if (std.mem.eql(u8, upper_name, "FLOOR")) {
+            return self.funcFloor(args[0]);
+        }
+        if (std.mem.eql(u8, upper_name, "CEIL") or std.mem.eql(u8, upper_name, "CEILING")) {
+            return self.funcCeil(args[0]);
+        }
+
+        // Type functions
+        if (std.mem.eql(u8, upper_name, "COALESCE")) {
+            // Return first non-null value
+            for (args[0..arg_count]) |arg| {
+                if (arg != .null) return arg;
+            }
+            return Value{ .null = {} };
+        }
+
+        return error.UnknownFunction;
+    }
+
+    /// UPPER(string) - Convert string to uppercase
+    fn funcUpper(self: *Self, val: Value) Value {
+        const str = switch (val) {
+            .string => |s| s,
+            else => return Value{ .null = {} },
+        };
+
+        const result = self.allocator.alloc(u8, str.len) catch return Value{ .null = {} };
+        for (str, 0..) |c, i| {
+            result[i] = std.ascii.toUpper(c);
+        }
+
+        return Value{ .string = result };
+    }
+
+    /// LOWER(string) - Convert string to lowercase
+    fn funcLower(self: *Self, val: Value) Value {
+        const str = switch (val) {
+            .string => |s| s,
+            else => return Value{ .null = {} },
+        };
+
+        const result = self.allocator.alloc(u8, str.len) catch return Value{ .null = {} };
+        for (str, 0..) |c, i| {
+            result[i] = std.ascii.toLower(c);
+        }
+
+        return Value{ .string = result };
+    }
+
+    /// LENGTH(string) - Return string length
+    fn funcLength(self: *Self, val: Value) Value {
+        _ = self;
+        return switch (val) {
+            .string => |s| Value{ .integer = @intCast(s.len) },
+            else => Value{ .null = {} },
+        };
+    }
+
+    /// TRIM(string) - Remove leading/trailing whitespace
+    fn funcTrim(self: *Self, val: Value) Value {
+        const str = switch (val) {
+            .string => |s| s,
+            else => return Value{ .null = {} },
+        };
+
+        const trimmed = std.mem.trim(u8, str, " \t\n\r");
+        const result = self.allocator.dupe(u8, trimmed) catch return Value{ .null = {} };
+
+        return Value{ .string = result };
+    }
+
+    /// ABS(number) - Absolute value
+    fn funcAbs(self: *Self, val: Value) Value {
+        _ = self;
+        return switch (val) {
+            .integer => |i| Value{ .integer = if (i < 0) -i else i },
+            .float => |f| Value{ .float = @abs(f) },
+            else => Value{ .null = {} },
+        };
+    }
+
+    /// ROUND(number, precision) - Round to precision decimal places
+    fn funcRound(self: *Self, val: Value, precision: i32) Value {
+        _ = self;
+        const f = switch (val) {
+            .integer => |i| @as(f64, @floatFromInt(i)),
+            .float => |f| f,
+            else => return Value{ .null = {} },
+        };
+
+        const multiplier = std.math.pow(f64, 10.0, @floatFromInt(precision));
+        return Value{ .float = @round(f * multiplier) / multiplier };
+    }
+
+    /// FLOOR(number) - Round down
+    fn funcFloor(self: *Self, val: Value) Value {
+        _ = self;
+        return switch (val) {
+            .integer => val,
+            .float => |f| Value{ .float = @floor(f) },
+            else => Value{ .null = {} },
+        };
+    }
+
+    /// CEIL(number) - Round up
+    fn funcCeil(self: *Self, val: Value) Value {
+        _ = self;
+        return switch (val) {
+            .integer => val,
+            .float => |f| Value{ .float = @ceil(f) },
+            else => Value{ .null = {} },
+        };
+    }
+
+    // ========================================================================
+    // Type Inference for Expressions
+    // ========================================================================
+
+    /// Result type enum for expression type inference
+    const ResultType = enum {
+        int64,
+        float64,
+        string,
+    };
+
+    /// Infer the result type of an expression
+    fn inferExpressionType(self: *Self, expr: *const Expr) !ResultType {
+        return switch (expr.*) {
+            .value => |v| switch (v) {
+                .integer => .int64,
+                .float => .float64,
+                .string => .string,
+                else => .string,
+            },
+            .column => |col| blk: {
+                const cached = self.column_cache.get(col.name) orelse {
+                    // Not cached yet, look up from table
+                    const physical_col_id = self.table.physicalColumnId(col.name) orelse return error.ColumnNotFound;
+                    const field = self.table.getFieldById(physical_col_id) orelse return error.InvalidColumn;
+
+                    if (std.mem.indexOf(u8, field.logical_type, "int") != null) {
+                        break :blk .int64;
+                    } else if (std.mem.indexOf(u8, field.logical_type, "float") != null or
+                              std.mem.indexOf(u8, field.logical_type, "double") != null) {
+                        break :blk .float64;
+                    } else {
+                        break :blk .string;
+                    }
+                };
+
+                break :blk switch (cached) {
+                    .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => .int64,
+                    .int32, .date32 => .int64, // int32/date32 promoted to int64 for expressions
+                    .float64 => .float64,
+                    .float32 => .float64, // float32 promoted to float64 for expressions
+                    .bool_ => .int64, // bool treated as integer
+                    .string => .string,
+                };
+            },
+            .binary => |bin| try self.inferBinaryType(bin),
+            .unary => |un| try self.inferExpressionType(un.operand),
+            .call => |call| self.inferFunctionReturnType(call.name),
+            else => .string,
+        };
+    }
+
+    /// Infer type of binary expression
+    fn inferBinaryType(self: *Self, bin: anytype) anyerror!ResultType {
+        // Concat always returns string
+        if (bin.op == .concat) return .string;
+
+        const left_type = try self.inferExpressionType(bin.left);
+        const right_type = try self.inferExpressionType(bin.right);
+
+        // Division always returns float
+        if (bin.op == .divide) return .float64;
+
+        // If either operand is float, result is float
+        if (left_type == .float64 or right_type == .float64) return .float64;
+
+        // Both integers -> integer
+        if (left_type == .int64 and right_type == .int64) return .int64;
+
+        // Default to float for mixed/unknown types
+        return .float64;
+    }
+
+    /// Infer return type of a scalar function
+    fn inferFunctionReturnType(self: *Self, name: []const u8) ResultType {
+        _ = self;
+        var upper_buf: [32]u8 = undefined;
+        const upper_name = std.ascii.upperString(&upper_buf, name);
+
+        // String functions return string
+        if (std.mem.eql(u8, upper_name, "UPPER") or
+            std.mem.eql(u8, upper_name, "LOWER") or
+            std.mem.eql(u8, upper_name, "TRIM"))
+        {
+            return .string;
+        }
+
+        // LENGTH returns int
+        if (std.mem.eql(u8, upper_name, "LENGTH")) {
+            return .int64;
+        }
+
+        // Math functions typically return float (except ABS which preserves type)
+        // For simplicity, return float64 for all math functions
+        return .float64;
+    }
+
+    /// Evaluate an expression column for all filtered indices
+    fn evaluateExpressionColumn(
+        self: *Self,
+        item: ast.SelectItem,
+        indices: []const u32,
+    ) !Result.Column {
+        // First, preload any columns referenced in the expression
+        var col_names = std.ArrayList([]const u8){};
+        defer col_names.deinit(self.allocator);
+        try self.extractExprColumnNames(&item.expr, &col_names);
+        try self.preloadColumns(col_names.items);
+
+        // Infer result type
+        const result_type = try self.inferExpressionType(&item.expr);
+
+        // Generate column name from expression if no alias
+        const col_name = item.alias orelse "expr";
+
+        // Evaluate expression for each row and store results
+        switch (result_type) {
+            .int64 => {
+                const results = try self.allocator.alloc(i64, indices.len);
+                errdefer self.allocator.free(results);
+
+                for (indices, 0..) |row_idx, i| {
+                    const val = try self.evaluateExprToValue(&item.expr, row_idx);
+                    results[i] = switch (val) {
+                        .integer => |v| v,
+                        .float => |f| @intFromFloat(f),
+                        else => 0,
+                    };
+                }
+
+                return Result.Column{
+                    .name = col_name,
+                    .data = Result.ColumnData{ .int64 = results },
+                };
+            },
+            .float64 => {
+                const results = try self.allocator.alloc(f64, indices.len);
+                errdefer self.allocator.free(results);
+
+                for (indices, 0..) |row_idx, i| {
+                    const val = try self.evaluateExprToValue(&item.expr, row_idx);
+                    results[i] = switch (val) {
+                        .integer => |v| @floatFromInt(v),
+                        .float => |f| f,
+                        else => 0.0,
+                    };
+                }
+
+                return Result.Column{
+                    .name = col_name,
+                    .data = Result.ColumnData{ .float64 = results },
+                };
+            },
+            .string => {
+                const results = try self.allocator.alloc([]const u8, indices.len);
+                errdefer self.allocator.free(results);
+
+                // Check if expression produces owned strings (e.g., concat, UPPER)
+                // by checking if it's a binary concat or a function call
+                const expr_produces_owned = switch (item.expr) {
+                    .binary => |bin| bin.op == .concat,
+                    .call => true, // String functions allocate their results
+                    else => false,
+                };
+
+                for (indices, 0..) |row_idx, i| {
+                    const val = try self.evaluateExprToValue(&item.expr, row_idx);
+                    results[i] = switch (val) {
+                        .string => |s| blk: {
+                            if (expr_produces_owned) {
+                                // String was already allocated by concat/UPPER/etc.
+                                // Use it directly without duping
+                                break :blk s;
+                            } else {
+                                // String is borrowed from cache, must dupe
+                                break :blk try self.allocator.dupe(u8, s);
+                            }
+                        },
+                        .integer => |v| blk: {
+                            var buf: [32]u8 = undefined;
+                            const str = std.fmt.bufPrint(&buf, "{d}", .{v}) catch "";
+                            break :blk try self.allocator.dupe(u8, str);
+                        },
+                        .float => |f| blk: {
+                            var buf: [32]u8 = undefined;
+                            const str = std.fmt.bufPrint(&buf, "{d}", .{f}) catch "";
+                            break :blk try self.allocator.dupe(u8, str);
+                        },
+                        else => try self.allocator.dupe(u8, ""),
+                    };
+                }
+
+                return Result.Column{
+                    .name = col_name,
+                    .data = Result.ColumnData{ .string = results },
+                };
+            },
+        }
     }
 
     /// Get all row indices (0, 1, 2, ..., n-1)
@@ -951,8 +1846,11 @@ pub const Executor = struct {
         errdefer {
             for (columns.items) |col| {
                 switch (col.data) {
-                    .int64 => |data| self.allocator.free(data),
+                    .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| self.allocator.free(data),
+                    .int32, .date32 => |data| self.allocator.free(data),
                     .float64 => |data| self.allocator.free(data),
+                    .float32 => |data| self.allocator.free(data),
+                    .bool_ => |data| self.allocator.free(data),
                     .string => |data| {
                         for (data) |str| {
                             self.allocator.free(str);
@@ -995,8 +1893,9 @@ pub const Executor = struct {
                     .data = data,
                 });
             } else {
-                // TODO: Handle expressions, function calls, etc.
-                return error.UnsupportedExpression;
+                // Handle expressions (arithmetic, functions, etc.)
+                const expr_col = try self.evaluateExpressionColumn(item, indices);
+                try columns.append(self.allocator, expr_col);
             }
         }
 
@@ -1014,8 +1913,95 @@ pub const Executor = struct {
         // For Phase 1: Read ALL rows, then filter by indices
         // TODO Phase 2: Add readAtIndices() methods to Table for efficiency
 
-        // Determine type from logical_type
-        if (std.mem.indexOf(u8, field.logical_type, "int") != null) {
+        const logical_type = field.logical_type;
+
+        // Precise type detection (order matters - check specific before general)
+        // Timestamp types (check before generic "int" matches)
+        if (std.mem.indexOf(u8, logical_type, "timestamp[ns") != null) {
+            const all_data = try self.table.readInt64Column(col_idx);
+            defer self.allocator.free(all_data);
+
+            const filtered = try self.allocator.alloc(i64, indices.len);
+            for (indices, 0..) |idx, i| {
+                filtered[i] = all_data[idx];
+            }
+            return Result.ColumnData{ .timestamp_ns = filtered };
+        } else if (std.mem.indexOf(u8, logical_type, "timestamp[us") != null) {
+            const all_data = try self.table.readInt64Column(col_idx);
+            defer self.allocator.free(all_data);
+
+            const filtered = try self.allocator.alloc(i64, indices.len);
+            for (indices, 0..) |idx, i| {
+                filtered[i] = all_data[idx];
+            }
+            return Result.ColumnData{ .timestamp_us = filtered };
+        } else if (std.mem.indexOf(u8, logical_type, "timestamp[ms") != null) {
+            const all_data = try self.table.readInt64Column(col_idx);
+            defer self.allocator.free(all_data);
+
+            const filtered = try self.allocator.alloc(i64, indices.len);
+            for (indices, 0..) |idx, i| {
+                filtered[i] = all_data[idx];
+            }
+            return Result.ColumnData{ .timestamp_ms = filtered };
+        } else if (std.mem.indexOf(u8, logical_type, "timestamp[s") != null) {
+            const all_data = try self.table.readInt64Column(col_idx);
+            defer self.allocator.free(all_data);
+
+            const filtered = try self.allocator.alloc(i64, indices.len);
+            for (indices, 0..) |idx, i| {
+                filtered[i] = all_data[idx];
+            }
+            return Result.ColumnData{ .timestamp_s = filtered };
+        } else if (std.mem.indexOf(u8, logical_type, "date32") != null) {
+            const all_data = try self.table.readInt32Column(col_idx);
+            defer self.allocator.free(all_data);
+
+            const filtered = try self.allocator.alloc(i32, indices.len);
+            for (indices, 0..) |idx, i| {
+                filtered[i] = all_data[idx];
+            }
+            return Result.ColumnData{ .date32 = filtered };
+        } else if (std.mem.indexOf(u8, logical_type, "date64") != null) {
+            const all_data = try self.table.readInt64Column(col_idx);
+            defer self.allocator.free(all_data);
+
+            const filtered = try self.allocator.alloc(i64, indices.len);
+            for (indices, 0..) |idx, i| {
+                filtered[i] = all_data[idx];
+            }
+            return Result.ColumnData{ .date64 = filtered };
+        } else if (std.mem.eql(u8, logical_type, "int32")) {
+            const all_data = try self.table.readInt32Column(col_idx);
+            defer self.allocator.free(all_data);
+
+            const filtered = try self.allocator.alloc(i32, indices.len);
+            for (indices, 0..) |idx, i| {
+                filtered[i] = all_data[idx];
+            }
+            return Result.ColumnData{ .int32 = filtered };
+        } else if (std.mem.eql(u8, logical_type, "float") or
+            std.mem.indexOf(u8, logical_type, "float32") != null) {
+            const all_data = try self.table.readFloat32Column(col_idx);
+            defer self.allocator.free(all_data);
+
+            const filtered = try self.allocator.alloc(f32, indices.len);
+            for (indices, 0..) |idx, i| {
+                filtered[i] = all_data[idx];
+            }
+            return Result.ColumnData{ .float32 = filtered };
+        } else if (std.mem.eql(u8, logical_type, "bool") or
+            std.mem.indexOf(u8, logical_type, "boolean") != null) {
+            const all_data = try self.table.readBoolColumn(col_idx);
+            defer self.allocator.free(all_data);
+
+            const filtered = try self.allocator.alloc(bool, indices.len);
+            for (indices, 0..) |idx, i| {
+                filtered[i] = all_data[idx];
+            }
+            return Result.ColumnData{ .bool_ = filtered };
+        } else if (std.mem.indexOf(u8, logical_type, "int") != null) {
+            // Default integers to int64
             const all_data = try self.table.readInt64Column(col_idx);
             defer self.allocator.free(all_data);
 
@@ -1024,8 +2010,7 @@ pub const Executor = struct {
                 filtered[i] = all_data[idx];
             }
             return Result.ColumnData{ .int64 = filtered };
-        } else if (std.mem.indexOf(u8, field.logical_type, "float") != null or
-                   std.mem.indexOf(u8, field.logical_type, "double") != null) {
+        } else if (std.mem.indexOf(u8, logical_type, "double") != null) {
             const all_data = try self.table.readFloat64Column(col_idx);
             defer self.allocator.free(all_data);
 
@@ -1034,8 +2019,8 @@ pub const Executor = struct {
                 filtered[i] = all_data[idx];
             }
             return Result.ColumnData{ .float64 = filtered };
-        } else if (std.mem.indexOf(u8, field.logical_type, "utf8") != null or
-                   std.mem.indexOf(u8, field.logical_type, "string") != null) {
+        } else if (std.mem.indexOf(u8, logical_type, "utf8") != null or
+            std.mem.indexOf(u8, logical_type, "string") != null) {
             const all_data = try self.table.readStringColumn(col_idx);
             // all_data contains owned strings - must free both array and individual strings
             defer {
@@ -1057,6 +2042,229 @@ pub const Executor = struct {
     }
 
     // ========================================================================
+    // DISTINCT Implementation
+    // ========================================================================
+
+    /// Apply DISTINCT - remove duplicate rows from result columns
+    fn applyDistinct(self: *Self, columns: []Result.Column) !struct {
+        columns: []Result.Column,
+        row_count: usize,
+    } {
+        if (columns.len == 0) {
+            return .{ .columns = columns, .row_count = 0 };
+        }
+
+        const total_rows = switch (columns[0].data) {
+            .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |d| d.len,
+            .int32, .date32 => |d| d.len,
+            .float64 => |d| d.len,
+            .float32 => |d| d.len,
+            .bool_ => |d| d.len,
+            .string => |d| d.len,
+        };
+
+        if (total_rows == 0) {
+            return .{ .columns = columns, .row_count = 0 };
+        }
+
+        // Track unique row keys using StringHashMap
+        var seen = std.StringHashMap(void).init(self.allocator);
+        defer {
+            // Free all keys stored in the map
+            var key_iter = seen.keyIterator();
+            while (key_iter.next()) |key| {
+                self.allocator.free(key.*);
+            }
+            seen.deinit();
+        }
+
+        // Track which row indices to keep
+        var keep_indices = std.ArrayList(usize){};
+        defer keep_indices.deinit(self.allocator);
+
+        // Build row keys and identify unique rows
+        for (0..total_rows) |row_idx| {
+            const row_key = try self.buildDistinctRowKey(columns, row_idx);
+
+            if (!seen.contains(row_key)) {
+                // Store owned copy of key in map
+                try seen.put(row_key, {});
+                try keep_indices.append(self.allocator, row_idx);
+            } else {
+                // Key already exists, free the duplicate
+                self.allocator.free(row_key);
+            }
+        }
+
+        // If all rows are unique, return original columns
+        if (keep_indices.items.len == total_rows) {
+            return .{ .columns = columns, .row_count = total_rows };
+        }
+
+        // Build new columns with only unique rows
+        const unique_count = keep_indices.items.len;
+        const new_columns = try self.allocator.alloc(Result.Column, columns.len);
+        errdefer self.allocator.free(new_columns);
+
+        for (columns, 0..) |col, col_idx| {
+            new_columns[col_idx] = try self.filterColumnByIndices(col, keep_indices.items);
+        }
+
+        // Free original column data
+        for (columns) |col| {
+            switch (col.data) {
+                .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |d| self.allocator.free(d),
+                .int32, .date32 => |d| self.allocator.free(d),
+                .float64 => |d| self.allocator.free(d),
+                .float32 => |d| self.allocator.free(d),
+                .bool_ => |d| self.allocator.free(d),
+                .string => |d| {
+                    for (d) |str| self.allocator.free(str);
+                    self.allocator.free(d);
+                },
+            }
+        }
+        self.allocator.free(columns);
+
+        return .{ .columns = new_columns, .row_count = unique_count };
+    }
+
+    /// Build a unique key string for a row across all columns (for DISTINCT)
+    fn buildDistinctRowKey(self: *Self, columns: []const Result.Column, row_idx: usize) ![]u8 {
+        var key = std.ArrayList(u8){};
+        errdefer key.deinit(self.allocator);
+
+        for (columns) |col| {
+            try key.append(self.allocator, '|'); // Column separator
+            switch (col.data) {
+                .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |vals| {
+                    var buf: [32]u8 = undefined;
+                    const str = std.fmt.bufPrint(&buf, "{d}", .{vals[row_idx]}) catch unreachable;
+                    try key.appendSlice(self.allocator, str);
+                },
+                .int32, .date32 => |vals| {
+                    var buf: [16]u8 = undefined;
+                    const str = std.fmt.bufPrint(&buf, "{d}", .{vals[row_idx]}) catch unreachable;
+                    try key.appendSlice(self.allocator, str);
+                },
+                .float64 => |vals| {
+                    var buf: [64]u8 = undefined;
+                    const str = std.fmt.bufPrint(&buf, "{d}", .{vals[row_idx]}) catch unreachable;
+                    try key.appendSlice(self.allocator, str);
+                },
+                .float32 => |vals| {
+                    var buf: [32]u8 = undefined;
+                    const str = std.fmt.bufPrint(&buf, "{d}", .{vals[row_idx]}) catch unreachable;
+                    try key.appendSlice(self.allocator, str);
+                },
+                .bool_ => |vals| {
+                    try key.appendSlice(self.allocator, if (vals[row_idx]) "true" else "false");
+                },
+                .string => |vals| {
+                    try key.appendSlice(self.allocator, vals[row_idx]);
+                },
+            }
+        }
+
+        return key.toOwnedSlice(self.allocator);
+    }
+
+    /// Filter a column to keep only specified row indices
+    fn filterColumnByIndices(self: *Self, col: Result.Column, indices: []const usize) !Result.Column {
+        const count = indices.len;
+
+        return Result.Column{
+            .name = col.name,
+            .data = switch (col.data) {
+                .int64 => |vals| blk: {
+                    const new_vals = try self.allocator.alloc(i64, count);
+                    for (indices, 0..) |idx, i| {
+                        new_vals[i] = vals[idx];
+                    }
+                    break :blk Result.ColumnData{ .int64 = new_vals };
+                },
+                .timestamp_s => |vals| blk: {
+                    const new_vals = try self.allocator.alloc(i64, count);
+                    for (indices, 0..) |idx, i| {
+                        new_vals[i] = vals[idx];
+                    }
+                    break :blk Result.ColumnData{ .timestamp_s = new_vals };
+                },
+                .timestamp_ms => |vals| blk: {
+                    const new_vals = try self.allocator.alloc(i64, count);
+                    for (indices, 0..) |idx, i| {
+                        new_vals[i] = vals[idx];
+                    }
+                    break :blk Result.ColumnData{ .timestamp_ms = new_vals };
+                },
+                .timestamp_us => |vals| blk: {
+                    const new_vals = try self.allocator.alloc(i64, count);
+                    for (indices, 0..) |idx, i| {
+                        new_vals[i] = vals[idx];
+                    }
+                    break :blk Result.ColumnData{ .timestamp_us = new_vals };
+                },
+                .timestamp_ns => |vals| blk: {
+                    const new_vals = try self.allocator.alloc(i64, count);
+                    for (indices, 0..) |idx, i| {
+                        new_vals[i] = vals[idx];
+                    }
+                    break :blk Result.ColumnData{ .timestamp_ns = new_vals };
+                },
+                .date64 => |vals| blk: {
+                    const new_vals = try self.allocator.alloc(i64, count);
+                    for (indices, 0..) |idx, i| {
+                        new_vals[i] = vals[idx];
+                    }
+                    break :blk Result.ColumnData{ .date64 = new_vals };
+                },
+                .int32 => |vals| blk: {
+                    const new_vals = try self.allocator.alloc(i32, count);
+                    for (indices, 0..) |idx, i| {
+                        new_vals[i] = vals[idx];
+                    }
+                    break :blk Result.ColumnData{ .int32 = new_vals };
+                },
+                .date32 => |vals| blk: {
+                    const new_vals = try self.allocator.alloc(i32, count);
+                    for (indices, 0..) |idx, i| {
+                        new_vals[i] = vals[idx];
+                    }
+                    break :blk Result.ColumnData{ .date32 = new_vals };
+                },
+                .float64 => |vals| blk: {
+                    const new_vals = try self.allocator.alloc(f64, count);
+                    for (indices, 0..) |idx, i| {
+                        new_vals[i] = vals[idx];
+                    }
+                    break :blk Result.ColumnData{ .float64 = new_vals };
+                },
+                .float32 => |vals| blk: {
+                    const new_vals = try self.allocator.alloc(f32, count);
+                    for (indices, 0..) |idx, i| {
+                        new_vals[i] = vals[idx];
+                    }
+                    break :blk Result.ColumnData{ .float32 = new_vals };
+                },
+                .bool_ => |vals| blk: {
+                    const new_vals = try self.allocator.alloc(bool, count);
+                    for (indices, 0..) |idx, i| {
+                        new_vals[i] = vals[idx];
+                    }
+                    break :blk Result.ColumnData{ .bool_ = new_vals };
+                },
+                .string => |vals| blk: {
+                    const new_vals = try self.allocator.alloc([]const u8, count);
+                    for (indices, 0..) |idx, i| {
+                        new_vals[i] = try self.allocator.dupe(u8, vals[idx]);
+                    }
+                    break :blk Result.ColumnData{ .string = new_vals };
+                },
+            },
+        };
+    }
+
+    // ========================================================================
     // ORDER BY Implementation
     // ========================================================================
 
@@ -1068,8 +2276,11 @@ pub const Executor = struct {
         if (columns.len == 0) return;
 
         const row_count = switch (columns[0].data) {
-            .int64 => |data| data.len,
+            .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| data.len,
+            .int32, .date32 => |data| data.len,
             .float64 => |data| data.len,
+            .float32 => |data| data.len,
+            .bool_ => |data| data.len,
             .string => |data| data.len,
         };
 
@@ -1112,7 +2323,14 @@ pub const Executor = struct {
         const ascending = context.direction == .asc;
 
         const cmp = switch (context.column.data) {
-            .int64 => |data| blk: {
+            .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| blk: {
+                const a = data[a_idx];
+                const b = data[b_idx];
+                if (a < b) break :blk std.math.Order.lt;
+                if (a > b) break :blk std.math.Order.gt;
+                break :blk std.math.Order.eq;
+            },
+            .int32, .date32 => |data| blk: {
                 const a = data[a_idx];
                 const b = data[b_idx];
                 if (a < b) break :blk std.math.Order.lt;
@@ -1122,6 +2340,20 @@ pub const Executor = struct {
             .float64 => |data| blk: {
                 const a = data[a_idx];
                 const b = data[b_idx];
+                if (a < b) break :blk std.math.Order.lt;
+                if (a > b) break :blk std.math.Order.gt;
+                break :blk std.math.Order.eq;
+            },
+            .float32 => |data| blk: {
+                const a = data[a_idx];
+                const b = data[b_idx];
+                if (a < b) break :blk std.math.Order.lt;
+                if (a > b) break :blk std.math.Order.gt;
+                break :blk std.math.Order.eq;
+            },
+            .bool_ => |data| blk: {
+                const a: u8 = if (data[a_idx]) 1 else 0;
+                const b: u8 = if (data[b_idx]) 1 else 0;
                 if (a < b) break :blk std.math.Order.lt;
                 if (a > b) break :blk std.math.Order.gt;
                 break :blk std.math.Order.eq;
@@ -1155,6 +2387,62 @@ pub const Executor = struct {
                 self.allocator.free(data);
                 col.data = Result.ColumnData{ .int64 = reordered };
             },
+            .timestamp_s => |data| {
+                const reordered = try self.allocator.alloc(i64, data.len);
+                for (indices, 0..) |idx, i| {
+                    reordered[i] = data[idx];
+                }
+                self.allocator.free(data);
+                col.data = Result.ColumnData{ .timestamp_s = reordered };
+            },
+            .timestamp_ms => |data| {
+                const reordered = try self.allocator.alloc(i64, data.len);
+                for (indices, 0..) |idx, i| {
+                    reordered[i] = data[idx];
+                }
+                self.allocator.free(data);
+                col.data = Result.ColumnData{ .timestamp_ms = reordered };
+            },
+            .timestamp_us => |data| {
+                const reordered = try self.allocator.alloc(i64, data.len);
+                for (indices, 0..) |idx, i| {
+                    reordered[i] = data[idx];
+                }
+                self.allocator.free(data);
+                col.data = Result.ColumnData{ .timestamp_us = reordered };
+            },
+            .timestamp_ns => |data| {
+                const reordered = try self.allocator.alloc(i64, data.len);
+                for (indices, 0..) |idx, i| {
+                    reordered[i] = data[idx];
+                }
+                self.allocator.free(data);
+                col.data = Result.ColumnData{ .timestamp_ns = reordered };
+            },
+            .date64 => |data| {
+                const reordered = try self.allocator.alloc(i64, data.len);
+                for (indices, 0..) |idx, i| {
+                    reordered[i] = data[idx];
+                }
+                self.allocator.free(data);
+                col.data = Result.ColumnData{ .date64 = reordered };
+            },
+            .int32 => |data| {
+                const reordered = try self.allocator.alloc(i32, data.len);
+                for (indices, 0..) |idx, i| {
+                    reordered[i] = data[idx];
+                }
+                self.allocator.free(data);
+                col.data = Result.ColumnData{ .int32 = reordered };
+            },
+            .date32 => |data| {
+                const reordered = try self.allocator.alloc(i32, data.len);
+                for (indices, 0..) |idx, i| {
+                    reordered[i] = data[idx];
+                }
+                self.allocator.free(data);
+                col.data = Result.ColumnData{ .date32 = reordered };
+            },
             .float64 => |data| {
                 const reordered = try self.allocator.alloc(f64, data.len);
                 for (indices, 0..) |idx, i| {
@@ -1162,6 +2450,22 @@ pub const Executor = struct {
                 }
                 self.allocator.free(data);
                 col.data = Result.ColumnData{ .float64 = reordered };
+            },
+            .float32 => |data| {
+                const reordered = try self.allocator.alloc(f32, data.len);
+                for (indices, 0..) |idx, i| {
+                    reordered[i] = data[idx];
+                }
+                self.allocator.free(data);
+                col.data = Result.ColumnData{ .float32 = reordered };
+            },
+            .bool_ => |data| {
+                const reordered = try self.allocator.alloc(bool, data.len);
+                for (indices, 0..) |idx, i| {
+                    reordered[i] = data[idx];
+                }
+                self.allocator.free(data);
+                col.data = Result.ColumnData{ .bool_ = reordered };
             },
             .string => |data| {
                 const reordered = try self.allocator.alloc([]const u8, data.len);
@@ -1191,8 +2495,11 @@ pub const Executor = struct {
         if (columns.len == 0) return 0;
 
         const row_count = switch (columns[0].data) {
-            .int64 => |data| data.len,
+            .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| data.len,
+            .int32, .date32 => |data| data.len,
             .float64 => |data| data.len,
+            .float32 => |data| data.len,
+            .bool_ => |data| data.len,
             .string => |data| data.len,
         };
 
@@ -1203,7 +2510,16 @@ pub const Executor = struct {
                 self.freeColumnData(&col.data);
                 col.data = switch (col.data) {
                     .int64 => Result.ColumnData{ .int64 = &[_]i64{} },
+                    .timestamp_s => Result.ColumnData{ .timestamp_s = &[_]i64{} },
+                    .timestamp_ms => Result.ColumnData{ .timestamp_ms = &[_]i64{} },
+                    .timestamp_us => Result.ColumnData{ .timestamp_us = &[_]i64{} },
+                    .timestamp_ns => Result.ColumnData{ .timestamp_ns = &[_]i64{} },
+                    .date64 => Result.ColumnData{ .date64 = &[_]i64{} },
+                    .int32 => Result.ColumnData{ .int32 = &[_]i32{} },
+                    .date32 => Result.ColumnData{ .date32 = &[_]i32{} },
                     .float64 => Result.ColumnData{ .float64 = &[_]f64{} },
+                    .float32 => Result.ColumnData{ .float32 = &[_]f32{} },
+                    .bool_ => Result.ColumnData{ .bool_ = &[_]bool{} },
                     .string => Result.ColumnData{ .string = &[_][]const u8{} },
                 };
             }
@@ -1233,11 +2549,65 @@ pub const Executor = struct {
                 self.allocator.free(data);
                 col.data = Result.ColumnData{ .int64 = sliced };
             },
+            .timestamp_s => |data| {
+                const sliced = try self.allocator.alloc(i64, new_len);
+                @memcpy(sliced, data[start..end]);
+                self.allocator.free(data);
+                col.data = Result.ColumnData{ .timestamp_s = sliced };
+            },
+            .timestamp_ms => |data| {
+                const sliced = try self.allocator.alloc(i64, new_len);
+                @memcpy(sliced, data[start..end]);
+                self.allocator.free(data);
+                col.data = Result.ColumnData{ .timestamp_ms = sliced };
+            },
+            .timestamp_us => |data| {
+                const sliced = try self.allocator.alloc(i64, new_len);
+                @memcpy(sliced, data[start..end]);
+                self.allocator.free(data);
+                col.data = Result.ColumnData{ .timestamp_us = sliced };
+            },
+            .timestamp_ns => |data| {
+                const sliced = try self.allocator.alloc(i64, new_len);
+                @memcpy(sliced, data[start..end]);
+                self.allocator.free(data);
+                col.data = Result.ColumnData{ .timestamp_ns = sliced };
+            },
+            .date64 => |data| {
+                const sliced = try self.allocator.alloc(i64, new_len);
+                @memcpy(sliced, data[start..end]);
+                self.allocator.free(data);
+                col.data = Result.ColumnData{ .date64 = sliced };
+            },
+            .int32 => |data| {
+                const sliced = try self.allocator.alloc(i32, new_len);
+                @memcpy(sliced, data[start..end]);
+                self.allocator.free(data);
+                col.data = Result.ColumnData{ .int32 = sliced };
+            },
+            .date32 => |data| {
+                const sliced = try self.allocator.alloc(i32, new_len);
+                @memcpy(sliced, data[start..end]);
+                self.allocator.free(data);
+                col.data = Result.ColumnData{ .date32 = sliced };
+            },
             .float64 => |data| {
                 const sliced = try self.allocator.alloc(f64, new_len);
                 @memcpy(sliced, data[start..end]);
                 self.allocator.free(data);
                 col.data = Result.ColumnData{ .float64 = sliced };
+            },
+            .float32 => |data| {
+                const sliced = try self.allocator.alloc(f32, new_len);
+                @memcpy(sliced, data[start..end]);
+                self.allocator.free(data);
+                col.data = Result.ColumnData{ .float32 = sliced };
+            },
+            .bool_ => |data| {
+                const sliced = try self.allocator.alloc(bool, new_len);
+                @memcpy(sliced, data[start..end]);
+                self.allocator.free(data);
+                col.data = Result.ColumnData{ .bool_ = sliced };
             },
             .string => |data| {
                 const sliced = try self.allocator.alloc([]const u8, new_len);
@@ -1256,8 +2626,11 @@ pub const Executor = struct {
 
     fn freeColumnData(self: *Self, data: *Result.ColumnData) void {
         switch (data.*) {
-            .int64 => |d| self.allocator.free(d),
+            .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |d| self.allocator.free(d),
+            .int32, .date32 => |d| self.allocator.free(d),
             .float64 => |d| self.allocator.free(d),
+            .float32 => |d| self.allocator.free(d),
+            .bool_ => |d| self.allocator.free(d),
             .string => |d| {
                 for (d) |str| {
                     self.allocator.free(str);

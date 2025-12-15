@@ -58,11 +58,13 @@ pub const TokenType = enum {
     PLUS,      // +
     MINUS,     // -
     SLASH,     // /
+    CONCAT,    // ||
     COMMA,     // ,
     DOT,       // .
     LPAREN,    // (
     RPAREN,    // )
     SEMICOLON, // ;
+    PARAMETER, // ?
 
     EOF,
 };
@@ -241,6 +243,7 @@ pub const Lexer = struct {
             '+' => return Token{ .type = .PLUS, .lexeme = "+", .position = start },
             '-' => return Token{ .type = .MINUS, .lexeme = "-", .position = start },
             '/' => return Token{ .type = .SLASH, .lexeme = "/", .position = start },
+            '?' => return Token{ .type = .PARAMETER, .lexeme = "?", .position = start },
 
             '=' => return Token{ .type = .EQ, .lexeme = "=", .position = start },
 
@@ -269,6 +272,14 @@ pub const Lexer = struct {
                     return Token{ .type = .GE, .lexeme = ">=", .position = start };
                 }
                 return Token{ .type = .GT, .lexeme = ">", .position = start };
+            },
+
+            '|' => {
+                if (self.peek() == '|') {
+                    _ = self.advance();
+                    return Token{ .type = .CONCAT, .lexeme = "||", .position = start };
+                }
+                return error.UnexpectedCharacter;
             },
 
             else => return error.UnexpectedCharacter,
@@ -382,4 +393,20 @@ test "lexer comparison operators" {
     try std.testing.expectEqual(TokenType.NE, tokens[5].type);
     try std.testing.expectEqual(TokenType.LE, tokens[9].type);
     try std.testing.expectEqual(TokenType.GE, tokens[13].type);
+}
+
+test "lexer parameter tokens" {
+    const sql = "SELECT * FROM t WHERE id = ? AND name = ?";
+    var lexer = Lexer.init(sql);
+
+    const allocator = std.testing.allocator;
+    const tokens = try lexer.tokenize(allocator);
+    defer allocator.free(tokens);
+
+    // Tokens: SELECT * FROM t WHERE id = ? AND name = ? EOF
+    //         0      1 2    3 4     5  6 7 8   9    10 11 12
+    try std.testing.expectEqual(TokenType.PARAMETER, tokens[7].type);
+    try std.testing.expectEqualStrings("?", tokens[7].lexeme);
+    try std.testing.expectEqual(TokenType.PARAMETER, tokens[11].type);
+    try std.testing.expectEqualStrings("?", tokens[11].lexeme);
 }

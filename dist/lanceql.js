@@ -6,35 +6,188 @@
  * Supports both local files and remote URLs via HTTP Range requests.
  */
 
-export class LanceQL {
-    constructor(wasmInstance) {
-        this.wasm = wasmInstance.exports;
-        this.memory = this.wasm.memory;
+/**
+ * IndexedDB cache for dataset metadata.
+ * Caches schema, column types, and fragment info to speed up repeat visits.
+ */
+class MetadataCache {
+    constructor(dbName = 'lanceql-cache', version = 1) {
+        this.dbName = dbName;
+        this.version = version;
+        this.db = null;
+    }
+
+    async open() {
+        if (this.db) return this.db;
+
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open(this.dbName, this.version);
+
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => {
+                this.db = request.result;
+                resolve(this.db);
+            };
+
+            request.onupgradeneeded = (event) => {
+                const db = event.target.result;
+                if (!db.objectStoreNames.contains('datasets')) {
+                    const store = db.createObjectStore('datasets', { keyPath: 'url' });
+                    store.createIndex('timestamp', 'timestamp');
+                }
+            };
+        });
     }
 
     /**
-     * Load LanceQL from a WASM file path or URL.
-     * @param {string} wasmPath - Path to the lanceql.wasm file
-     * @returns {Promise<LanceQL>}
+     * Get cached metadata for a dataset URL.
+     * @param {string} url - Dataset URL
+     * @returns {Promise<Object|null>} Cached metadata or null
      */
-    static async load(wasmPath = './lanceql.wasm') {
-        const response = await fetch(wasmPath);
-        const wasmBytes = await response.arrayBuffer();
-        const wasmModule = await WebAssembly.instantiate(wasmBytes, {});
-        return new LanceQL(wasmModule.instance);
+    async get(url) {
+        try {
+            const db = await this.open();
+            return new Promise((resolve) => {
+                const tx = db.transaction('datasets', 'readonly');
+                const store = tx.objectStore('datasets');
+                const request = store.get(url);
+                request.onsuccess = () => resolve(request.result || null);
+                request.onerror = () => resolve(null);
+            });
+        } catch (e) {
+            console.warn('[MetadataCache] Get failed:', e);
+            return null;
+        }
     }
 
+    /**
+     * Cache metadata for a dataset URL.
+     * @param {string} url - Dataset URL
+     * @param {Object} metadata - Metadata to cache (schema, columnTypes, fragments, etc.)
+     */
+    async set(url, metadata) {
+        try {
+            const db = await this.open();
+            return new Promise((resolve, reject) => {
+                const tx = db.transaction('datasets', 'readwrite');
+                const store = tx.objectStore('datasets');
+                const data = {
+                    url,
+                    timestamp: Date.now(),
+                    ...metadata
+                };
+                const request = store.put(data);
+                request.onsuccess = () => resolve();
+                request.onerror = () => reject(request.error);
+            });
+        } catch (e) {
+            console.warn('[MetadataCache] Set failed:', e);
+        }
+    }
+
+    /**
+     * Delete cached metadata for a URL.
+     * @param {string} url - Dataset URL
+     */
+    async delete(url) {
+        try {
+            const db = await this.open();
+            return new Promise((resolve) => {
+                const tx = db.transaction('datasets', 'readwrite');
+                const store = tx.objectStore('datasets');
+                store.delete(url);
+                tx.oncomplete = () => resolve();
+            });
+        } catch (e) {
+            console.warn('[MetadataCache] Delete failed:', e);
+        }
+    }
+
+    /**
+     * Clear all cached metadata.
+     */
+    async clear() {
+        try {
+            const db = await this.open();
+            return new Promise((resolve) => {
+                const tx = db.transaction('datasets', 'readwrite');
+                const store = tx.objectStore('datasets');
+                store.clear();
+                tx.oncomplete = () => resolve();
+            });
+        } catch (e) {
+            console.warn('[MetadataCache] Clear failed:', e);
+        }
+    }
+}
+
+// Global cache instance
+const metadataCache = new MetadataCache();
+
+// Immer-style WASM runtime - auto string/bytes marshalling
+const E = new TextEncoder();
+const D = new TextDecoder();
+let _w, _m, _p = 0, _M = 0;
+
+// Get shared buffer view (lazy allocation)
+const _g = () => {
+    if (!_p || !_M) return null;
+    return new Uint8Array(_m.buffer, _p, _M);
+};
+
+// Ensure shared buffer is large enough
+const _ensure = (size) => {
+    if (_p && size <= _M) return true;
+    // Free old buffer if exists
+    if (_p && _w.free) _w.free(_p, _M);
+    _M = Math.max(size + 1024, 4096); // At least 4KB
+    _p = _w.alloc(_M);
+    return _p !== 0;
+};
+
+// Marshal JS value to WASM args (strings and Uint8Array auto-copied to WASM memory)
+const _x = a => {
+    if (a instanceof Uint8Array) {
+        if (!_ensure(a.length)) return [a]; // Fallback if alloc fails
+        _g().set(a);
+        return [_p, a.length];
+    }
+    if (typeof a !== 'string') return [a];
+    const b = E.encode(a);
+    if (!_ensure(b.length)) return [a]; // Fallback if alloc fails
+    _g().set(b);
+    return [_p, b.length];
+};
+
+// Read string from WASM memory
+const readStr = (ptr, len) => D.decode(new Uint8Array(_m.buffer, ptr, len));
+
+// Read bytes from WASM memory (returns copy)
+const readBytes = (ptr, len) => new Uint8Array(_m.buffer, ptr, len).slice();
+
+// WASM utils exported for advanced usage
+export const wasmUtils = {
+    readStr,
+    readBytes,
+    encoder: E,
+    decoder: D,
+    getMemory: () => _m,
+    getExports: () => _w,
+};
+
+// LanceQL high-level methods factory (needs proxy reference)
+const _createLanceqlMethods = (proxy) => ({
     /**
      * Get the library version.
      * @returns {string} Version string like "0.1.0"
      */
     getVersion() {
-        const v = this.wasm.getVersion();
+        const v = _w.getVersion();
         const major = (v >> 16) & 0xFF;
         const minor = (v >> 8) & 0xFF;
         const patch = v & 0xFF;
         return `${major}.${minor}.${patch}`;
-    }
+    },
 
     /**
      * Open a Lance file from an ArrayBuffer (local file).
@@ -42,62 +195,111 @@ export class LanceQL {
      * @returns {LanceFile}
      */
     open(data) {
-        return new LanceFile(this, data);
-    }
+        return new LanceFile(proxy, data);
+    },
 
     /**
      * Open a Lance file from a URL using HTTP Range requests.
-     * Only fetches metadata initially - column data is fetched on demand.
      * @param {string} url - URL to the Lance file
      * @returns {Promise<RemoteLanceFile>}
      */
     async openUrl(url) {
-        return await RemoteLanceFile.open(this, url);
-    }
+        return await RemoteLanceFile.open(proxy, url);
+    },
 
     /**
-     * Parse footer from Lance file data (without opening).
+     * Open a Lance dataset from a base URL using HTTP Range requests.
+     * @param {string} baseUrl - Base URL to the Lance dataset
+     * @param {object} [options] - Options for opening
+     * @param {number} [options.version] - Specific version to load
+     * @returns {Promise<RemoteLanceDataset>}
+     */
+    async openDataset(baseUrl, options = {}) {
+        return await RemoteLanceDataset.open(proxy, baseUrl, options);
+    },
+
+    /**
+     * Parse footer from Lance file data.
      * @param {ArrayBuffer} data
      * @returns {{numColumns: number, majorVersion: number, minorVersion: number} | null}
      */
     parseFooter(data) {
         const bytes = new Uint8Array(data);
-        const ptr = this.wasm.alloc(bytes.length);
+        const ptr = _w.alloc(bytes.length);
         if (!ptr) return null;
 
         try {
-            new Uint8Array(this.memory.buffer).set(bytes, ptr);
+            new Uint8Array(_m.buffer).set(bytes, ptr);
 
-            const numColumns = this.wasm.parseFooterGetColumns(ptr, bytes.length);
-            const majorVersion = this.wasm.parseFooterGetMajorVersion(ptr, bytes.length);
-            const minorVersion = this.wasm.parseFooterGetMinorVersion(ptr, bytes.length);
+            const numColumns = _w.parseFooterGetColumns(ptr, bytes.length);
+            const majorVersion = _w.parseFooterGetMajorVersion(ptr, bytes.length);
+            const minorVersion = _w.parseFooterGetMinorVersion(ptr, bytes.length);
 
             if (numColumns === 0 && majorVersion === 0) {
-                return null; // Invalid file
+                return null;
             }
 
             return { numColumns, majorVersion, minorVersion };
         } finally {
-            this.wasm.free(ptr, bytes.length);
+            _w.free(ptr, bytes.length);
         }
-    }
+    },
 
     /**
      * Check if data is a valid Lance file.
      * @param {ArrayBuffer} data
      * @returns {boolean}
      */
-    isValid(data) {
+    isValidLanceFile(data) {
         const bytes = new Uint8Array(data);
-        const ptr = this.wasm.alloc(bytes.length);
+        const ptr = _w.alloc(bytes.length);
         if (!ptr) return false;
 
         try {
-            new Uint8Array(this.memory.buffer).set(bytes, ptr);
-            return this.wasm.isValidLanceFile(ptr, bytes.length) === 1;
+            new Uint8Array(_m.buffer).set(bytes, ptr);
+            return _w.isValidLanceFile(ptr, bytes.length) === 1;
         } finally {
-            this.wasm.free(ptr, bytes.length);
+            _w.free(ptr, bytes.length);
         }
+    }
+});
+
+export class LanceQL {
+    /**
+     * Load LanceQL from a WASM file path or URL.
+     * Returns Immer-style proxy with auto string/bytes marshalling.
+     * @param {string} wasmPath - Path to the lanceql.wasm file
+     * @returns {Promise<LanceQL>}
+     */
+    static async load(wasmPath = './lanceql.wasm') {
+        const response = await fetch(wasmPath);
+        const wasmBytes = await response.arrayBuffer();
+        const wasmModule = await WebAssembly.instantiate(wasmBytes, {});
+
+        _w = wasmModule.instance.exports;
+        _m = _w.memory;
+
+        // Create Immer-style proxy that auto-marshals string/bytes arguments
+        // Also includes high-level LanceQL methods
+        let _methods = null;
+        const proxy = new Proxy({}, {
+            get(_, n) {
+                // Lazy init methods with proxy reference
+                if (!_methods) _methods = _createLanceqlMethods(proxy);
+                // High-level LanceQL methods
+                if (n in _methods) return _methods[n];
+                // Special properties
+                if (n === 'memory') return _m;
+                if (n === 'raw') return _w;  // Raw WASM exports
+                if (n === 'wasm') return _w; // Backward compatibility
+                // WASM functions with auto-marshalling
+                if (typeof _w[n] === 'function') {
+                    return (...a) => _w[n](...a.flatMap(_x));
+                }
+                return _w[n];
+            }
+        });
+        return proxy;
     }
 }
 
@@ -745,6 +947,59 @@ export class LanceFile {
     // ========================================================================
 
     /**
+     * Debug: Get string column buffer info
+     * @param {number} colIdx - Column index
+     * @returns {{offsetsSize: number, dataSize: number}}
+     */
+    debugStringColInfo(colIdx) {
+        const packed = this.wasm.debugStringColInfo(colIdx);
+        return {
+            offsetsSize: Number(BigInt(packed) >> 32n),
+            dataSize: Number(BigInt(packed) & 0xFFFFFFFFn)
+        };
+    }
+
+    /**
+     * Debug: Get string read info for a specific row
+     * @param {number} colIdx - Column index
+     * @param {number} rowIdx - Row index
+     * @returns {{strStart: number, strLen: number} | {error: string}}
+     */
+    debugReadStringInfo(colIdx, rowIdx) {
+        const packed = this.wasm.debugReadStringInfo(colIdx, rowIdx);
+        // Check for error codes (0xDEAD00XX)
+        if ((packed & 0xFFFF0000n) === 0xDEAD0000n) {
+            const errCode = Number(packed & 0xFFFFn);
+            const errors = {
+                1: 'No file data',
+                2: 'No column entry',
+                3: 'Col meta out of bounds',
+                4: 'Not a string column',
+                5: 'Row out of bounds',
+                6: 'Invalid offset size'
+            };
+            return { error: errors[errCode] || `Unknown error ${errCode}` };
+        }
+        return {
+            strStart: Number(BigInt(packed) >> 32n),
+            strLen: Number(BigInt(packed) & 0xFFFFFFFFn)
+        };
+    }
+
+    /**
+     * Debug: Get data_start position for string column
+     * @param {number} colIdx - Column index
+     * @returns {{dataStart: number, fileLen: number}}
+     */
+    debugStringDataStart(colIdx) {
+        const packed = this.wasm.debugStringDataStart(colIdx);
+        return {
+            dataStart: Number(BigInt(packed) >> 32n),
+            fileLen: Number(BigInt(packed) & 0xFFFFFFFFn)
+        };
+    }
+
+    /**
      * Get the number of strings in a column.
      * @param {number} colIdx - Column index
      * @returns {number}
@@ -801,7 +1056,9 @@ export class LanceFile {
     readStringsAtIndices(colIdx, indices) {
         if (indices.length === 0) return [];
 
-        const maxTotalLen = 1024 * 1024; // 1MB total buffer
+        // Use smaller buffer - estimate based on indices count
+        // Assume average string is ~256 bytes, capped at 256KB to avoid WASM memory issues
+        const maxTotalLen = Math.min(indices.length * 256, 256 * 1024);
         const idxPtr = this.wasm.allocIndexBuffer(indices.length);
         if (!idxPtr) throw new Error('Failed to allocate index buffer');
 
@@ -1268,11 +1525,31 @@ export class RemoteLanceFile {
      * @private
      */
     _parseManifest(bytes) {
-        // Read content length from first 4 bytes
-        const contentLen = new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, true);
+        const view = new DataView(bytes.buffer, bytes.byteOffset);
 
-        // Protobuf content starts at byte 4 and has contentLen bytes
-        const protoData = bytes.slice(4, 4 + contentLen);
+        // Lance manifest file structure:
+        // - Chunk 1 (len-prefixed): Transaction metadata (may be small/incremental)
+        // - Chunk 2 (len-prefixed): Full manifest with schema + fragments
+        // - Footer (16 bytes): Offsets + "LANC" magic
+
+        // Read chunk 1 length
+        const chunk1Len = view.getUint32(0, true);
+
+        // Check if there's a chunk 2 (full manifest data)
+        const chunk2Start = 4 + chunk1Len;
+        let protoData;
+
+        if (chunk2Start + 4 < bytes.length) {
+            const chunk2Len = view.getUint32(chunk2Start, true);
+            if (chunk2Len > 0 && chunk2Start + 4 + chunk2Len <= bytes.length) {
+                // Use chunk 2 (full manifest)
+                protoData = bytes.slice(chunk2Start + 4, chunk2Start + 4 + chunk2Len);
+            } else {
+                protoData = bytes.slice(4, 4 + chunk1Len);
+            }
+        } else {
+            protoData = bytes.slice(4, 4 + chunk1Len);
+        }
 
         let pos = 0;
         const fields = [];
@@ -1540,9 +1817,8 @@ export class RemoteLanceFile {
      */
     _parseColumnMeta(bytes) {
         let pos = 0;
-        const bufferOffsets = [];
-        const bufferSizes = [];
-        let rows = 0;
+        const pages = [];
+        let totalRows = 0;
 
         // Read varint as BigInt to handle large values (>2GB offsets)
         const readVarint = () => {
@@ -1563,9 +1839,13 @@ export class RemoteLanceFile {
             const wireType = tag & 0x7;
 
             if (fieldNum === 2 && wireType === 2) {
-                // pages field (length-delimited)
+                // pages field (length-delimited) - parse ALL pages
                 const pageLen = readVarint();
                 const pageEnd = pos + pageLen;
+
+                const pageOffsets = [];
+                const pageSizes = [];
+                let pageRows = 0;
 
                 // Parse page
                 while (pos < pageEnd) {
@@ -1574,22 +1854,22 @@ export class RemoteLanceFile {
                     const pageWire = pageTag & 0x7;
 
                     if (pageField === 1 && pageWire === 2) {
-                        // buffer_offsets (packed) - read ALL offsets
+                        // buffer_offsets (packed)
                         const packedLen = readVarint();
                         const packedEnd = pos + packedLen;
                         while (pos < packedEnd) {
-                            bufferOffsets.push(readVarint());
+                            pageOffsets.push(readVarint());
                         }
                     } else if (pageField === 2 && pageWire === 2) {
-                        // buffer_sizes (packed) - read ALL sizes
+                        // buffer_sizes (packed)
                         const packedLen = readVarint();
                         const packedEnd = pos + packedLen;
                         while (pos < packedEnd) {
-                            bufferSizes.push(readVarint());
+                            pageSizes.push(readVarint());
                         }
                     } else if (pageField === 3 && pageWire === 0) {
                         // length (rows)
-                        rows = readVarint();
+                        pageRows = readVarint();
                     } else {
                         // Skip field
                         if (pageWire === 0) readVarint();
@@ -1601,7 +1881,14 @@ export class RemoteLanceFile {
                         else if (pageWire === 1) pos += 8;
                     }
                 }
-                break;
+
+                pages.push({
+                    offsets: pageOffsets,
+                    sizes: pageSizes,
+                    rows: pageRows
+                });
+                totalRows += pageRows;
+                // Don't break - continue to read more pages
             } else {
                 // Skip field
                 if (wireType === 0) readVarint();
@@ -1614,22 +1901,34 @@ export class RemoteLanceFile {
             }
         }
 
+        // Combine all pages - use first page for offset/size (for backward compat)
+        // Also compute total size across all pages for multi-page columns
+        const firstPage = pages[0] || { offsets: [], sizes: [], rows: 0 };
+        const bufferOffsets = firstPage.offsets;
+        const bufferSizes = firstPage.sizes;
+
+        // For multi-page columns (like embeddings), compute total size
+        let totalSize = 0;
+        for (const page of pages) {
+            // Use the data buffer (last buffer, or buffer 1 for nullable)
+            const dataIdx = page.sizes.length > 1 ? 1 : 0;
+            totalSize += page.sizes[dataIdx] || 0;
+        }
+
         // For nullable columns: buffer 0 = null bitmap, buffer 1 = data
         // For non-nullable: buffer 0 = data
-        // Use the LAST buffer (data buffer) for reading values
         const dataBufferIdx = bufferOffsets.length > 1 ? 1 : 0;
         const nullBitmapIdx = bufferOffsets.length > 1 ? 0 : -1;
 
-        // Debug: console.log(`_parseColumnMeta: ${bufferOffsets.length} buffers, rows=${rows}`);
-
         return {
             offset: bufferOffsets[dataBufferIdx] || 0,
-            size: bufferSizes[dataBufferIdx] || 0,
-            rows,
+            size: pages.length > 1 ? totalSize : (bufferSizes[dataBufferIdx] || 0),
+            rows: totalRows,
             nullBitmapOffset: nullBitmapIdx >= 0 ? bufferOffsets[nullBitmapIdx] : null,
             nullBitmapSize: nullBitmapIdx >= 0 ? bufferSizes[nullBitmapIdx] : null,
             bufferOffsets,
-            bufferSizes
+            bufferSizes,
+            pages  // Include all pages for multi-page access
         };
     }
 
@@ -1638,10 +1937,9 @@ export class RemoteLanceFile {
      * @private
      */
     _parseStringColumnMeta(bytes) {
+        // Parse ALL pages for multi-page string columns
+        const pages = [];
         let pos = 0;
-        let bufferOffsets = [0, 0];
-        let bufferSizes = [0, 0];
-        let rows = 0;
 
         const readVarint = () => {
             let result = 0;
@@ -1661,9 +1959,13 @@ export class RemoteLanceFile {
             const wireType = tag & 0x7;
 
             if (fieldNum === 2 && wireType === 2) {
-                // pages field (first page only)
+                // pages field - parse this page
                 const pageLen = readVarint();
                 const pageEnd = pos + pageLen;
+
+                let bufferOffsets = [0, 0];
+                let bufferSizes = [0, 0];
+                let rows = 0;
 
                 while (pos < pageEnd) {
                     const pageTag = readVarint();
@@ -1705,8 +2007,14 @@ export class RemoteLanceFile {
                         else if (pageWire === 1) pos += 8;
                     }
                 }
-                // We found the first page, that's enough for type detection
-                break;
+
+                pages.push({
+                    offsetsStart: bufferOffsets[0],
+                    offsetsSize: bufferSizes[0],
+                    dataStart: bufferOffsets[1],
+                    dataSize: bufferSizes[1],
+                    rows
+                });
             } else {
                 // Skip unknown fields
                 if (wireType === 0) {
@@ -1722,12 +2030,11 @@ export class RemoteLanceFile {
             }
         }
 
+        // Return first page for backwards compatibility, but also include all pages
+        const firstPage = pages[0] || { offsetsStart: 0, offsetsSize: 0, dataStart: 0, dataSize: 0, rows: 0 };
         return {
-            offsetsStart: bufferOffsets[0],
-            offsetsSize: bufferSizes[0],
-            dataStart: bufferOffsets[1],
-            dataSize: bufferSizes[1],
-            rows
+            ...firstPage,
+            pages
         };
     }
 
@@ -1903,6 +2210,111 @@ export class RemoteLanceFile {
             }
         }));
 
+        return results;
+    }
+
+    /**
+     * Read vectors (fixed_size_list of float32) at specific row indices.
+     * Returns array of Float32Array vectors.
+     * @param {number} colIdx - Vector column index
+     * @param {number[]} indices - Row indices to read
+     * @returns {Promise<Float32Array[]>} - Array of vectors
+     */
+    async readVectorsAtIndices(colIdx, indices) {
+        if (indices.length === 0) return [];
+
+        const entry = await this.getColumnOffsetEntry(colIdx);
+        const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
+        const metaInfo = this._parseColumnMeta(new Uint8Array(colMeta));
+
+        if (!metaInfo.pages || metaInfo.pages.length === 0) {
+            return indices.map(() => null);
+        }
+
+        // Calculate dimension from first page
+        const firstPage = metaInfo.pages[0];
+        const dataIdx = firstPage.sizes.length > 1 ? 1 : 0;
+        const firstPageSize = firstPage.sizes[dataIdx] || 0;
+        const firstPageRows = firstPage.rows || 0;
+
+        if (firstPageRows === 0 || firstPageSize === 0) {
+            return indices.map(() => null);
+        }
+
+        const dim = Math.floor(firstPageSize / (firstPageRows * 4));
+        const vecSize = dim * 4;
+
+        const results = new Array(indices.length).fill(null);
+
+        // Build page index for quick lookup
+        let pageRowStart = 0;
+        const pageIndex = [];
+        for (const page of metaInfo.pages) {
+            pageIndex.push({ start: pageRowStart, end: pageRowStart + page.rows, page });
+            pageRowStart += page.rows;
+        }
+
+        // Group indices by page
+        const pageGroups = new Map();
+        for (let i = 0; i < indices.length; i++) {
+            const rowIdx = indices[i];
+            // Find which page contains this row
+            for (let p = 0; p < pageIndex.length; p++) {
+                const pi = pageIndex[p];
+                if (rowIdx >= pi.start && rowIdx < pi.end) {
+                    if (!pageGroups.has(p)) {
+                        pageGroups.set(p, []);
+                    }
+                    pageGroups.set(p, [...pageGroups.get(p), { rowIdx, localIdx: rowIdx - pi.start, resultIdx: i }]);
+                    break;
+                }
+            }
+        }
+
+        // Fetch vectors from each page
+        const fetchPromises = [];
+        for (const [pageNum, items] of pageGroups) {
+            const page = metaInfo.pages[pageNum];
+            const pageDataIdx = page.sizes.length > 1 ? 1 : 0;
+            const pageOffset = page.offsets[pageDataIdx] || 0;
+
+            fetchPromises.push((async () => {
+                // Sort items by local index for better batching
+                items.sort((a, b) => a.localIdx - b.localIdx);
+
+                // Batch contiguous reads
+                const batches = [];
+                let currentBatch = { start: items[0].localIdx, end: items[0].localIdx, items: [items[0]] };
+
+                for (let i = 1; i < items.length; i++) {
+                    const item = items[i];
+                    // If within 10 vectors, extend batch (avoid too many small requests)
+                    if (item.localIdx - currentBatch.end <= 10) {
+                        currentBatch.end = item.localIdx;
+                        currentBatch.items.push(item);
+                    } else {
+                        batches.push(currentBatch);
+                        currentBatch = { start: item.localIdx, end: item.localIdx, items: [item] };
+                    }
+                }
+                batches.push(currentBatch);
+
+                // Fetch each batch
+                for (const batch of batches) {
+                    const startOffset = pageOffset + batch.start * vecSize;
+                    const endOffset = pageOffset + (batch.end + 1) * vecSize - 1;
+                    const data = await this.fetchRange(startOffset, endOffset);
+                    const floatData = new Float32Array(data);
+
+                    for (const item of batch.items) {
+                        const localOffset = (item.localIdx - batch.start) * dim;
+                        results[item.resultIdx] = floatData.slice(localOffset, localOffset + dim);
+                    }
+                }
+            })());
+        }
+
+        await Promise.all(fetchPromises);
         return results;
     }
 
@@ -2089,94 +2501,149 @@ export class RemoteLanceFile {
         const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
         const info = this._parseStringColumnMeta(new Uint8Array(colMeta));
 
-        if (info.offsetsSize === 0 || info.dataSize === 0) {
-            return indices.map(() => '');
-        }
-
-        // Determine offset size (4 or 8 bytes)
-        const offsetSize = info.offsetsSize / info.rows;
-        if (offsetSize !== 4 && offsetSize !== 8) {
+        if (!info.pages || info.pages.length === 0) {
             return indices.map(() => '');
         }
 
         const results = new Array(indices.length).fill('');
 
-        // Batch offset fetching - each string needs 2 consecutive offsets
-        const offsetBatches = this._batchIndices(indices, offsetSize, 2048);
-
-        // First pass: fetch all offsets in batches
-        const stringRanges = new Array(indices.length);
-
-        await Promise.all(offsetBatches.map(async (batch) => {
-            // Fetch offsets for entire batch range (need +1 for end offset)
-            const startOffset = info.offsetsStart + batch.startIdx * offsetSize;
-            const endOffset = info.offsetsStart + (batch.endIdx + 2) * offsetSize - 1;
-            const data = await this.fetchRange(startOffset, endOffset);
-            const view = new DataView(data);
-
-            // Extract string ranges from offsets
-            for (const item of batch.items) {
-                if (item.idx >= info.rows) continue;
-
-                const localIdx = item.idx - batch.startIdx;
-                let strStart, strEnd;
-
-                if (offsetSize === 4) {
-                    strStart = view.getUint32(localIdx * 4, true);
-                    strEnd = view.getUint32((localIdx + 1) * 4, true);
-                } else {
-                    strStart = Number(view.getBigUint64(localIdx * 8, true));
-                    strEnd = Number(view.getBigUint64((localIdx + 1) * 8, true));
-                }
-
-                if (strEnd > strStart) {
-                    stringRanges[item.origPos] = { start: strStart, end: strEnd };
-                }
+        // Build page index with cumulative row counts
+        let pageRowStart = 0;
+        const pageIndex = [];
+        for (const page of info.pages) {
+            if (page.offsetsSize === 0 || page.dataSize === 0 || page.rows === 0) {
+                pageRowStart += page.rows;
+                continue;
             }
-        }));
+            pageIndex.push({
+                start: pageRowStart,
+                end: pageRowStart + page.rows,
+                page
+            });
+            pageRowStart += page.rows;
+        }
 
-        // Second pass: batch fetch string data
-        // Group strings that are close together in the data buffer
-        const dataItems = stringRanges
-            .map((range, origPos) => range ? { ...range, origPos } : null)
-            .filter(Boolean)
-            .sort((a, b) => a.start - b.start);
-
-        if (dataItems.length === 0) return results;
-
-        // Batch string data fetches
-        const dataBatches = [];
-        let batchStart = 0;
-
-        for (let i = 1; i <= dataItems.length; i++) {
-            const endBatch = i === dataItems.length ||
-                (dataItems[i].start - dataItems[i-1].end) > 4096;
-
-            if (endBatch) {
-                dataBatches.push({
-                    rangeStart: dataItems[batchStart].start,
-                    rangeEnd: dataItems[i-1].end,
-                    items: dataItems.slice(batchStart, i)
-                });
-                batchStart = i;
+        // Group indices by page
+        const pageGroups = new Map();
+        for (let i = 0; i < indices.length; i++) {
+            const rowIdx = indices[i];
+            // Find which page contains this row
+            for (let p = 0; p < pageIndex.length; p++) {
+                const pi = pageIndex[p];
+                if (rowIdx >= pi.start && rowIdx < pi.end) {
+                    if (!pageGroups.has(p)) {
+                        pageGroups.set(p, []);
+                    }
+                    pageGroups.get(p).push({
+                        globalIdx: rowIdx,
+                        localIdx: rowIdx - pi.start,
+                        resultIdx: i
+                    });
+                    break;
+                }
             }
         }
 
-        // Fetch string data batches in parallel
-        await Promise.all(dataBatches.map(async (batch) => {
-            const data = await this.fetchRange(
-                info.dataStart + batch.rangeStart,
-                info.dataStart + batch.rangeEnd - 1
-            );
-            const bytes = new Uint8Array(data);
+        // Fetch strings from each page
+        for (const [pageNum, items] of pageGroups) {
+            const pi = pageIndex[pageNum];
+            const page = pi.page;
 
-            for (const item of batch.items) {
-                const localStart = item.start - batch.rangeStart;
-                const len = item.end - item.start;
-                const strBytes = bytes.slice(localStart, localStart + len);
-                results[item.origPos] = new TextDecoder().decode(strBytes);
+            // Determine offset size (4 or 8 bytes per offset)
+            const offsetSize = page.offsetsSize / page.rows;
+            if (offsetSize !== 4 && offsetSize !== 8) continue;
+
+            // Sort items by localIdx for efficient batching
+            items.sort((a, b) => a.localIdx - b.localIdx);
+
+            // Fetch offsets in batches
+            const offsetBatches = [];
+            let batchStart = 0;
+            for (let i = 1; i <= items.length; i++) {
+                if (i === items.length || items[i].localIdx - items[i-1].localIdx > 100) {
+                    offsetBatches.push(items.slice(batchStart, i));
+                    batchStart = i;
+                }
             }
-        }));
+
+            // Collect string ranges from offset fetches
+            // Lance string encoding: offset[N] = end of string N, start is offset[N-1] (or 0 if N=0)
+            const stringRanges = [];
+
+            await Promise.all(offsetBatches.map(async (batch) => {
+                const minIdx = batch[0].localIdx;
+                const maxIdx = batch[batch.length - 1].localIdx;
+
+                // Fetch offsets: need offset[minIdx-1] through offset[maxIdx]
+                // But if minIdx=0, we don't need offset[-1] since start is implicitly 0
+                const fetchStartIdx = minIdx > 0 ? minIdx - 1 : 0;
+                const fetchEndIdx = maxIdx;
+                const startOffset = page.offsetsStart + fetchStartIdx * offsetSize;
+                const endOffset = page.offsetsStart + (fetchEndIdx + 1) * offsetSize - 1;
+                const data = await this.fetchRange(startOffset, endOffset);
+                const view = new DataView(data);
+
+                for (const item of batch) {
+                    // Position in fetched data
+                    const dataIdx = item.localIdx - fetchStartIdx;
+                    let strStart, strEnd;
+
+                    if (offsetSize === 4) {
+                        // strEnd = offset[localIdx], strStart = offset[localIdx-1] or 0
+                        strEnd = view.getUint32(dataIdx * 4, true);
+                        strStart = item.localIdx === 0 ? 0 : view.getUint32((dataIdx - 1) * 4, true);
+                    } else {
+                        strEnd = Number(view.getBigUint64(dataIdx * 8, true));
+                        strStart = item.localIdx === 0 ? 0 : Number(view.getBigUint64((dataIdx - 1) * 8, true));
+                    }
+
+                    if (strEnd > strStart) {
+                        stringRanges.push({
+                            start: strStart,
+                            end: strEnd,
+                            resultIdx: item.resultIdx,
+                            dataStart: page.dataStart
+                        });
+                    }
+                }
+            }));
+
+            // Fetch string data
+            if (stringRanges.length > 0) {
+                stringRanges.sort((a, b) => a.start - b.start);
+
+                // Batch nearby string fetches
+                const dataBatches = [];
+                let dbStart = 0;
+                for (let i = 1; i <= stringRanges.length; i++) {
+                    if (i === stringRanges.length ||
+                        stringRanges[i].start - stringRanges[i-1].end > 4096) {
+                        dataBatches.push({
+                            rangeStart: stringRanges[dbStart].start,
+                            rangeEnd: stringRanges[i-1].end,
+                            items: stringRanges.slice(dbStart, i),
+                            dataStart: stringRanges[dbStart].dataStart
+                        });
+                        dbStart = i;
+                    }
+                }
+
+                await Promise.all(dataBatches.map(async (batch) => {
+                    const data = await this.fetchRange(
+                        batch.dataStart + batch.rangeStart,
+                        batch.dataStart + batch.rangeEnd - 1
+                    );
+                    const bytes = new Uint8Array(data);
+
+                    for (const item of batch.items) {
+                        const localStart = item.start - batch.rangeStart;
+                        const len = item.end - item.start;
+                        const strBytes = bytes.slice(localStart, localStart + len);
+                        results[item.resultIdx] = new TextDecoder().decode(strBytes);
+                    }
+                }));
+            }
+        }
 
         return results;
     }
@@ -2374,10 +2841,22 @@ export class RemoteLanceFile {
         const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
         const info = this._parseColumnMeta(new Uint8Array(colMeta));
 
-        if (info.rows === 0 || info.size === 0) return { rows: 0, dimension: 0 };
+        if (info.rows === 0) return { rows: 0, dimension: 0 };
 
-        // Dimension = buffer_size / (rows * 4) for float32
-        const dimension = Math.floor(info.size / (info.rows * 4));
+        // Calculate dimension from first page (all pages have same dimension)
+        let dimension = 0;
+        if (info.pages && info.pages.length > 0) {
+            const firstPage = info.pages[0];
+            const dataIdx = firstPage.sizes.length > 1 ? 1 : 0;
+            const pageSize = firstPage.sizes[dataIdx] || 0;
+            const pageRows = firstPage.rows || 0;
+            if (pageRows > 0 && pageSize > 0) {
+                dimension = Math.floor(pageSize / (pageRows * 4));
+            }
+        } else if (info.size > 0) {
+            // Fallback for single-page
+            dimension = Math.floor(info.size / (info.rows * 4));
+        }
 
         return { rows: info.rows, dimension };
     }
@@ -2429,21 +2908,31 @@ export class RemoteLanceFile {
         const vecSize = dim * 4;
         const results = new Array(indices.length);
 
-        // Batch indices for efficient fetching
-        const batches = this._batchIndices(indices, vecSize, vecSize * 10);
+        // Batch indices for efficient fetching - parallel with limit
+        const batches = this._batchIndices(indices, vecSize, vecSize * 50);
+        const BATCH_PARALLEL = 6;
 
-        await Promise.all(batches.map(async (batch) => {
-            const startOffset = info.offset + batch.startIdx * vecSize;
-            const endOffset = info.offset + (batch.endIdx + 1) * vecSize - 1;
-            const data = await this.fetchRange(startOffset, endOffset);
+        for (let i = 0; i < batches.length; i += BATCH_PARALLEL) {
+            const batchGroup = batches.slice(i, i + BATCH_PARALLEL);
+            await Promise.all(batchGroup.map(async (batch) => {
+                try {
+                    const startOffset = info.offset + batch.startIdx * vecSize;
+                    const endOffset = info.offset + (batch.endIdx + 1) * vecSize - 1;
+                    const data = await this.fetchRange(startOffset, endOffset);
 
-            for (const item of batch.items) {
-                const localOffset = (item.idx - batch.startIdx) * vecSize;
-                results[item.origPos] = new Float32Array(
-                    data.slice(localOffset, localOffset + vecSize)
-                );
-            }
-        }));
+                    for (const item of batch.items) {
+                        const localOffset = (item.idx - batch.startIdx) * vecSize;
+                        results[item.origPos] = new Float32Array(
+                            data.slice(localOffset, localOffset + vecSize)
+                        );
+                    }
+                } catch (e) {
+                    for (const item of batch.items) {
+                        results[item.origPos] = new Float32Array(0);
+                    }
+                }
+            }));
+        }
 
         return results;
     }
@@ -2490,86 +2979,80 @@ export class RemoteLanceFile {
             throw new Error(`Dimension mismatch: query=${queryVec.length}, column=${info.dimension}`);
         }
 
-        // Try to use IVF index if available and enabled
-        if (useIndex && this.hasIndex() && this._ivfIndex.dimension === queryVec.length) {
-            // Using IVF index for ANN search
-            return await this._vectorSearchWithIndex(colIdx, queryVec, topK, nprobe, onProgress);
+        // Require IVF index - no brute force fallback
+        if (!this.hasIndex()) {
+            throw new Error('No IVF index found. Vector search requires an IVF index for efficient querying.');
         }
 
-        // Fall back to brute-force search
-        // Using brute-force vector search
-        return await this._vectorSearchBruteForce(colIdx, queryVec, topK, onProgress);
+        if (this._ivfIndex.dimension !== queryVec.length) {
+            throw new Error(`Query dimension (${queryVec.length}) does not match index dimension (${this._ivfIndex.dimension}).`);
+        }
+
+        return await this._vectorSearchWithIndex(colIdx, queryVec, topK, nprobe, onProgress);
     }
 
     /**
      * Vector search using IVF index (ANN).
+     * Fetches row IDs from auxiliary.idx for nearest partitions,
+     * then looks up original vectors by fragment/offset.
      * @private
      */
     async _vectorSearchWithIndex(colIdx, queryVec, topK, nprobe, onProgress) {
         const dim = queryVec.length;
-        const vecSize = dim * 4;
 
         // Find nearest partitions using centroids
         if (onProgress) onProgress(0, 100);
         const partitions = this._ivfIndex.findNearestPartitions(queryVec, nprobe);
-        // Debug: console.log(`Searching ${partitions.length} partitions`);
+        const estimatedRows = this._ivfIndex.getPartitionRowCount(partitions);
 
-        const entry = await this.getColumnOffsetEntry(colIdx);
-        const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
-        const metaInfo = this._parseColumnMeta(new Uint8Array(colMeta));
-        const numRows = metaInfo.rows;
+        console.log(`[IVFSearch] Searching ${partitions.length} partitions (~${estimatedRows.toLocaleString()} rows)`);
 
-        // Determine which row indices to search based on partition info
-        const indicesToSearch = [];
-        const hasPartitionInfo = this._ivfIndex.partitionLengths.length === this._ivfIndex.numPartitions;
+        // Try to fetch row IDs from auxiliary.idx
+        const rowIdMappings = await this._ivfIndex.fetchPartitionRowIds(partitions);
 
-        if (hasPartitionInfo) {
-            // Use actual partition boundaries from index
-            // Using partition lengths from index
-            let currentRow = 0;
-            for (let p = 0; p < this._ivfIndex.numPartitions; p++) {
-                const partitionLen = this._ivfIndex.partitionLengths[p];
-                if (partitions.includes(p)) {
-                    // Include all rows in this partition
-                    for (let r = 0; r < partitionLen; r++) {
-                        indicesToSearch.push(currentRow + r);
-                    }
-                }
-                currentRow += partitionLen;
-            }
-        } else {
-            // Fallback: estimate partition boundaries by dividing evenly
-            // Estimating partition boundaries (no partition lengths in index)
-            const rowsPerPartition = Math.ceil(numRows / this._ivfIndex.numPartitions);
-
-            for (const p of partitions) {
-                const startRow = p * rowsPerPartition;
-                const endRow = Math.min((p + 1) * rowsPerPartition, numRows);
-                for (let r = startRow; r < endRow; r++) {
-                    indicesToSearch.push(r);
-                }
-            }
+        if (rowIdMappings && rowIdMappings.length > 0) {
+            // Use proper row ID mapping from auxiliary.idx
+            console.log(`[IVFSearch] Fetched ${rowIdMappings.length} row ID mappings`);
+            return await this._searchWithRowIdMappings(colIdx, queryVec, topK, rowIdMappings, onProgress);
         }
 
-        // Debug: console.log(`Searching ${indicesToSearch.length} rows (${(indicesToSearch.length / numRows * 100).toFixed(1)}% of data)`);
+        // No fallback - require proper row ID mapping
+        throw new Error('Failed to fetch row IDs from IVF index. Dataset may be missing auxiliary.idx or ivf_partitions.bin.');
+    }
 
-        // Search only the selected indices
-        const topResults = [];
-        const batchSize = 100;
+    /**
+     * Search using proper row ID mappings from auxiliary.idx.
+     * Groups row IDs by fragment and fetches vectors efficiently.
+     * @private
+     */
+    async _searchWithRowIdMappings(colIdx, queryVec, topK, rowIdMappings, onProgress) {
+        const dim = queryVec.length;
 
-        for (let i = 0; i < indicesToSearch.length; i += batchSize) {
-            if (onProgress) {
-                onProgress(i, indicesToSearch.length);
+        // Group row IDs by fragment for efficient batch fetching
+        const byFragment = new Map();
+        for (const mapping of rowIdMappings) {
+            if (!byFragment.has(mapping.fragId)) {
+                byFragment.set(mapping.fragId, []);
             }
+            byFragment.get(mapping.fragId).push(mapping.rowOffset);
+        }
 
-            const batchIndices = indicesToSearch.slice(i, i + batchSize);
+        console.log(`[IVFSearch] Fetching from ${byFragment.size} fragments`);
 
-            // Fetch vectors at these indices
-            const vectors = await this.readVectorsAtIndices(colIdx, batchIndices);
+        const topResults = [];
+        let processed = 0;
+        const total = rowIdMappings.length;
 
-            for (let j = 0; j < batchIndices.length; j++) {
-                const rowIdx = batchIndices[j];
-                const vec = vectors[j];
+        // Process each fragment
+        for (const [fragId, offsets] of byFragment) {
+            if (onProgress) onProgress(processed, total);
+
+            // Fetch vectors for this fragment's offsets
+            const vectors = await this.readVectorsAtIndices(colIdx, offsets);
+
+            for (let i = 0; i < offsets.length; i++) {
+                const vec = vectors[i];
+                if (!vec || vec.length !== dim) continue;
 
                 // Compute cosine similarity
                 let dot = 0, normA = 0, normB = 0;
@@ -2581,89 +3064,97 @@ export class RemoteLanceFile {
                 const denom = Math.sqrt(normA) * Math.sqrt(normB);
                 const score = denom === 0 ? 0 : dot / denom;
 
+                // Reconstruct global row index from fragment ID and offset
+                const globalIdx = fragId * 50000 + offsets[i]; // Assuming 50K rows per fragment
+
                 if (topResults.length < topK) {
-                    topResults.push({ idx: rowIdx, score });
+                    topResults.push({ idx: globalIdx, score });
                     topResults.sort((a, b) => b.score - a.score);
                 } else if (score > topResults[topK - 1].score) {
-                    topResults[topK - 1] = { idx: rowIdx, score };
+                    topResults[topK - 1] = { idx: globalIdx, score };
                     topResults.sort((a, b) => b.score - a.score);
                 }
+
+                processed++;
             }
         }
 
-        if (onProgress) onProgress(indicesToSearch.length, indicesToSearch.length);
+        if (onProgress) onProgress(total, total);
 
         return {
             indices: topResults.map(r => r.idx),
             scores: topResults.map(r => r.score),
-            usedIndex: true
+            usedIndex: true,
+            searchedRows: total
         };
     }
 
+    // NOTE: _searchWithEstimatedPartitions and _vectorSearchBruteForce have been removed.
+    // All vector search now requires IVF index with proper partition mapping.
+    // Use LanceDataset for multi-fragment datasets with ivf_partitions.bin.
+
     /**
-     * Brute-force vector search (exact).
-     * @private
+     * Read all vectors from a column as a flat Float32Array.
+     * Used for worker-based parallel search.
+     * Handles multi-page columns by fetching and combining all pages.
+     * @param {number} colIdx - Vector column index
+     * @returns {Promise<Float32Array>} - Flattened vector data [numRows * dim]
      */
-    async _vectorSearchBruteForce(colIdx, queryVec, topK, onProgress) {
-        const info = await this.getVectorInfo(colIdx);
-        const dim = info.dimension;
-        const vecSize = dim * 4;
-        const numRows = info.rows;
-
-        const batchSize = Math.min(100, numRows);
-        const topResults = [];
-
+    async readVectorColumn(colIdx) {
         const entry = await this.getColumnOffsetEntry(colIdx);
         const colMeta = await this.fetchRange(entry.pos, entry.pos + entry.len - 1);
         const metaInfo = this._parseColumnMeta(new Uint8Array(colMeta));
 
-        for (let batchStart = 0; batchStart < numRows; batchStart += batchSize) {
-            const batchEnd = Math.min(batchStart + batchSize, numRows);
-
-            if (onProgress) {
-                onProgress(batchStart, numRows);
-            }
-
-            // Fetch batch of vectors
-            const startOffset = metaInfo.offset + batchStart * vecSize;
-            const endOffset = metaInfo.offset + batchEnd * vecSize - 1;
-            const data = await this.fetchRange(startOffset, endOffset);
-
-            // Compute similarities for this batch
-            for (let i = 0; i < batchEnd - batchStart; i++) {
-                const rowIdx = batchStart + i;
-                const vecData = new Float32Array(data.slice(i * vecSize, (i + 1) * vecSize));
-
-                // Compute cosine similarity
-                let dot = 0, normA = 0, normB = 0;
-                for (let j = 0; j < dim; j++) {
-                    dot += queryVec[j] * vecData[j];
-                    normA += queryVec[j] * queryVec[j];
-                    normB += vecData[j] * vecData[j];
-                }
-                const denom = Math.sqrt(normA) * Math.sqrt(normB);
-                const score = denom === 0 ? 0 : dot / denom;
-
-                // Insert into top-k
-                if (topResults.length < topK) {
-                    topResults.push({ idx: rowIdx, score });
-                    topResults.sort((a, b) => b.score - a.score);
-                } else if (score > topResults[topK - 1].score) {
-                    topResults[topK - 1] = { idx: rowIdx, score };
-                    topResults.sort((a, b) => b.score - a.score);
-                }
-            }
+        if (!metaInfo.pages || metaInfo.pages.length === 0 || metaInfo.rows === 0) {
+            return new Float32Array(0);
         }
 
-        if (onProgress) {
-            onProgress(numRows, numRows);
+        // Calculate dimension from first page
+        const firstPage = metaInfo.pages[0];
+        const dataIdx = firstPage.sizes.length > 1 ? 1 : 0;
+        const firstPageSize = firstPage.sizes[dataIdx] || 0;
+        const firstPageRows = firstPage.rows || 0;
+
+        if (firstPageRows === 0 || firstPageSize === 0) {
+            return new Float32Array(0);
         }
 
-        return {
-            indices: topResults.map(r => r.idx),
-            scores: topResults.map(r => r.score),
-            usedIndex: false
-        };
+        const dim = Math.floor(firstPageSize / (firstPageRows * 4));
+        if (dim === 0) {
+            return new Float32Array(0);
+        }
+
+        const totalRows = metaInfo.rows;
+        const result = new Float32Array(totalRows * dim);
+
+        // Fetch each page in parallel
+        const pagePromises = metaInfo.pages.map(async (page, pageIdx) => {
+            const pageDataIdx = page.sizes.length > 1 ? 1 : 0;
+            const pageOffset = page.offsets[pageDataIdx] || 0;
+            const pageSize = page.sizes[pageDataIdx] || 0;
+
+            if (pageSize === 0) return { pageIdx, data: new Float32Array(0), rows: 0 };
+
+            const data = await this.fetchRange(pageOffset, pageOffset + pageSize - 1);
+            // data is ArrayBuffer from fetchRange, create Float32Array view directly
+            const floatData = new Float32Array(data);
+            return {
+                pageIdx,
+                data: floatData,
+                rows: page.rows
+            };
+        });
+
+        const pageResults = await Promise.all(pagePromises);
+
+        // Combine pages in order
+        let offset = 0;
+        for (const pageResult of pageResults.sort((a, b) => a.pageIdx - b.pageIdx)) {
+            result.set(pageResult.data, offset);
+            offset += pageResult.rows * dim;
+        }
+
+        return result;
     }
 }
 
@@ -2684,6 +3175,11 @@ export class IVFIndex {
         this.partitionOffsets = [];  // Byte offset of each partition in the data
         this.partitionLengths = [];  // Number of rows in each partition
         this.metricType = 'cosine';  // Distance metric (cosine, l2, dot)
+
+        // Custom partition index (ivf_partitions.bin)
+        this.partitionIndexUrl = null;  // URL to ivf_partitions.bin
+        this.partitionStarts = null;    // Uint32Array[257] - cumulative row counts
+        this.hasPartitionIndex = false; // Whether partition index is loaded
     }
 
     /**
@@ -2696,35 +3192,653 @@ export class IVFIndex {
         if (!datasetBaseUrl) return null;
 
         try {
-            // First, try to find index from manifest
-            const manifestUrl = `${datasetBaseUrl}/_versions/1.manifest`;
+            // Find latest manifest version
+            const manifestVersion = await IVFIndex._findLatestManifestVersion(datasetBaseUrl);
+            console.log(`[IVFIndex] Manifest version: ${manifestVersion}`);
+            if (!manifestVersion) return null;
+
+            const manifestUrl = `${datasetBaseUrl}/_versions/${manifestVersion}.manifest`;
             const manifestResp = await fetch(manifestUrl);
-            if (!manifestResp.ok) return null;
-
-            const manifestData = await manifestResp.arrayBuffer();
-            const indexInfo = IVFIndex._parseManifestForIndex(new Uint8Array(manifestData));
-
-            if (!indexInfo || !indexInfo.uuid) {
-                // No vector index found in manifest
+            if (!manifestResp.ok) {
+                console.log(`[IVFIndex] Failed to fetch manifest: ${manifestResp.status}`);
                 return null;
             }
 
-            // Found vector index in manifest
+            const manifestData = await manifestResp.arrayBuffer();
+            const indexInfo = IVFIndex._parseManifestForIndex(new Uint8Array(manifestData));
+            console.log(`[IVFIndex] Index info:`, indexInfo);
 
-            // Fetch the index file
+            if (!indexInfo || !indexInfo.uuid) {
+                // No vector index found in manifest
+                console.log('[IVFIndex] No index UUID found in manifest');
+                return null;
+            }
+
+            console.log(`[IVFIndex] Found index UUID: ${indexInfo.uuid}`);
+
+            // Fetch the index file (contains centroids)
             const indexUrl = `${datasetBaseUrl}/_indices/${indexInfo.uuid}/index.idx`;
             const indexResp = await fetch(indexUrl);
             if (!indexResp.ok) {
-                // Index file not found
+                console.warn('[IVFIndex] index.idx not found');
                 return null;
             }
 
             const indexData = await indexResp.arrayBuffer();
-            return IVFIndex._parseIndexFile(new Uint8Array(indexData), indexInfo);
+            const index = IVFIndex._parseIndexFile(new Uint8Array(indexData), indexInfo);
+
+            if (!index) return null;
+
+            // Store auxiliary URL for later partition data fetching
+            index.auxiliaryUrl = `${datasetBaseUrl}/_indices/${indexInfo.uuid}/auxiliary.idx`;
+            index.datasetBaseUrl = datasetBaseUrl;
+
+            // Fetch auxiliary.idx metadata (footer + partition info)
+            // We only need the last ~13MB which has the partition metadata
+            try {
+                await index._loadAuxiliaryMetadata();
+            } catch (e) {
+                console.warn('[IVFIndex] Failed to load auxiliary metadata:', e);
+            }
+
+            console.log(`[IVFIndex] Loaded: ${index.numPartitions} partitions, dim=${index.dimension}`);
+            if (index.partitionLengths.length > 0) {
+                const totalRows = index.partitionLengths.reduce((a, b) => a + b, 0);
+                console.log(`[IVFIndex] Partition info: ${totalRows.toLocaleString()} total rows`);
+            }
+
+            // Try to load custom partition index (ivf_partitions.bin)
+            try {
+                await index._loadPartitionIndex();
+            } catch (e) {
+                console.warn('[IVFIndex] Failed to load partition index:', e);
+            }
+
+            return index;
         } catch (e) {
-            // Failed to load IVF index
+            console.warn('[IVFIndex] Failed to load:', e);
             return null;
         }
+    }
+
+    /**
+     * Load partition-organized vectors index from ivf_vectors.bin.
+     * This file contains:
+     *   - Header: 257 uint64 byte offsets (2056 bytes)
+     *   - Per partition: [row_count: uint32][row_ids: uint32 × n][vectors: float32 × n × 384]
+     * @private
+     */
+    async _loadPartitionIndex() {
+        const url = `${this.datasetBaseUrl}/ivf_vectors.bin`;
+        this.partitionVectorsUrl = url;
+
+        // Fetch header (257 uint64s = 2056 bytes)
+        const headerResp = await fetch(url, {
+            headers: { 'Range': 'bytes=0-2055' }
+        });
+        if (!headerResp.ok) {
+            console.log('[IVFIndex] ivf_vectors.bin not found, IVF search disabled');
+            return;
+        }
+
+        const headerData = await headerResp.arrayBuffer();
+        // Parse as BigUint64Array then convert to regular numbers
+        const bigOffsets = new BigUint64Array(headerData);
+        this.partitionOffsets = Array.from(bigOffsets, n => Number(n));
+
+        this.hasPartitionIndex = true;
+        console.log(`[IVFIndex] Loaded partition vectors index: 256 partitions`);
+    }
+
+    /**
+     * Fetch partition data (row IDs and vectors) directly from ivf_vectors.bin.
+     * Each partition contains: [row_count: uint32][row_ids: uint32 × n][vectors: float32 × n × dim]
+     * @param {number[]} partitionIndices - Partition indices to fetch
+     * @param {number} dim - Vector dimension (default 384)
+     * @param {function} onProgress - Progress callback (bytesLoaded, totalBytes)
+     * @returns {Promise<{rowIds: number[], vectors: Float32Array[]}>}
+     */
+    async fetchPartitionData(partitionIndices, dim = 384, onProgress = null) {
+        if (!this.hasPartitionIndex || !this.partitionVectorsUrl) {
+            return null;
+        }
+
+        const allRowIds = [];
+        const allVectors = [];
+        let totalBytesToFetch = 0;
+        let bytesLoaded = 0;
+
+        // Calculate total bytes for progress reporting
+        for (const p of partitionIndices) {
+            const startOffset = this.partitionOffsets[p];
+            const endOffset = this.partitionOffsets[p + 1];
+            totalBytesToFetch += endOffset - startOffset;
+        }
+
+        console.log(`[IVFIndex] Fetching ${partitionIndices.length} partitions, ${(totalBytesToFetch / 1024 / 1024).toFixed(1)} MB total`);
+
+        // Fetch partitions in parallel (max 4 concurrent)
+        const PARALLEL_LIMIT = 4;
+        for (let i = 0; i < partitionIndices.length; i += PARALLEL_LIMIT) {
+            const batch = partitionIndices.slice(i, i + PARALLEL_LIMIT);
+
+            const results = await Promise.all(batch.map(async (p) => {
+                const startOffset = this.partitionOffsets[p];
+                const endOffset = this.partitionOffsets[p + 1];
+                const byteSize = endOffset - startOffset;
+
+                try {
+                    const resp = await fetch(this.partitionVectorsUrl, {
+                        headers: { 'Range': `bytes=${startOffset}-${endOffset - 1}` }
+                    });
+                    if (!resp.ok) {
+                        console.warn(`[IVFIndex] Partition ${p} fetch failed: ${resp.status}`);
+                        return { rowIds: [], vectors: [] };
+                    }
+
+                    const data = await resp.arrayBuffer();
+                    const view = new DataView(data);
+
+                    // Parse: [row_count: uint32][row_ids: uint32 × n][vectors: float32 × n × dim]
+                    const rowCount = view.getUint32(0, true);  // little-endian
+                    const rowIdsStart = 4;
+                    const rowIdsEnd = rowIdsStart + rowCount * 4;
+                    const vectorsStart = rowIdsEnd;
+
+                    const rowIds = new Uint32Array(data.slice(rowIdsStart, rowIdsEnd));
+                    const vectorsFlat = new Float32Array(data.slice(vectorsStart));
+
+                    // Split flat vectors into individual arrays
+                    const vectors = [];
+                    for (let j = 0; j < rowCount; j++) {
+                        vectors.push(vectorsFlat.slice(j * dim, (j + 1) * dim));
+                    }
+
+                    bytesLoaded += byteSize;
+                    if (onProgress) onProgress(bytesLoaded, totalBytesToFetch);
+
+                    return { rowIds: Array.from(rowIds), vectors };
+                } catch (e) {
+                    console.warn(`[IVFIndex] Error fetching partition ${p}:`, e);
+                    return { rowIds: [], vectors: [] };
+                }
+            }));
+
+            // Collect results
+            for (const result of results) {
+                allRowIds.push(...result.rowIds);
+                allVectors.push(...result.vectors);
+            }
+        }
+
+        console.log(`[IVFIndex] Loaded ${allRowIds.length.toLocaleString()} vectors from ${partitionIndices.length} partitions`);
+        return { rowIds: allRowIds, vectors: allVectors };
+    }
+
+    /**
+     * Find latest manifest version using binary search.
+     * @private
+     */
+    static async _findLatestManifestVersion(baseUrl) {
+        // Check common versions in parallel
+        const checkVersions = [1, 5, 10, 20, 50, 100];
+        const checks = await Promise.all(
+            checkVersions.map(async v => {
+                try {
+                    const url = `${baseUrl}/_versions/${v}.manifest`;
+                    const response = await fetch(url, { method: 'HEAD' });
+                    return response.ok ? v : 0;
+                } catch {
+                    return 0;
+                }
+            })
+        );
+
+        let highestFound = Math.max(...checks);
+        if (highestFound === 0) return null;
+
+        // Scan forward from highest found
+        for (let v = highestFound + 1; v <= highestFound + 30; v++) {
+            try {
+                const url = `${baseUrl}/_versions/${v}.manifest`;
+                const response = await fetch(url, { method: 'HEAD' });
+                if (response.ok) {
+                    highestFound = v;
+                } else {
+                    break;
+                }
+            } catch {
+                break;
+            }
+        }
+
+        return highestFound;
+    }
+
+    /**
+     * Load partition metadata from auxiliary.idx.
+     * Uses HTTP range request to fetch only the metadata section.
+     * @private
+     */
+    async _loadAuxiliaryMetadata() {
+        // Fetch file size first
+        let headResp;
+        try {
+            headResp = await fetch(this.auxiliaryUrl, { method: 'HEAD' });
+        } catch (e) {
+            console.warn('[IVFIndex] HEAD request failed for auxiliary.idx:', e.message);
+            return;
+        }
+        if (!headResp.ok) return;
+
+        const fileSize = parseInt(headResp.headers.get('content-length'));
+        if (!fileSize) return;
+
+        // Fetch footer (last 40 bytes) to get metadata locations
+        const footerResp = await fetch(this.auxiliaryUrl, {
+            headers: { 'Range': `bytes=${fileSize - 40}-${fileSize - 1}` }
+        });
+        if (!footerResp.ok) return;
+
+        const footer = new Uint8Array(await footerResp.arrayBuffer());
+        const view = new DataView(footer.buffer, footer.byteOffset);
+
+        // Parse Lance footer (40 bytes)
+        // Bytes 0-7: column_meta_start
+        // Bytes 8-15: column_meta_offsets_start
+        // Bytes 16-23: global_buff_offsets_start
+        // Bytes 24-27: num_global_buffers
+        // Bytes 28-31: num_columns
+        // Bytes 32-33: major_version
+        // Bytes 34-35: minor_version
+        // Bytes 36-39: magic "LANC"
+        const colMetaStart = Number(view.getBigUint64(0, true));
+        const colMetaOffsetsStart = Number(view.getBigUint64(8, true));
+        const globalBuffOffsetsStart = Number(view.getBigUint64(16, true));
+        const numGlobalBuffers = view.getUint32(24, true);
+        const numColumns = view.getUint32(28, true);
+        const magic = new TextDecoder().decode(footer.slice(36, 40));
+
+        if (magic !== 'LANC') {
+            console.warn('[IVFIndex] Invalid auxiliary.idx magic');
+            return;
+        }
+
+        console.log(`[IVFIndex] Footer: colMetaStart=${colMetaStart}, colMetaOffsetsStart=${colMetaOffsetsStart}, globalBuffOffsetsStart=${globalBuffOffsetsStart}, numGlobalBuffers=${numGlobalBuffers}, numColumns=${numColumns}`);
+
+        // Fetch global buffer offsets (each buffer has offset + length = 16 bytes)
+        const gboSize = numGlobalBuffers * 16;
+        const gboResp = await fetch(this.auxiliaryUrl, {
+            headers: { 'Range': `bytes=${globalBuffOffsetsStart}-${globalBuffOffsetsStart + gboSize - 1}` }
+        });
+        if (!gboResp.ok) return;
+
+        const gboData = new Uint8Array(await gboResp.arrayBuffer());
+        const gboView = new DataView(gboData.buffer, gboData.byteOffset);
+
+        // Global buffer offsets are stored as [offset, length] pairs
+        // Each buffer has: offset (8 bytes) + length (8 bytes) = 16 bytes per buffer
+        const buffers = [];
+        for (let i = 0; i < numGlobalBuffers; i++) {
+            const offset = Number(gboView.getBigUint64(i * 16, true));
+            const length = Number(gboView.getBigUint64(i * 16 + 8, true));
+            buffers.push({ offset, length });
+        }
+
+        console.log(`[IVFIndex] Buffers:`, buffers);
+
+        // Buffer 1 contains row IDs (_rowid column data)
+        // Buffer 2 contains PQ codes (__pq_code column data)
+        // We need buffer 1 for row ID lookups
+        if (buffers.length < 2) return;
+
+        // Store buffer info for later use
+        this._auxBuffers = buffers;
+        this._auxFileSize = fileSize;
+
+        // Now we need to fetch partition metadata from column metadata
+        // The auxiliary.idx stores _rowid and __pq_code columns
+        // Partition info (offsets, lengths) is in the column metadata section
+        // For now, we'll compute partition info from the row ID buffer
+        // Each partition's row IDs are stored contiguously
+
+        // We need to parse column metadata to get partition boundaries
+        // Column metadata is at col_meta_start, with offsets at col_meta_off_start
+        const colMetaOffResp = await fetch(this.auxiliaryUrl, {
+            headers: { 'Range': `bytes=${colMetaOffsetsStart}-${globalBuffOffsetsStart - 1}` }
+        });
+        if (!colMetaOffResp.ok) return;
+
+        const colMetaOffData = new Uint8Array(await colMetaOffResp.arrayBuffer());
+        // Parse column offset entries (16 bytes each: 8 byte pos + 8 byte len)
+        // We have 2 columns: _rowid and __pq_code
+        if (colMetaOffData.length >= 32) {
+            const colView = new DataView(colMetaOffData.buffer, colMetaOffData.byteOffset);
+            const col0Pos = Number(colView.getBigUint64(0, true));
+            const col0Len = Number(colView.getBigUint64(8, true));
+            console.log(`[IVFIndex] Column 0 (_rowid) metadata at ${col0Pos}, len=${col0Len}`);
+
+            // Fetch column 0 metadata to get page info
+            const col0MetaResp = await fetch(this.auxiliaryUrl, {
+                headers: { 'Range': `bytes=${col0Pos}-${col0Pos + col0Len - 1}` }
+            });
+            if (col0MetaResp.ok) {
+                const col0Meta = new Uint8Array(await col0MetaResp.arrayBuffer());
+                this._parseColumnMetaForPartitions(col0Meta);
+            }
+        }
+    }
+
+    /**
+     * Parse column metadata to extract partition (page) boundaries.
+     * @private
+     */
+    _parseColumnMetaForPartitions(bytes) {
+        let pos = 0;
+        const pages = [];
+
+        const readVarint = () => {
+            let result = 0;
+            let shift = 0;
+            while (pos < bytes.length) {
+                const byte = bytes[pos++];
+                result |= (byte & 0x7F) << shift;
+                if ((byte & 0x80) === 0) break;
+                shift += 7;
+            }
+            return result;
+        };
+
+        // Parse protobuf to find pages
+        while (pos < bytes.length) {
+            const tag = readVarint();
+            const fieldNum = tag >> 3;
+            const wireType = tag & 0x7;
+
+            if (wireType === 2) {
+                const len = readVarint();
+                if (len > bytes.length - pos) break;
+                const content = bytes.slice(pos, pos + len);
+                pos += len;
+
+                // Field 2 = pages (PageInfo)
+                if (fieldNum === 2) {
+                    const page = this._parsePageInfo(content);
+                    if (page) pages.push(page);
+                }
+            } else if (wireType === 0) {
+                readVarint();
+            } else if (wireType === 5) {
+                pos += 4;
+            } else if (wireType === 1) {
+                pos += 8;
+            }
+        }
+
+        console.log(`[IVFIndex] Found ${pages.length} column pages`);
+
+        // Store page info for row ID lookups
+        // Note: partition info should come from index.idx, not column pages
+        // Column pages are how data is stored, partitions are the IVF clusters
+        this._columnPages = pages;
+
+        // Calculate total rows for verification
+        let totalRows = 0;
+        for (const page of pages) {
+            totalRows += page.numRows;
+        }
+        console.log(`[IVFIndex] Column has ${totalRows} total rows`);
+    }
+
+    /**
+     * Parse PageInfo protobuf.
+     * @private
+     */
+    _parsePageInfo(bytes) {
+        let pos = 0;
+        let numRows = 0;
+        const bufferOffsets = [];
+        const bufferSizes = [];
+
+        const readVarint = () => {
+            let result = 0;
+            let shift = 0;
+            while (pos < bytes.length) {
+                const byte = bytes[pos++];
+                result |= (byte & 0x7F) << shift;
+                if ((byte & 0x80) === 0) break;
+                shift += 7;
+            }
+            return result;
+        };
+
+        while (pos < bytes.length) {
+            const tag = readVarint();
+            const fieldNum = tag >> 3;
+            const wireType = tag & 0x7;
+
+            if (wireType === 0) {
+                const val = readVarint();
+                if (fieldNum === 3) numRows = val;  // length field
+            } else if (wireType === 2) {
+                const len = readVarint();
+                const content = bytes.slice(pos, pos + len);
+                pos += len;
+
+                // Field 1 = buffer_offsets (packed uint64)
+                if (fieldNum === 1) {
+                    let p = 0;
+                    while (p < content.length) {
+                        let val = 0n;
+                        let shift = 0n;
+                        while (p < content.length) {
+                            const b = content[p++];
+                            val |= BigInt(b & 0x7F) << shift;
+                            if ((b & 0x80) === 0) break;
+                            shift += 7n;
+                        }
+                        bufferOffsets.push(Number(val));
+                    }
+                }
+                // Field 2 = buffer_sizes (packed uint64)
+                if (fieldNum === 2) {
+                    let p = 0;
+                    while (p < content.length) {
+                        let val = 0n;
+                        let shift = 0n;
+                        while (p < content.length) {
+                            const b = content[p++];
+                            val |= BigInt(b & 0x7F) << shift;
+                            if ((b & 0x80) === 0) break;
+                            shift += 7n;
+                        }
+                        bufferSizes.push(Number(val));
+                    }
+                }
+            } else if (wireType === 5) {
+                pos += 4;
+            } else if (wireType === 1) {
+                pos += 8;
+            }
+        }
+
+        return { numRows, bufferOffsets, bufferSizes };
+    }
+
+    /**
+     * Parse partition offsets and lengths from auxiliary.idx metadata.
+     * @private
+     */
+    _parseAuxiliaryPartitionInfo(bytes) {
+        let pos = 0;
+
+        const readVarint = () => {
+            let result = 0;
+            let shift = 0;
+            while (pos < bytes.length) {
+                const byte = bytes[pos++];
+                result |= (byte & 0x7F) << shift;
+                if ((byte & 0x80) === 0) break;
+                shift += 7;
+            }
+            return result;
+        };
+
+        // Parse protobuf structure
+        while (pos < bytes.length - 4) {
+            const tag = readVarint();
+            const fieldNum = tag >> 3;
+            const wireType = tag & 0x7;
+
+            if (wireType === 2) {
+                const len = readVarint();
+                if (len > bytes.length - pos) break;
+
+                const content = bytes.slice(pos, pos + len);
+                pos += len;
+
+                if (fieldNum === 2 && len > 100 && len < 2000) {
+                    // Partition offsets (varint-encoded)
+                    const offsets = [];
+                    let innerPos = 0;
+                    while (innerPos < content.length) {
+                        let val = 0, shift = 0;
+                        while (innerPos < content.length) {
+                            const byte = content[innerPos++];
+                            val |= (byte & 0x7F) << shift;
+                            if ((byte & 0x80) === 0) break;
+                            shift += 7;
+                        }
+                        offsets.push(val);
+                    }
+                    if (offsets.length === this.numPartitions) {
+                        this.partitionOffsets = offsets;
+                        console.log(`[IVFIndex] Loaded ${offsets.length} partition offsets`);
+                    }
+                } else if (fieldNum === 3 && len > 100 && len < 2000) {
+                    // Partition lengths (varint-encoded)
+                    const lengths = [];
+                    let innerPos = 0;
+                    while (innerPos < content.length) {
+                        let val = 0, shift = 0;
+                        while (innerPos < content.length) {
+                            const byte = content[innerPos++];
+                            val |= (byte & 0x7F) << shift;
+                            if ((byte & 0x80) === 0) break;
+                            shift += 7;
+                        }
+                        lengths.push(val);
+                    }
+                    if (lengths.length === this.numPartitions) {
+                        this.partitionLengths = lengths;
+                        console.log(`[IVFIndex] Loaded ${lengths.length} partition lengths`);
+                    }
+                }
+            } else if (wireType === 0) {
+                readVarint();
+            } else if (wireType === 1) {
+                pos += 8;
+            } else if (wireType === 5) {
+                pos += 4;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /**
+     * Fetch row IDs for specified partitions from auxiliary.idx.
+     * Returns array of decoded row IDs (as {fragId, rowOffset} pairs).
+     *
+     * The auxiliary.idx data region layout for each row:
+     * - Column 0: _rowid (uint64) - 8 bytes per row
+     * - Column 1: __pq_code (64 uint8s) - 64 bytes per row
+     * Total: 72 bytes per row if stored contiguously
+     *
+     * However, Lance stores columns separately, so we need to read
+     * just the _rowid column data.
+     *
+     * @param {number[]} partitionIndices - Partition indices to fetch
+     * @returns {Promise<Array<{fragId: number, rowOffset: number}>>}
+     */
+    async fetchPartitionRowIds(partitionIndices) {
+        if (!this.auxiliaryUrl || !this._auxBufferOffsets) {
+            return null;
+        }
+
+        // Calculate total rows to fetch and their byte ranges
+        const rowRanges = [];
+        for (const p of partitionIndices) {
+            if (p < this.partitionOffsets.length) {
+                const startRow = this.partitionOffsets[p];
+                const numRows = this.partitionLengths[p];
+                rowRanges.push({ partition: p, startRow, numRows });
+            }
+        }
+
+        if (rowRanges.length === 0) return [];
+
+        // The data region starts at bufferOffsets[1]
+        // auxiliary.idx stores _rowid as uint64 (8 bytes each)
+        // Data is stored with _rowid column first, then __pq_code column
+        // We only need _rowid values
+
+        // First, get the _rowid column metadata from auxiliary.idx footer
+        // For now, use a simpler approach: assume row IDs are stored at
+        // (dataStart + rowIndex * 8) for each row in the partition order
+
+        // Note: This is a simplification. Full implementation would parse
+        // the column encoding from auxiliary.idx metadata.
+
+        const results = [];
+        const dataStart = this._auxBufferOffsets[1];
+
+        // Fetch row IDs in batches
+        for (const range of rowRanges) {
+            // Calculate byte offset for this partition's row IDs
+            // Row IDs are at the start of the data region
+            const byteStart = dataStart + range.startRow * 8;
+            const byteEnd = byteStart + range.numRows * 8 - 1;
+
+            try {
+                const resp = await fetch(this.auxiliaryUrl, {
+                    headers: { 'Range': `bytes=${byteStart}-${byteEnd}` }
+                });
+
+                if (!resp.ok) {
+                    console.warn(`[IVFIndex] Failed to fetch row IDs for partition ${range.partition}`);
+                    continue;
+                }
+
+                const data = new Uint8Array(await resp.arrayBuffer());
+                const view = new DataView(data.buffer, data.byteOffset);
+
+                for (let i = 0; i < range.numRows; i++) {
+                    const rowId = Number(view.getBigUint64(i * 8, true));
+                    // Decode Lance row ID: fragId = rowId >> 32, rowOffset = rowId & 0xFFFFFFFF
+                    const fragId = Math.floor(rowId / 0x100000000);
+                    const rowOffset = rowId % 0x100000000;
+                    results.push({ fragId, rowOffset, partition: range.partition });
+                }
+            } catch (e) {
+                console.warn(`[IVFIndex] Error fetching partition ${range.partition}:`, e);
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * Get estimated number of rows to search for given partitions.
+     */
+    getPartitionRowCount(partitionIndices) {
+        let total = 0;
+        for (const p of partitionIndices) {
+            if (p < this.partitionLengths.length) {
+                total += this.partitionLengths[p];
+            }
+        }
+        return total;
     }
 
     /**
@@ -2733,44 +3847,48 @@ export class IVFIndex {
      */
     static _parseManifestForIndex(bytes) {
         // Manifest structure:
-        // - 4 bytes: content length (little-endian u32)
-        // - N bytes: protobuf content
-        // - Footer
+        // - Chunk 1: 4 bytes len + content (index metadata in field 1)
+        // - Chunk 2: 4 bytes len + content (full manifest with schema + fragments)
+        // - Footer (16 bytes)
+        //
+        // Index info is in CHUNK 1, field 1 (IndexMetadata repeated)
 
-        const contentLen = new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, true);
-        const protoData = bytes.slice(4, 4 + contentLen);
+        const view = new DataView(bytes.buffer, bytes.byteOffset);
+        const chunk1Len = view.getUint32(0, true);
+        const chunk1Data = bytes.slice(4, 4 + chunk1Len);
 
         let pos = 0;
         let indexUuid = null;
         let indexFieldId = null;
 
-        const readVarint = () => {
+        const readVarint = (data, startPos) => {
             let result = 0;
             let shift = 0;
-            while (pos < protoData.length) {
-                const byte = protoData[pos++];
+            let p = startPos;
+            while (p < data.length) {
+                const byte = data[p++];
                 result |= (byte & 0x7F) << shift;
                 if ((byte & 0x80) === 0) break;
                 shift += 7;
             }
-            return result;
+            return { value: result, pos: p };
         };
 
-        // Parse protobuf looking for index metadata
-        // Manifest field 6 = index_section, which contains IndexMetadata messages
-        while (pos < protoData.length) {
-            const tag = readVarint();
-            const fieldNum = tag >> 3;
-            const wireType = tag & 0x7;
+        // Parse chunk 1 looking for index metadata (field 1)
+        while (pos < chunk1Data.length) {
+            const tagResult = readVarint(chunk1Data, pos);
+            pos = tagResult.pos;
+            const fieldNum = tagResult.value >> 3;
+            const wireType = tagResult.value & 0x7;
 
             if (wireType === 2) {
-                // Length-delimited
-                const len = readVarint();
-                const content = protoData.slice(pos, pos + len);
-                pos += len;
+                const lenResult = readVarint(chunk1Data, pos);
+                pos = lenResult.pos;
+                const content = chunk1Data.slice(pos, pos + lenResult.value);
+                pos += lenResult.value;
 
-                // Field 6 = index_section (repeated IndexMetadata)
-                if (fieldNum === 6) {
+                // Field 1 = IndexMetadata (contains UUID)
+                if (fieldNum === 1) {
                     const parsed = IVFIndex._parseIndexMetadata(content);
                     if (parsed && parsed.uuid) {
                         indexUuid = parsed.uuid;
@@ -2778,7 +3896,8 @@ export class IVFIndex {
                     }
                 }
             } else if (wireType === 0) {
-                readVarint();
+                const r = readVarint(chunk1Data, pos);
+                pos = r.pos;
             } else if (wireType === 5) {
                 pos += 4;
             } else if (wireType === 1) {
@@ -2855,8 +3974,10 @@ export class IVFIndex {
             if (wireType === 2 && fieldNum === 1) {
                 const len = bytes[pos++];
                 const uuidBytes = bytes.slice(pos, pos + len);
-                // Convert to hex string
-                return Array.from(uuidBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+                // Convert to hex string with dashes (UUID format)
+                const hex = Array.from(uuidBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+                // Format as UUID: 8-4-4-4-12
+                return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20,32)}`;
             } else if (wireType === 0) {
                 while (pos < bytes.length && (bytes[pos++] & 0x80)) {}
             } else if (wireType === 5) {
@@ -3227,6 +4348,11 @@ const TokenType = {
     AVG: 'AVG',
     MIN: 'MIN',
     MAX: 'MAX',
+    // Vector search keywords
+    NEAR: 'NEAR',
+    TOPK: 'TOPK',
+    // File reference
+    FILE: 'FILE',
 
     // Literals
     IDENTIFIER: 'IDENTIFIER',
@@ -3282,12 +4408,15 @@ const KEYWORDS = {
     'AVG': TokenType.AVG,
     'MIN': TokenType.MIN,
     'MAX': TokenType.MAX,
+    'NEAR': TokenType.NEAR,
+    'TOPK': TokenType.TOPK,
+    'FILE': TokenType.FILE,
 };
 
 /**
  * SQL Lexer - tokenizes SQL input
  */
-class SQLLexer {
+export class SQLLexer {
     constructor(sql) {
         this.sql = sql;
         this.pos = 0;
@@ -3444,7 +4573,7 @@ class SQLLexer {
 /**
  * SQL Parser - parses tokens into AST
  */
-class SQLParser {
+export class SQLParser {
     constructor(tokens) {
         this.tokens = tokens;
         this.pos = 0;
@@ -3492,10 +4621,10 @@ class SQLParser {
         // Select list
         const columns = this.parseSelectList();
 
-        // FROM
+        // FROM - supports: table_name, read_lance('url'), 'url.lance'
         let from = null;
         if (this.match(TokenType.FROM)) {
-            from = this.expect(TokenType.IDENTIFIER).value;
+            from = this.parseFromClause();
         }
 
         // WHERE
@@ -3517,21 +4646,67 @@ class SQLParser {
             having = this.parseExpr();
         }
 
-        // ORDER BY
+        // NEAR - vector similarity search
+        // Syntax: NEAR [column] <'text'|row_num> [TOPK n]
+        let search = null;
+        if (this.match(TokenType.NEAR)) {
+            let column = null;
+            let query = null;
+            let searchRow = null;
+            let topK = 20; // default
+            let encoder = 'minilm'; // default
+
+            // First token after NEAR: could be column name, string, or number
+            if (this.check(TokenType.IDENTIFIER)) {
+                // Could be column name - peek ahead
+                const ident = this.advance().value;
+                if (this.check(TokenType.STRING) || this.check(TokenType.NUMBER)) {
+                    // It was a column name
+                    column = ident;
+                } else {
+                    // It was a search term without quotes (error)
+                    throw new Error(`NEAR requires quoted text or row number. Did you mean: NEAR '${ident}'?`);
+                }
+            }
+
+            // Now expect string (text search) or number (row search)
+            if (this.check(TokenType.STRING)) {
+                query = this.advance().value;
+            } else if (this.check(TokenType.NUMBER)) {
+                searchRow = parseInt(this.advance().value, 10);
+            } else {
+                throw new Error('NEAR requires a quoted text string or row number');
+            }
+
+            // Optional TOPK
+            if (this.match(TokenType.TOPK)) {
+                topK = parseInt(this.expect(TokenType.NUMBER).value, 10);
+            }
+
+            search = { query, searchRow, column, topK, encoder };
+        }
+
+        // ORDER BY and LIMIT can appear in either order
         let orderBy = [];
+        let limit = null;
+        let offset = null;
+
+        // First pass: check for ORDER BY or LIMIT
         if (this.match(TokenType.ORDER)) {
             this.expect(TokenType.BY);
             orderBy = this.parseOrderByList();
         }
-
-        // LIMIT
-        let limit = null;
         if (this.match(TokenType.LIMIT)) {
             limit = parseInt(this.expect(TokenType.NUMBER).value, 10);
         }
 
-        // OFFSET
-        let offset = null;
+        // Second pass: allow ORDER BY after LIMIT (non-standard but common)
+        if (orderBy.length === 0 && this.match(TokenType.ORDER)) {
+            this.expect(TokenType.BY);
+            orderBy = this.parseOrderByList();
+        }
+
+        // OFFSET (can come after LIMIT)
         if (this.match(TokenType.OFFSET)) {
             offset = parseInt(this.expect(TokenType.NUMBER).value, 10);
         }
@@ -3549,6 +4724,7 @@ class SQLParser {
             where,
             groupBy,
             having,
+            search,
             orderBy,
             limit,
             offset,
@@ -3584,6 +4760,66 @@ class SQLParser {
         }
 
         return { type: 'expr', expr, alias };
+    }
+
+    /**
+     * Parse FROM clause - supports:
+     * - table_name (identifier)
+     * - read_lance('url') (function call)
+     * - 'url.lance' (string literal, auto-detect)
+     */
+    parseFromClause() {
+        let from = null;
+
+        // Check for string literal (direct URL/path)
+        if (this.check(TokenType.STRING)) {
+            const url = this.advance().value;
+            from = { type: 'url', url };
+        }
+        // Check for function call like read_lance(), read_lance(24), read_lance('url'), read_lance('url', 24)
+        else if (this.check(TokenType.IDENTIFIER)) {
+            const name = this.advance().value;
+
+            // If followed by (, it's a function call
+            if (this.match(TokenType.LPAREN)) {
+                const funcName = name.toLowerCase();
+                if (funcName === 'read_lance') {
+                    // read_lance(FILE) - local uploaded file
+                    // read_lance(FILE, 24) - local file with version
+                    // read_lance('url') - remote url
+                    // read_lance('url', 24) - remote url with version
+                    from = { type: 'url', function: 'read_lance' };
+
+                    if (!this.check(TokenType.RPAREN)) {
+                        // First arg: FILE keyword, string (url)
+                        if (this.match(TokenType.FILE)) {
+                            // Local file - mark as file reference
+                            from.isFile = true;
+                            // Check for second arg (version)
+                            if (this.match(TokenType.COMMA)) {
+                                from.version = parseInt(this.expect(TokenType.NUMBER).value, 10);
+                            }
+                        } else if (this.check(TokenType.STRING)) {
+                            from.url = this.advance().value;
+                            // Check for second arg (version)
+                            if (this.match(TokenType.COMMA)) {
+                                from.version = parseInt(this.expect(TokenType.NUMBER).value, 10);
+                            }
+                        }
+                    }
+                    this.expect(TokenType.RPAREN);
+                } else {
+                    throw new Error(`Unknown table function: ${name}. Supported: read_lance()`);
+                }
+            } else {
+                // Just an identifier (table name - for future use)
+                from = { type: 'table', name };
+            }
+        } else {
+            throw new Error('Expected table name, URL string, or read_lance() after FROM');
+        }
+
+        return from;
     }
 
     parseColumnList() {
@@ -3880,6 +5116,25 @@ export class SQLExecutor {
         // Check if this is an aggregation query
         const hasAggregates = this.hasAggregates(ast);
         if (hasAggregates) {
+            // Special case: COUNT(*) without WHERE/SEARCH returns metadata row count (free)
+            if (this.isSimpleCountStar(ast) && !ast.where && !ast.search) {
+                return {
+                    columns: ['COUNT(*)'],
+                    rows: [[totalRows]],
+                    total: 1,
+                    aggregationStats: {
+                        scannedRows: 0,
+                        totalRows,
+                        coveragePercent: '100.00',
+                        isPartialScan: false,
+                        fromMetadata: true,
+                    },
+                };
+            }
+            // For aggregations with SEARCH, we need to run search first
+            if (ast.search) {
+                return await this.executeAggregateWithSearch(ast, totalRows, onProgress);
+            }
             return await this.executeAggregateQuery(ast, totalRows, onProgress);
         }
 
@@ -3958,10 +5213,19 @@ export class SQLExecutor {
             }
         }
 
+        // When LIMIT is specified, total should reflect the limited count, not full dataset
+        // This ensures infinite scroll respects the LIMIT clause
+        const effectiveTotal = ast.limit ? rows.length : totalRows;
+
+        // Track if ORDER BY was applied on a subset (honest about sorting limitations)
+        const orderByOnSubset = ast.orderBy && ast.orderBy.length > 0 && rows.length < totalRows;
+
         return {
             columns: colNames,
             rows,
-            total: totalRows,
+            total: effectiveTotal,
+            orderByOnSubset,
+            orderByColumns: ast.orderBy ? ast.orderBy.map(ob => `${ob.column} ${ob.direction}`) : [],
         };
     }
 
@@ -4355,6 +5619,37 @@ export class SQLExecutor {
     }
 
     /**
+     * Check if query is just SELECT COUNT(*) with no other columns
+     */
+    isSimpleCountStar(ast) {
+        if (ast.columns.length !== 1) return false;
+        const col = ast.columns[0];
+        if (col.type === 'star') return true; // COUNT(*) parsed as star
+        if (col.type === 'expr' && col.expr.type === 'call') {
+            const name = col.expr.name.toUpperCase();
+            if (name === 'COUNT') {
+                const arg = col.expr.args[0];
+                return arg?.type === 'star';
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Execute aggregation query after running vector search
+     */
+    async executeAggregateWithSearch(ast, totalRows, onProgress) {
+        // This is a simplified version - aggregate over search results
+        // For now, just return an error/notice that this combination isn't fully supported
+        return {
+            columns: ['error'],
+            rows: [['Aggregations with SEARCH not yet supported. Use SEARCH without aggregations, or aggregations without SEARCH.']],
+            total: 1,
+            aggregationStats: null,
+        };
+    }
+
+    /**
      * Check if the query contains aggregate functions
      */
     hasAggregates(ast) {
@@ -4427,16 +5722,21 @@ export class SQLExecutor {
         }
 
         // Process data in batches
+        // Respect LIMIT - only scan up to LIMIT rows for aggregation
+        const scanLimit = ast.limit || totalRows; // If no LIMIT, scan all (could be slow)
+        const maxRowsToScan = Math.min(scanLimit, totalRows);
         const batchSize = 1000;
         let processedRows = 0;
+        let scannedRows = 0;
 
-        for (let batchStart = 0; batchStart < totalRows; batchStart += batchSize) {
+        for (let batchStart = 0; batchStart < maxRowsToScan; batchStart += batchSize) {
             if (onProgress) {
-                onProgress(`Aggregating...`, batchStart, totalRows);
+                onProgress(`Aggregating...`, batchStart, maxRowsToScan);
             }
 
-            const batchEnd = Math.min(batchStart + batchSize, totalRows);
+            const batchEnd = Math.min(batchStart + batchSize, maxRowsToScan);
             const batchIndices = Array.from({ length: batchEnd - batchStart }, (_, i) => batchStart + i);
+            scannedRows += batchIndices.length;
 
             // Fetch needed column data for this batch
             const batchData = {};
@@ -4515,10 +5815,20 @@ export class SQLExecutor {
             }
         }
 
+        // Calculate coverage stats
+        const coveragePercent = totalRows > 0 ? ((scannedRows / totalRows) * 100).toFixed(2) : 100;
+        const isPartialScan = scannedRows < totalRows;
+
         return {
             columns: colNames,
             rows: [resultRow],
             total: 1,
+            aggregationStats: {
+                scannedRows,
+                totalRows,
+                coveragePercent,
+                isPartialScan,
+            },
         };
     }
 }
@@ -4533,6 +5843,1832 @@ export function parseSQL(sql) {
     const tokens = lexer.tokenize();
     const parser = new SQLParser(tokens);
     return parser.parse();
+}
+
+/**
+ * Represents a remote Lance dataset with multiple fragments.
+ * Loads manifest to discover fragments and fetches data in parallel.
+ */
+export class RemoteLanceDataset {
+    constructor(lanceql, baseUrl) {
+        this.lanceql = lanceql;
+        this.baseUrl = baseUrl.replace(/\/$/, ''); // Remove trailing slash
+        this._fragments = [];
+        this._schema = null;
+        this._totalRows = 0;
+        this._numColumns = 0;
+        this._onFetch = null;
+        this._fragmentFiles = new Map(); // Cache of opened RemoteLanceFile per fragment
+        this._isRemote = true;
+        this._ivfIndex = null; // IVF index for ANN search
+        this._deletedRows = new Map(); // Cache of deleted row Sets per fragment index
+    }
+
+    /**
+     * Open a remote Lance dataset.
+     * @param {LanceQL} lanceql - LanceQL instance
+     * @param {string} baseUrl - Base URL to the dataset
+     * @param {object} [options] - Options
+     * @param {number} [options.version] - Specific version to load (time-travel)
+     * @param {boolean} [options.prefetch] - Prefetch fragment metadata (default: true for small datasets)
+     * @returns {Promise<RemoteLanceDataset>}
+     */
+    static async open(lanceql, baseUrl, options = {}) {
+        const dataset = new RemoteLanceDataset(lanceql, baseUrl);
+        dataset._requestedVersion = options.version || null;
+
+        // Try to load from cache first (unless skipCache is true)
+        const cacheKey = options.version ? `${baseUrl}@v${options.version}` : baseUrl;
+        if (!options.skipCache) {
+            const cached = await metadataCache.get(cacheKey);
+            if (cached && cached.schema && cached.fragments) {
+                console.log(`[LanceQL Dataset] Using cached metadata for ${baseUrl}`);
+                dataset._schema = cached.schema;
+                dataset._fragments = cached.fragments;
+                dataset._numColumns = cached.schema.length;
+                dataset._totalRows = cached.fragments.reduce((sum, f) => sum + f.numRows, 0);
+                dataset._version = cached.version;
+                dataset._columnTypes = cached.columnTypes || null;
+                dataset._fromCache = true;
+            }
+        }
+
+        // If not cached, try sidecar first, then manifest
+        if (!dataset._fromCache) {
+            // Try to load .meta.json sidecar (faster, pre-calculated)
+            const sidecarLoaded = await dataset._tryLoadSidecar();
+
+            if (!sidecarLoaded) {
+                // Fall back to parsing manifest
+                await dataset._loadManifest();
+            }
+
+            // Cache the metadata for next time
+            metadataCache.set(cacheKey, {
+                schema: dataset._schema,
+                fragments: dataset._fragments,
+                version: dataset._version,
+                columnTypes: dataset._columnTypes || null
+            }).catch(() => {}); // Don't block on cache errors
+        }
+
+        await dataset._tryLoadIndex();
+
+        // Prefetch fragment metadata for faster first query
+        // Default: prefetch if <= 5 fragments
+        const shouldPrefetch = options.prefetch ?? (dataset._fragments.length <= 5);
+        if (shouldPrefetch && dataset._fragments.length > 0) {
+            dataset._prefetchFragments();
+        }
+
+        return dataset;
+    }
+
+    /**
+     * Try to load sidecar manifest (.meta.json) for faster startup.
+     * @returns {Promise<boolean>} True if sidecar was loaded successfully
+     * @private
+     */
+    async _tryLoadSidecar() {
+        try {
+            const sidecarUrl = `${this.baseUrl}/.meta.json`;
+            const response = await fetch(sidecarUrl);
+
+            if (!response.ok) {
+                return false;
+            }
+
+            const sidecar = await response.json();
+
+            // Validate sidecar format
+            if (!sidecar.schema || !sidecar.fragments) {
+                console.warn('[LanceQL Dataset] Invalid sidecar format');
+                return false;
+            }
+
+            console.log(`[LanceQL Dataset] Loaded sidecar manifest`);
+
+            // Convert sidecar schema to internal format
+            this._schema = sidecar.schema.map(col => ({
+                name: col.name,
+                id: col.index,
+                type: col.type
+            }));
+
+            // Convert sidecar fragments to internal format
+            this._fragments = sidecar.fragments.map(frag => ({
+                id: frag.id,
+                path: frag.data_files?.[0] || `${frag.id}.lance`,
+                numRows: frag.num_rows,
+                physicalRows: frag.physical_rows || frag.num_rows,
+                url: `${this.baseUrl}/data/${frag.data_files?.[0] || frag.id + '.lance'}`,
+                deletionFile: frag.has_deletions ? { numDeletedRows: frag.deleted_rows || 0 } : null
+            }));
+
+            this._numColumns = sidecar.num_columns;
+            this._totalRows = sidecar.total_rows;
+            this._version = sidecar.lance_version;
+
+            // Extract column types from sidecar schema
+            this._columnTypes = sidecar.schema.map(col => {
+                const type = col.type;
+                if (type.startsWith('vector[')) return 'vector';
+                if (type === 'float64' || type === 'double') return 'float64';
+                if (type === 'float32') return 'float32';
+                if (type.includes('int')) return type;
+                if (type === 'string') return 'string';
+                return 'unknown';
+            });
+
+            return true;
+        } catch (e) {
+            // Sidecar not available or invalid - fall back to manifest
+            return false;
+        }
+    }
+
+    /**
+     * Prefetch fragment metadata (footers) in parallel.
+     * Does not block - runs in background.
+     * @private
+     */
+    _prefetchFragments() {
+        const prefetchPromises = this._fragments.map((_, idx) =>
+            this.openFragment(idx).catch(() => null)
+        );
+        // Run in background, don't await
+        Promise.all(prefetchPromises).then(() => {
+            console.log(`[LanceQL Dataset] Prefetched ${this._fragments.length} fragment(s)`);
+        });
+    }
+
+    /**
+     * Check if dataset has an IVF index loaded.
+     */
+    hasIndex() {
+        return this._ivfIndex !== null && this._ivfIndex.centroids !== null;
+    }
+
+    /**
+     * Try to load IVF index from _indices folder.
+     * @private
+     */
+    async _tryLoadIndex() {
+        try {
+            console.log(`[LanceQL Dataset] Trying to load IVF index from ${this.baseUrl}`);
+            this._ivfIndex = await IVFIndex.tryLoad(this.baseUrl);
+            if (this._ivfIndex) {
+                console.log(`[LanceQL Dataset] IVF index loaded: ${this._ivfIndex.numPartitions} partitions, dim=${this._ivfIndex.dimension}`);
+            } else {
+                console.log('[LanceQL Dataset] IVF index not found or failed to parse');
+            }
+        } catch (e) {
+            console.log('[LanceQL Dataset] No IVF index found:', e.message);
+            this._ivfIndex = null;
+        }
+    }
+
+    /**
+     * Load and parse the manifest to discover fragments.
+     * @private
+     */
+    async _loadManifest() {
+        let manifestData = null;
+        let manifestVersion = 0;
+
+        // If specific version requested (time-travel), use that
+        if (this._requestedVersion) {
+            manifestVersion = this._requestedVersion;
+            const manifestUrl = `${this.baseUrl}/_versions/${manifestVersion}.manifest`;
+            const response = await fetch(manifestUrl);
+            if (!response.ok) {
+                throw new Error(`Version ${manifestVersion} not found (${response.status})`);
+            }
+            manifestData = new Uint8Array(await response.arrayBuffer());
+        } else {
+            // Find the latest manifest version using binary search approach
+            // First check common versions in parallel
+            const checkVersions = [1, 5, 10, 20, 50, 100];
+            const checks = await Promise.all(
+                checkVersions.map(async v => {
+                    try {
+                        const url = `${this.baseUrl}/_versions/${v}.manifest`;
+                        const response = await fetch(url, { method: 'HEAD' });
+                        return response.ok ? v : 0;
+                    } catch {
+                        return 0;
+                    }
+                })
+            );
+
+            // Find highest existing version from quick check
+            let highestFound = Math.max(...checks);
+
+            // If we found a high version, scan forward from there
+            if (highestFound > 0) {
+                for (let v = highestFound + 1; v <= highestFound + 50; v++) {
+                    try {
+                        const url = `${this.baseUrl}/_versions/${v}.manifest`;
+                        const response = await fetch(url, { method: 'HEAD' });
+                        if (response.ok) {
+                            highestFound = v;
+                        } else {
+                            break;
+                        }
+                    } catch {
+                        break;
+                    }
+                }
+            }
+
+            manifestVersion = highestFound;
+
+            if (manifestVersion === 0) {
+                throw new Error('No manifest found in dataset');
+            }
+
+            // Fetch the latest manifest
+            const manifestUrl = `${this.baseUrl}/_versions/${manifestVersion}.manifest`;
+            const response = await fetch(manifestUrl);
+            if (!response.ok) {
+                throw new Error(`Failed to fetch manifest: ${response.status}`);
+            }
+            manifestData = new Uint8Array(await response.arrayBuffer());
+        }
+
+        // Store the version we loaded
+        this._version = manifestVersion;
+        this._latestVersion = this._requestedVersion ? null : manifestVersion;
+
+        console.log(`[LanceQL Dataset] Loading manifest v${manifestVersion}${this._requestedVersion ? ' (time-travel)' : ''}...`);
+        this._parseManifest(manifestData);
+
+        console.log(`[LanceQL Dataset] Loaded: ${this._fragments.length} fragments, ${this._totalRows.toLocaleString()} rows, ${this._numColumns} columns`);
+    }
+
+    /**
+     * Get list of available versions.
+     * @returns {Promise<number[]>}
+     */
+    async listVersions() {
+        const versions = [];
+        // Scan for versions 1 to latestVersion (or 100 if unknown)
+        const maxVersion = this._latestVersion || 100;
+
+        const checks = await Promise.all(
+            Array.from({ length: maxVersion }, (_, i) => i + 1).map(async v => {
+                try {
+                    const url = `${this.baseUrl}/_versions/${v}.manifest`;
+                    const response = await fetch(url, { method: 'HEAD' });
+                    return response.ok ? v : 0;
+                } catch {
+                    return 0;
+                }
+            })
+        );
+
+        return checks.filter(v => v > 0);
+    }
+
+    /**
+     * Get current loaded version.
+     */
+    get version() {
+        return this._version;
+    }
+
+    /**
+     * Parse manifest protobuf to extract schema and fragment info.
+     *
+     * Lance manifest file structure:
+     * - Chunk 1 (len-prefixed): Transaction metadata (may be small/incremental)
+     * - Chunk 2 (len-prefixed): Full manifest with schema + fragments
+     * - Footer (16 bytes): Offsets + "LANC" magic
+     *
+     * @private
+     */
+    _parseManifest(bytes) {
+        const view = new DataView(bytes.buffer, bytes.byteOffset);
+
+        // Read chunk 1 length
+        const chunk1Len = view.getUint32(0, true);
+
+        // Check if there's a chunk 2 (full manifest data)
+        // Chunk 2 starts at offset (4 + chunk1Len)
+        const chunk2Start = 4 + chunk1Len;
+        let protoData;
+
+        if (chunk2Start + 4 < bytes.length) {
+            const chunk2Len = view.getUint32(chunk2Start, true);
+            // Verify chunk 2 exists and has reasonable size
+            if (chunk2Len > 0 && chunk2Start + 4 + chunk2Len <= bytes.length) {
+                // Use chunk 2 (full manifest)
+                protoData = bytes.slice(chunk2Start + 4, chunk2Start + 4 + chunk2Len);
+            } else {
+                // Fall back to chunk 1
+                protoData = bytes.slice(4, 4 + chunk1Len);
+            }
+        } else {
+            // Only chunk 1 exists
+            protoData = bytes.slice(4, 4 + chunk1Len);
+        }
+
+        let pos = 0;
+        const fields = [];
+        const fragments = [];
+
+        const readVarint = () => {
+            let result = 0;
+            let shift = 0;
+            while (pos < protoData.length) {
+                const byte = protoData[pos++];
+                result |= (byte & 0x7F) << shift;
+                if ((byte & 0x80) === 0) break;
+                shift += 7;
+            }
+            return result;
+        };
+
+        const skipField = (wireType) => {
+            if (wireType === 0) {
+                readVarint();
+            } else if (wireType === 2) {
+                const len = readVarint();
+                pos += len;
+            } else if (wireType === 5) {
+                pos += 4;
+            } else if (wireType === 1) {
+                pos += 8;
+            }
+        };
+
+        // Parse top-level Manifest message
+        while (pos < protoData.length) {
+            const tag = readVarint();
+            const fieldNum = tag >> 3;
+            const wireType = tag & 0x7;
+
+            if (fieldNum === 1 && wireType === 2) {
+                // Field 1 = schema (repeated Field message)
+                const fieldLen = readVarint();
+                const fieldEnd = pos + fieldLen;
+
+                let name = null;
+                let id = null;
+                let logicalType = null;
+
+                while (pos < fieldEnd) {
+                    const fTag = readVarint();
+                    const fNum = fTag >> 3;
+                    const fWire = fTag & 0x7;
+
+                    if (fWire === 0) {
+                        const val = readVarint();
+                        if (fNum === 3) id = val;
+                    } else if (fWire === 2) {
+                        const len = readVarint();
+                        const content = protoData.slice(pos, pos + len);
+                        pos += len;
+
+                        if (fNum === 2) {
+                            name = new TextDecoder().decode(content);
+                        } else if (fNum === 5) {
+                            logicalType = new TextDecoder().decode(content);
+                        }
+                    } else {
+                        skipField(fWire);
+                    }
+                }
+
+                if (name) {
+                    fields.push({ name, id, type: logicalType });
+                }
+            } else if (fieldNum === 2 && wireType === 2) {
+                // Field 2 = fragments (repeated Fragment message)
+                const fragLen = readVarint();
+                const fragEnd = pos + fragLen;
+
+                let fragId = null;
+                let filePath = null;
+                let numRows = 0;
+                let deletionFile = null;  // Track deletion info
+
+                while (pos < fragEnd) {
+                    const fTag = readVarint();
+                    const fNum = fTag >> 3;
+                    const fWire = fTag & 0x7;
+
+                    if (fWire === 0) {
+                        const val = readVarint();
+                        if (fNum === 1) fragId = val;  // Fragment.id
+                        else if (fNum === 4) numRows = val;  // Fragment.physical_rows
+                    } else if (fWire === 2) {
+                        const len = readVarint();
+                        const content = protoData.slice(pos, pos + len);
+                        pos += len;
+
+                        if (fNum === 2) {
+                            // Fragment.files - parse DataFile message
+                            let innerPos = 0;
+                            while (innerPos < content.length) {
+                                const iTag = content[innerPos++];
+                                const iNum = iTag >> 3;
+                                const iWire = iTag & 0x7;
+
+                                if (iWire === 2) {
+                                    // Length-delimited
+                                    let iLen = 0;
+                                    let iShift = 0;
+                                    while (innerPos < content.length) {
+                                        const b = content[innerPos++];
+                                        iLen |= (b & 0x7F) << iShift;
+                                        if ((b & 0x80) === 0) break;
+                                        iShift += 7;
+                                    }
+                                    const iContent = content.slice(innerPos, innerPos + iLen);
+                                    innerPos += iLen;
+
+                                    if (iNum === 1) {
+                                        // DataFile.path
+                                        filePath = new TextDecoder().decode(iContent);
+                                    }
+                                } else if (iWire === 0) {
+                                    // Varint - skip
+                                    while (innerPos < content.length && (content[innerPos++] & 0x80) !== 0);
+                                } else if (iWire === 5) {
+                                    innerPos += 4;
+                                } else if (iWire === 1) {
+                                    innerPos += 8;
+                                }
+                            }
+                        } else if (fNum === 3) {
+                            // Fragment.deletion_file - parse DeletionFile message
+                            deletionFile = this._parseDeletionFile(content, fragId);
+                        }
+                    } else {
+                        skipField(fWire);
+                    }
+                }
+
+                if (filePath) {
+                    const logicalRows = deletionFile ? numRows - deletionFile.numDeletedRows : numRows;
+                    fragments.push({
+                        id: fragId,
+                        path: filePath,
+                        numRows: logicalRows,  // Logical rows (excluding deleted)
+                        physicalRows: numRows, // Physical rows (including deleted)
+                        deletionFile: deletionFile,
+                        url: `${this.baseUrl}/data/${filePath}`
+                    });
+                }
+            } else {
+                skipField(wireType);
+            }
+        }
+
+        this._schema = fields;
+        this._fragments = fragments;
+        this._numColumns = fields.length;
+        this._totalRows = fragments.reduce((sum, f) => sum + f.numRows, 0);
+
+        // Track if any fragment has deletions
+        const deletedCount = fragments.reduce((sum, f) => sum + (f.deletionFile?.numDeletedRows || 0), 0);
+        if (deletedCount > 0) {
+            console.log(`[LanceQL Dataset] Has ${deletedCount} deleted rows across fragments`);
+        }
+    }
+
+    /**
+     * Parse DeletionFile protobuf message.
+     * @param {Uint8Array} data - Raw protobuf bytes
+     * @param {number} fragId - Fragment ID for path construction
+     * @returns {Object|null} Deletion file info
+     * @private
+     */
+    _parseDeletionFile(data, fragId) {
+        let fileType = 0;  // 0 = ARROW_ARRAY, 1 = BITMAP
+        let readVersion = 0;
+        let id = 0;
+        let numDeletedRows = 0;
+
+        let pos = 0;
+        const readVarint = () => {
+            let result = 0;
+            let shift = 0;
+            while (pos < data.length) {
+                const b = data[pos++];
+                result |= (b & 0x7F) << shift;
+                if ((b & 0x80) === 0) break;
+                shift += 7;
+            }
+            return result;
+        };
+
+        while (pos < data.length) {
+            const tag = readVarint();
+            const fieldNum = tag >> 3;
+            const wireType = tag & 0x7;
+
+            if (wireType === 0) {
+                const val = readVarint();
+                if (fieldNum === 1) fileType = val;       // DeletionFile.file_type
+                else if (fieldNum === 2) readVersion = val; // DeletionFile.read_version
+                else if (fieldNum === 3) id = val;        // DeletionFile.id
+                else if (fieldNum === 4) numDeletedRows = val; // DeletionFile.num_deleted_rows
+            } else if (wireType === 2) {
+                const len = readVarint();
+                pos += len; // Skip length-delimited fields
+            } else if (wireType === 5) {
+                pos += 4;
+            } else if (wireType === 1) {
+                pos += 8;
+            }
+        }
+
+        if (numDeletedRows === 0) return null;
+
+        const ext = fileType === 0 ? 'arrow' : 'bin';
+        const path = `_deletions/${fragId}-${readVersion}-${id}.${ext}`;
+
+        return {
+            fileType: fileType === 0 ? 'arrow' : 'bitmap',
+            readVersion,
+            id,
+            numDeletedRows,
+            path,
+            url: `${this.baseUrl}/${path}`
+        };
+    }
+
+    /**
+     * Load deleted row indices for a fragment.
+     * @param {number} fragmentIndex - Fragment index
+     * @returns {Promise<Set<number>>} Set of deleted row indices (local to fragment)
+     * @private
+     */
+    async _loadDeletedRows(fragmentIndex) {
+        // Check cache
+        if (this._deletedRows.has(fragmentIndex)) {
+            return this._deletedRows.get(fragmentIndex);
+        }
+
+        const frag = this._fragments[fragmentIndex];
+        if (!frag?.deletionFile) {
+            const emptySet = new Set();
+            this._deletedRows.set(fragmentIndex, emptySet);
+            return emptySet;
+        }
+
+        const { url, fileType, numDeletedRows } = frag.deletionFile;
+        console.log(`[LanceQL] Loading ${numDeletedRows} deletions from ${url} (${fileType})`);
+
+        try {
+            const response = await fetch(url);
+            if (!response.ok) {
+                console.warn(`[LanceQL] Failed to load deletion file: ${response.status}`);
+                const emptySet = new Set();
+                this._deletedRows.set(fragmentIndex, emptySet);
+                return emptySet;
+            }
+
+            const buffer = await response.arrayBuffer();
+            const data = new Uint8Array(buffer);
+            let deletedSet;
+
+            if (fileType === 'arrow') {
+                deletedSet = this._parseArrowDeletions(data);
+            } else {
+                deletedSet = this._parseRoaringBitmap(data);
+            }
+
+            console.log(`[LanceQL] Loaded ${deletedSet.size} deleted rows for fragment ${fragmentIndex}`);
+            this._deletedRows.set(fragmentIndex, deletedSet);
+            return deletedSet;
+        } catch (e) {
+            console.error(`[LanceQL] Error loading deletion file:`, e);
+            const emptySet = new Set();
+            this._deletedRows.set(fragmentIndex, emptySet);
+            return emptySet;
+        }
+    }
+
+    /**
+     * Parse Arrow IPC deletion file (Int32Array of deleted indices).
+     * @param {Uint8Array} data - Raw Arrow IPC bytes
+     * @returns {Set<number>} Set of deleted row indices
+     * @private
+     */
+    _parseArrowDeletions(data) {
+        // Arrow IPC format: Magic (ARROW1) + schema + record batch
+        // For simplicity, we look for the Int32 data after the schema
+        const deletedSet = new Set();
+
+        // Find continuation marker (-1 as int32 LE = 0xFFFFFFFF)
+        // Then record batch metadata length, then metadata, then body (Int32 array)
+        let pos = 0;
+
+        // Skip magic "ARROW1" + padding
+        if (data.length >= 8 && String.fromCharCode(...data.slice(0, 6)) === 'ARROW1') {
+            pos = 8;
+        }
+
+        // Look for continuation markers and skip metadata
+        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+
+        while (pos < data.length - 4) {
+            const marker = view.getInt32(pos, true);
+            if (marker === -1) {
+                // Continuation marker found
+                pos += 4;
+                if (pos + 4 > data.length) break;
+                const metaLen = view.getInt32(pos, true);
+                pos += 4 + metaLen; // Skip metadata
+
+                // The body follows - for deletion vectors it's just Int32 array
+                // We need to read until end or next message
+                while (pos + 4 <= data.length) {
+                    // Check if this looks like the start of data (not another marker)
+                    const nextMarker = view.getInt32(pos, true);
+                    if (nextMarker === -1) break; // Another message starts
+
+                    // Read Int32 values until we hit something that looks like a marker
+                    // or reach expected count
+                    const val = view.getInt32(pos, true);
+                    if (val >= 0 && val < 10000000) { // Sanity check
+                        deletedSet.add(val);
+                    }
+                    pos += 4;
+                }
+            } else {
+                pos++;
+            }
+        }
+
+        return deletedSet;
+    }
+
+    /**
+     * Parse Roaring Bitmap deletion file.
+     * @param {Uint8Array} data - Raw Roaring Bitmap bytes
+     * @returns {Set<number>} Set of deleted row indices
+     * @private
+     */
+    _parseRoaringBitmap(data) {
+        // Roaring bitmap format: header + containers
+        // This is a simplified parser for common cases
+        const deletedSet = new Set();
+        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+
+        if (data.length < 8) return deletedSet;
+
+        // Read cookie (first 4 bytes indicate format)
+        const cookie = view.getUint32(0, true);
+
+        // Standard roaring format: cookie = 12346 or 12347
+        // Portable format: first 8 bytes are magic
+        if (cookie === 12346 || cookie === 12347) {
+            // Standard format
+            const isRunContainer = (cookie === 12347);
+            let pos = 4;
+
+            // Number of containers
+            const numContainers = view.getUint16(pos, true);
+            pos += 2;
+
+            // Skip to container data
+            // Each key is 2 bytes, each cardinality is 2 bytes
+            const keysStart = pos;
+            pos += numContainers * 4; // keys + cardinalities
+
+            for (let i = 0; i < numContainers && pos < data.length; i++) {
+                const key = view.getUint16(keysStart + i * 4, true);
+                const card = view.getUint16(keysStart + i * 4 + 2, true) + 1;
+                const baseValue = key << 16;
+
+                // Read container values (simplified - assumes array container)
+                for (let j = 0; j < card && pos + 2 <= data.length; j++) {
+                    const lowBits = view.getUint16(pos, true);
+                    deletedSet.add(baseValue | lowBits);
+                    pos += 2;
+                }
+            }
+        }
+
+        return deletedSet;
+    }
+
+    /**
+     * Check if a row is deleted in a fragment.
+     * @param {number} fragmentIndex - Fragment index
+     * @param {number} localRowIndex - Row index within the fragment
+     * @returns {Promise<boolean>} True if row is deleted
+     */
+    async isRowDeleted(fragmentIndex, localRowIndex) {
+        const deletedSet = await this._loadDeletedRows(fragmentIndex);
+        return deletedSet.has(localRowIndex);
+    }
+
+    /**
+     * Get number of columns.
+     */
+    get numColumns() {
+        return this._numColumns;
+    }
+
+    /**
+     * Get total row count across all fragments.
+     */
+    get rowCount() {
+        return this._totalRows;
+    }
+
+    /**
+     * Get row count for a column (for API compatibility with RemoteLanceFile).
+     * @param {number} columnIndex - Column index (ignored, all columns have same row count)
+     * @returns {Promise<number>}
+     */
+    async getRowCount(columnIndex = 0) {
+        return this._totalRows;
+    }
+
+    /**
+     * Read a single vector at a global row index.
+     * Delegates to the correct fragment based on row index.
+     * @param {number} colIdx - Column index
+     * @param {number} rowIdx - Global row index
+     * @returns {Promise<Float32Array>}
+     */
+    async readVectorAt(colIdx, rowIdx) {
+        const loc = this._getFragmentForRow(rowIdx);
+        if (!loc) return new Float32Array(0);
+        const file = await this.openFragment(loc.fragmentIndex);
+        return await file.readVectorAt(colIdx, loc.localIndex);
+    }
+
+    /**
+     * Get vector info for a column by querying first fragment.
+     * @param {number} colIdx - Column index
+     * @returns {Promise<{rows: number, dimension: number}>}
+     */
+    async getVectorInfo(colIdx) {
+        if (this._fragments.length === 0) {
+            return { rows: 0, dimension: 0 };
+        }
+
+        // Get vector info from first fragment
+        const file = await this.openFragment(0);
+        const fragInfo = await file.getVectorInfo(colIdx);
+
+        if (fragInfo.dimension === 0) {
+            return { rows: 0, dimension: 0 };
+        }
+
+        // Return total rows across all fragments, dimension from first fragment
+        return {
+            rows: this._totalRows,
+            dimension: fragInfo.dimension
+        };
+    }
+
+    /**
+     * Get column names from schema.
+     */
+    get columnNames() {
+        return this._schema ? this._schema.map(f => f.name) : [];
+    }
+
+    /**
+     * Get full schema.
+     */
+    get schema() {
+        return this._schema;
+    }
+
+    /**
+     * Get fragment list.
+     */
+    get fragments() {
+        return this._fragments;
+    }
+
+    /**
+     * Get total size (sum of all fragment files).
+     */
+    get size() {
+        // Estimate based on fragments
+        return this._fragments.length * 100 * 1024 * 1024; // ~100MB per fragment estimate
+    }
+
+    /**
+     * Set callback for network fetch events.
+     */
+    onFetch(callback) {
+        this._onFetch = callback;
+    }
+
+    /**
+     * Open a specific fragment as RemoteLanceFile.
+     * @param {number} fragmentIndex - Index of fragment to open
+     * @returns {Promise<RemoteLanceFile>}
+     */
+    async openFragment(fragmentIndex) {
+        if (fragmentIndex < 0 || fragmentIndex >= this._fragments.length) {
+            throw new Error(`Invalid fragment index: ${fragmentIndex}`);
+        }
+
+        // Check cache
+        if (this._fragmentFiles.has(fragmentIndex)) {
+            return this._fragmentFiles.get(fragmentIndex);
+        }
+
+        const fragment = this._fragments[fragmentIndex];
+        const file = await RemoteLanceFile.open(this.lanceql, fragment.url);
+
+        // Propagate fetch callback
+        if (this._onFetch) {
+            file.onFetch(this._onFetch);
+        }
+
+        this._fragmentFiles.set(fragmentIndex, file);
+        return file;
+    }
+
+    /**
+     * Read rows from the dataset with pagination.
+     * Fetches from multiple fragments in parallel.
+     * @param {Object} options - Query options
+     * @param {number} options.offset - Starting row offset
+     * @param {number} options.limit - Maximum rows to return
+     * @param {number[]} options.columns - Column indices to read (optional)
+     * @param {boolean} options._isPrefetch - Internal flag to prevent recursive prefetch
+     * @returns {Promise<{columns: Array[], columnNames: string[], total: number}>}
+     */
+    async readRows({ offset = 0, limit = 50, columns = null, _isPrefetch = false } = {}) {
+        // Determine which fragments contain the requested rows
+        const fragmentRanges = [];
+        let currentOffset = 0;
+
+        for (let i = 0; i < this._fragments.length; i++) {
+            const frag = this._fragments[i];
+            const fragStart = currentOffset;
+            const fragEnd = currentOffset + frag.numRows;
+
+            // Check if this fragment overlaps with requested range
+            if (fragEnd > offset && fragStart < offset + limit) {
+                const localStart = Math.max(0, offset - fragStart);
+                const localEnd = Math.min(frag.numRows, offset + limit - fragStart);
+
+                fragmentRanges.push({
+                    fragmentIndex: i,
+                    localOffset: localStart,
+                    localLimit: localEnd - localStart,
+                    globalStart: fragStart + localStart
+                });
+            }
+
+            currentOffset = fragEnd;
+            if (currentOffset >= offset + limit) break;
+        }
+
+        if (fragmentRanges.length === 0) {
+            return { columns: [], columnNames: this.columnNames, total: this._totalRows };
+        }
+
+        // Fetch from fragments in parallel
+        const fetchPromises = fragmentRanges.map(async (range) => {
+            const file = await this.openFragment(range.fragmentIndex);
+            const result = await file.readRows({
+                offset: range.localOffset,
+                limit: range.localLimit,
+                columns: columns
+            });
+            return { ...range, result };
+        });
+
+        const results = await Promise.all(fetchPromises);
+
+        // Merge results in order
+        results.sort((a, b) => a.globalStart - b.globalStart);
+
+        const mergedColumns = [];
+        const colNames = results[0]?.result.columnNames || this.columnNames;
+        const numCols = columns ? columns.length : this._numColumns;
+
+        for (let c = 0; c < numCols; c++) {
+            const colData = [];
+            for (const r of results) {
+                if (r.result.columns[c]) {
+                    colData.push(...r.result.columns[c]);
+                }
+            }
+            mergedColumns.push(colData);
+        }
+
+        const result = {
+            columns: mergedColumns,
+            columnNames: colNames,
+            total: this._totalRows
+        };
+
+        // Speculative prefetch: if there are more rows, prefetch next page in background
+        // Only prefetch if: not already a prefetch, limit is reasonable, more rows exist
+        const nextOffset = offset + limit;
+        if (!_isPrefetch && nextOffset < this._totalRows && limit <= 100) {
+            this._prefetchNextPage(nextOffset, limit, columns);
+        }
+
+        return result;
+    }
+
+    /**
+     * Prefetch next page of rows in background.
+     * @private
+     */
+    _prefetchNextPage(offset, limit, columns) {
+        // Use a cache key to avoid duplicate prefetches
+        const cacheKey = `${offset}-${limit}-${columns?.join(',') || 'all'}`;
+        if (this._prefetchCache?.has(cacheKey)) {
+            return; // Already prefetching or prefetched
+        }
+
+        if (!this._prefetchCache) {
+            this._prefetchCache = new Map();
+        }
+
+        // Start prefetch in background (don't await)
+        const prefetchPromise = this.readRows({ offset, limit, columns, _isPrefetch: true })
+            .then(result => {
+                this._prefetchCache.set(cacheKey, result);
+                console.log(`[LanceQL] Prefetched rows ${offset}-${offset + limit}`);
+            })
+            .catch(() => {
+                // Ignore prefetch errors
+            });
+
+        this._prefetchCache.set(cacheKey, prefetchPromise);
+    }
+
+    /**
+     * Detect column types by sampling from first fragment.
+     * @returns {Promise<string[]>}
+     */
+    async detectColumnTypes() {
+        // Return cached types if available
+        if (this._columnTypes && this._columnTypes.length > 0) {
+            return this._columnTypes;
+        }
+
+        if (this._fragments.length === 0) {
+            return [];
+        }
+        const file = await this.openFragment(0);
+        const types = await file.detectColumnTypes();
+        this._columnTypes = types;
+
+        // Update cache with column types
+        const cacheKey = this._requestedVersion ? `${this.baseUrl}@v${this._requestedVersion}` : this.baseUrl;
+        metadataCache.get(cacheKey).then(cached => {
+            if (cached) {
+                cached.columnTypes = types;
+                metadataCache.set(cacheKey, cached).catch(() => {});
+            }
+        }).catch(() => {});
+
+        return types;
+    }
+
+    /**
+     * Helper to determine which fragment contains a given row index.
+     * @private
+     */
+    _getFragmentForRow(rowIdx) {
+        let offset = 0;
+        for (let i = 0; i < this._fragments.length; i++) {
+            const frag = this._fragments[i];
+            if (rowIdx < offset + frag.numRows) {
+                return { fragmentIndex: i, localIndex: rowIdx - offset };
+            }
+            offset += frag.numRows;
+        }
+        return null;
+    }
+
+    /**
+     * Group indices by fragment for efficient batch reading.
+     * @private
+     */
+    _groupIndicesByFragment(indices) {
+        const groups = new Map();
+        for (const globalIdx of indices) {
+            const loc = this._getFragmentForRow(globalIdx);
+            if (!loc) continue;
+
+            if (!groups.has(loc.fragmentIndex)) {
+                groups.set(loc.fragmentIndex, { localIndices: [], globalIndices: [] });
+            }
+            groups.get(loc.fragmentIndex).localIndices.push(loc.localIndex);
+            groups.get(loc.fragmentIndex).globalIndices.push(globalIdx);
+        }
+        return groups;
+    }
+
+    /**
+     * Read strings at specific indices across fragments.
+     */
+    async readStringsAtIndices(colIdx, indices) {
+        const groups = this._groupIndicesByFragment(indices);
+        const results = new Map();
+
+        console.log(`[ReadStrings] Reading ${indices.length} strings from col ${colIdx}`);
+        console.log(`[ReadStrings] First 5 indices: ${indices.slice(0, 5)}`);
+        console.log(`[ReadStrings] Fragment groups: ${Array.from(groups.keys())}`);
+
+        // Fetch from each fragment in parallel
+        const fetchPromises = [];
+        for (const [fragIdx, group] of groups) {
+            fetchPromises.push((async () => {
+                const file = await this.openFragment(fragIdx);
+                console.log(`[ReadStrings] Fragment ${fragIdx}: reading ${group.localIndices.length} strings, first local indices: ${group.localIndices.slice(0, 3)}`);
+                const data = await file.readStringsAtIndices(colIdx, group.localIndices);
+                console.log(`[ReadStrings] Fragment ${fragIdx}: got ${data.length} strings, first 3: ${data.slice(0, 3).map(s => s?.slice(0, 20) + '...')}`);
+                for (let i = 0; i < group.globalIndices.length; i++) {
+                    results.set(group.globalIndices[i], data[i]);
+                }
+            })());
+        }
+        await Promise.all(fetchPromises);
+
+        // Return in original order
+        return indices.map(idx => results.get(idx) || null);
+    }
+
+    /**
+     * Read int64 values at specific indices across fragments.
+     */
+    async readInt64AtIndices(colIdx, indices) {
+        const groups = this._groupIndicesByFragment(indices);
+        const results = new Map();
+
+        const fetchPromises = [];
+        for (const [fragIdx, group] of groups) {
+            fetchPromises.push((async () => {
+                const file = await this.openFragment(fragIdx);
+                const data = await file.readInt64AtIndices(colIdx, group.localIndices);
+                for (let i = 0; i < group.globalIndices.length; i++) {
+                    results.set(group.globalIndices[i], data[i]);
+                }
+            })());
+        }
+        await Promise.all(fetchPromises);
+
+        return new BigInt64Array(indices.map(idx => results.get(idx) || 0n));
+    }
+
+    /**
+     * Read float64 values at specific indices across fragments.
+     */
+    async readFloat64AtIndices(colIdx, indices) {
+        const groups = this._groupIndicesByFragment(indices);
+        const results = new Map();
+
+        const fetchPromises = [];
+        for (const [fragIdx, group] of groups) {
+            fetchPromises.push((async () => {
+                const file = await this.openFragment(fragIdx);
+                const data = await file.readFloat64AtIndices(colIdx, group.localIndices);
+                for (let i = 0; i < group.globalIndices.length; i++) {
+                    results.set(group.globalIndices[i], data[i]);
+                }
+            })());
+        }
+        await Promise.all(fetchPromises);
+
+        return new Float64Array(indices.map(idx => results.get(idx) || 0));
+    }
+
+    /**
+     * Read int32 values at specific indices across fragments.
+     */
+    async readInt32AtIndices(colIdx, indices) {
+        const groups = this._groupIndicesByFragment(indices);
+        const results = new Map();
+
+        const fetchPromises = [];
+        for (const [fragIdx, group] of groups) {
+            fetchPromises.push((async () => {
+                const file = await this.openFragment(fragIdx);
+                const data = await file.readInt32AtIndices(colIdx, group.localIndices);
+                for (let i = 0; i < group.globalIndices.length; i++) {
+                    results.set(group.globalIndices[i], data[i]);
+                }
+            })());
+        }
+        await Promise.all(fetchPromises);
+
+        return new Int32Array(indices.map(idx => results.get(idx) || 0));
+    }
+
+    /**
+     * Read float32 values at specific indices across fragments.
+     */
+    async readFloat32AtIndices(colIdx, indices) {
+        const groups = this._groupIndicesByFragment(indices);
+        const results = new Map();
+
+        const fetchPromises = [];
+        for (const [fragIdx, group] of groups) {
+            fetchPromises.push((async () => {
+                const file = await this.openFragment(fragIdx);
+                const data = await file.readFloat32AtIndices(colIdx, group.localIndices);
+                for (let i = 0; i < group.globalIndices.length; i++) {
+                    results.set(group.globalIndices[i], data[i]);
+                }
+            })());
+        }
+        await Promise.all(fetchPromises);
+
+        return new Float32Array(indices.map(idx => results.get(idx) || 0));
+    }
+
+    /**
+     * Vector search across all fragments.
+     * API compatible with RemoteLanceFile.vectorSearch.
+     *
+     * @param {number} colIdx - Vector column index
+     * @param {Float32Array} queryVec - Query vector
+     * @param {number} topK - Number of results to return
+     * @param {Function} onProgress - Progress callback (current, total)
+     * @param {Object} options - Search options
+     * @returns {Promise<{indices: number[], scores: number[], usedIndex: boolean}>}
+     */
+    async vectorSearch(colIdx, queryVec, topK = 10, onProgress = null, options = {}) {
+        const {
+            normalized = true,
+            workerPool = null,
+            useIndex = true,
+            nprobe = 20
+        } = options;
+
+        const vectorColIdx = colIdx;
+
+        if (vectorColIdx < 0) {
+            throw new Error('No vector column found in dataset');
+        }
+
+        const dim = queryVec.length;
+        console.log(`[VectorSearch] Query dim=${dim}, topK=${topK}, fragments=${this._fragments.length}, hasIndex=${this.hasIndex()}`);
+
+        // Require IVF index for efficient search - no brute force fallback
+        if (!this.hasIndex()) {
+            throw new Error('No IVF index found. Vector search requires an IVF index for efficient querying.');
+        }
+
+        if (this._ivfIndex.dimension !== dim) {
+            throw new Error(`Query dimension (${dim}) does not match index dimension (${this._ivfIndex.dimension}).`);
+        }
+
+        if (!this._ivfIndex.hasPartitionIndex) {
+            throw new Error('IVF partition index (ivf_partitions.bin) not found. Required for efficient search.');
+        }
+
+        console.log(`[VectorSearch] Using IVF index (nprobe=${nprobe})`);
+        return await this._ivfIndexSearch(queryVec, topK, vectorColIdx, nprobe, onProgress);
+    }
+
+    /**
+     * IVF index-based ANN search.
+     * Fetches partition data (row IDs + vectors) directly from ivf_vectors.bin.
+     * This is much faster than fetching scattered vectors from Lance files.
+     * @private
+     */
+    async _ivfIndexSearch(queryVec, topK, vectorColIdx, nprobe, onProgress) {
+        // Find nearest partitions using centroids
+        const partitions = this._ivfIndex.findNearestPartitions(queryVec, nprobe);
+        console.log(`[VectorSearch] Searching ${partitions.length} partitions:`, partitions);
+
+        // Fetch partition data (row IDs + vectors) directly
+        const partitionData = await this._ivfIndex.fetchPartitionData(
+            partitions,
+            this._ivfIndex.dimension,
+            (loaded, total) => {
+                if (onProgress) {
+                    const pct = total > 0 ? loaded / total : 0;
+                    onProgress(Math.floor(pct * 100), 100);
+                }
+            }
+        );
+
+        if (!partitionData || partitionData.rowIds.length === 0) {
+            throw new Error('IVF index not available. This dataset requires ivf_vectors.bin for efficient search.');
+        }
+
+        const { rowIds, vectors } = partitionData;
+        console.log(`[VectorSearch] Computing similarities for ${rowIds.length.toLocaleString()} vectors`);
+
+        // Compute similarities - vectors are already loaded, no more network requests!
+        const allResults = [];
+        for (let i = 0; i < rowIds.length; i++) {
+            const vec = vectors[i];
+            if (!vec || vec.length !== queryVec.length) continue;
+
+            // Cosine similarity (vectors should be normalized)
+            let dot = 0;
+            for (let k = 0; k < queryVec.length; k++) {
+                dot += queryVec[k] * vec[k];
+            }
+            allResults.push({ index: rowIds[i], score: dot });
+        }
+
+        // Sort and take top-k
+        allResults.sort((a, b) => b.score - a.score);
+        const finalK = Math.min(topK, allResults.length);
+
+        if (onProgress) onProgress(100, 100);
+
+        return {
+            indices: allResults.slice(0, finalK).map(r => r.index),
+            scores: allResults.slice(0, finalK).map(r => r.score),
+            usedIndex: true,
+            searchedRows: rowIds.length
+        };
+    }
+
+    /**
+     * Find the vector column index by looking at schema.
+     * @private
+     */
+    _findVectorColumn() {
+        if (!this._schema) return -1;
+
+        for (let i = 0; i < this._schema.length; i++) {
+            const field = this._schema[i];
+            if (field.name === 'embedding' || field.name === 'vector' ||
+                field.type === 'fixed_size_list' || field.type === 'list') {
+                return i;
+            }
+        }
+
+        // Assume last column is vector if schema unclear
+        return this._schema.length - 1;
+    }
+
+    /**
+     * Parallel vector search using WorkerPool.
+     * @private
+     */
+    async _parallelVectorSearch(query, topK, vectorColIdx, normalized, workerPool) {
+        const dim = query.length;
+
+        // Load vectors from each fragment in parallel
+        const chunkPromises = this._fragments.map(async (frag, idx) => {
+            const file = await this.openFragment(idx);
+
+            // Get vector data for this fragment
+            const vectors = await file.readVectorColumn(vectorColIdx);
+            if (!vectors || vectors.length === 0) {
+                return null;
+            }
+
+            // Calculate start index for this fragment
+            let startIndex = 0;
+            for (let i = 0; i < idx; i++) {
+                startIndex += this._fragments[i].numRows;
+            }
+
+            return {
+                vectors: new Float32Array(vectors),
+                startIndex,
+                numVectors: vectors.length / dim
+            };
+        });
+
+        const chunks = (await Promise.all(chunkPromises)).filter(c => c !== null);
+
+        if (chunks.length === 0) {
+            return { indices: new Uint32Array(0), scores: new Float32Array(0), rows: [] };
+        }
+
+        // Perform parallel search
+        const { indices, scores } = await workerPool.parallelVectorSearch(
+            query, chunks, dim, topK, normalized
+        );
+
+        // Fetch row data for results
+        const rows = await this._fetchResultRows(indices);
+
+        return { indices, scores, rows };
+    }
+
+    /**
+     * Fetch full row data for result indices.
+     * @private
+     */
+    async _fetchResultRows(indices) {
+        if (indices.length === 0) return [];
+
+        const rows = [];
+
+        // Group indices by fragment for efficient fetching
+        const groups = this._groupIndicesByFragment(Array.from(indices));
+
+        for (const [fragIdx, group] of groups) {
+            const file = await this.openFragment(fragIdx);
+
+            // Read string columns for display
+            for (const localIdx of group.localIndices) {
+                const row = {};
+
+                // Try to read text/url columns
+                for (let colIdx = 0; colIdx < this._numColumns; colIdx++) {
+                    const colName = this.columnNames[colIdx];
+                    if (colName === 'text' || colName === 'url' || colName === 'caption') {
+                        try {
+                            const values = await file.readStringsAtIndices(colIdx, [localIdx]);
+                            row[colName] = values[0];
+                        } catch (e) {
+                            // Column might not be string type
+                        }
+                    }
+                }
+
+                rows.push(row);
+            }
+        }
+
+        return rows;
+    }
+
+    /**
+     * Execute SQL query across all fragments in parallel.
+     * @param {string} sql - SQL query
+     * @returns {Promise<{columns: Array[], columnNames: string[], total: number}>}
+     */
+    async executeSQL(sql) {
+        // Parse the SQL to understand what's needed
+        const ast = parseSQL(sql);
+
+        // For simple SELECT * with LIMIT, use readRows
+        if (ast.type === 'SELECT' && ast.columns === '*' && !ast.where) {
+            const limit = ast.limit || 50;
+            const offset = ast.offset || 0;
+            return await this.readRows({ offset, limit });
+        }
+
+        // For queries with WHERE or complex operations, execute on each fragment in parallel
+        const fetchPromises = this._fragments.map(async (frag, idx) => {
+            const file = await this.openFragment(idx);
+            try {
+                return await file.executeSQL(sql);
+            } catch (e) {
+                console.warn(`Fragment ${idx} query failed:`, e);
+                return { columns: [], columnNames: [], total: 0 };
+            }
+        });
+
+        const results = await Promise.all(fetchPromises);
+
+        // Merge results
+        if (results.length === 0 || results.every(r => r.columns.length === 0)) {
+            return { columns: [], columnNames: this.columnNames, total: 0 };
+        }
+
+        const firstValid = results.find(r => r.columns.length > 0);
+        if (!firstValid) {
+            return { columns: [], columnNames: this.columnNames, total: 0 };
+        }
+
+        const numCols = firstValid.columns.length;
+        const colNames = firstValid.columnNames;
+        const mergedColumns = Array.from({ length: numCols }, () => []);
+
+        let totalRows = 0;
+        for (const r of results) {
+            for (let c = 0; c < numCols && c < r.columns.length; c++) {
+                mergedColumns[c].push(...r.columns[c]);
+            }
+            totalRows += r.total;
+        }
+
+        // Apply LIMIT if present (after merging)
+        if (ast.limit) {
+            const offset = ast.offset || 0;
+            for (let c = 0; c < numCols; c++) {
+                mergedColumns[c] = mergedColumns[c].slice(offset, offset + ast.limit);
+            }
+        }
+
+        return {
+            columns: mergedColumns,
+            columnNames: colNames,
+            total: totalRows
+        };
+    }
+
+    /**
+     * Close all cached fragment files.
+     */
+    close() {
+        for (const file of this._fragmentFiles.values()) {
+            if (file.close) file.close();
+        }
+        this._fragmentFiles.clear();
+    }
+}
+
+// ============================================================================
+// WorkerPool - Parallel WASM execution across Web Workers
+// ============================================================================
+
+/**
+ * WorkerPool manages a pool of Web Workers, each running their own WASM instance.
+ * Enables true parallel processing across CPU cores.
+ *
+ * Features:
+ * - Automatic worker scaling based on hardware concurrency
+ * - Task queue with load balancing
+ * - Support for SharedArrayBuffer (zero-copy) when available
+ * - Graceful degradation to transferable ArrayBuffers
+ */
+export class WorkerPool {
+    /**
+     * Create a new worker pool.
+     * @param {number} size - Number of workers (default: navigator.hardwareConcurrency)
+     * @param {string} workerPath - Path to worker.js
+     */
+    constructor(size = null, workerPath = './worker.js') {
+        this.size = size || navigator.hardwareConcurrency || 4;
+        this.workerPath = workerPath;
+        this.workers = [];
+        this.taskQueue = [];
+        this.pendingTasks = new Map();
+        this.nextTaskId = 0;
+        this.idleWorkers = [];
+        this.initialized = false;
+
+        // Check for SharedArrayBuffer support
+        this.hasSharedArrayBuffer = typeof SharedArrayBuffer !== 'undefined';
+    }
+
+    /**
+     * Initialize all workers.
+     * @returns {Promise<void>}
+     */
+    async init() {
+        if (this.initialized) return;
+
+        const initPromises = [];
+
+        for (let i = 0; i < this.size; i++) {
+            const worker = new Worker(this.workerPath, { type: 'module' });
+            this.workers.push(worker);
+
+            // Set up message handling
+            worker.onmessage = (e) => this._handleMessage(i, e.data);
+            worker.onerror = (e) => this._handleError(i, e);
+
+            // Initialize worker with WASM
+            initPromises.push(this._initWorker(i));
+        }
+
+        await Promise.all(initPromises);
+        this.initialized = true;
+
+        console.log(`[WorkerPool] Initialized ${this.size} workers (SharedArrayBuffer: ${this.hasSharedArrayBuffer})`);
+    }
+
+    /**
+     * Initialize a single worker.
+     * @private
+     */
+    _initWorker(workerId) {
+        return new Promise((resolve, reject) => {
+            const taskId = this.nextTaskId++;
+
+            this.pendingTasks.set(taskId, {
+                resolve: (result) => {
+                    this.idleWorkers.push(workerId);
+                    resolve(result);
+                },
+                reject
+            });
+
+            this.workers[workerId].postMessage({
+                type: 'init',
+                id: taskId,
+                params: { workerId }
+            });
+        });
+    }
+
+    /**
+     * Handle message from worker.
+     * @private
+     */
+    _handleMessage(workerId, data) {
+        // Handle ready message (initial worker startup)
+        if (data.type === 'ready') {
+            return;
+        }
+
+        const { id, success, result, error } = data;
+        const task = this.pendingTasks.get(id);
+
+        if (!task) {
+            console.warn(`[WorkerPool] Unknown task ID: ${id}`);
+            return;
+        }
+
+        this.pendingTasks.delete(id);
+
+        if (success) {
+            task.resolve(result);
+        } else {
+            task.reject(new Error(error));
+        }
+
+        // Worker is now idle
+        this.idleWorkers.push(workerId);
+
+        // Process next task in queue
+        this._processQueue();
+    }
+
+    /**
+     * Handle worker error.
+     * @private
+     */
+    _handleError(workerId, error) {
+        console.error(`[WorkerPool] Worker ${workerId} error:`, error);
+    }
+
+    /**
+     * Process next task in queue.
+     * @private
+     */
+    _processQueue() {
+        while (this.taskQueue.length > 0 && this.idleWorkers.length > 0) {
+            const task = this.taskQueue.shift();
+            const workerId = this.idleWorkers.shift();
+            this._sendTask(workerId, task);
+        }
+    }
+
+    /**
+     * Send task to worker.
+     * @private
+     */
+    _sendTask(workerId, task) {
+        const worker = this.workers[workerId];
+        const transfer = task.transfer || [];
+
+        worker.postMessage({
+            type: task.type,
+            id: task.id,
+            params: task.params
+        }, transfer);
+    }
+
+    /**
+     * Submit a task to the pool.
+     * @param {string} type - Task type
+     * @param {Object} params - Task parameters
+     * @param {Array} transfer - Transferable objects
+     * @returns {Promise<any>}
+     */
+    submit(type, params, transfer = []) {
+        return new Promise((resolve, reject) => {
+            const taskId = this.nextTaskId++;
+
+            this.pendingTasks.set(taskId, { resolve, reject });
+
+            const task = { type, params, transfer, id: taskId };
+
+            if (this.idleWorkers.length > 0) {
+                const workerId = this.idleWorkers.shift();
+                this._sendTask(workerId, task);
+            } else {
+                this.taskQueue.push(task);
+            }
+        });
+    }
+
+    /**
+     * Parallel vector search across multiple data chunks.
+     *
+     * @param {Float32Array} query - Query vector
+     * @param {Array<{vectors: Float32Array, startIndex: number}>} chunks - Data chunks
+     * @param {number} dim - Vector dimension
+     * @param {number} topK - Number of results per chunk
+     * @param {boolean} normalized - Whether vectors are L2-normalized
+     * @returns {Promise<{indices: Uint32Array, scores: Float32Array}>}
+     */
+    async parallelVectorSearch(query, chunks, dim, topK, normalized = false) {
+        if (!this.initialized) {
+            await this.init();
+        }
+
+        // Submit search task to each worker
+        const searchPromises = chunks.map((chunk, i) => {
+            // Copy query for each worker (will be transferred)
+            const queryCopy = new Float32Array(query);
+
+            return this.submit('vectorSearch', {
+                vectors: chunk.vectors,
+                query: queryCopy,
+                dim,
+                numVectors: chunk.vectors.length / dim,
+                topK,
+                startIndex: chunk.startIndex,
+                normalized
+            }, [chunk.vectors.buffer, queryCopy.buffer]);
+        });
+
+        // Wait for all workers
+        const results = await Promise.all(searchPromises);
+
+        // Merge results from all workers
+        return this._mergeTopK(results, topK);
+    }
+
+    /**
+     * Merge top-k results from multiple workers.
+     * @private
+     */
+    _mergeTopK(results, topK) {
+        // Collect all results
+        const allResults = [];
+
+        for (const result of results) {
+            for (let i = 0; i < result.count; i++) {
+                allResults.push({
+                    index: result.indices[i],
+                    score: result.scores[i]
+                });
+            }
+        }
+
+        // Sort by score descending
+        allResults.sort((a, b) => b.score - a.score);
+
+        // Take top-k
+        const finalK = Math.min(topK, allResults.length);
+        const indices = new Uint32Array(finalK);
+        const scores = new Float32Array(finalK);
+
+        for (let i = 0; i < finalK; i++) {
+            indices[i] = allResults[i].index;
+            scores[i] = allResults[i].score;
+        }
+
+        return { indices, scores };
+    }
+
+    /**
+     * Parallel batch similarity computation.
+     *
+     * @param {Float32Array} query - Query vector
+     * @param {Array<Float32Array>} vectorChunks - Chunks of vectors
+     * @param {number} dim - Vector dimension
+     * @param {boolean} normalized - Whether vectors are L2-normalized
+     * @returns {Promise<Float32Array>} - All similarity scores
+     */
+    async parallelBatchSimilarity(query, vectorChunks, dim, normalized = false) {
+        if (!this.initialized) {
+            await this.init();
+        }
+
+        const similarityPromises = vectorChunks.map(chunk => {
+            const queryCopy = new Float32Array(query);
+            return this.submit('batchSimilarity', {
+                query: queryCopy,
+                vectors: chunk,
+                dim,
+                numVectors: chunk.length / dim,
+                normalized
+            }, [chunk.buffer, queryCopy.buffer]);
+        });
+
+        const results = await Promise.all(similarityPromises);
+
+        // Concatenate all scores
+        const totalLength = results.reduce((sum, r) => sum + r.scores.length, 0);
+        const allScores = new Float32Array(totalLength);
+
+        let offset = 0;
+        for (const result of results) {
+            allScores.set(result.scores, offset);
+            offset += result.scores.length;
+        }
+
+        return allScores;
+    }
+
+    /**
+     * Terminate all workers.
+     */
+    terminate() {
+        for (const worker of this.workers) {
+            worker.terminate();
+        }
+        this.workers = [];
+        this.idleWorkers = [];
+        this.initialized = false;
+    }
+}
+
+// ============================================================================
+// SharedArrayBuffer Vector Store - Zero-copy data sharing
+// ============================================================================
+
+/**
+ * SharedVectorStore provides zero-copy data sharing between main thread and workers.
+ * Requires Cross-Origin-Isolation (COOP/COEP headers).
+ */
+export class SharedVectorStore {
+    constructor() {
+        this.buffer = null;
+        this.vectors = null;
+        this.dim = 0;
+        this.numVectors = 0;
+
+        if (typeof SharedArrayBuffer === 'undefined') {
+            console.warn('[SharedVectorStore] SharedArrayBuffer not available. Using regular ArrayBuffer.');
+        }
+    }
+
+    /**
+     * Check if SharedArrayBuffer is available.
+     */
+    static isAvailable() {
+        return typeof SharedArrayBuffer !== 'undefined' &&
+               typeof Atomics !== 'undefined';
+    }
+
+    /**
+     * Allocate shared memory for vectors.
+     *
+     * @param {number} numVectors - Number of vectors to store
+     * @param {number} dim - Vector dimension
+     */
+    allocate(numVectors, dim) {
+        this.numVectors = numVectors;
+        this.dim = dim;
+
+        const byteLength = numVectors * dim * 4; // float32
+
+        if (SharedVectorStore.isAvailable()) {
+            this.buffer = new SharedArrayBuffer(byteLength);
+        } else {
+            // Fallback to regular ArrayBuffer
+            this.buffer = new ArrayBuffer(byteLength);
+        }
+
+        this.vectors = new Float32Array(this.buffer);
+    }
+
+    /**
+     * Copy vectors into shared memory.
+     *
+     * @param {Float32Array} source - Source vectors
+     * @param {number} startIndex - Starting index in store
+     */
+    set(source, startIndex = 0) {
+        this.vectors.set(source, startIndex * this.dim);
+    }
+
+    /**
+     * Get a slice of vectors (view, not copy).
+     *
+     * @param {number} start - Start vector index
+     * @param {number} count - Number of vectors
+     * @returns {Float32Array}
+     */
+    slice(start, count) {
+        const startOffset = start * this.dim;
+        const length = count * this.dim;
+        return new Float32Array(this.buffer, startOffset * 4, length);
+    }
+
+    /**
+     * Get chunk boundaries for parallel processing.
+     *
+     * @param {number} numChunks - Number of chunks
+     * @returns {Array<{start: number, count: number}>}
+     */
+    getChunks(numChunks) {
+        const chunks = [];
+        const chunkSize = Math.ceil(this.numVectors / numChunks);
+
+        for (let i = 0; i < numChunks; i++) {
+            const start = i * chunkSize;
+            const count = Math.min(chunkSize, this.numVectors - start);
+            if (count > 0) {
+                chunks.push({ start, count });
+            }
+        }
+
+        return chunks;
+    }
 }
 
 // Default export for convenience

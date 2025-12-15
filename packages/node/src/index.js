@@ -175,8 +175,16 @@ class Statement {
     get busy() { return false; } // Synchronous execution
 
     all(...params) {
+        if (!this._stmt) {
+            throw new SqliteError('Statement has been finalized', 'SQLITE_MISUSE');
+        }
+
+        // Use bound params if no params provided
+        const actualParams = params.length > 0 ? params : (this._boundParams || []);
+
         try {
-            let rows = this._stmt.all();
+            // Pass parameters to native binding
+            let rows = this._stmt.all(...actualParams);
 
             // Apply formatting modifiers
             if (this._raw) {
@@ -264,8 +272,8 @@ class Statement {
     }
 
     bind(...params) {
-        // Bind parameters (for v0.1.0, this is a no-op since we don't support params yet)
-        // Just return this for chaining
+        // Store parameters for use in all/get/run
+        this._boundParams = params;
         return this;
     }
 

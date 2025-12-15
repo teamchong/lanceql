@@ -160,6 +160,46 @@ pub const Table = struct {
         return self.readFloat64Column(@intCast(idx));
     }
 
+    /// Read all int32 values from a column.
+    pub fn readInt32Column(self: Self, col_idx: u32) TableError![]i32 {
+        const buffer_data = try self.getColumnBuffer(col_idx);
+        const decoder = PlainDecoder.init(buffer_data);
+        return decoder.readAllInt32(self.allocator) catch return TableError.OutOfMemory;
+    }
+
+    /// Read all int32 values from a column by name.
+    pub fn readInt32ColumnByName(self: Self, name: []const u8) TableError![]i32 {
+        const idx = self.columnIndex(name) orelse return TableError.ColumnNotFound;
+        return self.readInt32Column(@intCast(idx));
+    }
+
+    /// Read all float32 values from a column.
+    pub fn readFloat32Column(self: Self, col_idx: u32) TableError![]f32 {
+        const buffer_data = try self.getColumnBuffer(col_idx);
+        const decoder = PlainDecoder.init(buffer_data);
+        return decoder.readAllFloat32(self.allocator) catch return TableError.OutOfMemory;
+    }
+
+    /// Read all float32 values from a column by name.
+    pub fn readFloat32ColumnByName(self: Self, name: []const u8) TableError![]f32 {
+        const idx = self.columnIndex(name) orelse return TableError.ColumnNotFound;
+        return self.readFloat32Column(@intCast(idx));
+    }
+
+    /// Read all boolean values from a column.
+    pub fn readBoolColumn(self: Self, col_idx: u32) TableError![]bool {
+        const buffer_data = try self.getColumnBuffer(col_idx);
+        const row_count = try self.numRows(col_idx);
+        const decoder = PlainDecoder.init(buffer_data);
+        return decoder.readAllBool(self.allocator, row_count) catch return TableError.OutOfMemory;
+    }
+
+    /// Read all boolean values from a column by name.
+    pub fn readBoolColumnByName(self: Self, name: []const u8) TableError![]bool {
+        const idx = self.columnIndex(name) orelse return TableError.ColumnNotFound;
+        return self.readBoolColumn(@intCast(idx));
+    }
+
     /// Read raw column buffer (first page, first buffer).
     pub fn getColumnBuffer(self: Self, col_idx: u32) TableError![]const u8 {
         const col_meta_bytes = self.lance_file.getColumnMetadataBytes(col_idx) catch {
