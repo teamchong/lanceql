@@ -46,3 +46,4 @@ node_modules/
 
 CLAUDE.md
 tests/fixtures/lance-repo
+.claude/TODO.md
