@@ -10,7 +10,7 @@ import os
 BENCHMARKS = [
     ("01_time_travel.py", "Time Travel"),
     ("02_updates.py", "Updates & Deletes"),
-    ("03_vector_search.py", "Vector Search"),
+    ("03_vector_search.py", "Vector Search (Lance-only feature)"),
     ("04_query_speed.py", "Query Speed"),
     ("05_compression.py", "Compression"),
 ]

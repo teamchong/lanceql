@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-Benchmark: Vector Search
-Lance has native ANN (Approximate Nearest Neighbor) search.
-Parquet requires external libraries (FAISS, Annoy, etc.).
+Feature Demo: Vector Search
+Lance has native ANN (Approximate Nearest Neighbor) search built-in.
+Parquet has NO vector search capability - this is a Lance-only feature.
+
+This demonstrates Lance's vector search performance.
+Parquet cannot do this at all without external tools like FAISS.
 """
 
 import time
@@ -10,16 +13,7 @@ import tempfile
 import os
 import numpy as np
 import pyarrow as pa
-import pyarrow.parquet as pq
 import lancedb
-
-# Try to import FAISS, fall back gracefully
-try:
-    import faiss
-    HAS_FAISS = True
-except ImportError:
-    HAS_FAISS = False
-    print("⚠️  FAISS not installed. Install with: pip install faiss-cpu")
 
 NUM_VECTORS = 100_000
 VECTOR_DIM = 384  # Common embedding dimension (e.g., MiniLM)
@@ -49,10 +43,11 @@ def benchmark_lance_vector_search(tmpdir: str, data: pa.Table, queries: np.ndarr
     tbl = db.create_table("vectors", data)
     write_time = time.perf_counter() - start
 
-    # Create index
+    # Create index on the embedding column
     start = time.perf_counter()
     tbl.create_index(
         metric="cosine",
+        vector_column_name="embedding",
         num_partitions=256,
         num_sub_vectors=48,
     )
@@ -66,62 +61,16 @@ def benchmark_lance_vector_search(tmpdir: str, data: pa.Table, queries: np.ndarr
         search_times.append(time.perf_counter() - start)
 
     return {
-        "format": "Lance",
         "write_time": write_time,
         "index_time": index_time,
         "search_time_avg": np.mean(search_times),
         "search_time_p99": np.percentile(search_times, 99),
         "qps": len(queries) / sum(search_times),
-        "native_vector_search": True,
-    }
-
-def benchmark_parquet_faiss(tmpdir: str, data: pa.Table, embeddings: np.ndarray, queries: np.ndarray) -> dict:
-    """Parquet + FAISS: External vector index."""
-    if not HAS_FAISS:
-        return {
-            "format": "Parquet + FAISS",
-            "error": "FAISS not installed",
-        }
-
-    parquet_path = os.path.join(tmpdir, "vectors.parquet")
-    index_path = os.path.join(tmpdir, "vectors.faiss")
-
-    # Write parquet (without embeddings for fair comparison, or with)
-    start = time.perf_counter()
-    pq.write_table(data, parquet_path)
-    write_time = time.perf_counter() - start
-
-    # Build FAISS index
-    start = time.perf_counter()
-    # IVF index similar to Lance's
-    nlist = 256  # Number of clusters
-    quantizer = faiss.IndexFlatIP(VECTOR_DIM)  # Inner product for cosine
-    index = faiss.IndexIVFFlat(quantizer, VECTOR_DIM, nlist, faiss.METRIC_INNER_PRODUCT)
-    index.train(embeddings)
-    index.add(embeddings)
-    index.nprobe = 16  # Search 16 clusters
-    index_time = time.perf_counter() - start
-
-    # Search
-    search_times = []
-    for query in queries:
-        start = time.perf_counter()
-        distances, indices = index.search(query.reshape(1, -1), TOP_K)
-        search_times.append(time.perf_counter() - start)
-
-    return {
-        "format": "Parquet + FAISS",
-        "write_time": write_time,
-        "index_time": index_time,
-        "search_time_avg": np.mean(search_times),
-        "search_time_p99": np.percentile(search_times, 99),
-        "qps": len(queries) / sum(search_times),
-        "native_vector_search": False,
     }
 
 def main():
     print("=" * 60)
-    print("Benchmark: Vector Search")
+    print("Feature Demo: Lance Native Vector Search")
     print(f"  Vectors: {NUM_VECTORS:,}")
     print(f"  Dimensions: {VECTOR_DIM}")
     print(f"  Queries: {NUM_QUERIES}")
@@ -134,35 +83,31 @@ def main():
     queries = queries / np.linalg.norm(queries, axis=1, keepdims=True)
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        print("\n⏳ Benchmarking Lance...")
-        lance_results = benchmark_lance_vector_search(tmpdir, data, queries)
+        print("\n⏳ Benchmarking Lance vector search...")
+        results = benchmark_lance_vector_search(tmpdir, data, queries)
 
-        print("⏳ Benchmarking Parquet + FAISS...")
-        faiss_results = benchmark_parquet_faiss(tmpdir, data, embeddings, queries)
-
-    print("\nResults:")
+    print("\nLance Vector Search Results:")
     print("-" * 60)
-    print(f"{'Metric':<25} {'Lance':>15} {'Parquet+FAISS':>15}")
-    print("-" * 60)
-    print(f"{'Native Vector Search':<25} {'✅ Yes':>15} {'❌ No':>15}")
-    print(f"{'Write Time':<25} {lance_results['write_time']:>13.2f}s {faiss_results.get('write_time', 0):>13.2f}s")
-    print(f"{'Index Time':<25} {lance_results['index_time']:>13.2f}s {faiss_results.get('index_time', 0):>13.2f}s")
-    print(f"{'Search Time (avg)':<25} {lance_results['search_time_avg']*1000:>11.2f}ms {faiss_results.get('search_time_avg', 0)*1000:>11.2f}ms")
-    print(f"{'Search Time (p99)':<25} {lance_results['search_time_p99']*1000:>11.2f}ms {faiss_results.get('search_time_p99', 0)*1000:>11.2f}ms")
-    print(f"{'Queries/sec':<25} {lance_results['qps']:>13.0f} {faiss_results.get('qps', 0):>13.0f}")
+    print(f"  Write Time:           {results['write_time']:.2f}s")
+    print(f"  Index Build Time:     {results['index_time']:.2f}s")
+    print(f"  Search Time (avg):    {results['search_time_avg']*1000:.2f}ms")
+    print(f"  Search Time (p99):    {results['search_time_p99']*1000:.2f}ms")
+    print(f"  Queries/sec:          {results['qps']:.0f}")
     print("-" * 60)
 
-    print("\n📝 Key Advantages of Lance:")
-    print("   • Single file format - no separate index files to manage")
-    print("   • Automatic index updates on data changes")
-    print("   • Combined SQL + vector search in one query")
-    print("   • Works with HTTP Range requests (browser/remote)")
-
-    print("\n📝 Parquet + FAISS Drawbacks:")
-    print("   • Must maintain separate index files")
-    print("   • Index must be rebuilt on data changes")
-    print("   • Complex deployment (multiple files)")
-    print("   • No combined SQL + vector filtering")
+    print("\n💡 Why this matters for Parquet users:")
+    print("   Parquet has NO vector search capability.")
+    print("   To add vector search to Parquet, you need:")
+    print("   • External library (FAISS, Annoy, ScaNN)")
+    print("   • Separate index files to manage")
+    print("   • Manual index rebuild on data changes")
+    print("   • Complex deployment (data + index files)")
+    print()
+    print("   Lance provides all this built-in:")
+    print("   ✅ Native ANN search in single file format")
+    print("   ✅ Automatic index updates on data changes")
+    print("   ✅ Combined SQL + vector search in one query")
+    print("   ✅ Works with HTTP Range requests (browser/remote)")
 
 if __name__ == "__main__":
     main()
