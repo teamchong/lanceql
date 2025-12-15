@@ -1,0 +1,54 @@
+{
+  "name": "lanceql",
+  "version": "0.1.0",
+  "description": "Query Lance columnar files in the browser with SQL and vector search",
+  "main": "dist/lanceql.js",
+  "module": "dist/lanceql.esm.js",
+  "types": "dist/lanceql.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/lanceql.esm.js",
+      "require": "./dist/lanceql.js",
+      "types": "./dist/lanceql.d.ts"
+    },
+    "./wasm": "./dist/lanceql.wasm"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "npm run build:wasm && npm run build:js",
+    "build:wasm": "cd ../.. && zig build wasm && cp zig-out/bin/lanceql.wasm packages/lanceql/dist/",
+    "build:js": "node scripts/build.js",
+    "test": "node --test test/*.test.js",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "lance",
+    "columnar",
+    "sql",
+    "wasm",
+    "webassembly",
+    "arrow",
+    "vector-search",
+    "analytics",
+    "browser"
+  ],
+  "author": "LanceQL Contributors",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/teamchong/lanceql.git",
+    "directory": "packages/lanceql"
+  },
+  "homepage": "https://github.com/teamchong/lanceql#readme",
+  "bugs": {
+    "url": "https://github.com/teamchong/lanceql/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.0"
+  }
+}
