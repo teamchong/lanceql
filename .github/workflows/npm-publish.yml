@@ -8,10 +8,10 @@ on:
       package:
         description: 'Package to publish'
         required: true
-        default: 'lanceql'
+        default: 'browser'
         type: choice
         options:
-          - lanceql
+          - browser
 
 jobs:
   build-and-publish:
@@ -38,18 +38,18 @@ jobs:
         run: zig build wasm -Doptimize=ReleaseSmall
 
       - name: Copy WASM to package
-        run: cp zig-out/bin/lanceql.wasm packages/lanceql/dist/
+        run: cp zig-out/bin/lanceql.wasm packages/browser/dist/
 
       - name: Build package
-        working-directory: packages/lanceql
+        working-directory: packages/browser
         run: node scripts/build.js
 
       - name: Run tests
-        working-directory: packages/lanceql
+        working-directory: packages/browser
         run: node --test test/*.test.js
 
       - name: Publish to npm
-        working-directory: packages/lanceql
+        working-directory: packages/browser
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

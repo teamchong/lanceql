@@ -1,4 +1,4 @@
-# lanceql
+# @lanceql/browser
 
 Query Lance columnar files in the browser with SQL and vector search. No server required.
 
@@ -13,13 +13,13 @@ Query Lance columnar files in the browser with SQL and vector search. No server 
 ## Installation
 
 ```bash
-npm install lanceql
+npm install @lanceql/browser
 ```
 
 ## Quick Start
 
 ```javascript
-import { LanceQL } from 'lanceql';
+import { LanceQL } from '@lanceql/browser';
 
 // Load the WASM module
 const lanceql = await LanceQL.load();

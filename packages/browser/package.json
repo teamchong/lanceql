@@ -1,5 +1,5 @@
 {
-  "name": "lanceql",
+  "name": "@lanceql/browser",
   "version": "0.1.0",
   "description": "Query Lance columnar files in the browser with SQL and vector search",
   "main": "dist/lanceql.js",
@@ -18,7 +18,7 @@
   ],
   "scripts": {
     "build": "npm run build:wasm && npm run build:js",
-    "build:wasm": "cd ../.. && zig build wasm && cp zig-out/bin/lanceql.wasm packages/lanceql/dist/",
+    "build:wasm": "cd ../.. && zig build wasm && cp zig-out/bin/lanceql.wasm packages/browser/dist/",
     "build:js": "node scripts/build.js",
     "test": "node --test test/*.test.js",
     "prepublishOnly": "npm run build"
@@ -39,7 +39,7 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/teamchong/lanceql.git",
-    "directory": "packages/lanceql"
+    "directory": "packages/browser"
   },
   "homepage": "https://github.com/teamchong/lanceql#readme",
   "bugs": {
