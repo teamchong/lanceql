@@ -352,6 +352,49 @@ pub const Table = struct {
         const idx = self.columnIndex(name) orelse return TableError.ColumnNotFound;
         return self.readStringColumn(@intCast(idx));
     }
+
+    /// String column buffers for zero-copy Arrow export.
+    pub const StringBuffers = struct {
+        offsets: []const u8, // Raw Lance offsets buffer (int32 end positions)
+        data: []const u8, // Raw string data buffer
+    };
+
+    /// Get raw string column buffers for zero-copy Arrow export.
+    /// Returns the raw offsets and data buffers without decoding.
+    pub fn getStringColumnBuffers(self: Self, col_idx: u32) TableError!StringBuffers {
+        const col_meta_bytes = self.lance_file.getColumnMetadataBytes(col_idx) catch {
+            return TableError.ColumnOutOfBounds;
+        };
+
+        var col_meta = ColumnMetadata.parse(self.allocator, col_meta_bytes) catch {
+            return TableError.InvalidMetadata;
+        };
+        defer col_meta.deinit(self.allocator);
+
+        if (col_meta.pages.len == 0) return TableError.NoPages;
+        const page = col_meta.pages[0];
+
+        if (page.buffer_offsets.len < 2) return TableError.InvalidMetadata;
+
+        // Buffer 0 = offsets array
+        const offsets_offset = page.buffer_offsets[0];
+        const offsets_size = page.buffer_sizes[0];
+        const offsets_buffer = self.lance_file.readBytes(offsets_offset, offsets_size) catch {
+            return TableError.InvalidMetadata;
+        };
+
+        // Buffer 1 = string data
+        const data_offset = page.buffer_offsets[1];
+        const data_size = page.buffer_sizes[1];
+        const data_buffer = self.lance_file.readBytes(data_offset, data_size) catch {
+            return TableError.InvalidMetadata;
+        };
+
+        return StringBuffers{
+            .offsets = offsets_buffer,
+            .data = data_buffer,
+        };
+    }
 };
 
 // ============================================================================

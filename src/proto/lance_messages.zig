@@ -214,27 +214,66 @@ test "parse empty column metadata" {
 }
 
 test "column metadata row count" {
-    var meta = ColumnMetadata{
-        .encoding = .none,
-        .pages = &[_]Page{
-            .{
-                .buffer_offsets = &[_]u64{},
-                .buffer_sizes = &[_]u64{},
-                .length = 100,
-                .encoding = .none,
-                .priority = 0,
-            },
-            .{
-                .buffer_offsets = &[_]u64{},
-                .buffer_sizes = &[_]u64{},
-                .length = 200,
-                .encoding = .none,
-                .priority = 100,
-            },
+    // Manual test with const pages array (can't use allocator for static pages)
+    var pages = [_]Page{
+        .{
+            .buffer_offsets = &[_]u64{},
+            .buffer_sizes = &[_]u64{},
+            .length = 100,
+            .encoding = .none,
+            .priority = 0,
         },
+        .{
+            .buffer_offsets = &[_]u64{},
+            .buffer_sizes = &[_]u64{},
+            .length = 200,
+            .encoding = .none,
+            .priority = 100,
+        },
+    };
+    const meta = ColumnMetadata{
+        .encoding = .none,
+        .pages = &pages,
         .buffer_offsets = &[_]u64{},
         .buffer_sizes = &[_]u64{},
     };
 
     try std.testing.expectEqual(@as(u64, 300), meta.rowCount());
+}
+
+test "parse lancedb column metadata" {
+    // Column 0 metadata from lancedb-created file (105 bytes)
+    // Contains: encoding, 1 page with length=3
+    const col_meta = [_]u8{
+        0x0a, 0x29, 0x12, 0x27, 0x0a, 0x25, 0x0a, 0x1f, 0x2f, 0x6c, 0x61, 0x6e, 0x63, 0x65, 0x2e, 0x65,
+        0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0x73, 0x2e, 0x43, 0x6f, 0x6c, 0x75, 0x6d, 0x6e, 0x45,
+        0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0x12, 0x02, 0x0a, 0x00, 0x12, 0x3c, 0x0a, 0x01, 0x00,
+        0x12, 0x01, 0x18, 0x18, 0x03, 0x22, 0x32, 0x12, 0x30, 0x0a, 0x2e, 0x0a, 0x1e, 0x2f, 0x6c, 0x61,
+        0x6e, 0x63, 0x65, 0x2e, 0x65, 0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0x73, 0x2e, 0x41, 0x72,
+        0x72, 0x61, 0x79, 0x45, 0x6e, 0x63, 0x6f, 0x64, 0x69, 0x6e, 0x67, 0x12, 0x0c, 0x12, 0x0a, 0x0a,
+        0x08, 0x0a, 0x06, 0x0a, 0x04, 0x08, 0x40, 0x12, 0x00,
+    };
+
+    const allocator = std.testing.allocator;
+    var meta = try ColumnMetadata.parse(allocator, &col_meta);
+    defer meta.deinit(allocator);
+
+    // Debug output
+    std.debug.print("\nParsed column metadata:\n", .{});
+    std.debug.print("  encoding: {any}\n", .{meta.encoding});
+    std.debug.print("  pages.len: {d}\n", .{meta.pages.len});
+    for (meta.pages, 0..) |page, i| {
+        std.debug.print("  page[{d}]: length={d}, buffer_offsets.len={d}, buffer_sizes.len={d}\n", .{
+            i,
+            page.length,
+            page.buffer_offsets.len,
+            page.buffer_sizes.len,
+        });
+    }
+    std.debug.print("  rowCount: {d}\n", .{meta.rowCount()});
+
+    // Should have 1 page with length=3
+    try std.testing.expectEqual(@as(usize, 1), meta.pages.len);
+    try std.testing.expectEqual(@as(u64, 3), meta.pages[0].length);
+    try std.testing.expectEqual(@as(u64, 3), meta.rowCount());
 }

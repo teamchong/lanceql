@@ -338,28 +338,20 @@ class ParquetFile:
             name = self._column_names[col_idx]
             col_type = self._column_types[col_idx]
 
-            # Use ACTUAL type from schema, not guessing!
+            # Use zero-copy Arrow C Data Interface for numeric types
             if col_type in ("int64", "Int64"):
-                data = self._file.read_int64_column(col_idx)
-                arrays.append(pa.array(data, type=pa.int64()))
+                arr = self._file.read_int64_column_arrow(col_idx)
+                arrays.append(arr)
             elif col_type in ("float64", "double", "Float64"):
-                data = self._file.read_float64_column(col_idx)
-                arrays.append(pa.array(data, type=pa.float64()))
+                arr = self._file.read_float64_column_arrow(col_idx)
+                arrays.append(arr)
             elif col_type in ("string", "utf8", "String"):
-                data = self._file.read_string_column(col_idx)
-                arrays.append(pa.array(data, type=pa.string()))
-            # TODO: Add support for other types as they're implemented
-            # elif col_type in ("int32", "Int32"):
-            #     data = self._file.read_int32_column(col_idx)
-            #     arrays.append(pa.array(data, type=pa.int32()))
-            # elif col_type in ("float32", "Float32"):
-            #     data = self._file.read_float32_column(col_idx)
-            #     arrays.append(pa.array(data, type=pa.float32()))
+                # Zero-copy via Arrow C Data Interface (data buffer is zero-copy)
+                arr = self._file.read_string_column_arrow(col_idx)
+                arrays.append(arr)
             else:
                 # Unsupported type - create null array with expected row count
-                # This maintains schema consistency even for unimplemented types
                 row_count = self._file.row_count(col_idx)
-                # Get the PyArrow type from schema to maintain type consistency
                 schema_field = self._schema.field(name)
                 arrays.append(pa.array([None] * row_count, type=schema_field.type))
 

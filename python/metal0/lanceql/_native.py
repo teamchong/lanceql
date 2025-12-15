@@ -1,10 +1,22 @@
-"""Native ctypes bindings for lanceql shared library."""
+"""Native ctypes bindings for lanceql shared library.
+
+Supports two data transfer modes:
+1. Copy mode (default): Data is copied through ctypes - slower but always works
+2. Zero-copy mode: Uses Arrow C Data Interface for direct memory sharing
+
+Zero-copy requires pyarrow to be installed. When available, use read_column_arrow()
+for best performance - the data stays in Zig-allocated memory and is imported
+directly into PyArrow without copying.
+"""
 
 import ctypes
 from pathlib import Path
 import sys
 import numpy as np
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 
 # Platform-specific library name
@@ -50,22 +62,7 @@ _lib.lance_column_type.argtypes = [
 ]
 _lib.lance_column_type.restype = ctypes.c_size_t
 
-_lib.lance_read_int64.argtypes = [
-    ctypes.c_void_p,
-    ctypes.c_uint32,
-    ctypes.POINTER(ctypes.c_int64),
-    ctypes.c_size_t,
-]
-_lib.lance_read_int64.restype = ctypes.c_size_t
-
-_lib.lance_read_float64.argtypes = [
-    ctypes.c_void_p,
-    ctypes.c_uint32,
-    ctypes.POINTER(ctypes.c_double),
-    ctypes.c_size_t,
-]
-_lib.lance_read_float64.restype = ctypes.c_size_t
-
+# String column still uses copy-based API (no Arrow string export yet)
 _lib.lance_read_string.argtypes = [
     ctypes.c_void_p,
     ctypes.c_uint32,
@@ -74,6 +71,37 @@ _lib.lance_read_string.argtypes = [
     ctypes.c_size_t,
 ]
 _lib.lance_read_string.restype = ctypes.c_size_t
+
+# Arrow C Data Interface functions for zero-copy export
+_lib.lance_export_int64_column.argtypes = [
+    ctypes.c_void_p,  # handle
+    ctypes.c_uint32,  # col_idx
+    ctypes.POINTER(ctypes.c_void_p),  # out_schema
+    ctypes.POINTER(ctypes.c_void_p),  # out_array
+]
+_lib.lance_export_int64_column.restype = ctypes.c_uint32
+
+_lib.lance_export_float64_column.argtypes = [
+    ctypes.c_void_p,  # handle
+    ctypes.c_uint32,  # col_idx
+    ctypes.POINTER(ctypes.c_void_p),  # out_schema
+    ctypes.POINTER(ctypes.c_void_p),  # out_array
+]
+_lib.lance_export_float64_column.restype = ctypes.c_uint32
+
+_lib.lance_release_schema.argtypes = [ctypes.c_void_p]
+_lib.lance_release_schema.restype = None
+
+_lib.lance_release_array.argtypes = [ctypes.c_void_p]
+_lib.lance_release_array.restype = None
+
+_lib.lance_export_string_column.argtypes = [
+    ctypes.c_void_p,  # handle
+    ctypes.c_uint32,  # col_idx
+    ctypes.POINTER(ctypes.c_void_p),  # out_schema
+    ctypes.POINTER(ctypes.c_void_p),  # out_array
+]
+_lib.lance_export_string_column.restype = ctypes.c_uint32
 
 
 class LanceFile:
@@ -92,9 +120,10 @@ class LanceFile:
         if not isinstance(data, bytes):
             raise TypeError(f"Expected bytes, got {type(data)}")
 
-        # Create C array
-        c_data = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
-        self._handle = _lib.lance_open_memory(c_data, len(data))
+        # Create C array and keep reference to prevent garbage collection
+        # The Zig code stores a pointer to this data, so it must stay alive
+        self._c_data = (ctypes.c_uint8 * len(data)).from_buffer_copy(data)
+        self._handle = _lib.lance_open_memory(self._c_data, len(data))
 
         if not self._handle:
             raise ValueError("Failed to open Lance file")
@@ -150,50 +179,6 @@ class LanceFile:
             return ""
         return bytes(buf[:length]).decode("utf-8")
 
-    def read_int64_column(self, col_idx: int) -> np.ndarray:
-        """Read an int64 column.
-
-        Args:
-            col_idx: Column index (0-based)
-
-        Returns:
-            NumPy array of int64 values
-        """
-        row_count = self.row_count(col_idx)
-        if row_count == 0:
-            return np.array([], dtype=np.int64)
-
-        out = np.zeros(row_count, dtype=np.int64)
-        actual = _lib.lance_read_int64(
-            self._handle,
-            col_idx,
-            out.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
-            row_count,
-        )
-        return out[:actual]
-
-    def read_float64_column(self, col_idx: int) -> np.ndarray:
-        """Read a float64 column.
-
-        Args:
-            col_idx: Column index (0-based)
-
-        Returns:
-            NumPy array of float64 values
-        """
-        row_count = self.row_count(col_idx)
-        if row_count == 0:
-            return np.array([], dtype=np.float64)
-
-        out = np.zeros(row_count, dtype=np.float64)
-        actual = _lib.lance_read_float64(
-            self._handle,
-            col_idx,
-            out.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
-            row_count,
-        )
-        return out[:actual]
-
     def read_string_column(self, col_idx: int) -> list[str]:
         """Read a string column.
 
@@ -223,6 +208,130 @@ class LanceFile:
             result.append(string_bytes.decode("utf-8"))
 
         return result
+
+    def read_int64_column_arrow(self, col_idx: int) -> "pa.Array":
+        """Read an int64 column as a PyArrow array (zero-copy).
+
+        This uses the Arrow C Data Interface to share memory directly
+        between Zig and Python without copying.
+
+        Args:
+            col_idx: Column index (0-based)
+
+        Returns:
+            PyArrow Int64Array
+
+        Raises:
+            ImportError: If pyarrow is not installed
+            ValueError: If column cannot be exported
+        """
+        import pyarrow as pa
+
+        schema_ptr = ctypes.c_void_p()
+        array_ptr = ctypes.c_void_p()
+
+        result = _lib.lance_export_int64_column(
+            self._handle,
+            col_idx,
+            ctypes.byref(schema_ptr),
+            ctypes.byref(array_ptr),
+        )
+
+        if result == 0:
+            raise ValueError(f"Failed to export column {col_idx} as Arrow")
+
+        try:
+            # Import via Arrow C Data Interface
+            return pa.Array._import_from_c(array_ptr.value, schema_ptr.value)
+        finally:
+            # Release Zig-side allocations
+            if schema_ptr.value:
+                _lib.lance_release_schema(schema_ptr.value)
+            if array_ptr.value:
+                _lib.lance_release_array(array_ptr.value)
+
+    def read_float64_column_arrow(self, col_idx: int) -> "pa.Array":
+        """Read a float64 column as a PyArrow array (zero-copy).
+
+        This uses the Arrow C Data Interface to share memory directly
+        between Zig and Python without copying.
+
+        Args:
+            col_idx: Column index (0-based)
+
+        Returns:
+            PyArrow Float64Array
+
+        Raises:
+            ImportError: If pyarrow is not installed
+            ValueError: If column cannot be exported
+        """
+        import pyarrow as pa
+
+        schema_ptr = ctypes.c_void_p()
+        array_ptr = ctypes.c_void_p()
+
+        result = _lib.lance_export_float64_column(
+            self._handle,
+            col_idx,
+            ctypes.byref(schema_ptr),
+            ctypes.byref(array_ptr),
+        )
+
+        if result == 0:
+            raise ValueError(f"Failed to export column {col_idx} as Arrow")
+
+        try:
+            # Import via Arrow C Data Interface
+            return pa.Array._import_from_c(array_ptr.value, schema_ptr.value)
+        finally:
+            # Release Zig-side allocations
+            if schema_ptr.value:
+                _lib.lance_release_schema(schema_ptr.value)
+            if array_ptr.value:
+                _lib.lance_release_array(array_ptr.value)
+
+    def read_string_column_arrow(self, col_idx: int) -> "pa.Array":
+        """Read a string column as a PyArrow array (zero-copy for data buffer).
+
+        This uses the Arrow C Data Interface. The string data buffer is
+        zero-copy, only the offsets array needs conversion from Lance
+        (end-offsets) to Arrow (start-offsets) format.
+
+        Args:
+            col_idx: Column index (0-based)
+
+        Returns:
+            PyArrow StringArray
+
+        Raises:
+            ImportError: If pyarrow is not installed
+            ValueError: If column cannot be exported
+        """
+        import pyarrow as pa
+
+        schema_ptr = ctypes.c_void_p()
+        array_ptr = ctypes.c_void_p()
+
+        result = _lib.lance_export_string_column(
+            self._handle,
+            col_idx,
+            ctypes.byref(schema_ptr),
+            ctypes.byref(array_ptr),
+        )
+
+        if result == 0:
+            raise ValueError(f"Failed to export column {col_idx} as Arrow")
+
+        try:
+            # Import via Arrow C Data Interface
+            return pa.Array._import_from_c(array_ptr.value, schema_ptr.value)
+        finally:
+            # Release Zig-side allocations
+            if schema_ptr.value:
+                _lib.lance_release_schema(schema_ptr.value)
+            if array_ptr.value:
+                _lib.lance_release_array(array_ptr.value)
 
     def __enter__(self):
         """Context manager entry."""

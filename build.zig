@@ -260,6 +260,11 @@ pub fn build(b: *std.Build) void {
     // Add to main test step
     test_step.dependOn(&wasm_test.step);
 
+    // Arrow C Data Interface module for zero-copy Python interop
+    const arrow_c_mod = b.addModule("arrow_c", .{
+        .root_source_file = b.path("src/arrow_c.zig"),
+    });
+
     // === Native Shared Library for Python ===
     const lib = b.addLibrary(.{
         .name = "lanceql",
@@ -276,6 +281,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "lanceql.io", .module = io_mod },
                 .{ .name = "lanceql.encoding", .module = encoding_mod },
                 .{ .name = "lanceql.value", .module = value_mod },
+                .{ .name = "arrow_c", .module = arrow_c_mod },
             },
         }),
     });

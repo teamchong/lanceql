@@ -2,9 +2,14 @@
 ///
 /// This module exports C-compatible functions for use with Python ctypes.
 /// All exported functions follow C calling conventions and use C-compatible types.
+///
+/// Zero-copy Arrow support:
+/// - Use lance_export_column_arrow() to get Arrow C Data Interface pointers
+/// - Python can import via pyarrow.Array._import_from_c()
 
 const std = @import("std");
 const Table = @import("lanceql.table").Table;
+const arrow_c = @import("arrow_c");
 
 /// Global allocator for Python bindings
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -93,36 +98,10 @@ export fn lance_column_type(handle: *Handle, col_idx: u32, buf: [*]u8, buf_len: 
 }
 
 // ============================================================================
-// Column Reading
+// Column Reading (Legacy copy-based API - use Arrow exports for zero-copy)
 // ============================================================================
 
-/// Read int64 column
-/// Returns number of values read (0 on error)
-export fn lance_read_int64(handle: *Handle, col_idx: u32, out: [*]i64, max_len: usize) usize {
-    const table = handleToTable(handle);
-
-    const data = table.readInt64Column(col_idx) catch return 0;
-    defer allocator.free(data);
-
-    const len = @min(data.len, max_len);
-    @memcpy(out[0..len], data[0..len]);
-    return len;
-}
-
-/// Read float64 column
-/// Returns number of values read (0 on error)
-export fn lance_read_float64(handle: *Handle, col_idx: u32, out: [*]f64, max_len: usize) usize {
-    const table = handleToTable(handle);
-
-    const data = table.readFloat64Column(col_idx) catch return 0;
-    defer allocator.free(data);
-
-    const len = @min(data.len, max_len);
-    @memcpy(out[0..len], data[0..len]);
-    return len;
-}
-
-/// Read string column
+/// Read string column (copy-based, no Arrow string export yet)
 /// Returns number of strings read (0 on error)
 /// out_strings should be pre-allocated array of string pointers
 /// out_lengths should be pre-allocated array for string lengths
@@ -165,4 +144,139 @@ export fn lance_version(buf: [*]u8, buf_len: usize) usize {
     const len = @min(version.len, buf_len);
     @memcpy(buf[0..len], version[0..len]);
     return len;
+}
+
+// ============================================================================
+// Arrow C Data Interface - Zero-Copy Exports
+// ============================================================================
+
+/// Export a column as Arrow arrays (zero-copy when possible).
+/// Returns 1 on success, 0 on error.
+/// The schema and array pointers are written to out_schema and out_array.
+/// Caller is responsible for calling the release callbacks on both.
+export fn lance_export_int64_column(
+    handle: *Handle,
+    col_idx: u32,
+    out_schema: *?*arrow_c.ArrowSchema,
+    out_array: *?*arrow_c.ArrowArray,
+) u32 {
+    const table = handleToTable(handle);
+
+    // Get column name for schema
+    const names = table.columnNames() catch return 0;
+    defer allocator.free(names);
+
+    if (col_idx >= names.len) return 0;
+    const col_name = names[col_idx];
+
+    // Create schema
+    const schema = arrow_c.createInt64Schema(allocator, col_name) catch return 0;
+    errdefer {
+        if (schema.release) |release| release(schema);
+        allocator.destroy(schema);
+    }
+
+    // Read column data
+    const data = table.readInt64Column(col_idx) catch return 0;
+    // Note: data is owned by us, but we pass ownership to the ArrowArray
+
+    // Create array (zero-copy - points directly to data)
+    const array = arrow_c.createInt64ArrayOwned(allocator, data) catch {
+        allocator.free(data);
+        return 0;
+    };
+
+    out_schema.* = schema;
+    out_array.* = array;
+    return 1;
+}
+
+/// Export a float64 column as Arrow arrays (zero-copy when possible).
+export fn lance_export_float64_column(
+    handle: *Handle,
+    col_idx: u32,
+    out_schema: *?*arrow_c.ArrowSchema,
+    out_array: *?*arrow_c.ArrowArray,
+) u32 {
+    const table = handleToTable(handle);
+
+    // Get column name for schema
+    const names = table.columnNames() catch return 0;
+    defer allocator.free(names);
+
+    if (col_idx >= names.len) return 0;
+    const col_name = names[col_idx];
+
+    // Create schema
+    const schema = arrow_c.createFloat64Schema(allocator, col_name) catch return 0;
+    errdefer {
+        if (schema.release) |release| release(schema);
+        allocator.destroy(schema);
+    }
+
+    // Read column data
+    const data = table.readFloat64Column(col_idx) catch return 0;
+
+    // Create array (zero-copy - points directly to data)
+    const array = arrow_c.createFloat64ArrayOwned(allocator, data) catch {
+        allocator.free(data);
+        return 0;
+    };
+
+    out_schema.* = schema;
+    out_array.* = array;
+    return 1;
+}
+
+/// Release an Arrow schema (call the release callback and free)
+export fn lance_release_schema(schema: *arrow_c.ArrowSchema) void {
+    if (schema.release) |release| {
+        release(schema);
+    }
+    allocator.destroy(schema);
+}
+
+/// Release an Arrow array (call the release callback and free)
+export fn lance_release_array(array: *arrow_c.ArrowArray) void {
+    if (array.release) |release| {
+        release(array);
+    }
+    allocator.destroy(array);
+}
+
+/// Export a string column as Arrow arrays.
+/// String data buffer is zero-copy, only offsets need conversion.
+export fn lance_export_string_column(
+    handle: *Handle,
+    col_idx: u32,
+    out_schema: *?*arrow_c.ArrowSchema,
+    out_array: *?*arrow_c.ArrowArray,
+) u32 {
+    const table = handleToTable(handle);
+
+    // Get column name for schema
+    const names = table.columnNames() catch return 0;
+    defer allocator.free(names);
+
+    if (col_idx >= names.len) return 0;
+    const col_name = names[col_idx];
+
+    // Create schema
+    const schema = arrow_c.createStringSchema(allocator, col_name) catch return 0;
+    errdefer {
+        if (schema.release) |release| release(schema);
+        allocator.destroy(schema);
+    }
+
+    // Get raw buffers from Lance file
+    const buffers = table.getStringColumnBuffers(col_idx) catch return 0;
+    const offsets_buffer = buffers.offsets;
+    const data_buffer = buffers.data;
+
+    // Create Arrow array (offsets converted, data zero-copy)
+    const array = arrow_c.createStringArrayFromLance(allocator, offsets_buffer, data_buffer) catch return 0;
+
+    out_schema.* = schema;
+    out_array.* = array;
+    return 1;
 }

@@ -273,3 +273,52 @@ test "parse empty schema" {
 
     try std.testing.expectEqual(@as(usize, 0), schema.fields.len);
 }
+
+test "parse lancedb schema" {
+    // Schema bytes from a lancedb-created file with columns: id (int64), name (string)
+    const schema_bytes = [_]u8{
+        0x0a, 0x4f, 0x0a, 0x23, 0x12, 0x02, 0x69, 0x64, 0x20, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0x01, 0x2a, 0x05, 0x69, 0x6e, 0x74, 0x36, 0x34, 0x30, 0x01, 0x38, 0x01, 0x5a, 0x07,
+        0x64, 0x65, 0x66, 0x61, 0x75, 0x6c, 0x74, 0x0a, 0x28, 0x12, 0x04, 0x6e, 0x61, 0x6d, 0x65, 0x18,
+        0x01, 0x20, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x2a, 0x06, 0x73, 0x74,
+        0x72, 0x69, 0x6e, 0x67, 0x30, 0x01, 0x38, 0x02, 0x5a, 0x07, 0x64, 0x65, 0x66, 0x61, 0x75, 0x6c,
+        0x74, 0x10, 0x03,
+    };
+
+    const allocator = std.testing.allocator;
+    var schema = try Schema.parse(allocator, &schema_bytes);
+    defer schema.deinit();
+
+    // Debug: print all fields
+    std.debug.print("\nParsed {d} fields:\n", .{schema.fields.len});
+    for (schema.fields, 0..) |field, i| {
+        std.debug.print("  Field {d}: name=\"{s}\" id={d} parent_id={d} type={s} logical_type=\"{s}\"\n", .{
+            i,
+            field.name,
+            field.id,
+            field.parent_id,
+            @tagName(field.field_type),
+            field.logical_type,
+        });
+    }
+
+    // Should have 2 fields
+    try std.testing.expectEqual(@as(usize, 2), schema.fields.len);
+
+    // First field: id (int64)
+    try std.testing.expectEqualStrings("id", schema.fields[0].name);
+    try std.testing.expectEqualStrings("int64", schema.fields[0].logical_type);
+    try std.testing.expectEqual(@as(i32, -1), schema.fields[0].parent_id);
+
+    // Second field: name (string)
+    try std.testing.expectEqualStrings("name", schema.fields[1].name);
+    try std.testing.expectEqualStrings("string", schema.fields[1].logical_type);
+    try std.testing.expectEqual(@as(i32, -1), schema.fields[1].parent_id);
+
+    // Column names should return both
+    const names = try schema.columnNames(allocator);
+    defer allocator.free(names);
+    try std.testing.expectEqual(@as(usize, 2), names.len);
+    try std.testing.expectEqualStrings("id", names[0]);
+    try std.testing.expectEqualStrings("name", names[1]);
+}

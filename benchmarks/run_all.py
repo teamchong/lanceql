@@ -13,6 +13,7 @@ BENCHMARKS = [
     ("03_vector_search.py", "Vector Search (Lance-only feature)"),
     ("04_query_speed.py", "Query Speed"),
     ("05_compression.py", "Compression"),
+    ("06_read_performance.py", "LanceQL vs lancedb - Read Performance"),
 ]
 
 def main():
