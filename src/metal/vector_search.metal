@@ -18,7 +18,7 @@ kernel void cosine_similarity_batch(
     uint gid [[thread_position_in_grid]]          // Vector index
 ) {
     // Compute dot product and norms
-    float dot = 0.0f;
+    float dot_product = 0.0f;
     float query_norm = 0.0f;
     float vec_norm = 0.0f;
 
@@ -30,7 +30,7 @@ kernel void cosine_similarity_batch(
         float4 q = float4(query[i], query[i+1], query[i+2], query[i+3]);
         float4 v = float4(vec[i], vec[i+1], vec[i+2], vec[i+3]);
 
-        dot += dot(q, v);
+        dot_product += dot(q, v);
         query_norm += dot(q, q);
         vec_norm += dot(v, v);
     }
@@ -39,14 +39,14 @@ kernel void cosine_similarity_batch(
     for (; i < dim; i++) {
         float q = query[i];
         float v = vec[i];
-        dot += q * v;
+        dot_product += q * v;
         query_norm += q * q;
         vec_norm += v * v;
     }
 
     // Cosine similarity
     float denom = sqrt(query_norm) * sqrt(vec_norm);
-    scores[gid] = (denom > 0.0f) ? (dot / denom) : 0.0f;
+    scores[gid] = (denom > 0.0f) ? (dot_product / denom) : 0.0f;
 }
 
 /// Batch dot product

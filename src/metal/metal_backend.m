@@ -2,80 +2,13 @@
 // Metal backend for LanceQL - Objective-C wrapper
 //
 // Provides C API for Zig to call Metal GPU operations
-// Compiles shaders at RUNTIME - no Xcode required!
+// Uses PRECOMPILED Metal shaders (.metallib) for faster startup
+//
+// Build shaders: make metal-shaders (or zig build metal-shaders)
 //
 
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
-
-// Embedded Metal shader source (compiled at runtime)
-static NSString* const kShaderSource = @R"(
-#include <metal_stdlib>
-using namespace metal;
-
-// Batch cosine similarity
-kernel void cosine_similarity_batch(
-    device const float* query [[buffer(0)]],
-    device const float* vectors [[buffer(1)]],
-    device float* scores [[buffer(2)]],
-    constant uint& dim [[buffer(3)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    float dot = 0.0f;
-    float query_norm = 0.0f;
-    float vec_norm = 0.0f;
-
-    device const float* vec = vectors + gid * dim;
-
-    for (uint i = 0; i < dim; i++) {
-        float q = query[i];
-        float v = vec[i];
-        dot += q * v;
-        query_norm += q * q;
-        vec_norm += v * v;
-    }
-
-    float denom = sqrt(query_norm) * sqrt(vec_norm);
-    scores[gid] = (denom > 0.0f) ? (dot / denom) : 0.0f;
-}
-
-// Batch dot product
-kernel void dot_product_batch(
-    device const float* query [[buffer(0)]],
-    device const float* vectors [[buffer(1)]],
-    device float* scores [[buffer(2)]],
-    constant uint& dim [[buffer(3)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    float dot = 0.0f;
-    device const float* vec = vectors + gid * dim;
-
-    for (uint i = 0; i < dim; i++) {
-        dot += query[i] * vec[i];
-    }
-
-    scores[gid] = dot;
-}
-
-// Batch L2 distance squared
-kernel void l2_distance_batch(
-    device const float* query [[buffer(0)]],
-    device const float* vectors [[buffer(1)]],
-    device float* scores [[buffer(2)]],
-    constant uint& dim [[buffer(3)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    float dist = 0.0f;
-    device const float* vec = vectors + gid * dim;
-
-    for (uint i = 0; i < dim; i++) {
-        float diff = query[i] - vec[i];
-        dist += diff * diff;
-    }
-
-    scores[gid] = dist;
-}
-)";
 
 // Global Metal state
 static id<MTLDevice> g_device = nil;
@@ -86,7 +19,15 @@ static id<MTLComputePipelineState> g_dot_pipeline = nil;
 static id<MTLComputePipelineState> g_l2_pipeline = nil;
 static bool g_initialized = false;
 
-// Initialize Metal and compile shaders at runtime
+// Path to precompiled Metal library (set by build system)
+static const char* g_metallib_path = NULL;
+
+// Set path to precompiled .metallib file
+void lanceql_metal_set_library_path(const char* path) {
+    g_metallib_path = path;
+}
+
+// Initialize Metal with precompiled shaders
 int lanceql_metal_init(void) {
     @autoreleasepool {
         if (g_initialized) return 0;
@@ -104,15 +45,107 @@ int lanceql_metal_init(void) {
             return -2;
         }
 
-        // Compile shaders at runtime (no Xcode needed!)
         NSError* error = nil;
-        MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
-        options.fastMathEnabled = YES;
 
-        g_library = [g_device newLibraryWithSource:kShaderSource options:options error:&error];
+        // Try to load precompiled .metallib
+        if (g_metallib_path) {
+            NSString* path = [NSString stringWithUTF8String:g_metallib_path];
+            NSURL* url = [NSURL fileURLWithPath:path];
+            g_library = [g_device newLibraryWithURL:url error:&error];
+            if (g_library) {
+                NSLog(@"LanceQL Metal: Loaded precompiled library from %@", path);
+            }
+        }
+
+        // Search common paths if not found
         if (!g_library) {
-            NSLog(@"LanceQL Metal: Shader compile error: %@", error);
-            return -3;
+            NSArray* searchPaths = @[
+                @"vector_search.metallib",
+                @"zig-out/lib/vector_search.metallib",
+                @"src/metal/vector_search.metallib",
+                [[NSBundle mainBundle] pathForResource:@"vector_search" ofType:@"metallib"] ?: @""
+            ];
+
+            for (NSString* path in searchPaths) {
+                if ([path length] == 0) continue;
+                NSURL* url = [NSURL fileURLWithPath:path];
+                g_library = [g_device newLibraryWithURL:url error:&error];
+                if (g_library) {
+                    NSLog(@"LanceQL Metal: Loaded precompiled library from %@", path);
+                    break;
+                }
+            }
+        }
+
+        // Fallback: compile at runtime if no precompiled library found
+        if (!g_library) {
+            NSLog(@"LanceQL Metal: No precompiled .metallib found, compiling at runtime...");
+
+            NSString* shaderSource = @R"(
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void cosine_similarity_batch(
+    device const float* query [[buffer(0)]],
+    device const float* vectors [[buffer(1)]],
+    device float* scores [[buffer(2)]],
+    constant uint& dim [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    float dot = 0.0f;
+    float query_norm = 0.0f;
+    float vec_norm = 0.0f;
+    device const float* vec = vectors + gid * dim;
+    for (uint i = 0; i < dim; i++) {
+        float q = query[i];
+        float v = vec[i];
+        dot += q * v;
+        query_norm += q * q;
+        vec_norm += v * v;
+    }
+    float denom = sqrt(query_norm) * sqrt(vec_norm);
+    scores[gid] = (denom > 0.0f) ? (dot / denom) : 0.0f;
+}
+
+kernel void dot_product_batch(
+    device const float* query [[buffer(0)]],
+    device const float* vectors [[buffer(1)]],
+    device float* scores [[buffer(2)]],
+    constant uint& dim [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    float dot = 0.0f;
+    device const float* vec = vectors + gid * dim;
+    for (uint i = 0; i < dim; i++) {
+        dot += query[i] * vec[i];
+    }
+    scores[gid] = dot;
+}
+
+kernel void l2_distance_batch(
+    device const float* query [[buffer(0)]],
+    device const float* vectors [[buffer(1)]],
+    device float* scores [[buffer(2)]],
+    constant uint& dim [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    float dist = 0.0f;
+    device const float* vec = vectors + gid * dim;
+    for (uint i = 0; i < dim; i++) {
+        float diff = query[i] - vec[i];
+        dist += diff * diff;
+    }
+    scores[gid] = dist;
+}
+)";
+            MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+            options.fastMathEnabled = YES;
+            g_library = [g_device newLibraryWithSource:shaderSource options:options error:&error];
+
+            if (!g_library) {
+                NSLog(@"LanceQL Metal: Shader compile error: %@", error);
+                return -3;
+            }
         }
 
         // Create compute pipelines
@@ -142,9 +175,9 @@ int lanceql_metal_init(void) {
     }
 }
 
-// Legacy function for compatibility - just calls init
+// Load precompiled .metallib from specific path
 int lanceql_metal_load_library(const char* path) {
-    (void)path;  // Ignored - we compile at runtime now
+    lanceql_metal_set_library_path(path);
     return lanceql_metal_init();
 }
 
@@ -205,7 +238,10 @@ int lanceql_metal_cosine_batch(
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
 
-        // No memcpy needed - scores buffer points directly to output array
+        // Copy results if we fell back to non-zero-copy buffers
+        if (scores_buf.contents != scores) {
+            memcpy(scores, scores_buf.contents, scores_size);
+        }
 
         return 0;
     }
@@ -324,4 +360,9 @@ int lanceql_metal_available(void) {
 const char* lanceql_metal_device_name(void) {
     if (!g_device) return "No device";
     return [g_device.name UTF8String];
+}
+
+// Check if using precompiled shaders
+int lanceql_metal_is_precompiled(void) {
+    return (g_metallib_path != NULL) ? 1 : 0;
 }

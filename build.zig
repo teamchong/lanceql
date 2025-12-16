@@ -321,6 +321,40 @@ pub fn build(b: *std.Build) void {
     const test_sql_step = b.step("test-sql", "Run SQL executor tests");
     test_sql_step.dependOn(&run_test_sql_executor.step);
 
+    // === Metal Shader Compilation (macOS with Xcode) ===
+    // Compiles .metal shaders to .metallib for faster startup
+    if (use_metal) {
+        // Step 1: Compile .metal to .air (Metal IR)
+        const metal_compile = b.addSystemCommand(&.{
+            "xcrun", "-sdk", "macosx", "metal",
+            "-O3", // Optimize for performance
+            "-c", "src/metal/vector_search.metal",
+            "-o",
+        });
+        const air_output = metal_compile.addOutputFileArg("vector_search.air");
+
+        // Step 2: Link .air to .metallib
+        const metallib_link = b.addSystemCommand(&.{
+            "xcrun", "-sdk", "macosx", "metallib",
+        });
+        metallib_link.addFileArg(air_output);
+        metallib_link.addArg("-o");
+        const metallib_output = metallib_link.addOutputFileArg("vector_search.metallib");
+
+        // Install to zig-out/lib/
+        const install_metallib = b.addInstallFileWithDir(
+            metallib_output,
+            .lib,
+            "vector_search.metallib",
+        );
+
+        const metal_shaders_step = b.step("metal-shaders", "Compile Metal shaders to .metallib (requires Xcode)");
+        metal_shaders_step.dependOn(&install_metallib.step);
+
+        // Make lib and bench-vector depend on metal shaders
+        // install_lib.step.dependOn(&install_metallib.step); // Optional: auto-build shaders
+    }
+
     // === WASM Build ===
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
