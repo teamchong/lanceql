@@ -145,7 +145,12 @@ src/
 ├── format/              # Lance file format (footer, columns)
 ├── proto/               # Protobuf decoder for manifests
 ├── io/                  # VFS abstraction (file, memory, HTTP)
-└── encoding/            # Column decoders (plain, dictionary)
+└── encoding/
+    ├── plain.zig        # Lance column decoders
+    └── parquet/         # Parquet file reader
+        ├── page.zig     # Page decoder (PLAIN, RLE_DICTIONARY)
+        ├── snappy.zig   # Snappy decompression (pure Zig, SIMD)
+        └── thrift.zig   # TCompactProtocol decoder
 
 examples/wasm/
 ├── index.html           # Demo UI
@@ -257,12 +262,15 @@ import { LanceQL } from './lanceql.js';
 
 ### LanceQL vs PyArrow (Parquet files)
 
-| Test | Dataset | pyarrow.parquet | lanceql.parquet | Speedup |
-|------|---------|-----------------|-----------------|---------|
-| read_table() | 100K rows | 5.6ms | 2.4ms | **2.3x faster** |
-| read_table() | 1M rows | 24.2ms | 16.5ms | **1.5x faster** |
-| iter_batches() | 100K rows | 6.2ms | 1.6ms | **3.8x faster** |
-| Throughput | 1M rows | 41.4M rows/s | 60.7M rows/s | **1.5x faster** |
+| Test | Dataset | PyArrow (C++) | LanceQL (Zig) | Speedup |
+|------|---------|---------------|---------------|---------|
+| Snappy Compressed | 100K rows | ~35M rows/s | **74.8M rows/s** | **2.1x faster** |
+| Uncompressed | 100K rows | - | **621M rows/s** | - |
+
+Pure Zig Parquet reader with zero external dependencies:
+- Thrift TCompactProtocol decoder
+- PLAIN + RLE/Dictionary encoding
+- Snappy decompression (SIMD-optimized)
 
 **Why so fast?**
 - **Zero-copy Arrow C Data Interface** - Data buffers shared directly between Zig and PyArrow
@@ -295,14 +303,22 @@ python generate_sidecar.py s3://bucket/dataset.lance ./meta.json
 aws s3 cp ./meta.json s3://bucket/dataset.lance/.meta.json --profile r2 --endpoint-url https://...
 ```
 
-## Lance Format Support
+## Format Support
 
+### Lance Files
 - Lance v2.0 and v2.1 file format
 - Multi-fragment datasets with manifest discovery
 - IVF-PQ vector indices
 - Deletion vectors (logical deletes)
 - Version/time-travel queries
 - Data types: int32/64, float32/64, bool, string, timestamp[s/ms/us/ns], date32/64
+
+### Parquet Files
+- Pure Zig implementation (zero external dependencies)
+- Thrift TCompactProtocol metadata decoder
+- Encodings: PLAIN, RLE, RLE_DICTIONARY
+- Compression: Uncompressed, Snappy
+- Data types: boolean, int32/64, float/double, byte_array, fixed_len_byte_array
 
 ## License
 

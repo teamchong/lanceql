@@ -36,6 +36,14 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const parquet_encoding_mod = b.addModule("lanceql.encoding.parquet", .{
+        .root_source_file = b.path("src/encoding/parquet/parquet_encoding.zig"),
+        .imports = &.{
+            .{ .name = "lanceql.proto", .module = proto_mod },
+            .{ .name = "lanceql.format", .module = format_mod },
+        },
+    });
+
     // SQL modules
     const sql_ast_mod = b.addModule("lanceql.sql.ast", .{
         .root_source_file = b.path("src/sql/ast.zig"),
@@ -154,6 +162,25 @@ pub fn build(b: *std.Build) void {
 
     const test_integration_step = b.step("test-integration", "Run integration tests with real .lance files");
     test_integration_step.dependOn(&run_test_integration.step);
+
+    // Parquet parser tests - use ReleaseFast for benchmark
+    const test_parquet = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/test_parquet.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lanceql.format", .module = format_mod },
+                .{ .name = "lanceql.encoding.parquet", .module = parquet_encoding_mod },
+            },
+        }),
+    });
+
+    const run_test_parquet = b.addRunArtifact(test_parquet);
+    test_step.dependOn(&run_test_parquet.step);
+
+    const test_parquet_step = b.step("test-parquet", "Run Parquet parser tests");
+    test_parquet_step.dependOn(&run_test_parquet.step);
 
     // Query module tests
     const test_query = b.addTest(.{
