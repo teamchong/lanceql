@@ -264,8 +264,8 @@ import { LanceQL } from './lanceql.js';
 
 | Test | Dataset | PyArrow (C++) | LanceQL (Zig) | Speedup |
 |------|---------|---------------|---------------|---------|
-| Snappy Compressed | 100K rows | ~35M rows/s | **74.8M rows/s** | **2.1x faster** |
-| Uncompressed | 100K rows | - | **621M rows/s** | - |
+| Snappy Compressed | 100K rows | 75.5M rows/s | **122.6M rows/s** | **1.6x faster** |
+| Uncompressed | 100K rows | 77.7M rows/s | **370.6M rows/s** | **4.8x faster** |
 
 Pure Zig Parquet reader with zero external dependencies:
 - Thrift TCompactProtocol decoder
@@ -279,9 +279,10 @@ Pure Zig Parquet reader with zero external dependencies:
 
 Run benchmarks yourself:
 ```bash
-python benchmarks/06_read_performance.py  # vs lancedb
-python benchmarks/10_parquet_api.py       # vs pyarrow.parquet (drop-in API)
-python benchmarks/08_scale_tests.py       # Scale tests (100K-10M rows)
+zig build test-parquet                           # Native Zig Parquet decoder benchmark
+python benchmarks/bench_parquet_vs_pyarrow.py    # vs PyArrow (Parquet files)
+python benchmarks/06_read_performance.py         # vs lancedb (Lance files)
+python benchmarks/10_parquet_api.py              # vs pyarrow.parquet (drop-in API)
 ```
 
 ## Performance Optimizations
