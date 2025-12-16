@@ -2,7 +2,7 @@
 //!
 //! Provides GPU-accelerated vector operations on macOS using:
 //! - Accelerate framework (vDSP) for SIMD vector math
-//! - Metal framework for GPU compute (future)
+//! - Metal framework for GPU compute (batch vector search)
 //!
 //! On non-macOS platforms, falls back to pure Zig SIMD implementations.
 
@@ -14,6 +14,144 @@ const builtin = @import("builtin");
 pub const is_macos = builtin.os.tag == .macos;
 pub const use_metal = is_macos;
 pub const use_accelerate = is_macos;
+
+// =============================================================================
+// Metal GPU Backend (Objective-C extern functions)
+// =============================================================================
+
+const metal_c = if (is_macos) struct {
+    extern fn lanceql_metal_init() c_int;
+    extern fn lanceql_metal_load_library(path: [*:0]const u8) c_int;
+    extern fn lanceql_metal_cosine_batch(
+        query: [*]const f32,
+        vectors: [*]const f32,
+        scores: [*]f32,
+        dim: c_uint,
+        num_vectors: c_uint,
+    ) c_int;
+    extern fn lanceql_metal_dot_batch(
+        query: [*]const f32,
+        vectors: [*]const f32,
+        scores: [*]f32,
+        dim: c_uint,
+        num_vectors: c_uint,
+    ) c_int;
+    extern fn lanceql_metal_cleanup() void;
+    extern fn lanceql_metal_available() c_int;
+    extern fn lanceql_metal_device_name() [*:0]const u8;
+} else struct {};
+
+/// Metal GPU state
+var gpu_initialized: bool = false;
+var gpu_library_loaded: bool = false;
+
+/// Initialize Metal GPU
+pub fn initGPU() bool {
+    if (comptime !is_macos) return false;
+    if (gpu_initialized) return true;
+
+    const result = metal_c.lanceql_metal_init();
+    gpu_initialized = (result == 0);
+    return gpu_initialized;
+}
+
+/// Load Metal shader library
+pub fn loadGPULibrary(path: []const u8) bool {
+    if (comptime !is_macos) return false;
+    if (!gpu_initialized) {
+        if (!initGPU()) return false;
+    }
+
+    // Need null-terminated path
+    var path_buf: [1024]u8 = undefined;
+    if (path.len >= path_buf.len) return false;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+
+    const result = metal_c.lanceql_metal_load_library(@ptrCast(&path_buf));
+    gpu_library_loaded = (result == 0);
+    return gpu_library_loaded;
+}
+
+/// Check if GPU is available and ready
+pub fn isGPUReady() bool {
+    if (comptime !is_macos) return false;
+    return gpu_initialized and gpu_library_loaded;
+}
+
+/// Get GPU device name
+pub fn getGPUDeviceName() []const u8 {
+    if (comptime !is_macos) return "N/A";
+    if (!gpu_initialized) return "Not initialized";
+
+    const name_ptr = metal_c.lanceql_metal_device_name();
+    return std.mem.span(name_ptr);
+}
+
+/// Cleanup GPU resources
+pub fn cleanupGPU() void {
+    if (comptime !is_macos) return;
+    if (gpu_initialized) {
+        metal_c.lanceql_metal_cleanup();
+        gpu_initialized = false;
+        gpu_library_loaded = false;
+    }
+}
+
+/// GPU-accelerated batch cosine similarity
+/// Falls back to CPU if GPU not available
+pub fn gpuCosineSimilarityBatch(
+    query: []const f32,
+    vectors: []const f32,
+    dim: usize,
+    scores: []f32,
+) void {
+    const num_vectors = vectors.len / dim;
+
+    if (comptime is_macos) {
+        if (gpu_library_loaded) {
+            const result = metal_c.lanceql_metal_cosine_batch(
+                query.ptr,
+                vectors.ptr,
+                scores.ptr,
+                @intCast(dim),
+                @intCast(num_vectors),
+            );
+            if (result == 0) return; // GPU success
+        }
+    }
+
+    // Fallback to CPU
+    batchCosineSimilarity(query, vectors, dim, scores);
+}
+
+/// GPU-accelerated batch dot product
+pub fn gpuDotProductBatch(
+    query: []const f32,
+    vectors: []const f32,
+    dim: usize,
+    scores: []f32,
+) void {
+    const num_vectors = vectors.len / dim;
+
+    if (comptime is_macos) {
+        if (gpu_library_loaded) {
+            const result = metal_c.lanceql_metal_dot_batch(
+                query.ptr,
+                vectors.ptr,
+                scores.ptr,
+                @intCast(dim),
+                @intCast(num_vectors),
+            );
+            if (result == 0) return;
+        }
+    }
+
+    // Fallback: CPU batch
+    for (0..num_vectors) |i| {
+        scores[i] = dotProduct(query, vectors[i * dim ..][0..dim]);
+    }
+}
 
 // =============================================================================
 // Accelerate Framework (vDSP) - macOS only
@@ -187,10 +325,10 @@ pub fn isMetalAvailable() bool {
 /// Get platform info string
 pub fn getPlatformInfo() []const u8 {
     if (comptime is_macos) {
-        if (comptime use_metal and use_accelerate) {
-            return "macOS (Metal + Accelerate)";
+        if (gpu_library_loaded) {
+            return "macOS (Metal GPU + Accelerate)";
         } else if (comptime use_accelerate) {
-            return "macOS (Accelerate)";
+            return "macOS (Accelerate vDSP)";
         } else {
             return "macOS (SIMD)";
         }
