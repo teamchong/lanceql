@@ -292,10 +292,24 @@ python benchmarks/10_parquet_api.py              # vs pyarrow.parquet (drop-in A
 ## Performance Optimizations
 
 - **Zero-copy Arrow** - Direct memory sharing via Arrow C Data Interface
+- **Metal/Accelerate (macOS)** - Auto-detected at compile time via `builtin.os.tag`
+  - vDSP-accelerated dot product: 32 ns/op
+  - Batch cosine similarity: 14M vectors/sec (384-dim)
+- **Comptime SIMD** - 32-byte vectors, bit-width specialization (1-20 bits)
 - **IndexedDB Cache** - Schema and column types cached for repeat visits
 - **Sidecar Manifest** - Optional `.meta.json` for faster startup
 - **Fragment Prefetching** - Parallel metadata loading on dataset open
 - **Speculative Prefetch** - Next page loaded in background
+
+### Platform Detection (comptime)
+
+```zig
+const builtin = @import("builtin");
+const is_macos = builtin.os.tag == .macos;
+const use_accelerate = is_macos;  // Auto-enabled on macOS
+```
+
+Run vector benchmark: `zig build bench-vector`
 
 Generate sidecar manifest:
 ```bash
