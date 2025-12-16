@@ -4,6 +4,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // === Platform Detection (comptime) ===
+    // Auto-detect Metal support on macOS
+    const use_metal = target.result.os.tag == .macos;
+    const use_accelerate = target.result.os.tag == .macos;
+
     // === Core Modules ===
     const proto_mod = b.addModule("lanceql.proto", .{
         .root_source_file = b.path("src/proto/proto.zig"),
@@ -88,6 +93,12 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // === Platform-specific Modules ===
+    // Metal/Accelerate module for macOS GPU acceleration
+    const metal_mod = b.addModule("lanceql.metal", .{
+        .root_source_file = b.path("src/metal/metal.zig"),
+    });
+
     // Root module exports all
     const lanceql_mod = b.addModule("lanceql", .{
         .root_source_file = b.path("src/lanceql.zig"),
@@ -100,8 +111,15 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lanceql.query", .module = query_mod },
             .{ .name = "lanceql.value", .module = value_mod },
             .{ .name = "lanceql.dataframe", .module = dataframe_mod },
+            .{ .name = "lanceql.metal", .module = metal_mod },
         },
     });
+
+    // Pass build options to metal module
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "use_metal", use_metal);
+    build_options.addOption(bool, "use_accelerate", use_accelerate);
+    metal_mod.addOptions("build_options", build_options);
 
     // === Tests ===
     const test_footer = b.addTest(.{
@@ -232,6 +250,47 @@ pub fn build(b: *std.Build) void {
     const test_dataframe_step = b.step("test-dataframe", "Run DataFrame module tests");
     test_dataframe_step.dependOn(&run_test_dataframe.step);
 
+    // Metal module tests (with framework linking on macOS)
+    const test_metal = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/metal/metal.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    // Link Accelerate framework on macOS for vDSP
+    if (use_accelerate) {
+        test_metal.root_module.linkFramework("Accelerate", .{});
+    }
+
+    const run_test_metal = b.addRunArtifact(test_metal);
+    test_step.dependOn(&run_test_metal.step);
+
+    const test_metal_step = b.step("test-metal", "Run Metal/Accelerate module tests");
+    test_metal_step.dependOn(&run_test_metal.step);
+
+    // Vector benchmark (Metal/Accelerate)
+    const bench_vector = b.addExecutable(.{
+        .name = "bench_vector",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/bench_vector_ops.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lanceql.metal", .module = metal_mod },
+            },
+        }),
+    });
+
+    if (use_accelerate) {
+        bench_vector.root_module.linkFramework("Accelerate", .{});
+    }
+
+    const run_bench_vector = b.addRunArtifact(bench_vector);
+    const bench_vector_step = b.step("bench-vector", "Benchmark vector operations (Accelerate vs SIMD)");
+    bench_vector_step.dependOn(&run_bench_vector.step);
+
     // SQL executor tests
     const test_sql_executor = b.addTest(.{
         .root_module = b.createModule(.{
@@ -308,10 +367,20 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "lanceql.io", .module = io_mod },
                 .{ .name = "lanceql.encoding", .module = encoding_mod },
                 .{ .name = "lanceql.value", .module = value_mod },
+                .{ .name = "lanceql.metal", .module = metal_mod },
                 .{ .name = "arrow_c", .module = arrow_c_mod },
             },
         }),
     });
+
+    // Link macOS frameworks for Metal/Accelerate support
+    if (use_metal) {
+        lib.root_module.linkFramework("Metal", .{});
+        lib.root_module.linkFramework("Foundation", .{});
+    }
+    if (use_accelerate) {
+        lib.root_module.linkFramework("Accelerate", .{});
+    }
 
     const lib_step = b.step("lib", "Build native shared library for Python");
     const install_lib = b.addInstallArtifact(lib, .{});
