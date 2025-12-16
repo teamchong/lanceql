@@ -23,24 +23,25 @@ pub const SnappyError = error{
 };
 
 /// SIMD-accelerated copy for non-overlapping regions
-/// Uses 16-byte vectors when possible
+/// Uses 32-byte vectors when possible, falls back to 16-byte, then scalar
 inline fn simdCopy(dst: [*]u8, src: [*]const u8, len: usize) void {
-    if (len >= 16) {
-        // Use SIMD for large copies
-        var i: usize = 0;
-        while (i + 16 <= len) : (i += 16) {
-            const v: @Vector(16, u8) = src[i..][0..16].*;
-            dst[i..][0..16].* = v;
-        }
-        // Handle remaining bytes
-        while (i < len) : (i += 1) {
-            dst[i] = src[i];
-        }
-    } else {
-        // Small copy - just do byte-by-byte (compiler will optimize)
-        for (0..len) |i| {
-            dst[i] = src[i];
-        }
+    var i: usize = 0;
+
+    // 32-byte SIMD (AVX/NEON)
+    while (i + 32 <= len) : (i += 32) {
+        const v: @Vector(32, u8) = src[i..][0..32].*;
+        dst[i..][0..32].* = v;
+    }
+
+    // 16-byte SIMD for remainder
+    while (i + 16 <= len) : (i += 16) {
+        const v: @Vector(16, u8) = src[i..][0..16].*;
+        dst[i..][0..16].* = v;
+    }
+
+    // Scalar fallback for tail
+    while (i < len) : (i += 1) {
+        dst[i] = src[i];
     }
 }
 

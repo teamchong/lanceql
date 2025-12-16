@@ -606,3 +606,29 @@ pub const DataPageHeaderV2 = struct {
         return header;
     }
 };
+
+// ============================================================================
+// Compile-time assertions
+// ============================================================================
+//
+// These assertions verify:
+// 1. Enum backing types match Parquet Thrift specification (all i32)
+// 2. Struct sizes are documented for ABI stability
+//
+// If these fail after a change, verify the modification is intentional.
+
+comptime {
+    // All Parquet enums use i32 backing per Thrift specification
+    const enum_size = @sizeOf(i32);
+    if (@sizeOf(Type) != enum_size) @compileError("Type enum size mismatch - expected i32");
+    if (@sizeOf(ConvertedType) != enum_size) @compileError("ConvertedType enum size mismatch - expected i32");
+    if (@sizeOf(FieldRepetitionType) != enum_size) @compileError("FieldRepetitionType enum size mismatch - expected i32");
+    if (@sizeOf(Encoding) != enum_size) @compileError("Encoding enum size mismatch - expected i32");
+    if (@sizeOf(CompressionCodec) != enum_size) @compileError("CompressionCodec enum size mismatch - expected i32");
+    if (@sizeOf(PageType) != enum_size) @compileError("PageType enum size mismatch - expected i32");
+
+    // Alignment assertions for key structs
+    if (@alignOf(DataPageHeader) < @alignOf(i32)) @compileError("DataPageHeader alignment too small");
+    if (@alignOf(DictionaryPageHeader) < @alignOf(i32)) @compileError("DictionaryPageHeader alignment too small");
+    if (@alignOf(DataPageHeaderV2) < @alignOf(i32)) @compileError("DataPageHeaderV2 alignment too small");
+}

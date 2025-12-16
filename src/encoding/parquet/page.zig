@@ -20,10 +20,71 @@ const rle = @import("rle.zig");
 const RleDecoder = rle.RleDecoder;
 const snappy = @import("snappy.zig");
 
+/// Comptime-specialized bit unpacking for a single group of 8 values
+/// All bit offsets and masks computed at compile time
+inline fn unpackGroupComptime(
+    comptime bit_width: comptime_int,
+    comptime T: type,
+    group_bytes: []const u8,
+    dict: []const T,
+    output: []T,
+    idx: *usize,
+    count: usize,
+) PageError!void {
+    const mask: u32 = comptime (1 << bit_width) - 1;
+
+    // Read group bytes into u64 (max 8 bytes needed for bit_width <= 8)
+    var group_val: u64 = 0;
+    inline for (0..@min(8, bit_width)) |b| {
+        if (b < group_bytes.len) {
+            group_val |= @as(u64, group_bytes[b]) << @intCast(b * 8);
+        }
+    }
+
+    // Extract 8 values with comptime-known offsets
+    inline for (0..8) |v| {
+        if (idx.* >= count) return;
+        const bit_offset = comptime v * bit_width;
+        const dict_idx: u32 = @truncate((group_val >> @intCast(bit_offset)) & mask);
+        if (dict_idx >= dict.len) return PageError.InvalidIndex;
+        output[idx.*] = dict[dict_idx];
+        idx.* += 1;
+    }
+}
+
 /// Fused RLE decode + dictionary lookup - eliminates intermediate allocation
 /// Decodes RLE-encoded indices and looks up dictionary values in one pass
 fn decodeDictFused(comptime T: type, data: []const u8, bit_width: usize, dict: []const T, output: []T) PageError!void {
-    const mask: u32 = if (bit_width == 32) 0xFFFFFFFF else (@as(u32, 1) << @intCast(bit_width)) - 1;
+    // Dispatch to comptime-specialized version for common bit widths
+    return switch (bit_width) {
+        1 => decodeDictFusedComptime(T, 1, data, dict, output),
+        2 => decodeDictFusedComptime(T, 2, data, dict, output),
+        3 => decodeDictFusedComptime(T, 3, data, dict, output),
+        4 => decodeDictFusedComptime(T, 4, data, dict, output),
+        5 => decodeDictFusedComptime(T, 5, data, dict, output),
+        6 => decodeDictFusedComptime(T, 6, data, dict, output),
+        7 => decodeDictFusedComptime(T, 7, data, dict, output),
+        8 => decodeDictFusedComptime(T, 8, data, dict, output),
+        9 => decodeDictFusedComptime(T, 9, data, dict, output),
+        10 => decodeDictFusedComptime(T, 10, data, dict, output),
+        11 => decodeDictFusedComptime(T, 11, data, dict, output),
+        12 => decodeDictFusedComptime(T, 12, data, dict, output),
+        13 => decodeDictFusedComptime(T, 13, data, dict, output),
+        14 => decodeDictFusedComptime(T, 14, data, dict, output),
+        15 => decodeDictFusedComptime(T, 15, data, dict, output),
+        16 => decodeDictFusedComptime(T, 16, data, dict, output),
+        17 => decodeDictFusedComptime(T, 17, data, dict, output),
+        18 => decodeDictFusedComptime(T, 18, data, dict, output),
+        19 => decodeDictFusedComptime(T, 19, data, dict, output),
+        20 => decodeDictFusedComptime(T, 20, data, dict, output),
+        else => decodeDictFusedGeneric(T, data, bit_width, dict, output),
+    };
+}
+
+/// Comptime-specialized fused decoder - all bit operations use compile-time constants
+fn decodeDictFusedComptime(comptime T: type, comptime bit_width: comptime_int, data: []const u8, dict: []const T, output: []T) PageError!void {
+    const mask: u32 = comptime if (bit_width == 32) 0xFFFFFFFF else (1 << bit_width) - 1;
+    const byte_width = comptime (bit_width + 7) / 8;
     var pos: usize = 0;
     var idx: usize = 0;
     const count = output.len;
@@ -43,13 +104,12 @@ fn decodeDictFused(comptime T: type, data: []const u8, bit_width: usize, dict: [
         if (indicator & 1 == 0) {
             // RLE run: repeat single value
             const run_len = indicator >> 1;
-            const byte_width = (bit_width + 7) / 8;
 
             if (pos + byte_width > data.len) return PageError.UnexpectedEndOfData;
 
-            // Read the dictionary index
+            // Read the dictionary index with comptime byte_width
             var dict_idx: u32 = 0;
-            for (0..byte_width) |i| {
+            inline for (0..byte_width) |i| {
                 dict_idx |= @as(u32, data[pos + i]) << @intCast(i * 8);
             }
             pos += byte_width;
@@ -60,30 +120,29 @@ fn decodeDictFused(comptime T: type, data: []const u8, bit_width: usize, dict: [
 
             // Fill output with repeated value
             const end = @min(idx + run_len, count);
-            for (idx..end) |i| {
-                output[i] = value;
-            }
+            @memset(output[idx..end], value);
             idx = end;
         } else {
             // Bit-packed run: decode groups of 8 values
             const num_groups = indicator >> 1;
-            const bytes_per_group = bit_width;
-            const total_bytes = num_groups * bytes_per_group;
+            const total_bytes = num_groups * bit_width;
 
             if (pos + total_bytes > data.len) return PageError.UnexpectedEndOfData;
 
             const group_data = data[pos..][0..total_bytes];
             pos += total_bytes;
 
-            // Fast path for byte-aligned bit widths (8, 16, 32)
-            if (bit_width == 8) {
+            // Comptime-specialized unpacking
+            if (comptime bit_width == 8) {
+                // Direct byte lookup
                 for (group_data) |byte| {
                     if (idx >= count) break;
                     if (byte >= dict.len) return PageError.InvalidIndex;
                     output[idx] = dict[byte];
                     idx += 1;
                 }
-            } else if (bit_width == 16) {
+            } else if (comptime bit_width == 16) {
+                // Direct 16-bit lookup
                 var i: usize = 0;
                 while (i + 1 < group_data.len and idx < count) {
                     const dict_idx = @as(u32, group_data[i]) | (@as(u32, group_data[i + 1]) << 8);
@@ -92,53 +151,35 @@ fn decodeDictFused(comptime T: type, data: []const u8, bit_width: usize, dict: [
                     idx += 1;
                     i += 2;
                 }
-            } else if (bit_width <= 8) {
-                // Fast path for small bit widths (3-7): use precomputed offsets
-                // Each group is bit_width bytes, containing 8 values
+            } else if (comptime bit_width <= 8) {
+                // Small bit widths: inline for with comptime offsets
                 for (0..num_groups) |g| {
                     if (idx >= count) break;
-                    const group_start = g * bytes_per_group;
-
-                    // Read all group bytes into a u64 for fast extraction
-                    var group_val: u64 = 0;
-                    const bytes_to_read = @min(8, group_data.len - group_start);
-                    for (0..bytes_to_read) |b| {
-                        group_val |= @as(u64, group_data[group_start + b]) << @intCast(b * 8);
-                    }
-
-                    // Extract 8 values
-                    inline for (0..8) |v| {
-                        if (idx >= count) break;
-                        const bit_offset = v * bit_width;
-                        const dict_idx: u32 = @truncate((group_val >> @intCast(bit_offset)) & mask);
-                        if (dict_idx >= dict.len) return PageError.InvalidIndex;
-                        output[idx] = dict[dict_idx];
-                        idx += 1;
-                    }
+                    const group_start = g * bit_width;
+                    const group_bytes = group_data[group_start..][0..bit_width];
+                    try unpackGroupComptime(bit_width, T, group_bytes, dict, output, &idx, count);
                 }
             } else {
-                // General case for bit widths > 8: unpack across byte boundaries
+                // Larger bit widths: use u64 reads with comptime mask
                 for (0..num_groups) |g| {
-                    const group_start = g * bytes_per_group;
-                    const group_bytes = group_data[group_start..][0..bytes_per_group];
+                    const group_start = g * bit_width;
+                    const group_bytes = group_data[group_start..][0..bit_width];
 
-                    for (0..8) |v| {
+                    inline for (0..8) |v| {
                         if (idx >= count) break;
 
-                        const bit_offset = v * bit_width;
-                        const byte_offset = bit_offset >> 3;
-                        const bit_shift: u6 = @intCast(bit_offset & 7);
+                        const bit_offset = comptime v * bit_width;
+                        const byte_off = comptime bit_offset / 8;
+                        const bit_shift: u6 = comptime bit_offset % 8;
 
-                        // Read u64 at byte_offset (handles cross-boundary reads)
+                        // Read u64 at comptime-known byte offset
                         var value: u64 = 0;
-                        const bytes_left = group_bytes.len - byte_offset;
-                        if (bytes_left >= 8) {
-                            // Fast path: read full u64
-                            value = std.mem.readInt(u64, group_bytes[byte_offset..][0..8], .little);
+                        const bytes_avail = bit_width - byte_off;
+                        if (bytes_avail >= 8) {
+                            value = std.mem.readInt(u64, group_bytes[byte_off..][0..8], .little);
                         } else {
-                            // Slow path: read available bytes
-                            for (0..bytes_left) |b| {
-                                value |= @as(u64, group_bytes[byte_offset + b]) << @intCast(b * 8);
+                            inline for (0..@min(8, bytes_avail)) |b| {
+                                value |= @as(u64, group_bytes[byte_off + b]) << @intCast(b * 8);
                             }
                         }
 
@@ -147,6 +188,82 @@ fn decodeDictFused(comptime T: type, data: []const u8, bit_width: usize, dict: [
                         output[idx] = dict[dict_idx];
                         idx += 1;
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Generic decoder for uncommon bit widths (>20)
+fn decodeDictFusedGeneric(comptime T: type, data: []const u8, bit_width: usize, dict: []const T, output: []T) PageError!void {
+    const mask: u32 = if (bit_width == 32) 0xFFFFFFFF else (@as(u32, 1) << @intCast(bit_width)) - 1;
+    var pos: usize = 0;
+    var idx: usize = 0;
+    const count = output.len;
+
+    while (idx < count and pos < data.len) {
+        var indicator: u32 = 0;
+        var shift: u5 = 0;
+        while (pos < data.len) {
+            const byte = data[pos];
+            pos += 1;
+            indicator |= @as(u32, byte & 0x7F) << shift;
+            if (byte & 0x80 == 0) break;
+            shift += 7;
+        }
+
+        if (indicator & 1 == 0) {
+            const run_len = indicator >> 1;
+            const byte_width = (bit_width + 7) / 8;
+
+            if (pos + byte_width > data.len) return PageError.UnexpectedEndOfData;
+
+            var dict_idx: u32 = 0;
+            for (0..byte_width) |i| {
+                dict_idx |= @as(u32, data[pos + i]) << @intCast(i * 8);
+            }
+            pos += byte_width;
+            dict_idx &= mask;
+
+            if (dict_idx >= dict.len) return PageError.InvalidIndex;
+            const value = dict[dict_idx];
+            const end = @min(idx + run_len, count);
+            @memset(output[idx..end], value);
+            idx = end;
+        } else {
+            const num_groups = indicator >> 1;
+            const total_bytes = num_groups * bit_width;
+
+            if (pos + total_bytes > data.len) return PageError.UnexpectedEndOfData;
+
+            const group_data = data[pos..][0..total_bytes];
+            pos += total_bytes;
+
+            for (0..num_groups) |g| {
+                const group_start = g * bit_width;
+                const group_bytes = group_data[group_start..][0..bit_width];
+
+                for (0..8) |v| {
+                    if (idx >= count) break;
+
+                    const bit_offset = v * bit_width;
+                    const byte_offset = bit_offset / 8;
+                    const bit_shift: u6 = @intCast(bit_offset % 8);
+
+                    var value: u64 = 0;
+                    const bytes_left = group_bytes.len - byte_offset;
+                    if (bytes_left >= 8) {
+                        value = std.mem.readInt(u64, group_bytes[byte_offset..][0..8], .little);
+                    } else {
+                        for (0..bytes_left) |b| {
+                            value |= @as(u64, group_bytes[byte_offset + b]) << @intCast(b * 8);
+                        }
+                    }
+
+                    const dict_idx: u32 = @truncate((value >> bit_shift) & mask);
+                    if (dict_idx >= dict.len) return PageError.InvalidIndex;
+                    output[idx] = dict[dict_idx];
+                    idx += 1;
                 }
             }
         }
