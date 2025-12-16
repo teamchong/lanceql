@@ -239,3 +239,74 @@ export const LanceQL: {
 };
 
 export default LanceQL;
+
+// =============================================================================
+// Dataset Storage (IndexedDB + OPFS)
+// =============================================================================
+
+export interface DatasetInfo {
+  name: string;
+  size: number;
+  timestamp: number;
+  storage: 'indexeddb' | 'opfs';
+  [key: string]: any;
+}
+
+export interface StorageUsage {
+  datasets: number;
+  totalSize: number;
+  indexedDBCount: number;
+  opfsCount: number;
+  quota: {
+    usage: number;
+    quota: number;
+  } | null;
+}
+
+export interface DatasetStorage {
+  /**
+   * Save a dataset file to local storage.
+   * Files <50MB use IndexedDB, larger files use OPFS.
+   * @param name Unique dataset name
+   * @param data File data
+   * @param metadata Optional metadata to store
+   */
+  save(name: string, data: ArrayBuffer | Uint8Array, metadata?: Record<string, any>): Promise<DatasetInfo>;
+
+  /**
+   * Load a dataset file from local storage.
+   * @param name Dataset name
+   * @returns File data or null if not found
+   */
+  load(name: string): Promise<Uint8Array | null>;
+
+  /**
+   * List all saved datasets.
+   */
+  list(): Promise<DatasetInfo[]>;
+
+  /**
+   * Delete a saved dataset.
+   * @param name Dataset name
+   */
+  delete(name: string): Promise<void>;
+
+  /**
+   * Check if a dataset exists.
+   * @param name Dataset name
+   */
+  exists(name: string): Promise<boolean>;
+
+  /**
+   * Get storage usage information.
+   */
+  getUsage(): Promise<StorageUsage>;
+}
+
+/** Global dataset storage instance */
+export const datasetStorage: DatasetStorage;
+
+/** DatasetStorage class for creating custom instances */
+export const DatasetStorage: {
+  new(dbName?: string, version?: number): DatasetStorage;
+};
