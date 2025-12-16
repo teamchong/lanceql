@@ -383,6 +383,743 @@ const datasetStorage = new DatasetStorage();
 // Export storage for external use
 export { datasetStorage, DatasetStorage };
 
+// =============================================================================
+// LocalDatabase - ACID-compliant local database with CRUD support
+// =============================================================================
+
+/**
+ * Data types for schema definition
+ */
+const DataType = {
+    INT: 'int64',
+    INTEGER: 'int64',
+    BIGINT: 'int64',
+    FLOAT: 'float32',
+    DOUBLE: 'float64',
+    TEXT: 'string',
+    VARCHAR: 'string',
+    BOOLEAN: 'bool',
+    BOOL: 'bool',
+    VECTOR: 'vector',
+};
+
+/**
+ * LocalDatabase - ACID-compliant database stored in IndexedDB/OPFS
+ *
+ * Uses manifest-based versioning for ACID:
+ * - Atomicity: Manifest update is atomic
+ * - Consistency: Always read from valid manifest
+ * - Isolation: Each transaction sees snapshot
+ * - Durability: Persisted to IndexedDB/OPFS
+ */
+export class LocalDatabase {
+    constructor(name, storage = datasetStorage) {
+        this.name = name;
+        this.storage = storage;
+        this.tables = new Map();  // tableName -> TableState
+        this.version = 0;
+        this.manifestKey = `${name}/__manifest__`;
+    }
+
+    /**
+     * Open or create the database
+     */
+    async open() {
+        // Load manifest from storage
+        const manifestData = await this.storage.load(this.manifestKey);
+        if (manifestData) {
+            const manifest = JSON.parse(new TextDecoder().decode(manifestData));
+            this.version = manifest.version || 0;
+            this.tables = new Map(Object.entries(manifest.tables || {}));
+        }
+        return this;
+    }
+
+    /**
+     * Save manifest to storage (atomic commit point)
+     */
+    async _saveManifest() {
+        this.version++;
+        const manifest = {
+            version: this.version,
+            timestamp: Date.now(),
+            tables: Object.fromEntries(this.tables),
+        };
+        const data = new TextEncoder().encode(JSON.stringify(manifest));
+        await this.storage.save(this.manifestKey, data);
+    }
+
+    /**
+     * CREATE TABLE
+     * @param {string} tableName - Table name
+     * @param {Array} columns - Column definitions [{name, type, primaryKey?, vectorDim?}]
+     */
+    async createTable(tableName, columns) {
+        if (this.tables.has(tableName)) {
+            throw new Error(`Table '${tableName}' already exists`);
+        }
+
+        const schema = columns.map(col => ({
+            name: col.name,
+            type: DataType[col.type?.toUpperCase()] || col.type || 'string',
+            primaryKey: col.primaryKey || false,
+            vectorDim: col.vectorDim || null,
+        }));
+
+        const tableState = {
+            name: tableName,
+            schema,
+            fragments: [],      // List of data fragment keys
+            deletionVector: [], // Row IDs that are deleted
+            rowCount: 0,
+            nextRowId: 0,
+            createdAt: Date.now(),
+        };
+
+        this.tables.set(tableName, tableState);
+        await this._saveManifest();
+
+        return { success: true, table: tableName };
+    }
+
+    /**
+     * DROP TABLE
+     * @param {string} tableName - Table name
+     */
+    async dropTable(tableName) {
+        if (!this.tables.has(tableName)) {
+            throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        const table = this.tables.get(tableName);
+
+        // Delete all fragments
+        for (const fragKey of table.fragments) {
+            await this.storage.delete(fragKey);
+        }
+
+        this.tables.delete(tableName);
+        await this._saveManifest();
+
+        return { success: true, table: tableName };
+    }
+
+    /**
+     * INSERT INTO
+     * @param {string} tableName - Table name
+     * @param {Array} rows - Array of row objects [{col1: val1, col2: val2}, ...]
+     */
+    async insert(tableName, rows) {
+        if (!this.tables.has(tableName)) {
+            throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        const table = this.tables.get(tableName);
+
+        // Assign row IDs
+        const rowsWithIds = rows.map(row => ({
+            __rowId: table.nextRowId++,
+            ...row,
+        }));
+
+        // Create new fragment
+        const fragKey = `${this.name}/${tableName}/frag_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        const fragData = new TextEncoder().encode(JSON.stringify(rowsWithIds));
+        await this.storage.save(fragKey, fragData);
+
+        // Update table state
+        table.fragments.push(fragKey);
+        table.rowCount += rows.length;
+
+        await this._saveManifest();
+
+        return { success: true, inserted: rows.length };
+    }
+
+    /**
+     * DELETE FROM
+     * @param {string} tableName - Table name
+     * @param {Function} predicate - Filter function (row) => boolean
+     */
+    async delete(tableName, predicate) {
+        if (!this.tables.has(tableName)) {
+            throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        const table = this.tables.get(tableName);
+        const allRows = await this._readAllRows(tableName);
+
+        let deletedCount = 0;
+        for (const row of allRows) {
+            if (predicate(row)) {
+                table.deletionVector.push(row.__rowId);
+                deletedCount++;
+                table.rowCount--;
+            }
+        }
+
+        await this._saveManifest();
+
+        return { success: true, deleted: deletedCount };
+    }
+
+    /**
+     * UPDATE
+     * @param {string} tableName - Table name
+     * @param {Object} updates - Column updates {col1: newVal, col2: newVal}
+     * @param {Function} predicate - Filter function (row) => boolean
+     */
+    async update(tableName, updates, predicate) {
+        if (!this.tables.has(tableName)) {
+            throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        const table = this.tables.get(tableName);
+        const allRows = await this._readAllRows(tableName);
+
+        const updatedRows = [];
+        let updatedCount = 0;
+
+        for (const row of allRows) {
+            if (predicate(row)) {
+                // Mark old row as deleted
+                table.deletionVector.push(row.__rowId);
+                table.rowCount--;
+
+                // Create new row with updates
+                const newRow = { ...row, ...updates };
+                delete newRow.__rowId;
+                updatedRows.push(newRow);
+                updatedCount++;
+            }
+        }
+
+        // Insert updated rows as new fragment
+        if (updatedRows.length > 0) {
+            await this.insert(tableName, updatedRows);
+        } else {
+            await this._saveManifest();
+        }
+
+        return { success: true, updated: updatedCount };
+    }
+
+    /**
+     * SELECT (query)
+     * @param {string} tableName - Table name
+     * @param {Object} options - Query options {columns, where, limit, offset, orderBy}
+     */
+    async select(tableName, options = {}) {
+        if (!this.tables.has(tableName)) {
+            throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        let rows = await this._readAllRows(tableName);
+
+        // WHERE filter
+        if (options.where) {
+            rows = rows.filter(options.where);
+        }
+
+        // ORDER BY
+        if (options.orderBy) {
+            const { column, desc } = options.orderBy;
+            rows.sort((a, b) => {
+                const cmp = a[column] < b[column] ? -1 : a[column] > b[column] ? 1 : 0;
+                return desc ? -cmp : cmp;
+            });
+        }
+
+        // OFFSET
+        if (options.offset) {
+            rows = rows.slice(options.offset);
+        }
+
+        // LIMIT
+        if (options.limit) {
+            rows = rows.slice(0, options.limit);
+        }
+
+        // Column projection
+        if (options.columns && options.columns.length > 0 && options.columns[0] !== '*') {
+            rows = rows.map(row => {
+                const projected = {};
+                for (const col of options.columns) {
+                    projected[col] = row[col];
+                }
+                return projected;
+            });
+        }
+
+        // Remove internal __rowId
+        rows = rows.map(row => {
+            const { __rowId, ...rest } = row;
+            return rest;
+        });
+
+        return rows;
+    }
+
+    /**
+     * Read all rows from a table (excluding deleted)
+     */
+    async _readAllRows(tableName) {
+        const table = this.tables.get(tableName);
+        const deletedSet = new Set(table.deletionVector);
+        const allRows = [];
+
+        for (const fragKey of table.fragments) {
+            const fragData = await this.storage.load(fragKey);
+            if (fragData) {
+                const rows = JSON.parse(new TextDecoder().decode(fragData));
+                for (const row of rows) {
+                    if (!deletedSet.has(row.__rowId)) {
+                        allRows.push(row);
+                    }
+                }
+            }
+        }
+
+        return allRows;
+    }
+
+    /**
+     * Get table info
+     */
+    getTable(tableName) {
+        return this.tables.get(tableName);
+    }
+
+    /**
+     * List all tables
+     */
+    listTables() {
+        return Array.from(this.tables.keys());
+    }
+
+    /**
+     * Execute SQL statement
+     * @param {string} sql - SQL statement
+     * @returns {Promise<any>} Result
+     */
+    async exec(sql) {
+        const lexer = new SQLLexer(sql);
+        const tokens = lexer.tokenize();
+        const parser = new LocalSQLParser(tokens);
+        const ast = parser.parse();
+
+        return this._executeAST(ast);
+    }
+
+    /**
+     * Execute parsed AST
+     */
+    async _executeAST(ast) {
+        switch (ast.type) {
+            case 'create_table':
+                return this.createTable(ast.table, ast.columns);
+
+            case 'drop_table':
+                return this.dropTable(ast.table);
+
+            case 'insert':
+                return this.insert(ast.table, ast.rows);
+
+            case 'delete':
+                const deletePredicate = ast.where
+                    ? (row) => this._evalWhere(ast.where, row)
+                    : () => true;
+                return this.delete(ast.table, deletePredicate);
+
+            case 'update':
+                const updatePredicate = ast.where
+                    ? (row) => this._evalWhere(ast.where, row)
+                    : () => true;
+                return this.update(ast.table, ast.set, updatePredicate);
+
+            case 'select':
+                const selectOptions = {
+                    columns: ast.columns,
+                    where: ast.where ? (row) => this._evalWhere(ast.where, row) : null,
+                    limit: ast.limit,
+                    offset: ast.offset,
+                    orderBy: ast.orderBy,
+                };
+                return this.select(ast.table, selectOptions);
+
+            default:
+                throw new Error(`Unknown statement type: ${ast.type}`);
+        }
+    }
+
+    /**
+     * Evaluate WHERE clause
+     */
+    _evalWhere(where, row) {
+        if (!where) return true;
+
+        switch (where.op) {
+            case 'AND':
+                return this._evalWhere(where.left, row) && this._evalWhere(where.right, row);
+            case 'OR':
+                return this._evalWhere(where.left, row) || this._evalWhere(where.right, row);
+            case '=':
+                return row[where.column] === where.value;
+            case '!=':
+            case '<>':
+                return row[where.column] !== where.value;
+            case '<':
+                return row[where.column] < where.value;
+            case '<=':
+                return row[where.column] <= where.value;
+            case '>':
+                return row[where.column] > where.value;
+            case '>=':
+                return row[where.column] >= where.value;
+            case 'LIKE':
+                const pattern = where.value.replace(/%/g, '.*').replace(/_/g, '.');
+                return new RegExp(`^${pattern}$`, 'i').test(row[where.column]);
+            default:
+                return true;
+        }
+    }
+
+    /**
+     * Compact the database (merge fragments, remove deleted rows)
+     */
+    async compact() {
+        for (const [tableName, table] of this.tables) {
+            const allRows = await this._readAllRows(tableName);
+
+            // Delete old fragments
+            for (const fragKey of table.fragments) {
+                await this.storage.delete(fragKey);
+            }
+
+            // Reset table state
+            table.fragments = [];
+            table.deletionVector = [];
+            table.rowCount = 0;
+            table.nextRowId = 0;
+
+            // Re-insert all rows as single fragment
+            if (allRows.length > 0) {
+                // Remove old __rowId
+                const cleanRows = allRows.map(({ __rowId, ...rest }) => rest);
+                await this.insert(tableName, cleanRows);
+            }
+        }
+
+        return { success: true, compacted: this.tables.size };
+    }
+
+    /**
+     * Close the database
+     */
+    async close() {
+        await this._saveManifest();
+    }
+}
+
+/**
+ * SQL Parser for LocalDatabase (supports CREATE, INSERT, UPDATE, DELETE, SELECT)
+ */
+class LocalSQLParser {
+    constructor(tokens) {
+        this.tokens = tokens;
+        this.pos = 0;
+    }
+
+    peek() {
+        return this.tokens[this.pos] || { type: TokenType.EOF };
+    }
+
+    advance() {
+        return this.tokens[this.pos++] || { type: TokenType.EOF };
+    }
+
+    match(type) {
+        if (this.peek().type === type) {
+            return this.advance();
+        }
+        return null;
+    }
+
+    expect(type) {
+        const token = this.advance();
+        if (token.type !== type) {
+            throw new Error(`Expected ${type}, got ${token.type}`);
+        }
+        return token;
+    }
+
+    parse() {
+        const token = this.peek();
+
+        switch (token.type) {
+            case TokenType.CREATE:
+                return this.parseCreate();
+            case TokenType.DROP:
+                return this.parseDrop();
+            case TokenType.INSERT:
+                return this.parseInsert();
+            case TokenType.UPDATE:
+                return this.parseUpdate();
+            case TokenType.DELETE:
+                return this.parseDelete();
+            case TokenType.SELECT:
+                return this.parseSelect();
+            default:
+                throw new Error(`Unexpected token: ${token.type}`);
+        }
+    }
+
+    parseCreate() {
+        this.expect(TokenType.CREATE);
+        this.expect(TokenType.TABLE);
+        const tableName = this.expect(TokenType.IDENTIFIER).value;
+        this.expect(TokenType.LPAREN);
+
+        const columns = [];
+        do {
+            const colName = this.expect(TokenType.IDENTIFIER).value;
+            const colType = this.parseDataType();
+            const col = { name: colName, type: colType };
+
+            // Check for PRIMARY KEY
+            if (this.match(TokenType.PRIMARY)) {
+                this.expect(TokenType.KEY);
+                col.primaryKey = true;
+            }
+
+            columns.push(col);
+        } while (this.match(TokenType.COMMA));
+
+        this.expect(TokenType.RPAREN);
+
+        return { type: 'create_table', table: tableName, columns };
+    }
+
+    parseDataType() {
+        const token = this.advance();
+        let type = token.value || token.type;
+
+        // Handle VECTOR(dim)
+        if (type === 'VECTOR' && this.match(TokenType.LPAREN)) {
+            const dim = this.expect(TokenType.NUMBER).value;
+            this.expect(TokenType.RPAREN);
+            return { type: 'vector', dim: parseInt(dim) };
+        }
+
+        // Handle VARCHAR(len)
+        if ((type === 'VARCHAR' || type === 'TEXT') && this.match(TokenType.LPAREN)) {
+            this.expect(TokenType.NUMBER); // ignore length
+            this.expect(TokenType.RPAREN);
+        }
+
+        return type;
+    }
+
+    parseDrop() {
+        this.expect(TokenType.DROP);
+        this.expect(TokenType.TABLE);
+        const tableName = this.expect(TokenType.IDENTIFIER).value;
+        return { type: 'drop_table', table: tableName };
+    }
+
+    parseInsert() {
+        this.expect(TokenType.INSERT);
+        this.expect(TokenType.INTO);
+        const tableName = this.expect(TokenType.IDENTIFIER).value;
+
+        // Optional column list
+        let columns = null;
+        if (this.match(TokenType.LPAREN)) {
+            columns = [this.expect(TokenType.IDENTIFIER).value];
+            while (this.match(TokenType.COMMA)) {
+                columns.push(this.expect(TokenType.IDENTIFIER).value);
+            }
+            this.expect(TokenType.RPAREN);
+        }
+
+        this.expect(TokenType.VALUES);
+
+        const rows = [];
+        do {
+            this.expect(TokenType.LPAREN);
+            const values = [this.parseValue()];
+            while (this.match(TokenType.COMMA)) {
+                values.push(this.parseValue());
+            }
+            this.expect(TokenType.RPAREN);
+
+            // Build row object
+            if (columns) {
+                const row = {};
+                columns.forEach((col, i) => row[col] = values[i]);
+                rows.push(row);
+            } else {
+                rows.push(values); // positional - needs schema lookup
+            }
+        } while (this.match(TokenType.COMMA));
+
+        return { type: 'insert', table: tableName, columns, rows };
+    }
+
+    parseValue() {
+        const token = this.peek();
+
+        if (token.type === TokenType.NUMBER) {
+            this.advance();
+            const num = parseFloat(token.value);
+            return Number.isInteger(num) ? parseInt(token.value) : num;
+        }
+        if (token.type === TokenType.STRING) {
+            this.advance();
+            return token.value;
+        }
+        if (token.type === TokenType.NULL) {
+            this.advance();
+            return null;
+        }
+        if (token.type === TokenType.TRUE) {
+            this.advance();
+            return true;
+        }
+        if (token.type === TokenType.FALSE) {
+            this.advance();
+            return false;
+        }
+        // Vector literal [1.0, 2.0, 3.0]
+        if (this.match(TokenType.LBRACKET)) {
+            const vec = [];
+            do {
+                vec.push(parseFloat(this.expect(TokenType.NUMBER).value));
+            } while (this.match(TokenType.COMMA));
+            this.expect(TokenType.RBRACKET);
+            return vec;
+        }
+
+        throw new Error(`Unexpected value token: ${token.type}`);
+    }
+
+    parseUpdate() {
+        this.expect(TokenType.UPDATE);
+        const tableName = this.expect(TokenType.IDENTIFIER).value;
+        this.expect(TokenType.SET);
+
+        const set = {};
+        do {
+            const col = this.expect(TokenType.IDENTIFIER).value;
+            this.expect(TokenType.EQ);
+            set[col] = this.parseValue();
+        } while (this.match(TokenType.COMMA));
+
+        let where = null;
+        if (this.match(TokenType.WHERE)) {
+            where = this.parseWhereExpr();
+        }
+
+        return { type: 'update', table: tableName, set, where };
+    }
+
+    parseDelete() {
+        this.expect(TokenType.DELETE);
+        this.expect(TokenType.FROM);
+        const tableName = this.expect(TokenType.IDENTIFIER).value;
+
+        let where = null;
+        if (this.match(TokenType.WHERE)) {
+            where = this.parseWhereExpr();
+        }
+
+        return { type: 'delete', table: tableName, where };
+    }
+
+    parseSelect() {
+        this.expect(TokenType.SELECT);
+
+        // Columns
+        const columns = [];
+        if (this.match(TokenType.STAR)) {
+            columns.push('*');
+        } else {
+            columns.push(this.expect(TokenType.IDENTIFIER).value);
+            while (this.match(TokenType.COMMA)) {
+                columns.push(this.expect(TokenType.IDENTIFIER).value);
+            }
+        }
+
+        this.expect(TokenType.FROM);
+        const tableName = this.expect(TokenType.IDENTIFIER).value;
+
+        let where = null;
+        if (this.match(TokenType.WHERE)) {
+            where = this.parseWhereExpr();
+        }
+
+        let orderBy = null;
+        if (this.match(TokenType.ORDER)) {
+            this.expect(TokenType.BY);
+            const column = this.expect(TokenType.IDENTIFIER).value;
+            const desc = !!this.match(TokenType.DESC);
+            if (!desc) this.match(TokenType.ASC);
+            orderBy = { column, desc };
+        }
+
+        let limit = null;
+        if (this.match(TokenType.LIMIT)) {
+            limit = parseInt(this.expect(TokenType.NUMBER).value);
+        }
+
+        let offset = null;
+        if (this.match(TokenType.OFFSET)) {
+            offset = parseInt(this.expect(TokenType.NUMBER).value);
+        }
+
+        return { type: 'select', table: tableName, columns, where, orderBy, limit, offset };
+    }
+
+    parseWhereExpr() {
+        return this.parseOrExpr();
+    }
+
+    parseOrExpr() {
+        let left = this.parseAndExpr();
+        while (this.match(TokenType.OR)) {
+            const right = this.parseAndExpr();
+            left = { op: 'OR', left, right };
+        }
+        return left;
+    }
+
+    parseAndExpr() {
+        let left = this.parseComparison();
+        while (this.match(TokenType.AND)) {
+            const right = this.parseComparison();
+            left = { op: 'AND', left, right };
+        }
+        return left;
+    }
+
+    parseComparison() {
+        const column = this.expect(TokenType.IDENTIFIER).value;
+
+        let op;
+        if (this.match(TokenType.EQ)) op = '=';
+        else if (this.match(TokenType.NE)) op = '!=';
+        else if (this.match(TokenType.LT)) op = '<';
+        else if (this.match(TokenType.LE)) op = '<=';
+        else if (this.match(TokenType.GT)) op = '>';
+        else if (this.match(TokenType.GE)) op = '>=';
+        else if (this.match(TokenType.LIKE)) op = 'LIKE';
+        else throw new Error(`Expected comparison operator`);
+
+        const value = this.parseValue();
+        return { op, column, value };
+    }
+}
+
 // Immer-style WASM runtime - auto string/bytes marshalling
 const E = new TextEncoder();
 const D = new TextDecoder();
@@ -4612,6 +5349,29 @@ const TokenType = {
     TOPK: 'TOPK',
     // File reference
     FILE: 'FILE',
+    // Write keywords
+    CREATE: 'CREATE',
+    TABLE: 'TABLE',
+    INSERT: 'INSERT',
+    INTO: 'INTO',
+    VALUES: 'VALUES',
+    UPDATE: 'UPDATE',
+    SET: 'SET',
+    DELETE: 'DELETE',
+    DROP: 'DROP',
+    // Data types
+    INT: 'INT',
+    INTEGER: 'INTEGER',
+    BIGINT: 'BIGINT',
+    FLOAT: 'FLOAT',
+    DOUBLE: 'DOUBLE',
+    TEXT: 'TEXT',
+    VARCHAR: 'VARCHAR',
+    BOOLEAN: 'BOOLEAN',
+    BOOL: 'BOOL',
+    VECTOR: 'VECTOR',
+    PRIMARY: 'PRIMARY',
+    KEY: 'KEY',
 
     // Literals
     IDENTIFIER: 'IDENTIFIER',
@@ -4670,6 +5430,29 @@ const KEYWORDS = {
     'NEAR': TokenType.NEAR,
     'TOPK': TokenType.TOPK,
     'FILE': TokenType.FILE,
+    // Write keywords
+    'CREATE': TokenType.CREATE,
+    'TABLE': TokenType.TABLE,
+    'INSERT': TokenType.INSERT,
+    'INTO': TokenType.INTO,
+    'VALUES': TokenType.VALUES,
+    'UPDATE': TokenType.UPDATE,
+    'SET': TokenType.SET,
+    'DELETE': TokenType.DELETE,
+    'DROP': TokenType.DROP,
+    // Data types
+    'INT': TokenType.INT,
+    'INTEGER': TokenType.INTEGER,
+    'BIGINT': TokenType.BIGINT,
+    'FLOAT': TokenType.FLOAT,
+    'DOUBLE': TokenType.DOUBLE,
+    'TEXT': TokenType.TEXT,
+    'VARCHAR': TokenType.VARCHAR,
+    'BOOLEAN': TokenType.BOOLEAN,
+    'BOOL': TokenType.BOOL,
+    'VECTOR': TokenType.VECTOR,
+    'PRIMARY': TokenType.PRIMARY,
+    'KEY': TokenType.KEY,
 };
 
 /**

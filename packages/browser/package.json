@@ -1,6 +1,7 @@
 {
   "name": "@lanceql/browser",
   "version": "0.1.0",
+  "type": "module",
   "description": "Query Lance columnar files in the browser with SQL and vector search",
   "main": "dist/lanceql.js",
   "module": "dist/lanceql.esm.js",
