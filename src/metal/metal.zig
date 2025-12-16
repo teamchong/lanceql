@@ -12,7 +12,8 @@ const builtin = @import("builtin");
 /// Compile-time platform detection
 /// Metal and Accelerate are auto-enabled on macOS
 pub const is_macos = builtin.os.tag == .macos;
-pub const use_metal = is_macos;
+pub const is_apple_silicon = is_macos and builtin.cpu.arch == .aarch64;
+pub const use_metal = is_macos; // Metal works on both Intel and ARM
 pub const use_accelerate = is_macos;
 
 // =============================================================================
@@ -45,38 +46,24 @@ const metal_c = if (is_macos) struct {
 var gpu_initialized: bool = false;
 var gpu_library_loaded: bool = false;
 
-/// Initialize Metal GPU
+/// Initialize Metal GPU (compiles shaders at runtime - no Xcode needed!)
 pub fn initGPU() bool {
     if (comptime !is_macos) return false;
     if (gpu_initialized) return true;
 
     const result = metal_c.lanceql_metal_init();
     gpu_initialized = (result == 0);
+    gpu_library_loaded = gpu_initialized; // Shaders compiled at init time
     return gpu_initialized;
-}
-
-/// Load Metal shader library
-pub fn loadGPULibrary(path: []const u8) bool {
-    if (comptime !is_macos) return false;
-    if (!gpu_initialized) {
-        if (!initGPU()) return false;
-    }
-
-    // Need null-terminated path
-    var path_buf: [1024]u8 = undefined;
-    if (path.len >= path_buf.len) return false;
-    @memcpy(path_buf[0..path.len], path);
-    path_buf[path.len] = 0;
-
-    const result = metal_c.lanceql_metal_load_library(@ptrCast(&path_buf));
-    gpu_library_loaded = (result == 0);
-    return gpu_library_loaded;
 }
 
 /// Check if GPU is available and ready
 pub fn isGPUReady() bool {
     if (comptime !is_macos) return false;
-    return gpu_initialized and gpu_library_loaded;
+    if (!gpu_initialized) {
+        _ = initGPU();
+    }
+    return gpu_initialized;
 }
 
 /// Get GPU device name
@@ -208,8 +195,14 @@ pub fn l2DistanceSquared(a: []const f32, b: []const f32) f32 {
     return simdL2DistanceSquared(a, b);
 }
 
-/// Batch cosine similarity: compute similarity of query against all vectors
-/// Returns scores array (must be pre-allocated with vectors.len / dim elements)
+/// Threshold for auto-switching to GPU (vectors count)
+/// Only Apple Silicon benefits from GPU (zero-copy unified memory)
+/// Intel Macs have discrete GPU memory - copy overhead makes CPU faster
+const GPU_THRESHOLD: usize = 100_000;
+
+/// Batch cosine similarity: auto-selects GPU or CPU based on workload size
+/// Apple Silicon: Uses Metal GPU (zero-copy) for large batches
+/// Intel Mac/Other: Uses Accelerate vDSP or SIMD
 pub fn batchCosineSimilarity(
     query: []const f32,
     vectors: []const f32,
@@ -220,7 +213,21 @@ pub fn batchCosineSimilarity(
     std.debug.assert(query.len == dim);
     std.debug.assert(scores.len >= num_vectors);
 
-    // For each vector, compute cosine similarity
+    // Auto-switch to GPU only on Apple Silicon (unified memory = zero-copy)
+    if (comptime is_apple_silicon) {
+        if (num_vectors >= GPU_THRESHOLD and isGPUReady()) {
+            const result = metal_c.lanceql_metal_cosine_batch(
+                query.ptr,
+                vectors.ptr,
+                scores.ptr,
+                @intCast(dim),
+                @intCast(num_vectors),
+            );
+            if (result == 0) return; // GPU success
+        }
+    }
+
+    // CPU path (Accelerate vDSP on macOS, SIMD elsewhere)
     for (0..num_vectors) |i| {
         const vec = vectors[i * dim ..][0..dim];
         scores[i] = cosineSimilarity(query, vec);
@@ -324,14 +331,14 @@ pub fn isMetalAvailable() bool {
 
 /// Get platform info string
 pub fn getPlatformInfo() []const u8 {
-    if (comptime is_macos) {
-        if (gpu_library_loaded) {
-            return "macOS (Metal GPU + Accelerate)";
-        } else if (comptime use_accelerate) {
-            return "macOS (Accelerate vDSP)";
+    if (comptime is_apple_silicon) {
+        if (gpu_initialized) {
+            return "Apple Silicon (Metal GPU + Accelerate)";
         } else {
-            return "macOS (SIMD)";
+            return "Apple Silicon (Accelerate vDSP)";
         }
+    } else if (comptime is_macos) {
+        return "Intel Mac (Accelerate vDSP)";
     } else if (comptime builtin.os.tag == .linux) {
         return "Linux (SIMD)";
     } else if (comptime builtin.os.tag == .windows) {

@@ -292,21 +292,35 @@ python benchmarks/10_parquet_api.py              # vs pyarrow.parquet (drop-in A
 ## Performance Optimizations
 
 - **Zero-copy Arrow** - Direct memory sharing via Arrow C Data Interface
-- **Metal/Accelerate (macOS)** - Auto-detected at compile time via `builtin.os.tag`
-  - vDSP-accelerated dot product: 32 ns/op
-  - Batch cosine similarity: 14M vectors/sec (384-dim)
+- **Metal GPU (Apple Silicon)** - Zero-copy unified memory, auto-switch at 100K+ vectors
+  - Batch cosine similarity: 14.3M vectors/sec (1M × 384-dim)
+  - Shaders compile at runtime - no Xcode required
+- **Accelerate vDSP (macOS)** - SIMD-optimized for small batches and single-vector ops
+  - Dot product: 42 ns/op (384-dim)
+  - Cosine similarity: 106 ns/op (384-dim)
 - **Comptime SIMD** - 32-byte vectors, bit-width specialization (1-20 bits)
 - **IndexedDB Cache** - Schema and column types cached for repeat visits
 - **Sidecar Manifest** - Optional `.meta.json` for faster startup
 - **Fragment Prefetching** - Parallel metadata loading on dataset open
 - **Speculative Prefetch** - Next page loaded in background
 
+### Vector Search Performance (384 dims)
+
+| Scale | Path | Throughput |
+|-------|------|------------|
+| 10K vectors | CPU (Accelerate) | 13.9M vec/s |
+| 100K vectors | GPU (Metal) | 13.5M vec/s |
+| 1M vectors | GPU (Metal) | 14.3M vec/s |
+
+*Apple Silicon only - Intel Macs use CPU path (Accelerate still fast)*
+
 ### Platform Detection (comptime)
 
 ```zig
 const builtin = @import("builtin");
 const is_macos = builtin.os.tag == .macos;
-const use_accelerate = is_macos;  // Auto-enabled on macOS
+const is_apple_silicon = is_macos and builtin.cpu.arch == .aarch64;
+// Auto-switch: GPU at 100K+ vectors on Apple Silicon
 ```
 
 Run vector benchmark: `zig build bench-vector`

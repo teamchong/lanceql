@@ -283,29 +283,22 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Link macOS frameworks for benchmark
+    if (use_metal) {
+        bench_vector.root_module.linkFramework("Metal", .{});
+        bench_vector.root_module.linkFramework("Foundation", .{});
+        bench_vector.root_module.addCSourceFiles(.{
+            .files = &.{"src/metal/metal_backend.m"},
+            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
+        });
+    }
     if (use_accelerate) {
         bench_vector.root_module.linkFramework("Accelerate", .{});
     }
 
     const run_bench_vector = b.addRunArtifact(bench_vector);
-    const bench_vector_step = b.step("bench-vector", "Benchmark vector operations (Accelerate vs SIMD)");
+    const bench_vector_step = b.step("bench-vector", "Benchmark vector operations (GPU vs CPU)");
     bench_vector_step.dependOn(&run_bench_vector.step);
-
-    // Metal shader compilation step (macOS only)
-    if (use_metal) {
-        const compile_metal = b.addSystemCommand(&.{
-            "xcrun", "-sdk", "macosx", "metal", "-O3", "-c",
-            "src/metal/vector_search.metal", "-o", "zig-out/vector_search.air",
-        });
-        const link_metal = b.addSystemCommand(&.{
-            "xcrun", "-sdk", "macosx", "metallib",
-            "zig-out/vector_search.air", "-o", "zig-out/vector_search.metallib",
-        });
-        link_metal.step.dependOn(&compile_metal.step);
-
-        const metal_shaders_step = b.step("metal-shaders", "Compile Metal shaders to .metallib");
-        metal_shaders_step.dependOn(&link_metal.step);
-    }
 
     // SQL executor tests
     const test_sql_executor = b.addTest(.{
