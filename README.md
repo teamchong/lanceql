@@ -254,6 +254,8 @@ import { LanceQL } from './lanceql.js';
 
 ### LanceQL vs lancedb (Lance files)
 
+*Benchmarked on Apple M2 Pro (ARM64). Results may vary on other platforms.*
+
 | Test | Dataset | lancedb | LanceQL | Speedup |
 |------|---------|---------|---------|---------|
 | Full Table Scan | 100K rows | 24.2ms | 2.4ms | **10x faster** |
@@ -261,6 +263,8 @@ import { LanceQL } from './lanceql.js';
 | Throughput | 1M rows | 2.0M rows/s | 60.7M rows/s | **30x faster** |
 
 ### LanceQL vs PyArrow (Parquet files)
+
+*Benchmarked on Apple M2 Pro (ARM64). Results may vary on other platforms.*
 
 | Test | Dataset | PyArrow (C++) | LanceQL (Zig) | Speedup |
 |------|---------|---------------|---------------|---------|
