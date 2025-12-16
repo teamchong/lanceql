@@ -293,9 +293,17 @@ class Statement {
 }
 
 // ============================================================================
+// LocalDatabase - CRUD with ACID support
+// ============================================================================
+
+const { LocalDatabase, FileStorage, SQLLexer, LocalSQLParser } = require('./local-database');
+
+// ============================================================================
 // Exports - Match better-sqlite3 export format exactly
 // ============================================================================
 
 module.exports = Database;
 module.exports.Database = Database;
 module.exports.SqliteError = SqliteError;
+module.exports.LocalDatabase = LocalDatabase;
+module.exports.FileStorage = FileStorage;
