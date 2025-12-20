@@ -1549,16 +1549,10 @@
                 </div>
             </div>
             <div class="agg-bar" id="agg-bar" style="display: none;"></div>
-            <div class="results-body" id="results-body">
-                <div class="empty-state">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                        <circle cx="12" cy="12" r="10"/>
-                        <line x1="12" y1="8" x2="12" y2="12"/>
-                        <line x1="12" y1="16" x2="12.01" y2="16"/>
-                    </svg>
-                    <h3>No results yet</h3>
-                    <p>Run a query to see results here</p>
-                </div>
+            <div class="results-body lance-data" id="results-body" data-render="table"
+                 @lq-start="$store.app.isLoading = true"
+                 @lq-complete="$store.app.resultsCount = `${$event.detail.total.toLocaleString()} rows`"
+                 @lq-error="$store.app.showStatus($event.detail.message, 'error')">
             </div>
         </section>
     </div>
@@ -1566,7 +1560,7 @@
     <script type="module">
         import Alpine from 'https://esm.sh/alpinejs@3.14.3';
         import { atom, computed } from 'https://esm.sh/nanostores@0.10.3';
-        import LanceQL, { SQLExecutor, SQLLexer, SQLParser } from './lanceql.js';
+        import LanceQL, { SQLExecutor, SQLLexer, SQLParser, LanceData } from './lanceql.js';
 
         let lanceql;
 
@@ -3099,9 +3093,10 @@
                 };
 
                 Alpine.store('app').showResults = true;
-                displayResults(formattedResult);
+                // CSS-driven: render via LanceData (events trigger Alpine updates)
+                LanceData.render('#results-body', formattedResult);
                 hideProgress();
-                showStatus(`Query completed: ${result.rows.length} rows`, 'success');
+                // Note: resultsCount updated via @lq-complete event
             } catch (err) {
                 if (err.name === 'AbortError' || isSearchCancelled(signal)) {
                     console.log('Search cancelled');

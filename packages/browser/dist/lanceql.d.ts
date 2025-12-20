@@ -239,3 +239,162 @@ export const LanceQL: {
 };
 
 export default LanceQL;
+
+// =============================================================================
+// Dataset Storage (IndexedDB + OPFS)
+// =============================================================================
+
+export interface DatasetInfo {
+  name: string;
+  size: number;
+  timestamp: number;
+  storage: 'indexeddb' | 'opfs';
+  [key: string]: any;
+}
+
+export interface StorageUsage {
+  datasets: number;
+  totalSize: number;
+  indexedDBCount: number;
+  opfsCount: number;
+  quota: {
+    usage: number;
+    quota: number;
+  } | null;
+}
+
+export interface DatasetStorage {
+  /**
+   * Save a dataset file to local storage.
+   * Files <50MB use IndexedDB, larger files use OPFS.
+   * @param name Unique dataset name
+   * @param data File data
+   * @param metadata Optional metadata to store
+   */
+  save(name: string, data: ArrayBuffer | Uint8Array, metadata?: Record<string, any>): Promise<DatasetInfo>;
+
+  /**
+   * Load a dataset file from local storage.
+   * @param name Dataset name
+   * @returns File data or null if not found
+   */
+  load(name: string): Promise<Uint8Array | null>;
+
+  /**
+   * List all saved datasets.
+   */
+  list(): Promise<DatasetInfo[]>;
+
+  /**
+   * Delete a saved dataset.
+   * @param name Dataset name
+   */
+  delete(name: string): Promise<void>;
+
+  /**
+   * Check if a dataset exists.
+   * @param name Dataset name
+   */
+  exists(name: string): Promise<boolean>;
+
+  /**
+   * Get storage usage information.
+   */
+  getUsage(): Promise<StorageUsage>;
+}
+
+/** Global dataset storage instance */
+export const datasetStorage: DatasetStorage;
+
+/** DatasetStorage class for creating custom instances */
+export const DatasetStorage: {
+  new(dbName?: string, version?: number): DatasetStorage;
+};
+
+// =============================================================================
+// CSS-Driven Data Engine (LanceData)
+// =============================================================================
+
+/**
+ * LanceData initialization options
+ */
+export interface LanceDataOptions {
+  /** Default dataset URL */
+  dataset?: string;
+  /** WASM module URL (optional) */
+  wasmUrl?: string;
+}
+
+/**
+ * Custom renderer function type
+ */
+export type LanceDataRenderer = (results: any[], config: LanceDataConfig) => string;
+
+/**
+ * Configuration parsed from CSS variables
+ */
+export interface LanceDataConfig {
+  /** SQL query from --query variable */
+  query?: string;
+  /** Renderer type from --render variable */
+  render: string;
+  /** Input binding selector from --bind variable */
+  bind?: string;
+  /** Dataset URL from --dataset variable */
+  dataset?: string;
+  /** Column names from --columns variable */
+  columns?: string[];
+  /** Row limit from --limit variable */
+  limit?: number;
+}
+
+/**
+ * CSS-driven data binding for Lance datasets.
+ *
+ * @example
+ * ```html
+ * <!-- Pure CSS data binding -->
+ * <div class="lance-data"
+ *      style="--query: 'SELECT * FROM data LIMIT 10'; --render: table;">
+ * </div>
+ * ```
+ *
+ * CSS Variables:
+ * - --query: SQL query string (required)
+ * - --render: Renderer type - table, list, value, images, json, count (default: table)
+ * - --bind: Input element selector for reactive binding
+ * - --dataset: Dataset URL (optional, uses default if not set)
+ * - --columns: Comma-separated column names to display
+ * - --limit: Maximum rows to display
+ */
+export class LanceData {
+  /**
+   * Initialize CSS-driven data binding.
+   * Must be called once before using lance-data elements.
+   */
+  static init(options?: LanceDataOptions): Promise<void>;
+
+  /**
+   * Register a custom renderer.
+   * @param name Renderer name (used in --render CSS variable)
+   * @param fn Renderer function (results, config) => html
+   */
+  static registerRenderer(name: string, fn: LanceDataRenderer): void;
+
+  /**
+   * Clear the query cache.
+   */
+  static clearCache(): void;
+
+  /**
+   * Refresh all lance-data elements.
+   */
+  static refresh(): void;
+
+  /**
+   * Destroy and clean up all bindings.
+   */
+  static destroy(): void;
+}
+
+export { LanceData };

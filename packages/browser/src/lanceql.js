@@ -8713,5 +8713,736 @@ export class SharedVectorStore {
     }
 }
 
+// ============================================================================
+// CSS-Driven Query Engine - Zero JavaScript Data Binding
+// ============================================================================
+
+/**
+ * LanceData provides CSS-driven data binding for Lance datasets.
+ *
+ * TRULY CSS-DRIVEN: No JavaScript initialization required!
+ * Just add lq-* attributes to any element.
+ *
+ * Usage (pure HTML/CSS, zero JavaScript):
+ * ```html
+ * <div lq-query="SELECT url, text FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 10"
+ *      lq-render="table">
+ * </div>
+ * ```
+ *
+ * Attributes (supports both lq-* and data-* prefixes):
+ * - lq-src / data-dataset: Dataset URL (optional if URL is in query)
+ * - lq-query / data-query: SQL query string (required)
+ * - lq-render / data-render: Renderer type - table, list, value, images, json (default: table)
+ * - lq-columns / data-columns: Comma-separated column names to display
+ * - lq-bind / data-bind: Input element selector for reactive binding
+ *
+ * The system auto-initializes when the script loads.
+ */
+export class LanceData {
+    static _initialized = false;
+    static _observer = null;
+    static _wasm = null;
+    static _datasets = new Map(); // Cache datasets by URL
+    static _renderers = {};
+    static _bindings = new Map();
+    static _queryCache = new Map();
+    static _defaultDataset = null;
+
+    /**
+     * Auto-initialize when DOM is ready.
+     * Called automatically - no user action needed.
+     */
+    static _autoInit() {
+        if (LanceData._initialized) return;
+        LanceData._initialized = true;
+
+        // Register built-in renderers
+        LanceData._registerBuiltinRenderers();
+
+        // Inject trigger styles
+        LanceData._injectTriggerStyles();
+
+        // Set up observer for lance-data elements
+        LanceData._setupObserver();
+
+        // Process any existing elements
+        LanceData._processExisting();
+    }
+
+    /**
+     * Get or load a dataset (cached).
+     */
+    static async _getDataset(url) {
+        if (!url) {
+            if (LanceData._defaultDataset) return LanceData._datasets.get(LanceData._defaultDataset);
+            throw new Error('No dataset URL. Add data-dataset="https://..." to your element.');
+        }
+
+        if (LanceData._datasets.has(url)) {
+            return LanceData._datasets.get(url);
+        }
+
+        // Load WASM if needed
+        if (!LanceData._wasm) {
+            // Try to find wasm URL from script tag or use default
+            const wasmUrl = document.querySelector('script[data-lanceql-wasm]')?.dataset.lanceqlWasm
+                || './lanceql.wasm';
+            LanceData._wasm = await LanceQL.load(wasmUrl);
+        }
+
+        const dataset = await RemoteLanceDataset.open(LanceData._wasm, url);
+        LanceData._datasets.set(url, dataset);
+
+        // First dataset becomes default
+        if (!LanceData._defaultDataset) {
+            LanceData._defaultDataset = url;
+        }
+
+        return dataset;
+    }
+
+    /**
+     * Manual init (optional) - for advanced configuration.
+     */
+    static async init(options = {}) {
+        LanceData._autoInit();
+
+        if (options.wasmUrl) {
+            LanceData._wasm = await LanceQL.load(options.wasmUrl);
+        }
+        if (options.dataset) {
+            await LanceData._getDataset(options.dataset);
+        }
+    }
+
+    /**
+     * Inject CSS that triggers JavaScript via animation events.
+     */
+    static _injectTriggerStyles() {
+        if (document.getElementById('lance-data-triggers')) return;
+
+        const style = document.createElement('style');
+        style.id = 'lance-data-triggers';
+        style.textContent = `
+            /* Lance Data CSS Trigger System */
+            @keyframes lance-query-trigger {
+                from { --lance-trigger: 0; }
+                to { --lance-trigger: 1; }
+            }
+
+            /* Elements with lance-data class trigger on insertion */
+            .lance-data {
+                animation: lance-query-trigger 0.001s;
+            }
+
+            /* Re-trigger on data attribute changes */
+            .lance-data[data-refresh] {
+                animation: lance-query-trigger 0.001s;
+            }
+
+            /* Loading state */
+            .lance-data[data-loading]::before {
+                content: '';
+                display: block;
+                width: 20px;
+                height: 20px;
+                border: 2px solid #3b82f6;
+                border-top-color: transparent;
+                border-radius: 50%;
+                animation: lance-spin 0.8s linear infinite;
+            }
+
+            @keyframes lance-spin {
+                to { transform: rotate(360deg); }
+            }
+
+            /* Error state */
+            .lance-data[data-error]::before {
+                content: attr(data-error);
+                color: #ef4444;
+                font-size: 12px;
+            }
+
+            /* Result container styling */
+            .lance-data table {
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 13px;
+            }
+
+            .lance-data th, .lance-data td {
+                padding: 8px 12px;
+                text-align: left;
+                border-bottom: 1px solid #334155;
+            }
+
+            .lance-data th {
+                background: #1e293b;
+                font-weight: 500;
+                color: #94a3b8;
+            }
+
+            .lance-data tr:hover td {
+                background: rgba(59, 130, 246, 0.05);
+            }
+
+            /* Value renderer */
+            .lance-data[style*="--render: value"] .lance-value,
+            .lance-data[style*="--render:'value'"] .lance-value,
+            .lance-data[style*='--render:"value"'] .lance-value {
+                font-size: 24px;
+                font-weight: 600;
+                color: #3b82f6;
+            }
+
+            /* List renderer */
+            .lance-data .lance-list {
+                list-style: none;
+                padding: 0;
+                margin: 0;
+            }
+
+            .lance-data .lance-list li {
+                padding: 8px 0;
+                border-bottom: 1px solid #334155;
+            }
+
+            /* JSON renderer */
+            .lance-data .lance-json {
+                background: #0f172a;
+                padding: 12px;
+                border-radius: 8px;
+                font-family: 'SF Mono', Monaco, monospace;
+                font-size: 12px;
+                white-space: pre-wrap;
+                overflow-x: auto;
+            }
+
+            /* Image grid renderer */
+            .lance-data .lance-images {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+                gap: 16px;
+            }
+
+            .lance-data .lance-images .image-card {
+                background: #1e293b;
+                border-radius: 8px;
+                overflow: hidden;
+            }
+
+            .lance-data .lance-images img {
+                width: 100%;
+                aspect-ratio: 1;
+                object-fit: cover;
+            }
+
+            .lance-data .lance-images .image-meta {
+                padding: 8px;
+                font-size: 12px;
+                color: #94a3b8;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    /**
+     * Set up MutationObserver for dynamic elements.
+     */
+    static _setupObserver() {
+        if (LanceData._observer) return;
+
+        // Helper to check if element has lq-* attributes
+        const hasLqAttrs = (el) => {
+            return el.hasAttribute?.('lq-query') || el.hasAttribute?.('lq-src') ||
+                   el.classList?.contains('lance-data');
+        };
+
+        LanceData._observer = new MutationObserver((mutations) => {
+            for (const mutation of mutations) {
+                // New nodes added
+                for (const node of mutation.addedNodes) {
+                    if (node.nodeType === Node.ELEMENT_NODE) {
+                        if (hasLqAttrs(node)) {
+                            LanceData._processElement(node);
+                        }
+                        // Check descendants
+                        node.querySelectorAll?.('[lq-query], [lq-src], .lance-data')?.forEach(el => {
+                            LanceData._processElement(el);
+                        });
+                    }
+                }
+
+                // Attribute changes
+                if (mutation.type === 'attributes' && hasLqAttrs(mutation.target)) {
+                    LanceData._processElement(mutation.target);
+                }
+            }
+        });
+
+        LanceData._observer.observe(document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['lq-query', 'lq-src', 'lq-render', 'lq-bind', 'data-query', 'data-dataset', 'data-render', 'data-refresh']
+        });
+
+        // Also listen for animation events (CSS trigger)
+        document.body.addEventListener('animationstart', (e) => {
+            if (e.animationName === 'lance-query-trigger' && hasLqAttrs(e.target)) {
+                LanceData._processElement(e.target);
+            }
+        });
+    }
+
+    /**
+     * Process existing lance-data elements.
+     */
+    static _processExisting() {
+        document.querySelectorAll('[lq-query], [lq-src], .lance-data').forEach(el => {
+            LanceData._processElement(el);
+        });
+    }
+
+    /**
+     * Parse config from attributes (supports both lq-* and data-* prefixes).
+     */
+    static _parseConfig(el) {
+        // Helper to get attribute value with fallback (lq-* takes precedence)
+        const getAttr = (lqName, dataName) => {
+            return el.getAttribute(lqName) || el.dataset[dataName] || null;
+        };
+
+        return {
+            dataset: getAttr('lq-src', 'dataset'),
+            query: getAttr('lq-query', 'query'),
+            render: getAttr('lq-render', 'render') || 'table',
+            columns: (getAttr('lq-columns', 'columns') || '')
+                .split(',')
+                .map(c => c.trim())
+                .filter(Boolean),
+            bind: getAttr('lq-bind', 'bind'),
+        };
+    }
+
+    /**
+     * Render pre-computed results to an element (CSS-driven from JS).
+     * Use this when you already have query results and just want CSS-driven rendering.
+     * @param {HTMLElement|string} el - Element or selector
+     * @param {Object} results - Query results {columns, rows, total}
+     * @param {Object} [options] - Render options
+     * @param {string} [options.render] - Renderer type (table, images, json, etc.)
+     */
+    static render(el, results, options = {}) {
+        const element = typeof el === 'string' ? document.querySelector(el) : el;
+        if (!element) {
+            console.error('[LanceData] Element not found:', el);
+            return;
+        }
+
+        try {
+            // Dispatch start event
+            element.dispatchEvent(new CustomEvent('lq-start', {
+                detail: { query: options.query || null }
+            }));
+
+            const renderType = options.render || element.dataset.render || 'table';
+            const renderer = LanceData._renderers[renderType] || LanceData._renderers.table;
+
+            // Store results in cache for potential re-renders
+            if (element.id) {
+                LanceData._queryCache.set(`rendered:${element.id}`, results);
+            }
+
+            element.innerHTML = renderer(results, { render: renderType, ...options });
+
+            // Dispatch complete event
+            element.dispatchEvent(new CustomEvent('lq-complete', {
+                detail: {
+                    query: options.query || null,
+                    columns: results.columns || [],
+                    total: results.total || results.rows?.length || 0
+                }
+            }));
+        } catch (error) {
+            // Dispatch error event
+            element.dispatchEvent(new CustomEvent('lq-error', {
+                detail: {
+                    query: options.query || null,
+                    message: error.message,
+                    error: error
+                }
+            }));
+            throw error;
+        }
+    }
+
+    /**
+     * Extract dataset URL from SQL query (e.g., read_lance('https://...'))
+     */
+    static _extractUrlFromQuery(sql) {
+        const match = sql.match(/read_lance\s*\(\s*['"]([^'"]+)['"]/i);
+        return match ? match[1] : null;
+    }
+
+    /**
+     * Process a single lance-data element.
+     */
+    static async _processElement(el) {
+        // Prevent double processing
+        if (el.dataset.processing === 'true') return;
+        el.dataset.processing = 'true';
+
+        try {
+            const config = LanceData._parseConfig(el);
+
+            if (!config.query) {
+                el.dataset.processing = 'false';
+                return;
+            }
+
+            // Set up input binding if specified
+            if (config.bind) {
+                LanceData._setupBinding(el, config);
+            }
+
+            el.dataset.loading = 'true';
+            delete el.dataset.error;
+
+            // Dispatch start event (for Alpine.js integration)
+            el.dispatchEvent(new CustomEvent('lq-start', {
+                detail: { query: config.query }
+            }));
+
+            // Extract dataset URL from query if not specified
+            const datasetUrl = config.dataset || LanceData._extractUrlFromQuery(config.query);
+
+            // Get dataset (auto-loads and caches)
+            const dataset = await LanceData._getDataset(datasetUrl);
+
+            // Check cache
+            const cacheKey = `${datasetUrl || 'default'}:${config.query}`;
+            let results = LanceData._queryCache.get(cacheKey);
+
+            if (!results) {
+                // Execute query
+                results = await dataset.executeSQL(config.query);
+                LanceData._queryCache.set(cacheKey, results);
+            }
+
+            // Render results
+            const renderer = LanceData._renderers[config.render] || LanceData._renderers.table;
+            el.innerHTML = renderer(results, config);
+
+            delete el.dataset.loading;
+
+            // Dispatch complete event (for Alpine.js integration)
+            el.dispatchEvent(new CustomEvent('lq-complete', {
+                detail: {
+                    query: config.query,
+                    columns: results.columns || [],
+                    total: results.total || results.rows?.length || 0
+                }
+            }));
+        } catch (error) {
+            delete el.dataset.loading;
+            el.dataset.error = error.message;
+            console.error('[LanceData]', error);
+
+            // Dispatch error event (for Alpine.js integration)
+            el.dispatchEvent(new CustomEvent('lq-error', {
+                detail: {
+                    query: config.query,
+                    message: error.message,
+                    error: error
+                }
+            }));
+        } finally {
+            el.dataset.processing = 'false';
+        }
+    }
+
+    /**
+     * Set up reactive binding to an input element.
+     */
+    static _setupBinding(el, config) {
+        const input = document.querySelector(config.bind);
+        if (!input) return;
+
+        // Store binding reference
+        const bindingKey = config.bind;
+        if (LanceData._bindings.has(bindingKey)) return;
+
+        const handler = () => {
+            // Replace $value in query with input value
+            const value = input.value;
+            const newQuery = config.query.replace(/\$value/g, value);
+
+            // Set via both attribute types
+            if (el.hasAttribute('lq-query')) {
+                el.setAttribute('lq-query', newQuery);
+            } else {
+                el.dataset.query = newQuery;
+            }
+
+            // Trigger refresh
+            el.dataset.refresh = Date.now();
+        };
+
+        input.addEventListener('input', handler);
+        input.addEventListener('change', handler);
+
+        LanceData._bindings.set(bindingKey, { input, handler, element: el });
+    }
+
+    /**
+     * Register a custom renderer.
+     * @param {string} name - Renderer name
+     * @param {Function} fn - Renderer function (results, config) => html
+     */
+    static registerRenderer(name, fn) {
+        LanceData._renderers[name] = fn;
+    }
+
+    /**
+     * Register built-in renderers.
+     */
+    static _registerBuiltinRenderers() {
+        // Table renderer - handles both {columns, rows} and array-of-objects formats
+        LanceData._renderers.table = (results, config) => {
+            if (!results) {
+                return '<div class="lance-empty">No results</div>';
+            }
+
+            // Detect format: {columns, rows} vs array of objects
+            let columns, rows;
+            if (results.columns && results.rows) {
+                // SQLExecutor format: {columns: ['col1', 'col2'], rows: [[val1, val2], ...]}
+                columns = config.columns || results.columns.filter(k =>
+                    !k.startsWith('_') && k !== 'embedding'
+                );
+                rows = results.rows;
+            } else if (Array.isArray(results)) {
+                // Array of objects format: [{col1: val1, col2: val2}, ...]
+                if (results.length === 0) {
+                    return '<div class="lance-empty">No results</div>';
+                }
+                columns = config.columns || Object.keys(results[0]).filter(k =>
+                    !k.startsWith('_') && k !== 'embedding'
+                );
+                rows = results.map(row => columns.map(col => row[col]));
+            } else {
+                return '<div class="lance-empty">No results</div>';
+            }
+
+            if (rows.length === 0) {
+                return '<div class="lance-empty">No results</div>';
+            }
+
+            let html = '<table><thead><tr>';
+            for (const col of columns) {
+                html += `<th>${LanceData._escapeHtml(String(col))}</th>`;
+            }
+            html += '</tr></thead><tbody>';
+
+            for (const row of rows) {
+                html += '<tr>';
+                for (let i = 0; i < columns.length; i++) {
+                    const value = row[i];
+                    html += `<td>${LanceData._formatValue(value)}</td>`;
+                }
+                html += '</tr>';
+            }
+
+            html += '</tbody></table>';
+            return html;
+        };
+
+        // List renderer
+        LanceData._renderers.list = (results, config) => {
+            if (!results || results.length === 0) {
+                return '<div class="lance-empty">No results</div>';
+            }
+
+            const displayCol = config.columns?.[0] || Object.keys(results[0])[0];
+
+            let html = '<ul class="lance-list">';
+            for (const row of results) {
+                html += `<li>${LanceData._formatValue(row[displayCol])}</li>`;
+            }
+            html += '</ul>';
+            return html;
+        };
+
+        // Single value renderer
+        LanceData._renderers.value = (results, config) => {
+            if (!results || results.length === 0) {
+                return '<div class="lance-empty">-</div>';
+            }
+
+            const firstRow = results[0];
+            const firstKey = Object.keys(firstRow)[0];
+            const value = firstRow[firstKey];
+
+            return `<div class="lance-value">${LanceData._formatValue(value)}</div>`;
+        };
+
+        // JSON renderer
+        LanceData._renderers.json = (results, config) => {
+            return `<pre class="lance-json">${LanceData._escapeHtml(JSON.stringify(results, null, 2))}</pre>`;
+        };
+
+        // Image grid renderer (for datasets with url column)
+        LanceData._renderers.images = (results, config) => {
+            if (!results || results.length === 0) {
+                return '<div class="lance-empty">No images</div>';
+            }
+
+            let html = '<div class="lance-images">';
+            for (const row of results) {
+                const url = row.url || row.image_url || row.src;
+                const text = row.text || row.caption || row.title || '';
+
+                if (url) {
+                    html += `
+                        <div class="image-card">
+                            <img src="${LanceData._escapeHtml(url)}" alt="${LanceData._escapeHtml(text)}" loading="lazy">
+                            ${text ? `<div class="image-meta">${LanceData._escapeHtml(text.substring(0, 100))}</div>` : ''}
+                        </div>
+                    `;
+                }
+            }
+            html += '</div>';
+            return html;
+        };
+
+        // Count renderer (for aggregates)
+        LanceData._renderers.count = (results, config) => {
+            const count = results?.[0]?.count ?? results?.length ?? 0;
+            return `<span class="lance-count">${count.toLocaleString()}</span>`;
+        };
+    }
+
+    /**
+     * Check if a string is an image URL.
+     */
+    static _isImageUrl(str) {
+        if (!str || typeof str !== 'string') return false;
+        const lower = str.toLowerCase();
+        return (lower.startsWith('http://') || lower.startsWith('https://')) &&
+               (lower.includes('.jpg') || lower.includes('.jpeg') || lower.includes('.png') ||
+                lower.includes('.gif') || lower.includes('.webp') || lower.includes('.svg'));
+    }
+
+    /**
+     * Check if a string is a URL.
+     */
+    static _isUrl(str) {
+        if (!str || typeof str !== 'string') return false;
+        return str.startsWith('http://') || str.startsWith('https://');
+    }
+
+    /**
+     * Format a value for display.
+     */
+    static _formatValue(value) {
+        if (value === null || value === undefined) return '<span class="null-value">NULL</span>';
+        if (value === '') return '<span class="empty-value">(empty)</span>';
+
+        if (typeof value === 'number') {
+            return Number.isInteger(value) ? value.toLocaleString() : value.toFixed(4);
+        }
+        if (Array.isArray(value)) {
+            if (value.length > 10) return `<span class="vector-badge">[${value.length}d]</span>`;
+            return `[${value.slice(0, 5).map(v => LanceData._formatValue(v)).join(', ')}${value.length > 5 ? '...' : ''}]`;
+        }
+        if (typeof value === 'object') return JSON.stringify(value);
+
+        const str = String(value);
+
+        // Handle image URLs - show thumbnail
+        if (LanceData._isImageUrl(str)) {
+            const escaped = LanceData._escapeHtml(str);
+            const short = escaped.length > 40 ? escaped.substring(0, 40) + '...' : escaped;
+            return `<div class="image-cell">
+                <img src="${escaped}" alt="" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
+                <div class="image-placeholder" style="display:none"><svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg></div>
+                <a href="${escaped}" target="_blank" class="url-text" title="${escaped}">${short}</a>
+            </div>`;
+        }
+
+        // Handle other URLs - show as clickable link
+        if (LanceData._isUrl(str)) {
+            const escaped = LanceData._escapeHtml(str);
+            const short = escaped.length > 50 ? escaped.substring(0, 50) + '...' : escaped;
+            return `<a href="${escaped}" target="_blank" class="url-link" title="${escaped}">${short}</a>`;
+        }
+
+        // Handle long strings - truncate
+        if (str.length > 100) return `<span title="${LanceData._escapeHtml(str)}">${LanceData._escapeHtml(str.substring(0, 100))}...</span>`;
+        return LanceData._escapeHtml(str);
+    }
+
+    /**
+     * Escape HTML special characters.
+     */
+    static _escapeHtml(str) {
+        const div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
+
+    /**
+     * Clear the query cache.
+     */
+    static clearCache() {
+        LanceData._queryCache.clear();
+    }
+
+    /**
+     * Refresh all lance-data elements.
+     */
+    static refresh() {
+        LanceData._queryCache.clear();
+        document.querySelectorAll('.lance-data').forEach(el => {
+            el.setAttribute('data-refresh', Date.now());
+        });
+    }
+
+    /**
+     * Destroy and clean up.
+     */
+    static destroy() {
+        if (LanceData._observer) {
+            LanceData._observer.disconnect();
+            LanceData._observer = null;
+        }
+
+        // Remove bindings
+        for (const [key, binding] of LanceData._bindings) {
+            binding.input.removeEventListener('input', binding.handler);
+            binding.input.removeEventListener('change', binding.handler);
+        }
+        LanceData._bindings.clear();
+
+        // Remove injected styles
+        document.getElementById('lance-data-triggers')?.remove();
+
+        LanceData._instance = null;
+        LanceData._dataset = null;
+        LanceData._queryCache.clear();
+    }
+}
+
+// Auto-initialize when DOM is ready (truly CSS-driven - no JS needed by user)
+if (typeof document !== 'undefined') {
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => LanceData._autoInit());
+    } else {
+        LanceData._autoInit();
+    }
+}
+
 // Default export for convenience
 export default LanceQL;

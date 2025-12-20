@@ -1,9 +1,10 @@
-# @lanceql/browser
+# lanceql
 
 Query Lance columnar files in the browser with SQL and vector search. No server required.
 
 ## Features
 
+- **CSS-Driven** - Zero JavaScript! Just add `lq-*` attributes to HTML elements
 - **SQL Queries** - SELECT, WHERE, ORDER BY, LIMIT, GROUP BY, aggregations
 - **Vector Search** - Semantic search with NEAR clause using MiniLM/CLIP embeddings
 - **HTTP Range Requests** - Only fetch the bytes you need from remote files
@@ -13,13 +14,68 @@ Query Lance columnar files in the browser with SQL and vector search. No server 
 ## Installation
 
 ```bash
-npm install @lanceql/browser
+npm install lanceql
 ```
 
-## Quick Start
+## Quick Start - CSS-Driven (Zero JavaScript)
+
+```html
+<!-- Just include the script -->
+<script type="module" src="node_modules/lanceql/dist/lanceql.esm.js"></script>
+
+<!-- Query and render with HTML attributes only -->
+<div lq-query="SELECT * FROM read_lance('https://example.com/data.lance') LIMIT 10"
+     lq-render="table">
+</div>
+```
+
+That's it! No JavaScript needed. The query executes and renders automatically.
+
+## CSS-Driven Features
+
+### Table Rendering
+
+```html
+<div lq-query="SELECT name, value FROM read_lance('https://...') WHERE value > 100 LIMIT 50"
+     lq-render="table">
+</div>
+```
+
+### Image Gallery
+
+```html
+<div lq-query="SELECT url, text FROM read_lance('https://...') LIMIT 20"
+     lq-render="images">
+</div>
+```
+
+### Reactive Search
+
+```html
+<input type="text" id="search" placeholder="Search...">
+
+<div lq-query="SELECT * FROM read_lance('https://...') WHERE text LIKE '%$value%' LIMIT 20"
+     lq-bind="#search"
+     lq-render="table">
+</div>
+```
+
+Types as you search - no JavaScript needed!
+
+### Available Renderers
+
+- `lq-render="table"` - Table with image thumbnails (default)
+- `lq-render="images"` - Image grid with captions
+- `lq-render="json"` - JSON output
+- `lq-render="value"` - Single value (for aggregates)
+- `lq-render="list"` - Simple list
+
+## JavaScript API (Optional)
+
+For programmatic control, you can also use the JavaScript API:
 
 ```javascript
-import { LanceQL } from '@lanceql/browser';
+import LanceQL from 'lanceql';
 
 // Load the WASM module
 const lanceql = await LanceQL.load();
@@ -29,17 +85,12 @@ const dataset = await lanceql.openDataset('https://example.com/data.lance');
 
 // Execute SQL
 const results = await dataset.executeSQL(`
-  SELECT name, value
-  FROM data
-  WHERE value > 100
-  LIMIT 50
+  SELECT name, value FROM data WHERE value > 100 LIMIT 50
 `);
 
 // Vector search
 const similar = await dataset.executeSQL(`
-  SELECT * FROM data
-  NEAR 'sunset beach'
-  TOPK 20
+  SELECT * FROM data NEAR 'sunset beach' TOPK 20
 `);
 ```
 

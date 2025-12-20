@@ -1,8 +1,8 @@
 {
-  "name": "@lanceql/browser",
-  "version": "0.1.0",
+  "name": "lanceql",
+  "version": "0.1.1",
   "type": "module",
-  "description": "Query Lance columnar files in the browser with SQL and vector search",
+  "description": "Query Lance columnar files in the browser with SQL, vector search, and CSS-driven data binding",
   "main": "dist/lanceql.js",
   "module": "dist/lanceql.esm.js",
   "types": "dist/lanceql.d.ts",
@@ -33,7 +33,9 @@
     "arrow",
     "vector-search",
     "analytics",
-    "browser"
+    "browser",
+    "css-data",
+    "declarative"
   ],
   "author": "LanceQL Contributors",
   "license": "Apache-2.0",

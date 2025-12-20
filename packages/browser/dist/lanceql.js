@@ -124,6 +124,1002 @@ class MetadataCache {
 // Global cache instance
 const metadataCache = new MetadataCache();
 
+/**
+ * IndexedDB + OPFS storage for Lance dataset files.
+ * Small files (<50MB) stored in IndexedDB, large files in OPFS.
+ */
+class DatasetStorage {
+    constructor(dbName = 'lanceql-files', version = 1) {
+        this.dbName = dbName;
+        this.version = version;
+        this.db = null;
+        this.SIZE_THRESHOLD = 50 * 1024 * 1024; // 50MB
+    }
+
+    async open() {
+        if (this.db) return this.db;
+
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open(this.dbName, this.version);
+
+            request.onerror = () => reject(request.error);
+            request.onsuccess = () => {
+                this.db = request.result;
+                resolve(this.db);
+            };
+
+            request.onupgradeneeded = (event) => {
+                const db = event.target.result;
+                // Store file data (for small files)
+                if (!db.objectStoreNames.contains('files')) {
+                    db.createObjectStore('files', { keyPath: 'name' });
+                }
+                // Store file metadata (for all files)
+                if (!db.objectStoreNames.contains('index')) {
+                    const store = db.createObjectStore('index', { keyPath: 'name' });
+                    store.createIndex('timestamp', 'timestamp');
+                    store.createIndex('size', 'size');
+                }
+            };
+        });
+    }
+
+    /**
+     * Check if OPFS is available
+     */
+    async hasOPFS() {
+        try {
+            return 'storage' in navigator && 'getDirectory' in navigator.storage;
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * Save a dataset file.
+     * @param {string} name - Dataset name (unique identifier)
+     * @param {ArrayBuffer|Uint8Array} data - File data
+     * @param {Object} metadata - Optional metadata (schema, etc.)
+     */
+    async save(name, data, metadata = {}) {
+        const db = await this.open();
+        const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+        const size = bytes.byteLength;
+        const useOPFS = size >= this.SIZE_THRESHOLD && await this.hasOPFS();
+
+        // Save to OPFS for large files
+        if (useOPFS) {
+            try {
+                const root = await navigator.storage.getDirectory();
+                const fileHandle = await root.getFileHandle(name, { create: true });
+                const writable = await fileHandle.createWritable();
+                await writable.write(bytes);
+                await writable.close();
+            } catch (e) {
+                console.warn('[DatasetStorage] OPFS save failed, falling back to IndexedDB:', e);
+                // Fall through to IndexedDB
+            }
+        }
+
+        // Save to IndexedDB (small files or OPFS fallback)
+        if (!useOPFS) {
+            await new Promise((resolve, reject) => {
+                const tx = db.transaction('files', 'readwrite');
+                const store = tx.objectStore('files');
+                store.put({ name, data: bytes });
+                tx.oncomplete = () => resolve();
+                tx.onerror = () => reject(tx.error);
+            });
+        }
+
+        // Save index entry
+        await new Promise((resolve, reject) => {
+            const tx = db.transaction('index', 'readwrite');
+            const store = tx.objectStore('index');
+            store.put({
+                name,
+                size,
+                timestamp: Date.now(),
+                storage: useOPFS ? 'opfs' : 'indexeddb',
+                ...metadata
+            });
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+        });
+
+        return { name, size, storage: useOPFS ? 'opfs' : 'indexeddb' };
+    }
+
+    /**
+     * Load a dataset file.
+     * @param {string} name - Dataset name
+     * @returns {Promise<Uint8Array|null>} File data or null if not found
+     */
+    async load(name) {
+        const db = await this.open();
+
+        // Get index entry to determine storage location
+        const entry = await new Promise((resolve) => {
+            const tx = db.transaction('index', 'readonly');
+            const store = tx.objectStore('index');
+            const request = store.get(name);
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => resolve(null);
+        });
+
+        if (!entry) return null;
+
+        // Load from OPFS
+        if (entry.storage === 'opfs') {
+            try {
+                const root = await navigator.storage.getDirectory();
+                const fileHandle = await root.getFileHandle(name);
+                const file = await fileHandle.getFile();
+                const buffer = await file.arrayBuffer();
+                return new Uint8Array(buffer);
+            } catch (e) {
+                console.warn('[DatasetStorage] OPFS load failed:', e);
+                return null;
+            }
+        }
+
+        // Load from IndexedDB
+        return new Promise((resolve) => {
+            const tx = db.transaction('files', 'readonly');
+            const store = tx.objectStore('files');
+            const request = store.get(name);
+            request.onsuccess = () => {
+                const result = request.result;
+                resolve(result ? result.data : null);
+            };
+            request.onerror = () => resolve(null);
+        });
+    }
+
+    /**
+     * List all saved datasets.
+     * @returns {Promise<Array>} List of dataset metadata
+     */
+    async list() {
+        const db = await this.open();
+
+        return new Promise((resolve) => {
+            const tx = db.transaction('index', 'readonly');
+            const store = tx.objectStore('index');
+            const request = store.getAll();
+            request.onsuccess = () => resolve(request.result || []);
+            request.onerror = () => resolve([]);
+        });
+    }
+
+    /**
+     * Delete a saved dataset.
+     * @param {string} name - Dataset name
+     */
+    async delete(name) {
+        const db = await this.open();
+
+        // Get index entry to determine storage location
+        const entry = await new Promise((resolve) => {
+            const tx = db.transaction('index', 'readonly');
+            const store = tx.objectStore('index');
+            const request = store.get(name);
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => resolve(null);
+        });
+
+        // Delete from OPFS
+        if (entry?.storage === 'opfs') {
+            try {
+                const root = await navigator.storage.getDirectory();
+                await root.removeEntry(name);
+            } catch (e) {
+                console.warn('[DatasetStorage] OPFS delete failed:', e);
+            }
+        }
+
+        // Delete from IndexedDB files store
+        await new Promise((resolve) => {
+            const tx = db.transaction('files', 'readwrite');
+            const store = tx.objectStore('files');
+            store.delete(name);
+            tx.oncomplete = () => resolve();
+        });
+
+        // Delete from index
+        await new Promise((resolve) => {
+            const tx = db.transaction('index', 'readwrite');
+            const store = tx.objectStore('index');
+            store.delete(name);
+            tx.oncomplete = () => resolve();
+        });
+    }
+
+    /**
+     * Check if a dataset exists.
+     * @param {string} name - Dataset name
+     * @returns {Promise<boolean>}
+     */
+    async exists(name) {
+        const db = await this.open();
+
+        return new Promise((resolve) => {
+            const tx = db.transaction('index', 'readonly');
+            const store = tx.objectStore('index');
+            const request = store.get(name);
+            request.onsuccess = () => resolve(!!request.result);
+            request.onerror = () => resolve(false);
+        });
+    }
+
+    /**
+     * Get storage usage info.
+     * @returns {Promise<Object>} Usage stats
+     */
+    async getUsage() {
+        const datasets = await this.list();
+        const totalSize = datasets.reduce((sum, d) => sum + (d.size || 0), 0);
+        const indexedDBCount = datasets.filter(d => d.storage === 'indexeddb').length;
+        const opfsCount = datasets.filter(d => d.storage === 'opfs').length;
+
+        let quota = null;
+        if (navigator.storage?.estimate) {
+            quota = await navigator.storage.estimate();
+        }
+
+        return {
+            datasets: datasets.length,
+            totalSize,
+            indexedDBCount,
+            opfsCount,
+            quota
+        };
+    }
+}
+
+// Global storage instance
+const datasetStorage = new DatasetStorage();
+
+// Export storage for external use
+
+
+// =============================================================================
+// LocalDatabase - ACID-compliant local database with CRUD support
+// =============================================================================
+
+/**
+ * Data types for schema definition
+ */
+const DataType = {
+    INT: 'int64',
+    INTEGER: 'int64',
+    BIGINT: 'int64',
+    FLOAT: 'float32',
+    DOUBLE: 'float64',
+    TEXT: 'string',
+    VARCHAR: 'string',
+    BOOLEAN: 'bool',
+    BOOL: 'bool',
+    VECTOR: 'vector',
+};
+
+/**
+ * LocalDatabase - ACID-compliant database stored in IndexedDB/OPFS
+ *
+ * Uses manifest-based versioning for ACID:
+ * - Atomicity: Manifest update is atomic
+ * - Consistency: Always read from valid manifest
+ * - Isolation: Each transaction sees snapshot
+ * - Durability: Persisted to IndexedDB/OPFS
+ */
+class LocalDatabase {
+    constructor(name, storage = datasetStorage) {
+        this.name = name;
+        this.storage = storage;
+        this.tables = new Map();  // tableName -> TableState
+        this.version = 0;
+        this.manifestKey = `${name}/__manifest__`;
+    }
+
+    /**
+     * Open or create the database
+     */
+    async open() {
+        // Load manifest from storage
+        const manifestData = await this.storage.load(this.manifestKey);
+        if (manifestData) {
+            const manifest = JSON.parse(new TextDecoder().decode(manifestData));
+            this.version = manifest.version || 0;
+            this.tables = new Map(Object.entries(manifest.tables || {}));
+        }
+        return this;
+    }
+
+    /**
+     * Save manifest to storage (atomic commit point)
+     */
+    async _saveManifest() {
+        this.version++;
+        const manifest = {
+            version: this.version,
+            timestamp: Date.now(),
+            tables: Object.fromEntries(this.tables),
+        };
+        const data = new TextEncoder().encode(JSON.stringify(manifest));
+        await this.storage.save(this.manifestKey, data);
+    }
+
+    /**
+     * CREATE TABLE
+     * @param {string} tableName - Table name
+     * @param {Array} columns - Column definitions [{name, type, primaryKey?, vectorDim?}]
+     */
+    async createTable(tableName, columns) {
+        if (this.tables.has(tableName)) {
+            throw new Error(`Table '${tableName}' already exists`);
+        }
+
+        const schema = columns.map(col => ({
+            name: col.name,
+            type: DataType[col.type?.toUpperCase()] || col.type || 'string',
+            primaryKey: col.primaryKey || false,
+            vectorDim: col.vectorDim || null,
+        }));
+
+        const tableState = {
+            name: tableName,
+            schema,
+            fragments: [],      // List of data fragment keys
+            deletionVector: [], // Row IDs that are deleted
+            rowCount: 0,
+            nextRowId: 0,
+            createdAt: Date.now(),
+        };
+
+        this.tables.set(tableName, tableState);
+        await this._saveManifest();
+
+        return { success: true, table: tableName };
+    }
+
+    /**
+     * DROP TABLE
+     * @param {string} tableName - Table name
+     */
+    async dropTable(tableName) {
+        if (!this.tables.has(tableName)) {
+            throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        const table = this.tables.get(tableName);
+
+        // Delete all fragments
+        for (const fragKey of table.fragments) {
+            await this.storage.delete(fragKey);
+        }
+
+        this.tables.delete(tableName);
+        await this._saveManifest();
+
+        return { success: true, table: tableName };
+    }
+
+    /**
+     * INSERT INTO
+     * @param {string} tableName - Table name
+     * @param {Array} rows - Array of row objects [{col1: val1, col2: val2}, ...]
+     */
+    async insert(tableName, rows) {
+        if (!this.tables.has(tableName)) {
+            throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        const table = this.tables.get(tableName);
+
+        // Assign row IDs
+        const rowsWithIds = rows.map(row => ({
+            __rowId: table.nextRowId++,
+            ...row,
+        }));
+
+        // Create new fragment
+        const fragKey = `${this.name}/${tableName}/frag_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        const fragData = new TextEncoder().encode(JSON.stringify(rowsWithIds));
+        await this.storage.save(fragKey, fragData);
+
+        // Update table state
+        table.fragments.push(fragKey);
+        table.rowCount += rows.length;
+
+        await this._saveManifest();
+
+        return { success: true, inserted: rows.length };
+    }
+
+    /**
+     * DELETE FROM
+     * @param {string} tableName - Table name
+     * @param {Function} predicate - Filter function (row) => boolean
+     */
+    async delete(tableName, predicate) {
+        if (!this.tables.has(tableName)) {
+            throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        const table = this.tables.get(tableName);
+        const allRows = await this._readAllRows(tableName);
+
+        let deletedCount = 0;
+        for (const row of allRows) {
+            if (predicate(row)) {
+                table.deletionVector.push(row.__rowId);
+                deletedCount++;
+                table.rowCount--;
+            }
+        }
+
+        await this._saveManifest();
+
+        return { success: true, deleted: deletedCount };
+    }
+
+    /**
+     * UPDATE
+     * @param {string} tableName - Table name
+     * @param {Object} updates - Column updates {col1: newVal, col2: newVal}
+     * @param {Function} predicate - Filter function (row) => boolean
+     */
+    async update(tableName, updates, predicate) {
+        if (!this.tables.has(tableName)) {
+            throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        const table = this.tables.get(tableName);
+        const allRows = await this._readAllRows(tableName);
+
+        const updatedRows = [];
+        let updatedCount = 0;
+
+        for (const row of allRows) {
+            if (predicate(row)) {
+                // Mark old row as deleted
+                table.deletionVector.push(row.__rowId);
+                table.rowCount--;
+
+                // Create new row with updates
+                const newRow = { ...row, ...updates };
+                delete newRow.__rowId;
+                updatedRows.push(newRow);
+                updatedCount++;
+            }
+        }
+
+        // Insert updated rows as new fragment
+        if (updatedRows.length > 0) {
+            await this.insert(tableName, updatedRows);
+        } else {
+            await this._saveManifest();
+        }
+
+        return { success: true, updated: updatedCount };
+    }
+
+    /**
+     * SELECT (query)
+     * @param {string} tableName - Table name
+     * @param {Object} options - Query options {columns, where, limit, offset, orderBy}
+     */
+    async select(tableName, options = {}) {
+        if (!this.tables.has(tableName)) {
+            throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        let rows = await this._readAllRows(tableName);
+
+        // WHERE filter
+        if (options.where) {
+            rows = rows.filter(options.where);
+        }
+
+        // ORDER BY
+        if (options.orderBy) {
+            const { column, desc } = options.orderBy;
+            rows.sort((a, b) => {
+                const cmp = a[column] < b[column] ? -1 : a[column] > b[column] ? 1 : 0;
+                return desc ? -cmp : cmp;
+            });
+        }
+
+        // OFFSET
+        if (options.offset) {
+            rows = rows.slice(options.offset);
+        }
+
+        // LIMIT
+        if (options.limit) {
+            rows = rows.slice(0, options.limit);
+        }
+
+        // Column projection
+        if (options.columns && options.columns.length > 0 && options.columns[0] !== '*') {
+            rows = rows.map(row => {
+                const projected = {};
+                for (const col of options.columns) {
+                    projected[col] = row[col];
+                }
+                return projected;
+            });
+        }
+
+        // Remove internal __rowId
+        rows = rows.map(row => {
+            const { __rowId, ...rest } = row;
+            return rest;
+        });
+
+        return rows;
+    }
+
+    /**
+     * Read all rows from a table (excluding deleted)
+     */
+    async _readAllRows(tableName) {
+        const table = this.tables.get(tableName);
+        const deletedSet = new Set(table.deletionVector);
+        const allRows = [];
+
+        for (const fragKey of table.fragments) {
+            const fragData = await this.storage.load(fragKey);
+            if (fragData) {
+                const rows = JSON.parse(new TextDecoder().decode(fragData));
+                for (const row of rows) {
+                    if (!deletedSet.has(row.__rowId)) {
+                        allRows.push(row);
+                    }
+                }
+            }
+        }
+
+        return allRows;
+    }
+
+    /**
+     * Get table info
+     */
+    getTable(tableName) {
+        return this.tables.get(tableName);
+    }
+
+    /**
+     * List all tables
+     */
+    listTables() {
+        return Array.from(this.tables.keys());
+    }
+
+    /**
+     * Execute SQL statement
+     * @param {string} sql - SQL statement
+     * @returns {Promise<any>} Result
+     */
+    async exec(sql) {
+        const lexer = new SQLLexer(sql);
+        const tokens = lexer.tokenize();
+        const parser = new LocalSQLParser(tokens);
+        const ast = parser.parse();
+
+        return this._executeAST(ast);
+    }
+
+    /**
+     * Execute parsed AST
+     */
+    async _executeAST(ast) {
+        switch (ast.type) {
+            case 'create_table':
+                return this.createTable(ast.table, ast.columns);
+
+            case 'drop_table':
+                return this.dropTable(ast.table);
+
+            case 'insert':
+                return this.insert(ast.table, ast.rows);
+
+            case 'delete':
+                const deletePredicate = ast.where
+                    ? (row) => this._evalWhere(ast.where, row)
+                    : () => true;
+                return this.delete(ast.table, deletePredicate);
+
+            case 'update':
+                const updatePredicate = ast.where
+                    ? (row) => this._evalWhere(ast.where, row)
+                    : () => true;
+                return this.update(ast.table, ast.set, updatePredicate);
+
+            case 'select':
+                const selectOptions = {
+                    columns: ast.columns,
+                    where: ast.where ? (row) => this._evalWhere(ast.where, row) : null,
+                    limit: ast.limit,
+                    offset: ast.offset,
+                    orderBy: ast.orderBy,
+                };
+                return this.select(ast.table, selectOptions);
+
+            default:
+                throw new Error(`Unknown statement type: ${ast.type}`);
+        }
+    }
+
+    /**
+     * Evaluate WHERE clause
+     */
+    _evalWhere(where, row) {
+        if (!where) return true;
+
+        switch (where.op) {
+            case 'AND':
+                return this._evalWhere(where.left, row) && this._evalWhere(where.right, row);
+            case 'OR':
+                return this._evalWhere(where.left, row) || this._evalWhere(where.right, row);
+            case '=':
+                return row[where.column] === where.value;
+            case '!=':
+            case '<>':
+                return row[where.column] !== where.value;
+            case '<':
+                return row[where.column] < where.value;
+            case '<=':
+                return row[where.column] <= where.value;
+            case '>':
+                return row[where.column] > where.value;
+            case '>=':
+                return row[where.column] >= where.value;
+            case 'LIKE':
+                const pattern = where.value.replace(/%/g, '.*').replace(/_/g, '.');
+                return new RegExp(`^${pattern}$`, 'i').test(row[where.column]);
+            default:
+                return true;
+        }
+    }
+
+    /**
+     * Compact the database (merge fragments, remove deleted rows)
+     */
+    async compact() {
+        for (const [tableName, table] of this.tables) {
+            const allRows = await this._readAllRows(tableName);
+
+            // Delete old fragments
+            for (const fragKey of table.fragments) {
+                await this.storage.delete(fragKey);
+            }
+
+            // Reset table state
+            table.fragments = [];
+            table.deletionVector = [];
+            table.rowCount = 0;
+            table.nextRowId = 0;
+
+            // Re-insert all rows as single fragment
+            if (allRows.length > 0) {
+                // Remove old __rowId
+                const cleanRows = allRows.map(({ __rowId, ...rest }) => rest);
+                await this.insert(tableName, cleanRows);
+            }
+        }
+
+        return { success: true, compacted: this.tables.size };
+    }
+
+    /**
+     * Close the database
+     */
+    async close() {
+        await this._saveManifest();
+    }
+}
+
+/**
+ * SQL Parser for LocalDatabase (supports CREATE, INSERT, UPDATE, DELETE, SELECT)
+ */
+class LocalSQLParser {
+    constructor(tokens) {
+        this.tokens = tokens;
+        this.pos = 0;
+    }
+
+    peek() {
+        return this.tokens[this.pos] || { type: TokenType.EOF };
+    }
+
+    advance() {
+        return this.tokens[this.pos++] || { type: TokenType.EOF };
+    }
+
+    match(type) {
+        if (this.peek().type === type) {
+            return this.advance();
+        }
+        return null;
+    }
+
+    expect(type) {
+        const token = this.advance();
+        if (token.type !== type) {
+            throw new Error(`Expected ${type}, got ${token.type}`);
+        }
+        return token;
+    }
+
+    parse() {
+        const token = this.peek();
+
+        switch (token.type) {
+            case TokenType.CREATE:
+                return this.parseCreate();
+            case TokenType.DROP:
+                return this.parseDrop();
+            case TokenType.INSERT:
+                return this.parseInsert();
+            case TokenType.UPDATE:
+                return this.parseUpdate();
+            case TokenType.DELETE:
+                return this.parseDelete();
+            case TokenType.SELECT:
+                return this.parseSelect();
+            default:
+                throw new Error(`Unexpected token: ${token.type}`);
+        }
+    }
+
+    parseCreate() {
+        this.expect(TokenType.CREATE);
+        this.expect(TokenType.TABLE);
+        const tableName = this.expect(TokenType.IDENTIFIER).value;
+        this.expect(TokenType.LPAREN);
+
+        const columns = [];
+        do {
+            const colName = this.expect(TokenType.IDENTIFIER).value;
+            const colType = this.parseDataType();
+            const col = { name: colName, type: colType };
+
+            // Check for PRIMARY KEY
+            if (this.match(TokenType.PRIMARY)) {
+                this.expect(TokenType.KEY);
+                col.primaryKey = true;
+            }
+
+            columns.push(col);
+        } while (this.match(TokenType.COMMA));
+
+        this.expect(TokenType.RPAREN);
+
+        return { type: 'create_table', table: tableName, columns };
+    }
+
+    parseDataType() {
+        const token = this.advance();
+        let type = token.value || token.type;
+
+        // Handle VECTOR(dim)
+        if (type === 'VECTOR' && this.match(TokenType.LPAREN)) {
+            const dim = this.expect(TokenType.NUMBER).value;
+            this.expect(TokenType.RPAREN);
+            return { type: 'vector', dim: parseInt(dim) };
+        }
+
+        // Handle VARCHAR(len)
+        if ((type === 'VARCHAR' || type === 'TEXT') && this.match(TokenType.LPAREN)) {
+            this.expect(TokenType.NUMBER); // ignore length
+            this.expect(TokenType.RPAREN);
+        }
+
+        return type;
+    }
+
+    parseDrop() {
+        this.expect(TokenType.DROP);
+        this.expect(TokenType.TABLE);
+        const tableName = this.expect(TokenType.IDENTIFIER).value;
+        return { type: 'drop_table', table: tableName };
+    }
+
+    parseInsert() {
+        this.expect(TokenType.INSERT);
+        this.expect(TokenType.INTO);
+        const tableName = this.expect(TokenType.IDENTIFIER).value;
+
+        // Optional column list
+        let columns = null;
+        if (this.match(TokenType.LPAREN)) {
+            columns = [this.expect(TokenType.IDENTIFIER).value];
+            while (this.match(TokenType.COMMA)) {
+                columns.push(this.expect(TokenType.IDENTIFIER).value);
+            }
+            this.expect(TokenType.RPAREN);
+        }
+
+        this.expect(TokenType.VALUES);
+
+        const rows = [];
+        do {
+            this.expect(TokenType.LPAREN);
+            const values = [this.parseValue()];
+            while (this.match(TokenType.COMMA)) {
+                values.push(this.parseValue());
+            }
+            this.expect(TokenType.RPAREN);
+
+            // Build row object
+            if (columns) {
+                const row = {};
+                columns.forEach((col, i) => row[col] = values[i]);
+                rows.push(row);
+            } else {
+                rows.push(values); // positional - needs schema lookup
+            }
+        } while (this.match(TokenType.COMMA));
+
+        return { type: 'insert', table: tableName, columns, rows };
+    }
+
+    parseValue() {
+        const token = this.peek();
+
+        if (token.type === TokenType.NUMBER) {
+            this.advance();
+            const num = parseFloat(token.value);
+            return Number.isInteger(num) ? parseInt(token.value) : num;
+        }
+        if (token.type === TokenType.STRING) {
+            this.advance();
+            return token.value;
+        }
+        if (token.type === TokenType.NULL) {
+            this.advance();
+            return null;
+        }
+        if (token.type === TokenType.TRUE) {
+            this.advance();
+            return true;
+        }
+        if (token.type === TokenType.FALSE) {
+            this.advance();
+            return false;
+        }
+        // Vector literal [1.0, 2.0, 3.0]
+        if (this.match(TokenType.LBRACKET)) {
+            const vec = [];
+            do {
+                vec.push(parseFloat(this.expect(TokenType.NUMBER).value));
+            } while (this.match(TokenType.COMMA));
+            this.expect(TokenType.RBRACKET);
+            return vec;
+        }
+
+        throw new Error(`Unexpected value token: ${token.type}`);
+    }
+
+    parseUpdate() {
+        this.expect(TokenType.UPDATE);
+        const tableName = this.expect(TokenType.IDENTIFIER).value;
+        this.expect(TokenType.SET);
+
+        const set = {};
+        do {
+            const col = this.expect(TokenType.IDENTIFIER).value;
+            this.expect(TokenType.EQ);
+            set[col] = this.parseValue();
+        } while (this.match(TokenType.COMMA));
+
+        let where = null;
+        if (this.match(TokenType.WHERE)) {
+            where = this.parseWhereExpr();
+        }
+
+        return { type: 'update', table: tableName, set, where };
+    }
+
+    parseDelete() {
+        this.expect(TokenType.DELETE);
+        this.expect(TokenType.FROM);
+        const tableName = this.expect(TokenType.IDENTIFIER).value;
+
+        let where = null;
+        if (this.match(TokenType.WHERE)) {
+            where = this.parseWhereExpr();
+        }
+
+        return { type: 'delete', table: tableName, where };
+    }
+
+    parseSelect() {
+        this.expect(TokenType.SELECT);
+
+        // Columns
+        const columns = [];
+        if (this.match(TokenType.STAR)) {
+            columns.push('*');
+        } else {
+            columns.push(this.expect(TokenType.IDENTIFIER).value);
+            while (this.match(TokenType.COMMA)) {
+                columns.push(this.expect(TokenType.IDENTIFIER).value);
+            }
+        }
+
+        this.expect(TokenType.FROM);
+        const tableName = this.expect(TokenType.IDENTIFIER).value;
+
+        let where = null;
+        if (this.match(TokenType.WHERE)) {
+            where = this.parseWhereExpr();
+        }
+
+        let orderBy = null;
+        if (this.match(TokenType.ORDER)) {
+            this.expect(TokenType.BY);
+            const column = this.expect(TokenType.IDENTIFIER).value;
+            const desc = !!this.match(TokenType.DESC);
+            if (!desc) this.match(TokenType.ASC);
+            orderBy = { column, desc };
+        }
+
+        let limit = null;
+        if (this.match(TokenType.LIMIT)) {
+            limit = parseInt(this.expect(TokenType.NUMBER).value);
+        }
+
+        let offset = null;
+        if (this.match(TokenType.OFFSET)) {
+            offset = parseInt(this.expect(TokenType.NUMBER).value);
+        }
+
+        return { type: 'select', table: tableName, columns, where, orderBy, limit, offset };
+    }
+
+    parseWhereExpr() {
+        return this.parseOrExpr();
+    }
+
+    parseOrExpr() {
+        let left = this.parseAndExpr();
+        while (this.match(TokenType.OR)) {
+            const right = this.parseAndExpr();
+            left = { op: 'OR', left, right };
+        }
+        return left;
+    }
+
+    parseAndExpr() {
+        let left = this.parseComparison();
+        while (this.match(TokenType.AND)) {
+            const right = this.parseComparison();
+            left = { op: 'AND', left, right };
+        }
+        return left;
+    }
+
+    parseComparison() {
+        const column = this.expect(TokenType.IDENTIFIER).value;
+
+        let op;
+        if (this.match(TokenType.EQ)) op = '=';
+        else if (this.match(TokenType.NE)) op = '!=';
+        else if (this.match(TokenType.LT)) op = '<';
+        else if (this.match(TokenType.LE)) op = '<=';
+        else if (this.match(TokenType.GT)) op = '>';
+        else if (this.match(TokenType.GE)) op = '>=';
+        else if (this.match(TokenType.LIKE)) op = 'LIKE';
+        else throw new Error(`Expected comparison operator`);
+
+        const value = this.parseValue();
+        return { op, column, value };
+    }
+}
+
 // Immer-style WASM runtime - auto string/bytes marshalling
 const E = new TextEncoder();
 const D = new TextDecoder();
@@ -4353,6 +5349,29 @@ const TokenType = {
     TOPK: 'TOPK',
     // File reference
     FILE: 'FILE',
+    // Write keywords
+    CREATE: 'CREATE',
+    TABLE: 'TABLE',
+    INSERT: 'INSERT',
+    INTO: 'INTO',
+    VALUES: 'VALUES',
+    UPDATE: 'UPDATE',
+    SET: 'SET',
+    DELETE: 'DELETE',
+    DROP: 'DROP',
+    // Data types
+    INT: 'INT',
+    INTEGER: 'INTEGER',
+    BIGINT: 'BIGINT',
+    FLOAT: 'FLOAT',
+    DOUBLE: 'DOUBLE',
+    TEXT: 'TEXT',
+    VARCHAR: 'VARCHAR',
+    BOOLEAN: 'BOOLEAN',
+    BOOL: 'BOOL',
+    VECTOR: 'VECTOR',
+    PRIMARY: 'PRIMARY',
+    KEY: 'KEY',
 
     // Literals
     IDENTIFIER: 'IDENTIFIER',
@@ -4411,6 +5430,29 @@ const KEYWORDS = {
     'NEAR': TokenType.NEAR,
     'TOPK': TokenType.TOPK,
     'FILE': TokenType.FILE,
+    // Write keywords
+    'CREATE': TokenType.CREATE,
+    'TABLE': TokenType.TABLE,
+    'INSERT': TokenType.INSERT,
+    'INTO': TokenType.INTO,
+    'VALUES': TokenType.VALUES,
+    'UPDATE': TokenType.UPDATE,
+    'SET': TokenType.SET,
+    'DELETE': TokenType.DELETE,
+    'DROP': TokenType.DROP,
+    // Data types
+    'INT': TokenType.INT,
+    'INTEGER': TokenType.INTEGER,
+    'BIGINT': TokenType.BIGINT,
+    'FLOAT': TokenType.FLOAT,
+    'DOUBLE': TokenType.DOUBLE,
+    'TEXT': TokenType.TEXT,
+    'VARCHAR': TokenType.VARCHAR,
+    'BOOLEAN': TokenType.BOOLEAN,
+    'BOOL': TokenType.BOOL,
+    'VECTOR': TokenType.VECTOR,
+    'PRIMARY': TokenType.PRIMARY,
+    'KEY': TokenType.KEY,
 };
 
 /**
@@ -7671,6 +8713,737 @@ class SharedVectorStore {
     }
 }
 
+// ============================================================================
+// CSS-Driven Query Engine - Zero JavaScript Data Binding
+// ============================================================================
+
+/**
+ * LanceData provides CSS-driven data binding for Lance datasets.
+ *
+ * TRULY CSS-DRIVEN: No JavaScript initialization required!
+ * Just add lq-* attributes to any element.
+ *
+ * Usage (pure HTML/CSS, zero JavaScript):
+ * ```html
+ * <div lq-query="SELECT url, text FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 10"
+ *      lq-render="table">
+ * </div>
+ * ```
+ *
+ * Attributes (supports both lq-* and data-* prefixes):
+ * - lq-src / data-dataset: Dataset URL (optional if URL is in query)
+ * - lq-query / data-query: SQL query string (required)
+ * - lq-render / data-render: Renderer type - table, list, value, images, json (default: table)
+ * - lq-columns / data-columns: Comma-separated column names to display
+ * - lq-bind / data-bind: Input element selector for reactive binding
+ *
+ * The system auto-initializes when the script loads.
+ */
+class LanceData {
+    static _initialized = false;
+    static _observer = null;
+    static _wasm = null;
+    static _datasets = new Map(); // Cache datasets by URL
+    static _renderers = {};
+    static _bindings = new Map();
+    static _queryCache = new Map();
+    static _defaultDataset = null;
+
+    /**
+     * Auto-initialize when DOM is ready.
+     * Called automatically - no user action needed.
+     */
+    static _autoInit() {
+        if (LanceData._initialized) return;
+        LanceData._initialized = true;
+
+        // Register built-in renderers
+        LanceData._registerBuiltinRenderers();
+
+        // Inject trigger styles
+        LanceData._injectTriggerStyles();
+
+        // Set up observer for lance-data elements
+        LanceData._setupObserver();
+
+        // Process any existing elements
+        LanceData._processExisting();
+    }
+
+    /**
+     * Get or load a dataset (cached).
+     */
+    static async _getDataset(url) {
+        if (!url) {
+            if (LanceData._defaultDataset) return LanceData._datasets.get(LanceData._defaultDataset);
+            throw new Error('No dataset URL. Add data-dataset="https://..." to your element.');
+        }
+
+        if (LanceData._datasets.has(url)) {
+            return LanceData._datasets.get(url);
+        }
+
+        // Load WASM if needed
+        if (!LanceData._wasm) {
+            // Try to find wasm URL from script tag or use default
+            const wasmUrl = document.querySelector('script[data-lanceql-wasm]')?.dataset.lanceqlWasm
+                || './lanceql.wasm';
+            LanceData._wasm = await LanceQL.load(wasmUrl);
+        }
+
+        const dataset = await RemoteLanceDataset.open(LanceData._wasm, url);
+        LanceData._datasets.set(url, dataset);
+
+        // First dataset becomes default
+        if (!LanceData._defaultDataset) {
+            LanceData._defaultDataset = url;
+        }
+
+        return dataset;
+    }
+
+    /**
+     * Manual init (optional) - for advanced configuration.
+     */
+    static async init(options = {}) {
+        LanceData._autoInit();
+
+        if (options.wasmUrl) {
+            LanceData._wasm = await LanceQL.load(options.wasmUrl);
+        }
+        if (options.dataset) {
+            await LanceData._getDataset(options.dataset);
+        }
+    }
+
+    /**
+     * Inject CSS that triggers JavaScript via animation events.
+     */
+    static _injectTriggerStyles() {
+        if (document.getElementById('lance-data-triggers')) return;
+
+        const style = document.createElement('style');
+        style.id = 'lance-data-triggers';
+        style.textContent = `
+            /* Lance Data CSS Trigger System */
+            @keyframes lance-query-trigger {
+                from { --lance-trigger: 0; }
+                to { --lance-trigger: 1; }
+            }
+
+            /* Elements with lance-data class trigger on insertion */
+            .lance-data {
+                animation: lance-query-trigger 0.001s;
+            }
+
+            /* Re-trigger on data attribute changes */
+            .lance-data[data-refresh] {
+                animation: lance-query-trigger 0.001s;
+            }
+
+            /* Loading state */
+            .lance-data[data-loading]::before {
+                content: '';
+                display: block;
+                width: 20px;
+                height: 20px;
+                border: 2px solid #3b82f6;
+                border-top-color: transparent;
+                border-radius: 50%;
+                animation: lance-spin 0.8s linear infinite;
+            }
+
+            @keyframes lance-spin {
+                to { transform: rotate(360deg); }
+            }
+
+            /* Error state */
+            .lance-data[data-error]::before {
+                content: attr(data-error);
+                color: #ef4444;
+                font-size: 12px;
+            }
+
+            /* Result container styling */
+            .lance-data table {
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 13px;
+            }
+
+            .lance-data th, .lance-data td {
+                padding: 8px 12px;
+                text-align: left;
+                border-bottom: 1px solid #334155;
+            }
+
+            .lance-data th {
+                background: #1e293b;
+                font-weight: 500;
+                color: #94a3b8;
+            }
+
+            .lance-data tr:hover td {
+                background: rgba(59, 130, 246, 0.05);
+            }
+
+            /* Value renderer */
+            .lance-data[style*="--render: value"] .lance-value,
+            .lance-data[style*="--render:'value'"] .lance-value,
+            .lance-data[style*='--render:"value"'] .lance-value {
+                font-size: 24px;
+                font-weight: 600;
+                color: #3b82f6;
+            }
+
+            /* List renderer */
+            .lance-data .lance-list {
+                list-style: none;
+                padding: 0;
+                margin: 0;
+            }
+
+            .lance-data .lance-list li {
+                padding: 8px 0;
+                border-bottom: 1px solid #334155;
+            }
+
+            /* JSON renderer */
+            .lance-data .lance-json {
+                background: #0f172a;
+                padding: 12px;
+                border-radius: 8px;
+                font-family: 'SF Mono', Monaco, monospace;
+                font-size: 12px;
+                white-space: pre-wrap;
+                overflow-x: auto;
+            }
+
+            /* Image grid renderer */
+            .lance-data .lance-images {
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+                gap: 16px;
+            }
+
+            .lance-data .lance-images .image-card {
+                background: #1e293b;
+                border-radius: 8px;
+                overflow: hidden;
+            }
+
+            .lance-data .lance-images img {
+                width: 100%;
+                aspect-ratio: 1;
+                object-fit: cover;
+            }
+
+            .lance-data .lance-images .image-meta {
+                padding: 8px;
+                font-size: 12px;
+                color: #94a3b8;
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
+    /**
+     * Set up MutationObserver for dynamic elements.
+     */
+    static _setupObserver() {
+        if (LanceData._observer) return;
+
+        // Helper to check if element has lq-* attributes
+        const hasLqAttrs = (el) => {
+            return el.hasAttribute?.('lq-query') || el.hasAttribute?.('lq-src') ||
+                   el.classList?.contains('lance-data');
+        };
+
+        LanceData._observer = new MutationObserver((mutations) => {
+            for (const mutation of mutations) {
+                // New nodes added
+                for (const node of mutation.addedNodes) {
+                    if (node.nodeType === Node.ELEMENT_NODE) {
+                        if (hasLqAttrs(node)) {
+                            LanceData._processElement(node);
+                        }
+                        // Check descendants
+                        node.querySelectorAll?.('[lq-query], [lq-src], .lance-data')?.forEach(el => {
+                            LanceData._processElement(el);
+                        });
+                    }
+                }
+
+                // Attribute changes
+                if (mutation.type === 'attributes' && hasLqAttrs(mutation.target)) {
+                    LanceData._processElement(mutation.target);
+                }
+            }
+        });
+
+        LanceData._observer.observe(document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['lq-query', 'lq-src', 'lq-render', 'lq-bind', 'data-query', 'data-dataset', 'data-render', 'data-refresh']
+        });
+
+        // Also listen for animation events (CSS trigger)
+        document.body.addEventListener('animationstart', (e) => {
+            if (e.animationName === 'lance-query-trigger' && hasLqAttrs(e.target)) {
+                LanceData._processElement(e.target);
+            }
+        });
+    }
+
+    /**
+     * Process existing lance-data elements.
+     */
+    static _processExisting() {
+        document.querySelectorAll('[lq-query], [lq-src], .lance-data').forEach(el => {
+            LanceData._processElement(el);
+        });
+    }
+
+    /**
+     * Parse config from attributes (supports both lq-* and data-* prefixes).
+     */
+    static _parseConfig(el) {
+        // Helper to get attribute value with fallback (lq-* takes precedence)
+        const getAttr = (lqName, dataName) => {
+            return el.getAttribute(lqName) || el.dataset[dataName] || null;
+        };
+
+        return {
+            dataset: getAttr('lq-src', 'dataset'),
+            query: getAttr('lq-query', 'query'),
+            render: getAttr('lq-render', 'render') || 'table',
+            columns: (getAttr('lq-columns', 'columns') || '')
+                .split(',')
+                .map(c => c.trim())
+                .filter(Boolean),
+            bind: getAttr('lq-bind', 'bind'),
+        };
+    }
+
+    /**
+     * Render pre-computed results to an element (CSS-driven from JS).
+     * Use this when you already have query results and just want CSS-driven rendering.
+     * @param {HTMLElement|string} el - Element or selector
+     * @param {Object} results - Query results {columns, rows, total}
+     * @param {Object} [options] - Render options
+     * @param {string} [options.render] - Renderer type (table, images, json, etc.)
+     */
+    static render(el, results, options = {}) {
+        const element = typeof el === 'string' ? document.querySelector(el) : el;
+        if (!element) {
+            console.error('[LanceData] Element not found:', el);
+            return;
+        }
+
+        try {
+            // Dispatch start event
+            element.dispatchEvent(new CustomEvent('lq-start', {
+                detail: { query: options.query || null }
+            }));
+
+            const renderType = options.render || element.dataset.render || 'table';
+            const renderer = LanceData._renderers[renderType] || LanceData._renderers.table;
+
+            // Store results in cache for potential re-renders
+            if (element.id) {
+                LanceData._queryCache.set(`rendered:${element.id}`, results);
+            }
+
+            element.innerHTML = renderer(results, { render: renderType, ...options });
+
+            // Dispatch complete event
+            element.dispatchEvent(new CustomEvent('lq-complete', {
+                detail: {
+                    query: options.query || null,
+                    columns: results.columns || [],
+                    total: results.total || results.rows?.length || 0
+                }
+            }));
+        } catch (error) {
+            // Dispatch error event
+            element.dispatchEvent(new CustomEvent('lq-error', {
+                detail: {
+                    query: options.query || null,
+                    message: error.message,
+                    error: error
+                }
+            }));
+            throw error;
+        }
+    }
+
+    /**
+     * Extract dataset URL from SQL query (e.g., read_lance('https://...'))
+     */
+    static _extractUrlFromQuery(sql) {
+        const match = sql.match(/read_lance\s*\(\s*['"]([^'"]+)['"]/i);
+        return match ? match[1] : null;
+    }
+
+    /**
+     * Process a single lance-data element.
+     */
+    static async _processElement(el) {
+        // Prevent double processing
+        if (el.dataset.processing === 'true') return;
+        el.dataset.processing = 'true';
+
+        try {
+            const config = LanceData._parseConfig(el);
+
+            if (!config.query) {
+                el.dataset.processing = 'false';
+                return;
+            }
+
+            // Set up input binding if specified
+            if (config.bind) {
+                LanceData._setupBinding(el, config);
+            }
+
+            el.dataset.loading = 'true';
+            delete el.dataset.error;
+
+            // Dispatch start event (for Alpine.js integration)
+            el.dispatchEvent(new CustomEvent('lq-start', {
+                detail: { query: config.query }
+            }));
+
+            // Extract dataset URL from query if not specified
+            const datasetUrl = config.dataset || LanceData._extractUrlFromQuery(config.query);
+
+            // Get dataset (auto-loads and caches)
+            const dataset = await LanceData._getDataset(datasetUrl);
+
+            // Check cache
+            const cacheKey = `${datasetUrl || 'default'}:${config.query}`;
+            let results = LanceData._queryCache.get(cacheKey);
+
+            if (!results) {
+                // Execute query
+                results = await dataset.executeSQL(config.query);
+                LanceData._queryCache.set(cacheKey, results);
+            }
+
+            // Render results
+            const renderer = LanceData._renderers[config.render] || LanceData._renderers.table;
+            el.innerHTML = renderer(results, config);
+
+            delete el.dataset.loading;
+
+            // Dispatch complete event (for Alpine.js integration)
+            el.dispatchEvent(new CustomEvent('lq-complete', {
+                detail: {
+                    query: config.query,
+                    columns: results.columns || [],
+                    total: results.total || results.rows?.length || 0
+                }
+            }));
+        } catch (error) {
+            delete el.dataset.loading;
+            el.dataset.error = error.message;
+            console.error('[LanceData]', error);
+
+            // Dispatch error event (for Alpine.js integration)
+            el.dispatchEvent(new CustomEvent('lq-error', {
+                detail: {
+                    query: config.query,
+                    message: error.message,
+                    error: error
+                }
+            }));
+        } finally {
+            el.dataset.processing = 'false';
+        }
+    }
+
+    /**
+     * Set up reactive binding to an input element.
+     */
+    static _setupBinding(el, config) {
+        const input = document.querySelector(config.bind);
+        if (!input) return;
+
+        // Store binding reference
+        const bindingKey = config.bind;
+        if (LanceData._bindings.has(bindingKey)) return;
+
+        const handler = () => {
+            // Replace $value in query with input value
+            const value = input.value;
+            const newQuery = config.query.replace(/\$value/g, value);
+
+            // Set via both attribute types
+            if (el.hasAttribute('lq-query')) {
+                el.setAttribute('lq-query', newQuery);
+            } else {
+                el.dataset.query = newQuery;
+            }
+
+            // Trigger refresh
+            el.dataset.refresh = Date.now();
+        };
+
+        input.addEventListener('input', handler);
+        input.addEventListener('change', handler);
+
+        LanceData._bindings.set(bindingKey, { input, handler, element: el });
+    }
+
+    /**
+     * Register a custom renderer.
+     * @param {string} name - Renderer name
+     * @param {Function} fn - Renderer function (results, config) => html
+     */
+    static registerRenderer(name, fn) {
+        LanceData._renderers[name] = fn;
+    }
+
+    /**
+     * Register built-in renderers.
+     */
+    static _registerBuiltinRenderers() {
+        // Table renderer - handles both {columns, rows} and array-of-objects formats
+        LanceData._renderers.table = (results, config) => {
+            if (!results) {
+                return '<div class="lance-empty">No results</div>';
+            }
+
+            // Detect format: {columns, rows} vs array of objects
+            let columns, rows;
+            if (results.columns && results.rows) {
+                // SQLExecutor format: {columns: ['col1', 'col2'], rows: [[val1, val2], ...]}
+                columns = config.columns || results.columns.filter(k =>
+                    !k.startsWith('_') && k !== 'embedding'
+                );
+                rows = results.rows;
+            } else if (Array.isArray(results)) {
+                // Array of objects format: [{col1: val1, col2: val2}, ...]
+                if (results.length === 0) {
+                    return '<div class="lance-empty">No results</div>';
+                }
+                columns = config.columns || Object.keys(results[0]).filter(k =>
+                    !k.startsWith('_') && k !== 'embedding'
+                );
+                rows = results.map(row => columns.map(col => row[col]));
+            } else {
+                return '<div class="lance-empty">No results</div>';
+            }
+
+            if (rows.length === 0) {
+                return '<div class="lance-empty">No results</div>';
+            }
+
+            let html = '<table><thead><tr>';
+            for (const col of columns) {
+                html += `<th>${LanceData._escapeHtml(String(col))}</th>`;
+            }
+            html += '</tr></thead><tbody>';
+
+            for (const row of rows) {
+                html += '<tr>';
+                for (let i = 0; i < columns.length; i++) {
+                    const value = row[i];
+                    html += `<td>${LanceData._formatValue(value)}</td>`;
+                }
+                html += '</tr>';
+            }
+
+            html += '</tbody></table>';
+            return html;
+        };
+
+        // List renderer
+        LanceData._renderers.list = (results, config) => {
+            if (!results || results.length === 0) {
+                return '<div class="lance-empty">No results</div>';
+            }
+
+            const displayCol = config.columns?.[0] || Object.keys(results[0])[0];
+
+            let html = '<ul class="lance-list">';
+            for (const row of results) {
+                html += `<li>${LanceData._formatValue(row[displayCol])}</li>`;
+            }
+            html += '</ul>';
+            return html;
+        };
+
+        // Single value renderer
+        LanceData._renderers.value = (results, config) => {
+            if (!results || results.length === 0) {
+                return '<div class="lance-empty">-</div>';
+            }
+
+            const firstRow = results[0];
+            const firstKey = Object.keys(firstRow)[0];
+            const value = firstRow[firstKey];
+
+            return `<div class="lance-value">${LanceData._formatValue(value)}</div>`;
+        };
+
+        // JSON renderer
+        LanceData._renderers.json = (results, config) => {
+            return `<pre class="lance-json">${LanceData._escapeHtml(JSON.stringify(results, null, 2))}</pre>`;
+        };
+
+        // Image grid renderer (for datasets with url column)
+        LanceData._renderers.images = (results, config) => {
+            if (!results || results.length === 0) {
+                return '<div class="lance-empty">No images</div>';
+            }
+
+            let html = '<div class="lance-images">';
+            for (const row of results) {
+                const url = row.url || row.image_url || row.src;
+                const text = row.text || row.caption || row.title || '';
+
+                if (url) {
+                    html += `
+                        <div class="image-card">
+                            <img src="${LanceData._escapeHtml(url)}" alt="${LanceData._escapeHtml(text)}" loading="lazy">
+                            ${text ? `<div class="image-meta">${LanceData._escapeHtml(text.substring(0, 100))}</div>` : ''}
+                        </div>
+                    `;
+                }
+            }
+            html += '</div>';
+            return html;
+        };
+
+        // Count renderer (for aggregates)
+        LanceData._renderers.count = (results, config) => {
+            const count = results?.[0]?.count ?? results?.length ?? 0;
+            return `<span class="lance-count">${count.toLocaleString()}</span>`;
+        };
+    }
+
+    /**
+     * Check if a string is an image URL.
+     */
+    static _isImageUrl(str) {
+        if (!str || typeof str !== 'string') return false;
+        const lower = str.toLowerCase();
+        return (lower.startsWith('http://') || lower.startsWith('https://')) &&
+               (lower.includes('.jpg') || lower.includes('.jpeg') || lower.includes('.png') ||
+                lower.includes('.gif') || lower.includes('.webp') || lower.includes('.svg'));
+    }
+
+    /**
+     * Check if a string is a URL.
+     */
+    static _isUrl(str) {
+        if (!str || typeof str !== 'string') return false;
+        return str.startsWith('http://') || str.startsWith('https://');
+    }
+
+    /**
+     * Format a value for display.
+     */
+    static _formatValue(value) {
+        if (value === null || value === undefined) return '<span class="null-value">NULL</span>';
+        if (value === '') return '<span class="empty-value">(empty)</span>';
+
+        if (typeof value === 'number') {
+            return Number.isInteger(value) ? value.toLocaleString() : value.toFixed(4);
+        }
+        if (Array.isArray(value)) {
+            if (value.length > 10) return `<span class="vector-badge">[${value.length}d]</span>`;
+            return `[${value.slice(0, 5).map(v => LanceData._formatValue(v)).join(', ')}${value.length > 5 ? '...' : ''}]`;
+        }
+        if (typeof value === 'object') return JSON.stringify(value);
+
+        const str = String(value);
+
+        // Handle image URLs - show thumbnail
+        if (LanceData._isImageUrl(str)) {
+            const escaped = LanceData._escapeHtml(str);
+            const short = escaped.length > 40 ? escaped.substring(0, 40) + '...' : escaped;
+            return `<div class="image-cell">
+                <img src="${escaped}" alt="" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
+                <div class="image-placeholder" style="display:none"><svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg></div>
+                <a href="${escaped}" target="_blank" class="url-text" title="${escaped}">${short}</a>
+            </div>`;
+        }
+
+        // Handle other URLs - show as clickable link
+        if (LanceData._isUrl(str)) {
+            const escaped = LanceData._escapeHtml(str);
+            const short = escaped.length > 50 ? escaped.substring(0, 50) + '...' : escaped;
+            return `<a href="${escaped}" target="_blank" class="url-link" title="${escaped}">${short}</a>`;
+        }
+
+        // Handle long strings - truncate
+        if (str.length > 100) return `<span title="${LanceData._escapeHtml(str)}">${LanceData._escapeHtml(str.substring(0, 100))}...</span>`;
+        return LanceData._escapeHtml(str);
+    }
+
+    /**
+     * Escape HTML special characters.
+     */
+    static _escapeHtml(str) {
+        const div = document.createElement('div');
+        div.textContent = str;
+        return div.innerHTML;
+    }
+
+    /**
+     * Clear the query cache.
+     */
+    static clearCache() {
+        LanceData._queryCache.clear();
+    }
+
+    /**
+     * Refresh all lance-data elements.
+     */
+    static refresh() {
+        LanceData._queryCache.clear();
+        document.querySelectorAll('.lance-data').forEach(el => {
+            el.setAttribute('data-refresh', Date.now());
+        });
+    }
+
+    /**
+     * Destroy and clean up.
+     */
+    static destroy() {
+        if (LanceData._observer) {
+            LanceData._observer.disconnect();
+            LanceData._observer = null;
+        }
+
+        // Remove bindings
+        for (const [key, binding] of LanceData._bindings) {
+            binding.input.removeEventListener('input', binding.handler);
+            binding.input.removeEventListener('change', binding.handler);
+        }
+        LanceData._bindings.clear();
+
+        // Remove injected styles
+        document.getElementById('lance-data-triggers')?.remove();
+
+        LanceData._instance = null;
+        LanceData._dataset = null;
+        LanceData._queryCache.clear();
+    }
+}
+
+// Auto-initialize when DOM is ready (truly CSS-driven - no JS needed by user)
+if (typeof document !== 'undefined') {
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => LanceData._autoInit());
+    } else {
+        LanceData._autoInit();
+    }
+}
+
 // Default export for convenience
 // default export: LanceQL
 
@@ -7678,6 +9451,7 @@ class SharedVectorStore {
 // CommonJS exports
 module.exports = {
     wasmUtils,
+    LocalDatabase,
     LanceQL,
     LanceFile,
     DataFrame,
@@ -7689,6 +9463,7 @@ module.exports = {
     RemoteLanceDataset,
     WorkerPool,
     SharedVectorStore,
+    LanceData,
     parseSQL,
     default: LanceQL
 };
