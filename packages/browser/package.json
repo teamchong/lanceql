@@ -1,6 +1,6 @@
 {
-  "name": "lanceql",
-  "version": "0.1.1",
+  "name": "@metal0/lanceql",
+  "version": "0.1.2",
   "type": "module",
   "description": "Query Lance columnar files in the browser with SQL, vector search, and CSS-driven data binding",
   "main": "dist/lanceql.js",

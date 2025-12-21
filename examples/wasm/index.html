@@ -1560,7 +1560,8 @@
     <script type="module">
         import Alpine from 'https://esm.sh/alpinejs@3.14.3';
         import { atom, computed } from 'https://esm.sh/nanostores@0.10.3';
-        import LanceQL, { SQLExecutor, SQLLexer, SQLParser, LanceData } from './lanceql.js';
+        // Import from @metal0/lanceql (falls back to local for development)
+        import LanceQL, { SQLExecutor, SQLLexer, SQLParser, LanceData, initSqlJs } from 'https://esm.sh/@metal0/lanceql@0.1.2';
 
         let lanceql;
 

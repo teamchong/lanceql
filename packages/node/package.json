@@ -1,6 +1,6 @@
 {
-  "name": "@lanceql/node",
-  "version": "0.1.0",
+  "name": "@metal0/lanceql-node",
+  "version": "0.1.2",
   "description": "SQLite-compatible API for Lance columnar files - drop-in replacement for better-sqlite3",
   "main": "src/index.js",
   "types": "types/index.d.ts",
@@ -39,13 +39,13 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/lancedb/lanceql.git",
+    "url": "https://github.com/teamchong/lanceql.git",
     "directory": "packages/node"
   },
   "bugs": {
-    "url": "https://github.com/lancedb/lanceql/issues"
+    "url": "https://github.com/teamchong/lanceql/issues"
   },
-  "homepage": "https://github.com/lancedb/lanceql#readme",
+  "homepage": "https://github.com/teamchong/lanceql#readme",
   "dependencies": {
     "node-addon-api": "^8.0.0",
     "node-gyp": "^10.0.0"
