@@ -125,9 +125,195 @@ class MetadataCache {
 const metadataCache = new MetadataCache();
 
 /**
- * IndexedDB + OPFS storage for Lance dataset files.
- * Small files (<50MB) stored in IndexedDB, large files in OPFS.
+ * OPFS-only storage for Lance database files.
+ *
+ * Uses Origin Private File System (OPFS) exclusively - no IndexedDB.
+ * This avoids migration complexity as data grows.
+ *
+ * OPFS benefits:
+ * - High performance file access
+ * - No size limits (beyond disk quota)
+ * - File-like API suitable for Lance format
+ * - Same approach as SQLite WASM
  */
+class OPFSStorage {
+    constructor(rootDir = 'lanceql') {
+        this.rootDir = rootDir;
+        this.root = null;
+    }
+
+    /**
+     * Get OPFS root directory, creating if needed
+     */
+    async getRoot() {
+        if (this.root) return this.root;
+
+        if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) {
+            throw new Error('OPFS not available. Requires modern browser with Origin Private File System support.');
+        }
+
+        const opfsRoot = await navigator.storage.getDirectory();
+        this.root = await opfsRoot.getDirectoryHandle(this.rootDir, { create: true });
+        return this.root;
+    }
+
+    async open() {
+        await this.getRoot();
+        return this;
+    }
+
+    /**
+     * Get or create a subdirectory
+     */
+    async getDir(path) {
+        const root = await this.getRoot();
+        const parts = path.split('/').filter(p => p);
+
+        let current = root;
+        for (const part of parts) {
+            current = await current.getDirectoryHandle(part, { create: true });
+        }
+        return current;
+    }
+
+    /**
+     * Save data to a file
+     * @param {string} path - File path (e.g., 'mydb/users/frag_001.lance')
+     * @param {Uint8Array} data - File data
+     */
+    async save(path, data) {
+        const parts = path.split('/');
+        const fileName = parts.pop();
+        const dirPath = parts.join('/');
+
+        const dir = dirPath ? await this.getDir(dirPath) : await this.getRoot();
+        const fileHandle = await dir.getFileHandle(fileName, { create: true });
+
+        // Use sync access handle for better performance if available
+        if (fileHandle.createSyncAccessHandle) {
+            try {
+                const accessHandle = await fileHandle.createSyncAccessHandle();
+                accessHandle.truncate(0);
+                accessHandle.write(data, { at: 0 });
+                accessHandle.flush();
+                accessHandle.close();
+                return { path, size: data.byteLength };
+            } catch (e) {
+                // Fall back to writable stream
+            }
+        }
+
+        const writable = await fileHandle.createWritable();
+        await writable.write(data);
+        await writable.close();
+
+        return { path, size: data.byteLength };
+    }
+
+    /**
+     * Load data from a file
+     * @param {string} path - File path
+     * @returns {Promise<Uint8Array|null>}
+     */
+    async load(path) {
+        try {
+            const parts = path.split('/');
+            const fileName = parts.pop();
+            const dirPath = parts.join('/');
+
+            const dir = dirPath ? await this.getDir(dirPath) : await this.getRoot();
+            const fileHandle = await dir.getFileHandle(fileName);
+            const file = await fileHandle.getFile();
+            const buffer = await file.arrayBuffer();
+            return new Uint8Array(buffer);
+        } catch (e) {
+            if (e.name === 'NotFoundError') {
+                return null;
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Delete a file
+     * @param {string} path - File path
+     */
+    async delete(path) {
+        try {
+            const parts = path.split('/');
+            const fileName = parts.pop();
+            const dirPath = parts.join('/');
+
+            const dir = dirPath ? await this.getDir(dirPath) : await this.getRoot();
+            await dir.removeEntry(fileName);
+            return true;
+        } catch (e) {
+            if (e.name === 'NotFoundError') {
+                return false;
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * List files in a directory
+     * @param {string} dirPath - Directory path
+     * @returns {Promise<string[]>} File names
+     */
+    async list(dirPath = '') {
+        try {
+            const dir = dirPath ? await this.getDir(dirPath) : await this.getRoot();
+            const files = [];
+            for await (const [name, handle] of dir.entries()) {
+                files.push({
+                    name,
+                    type: handle.kind, // 'file' or 'directory'
+                });
+            }
+            return files;
+        } catch (e) {
+            return [];
+        }
+    }
+
+    /**
+     * Check if a file exists
+     * @param {string} path - File path
+     */
+    async exists(path) {
+        try {
+            const parts = path.split('/');
+            const fileName = parts.pop();
+            const dirPath = parts.join('/');
+
+            const dir = dirPath ? await this.getDir(dirPath) : await this.getRoot();
+            await dir.getFileHandle(fileName);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    /**
+     * Delete a directory and all contents
+     * @param {string} dirPath - Directory path
+     */
+    async deleteDir(dirPath) {
+        try {
+            const parts = dirPath.split('/');
+            const dirName = parts.pop();
+            const parentPath = parts.join('/');
+
+            const parent = parentPath ? await this.getDir(parentPath) : await this.getRoot();
+            await parent.removeEntry(dirName, { recursive: true });
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+}
+
+// Legacy IndexedDB + OPFS storage (deprecated, use OPFSStorage instead)
 class DatasetStorage {
     constructor(dbName = 'lanceql-files', version = 1) {
         this.dbName = dbName;
@@ -150,11 +336,9 @@ class DatasetStorage {
 
             request.onupgradeneeded = (event) => {
                 const db = event.target.result;
-                // Store file data (for small files)
                 if (!db.objectStoreNames.contains('files')) {
                     db.createObjectStore('files', { keyPath: 'name' });
                 }
-                // Store file metadata (for all files)
                 if (!db.objectStoreNames.contains('index')) {
                     const store = db.createObjectStore('index', { keyPath: 'name' });
                     store.createIndex('timestamp', 'timestamp');
@@ -164,9 +348,6 @@ class DatasetStorage {
         });
     }
 
-    /**
-     * Check if OPFS is available
-     */
     async hasOPFS() {
         try {
             return 'storage' in navigator && 'getDirectory' in navigator.storage;
@@ -175,19 +356,12 @@ class DatasetStorage {
         }
     }
 
-    /**
-     * Save a dataset file.
-     * @param {string} name - Dataset name (unique identifier)
-     * @param {ArrayBuffer|Uint8Array} data - File data
-     * @param {Object} metadata - Optional metadata (schema, etc.)
-     */
     async save(name, data, metadata = {}) {
         const db = await this.open();
         const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
         const size = bytes.byteLength;
         const useOPFS = size >= this.SIZE_THRESHOLD && await this.hasOPFS();
 
-        // Save to OPFS for large files
         if (useOPFS) {
             try {
                 const root = await navigator.storage.getDirectory();
@@ -197,11 +371,9 @@ class DatasetStorage {
                 await writable.close();
             } catch (e) {
                 console.warn('[DatasetStorage] OPFS save failed, falling back to IndexedDB:', e);
-                // Fall through to IndexedDB
             }
         }
 
-        // Save to IndexedDB (small files or OPFS fallback)
         if (!useOPFS) {
             await new Promise((resolve, reject) => {
                 const tx = db.transaction('files', 'readwrite');
@@ -212,7 +384,6 @@ class DatasetStorage {
             });
         }
 
-        // Save index entry
         await new Promise((resolve, reject) => {
             const tx = db.transaction('index', 'readwrite');
             const store = tx.objectStore('index');
@@ -230,15 +401,9 @@ class DatasetStorage {
         return { name, size, storage: useOPFS ? 'opfs' : 'indexeddb' };
     }
 
-    /**
-     * Load a dataset file.
-     * @param {string} name - Dataset name
-     * @returns {Promise<Uint8Array|null>} File data or null if not found
-     */
     async load(name) {
         const db = await this.open();
 
-        // Get index entry to determine storage location
         const entry = await new Promise((resolve) => {
             const tx = db.transaction('index', 'readonly');
             const store = tx.objectStore('index');
@@ -249,7 +414,6 @@ class DatasetStorage {
 
         if (!entry) return null;
 
-        // Load from OPFS
         if (entry.storage === 'opfs') {
             try {
                 const root = await navigator.storage.getDirectory();
@@ -263,7 +427,6 @@ class DatasetStorage {
             }
         }
 
-        // Load from IndexedDB
         return new Promise((resolve) => {
             const tx = db.transaction('files', 'readonly');
             const store = tx.objectStore('files');
@@ -276,10 +439,6 @@ class DatasetStorage {
         });
     }
 
-    /**
-     * List all saved datasets.
-     * @returns {Promise<Array>} List of dataset metadata
-     */
     async list() {
         const db = await this.open();
 
@@ -292,14 +451,9 @@ class DatasetStorage {
         });
     }
 
-    /**
-     * Delete a saved dataset.
-     * @param {string} name - Dataset name
-     */
     async delete(name) {
         const db = await this.open();
 
-        // Get index entry to determine storage location
         const entry = await new Promise((resolve) => {
             const tx = db.transaction('index', 'readonly');
             const store = tx.objectStore('index');
@@ -308,7 +462,6 @@ class DatasetStorage {
             request.onerror = () => resolve(null);
         });
 
-        // Delete from OPFS
         if (entry?.storage === 'opfs') {
             try {
                 const root = await navigator.storage.getDirectory();
@@ -318,7 +471,6 @@ class DatasetStorage {
             }
         }
 
-        // Delete from IndexedDB files store
         await new Promise((resolve) => {
             const tx = db.transaction('files', 'readwrite');
             const store = tx.objectStore('files');
@@ -377,8 +529,9 @@ class DatasetStorage {
     }
 }
 
-// Global storage instance
-const datasetStorage = new DatasetStorage();
+// Global storage instances
+const opfsStorage = new OPFSStorage();  // OPFS-only (recommended)
+const datasetStorage = new DatasetStorage();  // Legacy IndexedDB + OPFS
 
 // Export storage for external use
 
@@ -410,10 +563,12 @@ const DataType = {
  * - Atomicity: Manifest update is atomic
  * - Consistency: Always read from valid manifest
  * - Isolation: Each transaction sees snapshot
- * - Durability: Persisted to IndexedDB/OPFS
+ * - Durability: Persisted to OPFS (Origin Private File System)
+ *
+ * Storage: Uses OPFS exclusively for all data sizes. No IndexedDB migration needed.
  */
 class LocalDatabase {
-    constructor(name, storage = datasetStorage) {
+    constructor(name, storage = opfsStorage) {
         this.name = name;
         this.storage = storage;
         this.tables = new Map();  // tableName -> TableState
