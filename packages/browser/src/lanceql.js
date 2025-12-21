@@ -698,14 +698,14 @@ export class LocalDatabase {
     }
 
     /**
-     * Execute SQL statement
+     * Execute SQL statement using standard SQLParser
      * @param {string} sql - SQL statement
      * @returns {Promise<any>} Result
      */
     async exec(sql) {
         const lexer = new SQLLexer(sql);
         const tokens = lexer.tokenize();
-        const parser = new LocalSQLParser(tokens);
+        const parser = new SQLParser(tokens);
         const ast = parser.parse();
 
         return this._executeAST(ast);
@@ -715,41 +715,129 @@ export class LocalDatabase {
      * Execute parsed AST
      */
     async _executeAST(ast) {
-        switch (ast.type) {
-            case 'create_table':
+        const type = ast.type.toUpperCase();
+
+        switch (type) {
+            case 'CREATE_TABLE':
                 return this.createTable(ast.table, ast.columns);
 
-            case 'drop_table':
+            case 'DROP_TABLE':
                 return this.dropTable(ast.table);
 
-            case 'insert':
-                return this.insert(ast.table, ast.rows);
+            case 'INSERT': {
+                // Convert from parser format to insert format
+                const table = this.tables.get(ast.table);
+                if (!table) {
+                    throw new Error(`Table '${ast.table}' does not exist`);
+                }
 
-            case 'delete':
+                // Map value rows to row objects
+                const columnNames = ast.columns || table.schema.map(c => c.name);
+                const rows = ast.rows.map(valueRow => {
+                    const row = {};
+                    valueRow.forEach((val, i) => {
+                        row[columnNames[i]] = val.value;
+                    });
+                    return row;
+                });
+
+                return this.insert(ast.table, rows);
+            }
+
+            case 'DELETE': {
                 const deletePredicate = ast.where
-                    ? (row) => this._evalWhere(ast.where, row)
+                    ? (row) => this._evalWhereExpr(ast.where, row)
                     : () => true;
                 return this.delete(ast.table, deletePredicate);
+            }
 
-            case 'update':
+            case 'UPDATE': {
+                // Convert assignments to updates object
+                const updates = {};
+                for (const assignment of ast.assignments) {
+                    updates[assignment.column] = assignment.value.value;
+                }
+
                 const updatePredicate = ast.where
-                    ? (row) => this._evalWhere(ast.where, row)
+                    ? (row) => this._evalWhereExpr(ast.where, row)
                     : () => true;
-                return this.update(ast.table, ast.set, updatePredicate);
+                return this.update(ast.table, updates, updatePredicate);
+            }
 
-            case 'select':
+            case 'SELECT': {
+                const tableName = ast.from?.name || ast.from?.table || ast.from;
+                if (!tableName) {
+                    throw new Error('SELECT requires FROM clause for LocalDatabase');
+                }
+
                 const selectOptions = {
-                    columns: ast.columns,
-                    where: ast.where ? (row) => this._evalWhere(ast.where, row) : null,
+                    columns: ast.columns === '*' ? ['*'] :
+                        ast.columns.map(c => c.type === 'star' ? '*' : c.expr?.column || c.column || c),
+                    where: ast.where ? (row) => this._evalWhereExpr(ast.where, row) : null,
                     limit: ast.limit,
                     offset: ast.offset,
-                    orderBy: ast.orderBy,
+                    orderBy: ast.orderBy?.[0] ? {
+                        column: ast.orderBy[0].column,
+                        desc: ast.orderBy[0].descending
+                    } : null,
                 };
-                return this.select(ast.table, selectOptions);
+                return this.select(tableName, selectOptions);
+            }
 
             default:
                 throw new Error(`Unknown statement type: ${ast.type}`);
         }
+    }
+
+    /**
+     * Evaluate WHERE expression from standard SQLParser AST
+     */
+    _evalWhereExpr(expr, row) {
+        if (!expr) return true;
+
+        if (expr.type === 'binary') {
+            const op = expr.op;
+
+            // Handle AND/OR
+            if (op === 'AND' || op === '&&') {
+                return this._evalWhereExpr(expr.left, row) && this._evalWhereExpr(expr.right, row);
+            }
+            if (op === 'OR' || op === '||') {
+                return this._evalWhereExpr(expr.left, row) || this._evalWhereExpr(expr.right, row);
+            }
+
+            // Get column value and literal value
+            const leftVal = expr.left.type === 'column' ?
+                row[expr.left.column] :
+                expr.left.value;
+            const rightVal = expr.right.type === 'column' ?
+                row[expr.right.column] :
+                expr.right.value;
+
+            switch (op) {
+                case '=':
+                case '==':
+                    return leftVal === rightVal;
+                case '!=':
+                case '<>':
+                    return leftVal !== rightVal;
+                case '<':
+                    return leftVal < rightVal;
+                case '<=':
+                    return leftVal <= rightVal;
+                case '>':
+                    return leftVal > rightVal;
+                case '>=':
+                    return leftVal >= rightVal;
+                case 'LIKE':
+                    const pattern = String(rightVal).replace(/%/g, '.*').replace(/_/g, '.');
+                    return new RegExp(`^${pattern}$`, 'i').test(leftVal);
+                default:
+                    return true;
+            }
+        }
+
+        return true;
     }
 
     /**
