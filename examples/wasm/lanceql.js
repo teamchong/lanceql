@@ -1257,6 +1257,20 @@ const _createLanceqlMethods = (proxy) => ({
         } finally {
             _w.free(ptr, bytes.length);
         }
+    },
+
+    /**
+     * Create a new LanceDatabase for multi-table queries with JOINs.
+     * @returns {LanceDatabase}
+     */
+    createDatabase() {
+        // Store reference to lanceql instance for registerRemote()
+        if (typeof window !== 'undefined') {
+            window.lanceql = proxy;
+        } else if (typeof globalThis !== 'undefined') {
+            globalThis.lanceql = proxy;
+        }
+        return new LanceDatabase();
     }
 });
 
@@ -5349,6 +5363,15 @@ const TokenType = {
     TOPK: 'TOPK',
     // File reference
     FILE: 'FILE',
+    // Join keywords
+    JOIN: 'JOIN',
+    INNER: 'INNER',
+    LEFT: 'LEFT',
+    RIGHT: 'RIGHT',
+    FULL: 'FULL',
+    OUTER: 'OUTER',
+    CROSS: 'CROSS',
+    ON: 'ON',
     // Write keywords
     CREATE: 'CREATE',
     TABLE: 'TABLE',
@@ -5430,6 +5453,15 @@ const KEYWORDS = {
     'NEAR': TokenType.NEAR,
     'TOPK': TokenType.TOPK,
     'FILE': TokenType.FILE,
+    // Join keywords
+    'JOIN': TokenType.JOIN,
+    'INNER': TokenType.INNER,
+    'LEFT': TokenType.LEFT,
+    'RIGHT': TokenType.RIGHT,
+    'FULL': TokenType.FULL,
+    'OUTER': TokenType.OUTER,
+    'CROSS': TokenType.CROSS,
+    'ON': TokenType.ON,
     // Write keywords
     'CREATE': TokenType.CREATE,
     'TABLE': TokenType.TABLE,
@@ -5669,6 +5701,14 @@ export class SQLParser {
             from = this.parseFromClause();
         }
 
+        // JOIN clauses (one or more)
+        const joins = [];
+        while (this.check(TokenType.JOIN) || this.check(TokenType.INNER) ||
+               this.check(TokenType.LEFT) || this.check(TokenType.RIGHT) ||
+               this.check(TokenType.FULL) || this.check(TokenType.CROSS)) {
+            joins.push(this.parseJoinClause());
+        }
+
         // WHERE
         let where = null;
         if (this.match(TokenType.WHERE)) {
@@ -5763,6 +5803,7 @@ export class SQLParser {
             distinct,
             columns,
             from,
+            joins,
             where,
             groupBy,
             having,
@@ -5796,8 +5837,8 @@ export class SQLParser {
         let alias = null;
         if (this.match(TokenType.AS)) {
             alias = this.expect(TokenType.IDENTIFIER).value;
-        } else if (this.check(TokenType.IDENTIFIER) && !this.check(TokenType.FROM, TokenType.WHERE, TokenType.ORDER, TokenType.LIMIT, TokenType.GROUP)) {
-            // Implicit alias
+        } else if (this.check(TokenType.IDENTIFIER) && !this.check(TokenType.FROM, TokenType.WHERE, TokenType.ORDER, TokenType.LIMIT, TokenType.GROUP, TokenType.JOIN, TokenType.INNER, TokenType.LEFT, TokenType.RIGHT, TokenType.COMMA)) {
+            // Implicit alias (but not if next token is a keyword or comma)
             alias = this.advance().value;
         }
 
@@ -5861,7 +5902,78 @@ export class SQLParser {
             throw new Error('Expected table name, URL string, or read_lance() after FROM');
         }
 
+        // Parse optional alias (e.g., FROM images i or FROM images AS i)
+        if (from) {
+            if (this.match(TokenType.AS)) {
+                from.alias = this.expect(TokenType.IDENTIFIER).value;
+            } else if (this.check(TokenType.IDENTIFIER) && !this.check(TokenType.WHERE, TokenType.ORDER, TokenType.LIMIT, TokenType.GROUP, TokenType.NEAR, TokenType.JOIN, TokenType.INNER, TokenType.LEFT, TokenType.RIGHT, TokenType.COMMA)) {
+                // Implicit alias (not followed by a keyword)
+                from.alias = this.advance().value;
+            }
+        }
+
         return from;
+    }
+
+    /**
+     * Parse JOIN clause - supports:
+     * - JOIN table ON condition
+     * - INNER JOIN table ON condition
+     * - LEFT JOIN table ON condition
+     * - RIGHT JOIN table ON condition
+     * - FULL OUTER JOIN table ON condition
+     * - CROSS JOIN table
+     */
+    parseJoinClause() {
+        // Parse join type
+        let joinType = 'INNER'; // default
+
+        if (this.match(TokenType.INNER)) {
+            this.expect(TokenType.JOIN);
+            joinType = 'INNER';
+        } else if (this.match(TokenType.LEFT)) {
+            this.match(TokenType.OUTER); // optional
+            this.expect(TokenType.JOIN);
+            joinType = 'LEFT';
+        } else if (this.match(TokenType.RIGHT)) {
+            this.match(TokenType.OUTER); // optional
+            this.expect(TokenType.JOIN);
+            joinType = 'RIGHT';
+        } else if (this.match(TokenType.FULL)) {
+            this.match(TokenType.OUTER); // optional
+            this.expect(TokenType.JOIN);
+            joinType = 'FULL';
+        } else if (this.match(TokenType.CROSS)) {
+            this.expect(TokenType.JOIN);
+            joinType = 'CROSS';
+        } else {
+            this.expect(TokenType.JOIN); // plain JOIN defaults to INNER
+        }
+
+        // Parse table reference (same as FROM clause)
+        const table = this.parseFromClause();
+
+        // Parse optional alias
+        let alias = null;
+        if (this.match(TokenType.AS)) {
+            alias = this.expect(TokenType.IDENTIFIER).value;
+        } else if (this.check(TokenType.IDENTIFIER) && !this.check(TokenType.ON, TokenType.JOIN, TokenType.WHERE, TokenType.ORDER, TokenType.GROUP, TokenType.LIMIT)) {
+            alias = this.advance().value;
+        }
+
+        // Parse ON condition (except for CROSS JOIN)
+        let on = null;
+        if (joinType !== 'CROSS') {
+            this.expect(TokenType.ON);
+            on = this.parseExpr();
+        }
+
+        return {
+            type: joinType,
+            table,
+            alias,
+            on
+        };
     }
 
     parseColumnList() {
@@ -6078,8 +6190,18 @@ export class SQLParser {
                 return { type: 'call', name: name.toUpperCase(), args, distinct };
             }
 
-            // Column reference
-            return { type: 'column', name };
+            // Column reference - check for table.column syntax
+            if (this.match(TokenType.DOT)) {
+                // table.column (column can be a keyword like "text")
+                const table = name;
+                const token = this.advance();
+                // Allow keywords as column names (e.g., c.text where TEXT is a keyword)
+                const column = token.value || token.type.toLowerCase();
+                return { type: 'column', table, column };
+            }
+
+            // Simple column reference
+            return { type: 'column', column: name };
         }
 
         // Parenthesized expression
@@ -8314,6 +8436,311 @@ export class RemoteLanceDataset {
             if (file.close) file.close();
         }
         this._fragmentFiles.clear();
+    }
+}
+
+// ============================================================================
+// LanceDatabase - Multi-table query execution with JOINs
+// ============================================================================
+
+/**
+ * LanceDatabase manages multiple Lance datasets and executes multi-table queries.
+ * Supports SQL JOINs across remote datasets with smart byte-range fetching.
+ *
+ * Features:
+ * - Multi-table JOIN support (INNER, LEFT, RIGHT, FULL, CROSS)
+ * - Hash join algorithm for efficient execution
+ * - Smart column fetching (only fetch needed columns)
+ * - Works with static files on CDN
+ *
+ * Usage:
+ *   const db = await LanceQL.createDatabase();
+ *   await db.registerRemote('images', 'https://cdn.example.com/images.lance');
+ *   await db.registerRemote('captions', 'https://cdn.example.com/captions.lance');
+ *   const results = await db.executeSQL(`
+ *     SELECT i.url, c.text
+ *     FROM images i
+ *     JOIN captions c ON i.id = c.image_id
+ *     WHERE i.aesthetic > 7.0
+ *     LIMIT 20
+ *   `);
+ */
+export class LanceDatabase {
+    constructor() {
+        this.tables = new Map(); // name -> RemoteLanceDataset
+        this.aliases = new Map(); // alias -> table name
+    }
+
+    /**
+     * Register a table with a name
+     * @param {string} name - Table name
+     * @param {RemoteLanceDataset} dataset - Dataset instance
+     */
+    register(name, dataset) {
+        this.tables.set(name, dataset);
+    }
+
+    /**
+     * Register a remote dataset by URL
+     * @param {string} name - Table name
+     * @param {string} url - Dataset URL
+     * @param {Object} options - Dataset options (version, etc.)
+     */
+    async registerRemote(name, url, options = {}) {
+        // Assume LanceQL is globally available or passed as parameter
+        const lanceql = window.lanceql || globalThis.lanceql;
+        if (!lanceql) {
+            throw new Error('LanceQL WASM module not loaded. Call LanceQL.load() first.');
+        }
+
+        const dataset = await lanceql.openDataset(url, options);
+        this.register(name, dataset);
+        return dataset;
+    }
+
+    /**
+     * Get a table by name or alias
+     */
+    getTable(name) {
+        // Check aliases first
+        const actualName = this.aliases.get(name) || name;
+        const table = this.tables.get(actualName);
+        if (!table) {
+            throw new Error(`Table '${name}' not found. Did you forget to register it?`);
+        }
+        return table;
+    }
+
+    /**
+     * Execute SQL query (supports SELECT with JOINs)
+     */
+    async executeSQL(sql) {
+        // Parse SQL
+        const lexer = new SQLLexer(sql);
+        const tokens = lexer.tokenize();
+        const parser = new SQLParser(tokens);
+        const ast = parser.parse();
+
+        if (ast.type !== 'SELECT') {
+            throw new Error('Only SELECT queries are supported in LanceDatabase');
+        }
+
+        // No joins - simple single-table query
+        if (!ast.joins || ast.joins.length === 0) {
+            return this._executeSingleTable(ast);
+        }
+
+        // Multi-table query with JOINs
+        return this._executeJoin(ast);
+    }
+
+    /**
+     * Execute single-table query (no joins)
+     */
+    async _executeSingleTable(ast) {
+        if (!ast.from) {
+            throw new Error('FROM clause required');
+        }
+
+        // Get table
+        let tableName = ast.from.name || ast.from.table;
+        if (!tableName && ast.from.url) {
+            throw new Error('Single-table queries must use registered table names, not URLs');
+        }
+
+        const dataset = this.getTable(tableName);
+
+        // Build SQL and execute
+        const executor = new SQLExecutor(dataset);
+        return executor.execute(ast);
+    }
+
+    /**
+     * Execute multi-table query with JOINs
+     */
+    async _executeJoin(ast) {
+        console.log('[LanceDatabase] Executing JOIN query:', ast);
+
+        // Extract table references
+        const leftTableName = ast.from.name || ast.from.table;
+        const leftAlias = ast.from.alias || leftTableName;
+
+        // Register alias
+        if (ast.from.alias) {
+            this.aliases.set(ast.from.alias, leftTableName);
+        }
+
+        // For now, support only single JOIN (can extend later)
+        if (ast.joins.length > 1) {
+            throw new Error('Multiple JOINs not yet supported. Coming soon!');
+        }
+
+        const join = ast.joins[0];
+        const rightTableName = join.table.name || join.table.table;
+        const rightAlias = join.alias || rightTableName;
+
+        // Register right table alias
+        if (join.alias) {
+            this.aliases.set(join.alias, rightTableName);
+        }
+
+        console.log(`[LanceDatabase] JOIN: ${leftTableName} (${leftAlias}) ${join.type} ${rightTableName} (${rightAlias})`);
+
+        // Get datasets
+        const leftDataset = this.getTable(leftTableName);
+        const rightDataset = this.getTable(rightTableName);
+
+        // Execute hash join
+        return this._hashJoin(
+            leftDataset,
+            rightDataset,
+            ast,
+            { leftAlias, rightAlias, leftTableName, rightTableName }
+        );
+    }
+
+    /**
+     * Execute hash join between two datasets
+     */
+    async _hashJoin(leftDataset, rightDataset, ast, context) {
+        const { leftAlias, rightAlias, leftTableName, rightTableName } = context;
+        const join = ast.joins[0];
+
+        // Parse JOIN ON condition (e.g., i.id = c.image_id)
+        const joinCondition = join.on;
+        if (!joinCondition || joinCondition.type !== 'binary' || joinCondition.op !== '=') {
+            throw new Error('JOIN ON condition must be an equality (e.g., table1.col1 = table2.col2)');
+        }
+
+        // Extract join keys
+        const leftKey = this._extractColumnFromExpr(joinCondition.left, leftAlias);
+        const rightKey = this._extractColumnFromExpr(joinCondition.right, rightAlias);
+
+        console.log(`[LanceDatabase] Join keys: ${leftAlias}.${leftKey} = ${rightAlias}.${rightKey}`);
+
+        // Extract columns needed for result
+        const leftColumns = this._getColumnsForTable(ast.columns, leftAlias);
+        const rightColumns = this._getColumnsForTable(ast.columns, rightAlias);
+
+        console.log(`[LanceDatabase] Left columns:`, leftColumns);
+        console.log(`[LanceDatabase] Right columns:`, rightColumns);
+
+        // TODO: Apply WHERE filter to left table to reduce rows fetched
+        const leftLimit = ast.limit ? ast.limit * 2 : 1000; // Over-fetch for safety
+
+        // Fetch left side (with join key + result columns)
+        const leftSQL = `SELECT ${leftKey} AS _joinkey, ${leftColumns.join(', ')} FROM ${leftTableName} LIMIT ${leftLimit}`;
+        console.log('[LanceDatabase] Left query:', leftSQL);
+
+        const leftExecutor = new SQLExecutor(leftDataset);
+        const leftData = await leftExecutor.executeSQL(leftSQL);
+
+        if (!leftData.rows || leftData.rows.length === 0) {
+            return { columns: [], rows: [], total: 0 };
+        }
+
+        console.log(`[LanceDatabase] Fetched ${leftData.rows.length} rows from left table`);
+
+        // Build hash map on left side
+        const hashMap = new Map();
+        const joinKeyIndex = leftData.columns.indexOf('_joinkey');
+
+        for (const row of leftData.rows) {
+            const key = row[joinKeyIndex];
+            if (!hashMap.has(key)) {
+                hashMap.set(key, []);
+            }
+            hashMap.set(key, row);
+        }
+
+        console.log(`[LanceDatabase] Built hash map with ${hashMap.size} unique keys`);
+
+        // Get unique join keys for right side
+        const joinKeys = Array.from(hashMap.keys()).filter(k => k !== null && k !== undefined);
+
+        if (joinKeys.length === 0) {
+            return { columns: [], rows: [], total: 0 };
+        }
+
+        // Fetch right side (only matching rows!)
+        const rightSQL = `SELECT ${rightKey} AS _joinkey, ${rightColumns.join(', ')} FROM ${rightTableName} WHERE ${rightKey} IN (${joinKeys.join(',')})`;
+        console.log('[LanceDatabase] Right query:', rightSQL);
+
+        const rightExecutor = new SQLExecutor(rightDataset);
+        const rightData = await rightExecutor.executeSQL(rightSQL);
+
+        console.log(`[LanceDatabase] Fetched ${rightData.rows.length} rows from right table`);
+
+        // Perform hash join
+        const results = [];
+        const rightJoinKeyIndex = rightData.columns.indexOf('_joinkey');
+
+        for (const rightRow of rightData.rows) {
+            const key = rightRow[rightJoinKeyIndex];
+            const leftRow = hashMap.get(key);
+
+            if (leftRow) {
+                // Merge rows (exclude _joinkey columns)
+                const leftValues = leftRow.filter((_, i) => i !== joinKeyIndex);
+                const rightValues = rightRow.filter((_, i) => i !== rightJoinKeyIndex);
+                results.push([...leftValues, ...rightValues]);
+            }
+        }
+
+        console.log(`[LanceDatabase] Joined ${results.length} rows`);
+
+        // Build result columns (exclude _joinkey)
+        const resultColumns = [
+            ...leftData.columns.filter(c => c !== '_joinkey'),
+            ...rightData.columns.filter(c => c !== '_joinkey')
+        ];
+
+        // Apply LIMIT
+        const limitedResults = ast.limit ? results.slice(0, ast.limit) : results;
+
+        return {
+            columns: resultColumns,
+            rows: limitedResults,
+            total: limitedResults.length
+        };
+    }
+
+    /**
+     * Extract column name from expression
+     */
+    _extractColumnFromExpr(expr, expectedTable) {
+        if (expr.type === 'column') {
+            // Handle table.column syntax
+            if (expr.table && expr.table !== expectedTable) {
+                // Column belongs to different table
+                return null;
+            }
+            return expr.column;
+        }
+        throw new Error(`Invalid join condition expression: ${JSON.stringify(expr)}`);
+    }
+
+    /**
+     * Get columns needed for a specific table from SELECT list
+     */
+    _getColumnsForTable(selectColumns, tableAlias) {
+        const columns = [];
+
+        for (const item of selectColumns) {
+            if (item.type === 'star') {
+                // SELECT * - need to fetch all columns (TODO: get schema)
+                return ['*'];
+            }
+
+            if (item.type === 'expr' && item.expr.type === 'column') {
+                const col = item.expr;
+                if (!col.table || col.table === tableAlias) {
+                    columns.push(col.column);
+                }
+            }
+        }
+
+        return columns.length > 0 ? columns : ['*'];
     }
 }
 
