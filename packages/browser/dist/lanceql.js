@@ -10928,6 +10928,457 @@ if (typeof document !== 'undefined') {
     }
 }
 
+// =============================================================================
+// sql.js-Compatible API - Drop-in replacement with vector search
+// =============================================================================
+
+/**
+ * Statement class - sql.js compatible prepared statement
+ *
+ * Thin wrapper that delegates to WASM-based SQLExecutor
+ */
+class Statement {
+    constructor(db, sql) {
+        this.db = db;
+        this.sql = sql;
+        this.params = null;
+        this.results = null;
+        this.resultIndex = 0;
+        this.done = false;
+    }
+
+    /**
+     * Bind parameters to the statement
+     * @param {Array|Object} params - Parameters to bind
+     * @returns {boolean} true on success
+     */
+    bind(params) {
+        this.params = params;
+        this.results = null;
+        this.resultIndex = 0;
+        this.done = false;
+        return true;
+    }
+
+    /**
+     * Execute and step to next row
+     * @returns {boolean} true if there's a row, false if done
+     */
+    step() {
+        if (this.done) return false;
+
+        // Execute on first step
+        if (this.results === null) {
+            const execResult = this.db.exec(this.sql, this.params);
+            if (execResult.length === 0 || execResult[0].values.length === 0) {
+                this.done = true;
+                return false;
+            }
+            this.results = execResult[0];
+            this.resultIndex = 0;
+        }
+
+        if (this.resultIndex >= this.results.values.length) {
+            this.done = true;
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Get current row as array
+     * @returns {Array} Current row values
+     */
+    get() {
+        if (!this.results || this.resultIndex >= this.results.values.length) {
+            return [];
+        }
+        const row = this.results.values[this.resultIndex];
+        this.resultIndex++;
+        return row;
+    }
+
+    /**
+     * Get current row as object
+     * @param {Object} params - Optional params (ignored, for compatibility)
+     * @returns {Object} Current row as {column: value}
+     */
+    getAsObject(params) {
+        if (!this.results || this.resultIndex >= this.results.values.length) {
+            return {};
+        }
+        const row = this.results.values[this.resultIndex];
+        this.resultIndex++;
+
+        const obj = {};
+        this.results.columns.forEach((col, i) => {
+            obj[col] = row[i];
+        });
+        return obj;
+    }
+
+    /**
+     * Get column names
+     * @returns {Array} Column names
+     */
+    getColumnNames() {
+        return this.results?.columns || [];
+    }
+
+    /**
+     * Reset statement for reuse
+     * @returns {boolean} true on success
+     */
+    reset() {
+        this.results = null;
+        this.resultIndex = 0;
+        this.done = false;
+        return true;
+    }
+
+    /**
+     * Free statement resources
+     * @returns {boolean} true on success
+     */
+    free() {
+        this.results = null;
+        this.params = null;
+        return true;
+    }
+
+    /**
+     * Free and finalize (alias for free)
+     */
+    freemem() {
+        return this.free();
+    }
+}
+
+/**
+ * Database class - sql.js compatible API with vector search
+ *
+ * Drop-in replacement for sql.js Database with:
+ * - Same API: exec(), run(), prepare(), export(), close()
+ * - OPFS persistence (automatic, no export/import needed)
+ * - Vector search: NEAR, TOPK, embeddings
+ * - Columnar Lance format for analytics
+ *
+ * @example
+ * const SQL = await initSqlJs();
+ * const db = new SQL.Database('mydb');
+ *
+ * // Standard SQL (same as sql.js)
+ * db.exec("CREATE TABLE users (id INT, name TEXT)");
+ * db.run("INSERT INTO users VALUES (?, ?)", [1, 'Alice']);
+ * const results = db.exec("SELECT * FROM users");
+ *
+ * // Vector search (LanceQL extension)
+ * db.exec("SELECT * FROM docs NEAR embedding 'search text' TOPK 10");
+ */
+class Database {
+    /**
+     * Create a new database
+     * @param {string|Uint8Array} nameOrData - Database name (OPFS) or data (in-memory)
+     * @param {OPFSStorage} storage - Optional storage backend
+     */
+    constructor(nameOrData, storage = null) {
+        if (nameOrData instanceof Uint8Array) {
+            // In-memory database from binary data (sql.js compatibility)
+            this._inMemory = true;
+            this._data = nameOrData;
+            this._name = ':memory:';
+            this._db = null;
+        } else {
+            // OPFS-persisted database
+            this._inMemory = false;
+            this._name = nameOrData || 'default';
+            this._storage = storage;
+            this._db = new LocalDatabase(this._name, storage || opfsStorage);
+        }
+        this._open = false;
+        this._rowsModified = 0;
+    }
+
+    /**
+     * Ensure database is open
+     */
+    async _ensureOpen() {
+        if (!this._open && this._db) {
+            await this._db.open();
+            this._open = true;
+        }
+    }
+
+    /**
+     * Execute SQL and return results
+     *
+     * @param {string} sql - SQL statement(s)
+     * @param {Array|Object} params - Optional parameters
+     * @returns {Array} Array of {columns, values} result sets
+     *
+     * @example
+     * const results = db.exec("SELECT * FROM users WHERE id = ?", [1]);
+     * // [{columns: ['id', 'name'], values: [[1, 'Alice']]}]
+     */
+    exec(sql, params) {
+        // Return promise for async operation
+        return this._execAsync(sql, params);
+    }
+
+    async _execAsync(sql, params) {
+        await this._ensureOpen();
+
+        // Substitute parameters
+        let processedSql = sql;
+        if (params) {
+            if (Array.isArray(params)) {
+                let paramIndex = 0;
+                processedSql = sql.replace(/\?/g, () => {
+                    const val = params[paramIndex++];
+                    return this._formatValue(val);
+                });
+            } else if (typeof params === 'object') {
+                for (const [key, val] of Object.entries(params)) {
+                    const pattern = new RegExp(`[:$@]${key}\\b`, 'g');
+                    processedSql = processedSql.replace(pattern, this._formatValue(val));
+                }
+            }
+        }
+
+        // Split multiple statements
+        const statements = processedSql
+            .split(';')
+            .map(s => s.trim())
+            .filter(s => s.length > 0);
+
+        const results = [];
+
+        for (const stmt of statements) {
+            try {
+                const lexer = new SQLLexer(stmt);
+                const tokens = lexer.tokenize();
+                const parser = new SQLParser(tokens);
+                const ast = parser.parse();
+
+                if (ast.type === 'SELECT') {
+                    // SELECT returns rows
+                    const rows = await this._db._executeAST(ast);
+                    if (rows && rows.length > 0) {
+                        const columns = Object.keys(rows[0]);
+                        const values = rows.map(row => columns.map(c => row[c]));
+                        results.push({ columns, values });
+                    }
+                    this._rowsModified = 0;
+                } else {
+                    // Non-SELECT statements
+                    const result = await this._db._executeAST(ast);
+                    this._rowsModified = result?.inserted || result?.updated || result?.deleted || 0;
+                }
+            } catch (e) {
+                throw new Error(`SQL error: ${e.message}\nStatement: ${stmt}`);
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * Execute SQL without returning results
+     *
+     * @param {string} sql - SQL statement
+     * @param {Array|Object} params - Optional parameters
+     * @returns {Database} this (for chaining)
+     */
+    run(sql, params) {
+        return this._runAsync(sql, params);
+    }
+
+    async _runAsync(sql, params) {
+        await this.exec(sql, params);
+        return this;
+    }
+
+    /**
+     * Prepare a statement for execution
+     *
+     * @param {string} sql - SQL statement
+     * @param {Array|Object} params - Optional initial parameters
+     * @returns {Statement} Prepared statement
+     */
+    prepare(sql, params) {
+        const stmt = new Statement(this, sql);
+        if (params) {
+            stmt.bind(params);
+        }
+        return stmt;
+    }
+
+    /**
+     * Execute SQL and call callback for each row
+     *
+     * @param {string} sql - SQL statement
+     * @param {Array|Object} params - Parameters
+     * @param {Function} callback - Called with row object for each row
+     * @param {Function} done - Called when complete
+     * @returns {Database} this
+     */
+    each(sql, params, callback, done) {
+        this._eachAsync(sql, params, callback, done);
+        return this;
+    }
+
+    async _eachAsync(sql, params, callback, done) {
+        try {
+            const results = await this.exec(sql, params);
+            if (results.length > 0) {
+                const { columns, values } = results[0];
+                for (const row of values) {
+                    const obj = {};
+                    columns.forEach((col, i) => {
+                        obj[col] = row[i];
+                    });
+                    callback(obj);
+                }
+            }
+            if (done) done();
+        } catch (e) {
+            if (done) done(e);
+            else throw e;
+        }
+    }
+
+    /**
+     * Get number of rows modified by last statement
+     * @returns {number} Rows modified
+     */
+    getRowsModified() {
+        return this._rowsModified;
+    }
+
+    /**
+     * Export database to Uint8Array
+     *
+     * For OPFS databases, this exports all tables as JSON.
+     * For in-memory databases, returns the original data.
+     *
+     * @returns {Uint8Array} Database contents
+     */
+    async export() {
+        if (this._inMemory && this._data) {
+            return this._data;
+        }
+
+        await this._ensureOpen();
+
+        // Export all tables as JSON
+        const exportData = {
+            version: this._db.version,
+            tables: {}
+        };
+
+        for (const tableName of this._db.listTables()) {
+            const table = this._db.getTable(tableName);
+            const rows = await this._db.select(tableName, {});
+            exportData.tables[tableName] = {
+                schema: table.schema,
+                rows
+            };
+        }
+
+        return new TextEncoder().encode(JSON.stringify(exportData));
+    }
+
+    /**
+     * Close the database
+     */
+    close() {
+        this._open = false;
+        this._db = null;
+    }
+
+    /**
+     * Register a custom SQL function (stub for compatibility)
+     * @param {string} name - Function name
+     * @param {Function} func - Function implementation
+     * @returns {Database} this
+     */
+    create_function(name, func) {
+        console.warn(`[LanceQL] create_function('${name}') not yet implemented`);
+        return this;
+    }
+
+    /**
+     * Register a custom aggregate function (stub for compatibility)
+     * @param {string} name - Function name
+     * @param {Object} funcs - Aggregate functions {init, step, finalize}
+     * @returns {Database} this
+     */
+    create_aggregate(name, funcs) {
+        console.warn(`[LanceQL] create_aggregate('${name}') not yet implemented`);
+        return this;
+    }
+
+    /**
+     * Format a value for SQL
+     */
+    _formatValue(val) {
+        if (val === null || val === undefined) {
+            return 'NULL';
+        }
+        if (typeof val === 'string') {
+            return `'${val.replace(/'/g, "''")}'`;
+        }
+        if (typeof val === 'number') {
+            return String(val);
+        }
+        if (typeof val === 'boolean') {
+            return val ? 'TRUE' : 'FALSE';
+        }
+        if (Array.isArray(val)) {
+            // Vector
+            return `'[${val.join(',')}]'`;
+        }
+        return String(val);
+    }
+}
+
+/**
+ * Initialize LanceQL with sql.js-compatible API
+ *
+ * Drop-in replacement for initSqlJs():
+ *
+ * @example
+ * // sql.js style
+ * import initSqlJs from 'sql.js';
+ * const SQL = await initSqlJs();
+ * const db = new SQL.Database();
+ *
+ * // LanceQL replacement
+ * import { initSqlJs } from 'lanceql';
+ * const SQL = await initSqlJs();
+ * const db = new SQL.Database('mydb'); // OPFS-persisted + vector search
+ *
+ * @param {Object} config - Configuration (for compatibility, mostly ignored)
+ * @returns {Promise<{Database: class}>} SQL namespace with Database class
+ */
+async function initSqlJs(config = {}) {
+    // Initialize OPFS storage
+    try {
+        await opfsStorage.open();
+    } catch (e) {
+        console.warn('[LanceQL] OPFS not available:', e.message);
+    }
+
+    return {
+        Database,
+        Statement,
+    };
+}
+
+// Also export as sqljs for explicit naming
+
+
 // Default export for convenience
 // default export: LanceQL
 
@@ -10951,5 +11402,6 @@ module.exports = {
     SharedVectorStore,
     LanceData,
     parseSQL,
+    initSqlJs,
     default: LanceQL
 };
