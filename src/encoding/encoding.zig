@@ -9,9 +9,17 @@
 const std = @import("std");
 
 pub const plain = @import("plain.zig");
+pub const writer = @import("writer.zig");
 
 // Re-export main types
 pub const PlainDecoder = plain.PlainDecoder;
+pub const PlainEncoder = writer.PlainEncoder;
+pub const LanceWriter = writer.LanceWriter;
+pub const FooterWriter = writer.FooterWriter;
+pub const ProtobufEncoder = writer.ProtobufEncoder;
+pub const DataType = writer.DataType;
+pub const ColumnSchema = writer.ColumnSchema;
+pub const ColumnBatch = writer.ColumnBatch;
 
 test {
     std.testing.refAllDecls(@This());

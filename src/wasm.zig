@@ -4067,3 +4067,181 @@ export fn zstd_get_decompressed_size(compressed_ptr: [*]const u8, compressed_len
 
     return 0;
 }
+
+// ============================================================================
+// Lance File Writer Exports
+// ============================================================================
+
+// Writer state
+var writer_buffer: ?[*]u8 = null;
+var writer_buffer_len: usize = 0;
+var writer_offset: usize = 0;
+
+/// Initialize a new Lance file writer with capacity
+export fn writerInit(capacity: usize) u32 {
+    writer_buffer = wasmAlloc(capacity);
+    if (writer_buffer == null) return 0;
+    writer_buffer_len = capacity;
+    writer_offset = 0;
+    return 1;
+}
+
+/// Get pointer to writer buffer for JS to write column data directly
+export fn writerGetBuffer() ?[*]u8 {
+    return writer_buffer;
+}
+
+/// Get current write offset
+export fn writerGetOffset() usize {
+    return writer_offset;
+}
+
+/// Write int64 values to buffer
+export fn writerWriteInt64(values: [*]const i64, count: usize) u32 {
+    const buf = writer_buffer orelse return 0;
+    const bytes_needed = count * 8;
+    if (writer_offset + bytes_needed > writer_buffer_len) return 0;
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        std.mem.writeInt(i64, buf[writer_offset..][0..8], values[i], .little);
+        writer_offset += 8;
+    }
+    return 1;
+}
+
+/// Write int32 values to buffer
+export fn writerWriteInt32(values: [*]const i32, count: usize) u32 {
+    const buf = writer_buffer orelse return 0;
+    const bytes_needed = count * 4;
+    if (writer_offset + bytes_needed > writer_buffer_len) return 0;
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        std.mem.writeInt(i32, buf[writer_offset..][0..4], values[i], .little);
+        writer_offset += 4;
+    }
+    return 1;
+}
+
+/// Write float64 values to buffer
+export fn writerWriteFloat64(values: [*]const f64, count: usize) u32 {
+    const buf = writer_buffer orelse return 0;
+    const bytes_needed = count * 8;
+    if (writer_offset + bytes_needed > writer_buffer_len) return 0;
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const bits: u64 = @bitCast(values[i]);
+        std.mem.writeInt(u64, buf[writer_offset..][0..8], bits, .little);
+        writer_offset += 8;
+    }
+    return 1;
+}
+
+/// Write float32 values to buffer
+export fn writerWriteFloat32(values: [*]const f32, count: usize) u32 {
+    const buf = writer_buffer orelse return 0;
+    const bytes_needed = count * 4;
+    if (writer_offset + bytes_needed > writer_buffer_len) return 0;
+
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const bits: u32 = @bitCast(values[i]);
+        std.mem.writeInt(u32, buf[writer_offset..][0..4], bits, .little);
+        writer_offset += 4;
+    }
+    return 1;
+}
+
+/// Write raw bytes to buffer (for strings, vectors, etc)
+export fn writerWriteBytes(data: [*]const u8, len: usize) u32 {
+    const buf = writer_buffer orelse return 0;
+    if (writer_offset + len > writer_buffer_len) return 0;
+
+    @memcpy(buf[writer_offset..][0..len], data[0..len]);
+    writer_offset += len;
+    return 1;
+}
+
+/// Write u32 offset value (for string offsets)
+export fn writerWriteOffset32(value: u32) u32 {
+    const buf = writer_buffer orelse return 0;
+    if (writer_offset + 4 > writer_buffer_len) return 0;
+
+    std.mem.writeInt(u32, buf[writer_offset..][0..4], value, .little);
+    writer_offset += 4;
+    return 1;
+}
+
+/// Write u64 offset value
+export fn writerWriteOffset64(value: u64) u32 {
+    const buf = writer_buffer orelse return 0;
+    if (writer_offset + 8 > writer_buffer_len) return 0;
+
+    std.mem.writeInt(u64, buf[writer_offset..][0..8], value, .little);
+    writer_offset += 8;
+    return 1;
+}
+
+/// Write Lance footer (40 bytes)
+export fn writerWriteFooter(
+    column_meta_start: u64,
+    column_meta_offsets_start_arg: u64,
+    global_buff_offsets_start: u64,
+    num_global_buffers: u32,
+    num_cols: u32,
+    major_version: u16,
+    minor_version: u16,
+) u32 {
+    const buf = writer_buffer orelse return 0;
+    if (writer_offset + 40 > writer_buffer_len) return 0;
+
+    std.mem.writeInt(u64, buf[writer_offset..][0..8], column_meta_start, .little);
+    writer_offset += 8;
+    std.mem.writeInt(u64, buf[writer_offset..][0..8], column_meta_offsets_start_arg, .little);
+    writer_offset += 8;
+    std.mem.writeInt(u64, buf[writer_offset..][0..8], global_buff_offsets_start, .little);
+    writer_offset += 8;
+    std.mem.writeInt(u32, buf[writer_offset..][0..4], num_global_buffers, .little);
+    writer_offset += 4;
+    std.mem.writeInt(u32, buf[writer_offset..][0..4], num_cols, .little);
+    writer_offset += 4;
+    std.mem.writeInt(u16, buf[writer_offset..][0..2], major_version, .little);
+    writer_offset += 2;
+    std.mem.writeInt(u16, buf[writer_offset..][0..2], minor_version, .little);
+    writer_offset += 2;
+    @memcpy(buf[writer_offset..][0..4], "LANC");
+    writer_offset += 4;
+
+    return 1;
+}
+
+/// Write protobuf varint
+export fn writerWriteVarint(value: u64) u32 {
+    const buf = writer_buffer orelse return 0;
+    var v = value;
+
+    while (v >= 0x80) {
+        if (writer_offset >= writer_buffer_len) return 0;
+        buf[writer_offset] = @as(u8, @truncate(v)) | 0x80;
+        writer_offset += 1;
+        v >>= 7;
+    }
+
+    if (writer_offset >= writer_buffer_len) return 0;
+    buf[writer_offset] = @truncate(v);
+    writer_offset += 1;
+
+    return 1;
+}
+
+/// Finalize and return the final file size
+export fn writerFinalize() usize {
+    return writer_offset;
+}
+
+/// Reset writer for next file
+export fn writerReset() void {
+    writer_offset = 0;
+}

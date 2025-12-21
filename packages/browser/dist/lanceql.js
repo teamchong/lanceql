@@ -5684,9 +5684,31 @@ class SQLParser {
     }
 
     /**
-     * Parse SELECT statement
+     * Parse SQL statement (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE)
      */
     parse() {
+        // Dispatch based on first keyword
+        if (this.check(TokenType.SELECT)) {
+            return this.parseSelect();
+        } else if (this.check(TokenType.INSERT)) {
+            return this.parseInsert();
+        } else if (this.check(TokenType.UPDATE)) {
+            return this.parseUpdate();
+        } else if (this.check(TokenType.DELETE)) {
+            return this.parseDelete();
+        } else if (this.check(TokenType.CREATE)) {
+            return this.parseCreateTable();
+        } else if (this.check(TokenType.DROP)) {
+            return this.parseDropTable();
+        } else {
+            throw new Error(`Unexpected token: ${this.current().type}. Expected SELECT, INSERT, UPDATE, DELETE, CREATE, or DROP`);
+        }
+    }
+
+    /**
+     * Parse SELECT statement
+     */
+    parseSelect() {
         this.expect(TokenType.SELECT);
 
         // DISTINCT
@@ -5811,6 +5833,236 @@ class SQLParser {
             orderBy,
             limit,
             offset,
+        };
+    }
+
+    /**
+     * Parse INSERT statement
+     * Syntax: INSERT INTO table_name [(col1, col2, ...)] VALUES (val1, val2, ...), ...
+     */
+    parseInsert() {
+        this.expect(TokenType.INSERT);
+        this.expect(TokenType.INTO);
+
+        // Table name
+        const table = this.expect(TokenType.IDENTIFIER).value;
+
+        // Optional column list
+        let columns = null;
+        if (this.match(TokenType.LPAREN)) {
+            columns = [];
+            columns.push(this.expect(TokenType.IDENTIFIER).value);
+            while (this.match(TokenType.COMMA)) {
+                columns.push(this.expect(TokenType.IDENTIFIER).value);
+            }
+            this.expect(TokenType.RPAREN);
+        }
+
+        // VALUES clause
+        this.expect(TokenType.VALUES);
+
+        // Parse value rows
+        const rows = [];
+        do {
+            this.expect(TokenType.LPAREN);
+            const values = [];
+            values.push(this.parseValue());
+            while (this.match(TokenType.COMMA)) {
+                values.push(this.parseValue());
+            }
+            this.expect(TokenType.RPAREN);
+            rows.push(values);
+        } while (this.match(TokenType.COMMA));
+
+        return {
+            type: 'INSERT',
+            table,
+            columns,
+            rows,
+        };
+    }
+
+    /**
+     * Parse a single value (number, string, null, true, false)
+     */
+    parseValue() {
+        if (this.match(TokenType.NULL)) {
+            return { type: 'null', value: null };
+        }
+        if (this.match(TokenType.TRUE)) {
+            return { type: 'boolean', value: true };
+        }
+        if (this.match(TokenType.FALSE)) {
+            return { type: 'boolean', value: false };
+        }
+        if (this.check(TokenType.NUMBER)) {
+            const token = this.advance();
+            const value = token.value.includes('.') ? parseFloat(token.value) : parseInt(token.value, 10);
+            return { type: 'number', value };
+        }
+        if (this.check(TokenType.STRING)) {
+            const token = this.advance();
+            return { type: 'string', value: token.value };
+        }
+        if (this.check(TokenType.MINUS)) {
+            this.advance();
+            const token = this.expect(TokenType.NUMBER);
+            const value = token.value.includes('.') ? -parseFloat(token.value) : -parseInt(token.value, 10);
+            return { type: 'number', value };
+        }
+        // Vector literal: [1.0, 2.0, 3.0]
+        if (this.check(TokenType.LBRACKET)) {
+            return this.parseVectorLiteral();
+        }
+
+        throw new Error(`Expected value, got ${this.current().type}`);
+    }
+
+    /**
+     * Parse vector literal: [1.0, 2.0, 3.0]
+     */
+    parseVectorLiteral() {
+        // Note: This requires adding LBRACKET/RBRACKET tokens
+        // For now, we'll handle arrays as strings that start with '['
+        throw new Error('Vector literals not yet supported. Use INSERT with individual columns.');
+    }
+
+    /**
+     * Parse UPDATE statement
+     * Syntax: UPDATE table_name SET col1 = val1, col2 = val2 [WHERE condition]
+     */
+    parseUpdate() {
+        this.expect(TokenType.UPDATE);
+
+        // Table name
+        const table = this.expect(TokenType.IDENTIFIER).value;
+
+        // SET clause
+        this.expect(TokenType.SET);
+
+        const assignments = [];
+        do {
+            const column = this.expect(TokenType.IDENTIFIER).value;
+            this.expect(TokenType.EQ);
+            const value = this.parseValue();
+            assignments.push({ column, value });
+        } while (this.match(TokenType.COMMA));
+
+        // Optional WHERE
+        let where = null;
+        if (this.match(TokenType.WHERE)) {
+            where = this.parseExpr();
+        }
+
+        return {
+            type: 'UPDATE',
+            table,
+            assignments,
+            where,
+        };
+    }
+
+    /**
+     * Parse DELETE statement
+     * Syntax: DELETE FROM table_name [WHERE condition]
+     */
+    parseDelete() {
+        this.expect(TokenType.DELETE);
+        this.expect(TokenType.FROM);
+
+        // Table name
+        const table = this.expect(TokenType.IDENTIFIER).value;
+
+        // Optional WHERE
+        let where = null;
+        if (this.match(TokenType.WHERE)) {
+            where = this.parseExpr();
+        }
+
+        return {
+            type: 'DELETE',
+            table,
+            where,
+        };
+    }
+
+    /**
+     * Parse CREATE TABLE statement
+     * Syntax: CREATE TABLE table_name (col1 TYPE, col2 TYPE, ...)
+     */
+    parseCreateTable() {
+        this.expect(TokenType.CREATE);
+        this.expect(TokenType.TABLE);
+
+        // Table name
+        const table = this.expect(TokenType.IDENTIFIER).value;
+
+        // Column definitions
+        this.expect(TokenType.LPAREN);
+
+        const columns = [];
+        do {
+            const name = this.expect(TokenType.IDENTIFIER).value;
+
+            // Data type
+            let dataType = 'TEXT'; // default
+            let primaryKey = false;
+            let vectorDim = null;
+
+            if (this.check(TokenType.INT) || this.check(TokenType.INTEGER) || this.check(TokenType.BIGINT)) {
+                this.advance();
+                dataType = 'INT64';
+            } else if (this.check(TokenType.FLOAT) || this.check(TokenType.DOUBLE)) {
+                this.advance();
+                dataType = 'FLOAT64';
+            } else if (this.check(TokenType.TEXT) || this.check(TokenType.VARCHAR)) {
+                this.advance();
+                dataType = 'STRING';
+            } else if (this.check(TokenType.BOOLEAN) || this.check(TokenType.BOOL)) {
+                this.advance();
+                dataType = 'BOOL';
+            } else if (this.check(TokenType.VECTOR)) {
+                this.advance();
+                dataType = 'VECTOR';
+                // Optional dimension: VECTOR(384)
+                if (this.match(TokenType.LPAREN)) {
+                    vectorDim = parseInt(this.expect(TokenType.NUMBER).value, 10);
+                    this.expect(TokenType.RPAREN);
+                }
+            }
+
+            // Optional PRIMARY KEY
+            if (this.match(TokenType.PRIMARY)) {
+                this.expect(TokenType.KEY);
+                primaryKey = true;
+            }
+
+            columns.push({ name, dataType, primaryKey, vectorDim });
+        } while (this.match(TokenType.COMMA));
+
+        this.expect(TokenType.RPAREN);
+
+        return {
+            type: 'CREATE_TABLE',
+            table,
+            columns,
+        };
+    }
+
+    /**
+     * Parse DROP TABLE statement
+     * Syntax: DROP TABLE table_name
+     */
+    parseDropTable() {
+        this.expect(TokenType.DROP);
+        this.expect(TokenType.TABLE);
+
+        // Table name
+        const table = this.expect(TokenType.IDENTIFIER).value;
+
+        return {
+            type: 'DROP_TABLE',
+            table,
         };
     }
 
