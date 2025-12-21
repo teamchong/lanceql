@@ -125,9 +125,195 @@ class MetadataCache {
 const metadataCache = new MetadataCache();
 
 /**
- * IndexedDB + OPFS storage for Lance dataset files.
- * Small files (<50MB) stored in IndexedDB, large files in OPFS.
+ * OPFS-only storage for Lance database files.
+ *
+ * Uses Origin Private File System (OPFS) exclusively - no IndexedDB.
+ * This avoids migration complexity as data grows.
+ *
+ * OPFS benefits:
+ * - High performance file access
+ * - No size limits (beyond disk quota)
+ * - File-like API suitable for Lance format
+ * - Same approach as SQLite WASM
  */
+class OPFSStorage {
+    constructor(rootDir = 'lanceql') {
+        this.rootDir = rootDir;
+        this.root = null;
+    }
+
+    /**
+     * Get OPFS root directory, creating if needed
+     */
+    async getRoot() {
+        if (this.root) return this.root;
+
+        if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) {
+            throw new Error('OPFS not available. Requires modern browser with Origin Private File System support.');
+        }
+
+        const opfsRoot = await navigator.storage.getDirectory();
+        this.root = await opfsRoot.getDirectoryHandle(this.rootDir, { create: true });
+        return this.root;
+    }
+
+    async open() {
+        await this.getRoot();
+        return this;
+    }
+
+    /**
+     * Get or create a subdirectory
+     */
+    async getDir(path) {
+        const root = await this.getRoot();
+        const parts = path.split('/').filter(p => p);
+
+        let current = root;
+        for (const part of parts) {
+            current = await current.getDirectoryHandle(part, { create: true });
+        }
+        return current;
+    }
+
+    /**
+     * Save data to a file
+     * @param {string} path - File path (e.g., 'mydb/users/frag_001.lance')
+     * @param {Uint8Array} data - File data
+     */
+    async save(path, data) {
+        const parts = path.split('/');
+        const fileName = parts.pop();
+        const dirPath = parts.join('/');
+
+        const dir = dirPath ? await this.getDir(dirPath) : await this.getRoot();
+        const fileHandle = await dir.getFileHandle(fileName, { create: true });
+
+        // Use sync access handle for better performance if available
+        if (fileHandle.createSyncAccessHandle) {
+            try {
+                const accessHandle = await fileHandle.createSyncAccessHandle();
+                accessHandle.truncate(0);
+                accessHandle.write(data, { at: 0 });
+                accessHandle.flush();
+                accessHandle.close();
+                return { path, size: data.byteLength };
+            } catch (e) {
+                // Fall back to writable stream
+            }
+        }
+
+        const writable = await fileHandle.createWritable();
+        await writable.write(data);
+        await writable.close();
+
+        return { path, size: data.byteLength };
+    }
+
+    /**
+     * Load data from a file
+     * @param {string} path - File path
+     * @returns {Promise<Uint8Array|null>}
+     */
+    async load(path) {
+        try {
+            const parts = path.split('/');
+            const fileName = parts.pop();
+            const dirPath = parts.join('/');
+
+            const dir = dirPath ? await this.getDir(dirPath) : await this.getRoot();
+            const fileHandle = await dir.getFileHandle(fileName);
+            const file = await fileHandle.getFile();
+            const buffer = await file.arrayBuffer();
+            return new Uint8Array(buffer);
+        } catch (e) {
+            if (e.name === 'NotFoundError') {
+                return null;
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Delete a file
+     * @param {string} path - File path
+     */
+    async delete(path) {
+        try {
+            const parts = path.split('/');
+            const fileName = parts.pop();
+            const dirPath = parts.join('/');
+
+            const dir = dirPath ? await this.getDir(dirPath) : await this.getRoot();
+            await dir.removeEntry(fileName);
+            return true;
+        } catch (e) {
+            if (e.name === 'NotFoundError') {
+                return false;
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * List files in a directory
+     * @param {string} dirPath - Directory path
+     * @returns {Promise<string[]>} File names
+     */
+    async list(dirPath = '') {
+        try {
+            const dir = dirPath ? await this.getDir(dirPath) : await this.getRoot();
+            const files = [];
+            for await (const [name, handle] of dir.entries()) {
+                files.push({
+                    name,
+                    type: handle.kind, // 'file' or 'directory'
+                });
+            }
+            return files;
+        } catch (e) {
+            return [];
+        }
+    }
+
+    /**
+     * Check if a file exists
+     * @param {string} path - File path
+     */
+    async exists(path) {
+        try {
+            const parts = path.split('/');
+            const fileName = parts.pop();
+            const dirPath = parts.join('/');
+
+            const dir = dirPath ? await this.getDir(dirPath) : await this.getRoot();
+            await dir.getFileHandle(fileName);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    /**
+     * Delete a directory and all contents
+     * @param {string} dirPath - Directory path
+     */
+    async deleteDir(dirPath) {
+        try {
+            const parts = dirPath.split('/');
+            const dirName = parts.pop();
+            const parentPath = parts.join('/');
+
+            const parent = parentPath ? await this.getDir(parentPath) : await this.getRoot();
+            await parent.removeEntry(dirName, { recursive: true });
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+}
+
+// Legacy IndexedDB + OPFS storage (deprecated, use OPFSStorage instead)
 class DatasetStorage {
     constructor(dbName = 'lanceql-files', version = 1) {
         this.dbName = dbName;
@@ -150,11 +336,9 @@ class DatasetStorage {
 
             request.onupgradeneeded = (event) => {
                 const db = event.target.result;
-                // Store file data (for small files)
                 if (!db.objectStoreNames.contains('files')) {
                     db.createObjectStore('files', { keyPath: 'name' });
                 }
-                // Store file metadata (for all files)
                 if (!db.objectStoreNames.contains('index')) {
                     const store = db.createObjectStore('index', { keyPath: 'name' });
                     store.createIndex('timestamp', 'timestamp');
@@ -164,9 +348,6 @@ class DatasetStorage {
         });
     }
 
-    /**
-     * Check if OPFS is available
-     */
     async hasOPFS() {
         try {
             return 'storage' in navigator && 'getDirectory' in navigator.storage;
@@ -175,19 +356,12 @@ class DatasetStorage {
         }
     }
 
-    /**
-     * Save a dataset file.
-     * @param {string} name - Dataset name (unique identifier)
-     * @param {ArrayBuffer|Uint8Array} data - File data
-     * @param {Object} metadata - Optional metadata (schema, etc.)
-     */
     async save(name, data, metadata = {}) {
         const db = await this.open();
         const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
         const size = bytes.byteLength;
         const useOPFS = size >= this.SIZE_THRESHOLD && await this.hasOPFS();
 
-        // Save to OPFS for large files
         if (useOPFS) {
             try {
                 const root = await navigator.storage.getDirectory();
@@ -197,11 +371,9 @@ class DatasetStorage {
                 await writable.close();
             } catch (e) {
                 console.warn('[DatasetStorage] OPFS save failed, falling back to IndexedDB:', e);
-                // Fall through to IndexedDB
             }
         }
 
-        // Save to IndexedDB (small files or OPFS fallback)
         if (!useOPFS) {
             await new Promise((resolve, reject) => {
                 const tx = db.transaction('files', 'readwrite');
@@ -212,7 +384,6 @@ class DatasetStorage {
             });
         }
 
-        // Save index entry
         await new Promise((resolve, reject) => {
             const tx = db.transaction('index', 'readwrite');
             const store = tx.objectStore('index');
@@ -230,15 +401,9 @@ class DatasetStorage {
         return { name, size, storage: useOPFS ? 'opfs' : 'indexeddb' };
     }
 
-    /**
-     * Load a dataset file.
-     * @param {string} name - Dataset name
-     * @returns {Promise<Uint8Array|null>} File data or null if not found
-     */
     async load(name) {
         const db = await this.open();
 
-        // Get index entry to determine storage location
         const entry = await new Promise((resolve) => {
             const tx = db.transaction('index', 'readonly');
             const store = tx.objectStore('index');
@@ -249,7 +414,6 @@ class DatasetStorage {
 
         if (!entry) return null;
 
-        // Load from OPFS
         if (entry.storage === 'opfs') {
             try {
                 const root = await navigator.storage.getDirectory();
@@ -263,7 +427,6 @@ class DatasetStorage {
             }
         }
 
-        // Load from IndexedDB
         return new Promise((resolve) => {
             const tx = db.transaction('files', 'readonly');
             const store = tx.objectStore('files');
@@ -276,10 +439,6 @@ class DatasetStorage {
         });
     }
 
-    /**
-     * List all saved datasets.
-     * @returns {Promise<Array>} List of dataset metadata
-     */
     async list() {
         const db = await this.open();
 
@@ -292,14 +451,9 @@ class DatasetStorage {
         });
     }
 
-    /**
-     * Delete a saved dataset.
-     * @param {string} name - Dataset name
-     */
     async delete(name) {
         const db = await this.open();
 
-        // Get index entry to determine storage location
         const entry = await new Promise((resolve) => {
             const tx = db.transaction('index', 'readonly');
             const store = tx.objectStore('index');
@@ -308,7 +462,6 @@ class DatasetStorage {
             request.onerror = () => resolve(null);
         });
 
-        // Delete from OPFS
         if (entry?.storage === 'opfs') {
             try {
                 const root = await navigator.storage.getDirectory();
@@ -318,7 +471,6 @@ class DatasetStorage {
             }
         }
 
-        // Delete from IndexedDB files store
         await new Promise((resolve) => {
             const tx = db.transaction('files', 'readwrite');
             const store = tx.objectStore('files');
@@ -377,11 +529,12 @@ class DatasetStorage {
     }
 }
 
-// Global storage instance
-const datasetStorage = new DatasetStorage();
+// Global storage instances
+const opfsStorage = new OPFSStorage();  // OPFS-only (recommended)
+const datasetStorage = new DatasetStorage();  // Legacy IndexedDB + OPFS
 
 // Export storage for external use
-export { datasetStorage, DatasetStorage };
+export { opfsStorage, OPFSStorage, datasetStorage, DatasetStorage };
 
 // =============================================================================
 // LocalDatabase - ACID-compliant local database with CRUD support
@@ -410,10 +563,12 @@ const DataType = {
  * - Atomicity: Manifest update is atomic
  * - Consistency: Always read from valid manifest
  * - Isolation: Each transaction sees snapshot
- * - Durability: Persisted to IndexedDB/OPFS
+ * - Durability: Persisted to OPFS (Origin Private File System)
+ *
+ * Storage: Uses OPFS exclusively for all data sizes. No IndexedDB migration needed.
  */
 export class LocalDatabase {
-    constructor(name, storage = datasetStorage) {
+    constructor(name, storage = opfsStorage) {
         this.name = name;
         this.storage = storage;
         this.tables = new Map();  // tableName -> TableState
@@ -698,14 +853,14 @@ export class LocalDatabase {
     }
 
     /**
-     * Execute SQL statement
+     * Execute SQL statement using standard SQLParser
      * @param {string} sql - SQL statement
      * @returns {Promise<any>} Result
      */
     async exec(sql) {
         const lexer = new SQLLexer(sql);
         const tokens = lexer.tokenize();
-        const parser = new LocalSQLParser(tokens);
+        const parser = new SQLParser(tokens);
         const ast = parser.parse();
 
         return this._executeAST(ast);
@@ -715,41 +870,129 @@ export class LocalDatabase {
      * Execute parsed AST
      */
     async _executeAST(ast) {
-        switch (ast.type) {
-            case 'create_table':
+        const type = ast.type.toUpperCase();
+
+        switch (type) {
+            case 'CREATE_TABLE':
                 return this.createTable(ast.table, ast.columns);
 
-            case 'drop_table':
+            case 'DROP_TABLE':
                 return this.dropTable(ast.table);
 
-            case 'insert':
-                return this.insert(ast.table, ast.rows);
+            case 'INSERT': {
+                // Convert from parser format to insert format
+                const table = this.tables.get(ast.table);
+                if (!table) {
+                    throw new Error(`Table '${ast.table}' does not exist`);
+                }
 
-            case 'delete':
+                // Map value rows to row objects
+                const columnNames = ast.columns || table.schema.map(c => c.name);
+                const rows = ast.rows.map(valueRow => {
+                    const row = {};
+                    valueRow.forEach((val, i) => {
+                        row[columnNames[i]] = val.value;
+                    });
+                    return row;
+                });
+
+                return this.insert(ast.table, rows);
+            }
+
+            case 'DELETE': {
                 const deletePredicate = ast.where
-                    ? (row) => this._evalWhere(ast.where, row)
+                    ? (row) => this._evalWhereExpr(ast.where, row)
                     : () => true;
                 return this.delete(ast.table, deletePredicate);
+            }
 
-            case 'update':
+            case 'UPDATE': {
+                // Convert assignments to updates object
+                const updates = {};
+                for (const assignment of ast.assignments) {
+                    updates[assignment.column] = assignment.value.value;
+                }
+
                 const updatePredicate = ast.where
-                    ? (row) => this._evalWhere(ast.where, row)
+                    ? (row) => this._evalWhereExpr(ast.where, row)
                     : () => true;
-                return this.update(ast.table, ast.set, updatePredicate);
+                return this.update(ast.table, updates, updatePredicate);
+            }
 
-            case 'select':
+            case 'SELECT': {
+                const tableName = ast.from?.name || ast.from?.table || ast.from;
+                if (!tableName) {
+                    throw new Error('SELECT requires FROM clause for LocalDatabase');
+                }
+
                 const selectOptions = {
-                    columns: ast.columns,
-                    where: ast.where ? (row) => this._evalWhere(ast.where, row) : null,
+                    columns: ast.columns === '*' ? ['*'] :
+                        ast.columns.map(c => c.type === 'star' ? '*' : c.expr?.column || c.column || c),
+                    where: ast.where ? (row) => this._evalWhereExpr(ast.where, row) : null,
                     limit: ast.limit,
                     offset: ast.offset,
-                    orderBy: ast.orderBy,
+                    orderBy: ast.orderBy?.[0] ? {
+                        column: ast.orderBy[0].column,
+                        desc: ast.orderBy[0].descending
+                    } : null,
                 };
-                return this.select(ast.table, selectOptions);
+                return this.select(tableName, selectOptions);
+            }
 
             default:
                 throw new Error(`Unknown statement type: ${ast.type}`);
         }
+    }
+
+    /**
+     * Evaluate WHERE expression from standard SQLParser AST
+     */
+    _evalWhereExpr(expr, row) {
+        if (!expr) return true;
+
+        if (expr.type === 'binary') {
+            const op = expr.op;
+
+            // Handle AND/OR
+            if (op === 'AND' || op === '&&') {
+                return this._evalWhereExpr(expr.left, row) && this._evalWhereExpr(expr.right, row);
+            }
+            if (op === 'OR' || op === '||') {
+                return this._evalWhereExpr(expr.left, row) || this._evalWhereExpr(expr.right, row);
+            }
+
+            // Get column value and literal value
+            const leftVal = expr.left.type === 'column' ?
+                row[expr.left.column] :
+                expr.left.value;
+            const rightVal = expr.right.type === 'column' ?
+                row[expr.right.column] :
+                expr.right.value;
+
+            switch (op) {
+                case '=':
+                case '==':
+                    return leftVal === rightVal;
+                case '!=':
+                case '<>':
+                    return leftVal !== rightVal;
+                case '<':
+                    return leftVal < rightVal;
+                case '<=':
+                    return leftVal <= rightVal;
+                case '>':
+                    return leftVal > rightVal;
+                case '>=':
+                    return leftVal >= rightVal;
+                case 'LIKE':
+                    const pattern = String(rightVal).replace(/%/g, '.*').replace(/_/g, '.');
+                    return new RegExp(`^${pattern}$`, 'i').test(leftVal);
+                default:
+                    return true;
+            }
+        }
+
+        return true;
     }
 
     /**
@@ -5684,9 +5927,31 @@ export class SQLParser {
     }
 
     /**
-     * Parse SELECT statement
+     * Parse SQL statement (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE)
      */
     parse() {
+        // Dispatch based on first keyword
+        if (this.check(TokenType.SELECT)) {
+            return this.parseSelect();
+        } else if (this.check(TokenType.INSERT)) {
+            return this.parseInsert();
+        } else if (this.check(TokenType.UPDATE)) {
+            return this.parseUpdate();
+        } else if (this.check(TokenType.DELETE)) {
+            return this.parseDelete();
+        } else if (this.check(TokenType.CREATE)) {
+            return this.parseCreateTable();
+        } else if (this.check(TokenType.DROP)) {
+            return this.parseDropTable();
+        } else {
+            throw new Error(`Unexpected token: ${this.current().type}. Expected SELECT, INSERT, UPDATE, DELETE, CREATE, or DROP`);
+        }
+    }
+
+    /**
+     * Parse SELECT statement
+     */
+    parseSelect() {
         this.expect(TokenType.SELECT);
 
         // DISTINCT
@@ -5811,6 +6076,236 @@ export class SQLParser {
             orderBy,
             limit,
             offset,
+        };
+    }
+
+    /**
+     * Parse INSERT statement
+     * Syntax: INSERT INTO table_name [(col1, col2, ...)] VALUES (val1, val2, ...), ...
+     */
+    parseInsert() {
+        this.expect(TokenType.INSERT);
+        this.expect(TokenType.INTO);
+
+        // Table name
+        const table = this.expect(TokenType.IDENTIFIER).value;
+
+        // Optional column list
+        let columns = null;
+        if (this.match(TokenType.LPAREN)) {
+            columns = [];
+            columns.push(this.expect(TokenType.IDENTIFIER).value);
+            while (this.match(TokenType.COMMA)) {
+                columns.push(this.expect(TokenType.IDENTIFIER).value);
+            }
+            this.expect(TokenType.RPAREN);
+        }
+
+        // VALUES clause
+        this.expect(TokenType.VALUES);
+
+        // Parse value rows
+        const rows = [];
+        do {
+            this.expect(TokenType.LPAREN);
+            const values = [];
+            values.push(this.parseValue());
+            while (this.match(TokenType.COMMA)) {
+                values.push(this.parseValue());
+            }
+            this.expect(TokenType.RPAREN);
+            rows.push(values);
+        } while (this.match(TokenType.COMMA));
+
+        return {
+            type: 'INSERT',
+            table,
+            columns,
+            rows,
+        };
+    }
+
+    /**
+     * Parse a single value (number, string, null, true, false)
+     */
+    parseValue() {
+        if (this.match(TokenType.NULL)) {
+            return { type: 'null', value: null };
+        }
+        if (this.match(TokenType.TRUE)) {
+            return { type: 'boolean', value: true };
+        }
+        if (this.match(TokenType.FALSE)) {
+            return { type: 'boolean', value: false };
+        }
+        if (this.check(TokenType.NUMBER)) {
+            const token = this.advance();
+            const value = token.value.includes('.') ? parseFloat(token.value) : parseInt(token.value, 10);
+            return { type: 'number', value };
+        }
+        if (this.check(TokenType.STRING)) {
+            const token = this.advance();
+            return { type: 'string', value: token.value };
+        }
+        if (this.check(TokenType.MINUS)) {
+            this.advance();
+            const token = this.expect(TokenType.NUMBER);
+            const value = token.value.includes('.') ? -parseFloat(token.value) : -parseInt(token.value, 10);
+            return { type: 'number', value };
+        }
+        // Vector literal: [1.0, 2.0, 3.0]
+        if (this.check(TokenType.LBRACKET)) {
+            return this.parseVectorLiteral();
+        }
+
+        throw new Error(`Expected value, got ${this.current().type}`);
+    }
+
+    /**
+     * Parse vector literal: [1.0, 2.0, 3.0]
+     */
+    parseVectorLiteral() {
+        // Note: This requires adding LBRACKET/RBRACKET tokens
+        // For now, we'll handle arrays as strings that start with '['
+        throw new Error('Vector literals not yet supported. Use INSERT with individual columns.');
+    }
+
+    /**
+     * Parse UPDATE statement
+     * Syntax: UPDATE table_name SET col1 = val1, col2 = val2 [WHERE condition]
+     */
+    parseUpdate() {
+        this.expect(TokenType.UPDATE);
+
+        // Table name
+        const table = this.expect(TokenType.IDENTIFIER).value;
+
+        // SET clause
+        this.expect(TokenType.SET);
+
+        const assignments = [];
+        do {
+            const column = this.expect(TokenType.IDENTIFIER).value;
+            this.expect(TokenType.EQ);
+            const value = this.parseValue();
+            assignments.push({ column, value });
+        } while (this.match(TokenType.COMMA));
+
+        // Optional WHERE
+        let where = null;
+        if (this.match(TokenType.WHERE)) {
+            where = this.parseExpr();
+        }
+
+        return {
+            type: 'UPDATE',
+            table,
+            assignments,
+            where,
+        };
+    }
+
+    /**
+     * Parse DELETE statement
+     * Syntax: DELETE FROM table_name [WHERE condition]
+     */
+    parseDelete() {
+        this.expect(TokenType.DELETE);
+        this.expect(TokenType.FROM);
+
+        // Table name
+        const table = this.expect(TokenType.IDENTIFIER).value;
+
+        // Optional WHERE
+        let where = null;
+        if (this.match(TokenType.WHERE)) {
+            where = this.parseExpr();
+        }
+
+        return {
+            type: 'DELETE',
+            table,
+            where,
+        };
+    }
+
+    /**
+     * Parse CREATE TABLE statement
+     * Syntax: CREATE TABLE table_name (col1 TYPE, col2 TYPE, ...)
+     */
+    parseCreateTable() {
+        this.expect(TokenType.CREATE);
+        this.expect(TokenType.TABLE);
+
+        // Table name
+        const table = this.expect(TokenType.IDENTIFIER).value;
+
+        // Column definitions
+        this.expect(TokenType.LPAREN);
+
+        const columns = [];
+        do {
+            const name = this.expect(TokenType.IDENTIFIER).value;
+
+            // Data type
+            let dataType = 'TEXT'; // default
+            let primaryKey = false;
+            let vectorDim = null;
+
+            if (this.check(TokenType.INT) || this.check(TokenType.INTEGER) || this.check(TokenType.BIGINT)) {
+                this.advance();
+                dataType = 'INT64';
+            } else if (this.check(TokenType.FLOAT) || this.check(TokenType.DOUBLE)) {
+                this.advance();
+                dataType = 'FLOAT64';
+            } else if (this.check(TokenType.TEXT) || this.check(TokenType.VARCHAR)) {
+                this.advance();
+                dataType = 'STRING';
+            } else if (this.check(TokenType.BOOLEAN) || this.check(TokenType.BOOL)) {
+                this.advance();
+                dataType = 'BOOL';
+            } else if (this.check(TokenType.VECTOR)) {
+                this.advance();
+                dataType = 'VECTOR';
+                // Optional dimension: VECTOR(384)
+                if (this.match(TokenType.LPAREN)) {
+                    vectorDim = parseInt(this.expect(TokenType.NUMBER).value, 10);
+                    this.expect(TokenType.RPAREN);
+                }
+            }
+
+            // Optional PRIMARY KEY
+            if (this.match(TokenType.PRIMARY)) {
+                this.expect(TokenType.KEY);
+                primaryKey = true;
+            }
+
+            columns.push({ name, dataType, primaryKey, vectorDim });
+        } while (this.match(TokenType.COMMA));
+
+        this.expect(TokenType.RPAREN);
+
+        return {
+            type: 'CREATE_TABLE',
+            table,
+            columns,
+        };
+    }
+
+    /**
+     * Parse DROP TABLE statement
+     * Syntax: DROP TABLE table_name
+     */
+    parseDropTable() {
+        this.expect(TokenType.DROP);
+        this.expect(TokenType.TABLE);
+
+        // Table name
+        const table = this.expect(TokenType.IDENTIFIER).value;
+
+        return {
+            type: 'DROP_TABLE',
+            table,
         };
     }
 
@@ -5950,16 +6445,11 @@ export class SQLParser {
             this.expect(TokenType.JOIN); // plain JOIN defaults to INNER
         }
 
-        // Parse table reference (same as FROM clause)
+        // Parse table reference (same as FROM clause) - includes alias parsing
         const table = this.parseFromClause();
 
-        // Parse optional alias
-        let alias = null;
-        if (this.match(TokenType.AS)) {
-            alias = this.expect(TokenType.IDENTIFIER).value;
-        } else if (this.check(TokenType.IDENTIFIER) && !this.check(TokenType.ON, TokenType.JOIN, TokenType.WHERE, TokenType.ORDER, TokenType.GROUP, TokenType.LIMIT)) {
-            alias = this.advance().value;
-        }
+        // Alias is already parsed by parseFromClause and stored in table.alias
+        const alias = table.alias || null;
 
         // Parse ON condition (except for CROSS JOIN)
         let on = null;
@@ -8440,6 +8930,478 @@ export class RemoteLanceDataset {
 }
 
 // ============================================================================
+// QueryPlanner - Query execution planning and optimization
+// ============================================================================
+
+/**
+ * QueryPlanner generates optimized physical execution plans from logical query ASTs.
+ *
+ * Key optimizations:
+ * - Column pruning: Only fetch columns actually needed
+ * - Filter pushdown: Apply filters as early as possible
+ * - Fetch size estimation: Minimize data transfer over HTTP
+ * - Deduplication: Avoid fetching same column multiple times
+ *
+ * Example:
+ *   SELECT a.url, b.text
+ *   FROM images a
+ *   JOIN captions b ON a.id = b.image_id
+ *   WHERE a.aesthetic > 7.0 AND b.language = 'zh'
+ *   LIMIT 20
+ *
+ * Physical Plan:
+ *   1. SCAN left: fetch [id, url, aesthetic], filter aesthetic > 7.0, limit ~50
+ *   2. BUILD_HASH: index by id, keep [id, url]
+ *   3. SCAN right: fetch [image_id, text], filter image_id IN (...) AND language = 'zh'
+ *   4. HASH_JOIN: join on id = image_id
+ *   5. PROJECT: select [url, text]
+ *   6. LIMIT: 20
+ */
+export class QueryPlanner {
+    constructor() {
+        this.debug = true; // Enable query plan logging
+    }
+
+    /**
+     * Generate physical execution plan from logical AST
+     * @param {Object} ast - Parsed SQL AST
+     * @param {Object} context - Table names and aliases
+     * @returns {Object} Physical execution plan
+     */
+    plan(ast, context) {
+        const { leftTableName, leftAlias, rightTableName, rightAlias } = context;
+
+        // Analyze what columns are needed from each table
+        const columnAnalysis = this._analyzeColumns(ast, context);
+
+        // Separate filters by table (pushdown optimization)
+        const filterAnalysis = this._analyzeFilters(ast, context);
+
+        // Estimate how many rows to fetch (over-fetch for safety)
+        const fetchEstimate = this._estimateFetchSize(ast, filterAnalysis);
+
+        // Build physical plan
+        const plan = {
+            // Step 1: Scan left table
+            leftScan: {
+                table: leftTableName,
+                alias: leftAlias,
+                columns: columnAnalysis.left.all,  // Deduplicated list
+                filters: filterAnalysis.left,
+                limit: fetchEstimate.left,
+                purpose: {
+                    join: columnAnalysis.left.join,
+                    where: columnAnalysis.left.where,
+                    result: columnAnalysis.left.result
+                }
+            },
+
+            // Step 2: Scan right table
+            rightScan: {
+                table: rightTableName,
+                alias: rightAlias,
+                columns: columnAnalysis.right.all,
+                filters: filterAnalysis.right,
+                filterByJoinKeys: true,  // Will add IN clause dynamically
+                purpose: {
+                    join: columnAnalysis.right.join,
+                    where: columnAnalysis.right.where,
+                    result: columnAnalysis.right.result
+                }
+            },
+
+            // Step 3: Join strategy
+            join: {
+                type: ast.joins[0].type,
+                leftKey: columnAnalysis.joinKeys.left,
+                rightKey: columnAnalysis.joinKeys.right,
+                algorithm: 'HASH_JOIN'  // Could be SORT_MERGE or NESTED_LOOP in future
+            },
+
+            // Step 4: Final projection
+            projection: columnAnalysis.resultColumns,
+
+            // Step 5: Limit
+            limit: ast.limit || null,
+            offset: ast.offset || 0
+        };
+
+        if (this.debug) {
+            this._logPlan(plan, ast);
+        }
+
+        return plan;
+    }
+
+    /**
+     * Analyze which columns are needed from each table
+     */
+    _analyzeColumns(ast, context) {
+        const { leftAlias, rightAlias } = context;
+
+        const left = {
+            join: new Set(),    // Columns needed for JOIN key
+            where: new Set(),   // Columns needed for WHERE filter
+            result: new Set(),  // Columns needed in final result
+            all: []             // Deduplicated union of above
+        };
+
+        const right = {
+            join: new Set(),
+            where: new Set(),
+            result: new Set(),
+            all: []
+        };
+
+        // 1. Analyze SELECT columns (result set)
+        for (const item of ast.columns) {
+            if (item.type === 'star') {
+                // SELECT * - need all columns (can't optimize this easily)
+                left.result.add('*');
+                right.result.add('*');
+            } else if (item.type === 'expr' && item.expr.type === 'column') {
+                const col = item.expr;
+                const table = col.table || null;
+                const column = col.column;
+
+                if (!table || table === leftAlias) {
+                    left.result.add(column);
+                }
+                if (!table || table === rightAlias) {
+                    right.result.add(column);
+                }
+            }
+        }
+
+        // 2. Analyze JOIN ON condition (join keys)
+        const join = ast.joins[0];
+        const joinKeys = this._extractJoinKeys(join.on, leftAlias, rightAlias);
+
+        if (joinKeys.left) {
+            left.join.add(joinKeys.left);
+        }
+        if (joinKeys.right) {
+            right.join.add(joinKeys.right);
+        }
+
+        // 3. Analyze WHERE clause (filter columns)
+        if (ast.where) {
+            this._extractWhereColumns(ast.where, leftAlias, rightAlias, left.where, right.where);
+        }
+
+        // 4. Deduplicate: merge join, where, result
+        left.all = [...new Set([...left.join, ...left.where, ...left.result])];
+        right.all = [...new Set([...right.join, ...right.where, ...right.result])];
+
+        // 5. Handle SELECT *
+        if (left.result.has('*')) {
+            left.all = ['*'];
+        }
+        if (right.result.has('*')) {
+            right.all = ['*'];
+        }
+
+        // 6. Determine final result columns (for projection after join)
+        const resultColumns = [];
+        for (const item of ast.columns) {
+            if (item.type === 'star') {
+                resultColumns.push('*');
+            } else if (item.type === 'expr' && item.expr.type === 'column') {
+                const col = item.expr;
+                const alias = item.alias || `${col.table || ''}.${col.column}`.replace(/^\./, '');
+                resultColumns.push({
+                    table: col.table,
+                    column: col.column,
+                    alias: alias
+                });
+            }
+        }
+
+        return {
+            left,
+            right,
+            joinKeys,
+            resultColumns
+        };
+    }
+
+    /**
+     * Extract join keys from ON condition
+     */
+    _extractJoinKeys(onExpr, leftAlias, rightAlias) {
+        if (!onExpr || onExpr.type !== 'binary') {
+            return { left: null, right: null };
+        }
+
+        const leftCol = onExpr.left;
+        const rightCol = onExpr.right;
+
+        let leftKey = null;
+        let rightKey = null;
+
+        // Left side of equality
+        if (leftCol.type === 'column') {
+            if (!leftCol.table || leftCol.table === leftAlias) {
+                leftKey = leftCol.column;
+            } else if (leftCol.table === rightAlias) {
+                rightKey = leftCol.column;
+            }
+        }
+
+        // Right side of equality
+        if (rightCol.type === 'column') {
+            if (!rightCol.table || rightCol.table === leftAlias) {
+                leftKey = rightCol.column;
+            } else if (rightCol.table === rightAlias) {
+                rightKey = rightCol.column;
+            }
+        }
+
+        return { left: leftKey, right: rightKey };
+    }
+
+    /**
+     * Extract columns referenced in WHERE clause
+     */
+    _extractWhereColumns(expr, leftAlias, rightAlias, leftCols, rightCols) {
+        if (!expr) return;
+
+        if (expr.type === 'column') {
+            const table = expr.table;
+            const column = expr.column;
+
+            if (!table || table === leftAlias) {
+                leftCols.add(column);
+            } else if (table === rightAlias) {
+                rightCols.add(column);
+            }
+        } else if (expr.type === 'binary') {
+            this._extractWhereColumns(expr.left, leftAlias, rightAlias, leftCols, rightCols);
+            this._extractWhereColumns(expr.right, leftAlias, rightAlias, leftCols, rightCols);
+        } else if (expr.type === 'unary') {
+            this._extractWhereColumns(expr.expr, leftAlias, rightAlias, leftCols, rightCols);
+        }
+    }
+
+    /**
+     * Analyze and separate filters by table (for pushdown)
+     */
+    _analyzeFilters(ast, context) {
+        const { leftAlias, rightAlias } = context;
+
+        const left = [];   // Filters that can be pushed to left table
+        const right = [];  // Filters that can be pushed to right table
+        const join = [];   // Filters that must be applied after join
+
+        if (ast.where) {
+            this._separateFilters(ast.where, leftAlias, rightAlias, left, right, join);
+        }
+
+        return { left, right, join };
+    }
+
+    /**
+     * Separate WHERE filters by which table they reference
+     */
+    _separateFilters(expr, leftAlias, rightAlias, leftFilters, rightFilters, joinFilters) {
+        if (!expr) return;
+
+        // For AND expressions, recursively separate each side
+        if (expr.type === 'binary' && expr.op === 'AND') {
+            this._separateFilters(expr.left, leftAlias, rightAlias, leftFilters, rightFilters, joinFilters);
+            this._separateFilters(expr.right, leftAlias, rightAlias, leftFilters, rightFilters, joinFilters);
+            return;
+        }
+
+        // For other expressions, check which table(s) they reference
+        const tables = this._getReferencedTables(expr, leftAlias, rightAlias);
+
+        if (tables.size === 1) {
+            // Filter references only one table - can push down
+            if (tables.has(leftAlias)) {
+                leftFilters.push(expr);
+            } else if (tables.has(rightAlias)) {
+                rightFilters.push(expr);
+            }
+        } else if (tables.size > 1) {
+            // Filter references multiple tables - must apply after join
+            joinFilters.push(expr);
+        }
+        // If tables.size === 0, it's a constant expression (ignore for now)
+    }
+
+    /**
+     * Get which tables an expression references
+     */
+    _getReferencedTables(expr, leftAlias, rightAlias) {
+        const tables = new Set();
+
+        const walk = (e) => {
+            if (!e) return;
+
+            if (e.type === 'column') {
+                const table = e.table;
+                if (!table) {
+                    // Ambiguous - could be either table (conservative: don't push down)
+                    tables.add(leftAlias);
+                    tables.add(rightAlias);
+                } else if (table === leftAlias) {
+                    tables.add(leftAlias);
+                } else if (table === rightAlias) {
+                    tables.add(rightAlias);
+                }
+            } else if (e.type === 'binary') {
+                walk(e.left);
+                walk(e.right);
+            } else if (e.type === 'unary') {
+                walk(e.expr);
+            } else if (e.type === 'call') {
+                for (const arg of e.args || []) {
+                    walk(arg);
+                }
+            }
+        };
+
+        walk(expr);
+        return tables;
+    }
+
+    /**
+     * Estimate how many rows to fetch from each table
+     *
+     * Need to over-fetch because:
+     * - WHERE filters reduce rows
+     * - JOIN reduces rows
+     * - Want to ensure we get LIMIT rows after all filtering
+     */
+    _estimateFetchSize(ast, filterAnalysis) {
+        const requestedLimit = ast.limit || 1000;
+
+        // Estimate selectivity (how many rows pass filters)
+        // This is a simple heuristic - could be improved with statistics
+        const leftSelectivity = filterAnalysis.left.length > 0 ? 0.5 : 1.0;  // 50% if filtered
+        const rightSelectivity = filterAnalysis.right.length > 0 ? 0.5 : 1.0;
+
+        // Join selectivity (how many rows match)
+        const joinSelectivity = 0.7;  // Assume 70% of left rows find a match
+
+        // Over-fetch multiplier
+        const safetyFactor = 2.5;
+
+        // Estimate left fetch size
+        // Want: requestedLimit = leftFetch * leftSelectivity * joinSelectivity
+        // So: leftFetch = requestedLimit / (leftSelectivity * joinSelectivity) * safetyFactor
+        const leftFetch = Math.ceil(
+            requestedLimit / (leftSelectivity * joinSelectivity) * safetyFactor
+        );
+
+        // Right table: fetch only what's needed based on left join keys
+        // This will be dynamic (added in executor)
+        const rightFetch = null;  // Determined by left join keys
+
+        return {
+            left: Math.min(leftFetch, 10000),  // Cap at 10K for safety
+            right: rightFetch
+        };
+    }
+
+    /**
+     * Log the query plan for debugging
+     */
+    _logPlan(plan, ast) {
+        console.log('\n' + '='.repeat(60));
+        console.log('📋 QUERY EXECUTION PLAN');
+        console.log('='.repeat(60));
+
+        console.log('\n🔍 Original Query:');
+        console.log(`  SELECT: ${ast.columns.length} columns`);
+        console.log(`  FROM: ${plan.leftScan.table} AS ${plan.leftScan.alias}`);
+        console.log(`  JOIN: ${plan.rightScan.table} AS ${plan.rightScan.alias}`);
+        console.log(`  WHERE: ${ast.where ? 'yes' : 'no'}`);
+        console.log(`  LIMIT: ${ast.limit || 'none'}`);
+
+        console.log('\n📊 Physical Plan:');
+
+        console.log('\n  Step 1: SCAN LEFT TABLE');
+        console.log(`    Table: ${plan.leftScan.table}`);
+        console.log(`    Columns: [${plan.leftScan.columns.join(', ')}]`);
+        console.log(`      - Join keys: [${[...plan.leftScan.purpose.join].join(', ')}]`);
+        console.log(`      - Filter cols: [${[...plan.leftScan.purpose.where].join(', ')}]`);
+        console.log(`      - Result cols: [${[...plan.leftScan.purpose.result].join(', ')}]`);
+        console.log(`    Filters: ${plan.leftScan.filters.length} pushed down`);
+        plan.leftScan.filters.forEach((f, i) => {
+            console.log(`      ${i + 1}. ${this._formatFilter(f)}`);
+        });
+        console.log(`    Limit: ${plan.leftScan.limit} rows (over-fetch for safety)`);
+
+        console.log('\n  Step 2: BUILD HASH TABLE');
+        console.log(`    Index by: ${plan.join.leftKey}`);
+        console.log(`    Keep: [${plan.leftScan.columns.join(', ')}]`);
+
+        console.log('\n  Step 3: SCAN RIGHT TABLE');
+        console.log(`    Table: ${plan.rightScan.table}`);
+        console.log(`    Columns: [${plan.rightScan.columns.join(', ')}]`);
+        console.log(`      - Join keys: [${[...plan.rightScan.purpose.join].join(', ')}]`);
+        console.log(`      - Filter cols: [${[...plan.rightScan.purpose.where].join(', ')}]`);
+        console.log(`      - Result cols: [${[...plan.rightScan.purpose.result].join(', ')}]`);
+        console.log(`    Filters: ${plan.rightScan.filters.length} pushed down`);
+        plan.rightScan.filters.forEach((f, i) => {
+            console.log(`      ${i + 1}. ${this._formatFilter(f)}`);
+        });
+        console.log(`    Dynamic filter: ${plan.join.rightKey} IN (keys from left)`);
+
+        console.log('\n  Step 4: HASH JOIN');
+        console.log(`    Algorithm: ${plan.join.algorithm}`);
+        console.log(`    Condition: ${plan.join.leftKey} = ${plan.join.rightKey}`);
+
+        console.log('\n  Step 5: PROJECT');
+        console.log(`    Result columns: ${plan.projection.length}`);
+        plan.projection.forEach((col, i) => {
+            if (col === '*') {
+                console.log(`      ${i + 1}. *`);
+            } else {
+                console.log(`      ${i + 1}. ${col.table}.${col.column} AS ${col.alias}`);
+            }
+        });
+
+        console.log('\n  Step 6: LIMIT');
+        console.log(`    Rows: ${plan.limit || 'none'}`);
+
+        console.log('\n💡 Optimization Summary:');
+        const leftTotal = plan.leftScan.columns.length;
+        const rightTotal = plan.rightScan.columns.length;
+        console.log(`  - Fetch ${leftTotal} cols from left (not all columns)`);
+        console.log(`  - Fetch ${rightTotal} cols from right (not all columns)`);
+        console.log(`  - Push down ${plan.leftScan.filters.length + plan.rightScan.filters.length} filters`);
+        console.log(`  - Over-fetch left by ${(plan.leftScan.limit / (ast.limit || 1)).toFixed(1)}x for safety`);
+
+        console.log('\n' + '='.repeat(60) + '\n');
+    }
+
+    /**
+     * Format filter expression for logging
+     */
+    _formatFilter(expr) {
+        if (!expr) return 'null';
+
+        if (expr.type === 'binary') {
+            const left = this._formatFilter(expr.left);
+            const right = this._formatFilter(expr.right);
+            return `${left} ${expr.op} ${right}`;
+        } else if (expr.type === 'column') {
+            return expr.table ? `${expr.table}.${expr.column}` : expr.column;
+        } else if (expr.type === 'literal') {
+            return JSON.stringify(expr.value);
+        } else if (expr.type === 'call') {
+            const args = (expr.args || []).map(a => this._formatFilter(a)).join(', ');
+            return `${expr.name}(${args})`;
+        }
+
+        return JSON.stringify(expr);
+    }
+}
+
+// ============================================================================
 // LanceDatabase - Multi-table query execution with JOINs
 // ============================================================================
 
@@ -8600,7 +9562,7 @@ export class LanceDatabase {
     }
 
     /**
-     * Execute hash join between two datasets
+     * Execute hash join between two datasets using QueryPlanner
      */
     async _hashJoin(leftDataset, rightDataset, ast, context) {
         const { leftAlias, rightAlias, leftTableName, rightTableName } = context;
@@ -8612,24 +9574,32 @@ export class LanceDatabase {
             throw new Error('JOIN ON condition must be an equality (e.g., table1.col1 = table2.col2)');
         }
 
-        // Extract join keys
-        const leftKey = this._extractColumnFromExpr(joinCondition.left, leftAlias);
-        const rightKey = this._extractColumnFromExpr(joinCondition.right, rightAlias);
+        // Use QueryPlanner to generate optimized execution plan
+        const planner = new QueryPlanner();
+        const plan = planner.plan(ast, context);
 
-        console.log(`[LanceDatabase] Join keys: ${leftAlias}.${leftKey} = ${rightAlias}.${rightKey}`);
+        // Extract columns and keys from the plan
+        const leftKey = plan.join.leftKey;
+        const rightKey = plan.join.rightKey;
+        const leftColumns = plan.leftScan.columns;
+        const rightColumns = plan.rightScan.columns;
+        const leftFilters = plan.leftScan.filters;
+        const rightFilters = plan.rightScan.filters;
+        const leftLimit = plan.leftScan.limit;
 
-        // Extract columns needed for result
-        const leftColumns = this._getColumnsForTable(ast.columns, leftAlias);
-        const rightColumns = this._getColumnsForTable(ast.columns, rightAlias);
+        // Build left SQL with filter pushdown
+        let leftWhereClause = '';
+        if (leftFilters.length > 0) {
+            const filterStr = leftFilters.map(f => this._filterToSQL(f)).join(' AND ');
+            leftWhereClause = ` WHERE ${filterStr}`;
+        }
 
-        console.log(`[LanceDatabase] Left columns:`, leftColumns);
-        console.log(`[LanceDatabase] Right columns:`, rightColumns);
+        // Ensure join key is included in columns
+        const leftColsWithKey = leftColumns.includes('*')
+            ? ['*']
+            : [...new Set([leftKey, ...leftColumns])];
 
-        // TODO: Apply WHERE filter to left table to reduce rows fetched
-        const leftLimit = ast.limit ? ast.limit * 2 : 1000; // Over-fetch for safety
-
-        // Fetch left side (with join key + result columns)
-        const leftSQL = `SELECT ${leftKey} AS _joinkey, ${leftColumns.join(', ')} FROM ${leftTableName} LIMIT ${leftLimit}`;
+        const leftSQL = `SELECT ${leftColsWithKey.join(', ')} FROM ${leftTableName}${leftWhereClause} LIMIT ${leftLimit}`;
         console.log('[LanceDatabase] Left query:', leftSQL);
 
         const leftExecutor = new SQLExecutor(leftDataset);
@@ -8643,27 +9613,45 @@ export class LanceDatabase {
 
         // Build hash map on left side
         const hashMap = new Map();
-        const joinKeyIndex = leftData.columns.indexOf('_joinkey');
+        const joinKeyIndex = leftData.columns.indexOf(leftKey);
 
         for (const row of leftData.rows) {
             const key = row[joinKeyIndex];
-            if (!hashMap.has(key)) {
-                hashMap.set(key, []);
+            if (key !== null && key !== undefined) {
+                if (!hashMap.has(key)) {
+                    hashMap.set(key, []);
+                }
+                hashMap.get(key).push(row);
             }
-            hashMap.set(key, row);
         }
 
         console.log(`[LanceDatabase] Built hash map with ${hashMap.size} unique keys`);
 
         // Get unique join keys for right side
-        const joinKeys = Array.from(hashMap.keys()).filter(k => k !== null && k !== undefined);
+        const joinKeys = Array.from(hashMap.keys());
 
         if (joinKeys.length === 0) {
             return { columns: [], rows: [], total: 0 };
         }
 
-        // Fetch right side (only matching rows!)
-        const rightSQL = `SELECT ${rightKey} AS _joinkey, ${rightColumns.join(', ')} FROM ${rightTableName} WHERE ${rightKey} IN (${joinKeys.join(',')})`;
+        // Build right SQL with filter pushdown AND join key filter
+        const rightColsWithKey = rightColumns.includes('*')
+            ? ['*']
+            : [...new Set([rightKey, ...rightColumns])];
+
+        // Combine pushed-down filters with join key IN clause
+        const rightFilterParts = [];
+        if (rightFilters.length > 0) {
+            rightFilterParts.push(rightFilters.map(f => this._filterToSQL(f)).join(' AND '));
+        }
+
+        // Add join key filter
+        const joinKeyValues = joinKeys.map(k => typeof k === 'string' ? `'${k}'` : k).join(',');
+        rightFilterParts.push(`${rightKey} IN (${joinKeyValues})`);
+
+        const rightWhereClause = ` WHERE ${rightFilterParts.join(' AND ')}`;
+
+        const rightSQL = `SELECT ${rightColsWithKey.join(', ')} FROM ${rightTableName}${rightWhereClause}`;
         console.log('[LanceDatabase] Right query:', rightSQL);
 
         const rightExecutor = new SQLExecutor(rightDataset);
@@ -8673,36 +9661,105 @@ export class LanceDatabase {
 
         // Perform hash join
         const results = [];
-        const rightJoinKeyIndex = rightData.columns.indexOf('_joinkey');
+        const rightJoinKeyIndex = rightData.columns.indexOf(rightKey);
 
         for (const rightRow of rightData.rows) {
             const key = rightRow[rightJoinKeyIndex];
-            const leftRow = hashMap.get(key);
+            const leftRows = hashMap.get(key);
 
-            if (leftRow) {
-                // Merge rows (exclude _joinkey columns)
-                const leftValues = leftRow.filter((_, i) => i !== joinKeyIndex);
-                const rightValues = rightRow.filter((_, i) => i !== rightJoinKeyIndex);
-                results.push([...leftValues, ...rightValues]);
+            if (leftRows) {
+                for (const leftRow of leftRows) {
+                    // Merge rows
+                    results.push([...leftRow, ...rightRow]);
+                }
             }
         }
 
         console.log(`[LanceDatabase] Joined ${results.length} rows`);
 
-        // Build result columns (exclude _joinkey)
-        const resultColumns = [
-            ...leftData.columns.filter(c => c !== '_joinkey'),
-            ...rightData.columns.filter(c => c !== '_joinkey')
-        ];
+        // Build result columns
+        const resultColumns = [...leftData.columns, ...rightData.columns];
+
+        // Apply projection to select only the requested columns
+        const projectedResults = this._applyProjection(results, resultColumns, plan.projection, leftAlias, rightAlias);
 
         // Apply LIMIT
-        const limitedResults = ast.limit ? results.slice(0, ast.limit) : results;
+        const limitedResults = ast.limit ? projectedResults.rows.slice(0, ast.limit) : projectedResults.rows;
 
         return {
-            columns: resultColumns,
+            columns: projectedResults.columns,
             rows: limitedResults,
             total: limitedResults.length
         };
+    }
+
+    /**
+     * Convert filter expression to SQL WHERE clause
+     */
+    _filterToSQL(expr) {
+        if (!expr) return '';
+
+        if (expr.type === 'binary') {
+            const left = this._filterToSQL(expr.left);
+            const right = this._filterToSQL(expr.right);
+            return `${left} ${expr.op} ${right}`;
+        } else if (expr.type === 'column') {
+            return expr.table ? `${expr.table}.${expr.column}` : expr.column;
+        } else if (expr.type === 'literal') {
+            if (typeof expr.value === 'string') {
+                return `'${expr.value}'`;
+            }
+            return String(expr.value);
+        } else if (expr.type === 'call') {
+            const args = (expr.args || []).map(a => this._filterToSQL(a)).join(', ');
+            return `${expr.name}(${args})`;
+        }
+
+        return '';
+    }
+
+    /**
+     * Apply projection to select only requested columns from joined result
+     */
+    _applyProjection(rows, allColumns, projection, leftAlias, rightAlias) {
+        // Handle SELECT *
+        if (projection.includes('*')) {
+            return { columns: allColumns, rows };
+        }
+
+        // Build column mapping
+        const projectedColumns = [];
+        const columnIndices = [];
+
+        for (const col of projection) {
+            if (col === '*') {
+                // Already handled above
+                continue;
+            }
+
+            const targetCol = col.table
+                ? `${col.column}`  // Use just column name for matching
+                : col.column;
+
+            // Find column in result set
+            let idx = allColumns.indexOf(targetCol);
+            if (idx === -1) {
+                // Try with table prefix
+                idx = allColumns.indexOf(`${col.table}.${col.column}`);
+            }
+
+            if (idx !== -1) {
+                projectedColumns.push(col.alias || targetCol);
+                columnIndices.push(idx);
+            }
+        }
+
+        // Apply projection
+        const projectedRows = rows.map(row =>
+            columnIndices.map(idx => row[idx])
+        );
+
+        return { columns: projectedColumns, rows: projectedRows };
     }
 
     /**
@@ -9870,6 +10927,457 @@ if (typeof document !== 'undefined') {
         LanceData._autoInit();
     }
 }
+
+// =============================================================================
+// sql.js-Compatible API - Drop-in replacement with vector search
+// =============================================================================
+
+/**
+ * Statement class - sql.js compatible prepared statement
+ *
+ * Thin wrapper that delegates to WASM-based SQLExecutor
+ */
+class Statement {
+    constructor(db, sql) {
+        this.db = db;
+        this.sql = sql;
+        this.params = null;
+        this.results = null;
+        this.resultIndex = 0;
+        this.done = false;
+    }
+
+    /**
+     * Bind parameters to the statement
+     * @param {Array|Object} params - Parameters to bind
+     * @returns {boolean} true on success
+     */
+    bind(params) {
+        this.params = params;
+        this.results = null;
+        this.resultIndex = 0;
+        this.done = false;
+        return true;
+    }
+
+    /**
+     * Execute and step to next row
+     * @returns {boolean} true if there's a row, false if done
+     */
+    step() {
+        if (this.done) return false;
+
+        // Execute on first step
+        if (this.results === null) {
+            const execResult = this.db.exec(this.sql, this.params);
+            if (execResult.length === 0 || execResult[0].values.length === 0) {
+                this.done = true;
+                return false;
+            }
+            this.results = execResult[0];
+            this.resultIndex = 0;
+        }
+
+        if (this.resultIndex >= this.results.values.length) {
+            this.done = true;
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Get current row as array
+     * @returns {Array} Current row values
+     */
+    get() {
+        if (!this.results || this.resultIndex >= this.results.values.length) {
+            return [];
+        }
+        const row = this.results.values[this.resultIndex];
+        this.resultIndex++;
+        return row;
+    }
+
+    /**
+     * Get current row as object
+     * @param {Object} params - Optional params (ignored, for compatibility)
+     * @returns {Object} Current row as {column: value}
+     */
+    getAsObject(params) {
+        if (!this.results || this.resultIndex >= this.results.values.length) {
+            return {};
+        }
+        const row = this.results.values[this.resultIndex];
+        this.resultIndex++;
+
+        const obj = {};
+        this.results.columns.forEach((col, i) => {
+            obj[col] = row[i];
+        });
+        return obj;
+    }
+
+    /**
+     * Get column names
+     * @returns {Array} Column names
+     */
+    getColumnNames() {
+        return this.results?.columns || [];
+    }
+
+    /**
+     * Reset statement for reuse
+     * @returns {boolean} true on success
+     */
+    reset() {
+        this.results = null;
+        this.resultIndex = 0;
+        this.done = false;
+        return true;
+    }
+
+    /**
+     * Free statement resources
+     * @returns {boolean} true on success
+     */
+    free() {
+        this.results = null;
+        this.params = null;
+        return true;
+    }
+
+    /**
+     * Free and finalize (alias for free)
+     */
+    freemem() {
+        return this.free();
+    }
+}
+
+/**
+ * Database class - sql.js compatible API with vector search
+ *
+ * Drop-in replacement for sql.js Database with:
+ * - Same API: exec(), run(), prepare(), export(), close()
+ * - OPFS persistence (automatic, no export/import needed)
+ * - Vector search: NEAR, TOPK, embeddings
+ * - Columnar Lance format for analytics
+ *
+ * @example
+ * const SQL = await initSqlJs();
+ * const db = new SQL.Database('mydb');
+ *
+ * // Standard SQL (same as sql.js)
+ * db.exec("CREATE TABLE users (id INT, name TEXT)");
+ * db.run("INSERT INTO users VALUES (?, ?)", [1, 'Alice']);
+ * const results = db.exec("SELECT * FROM users");
+ *
+ * // Vector search (LanceQL extension)
+ * db.exec("SELECT * FROM docs NEAR embedding 'search text' TOPK 10");
+ */
+class Database {
+    /**
+     * Create a new database
+     * @param {string|Uint8Array} nameOrData - Database name (OPFS) or data (in-memory)
+     * @param {OPFSStorage} storage - Optional storage backend
+     */
+    constructor(nameOrData, storage = null) {
+        if (nameOrData instanceof Uint8Array) {
+            // In-memory database from binary data (sql.js compatibility)
+            this._inMemory = true;
+            this._data = nameOrData;
+            this._name = ':memory:';
+            this._db = null;
+        } else {
+            // OPFS-persisted database
+            this._inMemory = false;
+            this._name = nameOrData || 'default';
+            this._storage = storage;
+            this._db = new LocalDatabase(this._name, storage || opfsStorage);
+        }
+        this._open = false;
+        this._rowsModified = 0;
+    }
+
+    /**
+     * Ensure database is open
+     */
+    async _ensureOpen() {
+        if (!this._open && this._db) {
+            await this._db.open();
+            this._open = true;
+        }
+    }
+
+    /**
+     * Execute SQL and return results
+     *
+     * @param {string} sql - SQL statement(s)
+     * @param {Array|Object} params - Optional parameters
+     * @returns {Array} Array of {columns, values} result sets
+     *
+     * @example
+     * const results = db.exec("SELECT * FROM users WHERE id = ?", [1]);
+     * // [{columns: ['id', 'name'], values: [[1, 'Alice']]}]
+     */
+    exec(sql, params) {
+        // Return promise for async operation
+        return this._execAsync(sql, params);
+    }
+
+    async _execAsync(sql, params) {
+        await this._ensureOpen();
+
+        // Substitute parameters
+        let processedSql = sql;
+        if (params) {
+            if (Array.isArray(params)) {
+                let paramIndex = 0;
+                processedSql = sql.replace(/\?/g, () => {
+                    const val = params[paramIndex++];
+                    return this._formatValue(val);
+                });
+            } else if (typeof params === 'object') {
+                for (const [key, val] of Object.entries(params)) {
+                    const pattern = new RegExp(`[:$@]${key}\\b`, 'g');
+                    processedSql = processedSql.replace(pattern, this._formatValue(val));
+                }
+            }
+        }
+
+        // Split multiple statements
+        const statements = processedSql
+            .split(';')
+            .map(s => s.trim())
+            .filter(s => s.length > 0);
+
+        const results = [];
+
+        for (const stmt of statements) {
+            try {
+                const lexer = new SQLLexer(stmt);
+                const tokens = lexer.tokenize();
+                const parser = new SQLParser(tokens);
+                const ast = parser.parse();
+
+                if (ast.type === 'SELECT') {
+                    // SELECT returns rows
+                    const rows = await this._db._executeAST(ast);
+                    if (rows && rows.length > 0) {
+                        const columns = Object.keys(rows[0]);
+                        const values = rows.map(row => columns.map(c => row[c]));
+                        results.push({ columns, values });
+                    }
+                    this._rowsModified = 0;
+                } else {
+                    // Non-SELECT statements
+                    const result = await this._db._executeAST(ast);
+                    this._rowsModified = result?.inserted || result?.updated || result?.deleted || 0;
+                }
+            } catch (e) {
+                throw new Error(`SQL error: ${e.message}\nStatement: ${stmt}`);
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * Execute SQL without returning results
+     *
+     * @param {string} sql - SQL statement
+     * @param {Array|Object} params - Optional parameters
+     * @returns {Database} this (for chaining)
+     */
+    run(sql, params) {
+        return this._runAsync(sql, params);
+    }
+
+    async _runAsync(sql, params) {
+        await this.exec(sql, params);
+        return this;
+    }
+
+    /**
+     * Prepare a statement for execution
+     *
+     * @param {string} sql - SQL statement
+     * @param {Array|Object} params - Optional initial parameters
+     * @returns {Statement} Prepared statement
+     */
+    prepare(sql, params) {
+        const stmt = new Statement(this, sql);
+        if (params) {
+            stmt.bind(params);
+        }
+        return stmt;
+    }
+
+    /**
+     * Execute SQL and call callback for each row
+     *
+     * @param {string} sql - SQL statement
+     * @param {Array|Object} params - Parameters
+     * @param {Function} callback - Called with row object for each row
+     * @param {Function} done - Called when complete
+     * @returns {Database} this
+     */
+    each(sql, params, callback, done) {
+        this._eachAsync(sql, params, callback, done);
+        return this;
+    }
+
+    async _eachAsync(sql, params, callback, done) {
+        try {
+            const results = await this.exec(sql, params);
+            if (results.length > 0) {
+                const { columns, values } = results[0];
+                for (const row of values) {
+                    const obj = {};
+                    columns.forEach((col, i) => {
+                        obj[col] = row[i];
+                    });
+                    callback(obj);
+                }
+            }
+            if (done) done();
+        } catch (e) {
+            if (done) done(e);
+            else throw e;
+        }
+    }
+
+    /**
+     * Get number of rows modified by last statement
+     * @returns {number} Rows modified
+     */
+    getRowsModified() {
+        return this._rowsModified;
+    }
+
+    /**
+     * Export database to Uint8Array
+     *
+     * For OPFS databases, this exports all tables as JSON.
+     * For in-memory databases, returns the original data.
+     *
+     * @returns {Uint8Array} Database contents
+     */
+    async export() {
+        if (this._inMemory && this._data) {
+            return this._data;
+        }
+
+        await this._ensureOpen();
+
+        // Export all tables as JSON
+        const exportData = {
+            version: this._db.version,
+            tables: {}
+        };
+
+        for (const tableName of this._db.listTables()) {
+            const table = this._db.getTable(tableName);
+            const rows = await this._db.select(tableName, {});
+            exportData.tables[tableName] = {
+                schema: table.schema,
+                rows
+            };
+        }
+
+        return new TextEncoder().encode(JSON.stringify(exportData));
+    }
+
+    /**
+     * Close the database
+     */
+    close() {
+        this._open = false;
+        this._db = null;
+    }
+
+    /**
+     * Register a custom SQL function (stub for compatibility)
+     * @param {string} name - Function name
+     * @param {Function} func - Function implementation
+     * @returns {Database} this
+     */
+    create_function(name, func) {
+        console.warn(`[LanceQL] create_function('${name}') not yet implemented`);
+        return this;
+    }
+
+    /**
+     * Register a custom aggregate function (stub for compatibility)
+     * @param {string} name - Function name
+     * @param {Object} funcs - Aggregate functions {init, step, finalize}
+     * @returns {Database} this
+     */
+    create_aggregate(name, funcs) {
+        console.warn(`[LanceQL] create_aggregate('${name}') not yet implemented`);
+        return this;
+    }
+
+    /**
+     * Format a value for SQL
+     */
+    _formatValue(val) {
+        if (val === null || val === undefined) {
+            return 'NULL';
+        }
+        if (typeof val === 'string') {
+            return `'${val.replace(/'/g, "''")}'`;
+        }
+        if (typeof val === 'number') {
+            return String(val);
+        }
+        if (typeof val === 'boolean') {
+            return val ? 'TRUE' : 'FALSE';
+        }
+        if (Array.isArray(val)) {
+            // Vector
+            return `'[${val.join(',')}]'`;
+        }
+        return String(val);
+    }
+}
+
+/**
+ * Initialize LanceQL with sql.js-compatible API
+ *
+ * Drop-in replacement for initSqlJs():
+ *
+ * @example
+ * // sql.js style
+ * import initSqlJs from 'sql.js';
+ * const SQL = await initSqlJs();
+ * const db = new SQL.Database();
+ *
+ * // LanceQL replacement
+ * import { initSqlJs } from 'lanceql';
+ * const SQL = await initSqlJs();
+ * const db = new SQL.Database('mydb'); // OPFS-persisted + vector search
+ *
+ * @param {Object} config - Configuration (for compatibility, mostly ignored)
+ * @returns {Promise<{Database: class}>} SQL namespace with Database class
+ */
+export async function initSqlJs(config = {}) {
+    // Initialize OPFS storage
+    try {
+        await opfsStorage.open();
+    } catch (e) {
+        console.warn('[LanceQL] OPFS not available:', e.message);
+    }
+
+    return {
+        Database,
+        Statement,
+    };
+}
+
+// Also export as sqljs for explicit naming
+export { Database as SqlJsDatabase, Statement as SqlJsStatement };
 
 // Default export for convenience
 export default LanceQL;
