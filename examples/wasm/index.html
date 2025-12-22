@@ -1278,6 +1278,13 @@
                     </svg>
                     <span>Requests: <strong x-text="$store.app.requests">0</strong></span>
                 </div>
+                <div class="network-stat" x-show="$store.app.opfsWritten > 0" style="color: #10b981;">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="3" width="18" height="18" rx="2"/>
+                        <path d="M9 3v18M3 9h18"/>
+                    </svg>
+                    <span>OPFS: <strong x-text="$store.app.formatBytes($store.app.opfsWritten)">0 KB</strong> written</span>
+                </div>
             </div>
             <div class="progress-container" id="progress-container">
                 <div class="progress-bar">
@@ -1619,6 +1626,7 @@
             Alpine.store('app', {
                 bytesDownloaded: 0,
                 requests: 0,
+                opfsWritten: 0,  // OPFS bytes written for joins
                 file: null,
                 fileName: '',
                 fileSize: '',
@@ -3092,6 +3100,12 @@
                     aggregationStats: result.aggregationStats,
                     orderByOnSubset: result.orderByOnSubset
                 };
+
+                // Update OPFS stats if join was used
+                if (result.opfsStats) {
+                    Alpine.store('app').opfsWritten = result.opfsStats.bytesWrittenToOPFS || 0;
+                    console.log('[Demo] OPFS Join Stats:', result.opfsStats);
+                }
 
                 Alpine.store('app').showResults = true;
                 // CSS-driven: render via LanceData (events trigger Alpine updates)

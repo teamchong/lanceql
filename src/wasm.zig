@@ -4245,3 +4245,742 @@ export fn writerFinalize() usize {
 export fn writerReset() void {
     writer_offset = 0;
 }
+
+// ============================================================================
+// High-Level Fragment Writer API
+// ============================================================================
+// Manages column schema, data offsets, and metadata writing automatically.
+// JS just needs to: beginFragment -> addColumn (for each) -> endFragment
+
+const MAX_COLUMNS = 64;
+
+const ColumnType = enum(u8) {
+    int64 = 0,
+    int32 = 1,
+    float64 = 2,
+    float32 = 3,
+    string = 4,
+    bool = 5,
+    vector = 6,
+    uint8 = 7,
+};
+
+const ColumnInfo = struct {
+    name_ptr: [*]const u8,
+    name_len: usize,
+    col_type: ColumnType,
+    data_offset: usize,
+    data_size: usize,
+    row_count: usize,
+    vector_dim: u32, // Only for vector type
+    nullable: bool,
+};
+
+var fragment_columns: [MAX_COLUMNS]ColumnInfo = undefined;
+var fragment_column_count: usize = 0;
+var fragment_row_count: usize = 0;
+
+/// Begin a new fragment (resets state)
+export fn fragmentBegin(capacity: usize) u32 {
+    if (writerInit(capacity) == 0) return 0;
+    fragment_column_count = 0;
+    fragment_row_count = 0;
+    return 1;
+}
+
+/// Add a column with int64 data
+export fn fragmentAddInt64Column(
+    name_ptr: [*]const u8,
+    name_len: usize,
+    values: [*]const i64,
+    count: usize,
+    nullable: bool,
+) u32 {
+    if (fragment_column_count >= MAX_COLUMNS) return 0;
+
+    const data_offset = writer_offset;
+    if (writerWriteInt64(values, count) == 0) return 0;
+    const data_size = writer_offset - data_offset;
+
+    fragment_columns[fragment_column_count] = .{
+        .name_ptr = name_ptr,
+        .name_len = name_len,
+        .col_type = .int64,
+        .data_offset = data_offset,
+        .data_size = data_size,
+        .row_count = count,
+        .vector_dim = 0,
+        .nullable = nullable,
+    };
+    fragment_column_count += 1;
+    if (count > fragment_row_count) fragment_row_count = count;
+
+    return 1;
+}
+
+/// Add a column with int32 data
+export fn fragmentAddInt32Column(
+    name_ptr: [*]const u8,
+    name_len: usize,
+    values: [*]const i32,
+    count: usize,
+    nullable: bool,
+) u32 {
+    if (fragment_column_count >= MAX_COLUMNS) return 0;
+
+    const data_offset = writer_offset;
+    if (writerWriteInt32(values, count) == 0) return 0;
+    const data_size = writer_offset - data_offset;
+
+    fragment_columns[fragment_column_count] = .{
+        .name_ptr = name_ptr,
+        .name_len = name_len,
+        .col_type = .int32,
+        .data_offset = data_offset,
+        .data_size = data_size,
+        .row_count = count,
+        .vector_dim = 0,
+        .nullable = nullable,
+    };
+    fragment_column_count += 1;
+    if (count > fragment_row_count) fragment_row_count = count;
+
+    return 1;
+}
+
+/// Add a column with float64 data
+export fn fragmentAddFloat64Column(
+    name_ptr: [*]const u8,
+    name_len: usize,
+    values: [*]const f64,
+    count: usize,
+    nullable: bool,
+) u32 {
+    if (fragment_column_count >= MAX_COLUMNS) return 0;
+
+    const data_offset = writer_offset;
+    if (writerWriteFloat64(values, count) == 0) return 0;
+    const data_size = writer_offset - data_offset;
+
+    fragment_columns[fragment_column_count] = .{
+        .name_ptr = name_ptr,
+        .name_len = name_len,
+        .col_type = .float64,
+        .data_offset = data_offset,
+        .data_size = data_size,
+        .row_count = count,
+        .vector_dim = 0,
+        .nullable = nullable,
+    };
+    fragment_column_count += 1;
+    if (count > fragment_row_count) fragment_row_count = count;
+
+    return 1;
+}
+
+/// Add a column with float32 data
+export fn fragmentAddFloat32Column(
+    name_ptr: [*]const u8,
+    name_len: usize,
+    values: [*]const f32,
+    count: usize,
+    nullable: bool,
+) u32 {
+    if (fragment_column_count >= MAX_COLUMNS) return 0;
+
+    const data_offset = writer_offset;
+    if (writerWriteFloat32(values, count) == 0) return 0;
+    const data_size = writer_offset - data_offset;
+
+    fragment_columns[fragment_column_count] = .{
+        .name_ptr = name_ptr,
+        .name_len = name_len,
+        .col_type = .float32,
+        .data_offset = data_offset,
+        .data_size = data_size,
+        .row_count = count,
+        .vector_dim = 0,
+        .nullable = nullable,
+    };
+    fragment_column_count += 1;
+    if (count > fragment_row_count) fragment_row_count = count;
+
+    return 1;
+}
+
+/// Add a column with string data (data followed by offsets)
+/// string_data: concatenated UTF-8 bytes
+/// offsets: uint32 array of length count+1 (start positions + final end)
+export fn fragmentAddStringColumn(
+    name_ptr: [*]const u8,
+    name_len: usize,
+    string_data: [*]const u8,
+    string_data_len: usize,
+    offsets: [*]const u32,
+    count: usize,
+    nullable: bool,
+) u32 {
+    if (fragment_column_count >= MAX_COLUMNS) return 0;
+
+    const data_offset = writer_offset;
+
+    // Write string data
+    if (writerWriteBytes(string_data, string_data_len) == 0) return 0;
+
+    // Write offsets (count + 1 values)
+    const buf = writer_buffer orelse return 0;
+    const offsets_bytes = (count + 1) * 4;
+    if (writer_offset + offsets_bytes > writer_buffer_len) return 0;
+
+    var i: usize = 0;
+    while (i <= count) : (i += 1) {
+        std.mem.writeInt(u32, buf[writer_offset..][0..4], offsets[i], .little);
+        writer_offset += 4;
+    }
+
+    const data_size = writer_offset - data_offset;
+
+    fragment_columns[fragment_column_count] = .{
+        .name_ptr = name_ptr,
+        .name_len = name_len,
+        .col_type = .string,
+        .data_offset = data_offset,
+        .data_size = data_size,
+        .row_count = count,
+        .vector_dim = 0,
+        .nullable = nullable,
+    };
+    fragment_column_count += 1;
+    if (count > fragment_row_count) fragment_row_count = count;
+
+    return 1;
+}
+
+/// Add a column with boolean data (bit-packed)
+export fn fragmentAddBoolColumn(
+    name_ptr: [*]const u8,
+    name_len: usize,
+    packed_bits: [*]const u8,
+    byte_count: usize,
+    row_count: usize,
+    nullable: bool,
+) u32 {
+    if (fragment_column_count >= MAX_COLUMNS) return 0;
+
+    const data_offset = writer_offset;
+    if (writerWriteBytes(packed_bits, byte_count) == 0) return 0;
+    const data_size = writer_offset - data_offset;
+
+    fragment_columns[fragment_column_count] = .{
+        .name_ptr = name_ptr,
+        .name_len = name_len,
+        .col_type = .bool,
+        .data_offset = data_offset,
+        .data_size = data_size,
+        .row_count = row_count,
+        .vector_dim = 0,
+        .nullable = nullable,
+    };
+    fragment_column_count += 1;
+    if (row_count > fragment_row_count) fragment_row_count = row_count;
+
+    return 1;
+}
+
+/// Add a column with vector data (float32 arrays, flattened)
+export fn fragmentAddVectorColumn(
+    name_ptr: [*]const u8,
+    name_len: usize,
+    values: [*]const f32,
+    total_floats: usize,
+    vector_dim: u32,
+    nullable: bool,
+) u32 {
+    if (fragment_column_count >= MAX_COLUMNS) return 0;
+    if (vector_dim == 0) return 0;
+
+    const data_offset = writer_offset;
+    if (writerWriteFloat32(values, total_floats) == 0) return 0;
+    const data_size = writer_offset - data_offset;
+
+    const row_count = total_floats / vector_dim;
+
+    fragment_columns[fragment_column_count] = .{
+        .name_ptr = name_ptr,
+        .name_len = name_len,
+        .col_type = .vector,
+        .data_offset = data_offset,
+        .data_size = data_size,
+        .row_count = row_count,
+        .vector_dim = vector_dim,
+        .nullable = nullable,
+    };
+    fragment_column_count += 1;
+    if (row_count > fragment_row_count) fragment_row_count = row_count;
+
+    return 1;
+}
+
+/// Helper to write column metadata in protobuf format
+fn writeColumnMetadata(col: *const ColumnInfo) void {
+    const buf = writer_buffer orelse return;
+
+    // Field 1: name (string) - tag = (1 << 3) | 2 = 10
+    buf[writer_offset] = 10;
+    writer_offset += 1;
+    writeVarintInternal(col.name_len);
+    @memcpy(buf[writer_offset..][0..col.name_len], col.name_ptr[0..col.name_len]);
+    writer_offset += col.name_len;
+
+    // Field 2: type (string) - tag = (2 << 3) | 2 = 18
+    const type_str = switch (col.col_type) {
+        .int64 => "int64",
+        .int32 => "int32",
+        .float64 => "float64",
+        .float32 => "float32",
+        .string => "string",
+        .bool => "bool",
+        .vector => "vector",
+        .uint8 => "uint8",
+    };
+    buf[writer_offset] = 18;
+    writer_offset += 1;
+    writeVarintInternal(type_str.len);
+    @memcpy(buf[writer_offset..][0..type_str.len], type_str);
+    writer_offset += type_str.len;
+
+    // Field 3: nullable (varint) - tag = (3 << 3) | 0 = 24
+    buf[writer_offset] = 24;
+    writer_offset += 1;
+    buf[writer_offset] = if (col.nullable) 1 else 0;
+    writer_offset += 1;
+
+    // Field 4: data_offset (fixed64) - tag = (4 << 3) | 1 = 33
+    buf[writer_offset] = 33;
+    writer_offset += 1;
+    std.mem.writeInt(u64, buf[writer_offset..][0..8], col.data_offset, .little);
+    writer_offset += 8;
+
+    // Field 5: row_count (varint) - tag = (5 << 3) | 0 = 40
+    buf[writer_offset] = 40;
+    writer_offset += 1;
+    writeVarintInternal(col.row_count);
+
+    // Field 6: data_size (varint) - tag = (6 << 3) | 0 = 48
+    buf[writer_offset] = 48;
+    writer_offset += 1;
+    writeVarintInternal(col.data_size);
+
+    // Field 7: vector_dim (varint) - tag = (7 << 3) | 0 = 56, only if vector
+    if (col.col_type == .vector and col.vector_dim > 0) {
+        buf[writer_offset] = 56;
+        writer_offset += 1;
+        writeVarintInternal(col.vector_dim);
+    }
+}
+
+fn writeVarintInternal(value: usize) void {
+    const buf = writer_buffer orelse return;
+    var v = value;
+
+    while (v >= 0x80) {
+        buf[writer_offset] = @as(u8, @truncate(v)) | 0x80;
+        writer_offset += 1;
+        v >>= 7;
+    }
+    buf[writer_offset] = @truncate(v);
+    writer_offset += 1;
+}
+
+/// Finish the fragment - writes metadata, offsets table, and footer
+/// Returns final file size, or 0 on error
+export fn fragmentEnd() usize {
+    if (fragment_column_count == 0) return 0;
+    const buf = writer_buffer orelse return 0;
+
+    // Record where column metadata starts
+    const col_meta_start = writer_offset;
+
+    // Track each column's metadata offset
+    var meta_offsets: [MAX_COLUMNS]usize = undefined;
+
+    // Write column metadata
+    for (0..fragment_column_count) |i| {
+        meta_offsets[i] = writer_offset;
+        writeColumnMetadata(&fragment_columns[i]);
+    }
+
+    // Record where offsets table starts
+    const col_meta_offsets_start = writer_offset;
+
+    // Write metadata offsets table (uint64 per column)
+    for (0..fragment_column_count) |i| {
+        std.mem.writeInt(u64, buf[writer_offset..][0..8], meta_offsets[i], .little);
+        writer_offset += 8;
+    }
+
+    // Global buffer offsets (none for now)
+    const global_buff_offsets_start = writer_offset;
+
+    // Write footer (40 bytes)
+    std.mem.writeInt(u64, buf[writer_offset..][0..8], col_meta_start, .little);
+    writer_offset += 8;
+    std.mem.writeInt(u64, buf[writer_offset..][0..8], col_meta_offsets_start, .little);
+    writer_offset += 8;
+    std.mem.writeInt(u64, buf[writer_offset..][0..8], global_buff_offsets_start, .little);
+    writer_offset += 8;
+    std.mem.writeInt(u32, buf[writer_offset..][0..4], 0, .little); // num_global_buffers
+    writer_offset += 4;
+    std.mem.writeInt(u32, buf[writer_offset..][0..4], @intCast(fragment_column_count), .little);
+    writer_offset += 4;
+    std.mem.writeInt(u16, buf[writer_offset..][0..2], 0, .little); // major version (Lance 2.0)
+    writer_offset += 2;
+    std.mem.writeInt(u16, buf[writer_offset..][0..2], 3, .little); // minor version
+    writer_offset += 2;
+    @memcpy(buf[writer_offset..][0..4], "LANC");
+    writer_offset += 4;
+
+    return writer_offset;
+}
+
+// ============================================================================
+// High-Level Fragment Reader API
+// ============================================================================
+// Parse a Lance fragment file and provide access to columns
+
+var reader_data: ?[*]const u8 = null;
+var reader_len: usize = 0;
+var reader_num_columns: u32 = 0;
+var reader_column_meta_start: u64 = 0;
+var reader_column_meta_offsets_start: u64 = 0;
+
+const ReaderColumnInfo = struct {
+    name: [64]u8,
+    name_len: usize,
+    col_type: [16]u8,
+    type_len: usize,
+    nullable: bool,
+    data_offset: u64,
+    row_count: u64,
+    data_size: u64,
+    vector_dim: u32,
+};
+
+var reader_columns: [MAX_COLUMNS]ReaderColumnInfo = undefined;
+
+/// Load a fragment for reading
+export fn fragmentLoad(data: [*]const u8, len: usize) u32 {
+    if (len < 40) return 0;
+
+    reader_data = data;
+    reader_len = len;
+
+    // Parse footer (last 40 bytes)
+    const footer_start = len - 40;
+
+    // Check magic
+    if (data[footer_start + 36] != 'L' or
+        data[footer_start + 37] != 'A' or
+        data[footer_start + 38] != 'N' or
+        data[footer_start + 39] != 'C')
+    {
+        return 0;
+    }
+
+    reader_column_meta_start = std.mem.readInt(u64, data[footer_start..][0..8], .little);
+    reader_column_meta_offsets_start = std.mem.readInt(u64, data[footer_start + 8 ..][0..8], .little);
+    reader_num_columns = std.mem.readInt(u32, data[footer_start + 28 ..][0..4], .little);
+
+    if (reader_num_columns > MAX_COLUMNS) return 0;
+
+    // Parse column metadata
+    for (0..reader_num_columns) |i| {
+        const offset_pos: usize = @intCast(reader_column_meta_offsets_start + i * 8);
+        const meta_offset = std.mem.readInt(u64, data[offset_pos..][0..8], .little);
+
+        const next_offset = if (i + 1 < reader_num_columns)
+            std.mem.readInt(u64, data[offset_pos + 8 ..][0..8], .little)
+        else
+            reader_column_meta_offsets_start;
+
+        parseColumnMeta(data, meta_offset, next_offset, &reader_columns[i]);
+    }
+
+    return 1;
+}
+
+fn parseColumnMeta(data: [*]const u8, start: u64, end: u64, info: *ReaderColumnInfo) void {
+    info.* = .{
+        .name = undefined,
+        .name_len = 0,
+        .col_type = undefined,
+        .type_len = 0,
+        .nullable = true,
+        .data_offset = 0,
+        .row_count = 0,
+        .data_size = 0,
+        .vector_dim = 0,
+    };
+
+    var pos: usize = @intCast(start);
+    const end_pos: usize = @intCast(end);
+    while (pos < end_pos) {
+        const tag = data[pos];
+        pos += 1;
+
+        const field_num = tag >> 3;
+        const wire_type = tag & 0x7;
+
+        switch (field_num) {
+            1 => { // name (string)
+                if (wire_type == 2) {
+                    const len = readVarintAtUsize(data, &pos);
+                    const copy_len = @min(len, 64);
+                    @memcpy(info.name[0..copy_len], data[pos..][0..copy_len]);
+                    info.name_len = copy_len;
+                    pos += len;
+                }
+            },
+            2 => { // type (string)
+                if (wire_type == 2) {
+                    const len = readVarintAtUsize(data, &pos);
+                    const copy_len = @min(len, 16);
+                    @memcpy(info.col_type[0..copy_len], data[pos..][0..copy_len]);
+                    info.type_len = copy_len;
+                    pos += len;
+                }
+            },
+            3 => { // nullable (varint)
+                if (wire_type == 0) {
+                    info.nullable = readVarintAtUsize(data, &pos) != 0;
+                }
+            },
+            4 => { // data_offset (fixed64)
+                if (wire_type == 1) {
+                    info.data_offset = std.mem.readInt(u64, data[pos..][0..8], .little);
+                    pos += 8;
+                }
+            },
+            5 => { // row_count (varint)
+                if (wire_type == 0) {
+                    info.row_count = readVarintAtUsize(data, &pos);
+                }
+            },
+            6 => { // data_size (varint)
+                if (wire_type == 0) {
+                    info.data_size = readVarintAtUsize(data, &pos);
+                }
+            },
+            7 => { // vector_dim (varint)
+                if (wire_type == 0) {
+                    info.vector_dim = @intCast(readVarintAtUsize(data, &pos));
+                }
+            },
+            else => {
+                // Skip unknown field
+                if (wire_type == 0) {
+                    _ = readVarintAtUsize(data, &pos);
+                } else if (wire_type == 1) {
+                    pos += 8;
+                } else if (wire_type == 2) {
+                    const len = readVarintAtUsize(data, &pos);
+                    pos += len;
+                } else if (wire_type == 5) {
+                    pos += 4;
+                }
+            },
+        }
+    }
+}
+
+fn readVarintAtUsize(data: [*]const u8, pos: *usize) usize {
+    var value: usize = 0;
+    var shift: u5 = 0;
+
+    while (true) {
+        const byte = data[pos.*];
+        pos.* += 1;
+        value |= @as(usize, byte & 0x7F) << shift;
+        if ((byte & 0x80) == 0) break;
+        shift += 7;
+    }
+
+    return value;
+}
+
+/// Get number of columns in loaded fragment
+export fn fragmentGetColumnCount() u32 {
+    return reader_num_columns;
+}
+
+/// Get row count from loaded fragment
+export fn fragmentGetRowCount() u64 {
+    if (reader_num_columns == 0) return 0;
+    return reader_columns[0].row_count;
+}
+
+/// Get column name (returns length, writes to out_ptr)
+export fn fragmentGetColumnName(col_idx: u32, out_ptr: [*]u8, max_len: usize) usize {
+    if (col_idx >= reader_num_columns) return 0;
+    const info = &reader_columns[col_idx];
+    const copy_len = @min(info.name_len, max_len);
+    @memcpy(out_ptr[0..copy_len], info.name[0..copy_len]);
+    return copy_len;
+}
+
+/// Get column type (returns length, writes to out_ptr)
+export fn fragmentGetColumnType(col_idx: u32, out_ptr: [*]u8, max_len: usize) usize {
+    if (col_idx >= reader_num_columns) return 0;
+    const info = &reader_columns[col_idx];
+    const copy_len = @min(info.type_len, max_len);
+    @memcpy(out_ptr[0..copy_len], info.col_type[0..copy_len]);
+    return copy_len;
+}
+
+/// Get column vector dimension (0 if not a vector)
+export fn fragmentGetColumnVectorDim(col_idx: u32) u32 {
+    if (col_idx >= reader_num_columns) return 0;
+    return reader_columns[col_idx].vector_dim;
+}
+
+/// Read int64 column data
+export fn fragmentReadInt64(col_idx: u32, out_ptr: [*]i64, max_count: usize) usize {
+    if (col_idx >= reader_num_columns) return 0;
+    const data = reader_data orelse return 0;
+    const info = &reader_columns[col_idx];
+
+    const count: usize = @intCast(@min(info.row_count, max_count));
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const offset: usize = @intCast(info.data_offset + i * 8);
+        out_ptr[i] = std.mem.readInt(i64, data[offset..][0..8], .little);
+    }
+    return count;
+}
+
+/// Read int32 column data
+export fn fragmentReadInt32(col_idx: u32, out_ptr: [*]i32, max_count: usize) usize {
+    if (col_idx >= reader_num_columns) return 0;
+    const data = reader_data orelse return 0;
+    const info = &reader_columns[col_idx];
+
+    const count: usize = @intCast(@min(info.row_count, max_count));
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const offset: usize = @intCast(info.data_offset + i * 4);
+        out_ptr[i] = std.mem.readInt(i32, data[offset..][0..4], .little);
+    }
+    return count;
+}
+
+/// Read float64 column data
+export fn fragmentReadFloat64(col_idx: u32, out_ptr: [*]f64, max_count: usize) usize {
+    if (col_idx >= reader_num_columns) return 0;
+    const data = reader_data orelse return 0;
+    const info = &reader_columns[col_idx];
+
+    const count: usize = @intCast(@min(info.row_count, max_count));
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const offset: usize = @intCast(info.data_offset + i * 8);
+        const bits = std.mem.readInt(u64, data[offset..][0..8], .little);
+        out_ptr[i] = @bitCast(bits);
+    }
+    return count;
+}
+
+/// Read float32 column data
+export fn fragmentReadFloat32(col_idx: u32, out_ptr: [*]f32, max_count: usize) usize {
+    if (col_idx >= reader_num_columns) return 0;
+    const data = reader_data orelse return 0;
+    const info = &reader_columns[col_idx];
+
+    const count: usize = @intCast(@min(info.row_count, max_count));
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const offset: usize = @intCast(info.data_offset + i * 4);
+        const bits = std.mem.readInt(u32, data[offset..][0..4], .little);
+        out_ptr[i] = @bitCast(bits);
+    }
+    return count;
+}
+
+/// Read bool column data (unpacked from bits)
+export fn fragmentReadBool(col_idx: u32, out_ptr: [*]u8, max_count: usize) usize {
+    if (col_idx >= reader_num_columns) return 0;
+    const data = reader_data orelse return 0;
+    const info = &reader_columns[col_idx];
+
+    const count: usize = @intCast(@min(info.row_count, max_count));
+    const base_offset: usize = @intCast(info.data_offset);
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const byte_idx = i / 8;
+        const bit_idx: u3 = @intCast(i % 8);
+        const byte = data[base_offset + byte_idx];
+        out_ptr[i] = if ((byte & (@as(u8, 1) << bit_idx)) != 0) 1 else 0;
+    }
+    return count;
+}
+
+/// Get string at index - returns length, writes to out_ptr
+export fn fragmentReadStringAt(col_idx: u32, row_idx: u32, out_ptr: [*]u8, max_len: usize) usize {
+    if (col_idx >= reader_num_columns) return 0;
+    const data = reader_data orelse return 0;
+    const info = &reader_columns[col_idx];
+
+    if (row_idx >= info.row_count) return 0;
+
+    // String layout: [string_data][offsets]
+    // offsets are at the end: (row_count + 1) * 4 bytes
+    const offsets_size: usize = @intCast((info.row_count + 1) * 4);
+    const offsets_start: usize = @intCast(info.data_offset + info.data_size - offsets_size);
+    const data_start: usize = @intCast(info.data_offset);
+
+    const start_offset = std.mem.readInt(u32, data[offsets_start + row_idx * 4 ..][0..4], .little);
+    const end_offset = std.mem.readInt(u32, data[offsets_start + (row_idx + 1) * 4 ..][0..4], .little);
+
+    const str_len = end_offset - start_offset;
+    const copy_len = @min(str_len, max_len);
+
+    @memcpy(out_ptr[0..copy_len], data[data_start + start_offset ..][0..copy_len]);
+    return copy_len;
+}
+
+/// Get string length at index (useful for allocation)
+export fn fragmentGetStringLength(col_idx: u32, row_idx: u32) usize {
+    if (col_idx >= reader_num_columns) return 0;
+    const data = reader_data orelse return 0;
+    const info = &reader_columns[col_idx];
+
+    if (row_idx >= info.row_count) return 0;
+
+    const offsets_size: usize = @intCast((info.row_count + 1) * 4);
+    const offsets_start: usize = @intCast(info.data_offset + info.data_size - offsets_size);
+
+    const start_offset = std.mem.readInt(u32, data[offsets_start + row_idx * 4 ..][0..4], .little);
+    const end_offset = std.mem.readInt(u32, data[offsets_start + (row_idx + 1) * 4 ..][0..4], .little);
+
+    return end_offset - start_offset;
+}
+
+/// Read vector at index - returns number of floats written
+export fn fragmentReadVectorAt(col_idx: u32, row_idx: u32, out_ptr: [*]f32, max_floats: usize) usize {
+    if (col_idx >= reader_num_columns) return 0;
+    const data = reader_data orelse return 0;
+    const info = &reader_columns[col_idx];
+
+    if (row_idx >= info.row_count) return 0;
+    if (info.vector_dim == 0) return 0;
+
+    const dim = info.vector_dim;
+    const copy_count: usize = @min(dim, max_floats);
+    const base_offset: usize = @intCast(info.data_offset + row_idx * dim * 4);
+
+    var i: usize = 0;
+    while (i < copy_count) : (i += 1) {
+        const bits = std.mem.readInt(u32, data[base_offset + i * 4 ..][0..4], .little);
+        out_ptr[i] = @bitCast(bits);
+    }
+    return copy_count;
+}

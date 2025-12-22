@@ -537,6 +537,303 @@ const datasetStorage = new DatasetStorage();  // Legacy IndexedDB + OPFS
 export { opfsStorage, OPFSStorage, datasetStorage, DatasetStorage };
 
 // =============================================================================
+// OPFSJoinExecutor - OPFS-backed join execution for TB-scale joins
+// =============================================================================
+
+/**
+ * OPFSJoinExecutor enables TB-scale JOINs in the browser by spilling to OPFS.
+ *
+ * Architecture:
+ * 1. Stream left table chunks → write to OPFS partitioned by hash(join_key)
+ * 2. Stream right table chunks → probe OPFS partitions → write matches to OPFS
+ * 3. Stream final results from OPFS
+ *
+ * This avoids loading entire tables into RAM. Only one chunk + one hash partition
+ * need to fit in memory at a time.
+ *
+ * Storage layout:
+ *   _join_temp/
+ *     {sessionId}/
+ *       left/
+ *         partition_000.jsonl   # Rows where hash(key) % numPartitions == 0
+ *         partition_001.jsonl
+ *         ...
+ *       right/
+ *         partition_000.jsonl
+ *         ...
+ *       results/
+ *         chunk_000.jsonl
+ *         chunk_001.jsonl
+ *         ...
+ */
+export class OPFSJoinExecutor {
+    constructor(storage = opfsStorage) {
+        this.storage = storage;
+        this.sessionId = `join_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        this.basePath = `_join_temp/${this.sessionId}`;
+        this.numPartitions = 64;  // Number of hash partitions
+        this.chunkSize = 1000;    // Rows per chunk when streaming
+        this.stats = {
+            leftRowsWritten: 0,
+            rightRowsWritten: 0,
+            resultRowsWritten: 0,
+            bytesWrittenToOPFS: 0,
+            bytesReadFromOPFS: 0,
+            partitionsUsed: new Set(),
+        };
+    }
+
+    /**
+     * Execute a hash join using OPFS for intermediate storage
+     * @param {AsyncGenerator} leftStream - Async generator yielding {columns, rows} chunks
+     * @param {AsyncGenerator} rightStream - Async generator yielding {columns, rows} chunks
+     * @param {string} leftKey - Join key column name for left table
+     * @param {string} rightKey - Join key column name for right table
+     * @param {Object} options - Join options
+     * @returns {AsyncGenerator} Yields result chunks
+     */
+    async *executeHashJoin(leftStream, rightStream, leftKey, rightKey, options = {}) {
+        const { limit = Infinity, projection = null } = options;
+
+        console.log(`[OPFSJoin] Starting OPFS-backed hash join`);
+        console.log(`[OPFSJoin] Session: ${this.sessionId}`);
+        console.log(`[OPFSJoin] Partitions: ${this.numPartitions}`);
+
+        try {
+            // Phase 1: Partition left table to OPFS
+            console.log(`[OPFSJoin] Phase 1: Partitioning left table...`);
+            const leftMeta = await this._partitionToOPFS(leftStream, leftKey, 'left');
+            console.log(`[OPFSJoin] Left table: ${leftMeta.totalRows} rows in ${leftMeta.partitionsUsed.size} partitions`);
+
+            // Phase 2: Partition right table to OPFS
+            console.log(`[OPFSJoin] Phase 2: Partitioning right table...`);
+            const rightMeta = await this._partitionToOPFS(rightStream, rightKey, 'right');
+            console.log(`[OPFSJoin] Right table: ${rightMeta.totalRows} rows in ${rightMeta.partitionsUsed.size} partitions`);
+
+            // Phase 3: Join partition by partition
+            console.log(`[OPFSJoin] Phase 3: Joining partitions...`);
+            let totalYielded = 0;
+
+            // Only process partitions that have data on both sides
+            const activePartitions = new Set(
+                [...leftMeta.partitionsUsed].filter(p => rightMeta.partitionsUsed.has(p))
+            );
+            console.log(`[OPFSJoin] Active partitions (both sides): ${activePartitions.size}`);
+
+            for (const partitionId of activePartitions) {
+                if (totalYielded >= limit) break;
+
+                // Load left partition into memory (fits because we partitioned)
+                const leftPartition = await this._loadPartition('left', partitionId, leftMeta.columns);
+                if (leftPartition.length === 0) continue;
+
+                // Build in-memory hash map for this partition only
+                const hashMap = new Map();
+                const leftKeyIndex = leftMeta.columns.indexOf(leftKey);
+                for (const row of leftPartition) {
+                    const key = row[leftKeyIndex];
+                    if (key !== null && key !== undefined) {
+                        if (!hashMap.has(key)) hashMap.set(key, []);
+                        hashMap.get(key).push(row);
+                    }
+                }
+
+                // Stream right partition and probe hash map
+                const rightKeyIndex = rightMeta.columns.indexOf(rightKey);
+                const rightPartition = await this._loadPartition('right', partitionId, rightMeta.columns);
+
+                const chunk = [];
+                for (const rightRow of rightPartition) {
+                    if (totalYielded >= limit) break;
+
+                    const key = rightRow[rightKeyIndex];
+                    const leftRows = hashMap.get(key);
+
+                    if (leftRows) {
+                        for (const leftRow of leftRows) {
+                            if (totalYielded >= limit) break;
+
+                            const mergedRow = [...leftRow, ...rightRow];
+                            chunk.push(mergedRow);
+                            totalYielded++;
+
+                            // Yield in chunks to avoid memory buildup
+                            if (chunk.length >= this.chunkSize) {
+                                yield {
+                                    columns: [...leftMeta.columns, ...rightMeta.columns],
+                                    rows: chunk.splice(0),
+                                };
+                            }
+                        }
+                    }
+                }
+
+                // Yield remaining rows in chunk
+                if (chunk.length > 0) {
+                    yield {
+                        columns: [...leftMeta.columns, ...rightMeta.columns],
+                        rows: chunk,
+                    };
+                }
+            }
+
+            console.log(`[OPFSJoin] Join complete: ${totalYielded} result rows`);
+            console.log(`[OPFSJoin] Stats:`, this.getStats());
+
+        } finally {
+            // Cleanup temp files
+            await this.cleanup();
+        }
+    }
+
+    /**
+     * Partition a stream of data to OPFS files by hash(key)
+     */
+    async _partitionToOPFS(stream, keyColumn, side) {
+        const partitionBuffers = new Map();  // partitionId -> rows[]
+        const flushThreshold = 500;  // Flush to OPFS when buffer reaches this size
+        let columns = null;
+        let keyIndex = -1;
+        let totalRows = 0;
+        const partitionsUsed = new Set();
+
+        for await (const chunk of stream) {
+            if (!columns) {
+                columns = chunk.columns;
+                keyIndex = columns.indexOf(keyColumn);
+                if (keyIndex === -1) {
+                    throw new Error(`Join key column '${keyColumn}' not found in columns: ${columns.join(', ')}`);
+                }
+            }
+
+            for (const row of chunk.rows) {
+                const key = row[keyIndex];
+                const partitionId = this._hashToPartition(key);
+                partitionsUsed.add(partitionId);
+
+                if (!partitionBuffers.has(partitionId)) {
+                    partitionBuffers.set(partitionId, []);
+                }
+                partitionBuffers.get(partitionId).push(row);
+                totalRows++;
+
+                // Flush partition buffer if too large
+                if (partitionBuffers.get(partitionId).length >= flushThreshold) {
+                    await this._appendToPartition(side, partitionId, partitionBuffers.get(partitionId));
+                    partitionBuffers.set(partitionId, []);
+                }
+            }
+        }
+
+        // Flush remaining buffers
+        for (const [partitionId, rows] of partitionBuffers) {
+            if (rows.length > 0) {
+                await this._appendToPartition(side, partitionId, rows);
+            }
+        }
+
+        if (side === 'left') {
+            this.stats.leftRowsWritten = totalRows;
+        } else {
+            this.stats.rightRowsWritten = totalRows;
+        }
+
+        return { columns, totalRows, partitionsUsed };
+    }
+
+    /**
+     * Hash a value to a partition number
+     */
+    _hashToPartition(value) {
+        if (value === null || value === undefined) {
+            return 0;  // Null keys go to partition 0
+        }
+
+        // Simple string hash
+        const str = String(value);
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+            const char = str.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash;  // Convert to 32-bit integer
+        }
+        return Math.abs(hash) % this.numPartitions;
+    }
+
+    /**
+     * Append rows to a partition file in OPFS
+     */
+    async _appendToPartition(side, partitionId, rows) {
+        const path = `${this.basePath}/${side}/partition_${String(partitionId).padStart(3, '0')}.jsonl`;
+
+        // Serialize rows as JSONL (one JSON array per line)
+        const jsonl = rows.map(row => JSON.stringify(row)).join('\n') + '\n';
+        const data = new TextEncoder().encode(jsonl);
+
+        // Load existing data if any
+        const existing = await this.storage.load(path);
+
+        if (existing) {
+            // Append to existing
+            const combined = new Uint8Array(existing.length + data.length);
+            combined.set(existing);
+            combined.set(data, existing.length);
+            await this.storage.save(path, combined);
+            this.stats.bytesWrittenToOPFS += data.length;
+        } else {
+            await this.storage.save(path, data);
+            this.stats.bytesWrittenToOPFS += data.length;
+        }
+
+        this.stats.partitionsUsed.add(partitionId);
+    }
+
+    /**
+     * Load a partition from OPFS
+     */
+    async _loadPartition(side, partitionId, columns) {
+        const path = `${this.basePath}/${side}/partition_${String(partitionId).padStart(3, '0')}.jsonl`;
+
+        const data = await this.storage.load(path);
+        if (!data) return [];
+
+        this.stats.bytesReadFromOPFS += data.length;
+
+        const text = new TextDecoder().decode(data);
+        const lines = text.trim().split('\n').filter(line => line);
+
+        return lines.map(line => JSON.parse(line));
+    }
+
+    /**
+     * Get execution statistics
+     */
+    getStats() {
+        return {
+            ...this.stats,
+            partitionsUsed: this.stats.partitionsUsed.size,
+            bytesWrittenMB: (this.stats.bytesWrittenToOPFS / 1024 / 1024).toFixed(2),
+            bytesReadMB: (this.stats.bytesReadFromOPFS / 1024 / 1024).toFixed(2),
+        };
+    }
+
+    /**
+     * Cleanup temp files
+     */
+    async cleanup() {
+        try {
+            await this.storage.deleteDir(this.basePath);
+            console.log(`[OPFSJoin] Cleaned up temp files: ${this.basePath}`);
+        } catch (e) {
+            console.warn(`[OPFSJoin] Cleanup failed:`, e);
+        }
+    }
+}
+
+// Export for external use
+export { OPFSJoinExecutor };
+
+// =============================================================================
 // LocalDatabase - ACID-compliant local database with CRUD support
 // =============================================================================
 
@@ -671,16 +968,26 @@ export class LocalDatabase {
 
         const table = this.tables.get(tableName);
 
+        // Add __rowId to schema if not present
+        const schemaWithRowId = [
+            { name: '__rowId', type: 'int64', primaryKey: true },
+            ...table.schema.filter(c => c.name !== '__rowId')
+        ];
+
         // Assign row IDs
         const rowsWithIds = rows.map(row => ({
             __rowId: table.nextRowId++,
             ...row,
         }));
 
-        // Create new fragment
-        const fragKey = `${this.name}/${tableName}/frag_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-        const fragData = new TextEncoder().encode(JSON.stringify(rowsWithIds));
-        await this.storage.save(fragKey, fragData);
+        // Create Lance file using WASM writer
+        const writer = new LanceFileWriter(schemaWithRowId);
+        writer.addRows(rowsWithIds);
+        const lanceData = writer.build();
+
+        // Save as .lance fragment
+        const fragKey = `${this.name}/${tableName}/frag_${Date.now()}_${Math.random().toString(36).slice(2)}.lance`;
+        await this.storage.save(fragKey, lanceData);
 
         // Update table state
         table.fragments.push(fragKey);
@@ -826,7 +1133,7 @@ export class LocalDatabase {
         for (const fragKey of table.fragments) {
             const fragData = await this.storage.load(fragKey);
             if (fragData) {
-                const rows = JSON.parse(new TextDecoder().decode(fragData));
+                const rows = this._parseFragment(fragData, table.schema);
                 for (const row of rows) {
                     if (!deletedSet.has(row.__rowId)) {
                         allRows.push(row);
@@ -836,6 +1143,350 @@ export class LocalDatabase {
         }
 
         return allRows;
+    }
+
+    /**
+     * Parse a fragment (Lance or JSON format)
+     */
+    _parseFragment(data, schema) {
+        // Check for Lance magic at end of file
+        if (data.length >= 40) {
+            const magic = new TextDecoder().decode(data.slice(-4));
+            if (magic === 'LANC') {
+                return this._parseLanceFragment(data, schema);
+            }
+        }
+
+        // Try JSON format
+        try {
+            const text = new TextDecoder().decode(data);
+            const parsed = JSON.parse(text);
+
+            // Check for LanceFileWriter JSON fallback format
+            if (parsed.format === 'json' && parsed.columns) {
+                return this._parseJsonColumnar(parsed);
+            }
+
+            // Legacy row-based JSON format
+            return Array.isArray(parsed) ? parsed : [parsed];
+        } catch (e) {
+            console.warn('[LocalDatabase] Failed to parse fragment:', e);
+            return [];
+        }
+    }
+
+    /**
+     * Parse JSON columnar format (LanceFileWriter fallback)
+     */
+    _parseJsonColumnar(data) {
+        const { schema, columns, rowCount } = data;
+        const rows = [];
+
+        for (let i = 0; i < rowCount; i++) {
+            const row = {};
+            for (const col of schema) {
+                row[col.name] = columns[col.name]?.[i] ?? null;
+            }
+            rows.push(row);
+        }
+
+        return rows;
+    }
+
+    /**
+     * Parse Lance file format using WASM reader API
+     * All parsing/decoding logic is in WASM, JS only marshals data.
+     */
+    _parseLanceFragment(data, tableSchema) {
+        if (!_w?.fragmentLoad) {
+            // Fallback to JS parsing if WASM not loaded
+            return this._parseLanceFragmentJS(data, tableSchema);
+        }
+
+        // Copy data to WASM memory
+        const ptr = _w.alloc(data.length);
+        new Uint8Array(_m.buffer, ptr, data.length).set(data);
+
+        // Load fragment in WASM
+        if (!_w.fragmentLoad(ptr, data.length)) {
+            _w.free(ptr, data.length);
+            throw new Error('Failed to load Lance fragment');
+        }
+
+        const numColumns = _w.fragmentGetColumnCount();
+        const rowCount = Number(_w.fragmentGetRowCount());
+
+        if (rowCount === 0) {
+            _w.free(ptr, data.length);
+            return [];
+        }
+
+        // Read column info and data
+        const columns = {};
+        const nameBuf = _w.alloc(64);
+        const typeBuf = _w.alloc(16);
+
+        for (let i = 0; i < numColumns; i++) {
+            // Get column name
+            const nameLen = _w.fragmentGetColumnName(i, nameBuf, 64);
+            const name = D.decode(new Uint8Array(_m.buffer, nameBuf, nameLen));
+
+            // Get column type
+            const typeLen = _w.fragmentGetColumnType(i, typeBuf, 16);
+            const type = D.decode(new Uint8Array(_m.buffer, typeBuf, typeLen));
+
+            // Read column data based on type
+            columns[name] = this._readColumnFromWasm(i, type, rowCount);
+        }
+
+        _w.free(nameBuf, 64);
+        _w.free(typeBuf, 16);
+        _w.free(ptr, data.length);
+
+        // Build rows
+        const rows = [];
+        const colNames = Object.keys(columns);
+        for (let i = 0; i < rowCount; i++) {
+            const row = {};
+            for (const name of colNames) {
+                row[name] = columns[name][i];
+            }
+            rows.push(row);
+        }
+
+        return rows;
+    }
+
+    /**
+     * Read column data from WASM using fragment reader API
+     */
+    _readColumnFromWasm(colIdx, type, rowCount) {
+        const typeLower = type.toLowerCase();
+
+        switch (typeLower) {
+            case 'int64':
+            case 'int':
+            case 'integer':
+            case 'bigint': {
+                const buf = _w.alloc(rowCount * 8);
+                const count = _w.fragmentReadInt64(colIdx, buf, rowCount);
+                const arr = new BigInt64Array(_m.buffer, buf, count);
+                const values = Array.from(arr, v => Number(v));
+                _w.free(buf, rowCount * 8);
+                return values;
+            }
+
+            case 'int32': {
+                const buf = _w.alloc(rowCount * 4);
+                const count = _w.fragmentReadInt32(colIdx, buf, rowCount);
+                const values = Array.from(new Int32Array(_m.buffer, buf, count));
+                _w.free(buf, rowCount * 4);
+                return values;
+            }
+
+            case 'float64':
+            case 'float':
+            case 'double': {
+                const buf = _w.alloc(rowCount * 8);
+                const count = _w.fragmentReadFloat64(colIdx, buf, rowCount);
+                const values = Array.from(new Float64Array(_m.buffer, buf, count));
+                _w.free(buf, rowCount * 8);
+                return values;
+            }
+
+            case 'float32': {
+                const buf = _w.alloc(rowCount * 4);
+                const count = _w.fragmentReadFloat32(colIdx, buf, rowCount);
+                const values = Array.from(new Float32Array(_m.buffer, buf, count));
+                _w.free(buf, rowCount * 4);
+                return values;
+            }
+
+            case 'string':
+            case 'text':
+            case 'varchar': {
+                const values = [];
+                const strBuf = _w.alloc(4096); // Max string length
+                for (let i = 0; i < rowCount; i++) {
+                    const len = _w.fragmentReadStringAt(colIdx, i, strBuf, 4096);
+                    values.push(D.decode(new Uint8Array(_m.buffer, strBuf, len)));
+                }
+                _w.free(strBuf, 4096);
+                return values;
+            }
+
+            case 'bool':
+            case 'boolean': {
+                const buf = _w.alloc(rowCount);
+                const count = _w.fragmentReadBool(colIdx, buf, rowCount);
+                const arr = new Uint8Array(_m.buffer, buf, count);
+                const values = Array.from(arr, v => v !== 0);
+                _w.free(buf, rowCount);
+                return values;
+            }
+
+            case 'vector': {
+                const dim = _w.fragmentGetColumnVectorDim(colIdx);
+                if (dim === 0) return new Array(rowCount).fill([]);
+
+                const vecBuf = _w.alloc(dim * 4);
+                const values = [];
+                for (let i = 0; i < rowCount; i++) {
+                    _w.fragmentReadVectorAt(colIdx, i, vecBuf, dim);
+                    values.push(Array.from(new Float32Array(_m.buffer, vecBuf, dim)));
+                }
+                _w.free(vecBuf, dim * 4);
+                return values;
+            }
+
+            default:
+                return this._readColumnFromWasm(colIdx, 'string', rowCount);
+        }
+    }
+
+    /**
+     * Fallback JS parser for when WASM not available
+     */
+    _parseLanceFragmentJS(data, tableSchema) {
+        const footer = data.slice(-40);
+        const view = new DataView(footer.buffer, footer.byteOffset, footer.byteLength);
+
+        const columnMetaStart = Number(view.getBigUint64(0, true));
+        const columnMetaOffsetsStart = Number(view.getBigUint64(8, true));
+        const numColumns = view.getUint32(28, true);
+
+        const schemaWithRowId = [
+            { name: '__rowId', type: 'int64' },
+            ...tableSchema.filter(c => c.name !== '__rowId')
+        ];
+
+        const metaOffsets = [];
+        const offsetsView = new DataView(data.buffer, data.byteOffset + columnMetaOffsetsStart);
+        for (let i = 0; i < numColumns; i++) {
+            metaOffsets.push(Number(offsetsView.getBigUint64(i * 8, true)));
+        }
+
+        const columnInfos = [];
+        for (let i = 0; i < numColumns; i++) {
+            const metaStart = metaOffsets[i];
+            const metaEnd = i < numColumns - 1 ? metaOffsets[i + 1] : columnMetaOffsetsStart;
+            const metaBytes = data.slice(metaStart, metaEnd);
+            const info = this._parseColumnMetadataJS(metaBytes);
+            info.schema = schemaWithRowId[i] || { name: `col_${i}`, type: 'string' };
+            columnInfos.push(info);
+        }
+
+        const rowCount = columnInfos[0]?.rowCount || 0;
+        if (rowCount === 0) return [];
+
+        const columns = {};
+        for (let i = 0; i < columnInfos.length; i++) {
+            const info = columnInfos[i];
+            const colName = info.name || info.schema.name;
+            const colType = info.type || info.schema.type || 'string';
+            const colData = data.slice(info.dataOffset, info.dataOffset + info.dataSize);
+            columns[colName] = this._decodeColumnDataJS(colData, colType, rowCount, info.schema);
+        }
+
+        const rows = [];
+        for (let i = 0; i < rowCount; i++) {
+            const row = {};
+            for (const name of Object.keys(columns)) {
+                row[name] = columns[name][i];
+            }
+            rows.push(row);
+        }
+        return rows;
+    }
+
+    _parseColumnMetadataJS(bytes) {
+        const info = { name: '', type: 'string', nullable: true, dataOffset: 0, rowCount: 0, dataSize: 0 };
+        let pos = 0;
+        while (pos < bytes.length) {
+            const byte = bytes[pos++];
+            const fieldNum = byte >> 3;
+            const wireType = byte & 0x7;
+            if (fieldNum === 1 && wireType === 2) {
+                const len = this._readVarintJS(bytes, pos);
+                pos = len.nextPos;
+                info.name = D.decode(bytes.slice(pos, pos + len.value));
+                pos += len.value;
+            } else if (fieldNum === 2 && wireType === 2) {
+                const len = this._readVarintJS(bytes, pos);
+                pos = len.nextPos;
+                info.type = D.decode(bytes.slice(pos, pos + len.value));
+                pos += len.value;
+            } else if (fieldNum === 3 && wireType === 0) {
+                const val = this._readVarintJS(bytes, pos);
+                pos = val.nextPos;
+                info.nullable = val.value !== 0;
+            } else if (fieldNum === 4 && wireType === 1) {
+                info.dataOffset = Number(new DataView(bytes.buffer, bytes.byteOffset + pos, 8).getBigUint64(0, true));
+                pos += 8;
+            } else if (fieldNum === 5 && wireType === 0) {
+                const val = this._readVarintJS(bytes, pos);
+                pos = val.nextPos;
+                info.rowCount = val.value;
+            } else if (fieldNum === 6 && wireType === 0) {
+                const val = this._readVarintJS(bytes, pos);
+                pos = val.nextPos;
+                info.dataSize = val.value;
+            } else if (wireType === 0) {
+                const val = this._readVarintJS(bytes, pos);
+                pos = val.nextPos;
+            } else if (wireType === 1) {
+                pos += 8;
+            } else if (wireType === 2) {
+                const len = this._readVarintJS(bytes, pos);
+                pos = len.nextPos + len.value;
+            } else if (wireType === 5) {
+                pos += 4;
+            }
+        }
+        return info;
+    }
+
+    _readVarintJS(bytes, pos) {
+        let value = 0, shift = 0;
+        while (pos < bytes.length) {
+            const byte = bytes[pos++];
+            value |= (byte & 0x7F) << shift;
+            if ((byte & 0x80) === 0) break;
+            shift += 7;
+        }
+        return { value, nextPos: pos };
+    }
+
+    _decodeColumnDataJS(data, type, rowCount, schema) {
+        const t = type.toLowerCase();
+        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+        if (t === 'int64' || t === 'int' || t === 'integer' || t === 'bigint') {
+            return Array.from({ length: rowCount }, (_, i) => Number(view.getBigInt64(i * 8, true)));
+        } else if (t === 'int32') {
+            return Array.from({ length: rowCount }, (_, i) => view.getInt32(i * 4, true));
+        } else if (t === 'float64' || t === 'float' || t === 'double') {
+            return Array.from({ length: rowCount }, (_, i) => view.getFloat64(i * 8, true));
+        } else if (t === 'float32') {
+            return Array.from({ length: rowCount }, (_, i) => view.getFloat32(i * 4, true));
+        } else if (t === 'string' || t === 'text' || t === 'varchar') {
+            const offsetsSize = (rowCount + 1) * 4;
+            const stringData = data.slice(0, data.length - offsetsSize);
+            const offsetsData = data.slice(data.length - offsetsSize);
+            const offView = new DataView(offsetsData.buffer, offsetsData.byteOffset);
+            return Array.from({ length: rowCount }, (_, i) => {
+                const start = offView.getUint32(i * 4, true);
+                const end = offView.getUint32((i + 1) * 4, true);
+                return D.decode(stringData.slice(start, end));
+            });
+        } else if (t === 'bool' || t === 'boolean') {
+            return Array.from({ length: rowCount }, (_, i) => (data[Math.floor(i / 8)] & (1 << (i % 8))) !== 0);
+        } else if (t === 'vector') {
+            const dim = schema?.vectorDim || 0;
+            if (dim === 0) return new Array(rowCount).fill([]);
+            return Array.from({ length: rowCount }, (_, i) =>
+                Array.from({ length: dim }, (_, j) => view.getFloat32((i * dim + j) * 4, true)));
+        }
+        return this._decodeColumnDataJS(data, 'string', rowCount, schema);
     }
 
     /**
@@ -1403,6 +2054,201 @@ const readStr = (ptr, len) => D.decode(new Uint8Array(_m.buffer, ptr, len));
 
 // Read bytes from WASM memory (returns copy)
 const readBytes = (ptr, len) => new Uint8Array(_m.buffer, ptr, len).slice();
+
+/**
+ * LanceFileWriter - Thin JS wrapper for WASM fragment writer
+ *
+ * Uses high-level WASM API: fragmentBegin -> fragmentAdd*Column -> fragmentEnd
+ * All encoding logic is in WASM, JS only marshals data.
+ */
+class LanceFileWriter {
+    constructor(schema) {
+        this.schema = schema;  // [{name, type, nullable?, vectorDim?}]
+        this.columns = new Map();  // columnName -> values[]
+        this.rowCount = 0;
+    }
+
+    addRows(rows) {
+        for (const row of rows) {
+            for (const col of this.schema) {
+                if (!this.columns.has(col.name)) {
+                    this.columns.set(col.name, []);
+                }
+                this.columns.get(col.name).push(row[col.name] ?? null);
+            }
+            this.rowCount++;
+        }
+    }
+
+    build() {
+        if (!_w?.fragmentBegin) {
+            return this._buildJson();
+        }
+
+        // Estimate buffer size
+        const estimatedSize = Math.max(64 * 1024, this.rowCount * 1024);
+        if (!_w.fragmentBegin(estimatedSize)) {
+            throw new Error('Failed to initialize WASM fragment writer');
+        }
+
+        // Add each column using high-level WASM API
+        for (const col of this.schema) {
+            const values = this.columns.get(col.name) || [];
+            this._addColumn(col, values);
+        }
+
+        // Finalize - WASM writes metadata, offsets table, and footer
+        const finalSize = _w.fragmentEnd();
+        if (finalSize === 0) {
+            throw new Error('Failed to finalize fragment');
+        }
+
+        const bufferPtr = _w.writerGetBuffer();
+        if (!bufferPtr) {
+            throw new Error('Failed to get writer buffer');
+        }
+
+        return new Uint8Array(_m.buffer, bufferPtr, finalSize).slice();
+    }
+
+    _addColumn(col, values) {
+        const type = (col.type || col.dataType || 'string').toLowerCase();
+        const nullable = col.nullable !== false;
+
+        // Allocate name in WASM memory
+        const nameBytes = E.encode(col.name);
+        const namePtr = _w.alloc(nameBytes.length);
+        new Uint8Array(_m.buffer, namePtr, nameBytes.length).set(nameBytes);
+
+        let result = 0;
+
+        switch (type) {
+            case 'int64':
+            case 'int':
+            case 'integer':
+            case 'bigint': {
+                const arr = new BigInt64Array(values.map(v => BigInt(v ?? 0)));
+                const ptr = _w.alloc(arr.byteLength);
+                new BigInt64Array(_m.buffer, ptr, values.length).set(arr);
+                result = _w.fragmentAddInt64Column(namePtr, nameBytes.length, ptr, values.length, nullable);
+                _w.free(ptr, arr.byteLength);
+                break;
+            }
+
+            case 'int32': {
+                const arr = new Int32Array(values.map(v => v ?? 0));
+                const ptr = _w.alloc(arr.byteLength);
+                new Int32Array(_m.buffer, ptr, values.length).set(arr);
+                result = _w.fragmentAddInt32Column(namePtr, nameBytes.length, ptr, values.length, nullable);
+                _w.free(ptr, arr.byteLength);
+                break;
+            }
+
+            case 'float64':
+            case 'float':
+            case 'double': {
+                const arr = new Float64Array(values.map(v => v ?? 0.0));
+                const ptr = _w.alloc(arr.byteLength);
+                new Float64Array(_m.buffer, ptr, values.length).set(arr);
+                result = _w.fragmentAddFloat64Column(namePtr, nameBytes.length, ptr, values.length, nullable);
+                _w.free(ptr, arr.byteLength);
+                break;
+            }
+
+            case 'float32': {
+                const arr = new Float32Array(values.map(v => v ?? 0.0));
+                const ptr = _w.alloc(arr.byteLength);
+                new Float32Array(_m.buffer, ptr, values.length).set(arr);
+                result = _w.fragmentAddFloat32Column(namePtr, nameBytes.length, ptr, values.length, nullable);
+                _w.free(ptr, arr.byteLength);
+                break;
+            }
+
+            case 'string':
+            case 'text':
+            case 'varchar': {
+                // Build string data and offsets
+                let currentOffset = 0;
+                const offsets = new Uint32Array(values.length + 1);
+                const allBytes = [];
+
+                for (let i = 0; i < values.length; i++) {
+                    offsets[i] = currentOffset;
+                    const bytes = E.encode(String(values[i] ?? ''));
+                    allBytes.push(...bytes);
+                    currentOffset += bytes.length;
+                }
+                offsets[values.length] = currentOffset;
+
+                const strData = new Uint8Array(allBytes);
+                const strPtr = _w.alloc(strData.length);
+                new Uint8Array(_m.buffer, strPtr, strData.length).set(strData);
+
+                const offPtr = _w.alloc(offsets.byteLength);
+                new Uint32Array(_m.buffer, offPtr, offsets.length).set(offsets);
+
+                result = _w.fragmentAddStringColumn(namePtr, nameBytes.length, strPtr, strData.length, offPtr, values.length, nullable);
+
+                _w.free(strPtr, strData.length);
+                _w.free(offPtr, offsets.byteLength);
+                break;
+            }
+
+            case 'bool':
+            case 'boolean': {
+                const byteCount = Math.ceil(values.length / 8);
+                const packed = new Uint8Array(byteCount);
+                for (let i = 0; i < values.length; i++) {
+                    if (values[i]) packed[Math.floor(i / 8)] |= (1 << (i % 8));
+                }
+                const ptr = _w.alloc(packed.length);
+                new Uint8Array(_m.buffer, ptr, packed.length).set(packed);
+                result = _w.fragmentAddBoolColumn(namePtr, nameBytes.length, ptr, packed.length, values.length, nullable);
+                _w.free(ptr, packed.length);
+                break;
+            }
+
+            case 'vector': {
+                const dim = col.vectorDim || (values[0]?.length || 0);
+                const allFloats = [];
+                for (const v of values) {
+                    if (Array.isArray(v)) {
+                        allFloats.push(...v);
+                    } else {
+                        for (let i = 0; i < dim; i++) allFloats.push(0);
+                    }
+                }
+                const arr = new Float32Array(allFloats);
+                const ptr = _w.alloc(arr.byteLength);
+                new Float32Array(_m.buffer, ptr, allFloats.length).set(arr);
+                result = _w.fragmentAddVectorColumn(namePtr, nameBytes.length, ptr, allFloats.length, dim, nullable);
+                _w.free(ptr, arr.byteLength);
+                break;
+            }
+
+            default:
+                // Fallback to string
+                _w.free(namePtr, nameBytes.length);
+                return this._addColumn({ ...col, type: 'string' }, values);
+        }
+
+        _w.free(namePtr, nameBytes.length);
+
+        if (!result) {
+            throw new Error(`Failed to add column '${col.name}'`);
+        }
+    }
+
+    _buildJson() {
+        const data = {
+            schema: this.schema,
+            columns: Object.fromEntries(this.columns),
+            rowCount: this.rowCount,
+            format: 'json'
+        };
+        return E.encode(JSON.stringify(data));
+    }
+}
 
 // WASM utils exported for advanced usage
 export const wasmUtils = {
@@ -7485,6 +8331,156 @@ export class SQLExecutor {
             },
         };
     }
+
+    /**
+     * Execute SQL and return results as async generator (streaming).
+     * Yields chunks of {columns, rows} for memory-efficient processing.
+     * @param {string} sql - SQL query string
+     * @param {Object} options - Streaming options
+     * @returns {AsyncGenerator<{columns: string[], rows: any[][]}>}
+     */
+    async *executeStream(sql, options = {}) {
+        const { chunkSize = 1000 } = options;
+
+        // Parse SQL
+        const lexer = new SQLLexer(sql);
+        const tokens = lexer.tokenize();
+        const parser = new SQLParser(tokens);
+        const ast = parser.parse();
+
+        // Detect column types
+        if (this.columnTypes.length === 0) {
+            if (this.file._isRemote && this.file.detectColumnTypes) {
+                this.columnTypes = await this.file.detectColumnTypes();
+            } else if (this.file._columnTypes) {
+                this.columnTypes = this.file._columnTypes;
+            } else {
+                this.columnTypes = Array(this.file.numColumns || 0).fill('unknown');
+            }
+        }
+
+        // Get total rows
+        const totalRows = this.file._isRemote
+            ? await this.file.getRowCount(0)
+            : Number(this.file.getRowCount(0));
+
+        // Determine columns
+        const neededColumns = this.collectNeededColumns(ast);
+        const outputColumns = this.resolveOutputColumns(ast);
+
+        // Stream in chunks
+        const limit = ast.limit || totalRows;
+        let yielded = 0;
+
+        for (let offset = 0; offset < totalRows && yielded < limit; offset += chunkSize) {
+            const batchSize = Math.min(chunkSize, limit - yielded, totalRows - offset);
+
+            // Generate indices for this chunk
+            const indices = [];
+            for (let i = 0; i < batchSize; i++) {
+                indices.push(offset + i);
+            }
+
+            // Read column data for these indices
+            const columnData = [];
+            for (const colName of neededColumns) {
+                const colIdx = this.columnMap[colName.toLowerCase()];
+                if (colIdx !== undefined) {
+                    const data = await this.readColumnAtIndices(colIdx, indices);
+                    columnData.push(data);
+                } else {
+                    columnData.push(indices.map(() => null));
+                }
+            }
+
+            // Build rows
+            const rows = [];
+            for (let i = 0; i < indices.length; i++) {
+                const row = [];
+                for (let c = 0; c < neededColumns.length; c++) {
+                    row.push(columnData[c][i]);
+                }
+                rows.push(row);
+            }
+
+            // Apply WHERE filter if present
+            let filteredRows = rows;
+            if (ast.where) {
+                filteredRows = rows.filter((row, idx) => {
+                    return this.evaluateWhereExprOnRow(ast.where, neededColumns, row);
+                });
+            }
+
+            if (filteredRows.length > 0) {
+                yield {
+                    columns: neededColumns,
+                    rows: filteredRows,
+                };
+                yielded += filteredRows.length;
+            }
+        }
+    }
+
+    /**
+     * Evaluate WHERE expression on a single row
+     * @private
+     */
+    evaluateWhereExprOnRow(expr, columns, row) {
+        if (!expr) return true;
+
+        if (expr.type === 'binary') {
+            if (expr.op === 'AND') {
+                return this.evaluateWhereExprOnRow(expr.left, columns, row) &&
+                       this.evaluateWhereExprOnRow(expr.right, columns, row);
+            }
+            if (expr.op === 'OR') {
+                return this.evaluateWhereExprOnRow(expr.left, columns, row) ||
+                       this.evaluateWhereExprOnRow(expr.right, columns, row);
+            }
+
+            const leftVal = this._getValueFromExpr(expr.left, columns, row);
+            const rightVal = this._getValueFromExpr(expr.right, columns, row);
+
+            switch (expr.op) {
+                case '=':
+                case '==':
+                    return leftVal == rightVal;
+                case '!=':
+                case '<>':
+                    return leftVal != rightVal;
+                case '<':
+                    return leftVal < rightVal;
+                case '<=':
+                    return leftVal <= rightVal;
+                case '>':
+                    return leftVal > rightVal;
+                case '>=':
+                    return leftVal >= rightVal;
+                default:
+                    return true;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Get value from expression for row evaluation
+     * @private
+     */
+    _getValueFromExpr(expr, columns, row) {
+        if (expr.type === 'literal') {
+            return expr.value;
+        }
+        if (expr.type === 'column') {
+            const colName = expr.name || expr.column;
+            const idx = columns.indexOf(colName) !== -1
+                ? columns.indexOf(colName)
+                : columns.indexOf(colName.toLowerCase());
+            return idx !== -1 ? row[idx] : null;
+        }
+        return null;
+    }
 }
 
 /**
@@ -9562,7 +10558,8 @@ export class LanceDatabase {
     }
 
     /**
-     * Execute hash join between two datasets using QueryPlanner
+     * Execute hash join between two datasets using OPFS for intermediate storage.
+     * This enables TB-scale joins in the browser by spilling to disk instead of RAM.
      */
     async _hashJoin(leftDataset, rightDataset, ast, context) {
         const { leftAlias, rightAlias, leftTableName, rightTableName } = context;
@@ -9585,111 +10582,101 @@ export class LanceDatabase {
         const rightColumns = plan.rightScan.columns;
         const leftFilters = plan.leftScan.filters;
         const rightFilters = plan.rightScan.filters;
-        const leftLimit = plan.leftScan.limit;
 
-        // Build left SQL with filter pushdown
-        let leftWhereClause = '';
-        if (leftFilters.length > 0) {
-            const filterStr = leftFilters.map(f => this._filterToSQL(f)).join(' AND ');
-            leftWhereClause = ` WHERE ${filterStr}`;
-        }
-
-        // Ensure join key is included in columns
+        // Build SQL queries for streaming
         const leftColsWithKey = leftColumns.includes('*')
             ? ['*']
             : [...new Set([leftKey, ...leftColumns])];
 
-        const leftSQL = `SELECT ${leftColsWithKey.join(', ')} FROM ${leftTableName}${leftWhereClause} LIMIT ${leftLimit}`;
-        console.log('[LanceDatabase] Left query:', leftSQL);
-
-        const leftExecutor = new SQLExecutor(leftDataset);
-        const leftData = await leftExecutor.executeSQL(leftSQL);
-
-        if (!leftData.rows || leftData.rows.length === 0) {
-            return { columns: [], rows: [], total: 0 };
+        let leftWhereClause = '';
+        if (leftFilters.length > 0) {
+            leftWhereClause = ` WHERE ${leftFilters.map(f => this._filterToSQL(f)).join(' AND ')}`;
         }
+        const leftSQL = `SELECT ${leftColsWithKey.join(', ')} FROM ${leftTableName}${leftWhereClause}`;
 
-        console.log(`[LanceDatabase] Fetched ${leftData.rows.length} rows from left table`);
-
-        // Build hash map on left side
-        const hashMap = new Map();
-        const joinKeyIndex = leftData.columns.indexOf(leftKey);
-
-        for (const row of leftData.rows) {
-            const key = row[joinKeyIndex];
-            if (key !== null && key !== undefined) {
-                if (!hashMap.has(key)) {
-                    hashMap.set(key, []);
-                }
-                hashMap.get(key).push(row);
-            }
-        }
-
-        console.log(`[LanceDatabase] Built hash map with ${hashMap.size} unique keys`);
-
-        // Get unique join keys for right side
-        const joinKeys = Array.from(hashMap.keys());
-
-        if (joinKeys.length === 0) {
-            return { columns: [], rows: [], total: 0 };
-        }
-
-        // Build right SQL with filter pushdown AND join key filter
         const rightColsWithKey = rightColumns.includes('*')
             ? ['*']
             : [...new Set([rightKey, ...rightColumns])];
 
-        // Combine pushed-down filters with join key IN clause
-        const rightFilterParts = [];
+        let rightWhereClause = '';
         if (rightFilters.length > 0) {
-            rightFilterParts.push(rightFilters.map(f => this._filterToSQL(f)).join(' AND '));
+            rightWhereClause = ` WHERE ${rightFilters.map(f => this._filterToSQL(f)).join(' AND ')}`;
         }
-
-        // Add join key filter
-        const joinKeyValues = joinKeys.map(k => typeof k === 'string' ? `'${k}'` : k).join(',');
-        rightFilterParts.push(`${rightKey} IN (${joinKeyValues})`);
-
-        const rightWhereClause = ` WHERE ${rightFilterParts.join(' AND ')}`;
-
         const rightSQL = `SELECT ${rightColsWithKey.join(', ')} FROM ${rightTableName}${rightWhereClause}`;
+
+        console.log('[LanceDatabase] OPFS-backed hash join starting...');
+        console.log('[LanceDatabase] Left query:', leftSQL);
         console.log('[LanceDatabase] Right query:', rightSQL);
 
+        // Initialize OPFS storage
+        await opfsStorage.open();
+
+        // Create OPFS join executor
+        const joinExecutor = new OPFSJoinExecutor(opfsStorage);
+
+        // Create streaming executors
+        const leftExecutor = new SQLExecutor(leftDataset);
         const rightExecutor = new SQLExecutor(rightDataset);
-        const rightData = await rightExecutor.executeSQL(rightSQL);
 
-        console.log(`[LanceDatabase] Fetched ${rightData.rows.length} rows from right table`);
+        // Create async generators for streaming
+        const leftStream = leftExecutor.executeStream(leftSQL);
+        const rightStream = rightExecutor.executeStream(rightSQL);
 
-        // Perform hash join
+        // Execute OPFS-backed join
         const results = [];
-        const rightJoinKeyIndex = rightData.columns.indexOf(rightKey);
+        let resultColumns = null;
 
-        for (const rightRow of rightData.rows) {
-            const key = rightRow[rightJoinKeyIndex];
-            const leftRows = hashMap.get(key);
+        try {
+            for await (const chunk of joinExecutor.executeHashJoin(
+                leftStream,
+                rightStream,
+                leftKey,
+                rightKey,
+                { limit: ast.limit || Infinity }
+            )) {
+                if (!resultColumns) {
+                    resultColumns = chunk.columns;
+                }
+                results.push(...chunk.rows);
 
-            if (leftRows) {
-                for (const leftRow of leftRows) {
-                    // Merge rows
-                    results.push([...leftRow, ...rightRow]);
+                // Early exit if we have enough rows
+                if (ast.limit && results.length >= ast.limit) {
+                    break;
                 }
             }
+        } catch (e) {
+            console.error('[LanceDatabase] OPFS join failed:', e);
+            throw e;
         }
 
-        console.log(`[LanceDatabase] Joined ${results.length} rows`);
+        // Get stats
+        const stats = joinExecutor.getStats();
+        console.log('[LanceDatabase] OPFS Join Stats:', stats);
 
-        // Build result columns
-        const resultColumns = [...leftData.columns, ...rightData.columns];
+        // If no results, return empty
+        if (!resultColumns || results.length === 0) {
+            return { columns: [], rows: [], total: 0, opfsStats: stats };
+        }
 
-        // Apply projection to select only the requested columns
-        const projectedResults = this._applyProjection(results, resultColumns, plan.projection, leftAlias, rightAlias);
+        // Apply projection
+        const projectedResults = this._applyProjection(
+            results,
+            resultColumns,
+            plan.projection,
+            leftAlias,
+            rightAlias
+        );
 
         // Apply LIMIT
-        const limitedResults = ast.limit ? projectedResults.rows.slice(0, ast.limit) : projectedResults.rows;
+        const limitedResults = ast.limit
+            ? projectedResults.rows.slice(0, ast.limit)
+            : projectedResults.rows;
 
         return {
             columns: projectedResults.columns,
             rows: limitedResults,
-            total: limitedResults.length
+            total: limitedResults.length,
+            opfsStats: stats  // Include OPFS stats in result
         };
     }
 
