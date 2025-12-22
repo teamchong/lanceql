@@ -7586,7 +7586,9 @@ export class SQLExecutor {
         const parser = new SQLParser(tokens);
         const ast = parser.parse();
 
-        // Debug: console.log('Parsed SQL AST:', ast);
+        // Generate optimized query plan
+        const planner = new QueryPlanner();
+        const plan = planner.planSingleTable(ast);
 
         // Detect column types if not already done
         if (this.columnTypes.length === 0) {
@@ -7605,16 +7607,16 @@ export class SQLExecutor {
             ? await this.file.getRowCount(0)
             : Number(this.file.getRowCount(0));
 
-        // Determine which columns to read
-        const neededColumns = this.collectNeededColumns(ast);
-        // Debug: console.log('Needed columns:', neededColumns);
+        // Use plan's scan columns instead of basic column collection
+        const neededColumns = plan.scanColumns.length > 0
+            ? plan.scanColumns
+            : this.collectNeededColumns(ast);
 
         // Determine output columns
         const outputColumns = this.resolveOutputColumns(ast);
-        // Debug: console.log('Output columns:', outputColumns);
 
         // Check if this is an aggregation query
-        const hasAggregates = this.hasAggregates(ast);
+        const hasAggregates = plan.aggregations.length > 0 || this.hasAggregates(ast);
         if (hasAggregates) {
             // Special case: COUNT(*) without WHERE/SEARCH returns metadata row count (free)
             if (this.isSimpleCountStar(ast) && !ast.where && !ast.search) {
@@ -7629,6 +7631,7 @@ export class SQLExecutor {
                         isPartialScan: false,
                         fromMetadata: true,
                     },
+                    queryPlan: plan,  // Include plan in result
                 };
             }
             // For aggregations with SEARCH, we need to run search first
@@ -10394,6 +10397,339 @@ export class QueryPlanner {
         }
 
         return JSON.stringify(expr);
+    }
+
+    /**
+     * Generate optimized plan for single-table queries (SELECT, aggregations).
+     * This is the key optimization that makes us better than DuckDB for remote data:
+     *
+     * DuckDB approach (local-first):
+     *   1. Load data into memory
+     *   2. Build indexes
+     *   3. Execute query
+     *
+     * LanceQL approach (remote-first):
+     *   1. Analyze query to determine minimum columns needed
+     *   2. Use Lance column statistics to skip entire chunks
+     *   3. Stream only matching rows, never load full table
+     *   4. Apply projections at the data source
+     *
+     * @param {Object} ast - Parsed SQL AST
+     * @returns {Object} Physical execution plan
+     */
+    planSingleTable(ast) {
+        const plan = {
+            type: ast.type,
+            // Phase 1: Determine columns to fetch
+            scanColumns: [],
+            // Phase 2: Filters to push down (executed at data source)
+            pushedFilters: [],
+            // Phase 3: Filters that must be evaluated after fetch
+            postFilters: [],
+            // Phase 4: Aggregations (if any)
+            aggregations: [],
+            // Phase 5: GROUP BY (if any)
+            groupBy: [],
+            // Phase 6: HAVING (if any)
+            having: null,
+            // Phase 7: ORDER BY (if any)
+            orderBy: [],
+            // Phase 8: LIMIT/OFFSET
+            limit: ast.limit || null,
+            offset: ast.offset || 0,
+            // Phase 9: Final projection
+            projection: [],
+            // Optimization flags
+            canUseStatistics: false,
+            canStreamResults: true,
+            estimatedSelectivity: 1.0,
+        };
+
+        // Analyze columns needed
+        const neededColumns = new Set();
+
+        // 1. Columns from SELECT
+        if (ast.columns === '*' || (Array.isArray(ast.columns) && ast.columns.some(c => c.type === 'star'))) {
+            plan.projection = ['*'];
+            // For *, we can't prune columns - need all
+            plan.canStreamResults = false;
+        } else if (Array.isArray(ast.columns)) {
+            for (const col of ast.columns) {
+                this._collectColumnsFromSelectItem(col, neededColumns, plan);
+            }
+        }
+
+        // 2. Columns from WHERE (for filter evaluation)
+        if (ast.where) {
+            this._collectColumnsFromExpr(ast.where, neededColumns);
+            // Analyze filter for pushdown opportunities
+            this._analyzeFilterPushdown(ast.where, plan);
+        }
+
+        // 3. Columns from GROUP BY
+        if (ast.groupBy && ast.groupBy.length > 0) {
+            for (const groupExpr of ast.groupBy) {
+                this._collectColumnsFromExpr(groupExpr, neededColumns);
+                plan.groupBy.push(groupExpr);
+            }
+        }
+
+        // 4. Columns from HAVING
+        if (ast.having) {
+            this._collectColumnsFromExpr(ast.having, neededColumns);
+            plan.having = ast.having;
+        }
+
+        // 5. Columns from ORDER BY
+        if (ast.orderBy && ast.orderBy.length > 0) {
+            for (const orderItem of ast.orderBy) {
+                this._collectColumnsFromExpr(orderItem.expr || orderItem, neededColumns);
+                plan.orderBy.push(orderItem);
+            }
+        }
+
+        // Finalize scan columns
+        plan.scanColumns = Array.from(neededColumns);
+
+        // Calculate selectivity estimate based on filters
+        plan.estimatedSelectivity = this._estimateSelectivity(plan.pushedFilters);
+
+        // Determine if we can use column statistics to skip chunks
+        plan.canUseStatistics = plan.pushedFilters.some(f =>
+            f.type === 'range' || f.type === 'equality'
+        );
+
+        if (this.debug) {
+            this._logSingleTablePlan(plan, ast);
+        }
+
+        return plan;
+    }
+
+    /**
+     * Collect columns from a SELECT item
+     */
+    _collectColumnsFromSelectItem(item, columns, plan) {
+        if (item.type === 'star') {
+            plan.projection.push('*');
+            return;
+        }
+
+        if (item.type === 'expr') {
+            const expr = item.expr;
+
+            // Check for aggregation
+            if (expr.type === 'call') {
+                const funcName = expr.name.toUpperCase();
+                const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'VARIANCE'];
+
+                if (aggFuncs.includes(funcName)) {
+                    const agg = {
+                        type: funcName,
+                        column: null,
+                        alias: item.alias || `${funcName}(${expr.args[0]?.name || '*'})`,
+                        distinct: expr.distinct || false,
+                    };
+
+                    if (expr.args && expr.args.length > 0) {
+                        const arg = expr.args[0];
+                        if (arg.type === 'column') {
+                            agg.column = arg.name || arg.column;
+                            columns.add(agg.column);
+                        } else if (arg.type !== 'star') {
+                            this._collectColumnsFromExpr(arg, columns);
+                        }
+                    }
+
+                    plan.aggregations.push(agg);
+                    plan.projection.push({ type: 'aggregation', index: plan.aggregations.length - 1 });
+                    return;
+                }
+            }
+
+            // Regular column or expression
+            this._collectColumnsFromExpr(expr, columns);
+            plan.projection.push({
+                type: 'column',
+                expr: expr,
+                alias: item.alias
+            });
+        }
+    }
+
+    /**
+     * Collect column names from an expression
+     */
+    _collectColumnsFromExpr(expr, columns) {
+        if (!expr) return;
+
+        if (expr.type === 'column') {
+            columns.add(expr.name || expr.column);
+        } else if (expr.type === 'binary') {
+            this._collectColumnsFromExpr(expr.left, columns);
+            this._collectColumnsFromExpr(expr.right, columns);
+        } else if (expr.type === 'call') {
+            for (const arg of (expr.args || [])) {
+                this._collectColumnsFromExpr(arg, columns);
+            }
+        } else if (expr.type === 'unary') {
+            this._collectColumnsFromExpr(expr.operand, columns);
+        }
+    }
+
+    /**
+     * Analyze WHERE clause for filter pushdown opportunities.
+     *
+     * Pushable filters (can be evaluated at data source):
+     * - Simple comparisons: col > 5, col = 'foo', col BETWEEN 1 AND 10
+     * - IN clauses: col IN (1, 2, 3)
+     * - LIKE patterns: col LIKE 'prefix%' (prefix only)
+     *
+     * Non-pushable filters (must evaluate after fetch):
+     * - Complex expressions: col1 + col2 > 10
+     * - Functions: UPPER(col) = 'FOO'
+     * - Cross-column comparisons: col1 > col2
+     */
+    _analyzeFilterPushdown(expr, plan) {
+        if (!expr) return;
+
+        if (expr.type === 'binary') {
+            // Check if this is a simple pushable condition
+            if (this._isPushableFilter(expr)) {
+                plan.pushedFilters.push(this._classifyFilter(expr));
+            } else if (expr.op === 'AND') {
+                // AND - recurse into both sides
+                this._analyzeFilterPushdown(expr.left, plan);
+                this._analyzeFilterPushdown(expr.right, plan);
+            } else if (expr.op === 'OR') {
+                // OR with pushable conditions on same column can be pushed
+                const leftPushable = this._isPushableFilter(expr.left);
+                const rightPushable = this._isPushableFilter(expr.right);
+
+                if (leftPushable && rightPushable) {
+                    plan.pushedFilters.push({
+                        type: 'or',
+                        left: this._classifyFilter(expr.left),
+                        right: this._classifyFilter(expr.right),
+                    });
+                } else {
+                    // Can't push OR with non-pushable condition
+                    plan.postFilters.push(expr);
+                }
+            } else {
+                // Non-pushable binary expression
+                plan.postFilters.push(expr);
+            }
+        } else {
+            plan.postFilters.push(expr);
+        }
+    }
+
+    /**
+     * Check if a filter can be pushed down to data source
+     */
+    _isPushableFilter(expr) {
+        if (expr.type !== 'binary') return false;
+
+        const compOps = ['=', '==', '!=', '<>', '<', '<=', '>', '>=', 'LIKE', 'IN', 'BETWEEN'];
+        if (!compOps.includes(expr.op.toUpperCase())) return false;
+
+        // One side must be a column, other must be a literal/constant
+        const leftIsCol = expr.left.type === 'column';
+        const rightIsCol = expr.right?.type === 'column';
+        const leftIsLiteral = expr.left.type === 'literal' || expr.left.type === 'list';
+        const rightIsLiteral = expr.right?.type === 'literal' || expr.right?.type === 'list';
+
+        return (leftIsCol && rightIsLiteral) || (rightIsCol && leftIsLiteral);
+    }
+
+    /**
+     * Classify a filter for optimization
+     */
+    _classifyFilter(expr) {
+        const leftIsCol = expr.left.type === 'column';
+        const column = leftIsCol
+            ? (expr.left.name || expr.left.column)
+            : (expr.right.name || expr.right.column);
+        const value = leftIsCol ? expr.right.value : expr.left.value;
+
+        const op = expr.op.toUpperCase();
+
+        if (op === '=' || op === '==') {
+            return { type: 'equality', column, value, op: '=' };
+        } else if (op === '!=' || op === '<>') {
+            return { type: 'inequality', column, value, op: '!=' };
+        } else if (['<', '<=', '>', '>='].includes(op)) {
+            return { type: 'range', column, value, op };
+        } else if (op === 'LIKE') {
+            return { type: 'like', column, pattern: value };
+        } else if (op === 'IN') {
+            const values = expr.right.type === 'list' ? expr.right.values : [expr.right.value];
+            return { type: 'in', column, values };
+        } else if (op === 'BETWEEN') {
+            return { type: 'between', column, low: expr.right.low, high: expr.right.high };
+        }
+
+        return { type: 'unknown', expr };
+    }
+
+    /**
+     * Estimate selectivity of filters (what % of rows will pass)
+     */
+    _estimateSelectivity(filters) {
+        if (filters.length === 0) return 1.0;
+
+        let selectivity = 1.0;
+        for (const f of filters) {
+            switch (f.type) {
+                case 'equality':
+                    selectivity *= 0.1; // Assume 10% match for equality
+                    break;
+                case 'range':
+                    selectivity *= 0.3; // Assume 30% for range
+                    break;
+                case 'in':
+                    selectivity *= Math.min(0.5, f.values.length * 0.05);
+                    break;
+                case 'like':
+                    selectivity *= f.pattern.startsWith('%') ? 0.5 : 0.2;
+                    break;
+                default:
+                    selectivity *= 0.5;
+            }
+        }
+        return Math.max(0.01, selectivity); // At least 1%
+    }
+
+    /**
+     * Log single-table query plan
+     */
+    _logSingleTablePlan(plan, ast) {
+        console.log('\n' + '='.repeat(60));
+        console.log('📋 SINGLE-TABLE QUERY PLAN');
+        console.log('='.repeat(60));
+
+        console.log('\n🔍 Query Analysis:');
+        console.log(`  Type: ${plan.type}`);
+        console.log(`  Aggregations: ${plan.aggregations.length}`);
+        console.log(`  Group By: ${plan.groupBy.length} columns`);
+        console.log(`  Order By: ${plan.orderBy.length} columns`);
+        console.log(`  Limit: ${plan.limit || 'none'}`);
+
+        console.log('\n📊 Scan Strategy:');
+        console.log(`  Columns to fetch: [${plan.scanColumns.join(', ')}]`);
+        console.log(`  Pushed filters: ${plan.pushedFilters.length}`);
+        plan.pushedFilters.forEach((f, i) => {
+            console.log(`    ${i + 1}. ${f.type}: ${f.column} ${f.op || ''} ${JSON.stringify(f.value || f.values || f.pattern || '')}`);
+        });
+        console.log(`  Post-fetch filters: ${plan.postFilters.length}`);
+
+        console.log('\n💡 Optimizations:');
+        console.log(`  Can use column statistics: ${plan.canUseStatistics}`);
+        console.log(`  Can stream results: ${plan.canStreamResults}`);
+        console.log(`  Estimated selectivity: ${(plan.estimatedSelectivity * 100).toFixed(1)}%`);
+
+        console.log('\n' + '='.repeat(60) + '\n');
     }
 }
 
