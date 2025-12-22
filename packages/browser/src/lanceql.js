@@ -125,6 +125,603 @@ class MetadataCache {
 const metadataCache = new MetadataCache();
 
 /**
+ * Statistics Manager - computes and caches column statistics for query optimization.
+ *
+ * Unlike pre-generated sidecar files, this computes statistics dynamically:
+ * 1. On first query to a column, stream through data to compute min/max/null_count
+ * 2. Cache computed stats in OPFS for reuse across sessions
+ * 3. Use statistics for fragment/page pruning during query execution
+ *
+ * This is the same approach used by DuckDB and DataFusion - no pre-processing required.
+ */
+class StatisticsManager {
+    constructor() {
+        this._cache = new Map(); // In-memory cache: datasetUrl -> { columns: Map<colName, stats> }
+        this._opfsRoot = null;
+        this._computing = new Map(); // Track in-progress computations to avoid duplicates
+    }
+
+    /**
+     * Get OPFS directory for statistics cache
+     */
+    async _getStatsDir() {
+        if (this._opfsRoot) return this._opfsRoot;
+
+        if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) {
+            return null; // OPFS not available
+        }
+
+        try {
+            const opfsRoot = await navigator.storage.getDirectory();
+            this._opfsRoot = await opfsRoot.getDirectoryHandle('lanceql-stats', { create: true });
+            return this._opfsRoot;
+        } catch (e) {
+            console.warn('[StatisticsManager] OPFS not available:', e);
+            return null;
+        }
+    }
+
+    /**
+     * Get cache key for a dataset
+     */
+    _getCacheKey(datasetUrl) {
+        // Hash the URL for filesystem-safe name
+        let hash = 0;
+        for (let i = 0; i < datasetUrl.length; i++) {
+            hash = ((hash << 5) - hash) + datasetUrl.charCodeAt(i);
+            hash |= 0;
+        }
+        return `stats_${Math.abs(hash).toString(16)}`;
+    }
+
+    /**
+     * Load cached statistics from OPFS
+     */
+    async loadFromCache(datasetUrl, version) {
+        const cacheKey = this._getCacheKey(datasetUrl);
+
+        // Check in-memory cache first
+        if (this._cache.has(cacheKey)) {
+            const cached = this._cache.get(cacheKey);
+            if (cached.version === version) {
+                return cached;
+            }
+        }
+
+        // Try OPFS
+        const statsDir = await this._getStatsDir();
+        if (!statsDir) return null;
+
+        try {
+            const fileHandle = await statsDir.getFileHandle(`${cacheKey}.json`);
+            const file = await fileHandle.getFile();
+            const text = await file.text();
+            const cached = JSON.parse(text);
+
+            // Validate version
+            if (cached.version !== version) {
+                return null; // Stale cache
+            }
+
+            // Store in memory cache
+            this._cache.set(cacheKey, cached);
+            return cached;
+        } catch (e) {
+            return null; // No cache or read error
+        }
+    }
+
+    /**
+     * Save statistics to OPFS cache
+     */
+    async saveToCache(datasetUrl, version, statistics) {
+        const cacheKey = this._getCacheKey(datasetUrl);
+
+        const cacheData = {
+            datasetUrl,
+            version,
+            timestamp: Date.now(),
+            columns: statistics.columns, // Map serialized as object
+            fragments: statistics.fragments || null
+        };
+
+        // Store in memory
+        this._cache.set(cacheKey, cacheData);
+
+        // Persist to OPFS
+        const statsDir = await this._getStatsDir();
+        if (!statsDir) return;
+
+        try {
+            const fileHandle = await statsDir.getFileHandle(`${cacheKey}.json`, { create: true });
+            const writable = await fileHandle.createWritable();
+            await writable.write(JSON.stringify(cacheData));
+            await writable.close();
+        } catch (e) {
+            console.warn('[StatisticsManager] Failed to persist stats:', e);
+        }
+    }
+
+    /**
+     * Get statistics for a column, computing if necessary.
+     *
+     * @param {RemoteLanceDataset} dataset - The dataset
+     * @param {string} columnName - Column name
+     * @param {object} options - Options
+     * @param {number} [options.sampleSize] - Max rows to sample (default: 100000)
+     * @returns {Promise<ColumnStatistics>}
+     */
+    async getColumnStats(dataset, columnName, options = {}) {
+        const datasetUrl = dataset.baseUrl;
+        const version = dataset._version;
+        const sampleSize = options.sampleSize || 100000;
+
+        // Try to load from cache
+        const cached = await this.loadFromCache(datasetUrl, version);
+        if (cached?.columns?.[columnName]) {
+            return cached.columns[columnName];
+        }
+
+        // Check if already computing
+        const computeKey = `${datasetUrl}:${columnName}`;
+        if (this._computing.has(computeKey)) {
+            return this._computing.get(computeKey);
+        }
+
+        // Compute statistics by streaming through data
+        const computePromise = this._computeColumnStats(dataset, columnName, sampleSize);
+        this._computing.set(computeKey, computePromise);
+
+        try {
+            const stats = await computePromise;
+
+            // Merge into cache
+            const existing = await this.loadFromCache(datasetUrl, version) || { columns: {} };
+            existing.columns[columnName] = stats;
+            await this.saveToCache(datasetUrl, version, existing);
+
+            return stats;
+        } finally {
+            this._computing.delete(computeKey);
+        }
+    }
+
+    /**
+     * Compute statistics for a column by streaming through data.
+     */
+    async _computeColumnStats(dataset, columnName, sampleSize) {
+        const colIdx = dataset.schema.findIndex(c => c.name === columnName);
+        if (colIdx === -1) {
+            throw new Error(`Column not found: ${columnName}`);
+        }
+
+        const colType = dataset._columnTypes?.[colIdx] || 'unknown';
+        const isNumeric = ['int8', 'int16', 'int32', 'int64', 'float32', 'float64', 'double'].includes(colType);
+
+        const stats = {
+            column: columnName,
+            type: colType,
+            rowCount: 0,
+            nullCount: 0,
+            min: null,
+            max: null,
+            computed: true,
+            sampleSize: 0
+        };
+
+        // Stream through fragments
+        let rowsProcessed = 0;
+
+        for (let fragIdx = 0; fragIdx < dataset._fragments.length && rowsProcessed < sampleSize; fragIdx++) {
+            try {
+                const fragFile = await dataset.openFragment(fragIdx);
+                const fragRows = Math.min(
+                    dataset._fragments[fragIdx].numRows,
+                    sampleSize - rowsProcessed
+                );
+
+                // Read column data
+                const indices = Array.from({ length: fragRows }, (_, i) => i);
+                const values = await fragFile.readColumnAtIndices(colIdx, indices);
+
+                for (const value of values) {
+                    stats.rowCount++;
+                    stats.sampleSize++;
+
+                    if (value === null || value === undefined) {
+                        stats.nullCount++;
+                        continue;
+                    }
+
+                    if (isNumeric) {
+                        if (stats.min === null || value < stats.min) stats.min = value;
+                        if (stats.max === null || value > stats.max) stats.max = value;
+                    }
+                }
+
+                rowsProcessed += values.length;
+            } catch (e) {
+                console.warn(`[StatisticsManager] Error reading fragment ${fragIdx}:`, e);
+            }
+        }
+
+        console.log(`[StatisticsManager] Computed stats for ${columnName}: min=${stats.min}, max=${stats.max}, nulls=${stats.nullCount}/${stats.rowCount}`);
+        return stats;
+    }
+
+    /**
+     * Compute statistics for all filter columns in a query plan.
+     * This is called before query execution to enable pruning.
+     */
+    async precomputeForPlan(dataset, plan) {
+        const filterColumns = new Set();
+
+        // Collect columns from pushed filters
+        for (const filter of (plan.pushedFilters || [])) {
+            if (filter.column) filterColumns.add(filter.column);
+            if (filter.left?.column) filterColumns.add(filter.left.column);
+            if (filter.right?.column) filterColumns.add(filter.right.column);
+        }
+
+        // Compute stats in parallel
+        const statsPromises = Array.from(filterColumns).map(col =>
+            this.getColumnStats(dataset, col).catch(e => {
+                console.warn(`[StatisticsManager] Failed to compute stats for ${col}:`, e);
+                return null;
+            })
+        );
+
+        const results = await Promise.all(statsPromises);
+        const statsMap = new Map();
+
+        Array.from(filterColumns).forEach((col, i) => {
+            if (results[i]) statsMap.set(col, results[i]);
+        });
+
+        return statsMap;
+    }
+
+    /**
+     * Check if a filter can be satisfied by a fragment's statistics.
+     * Returns false if we can definitively skip this fragment.
+     */
+    canMatchFragment(fragmentStats, filter) {
+        if (!fragmentStats || !filter) return true; // Can't determine, must scan
+
+        const colStats = fragmentStats[filter.column];
+        if (!colStats || colStats.min === null || colStats.max === null) return true;
+
+        switch (filter.type) {
+            case 'equality':
+                // col = value: skip if value outside [min, max]
+                return filter.value >= colStats.min && filter.value <= colStats.max;
+
+            case 'range':
+                switch (filter.op) {
+                    case '>':
+                        // col > value: skip if max <= value
+                        return colStats.max > filter.value;
+                    case '>=':
+                        return colStats.max >= filter.value;
+                    case '<':
+                        // col < value: skip if min >= value
+                        return colStats.min < filter.value;
+                    case '<=':
+                        return colStats.min <= filter.value;
+                }
+                break;
+
+            case 'between':
+                // col BETWEEN low AND high: skip if max < low OR min > high
+                return colStats.max >= filter.low && colStats.min <= filter.high;
+
+            case 'in':
+                // col IN (values): skip if all values outside [min, max]
+                if (Array.isArray(filter.values)) {
+                    return filter.values.some(v => v >= colStats.min && v <= colStats.max);
+                }
+                break;
+        }
+
+        return true; // Default: can't skip
+    }
+
+    /**
+     * Compute per-fragment statistics for a column.
+     * This enables fine-grained fragment pruning.
+     */
+    async getFragmentStats(dataset, columnName, fragmentIndex) {
+        const datasetUrl = dataset.baseUrl;
+        const version = dataset._version;
+        const cacheKey = `${datasetUrl}:frag${fragmentIndex}:${columnName}`;
+
+        // Check if already computed
+        const cached = await this.loadFromCache(datasetUrl, version);
+        if (cached?.fragments?.[fragmentIndex]?.[columnName]) {
+            return cached.fragments[fragmentIndex][columnName];
+        }
+
+        // Compute stats for this fragment only
+        const colIdx = dataset.schema.findIndex(c => c.name === columnName);
+        if (colIdx === -1) return null;
+
+        const colType = dataset._columnTypes?.[colIdx] || 'unknown';
+        const isNumeric = ['int8', 'int16', 'int32', 'int64', 'float32', 'float64', 'double'].includes(colType);
+
+        try {
+            const fragFile = await dataset.openFragment(fragmentIndex);
+            const fragRows = dataset._fragments[fragmentIndex].numRows;
+
+            // Sample up to 10000 rows for fragment stats
+            const sampleSize = Math.min(fragRows, 10000);
+            const indices = Array.from({ length: sampleSize }, (_, i) => i);
+            const values = await fragFile.readColumnAtIndices(colIdx, indices);
+
+            const stats = {
+                fragmentIndex,
+                column: columnName,
+                rowCount: fragRows,
+                sampledRows: sampleSize,
+                nullCount: 0,
+                min: null,
+                max: null
+            };
+
+            for (const value of values) {
+                if (value === null || value === undefined) {
+                    stats.nullCount++;
+                    continue;
+                }
+                if (isNumeric) {
+                    if (stats.min === null || value < stats.min) stats.min = value;
+                    if (stats.max === null || value > stats.max) stats.max = value;
+                }
+            }
+
+            // Cache fragment stats
+            const existing = await this.loadFromCache(datasetUrl, version) || { columns: {}, fragments: {} };
+            if (!existing.fragments) existing.fragments = {};
+            if (!existing.fragments[fragmentIndex]) existing.fragments[fragmentIndex] = {};
+            existing.fragments[fragmentIndex][columnName] = stats;
+            await this.saveToCache(datasetUrl, version, existing);
+
+            return stats;
+        } catch (e) {
+            console.warn(`[StatisticsManager] Error computing fragment ${fragmentIndex} stats:`, e);
+            return null;
+        }
+    }
+
+    /**
+     * Get fragments that might match a filter based on statistics.
+     * Returns indices of fragments that can't be pruned.
+     */
+    async getPrunableFragments(dataset, filters) {
+        if (!filters || filters.length === 0 || !dataset._fragments) {
+            return null; // Can't prune
+        }
+
+        const numFragments = dataset._fragments.length;
+        const matchingFragments = [];
+        let fragmentsPruned = 0;
+
+        // Get filter columns
+        const filterColumns = new Set();
+        for (const filter of filters) {
+            if (filter.column) filterColumns.add(filter.column);
+        }
+
+        for (let fragIdx = 0; fragIdx < numFragments; fragIdx++) {
+            let canPrune = false;
+
+            for (const filter of filters) {
+                if (!filter.column) continue;
+
+                // Get stats for this fragment/column (computed lazily)
+                const fragStats = await this.getFragmentStats(dataset, filter.column, fragIdx);
+
+                if (fragStats && !this.canMatchFragment({ [filter.column]: fragStats }, filter)) {
+                    canPrune = true;
+                    break;
+                }
+            }
+
+            if (!canPrune) {
+                matchingFragments.push(fragIdx);
+            } else {
+                fragmentsPruned++;
+            }
+        }
+
+        console.log(`[StatisticsManager] Fragment pruning: ${fragmentsPruned}/${numFragments} fragments pruned`);
+
+        return {
+            matchingFragments,
+            fragmentsPruned,
+            totalFragments: numFragments
+        };
+    }
+}
+
+// Global statistics manager instance
+const statisticsManager = new StatisticsManager();
+
+/**
+ * Cost Model - estimates query execution cost for remote vs local strategies.
+ *
+ * This enables the optimizer to choose between:
+ * - Remote: Minimize RTTs and bytes transferred (high latency, high bandwidth cost)
+ * - Local: Maximize sequential I/O (low latency, CPU-bound)
+ *
+ * Similar to how DuckDB and DataFusion estimate query costs.
+ */
+class CostModel {
+    constructor(options = {}) {
+        this.isRemote = options.isRemote ?? true;
+
+        // Network costs (ms)
+        this.rttLatency = options.rttLatency ?? 50; // Round-trip time
+        this.bandwidthMBps = options.bandwidthMBps ?? 10; // MB/s
+
+        // CPU costs (ms per row)
+        this.filterCostPerRow = options.filterCostPerRow ?? 0.001;
+        this.hashBuildCostPerRow = options.hashBuildCostPerRow ?? 0.01;
+        this.hashProbeCostPerRow = options.hashProbeCostPerRow ?? 0.005;
+
+        // Memory costs
+        this.memoryLimitMB = options.memoryLimitMB ?? 512;
+    }
+
+    /**
+     * Estimate cost of scanning a table/fragment
+     */
+    estimateScanCost(rowCount, columnBytes, selectivity = 1.0) {
+        const bytesToFetch = rowCount * columnBytes * selectivity;
+
+        // Network cost for remote, near-zero for local
+        const networkCost = this.isRemote
+            ? this.rttLatency + (bytesToFetch / (this.bandwidthMBps * 1024 * 1024)) * 1000
+            : 0.1; // Local disk is nearly instant
+
+        // CPU cost (filtering)
+        const cpuCost = rowCount * this.filterCostPerRow;
+
+        return {
+            totalMs: networkCost + cpuCost,
+            networkMs: networkCost,
+            cpuMs: cpuCost,
+            bytesToFetch,
+            rowsToScan: rowCount * selectivity
+        };
+    }
+
+    /**
+     * Estimate cost of a hash join
+     */
+    estimateJoinCost(leftRows, rightRows, leftBytes, rightBytes, joinSelectivity = 0.1) {
+        // Build phase: hash the smaller table
+        const buildRows = Math.min(leftRows, rightRows);
+        const buildBytes = buildRows < leftRows ? leftBytes : rightBytes;
+        const buildCost = buildRows * this.hashBuildCostPerRow;
+
+        // Probe phase: scan the larger table
+        const probeRows = Math.max(leftRows, rightRows);
+        const probeCost = probeRows * this.hashProbeCostPerRow;
+
+        // Memory check: can we fit build side in RAM?
+        const buildMemoryMB = (buildRows * buildBytes) / (1024 * 1024);
+        const needsSpill = buildMemoryMB > this.memoryLimitMB;
+
+        // Spill cost (OPFS write + read)
+        const spillCost = needsSpill ? buildMemoryMB * 10 : 0; // ~10ms per MB for OPFS
+
+        return {
+            totalMs: buildCost + probeCost + spillCost,
+            buildMs: buildCost,
+            probeMs: probeCost,
+            spillMs: spillCost,
+            needsSpill,
+            outputRows: Math.round(leftRows * rightRows * joinSelectivity)
+        };
+    }
+
+    /**
+     * Estimate cost of an aggregation
+     */
+    estimateAggregateCost(inputRows, groupCount, aggCount) {
+        // Cost scales with input rows and number of groups
+        const hashGroupCost = inputRows * this.hashBuildCostPerRow;
+        const aggComputeCost = inputRows * aggCount * 0.0001; // Aggregation is cheap
+
+        return {
+            totalMs: hashGroupCost + aggComputeCost,
+            outputRows: groupCount
+        };
+    }
+
+    /**
+     * Compare two plan costs and recommend the better one
+     */
+    comparePlans(planA, planB) {
+        const costA = planA.totalCost || this.estimatePlanCost(planA);
+        const costB = planB.totalCost || this.estimatePlanCost(planB);
+
+        return {
+            recommended: costA.totalMs < costB.totalMs ? 'A' : 'B',
+            costA,
+            costB,
+            savings: Math.abs(costA.totalMs - costB.totalMs)
+        };
+    }
+
+    /**
+     * Estimate total cost of a query plan
+     */
+    estimatePlanCost(plan) {
+        let totalMs = 0;
+        let totalBytes = 0;
+        let operations = [];
+
+        // Scan costs
+        if (plan.leftScan) {
+            const scanCost = this.estimateScanCost(
+                plan.leftScan.estimatedRows || 10000,
+                plan.leftScan.columnBytes || 100,
+                plan.leftScan.selectivity || 1.0
+            );
+            totalMs += scanCost.totalMs;
+            totalBytes += scanCost.bytesToFetch;
+            operations.push({ op: 'scan_left', ...scanCost });
+        }
+
+        if (plan.rightScan) {
+            const scanCost = this.estimateScanCost(
+                plan.rightScan.estimatedRows || 10000,
+                plan.rightScan.columnBytes || 100,
+                plan.rightScan.selectivity || 1.0
+            );
+            totalMs += scanCost.totalMs;
+            totalBytes += scanCost.bytesToFetch;
+            operations.push({ op: 'scan_right', ...scanCost });
+        }
+
+        // Join costs
+        if (plan.join) {
+            const joinCost = this.estimateJoinCost(
+                plan.leftScan?.estimatedRows || 10000,
+                plan.rightScan?.estimatedRows || 10000,
+                plan.leftScan?.columnBytes || 100,
+                plan.rightScan?.columnBytes || 100,
+                plan.join.selectivity || 0.1
+            );
+            totalMs += joinCost.totalMs;
+            operations.push({ op: 'join', ...joinCost });
+        }
+
+        // Aggregation costs
+        if (plan.aggregations && plan.aggregations.length > 0) {
+            const aggCost = this.estimateAggregateCost(
+                plan.estimatedInputRows || 10000,
+                plan.groupBy?.length || 1,
+                plan.aggregations.length
+            );
+            totalMs += aggCost.totalMs;
+            operations.push({ op: 'aggregate', ...aggCost });
+        }
+
+        return {
+            totalMs,
+            totalBytes,
+            operations,
+            isRemote: this.isRemote
+        };
+    }
+}
+
+// Export cost model
+export { CostModel };
+
+/**
  * OPFS-only storage for Lance database files.
  *
  * Uses Origin Private File System (OPFS) exclusively - no IndexedDB.
@@ -533,8 +1130,8 @@ class DatasetStorage {
 const opfsStorage = new OPFSStorage();  // OPFS-only (recommended)
 const datasetStorage = new DatasetStorage();  // Legacy IndexedDB + OPFS
 
-// Export storage for external use
-export { opfsStorage, OPFSStorage, datasetStorage, DatasetStorage };
+// Export storage and statistics for external use
+export { opfsStorage, OPFSStorage, datasetStorage, DatasetStorage, statisticsManager, StatisticsManager };
 
 // =============================================================================
 // OPFSJoinExecutor - OPFS-backed join execution for TB-scale joins
@@ -7607,6 +8204,29 @@ export class SQLExecutor {
             ? await this.file.getRowCount(0)
             : Number(this.file.getRowCount(0));
 
+        // === STATISTICS-BASED OPTIMIZATION ===
+        // For queries with filters, compute statistics to enable pruning
+        let columnStats = null;
+        let prunedFragments = null;
+        let fragmentsPruned = 0;
+
+        if (ast.where && plan.pushedFilters.length > 0 && this.file._isRemote) {
+            // Compute stats for filter columns (cached after first computation)
+            columnStats = await statisticsManager.precomputeForPlan(this.file, plan);
+
+            // Log statistics info
+            if (columnStats.size > 0) {
+                console.log(`[SQLExecutor] Statistics available for ${columnStats.size} columns`);
+                for (const [col, stats] of columnStats) {
+                    console.log(`  ${col}: min=${stats.min}, max=${stats.max}, nulls=${stats.nullCount}`);
+                }
+            }
+
+            // Fragment pruning based on global statistics
+            // (Per-fragment stats would be even better - computed lazily)
+            plan.columnStats = Object.fromEntries(columnStats);
+        }
+
         // Use plan's scan columns instead of basic column collection
         const neededColumns = plan.scanColumns.length > 0
             ? plan.scanColumns
@@ -7729,6 +8349,14 @@ export class SQLExecutor {
             total: effectiveTotal,
             orderByOnSubset,
             orderByColumns: ast.orderBy ? ast.orderBy.map(ob => `${ob.column} ${ob.direction}`) : [],
+            // Query optimization info
+            queryPlan: plan,
+            optimization: {
+                statsComputed: columnStats?.size > 0,
+                columnStats: columnStats ? Object.fromEntries(columnStats) : null,
+                pushedFilters: plan.pushedFilters?.length || 0,
+                estimatedSelectivity: plan.estimatedSelectivity,
+            },
         };
     }
 
