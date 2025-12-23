@@ -2968,7 +2968,7 @@
                     const displayName = url.split('/').pop() || 'remote.lance';
                     const versionSuffix = currentFile.version ? ` v${currentFile.version}` : '';
                     Alpine.store('app').fileName = displayName + (currentFile._isDataset ? ` (dataset${versionSuffix})` : '');
-                    Alpine.store('app').fileSize = (currentFile.size / 1024 / 1024).toFixed(2) + ' MB';
+                    Alpine.store('app').fileSize = currentFile._isDataset ? '' : (currentFile.size / 1024 / 1024).toFixed(2) + ' MB';
                     Alpine.store('app').colCount = currentFile.numColumns;
                     Alpine.store('app').rowCount = currentFile._isDataset ? rowCount.toLocaleString() : 'Lazy';
                     collapseFileLoader();
@@ -3800,7 +3800,7 @@
                 // Update UI via Alpine store
                 const displayName = isDataset ? url.split('/').pop() : (url.split('/').pop() || 'remote.lance');
                 Alpine.store('app').fileName = displayName + (isDataset ? ' (dataset)' : '');
-                Alpine.store('app').fileSize = (remoteFile.size / 1024 / 1024).toFixed(2) + ' MB';
+                Alpine.store('app').fileSize = isDataset ? '' : (remoteFile.size / 1024 / 1024).toFixed(2) + ' MB';
                 Alpine.store('app').colCount = remoteFile.numColumns;
                 Alpine.store('app').rowCount = isDataset ? rowCount.toLocaleString() : 'Lazy';
                 collapseFileLoader();
