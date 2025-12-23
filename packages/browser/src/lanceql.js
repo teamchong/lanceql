@@ -1427,9 +1427,6 @@ export class OPFSJoinExecutor {
     }
 }
 
-// Export for external use
-export { OPFSJoinExecutor };
-
 // =============================================================================
 // LocalDatabase - ACID-compliant local database with CRUD support
 // =============================================================================
