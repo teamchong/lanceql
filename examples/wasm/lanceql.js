@@ -9930,11 +9930,39 @@ export class RemoteLanceDataset {
     }
 
     /**
-     * Get total size (sum of all fragment files).
+     * Get estimated total size based on row count and schema.
+     * More accurate than fragment count estimate.
      */
     get size() {
-        // Estimate based on fragments
-        return this._fragments.length * 100 * 1024 * 1024; // ~100MB per fragment estimate
+        if (this._cachedSize) return this._cachedSize;
+
+        // Estimate bytes per row based on column types
+        let bytesPerRow = 0;
+        for (let i = 0; i < (this._columnTypes?.length || 0); i++) {
+            const colType = this._columnTypes[i];
+            if (colType === 'int64' || colType === 'float64' || colType === 'double') {
+                bytesPerRow += 8;
+            } else if (colType === 'int32' || colType === 'float32') {
+                bytesPerRow += 4;
+            } else if (colType === 'string') {
+                bytesPerRow += 50; // Average string length estimate
+            } else if (colType === 'vector' || colType?.startsWith('vector[')) {
+                // Extract dimension from type like "vector[384]"
+                const match = colType?.match(/\[(\d+)\]/);
+                const dim = match ? parseInt(match[1]) : 384;
+                bytesPerRow += dim * 4; // float32 per dimension
+            } else {
+                bytesPerRow += 8; // Default
+            }
+        }
+
+        // Fallback if no column types
+        if (bytesPerRow === 0) {
+            bytesPerRow = 100; // Conservative default
+        }
+
+        this._cachedSize = this._totalRows * bytesPerRow;
+        return this._cachedSize;
     }
 
     /**
