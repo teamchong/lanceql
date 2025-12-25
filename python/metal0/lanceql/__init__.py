@@ -3,6 +3,7 @@
 __version__ = "0.1.0"
 
 from . import parquet
+from .cache import HotTierCache, hot_tier_cache
 
 # polars is optional - import lazily to avoid ImportError if not installed
 def __getattr__(name):
@@ -11,4 +12,4 @@ def __getattr__(name):
         return polars
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-__all__ = ["parquet", "polars", "__version__"]
+__all__ = ["parquet", "polars", "HotTierCache", "hot_tier_cache", "__version__"]

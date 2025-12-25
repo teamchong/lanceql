@@ -1259,6 +1259,7 @@
                     Change File
                 </button>
             </div>
+
             <div class="column-chips" id="column-chips"></div>
             <div class="network-stats"
                  :class="{ 'hidden': $store.app.bytesDownloaded === 0 }"
@@ -1338,6 +1339,7 @@
                         <button class="sql-example" data-sql="SELECT COUNT(*) FROM read_lance('https://data.metal0.dev/laion-1m/images.lance')">COUNT(*)</button>
                         <button class="sql-example" data-sql="SELECT AVG(aesthetic), MIN(aesthetic), MAX(aesthetic) FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 10000">Stats 10K</button>
                         <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') NEAR 'cat'">NEAR 'cat'</button>
+                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/translations.lance') LIMIT 50" title="Translations dataset">Translations</button>
                         <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance', 1) LIMIT 50">Version 1</button>
                         <button class="sql-example copy-link-btn" id="copy-link-btn" title="Copy shareable link">
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1567,8 +1569,9 @@
     <script type="module">
         import Alpine from 'https://esm.sh/alpinejs@3.14.3';
         import { atom, computed } from 'https://esm.sh/nanostores@0.10.3';
-        // Import from local lanceql.js
-        import LanceQL, { SQLExecutor, SQLLexer, SQLParser, LanceData, initSqlJs } from './lanceql.js';
+        // Import from local lanceql.js (synced from packages/browser/src/lanceql.js)
+        // Run: cp packages/browser/src/lanceql.js examples/wasm/lanceql.js
+        import LanceQL, { SQLExecutor, SQLLexer, SQLParser, initSqlJs } from './lanceql.js';
 
         let lanceql;
 
@@ -3080,9 +3083,11 @@
 
                 showStatus('Executing query...', 'info');
 
-                // Use the new SQL executor for proper parsing
+                let result;
+
+                // Use SQLExecutor which handles read_lance() inline URL loading
                 const executor = new SQLExecutor(targetFile);
-                const result = await executor.execute(sql, (msg, current, total) => {
+                result = await executor.execute(sql, (msg, current, total) => {
                     showProgress(msg, current, total);
                 });
 
@@ -3108,10 +3113,15 @@
                 }
 
                 Alpine.store('app').showResults = true;
-                // CSS-driven: render via LanceData (events trigger Alpine updates)
-                LanceData.render('#results-body', formattedResult);
+                // Use displayResults to include Find Similar buttons for vector columns
+                displayResults(formattedResult);
                 hideProgress();
-                // Note: resultsCount updated via @lq-complete event
+
+                // Show success status with row count
+                const rowsReturned = formattedResult.rows.length;
+                const totalRows = formattedResult.total || rowsReturned;
+                showStatus(`Query complete: ${rowsReturned.toLocaleString()} rows${totalRows > rowsReturned ? ` of ${totalRows.toLocaleString()} total` : ''}`, 'success');
+                Alpine.store('app').resultsCount = rowsReturned;
             } catch (err) {
                 if (err.name === 'AbortError' || isSearchCancelled(signal)) {
                     console.log('Search cancelled');
@@ -3529,8 +3539,10 @@
             const isAggregationResult = resultColNames.some(c =>
                 /^(COUNT|SUM|AVG|MIN|MAX)\s*\(/i.test(c)
             );
+            // Use currentFile._columnTypes directly (more reliable than global columnTypes)
+            const colTypes = currentFile?._columnTypes || columnTypes || [];
             if (!isAggregationResult) {
-                columnTypes.forEach((t, idx) => {
+                colTypes.forEach((t, idx) => {
                     if (t === 'vector') {
                         vectorCols.push({ idx, name: colNames[idx] || `col_${idx}` });
                     }

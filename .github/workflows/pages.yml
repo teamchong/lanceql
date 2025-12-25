@@ -6,6 +6,7 @@ on:
     paths:
       - 'src/wasm.zig'
       - 'examples/wasm/**'
+      - 'packages/browser/src/**'  # lanceql.js source (symlinked from examples/wasm)
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
