@@ -75,6 +75,8 @@ class HotTierCache:
             "bytes_from_cache": 0,
             "bytes_from_network": 0,
         }
+        # In-memory cache for metadata to avoid disk reads on every get_range call
+        self._meta_cache: Dict[str, Dict[str, Any]] = {}  # url -> {meta, full_file_data}
 
     def _get_cache_key(self, url: str) -> str:
         """Get cache key from URL (hash for safe filesystem names)."""
@@ -164,51 +166,49 @@ class HotTierCache:
         if not self.enabled:
             return self._fetch_range(url, start, end)
 
+        # Fast path: check in-memory cache first (no disk I/O)
+        mem_cached = self._meta_cache.get(url)
+        if mem_cached and mem_cached.get("full_file_data") is not None:
+            data = mem_cached["full_file_data"]
+            if len(data) > end:
+                self._stats["hits"] += 1
+                self._stats["bytes_from_cache"] += (end - start + 1)
+                return data[start:end + 1]
+
         self._ensure_cache_dir()
 
-        # Check if we have the full file cached
-        cached, meta = self.is_cached(url)
-        if cached and meta and meta.get("full_file"):
-            data_path = self._get_cache_path(url, "data.lance")
-            try:
-                data = self._mmap_read(str(data_path), start, end - start + 1)
-                self._stats["hits"] += 1
-                self._stats["bytes_from_cache"] += len(data)
-                return data
-            except Exception:
-                # Fallback to regular read
-                with open(data_path, "rb") as f:
-                    full_data = f.read()
-                if len(full_data) > end:
-                    self._stats["hits"] += 1
-                    self._stats["bytes_from_cache"] += (end - start + 1)
-                    return full_data[start:end + 1]
-
-        # Check if this specific range is cached
-        if cached and meta and meta.get("ranges"):
-            for range_info in meta["ranges"]:
-                if range_info["start"] <= start and range_info["end"] >= end:
-                    range_path = self._get_cache_path(
-                        url, f"ranges/{range_info['start']}-{range_info['end']}"
-                    )
-                    try:
-                        with open(range_path, "rb") as f:
-                            range_data = f.read()
+        # Check disk cache (only once per URL, then cache in memory)
+        if mem_cached is None:
+            cached, meta = self.is_cached(url)
+            if cached and meta and meta.get("full_file"):
+                data_path = self._get_cache_path(url, "data.lance")
+                try:
+                    data = self._mmap_read(str(data_path))
+                    # Cache in memory for subsequent calls
+                    self._meta_cache[url] = {"meta": meta, "full_file_data": data}
+                    if len(data) > end:
                         self._stats["hits"] += 1
-                        offset = start - range_info["start"]
-                        length = end - start + 1
-                        self._stats["bytes_from_cache"] += length
-                        return range_data[offset:offset + length]
-                    except FileNotFoundError:
-                        pass  # Range file missing, fall through to network
+                        self._stats["bytes_from_cache"] += (end - start + 1)
+                        return data[start:end + 1]
+                except Exception:
+                    # Fallback to regular read
+                    with open(data_path, "rb") as f:
+                        full_data = f.read()
+                    self._meta_cache[url] = {"meta": meta, "full_file_data": full_data}
+                    if len(full_data) > end:
+                        self._stats["hits"] += 1
+                        self._stats["bytes_from_cache"] += (end - start + 1)
+                        return full_data[start:end + 1]
+            # Mark as checked even if not cached
+            self._meta_cache[url] = {"meta": meta if cached else None, "full_file_data": None}
 
         # Cache miss - fetch from network
         self._stats["misses"] += 1
         data = self._fetch_range(url, start, end)
         self._stats["bytes_from_network"] += len(data)
 
-        # Cache the range for future use
-        self._cache_range(url, start, end, data, file_size)
+        # Don't cache individual ranges - too slow for many small reads
+        # Only full files are cached (via prefetch)
 
         return data
 

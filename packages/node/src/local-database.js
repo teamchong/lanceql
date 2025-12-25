@@ -467,6 +467,8 @@ class HotTierCache {
             bytesFromCache: 0,
             bytesFromNetwork: 0,
         };
+        // In-memory cache for metadata to avoid disk reads on every getRange call
+        this._metaCache = new Map();  // url -> { meta, fullFileData }
     }
 
     /**
@@ -569,45 +571,46 @@ class HotTierCache {
             return this._fetchRange(url, start, end);
         }
 
-        await this.init();
-
-        // Check if we have the full file cached
-        const { cached, meta } = await this.isCached(url);
-        if (cached && meta.fullFile) {
-            const dataPath = this._getCachePath(url, 'data.lance');
-            try {
-                const data = await this._mmapRead(dataPath, start, end - start + 1);
+        // Fast path: check in-memory cache first (no disk I/O)
+        const memCached = this._metaCache.get(url);
+        if (memCached?.fullFileData) {
+            const data = memCached.fullFileData;
+            if (data.length > end) {
                 this._stats.hits++;
-                this._stats.bytesFromCache += data.length;
-                return data;
-            } catch (e) {
-                // Fallback to regular read
-                const fullData = await readFile(dataPath);
-                if (fullData.length > end) {
-                    this._stats.hits++;
-                    this._stats.bytesFromCache += (end - start + 1);
-                    return fullData.slice(start, end + 1);
-                }
+                this._stats.bytesFromCache += (end - start + 1);
+                return data.slice(start, end + 1);
             }
         }
 
-        // Check if this specific range is cached
-        if (cached && meta.ranges) {
-            for (const range of meta.ranges) {
-                if (range.start <= start && range.end >= end) {
-                    const rangePath = this._getCachePath(url, `ranges/${range.start}-${range.end}`);
-                    try {
-                        const rangeData = await readFile(rangePath);
+        await this.init();
+
+        // Check disk cache (only once per URL, then cache in memory)
+        if (!memCached) {
+            const { cached, meta } = await this.isCached(url);
+            if (cached && meta.fullFile) {
+                const dataPath = this._getCachePath(url, 'data.lance');
+                try {
+                    const data = await this._mmapRead(dataPath);
+                    // Cache in memory for subsequent calls
+                    this._metaCache.set(url, { meta, fullFileData: data });
+                    if (data.length > end) {
                         this._stats.hits++;
-                        const offset = start - range.start;
-                        const length = end - start + 1;
-                        this._stats.bytesFromCache += length;
-                        return rangeData.slice(offset, offset + length);
-                    } catch (e) {
-                        // Range file missing, fall through to network
+                        this._stats.bytesFromCache += (end - start + 1);
+                        return data.slice(start, end + 1);
+                    }
+                } catch (e) {
+                    // Fallback to regular read
+                    const fullData = await readFile(dataPath);
+                    this._metaCache.set(url, { meta, fullFileData: fullData });
+                    if (fullData.length > end) {
+                        this._stats.hits++;
+                        this._stats.bytesFromCache += (end - start + 1);
+                        return fullData.slice(start, end + 1);
                     }
                 }
             }
+            // Mark as checked even if not cached
+            this._metaCache.set(url, { meta: cached ? meta : null, fullFileData: null });
         }
 
         // Cache miss - fetch from network
@@ -615,8 +618,8 @@ class HotTierCache {
         const data = await this._fetchRange(url, start, end);
         this._stats.bytesFromNetwork += data.length;
 
-        // Cache the range for future use
-        await this._cacheRange(url, start, end, data, fileSize);
+        // Don't cache individual ranges - too slow for many small reads
+        // Only full files are cached (via prefetch)
 
         return data;
     }

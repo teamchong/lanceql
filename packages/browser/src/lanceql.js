@@ -1166,6 +1166,8 @@ class HotTierCache {
             bytesFromCache: 0,
             bytesFromNetwork: 0,
         };
+        // In-memory cache for metadata to avoid OPFS reads on every getRange call
+        this._metaCache = new Map();  // url -> { meta, fullFileData }
     }
 
     /**
@@ -1272,35 +1274,35 @@ class HotTierCache {
             return this._fetchRange(url, start, end);
         }
 
-        await this.init();
-
-        // Check if we have the full file cached
-        const { cached, meta } = await this.isCached(url);
-        if (cached && meta.fullFile) {
-            const dataPath = this._getCachePath(url, '/data.lance');
-            const data = await this.storage.load(dataPath);
-            if (data && data.byteLength > end) {
+        // Fast path: check in-memory cache first (no async overhead)
+        const memCached = this._metaCache.get(url);
+        if (memCached?.fullFileData) {
+            const data = memCached.fullFileData;
+            if (data.byteLength > end) {
                 this._stats.hits++;
                 this._stats.bytesFromCache += (end - start + 1);
                 return data.slice(start, end + 1).buffer;
             }
         }
 
-        // Check if this specific range is cached
-        if (cached && meta.ranges) {
-            for (const range of meta.ranges) {
-                if (range.start <= start && range.end >= end) {
-                    const rangePath = this._getCachePath(url, `/ranges/${range.start}-${range.end}`);
-                    const rangeData = await this.storage.load(rangePath);
-                    if (rangeData) {
-                        this._stats.hits++;
-                        const offset = start - range.start;
-                        const length = end - start + 1;
-                        this._stats.bytesFromCache += length;
-                        return rangeData.slice(offset, offset + length).buffer;
-                    }
+        await this.init();
+
+        // Check OPFS cache (only once per URL, then cache in memory)
+        if (!memCached) {
+            const { cached, meta } = await this.isCached(url);
+            if (cached && meta.fullFile) {
+                const dataPath = this._getCachePath(url, '/data.lance');
+                const data = await this.storage.load(dataPath);
+                if (data && data.byteLength > end) {
+                    // Cache in memory for subsequent calls
+                    this._metaCache.set(url, { meta, fullFileData: data });
+                    this._stats.hits++;
+                    this._stats.bytesFromCache += (end - start + 1);
+                    return data.slice(start, end + 1).buffer;
                 }
             }
+            // Mark as checked even if not cached
+            this._metaCache.set(url, { meta: cached ? meta : null, fullFileData: null });
         }
 
         // Cache miss - fetch from network
@@ -1308,8 +1310,8 @@ class HotTierCache {
         const data = await this._fetchRange(url, start, end);
         this._stats.bytesFromNetwork += data.byteLength;
 
-        // Cache the range for future use
-        await this._cacheRange(url, start, end, new Uint8Array(data), fileSize);
+        // Don't cache individual ranges to OPFS - too slow for IVF search
+        // Only full files are cached (via prefetch)
 
         return data;
     }
@@ -6258,6 +6260,10 @@ export class IVFIndex {
         this.partitionIndexUrl = null;  // URL to ivf_partitions.bin
         this.partitionStarts = null;    // Uint32Array[257] - cumulative row counts
         this.hasPartitionIndex = false; // Whether partition index is loaded
+
+        // Prefetched row IDs cache - avoids HTTP requests during search
+        this._rowIdCache = null;  // Map<partitionIdx, Array<{fragId, rowOffset}>>
+        this._rowIdCacheReady = false;
     }
 
     /**
@@ -6330,6 +6336,13 @@ export class IVFIndex {
                 await index._loadPartitionIndex();
             } catch (e) {
                 console.warn('[IVFIndex] Failed to load partition index:', e);
+            }
+
+            // Prefetch all row IDs for fast search (no HTTP during search)
+            try {
+                await index.prefetchAllRowIds();
+            } catch (e) {
+                console.warn('[IVFIndex] Failed to prefetch row IDs:', e);
             }
 
             return index;
@@ -6825,26 +6838,100 @@ export class IVFIndex {
     }
 
     /**
-     * Fetch row IDs for specified partitions from auxiliary.idx.
-     * Returns array of decoded row IDs (as {fragId, rowOffset} pairs).
-     *
-     * The auxiliary.idx data region layout for each row:
-     * - Column 0: _rowid (uint64) - 8 bytes per row
-     * - Column 1: __pq_code (64 uint8s) - 64 bytes per row
-     * Total: 72 bytes per row if stored contiguously
-     *
-     * However, Lance stores columns separately, so we need to read
-     * just the _rowid column data.
+     * Prefetch ALL row IDs from auxiliary.idx into memory.
+     * This is called once during index loading to avoid HTTP requests during search.
+     * @returns {Promise<void>}
+     */
+    async prefetchAllRowIds() {
+        if (!this.auxiliaryUrl || !this._auxBufferOffsets) {
+            console.log('[IVFIndex] No auxiliary.idx available for prefetch');
+            return;
+        }
+
+        if (this._rowIdCacheReady) {
+            console.log('[IVFIndex] Row IDs already prefetched');
+            return;
+        }
+
+        const totalRows = this.partitionLengths.reduce((a, b) => a + b, 0);
+        if (totalRows === 0) {
+            console.log('[IVFIndex] No rows to prefetch');
+            return;
+        }
+
+        console.log(`[IVFIndex] Prefetching ${totalRows.toLocaleString()} row IDs...`);
+        const startTime = performance.now();
+
+        const dataStart = this._auxBufferOffsets[1];
+        const totalBytes = totalRows * 8;
+
+        try {
+            // Fetch ALL row IDs in a single request
+            const resp = await fetch(this.auxiliaryUrl, {
+                headers: { 'Range': `bytes=${dataStart}-${dataStart + totalBytes - 1}` }
+            });
+
+            if (!resp.ok) {
+                throw new Error(`HTTP ${resp.status}`);
+            }
+
+            const data = new Uint8Array(await resp.arrayBuffer());
+            const view = new DataView(data.buffer, data.byteOffset);
+
+            // Parse and organize by partition
+            this._rowIdCache = new Map();
+            let globalRowIdx = 0;
+
+            for (let p = 0; p < this.partitionLengths.length; p++) {
+                const numRows = this.partitionLengths[p];
+                const partitionRows = [];
+
+                for (let i = 0; i < numRows; i++) {
+                    const rowId = Number(view.getBigUint64(globalRowIdx * 8, true));
+                    const fragId = Math.floor(rowId / 0x100000000);
+                    const rowOffset = rowId % 0x100000000;
+                    partitionRows.push({ fragId, rowOffset });
+                    globalRowIdx++;
+                }
+
+                this._rowIdCache.set(p, partitionRows);
+            }
+
+            this._rowIdCacheReady = true;
+            const elapsed = performance.now() - startTime;
+            console.log(`[IVFIndex] Prefetched ${totalRows.toLocaleString()} row IDs in ${elapsed.toFixed(0)}ms (${(totalBytes / 1024 / 1024).toFixed(1)}MB)`);
+        } catch (e) {
+            console.warn('[IVFIndex] Failed to prefetch row IDs:', e);
+        }
+    }
+
+    /**
+     * Fetch row IDs for specified partitions.
+     * Uses prefetched cache if available (instant), otherwise fetches from network.
      *
      * @param {number[]} partitionIndices - Partition indices to fetch
      * @returns {Promise<Array<{fragId: number, rowOffset: number}>>}
      */
     async fetchPartitionRowIds(partitionIndices) {
+        // Fast path: use prefetched cache
+        if (this._rowIdCacheReady && this._rowIdCache) {
+            const results = [];
+            for (const p of partitionIndices) {
+                const cached = this._rowIdCache.get(p);
+                if (cached) {
+                    for (const row of cached) {
+                        results.push({ ...row, partition: p });
+                    }
+                }
+            }
+            return results;
+        }
+
+        // Slow path: fetch from network (fallback if prefetch failed)
         if (!this.auxiliaryUrl || !this._auxBufferOffsets) {
             return null;
         }
 
-        // Calculate total rows to fetch and their byte ranges
         const rowRanges = [];
         for (const p of partitionIndices) {
             if (p < this.partitionOffsets.length) {
@@ -6856,25 +6943,10 @@ export class IVFIndex {
 
         if (rowRanges.length === 0) return [];
 
-        // The data region starts at bufferOffsets[1]
-        // auxiliary.idx stores _rowid as uint64 (8 bytes each)
-        // Data is stored with _rowid column first, then __pq_code column
-        // We only need _rowid values
-
-        // First, get the _rowid column metadata from auxiliary.idx footer
-        // For now, use a simpler approach: assume row IDs are stored at
-        // (dataStart + rowIndex * 8) for each row in the partition order
-
-        // Note: This is a simplification. Full implementation would parse
-        // the column encoding from auxiliary.idx metadata.
-
         const results = [];
         const dataStart = this._auxBufferOffsets[1];
 
-        // Fetch row IDs in batches
         for (const range of rowRanges) {
-            // Calculate byte offset for this partition's row IDs
-            // Row IDs are at the start of the data region
             const byteStart = dataStart + range.startRow * 8;
             const byteEnd = byteStart + range.numRows * 8 - 1;
 
@@ -6883,17 +6955,13 @@ export class IVFIndex {
                     headers: { 'Range': `bytes=${byteStart}-${byteEnd}` }
                 });
 
-                if (!resp.ok) {
-                    console.warn(`[IVFIndex] Failed to fetch row IDs for partition ${range.partition}`);
-                    continue;
-                }
+                if (!resp.ok) continue;
 
                 const data = new Uint8Array(await resp.arrayBuffer());
                 const view = new DataView(data.buffer, data.byteOffset);
 
                 for (let i = 0; i < range.numRows; i++) {
                     const rowId = Number(view.getBigUint64(i * 8, true));
-                    // Decode Lance row ID: fragId = rowId >> 32, rowOffset = rowId & 0xFFFFFFFF
                     const fragId = Math.floor(rowId / 0x100000000);
                     const rowOffset = rowId % 0x100000000;
                     results.push({ fragId, rowOffset, partition: range.partition });

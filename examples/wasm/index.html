@@ -59,147 +59,135 @@
             color: #f8fafc;
         }
 
-        /* File loader */
-        .file-section {
+        /* Tables Panel */
+        .tables-section {
             background: #1e293b;
             border-radius: 12px;
-            padding: 20px;
+            padding: 15px;
             margin-bottom: 20px;
         }
-        .drop-zone {
-            border: 2px dashed #475569;
-            border-radius: 8px;
-            padding: 30px;
+        .tables-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+        .tables-title {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 600;
+            color: #e2e8f0;
+        }
+        .tables-title svg {
+            color: #3b82f6;
+        }
+        .tables-actions {
+            display: flex;
+            gap: 8px;
+        }
+        .tables-list {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            min-height: 40px;
+        }
+        .tables-empty {
+            color: #64748b;
+            font-size: 13px;
             text-align: center;
-            cursor: pointer;
+            padding: 20px;
+        }
+        .tables-empty code {
+            background: #334155;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'SF Mono', Monaco, monospace;
+        }
+        .table-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 12px;
+            background: #0f172a;
+            border-radius: 8px;
+            border: 1px solid #334155;
             transition: all 0.2s;
         }
-        .drop-zone:hover, .drop-zone.dragover {
+        .table-item:hover {
+            border-color: #475569;
+        }
+        .table-item.active {
             border-color: #3b82f6;
             background: rgba(59, 130, 246, 0.1);
         }
-        .drop-zone p {
-            margin: 5px 0;
-            color: #94a3b8;
-        }
-        .drop-zone p:first-child {
-            color: #e2e8f0;
-            font-size: 16px;
-        }
-        #file-input {
-            display: none;
-        }
-        .divider {
-            text-align: center;
-            margin: 15px 0;
+        .table-icon {
             color: #64748b;
-            font-size: 14px;
+            flex-shrink: 0;
         }
-        .url-input-group {
-            display: flex;
-            gap: 10px;
-        }
-        .url-input-group input {
+        .table-icon.local { color: #4ade80; }
+        .table-icon.remote { color: #60a5fa; }
+        .table-info {
             flex: 1;
-            padding: 12px 15px;
-            background: #0f172a;
-            border: 1px solid #334155;
-            border-radius: 8px;
-            color: #e2e8f0;
-            font-size: 14px;
-        }
-        .url-input-group input:focus {
-            outline: none;
-            border-color: #3b82f6;
-        }
-        .url-input-group input::placeholder {
-            color: #64748b;
-        }
-        .file-info {
-            display: flex;
-            align-items: center;
-            gap: 15px;
-            padding: 15px;
-            background: #0f172a;
-            border-radius: 8px;
-            margin-top: 15px;
+            min-width: 0;
             overflow: hidden;
         }
-        .file-info .file-details {
-            flex: 1;
-            min-width: 0; /* Allow flex item to shrink below content size */
-            overflow: hidden;
-        }
-        .file-info .file-details h3 {
+        .table-name {
+            font-weight: 600;
+            color: #e2e8f0;
+            font-family: 'SF Mono', Monaco, monospace;
+            font-size: 13px;
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
         }
-        .file-info.hidden {
-            display: none;
+        .table-meta {
+            font-size: 11px;
+            color: #64748b;
+            margin-top: 2px;
         }
-        .btn-change-file {
-            margin-left: auto;
-            padding: 6px 12px;
-            background: transparent;
-            border: 1px solid #475569;
-            border-radius: 6px;
+        .table-actions {
+            display: flex;
+            gap: 4px;
+            flex-shrink: 0;
+        }
+        .table-action-btn {
+            padding: 4px 8px;
+            background: #334155;
+            border: none;
+            border-radius: 4px;
             color: #94a3b8;
-            font-size: 13px;
-            flex-shrink: 0; /* Don't shrink the button */
-            white-space: nowrap;
+            font-size: 11px;
             cursor: pointer;
             transition: all 0.2s;
         }
-        .btn-change-file:hover {
-            background: #1e293b;
-            border-color: #64748b;
+        .table-action-btn:hover {
+            background: #475569;
             color: #e2e8f0;
         }
-        #file-loader-section {
-            transition: all 0.3s ease;
+        .table-action-btn.delete:hover {
+            background: #ef4444;
+            color: white;
         }
-        #file-loader-section.collapsed {
+        .tables-drop-zone {
             display: none;
-        }
-        .file-icon {
-            width: 48px;
-            height: 48px;
-            background: #3b82f6;
-            border-radius: 8px;
-            display: flex;
             align-items: center;
             justify-content: center;
-            color: white;
-            font-size: 20px;
-        }
-        .file-details h3 {
-            margin: 0 0 5px 0;
-            color: #f8fafc;
-        }
-        .file-details p {
-            margin: 0;
-            color: #64748b;
-            font-size: 14px;
-        }
-        .file-stats {
-            display: flex;
-            gap: 20px;
-            margin-left: auto;
-        }
-        .stat {
-            text-align: center;
-        }
-        .stat-value {
-            font-size: 20px;
-            font-weight: 600;
+            gap: 8px;
+            padding: 20px;
+            border: 2px dashed #3b82f6;
+            border-radius: 8px;
+            background: rgba(59, 130, 246, 0.1);
             color: #3b82f6;
+            font-size: 14px;
+            margin-top: 12px;
         }
-        .stat-label {
-            font-size: 12px;
-            color: #64748b;
+        .tables-section.dragover .tables-drop-zone {
+            display: flex;
         }
-
+        .tables-section.dragover .tables-list {
+            opacity: 0.5;
+        }
         /* Tabs */
         .tabs-container {
             background: #1e293b;
@@ -1165,15 +1153,7 @@
             .container { padding: 8px; }
             header { gap: 8px; }
             .logo { font-size: 16px; }
-            .file-section { padding: 12px; }
-            .drop-zone { padding: 20px; }
-            .url-input-group { flex-direction: column; }
-            .url-input-group input { width: 100%; }
-            .file-info { flex-wrap: wrap; gap: 8px; }
-            .file-info .file-icon { display: none; }
-            .file-info .file-details { flex: 1; min-width: 150px; }
-            .file-info .file-stats { flex: 1; min-width: 100px; }
-            .file-info .btn-change-file { width: 100%; margin-top: 8px; }
+            .tables-section { padding: 12px; }
             .tabs-header { flex-wrap: wrap; gap: 4px; }
             .tab-btn { padding: 8px 10px; font-size: 12px; flex: 1; min-width: 100px; }
             .tab-btn svg { display: none; }
@@ -1214,52 +1194,43 @@
             </a>
         </header>
 
-        <!-- File Loader -->
-        <section class="file-section" :class="{ 'collapsed': $store.app.fileLoaderCollapsed }">
-            <div id="file-loader-section" x-show="!$store.app.fileLoaderCollapsed">
-                <div class="drop-zone" id="drop-zone">
-                    <p>Drop a .lance folder/file here or click to select</p>
-                    <div style="display: flex; gap: 8px; justify-content: center; margin-top: 8px;">
-                        <button class="btn btn-secondary" id="select-folder-btn" style="font-size: 12px;">Select Folder</button>
-                        <button class="btn btn-secondary" id="select-file-btn" style="font-size: 12px;">Select File</button>
-                    </div>
-                    <input type="file" id="file-input-folder" webkitdirectory directory style="display: none;">
-                    <input type="file" id="file-input-file" accept=".lance" style="display: none;">
-                </div>
-                <div class="divider">or load from URL</div>
-                <div class="url-input-group">
-                    <input type="text" id="url-input" placeholder="Enter Lance file URL (requires CORS headers)">
-                    <button class="btn btn-primary" id="load-url-btn" :disabled="$store.app.isLoading">Load URL</button>
-                </div>
-            </div>
-            <div class="file-info"
-                 :class="{ 'hidden': !$store.app.fileName }"
-                 id="file-info">
-                <div class="file-icon">
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <!-- Tables Panel -->
+        <section class="tables-section">
+            <div class="tables-header">
+                <span class="tables-title">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
                         <polyline points="14,2 14,8 20,8"/>
                     </svg>
+                    Tables
+                </span>
+                <div class="tables-actions">
+                    <button class="btn btn-sm btn-primary" id="upload-btn" title="Upload .lance file">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                            <polyline points="17 8 12 3 7 8"/>
+                            <line x1="12" y1="3" x2="12" y2="15"/>
+                        </svg>
+                        Upload
+                    </button>
+                    <input type="file" id="file-input-upload" accept=".lance" multiple style="display: none;">
+                    <input type="file" id="folder-input-upload" webkitdirectory directory style="display: none;">
                 </div>
-                <div class="file-details">
-                    <h3 x-text="$store.app.fileName" id="file-name">filename.lance</h3>
-                    <p x-text="$store.app.fileSize" id="file-size">0 KB</p>
-                </div>
-                <div class="file-stats">
-                    <div class="stat">
-                        <div class="stat-value" x-text="$store.app.colCount" id="col-count">0</div>
-                        <div class="stat-label">Columns</div>
-                    </div>
-                    <div class="stat">
-                        <div class="stat-value" x-text="$store.app.rowCount" id="row-count">0</div>
-                        <div class="stat-label">Rows</div>
-                    </div>
-                </div>
-                <button class="btn-change-file" onclick="toggleFileLoader()" title="Load a different file">
-                    Change File
-                </button>
             </div>
-
+            <div class="tables-list" id="tables-list">
+                <div class="tables-empty" id="tables-empty">
+                    <p>No tables loaded. Upload a .lance file or run a query with <code>read_lance('https://...')</code></p>
+                </div>
+                <!-- Tables will be populated here -->
+            </div>
+            <div class="tables-drop-zone" id="tables-drop-zone">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <polyline points="17 8 12 3 7 8"/>
+                    <line x1="12" y1="3" x2="12" y2="15"/>
+                </svg>
+                <span>Drop .lance files here</span>
+            </div>
             <div class="column-chips" id="column-chips"></div>
             <div class="network-stats"
                  :class="{ 'hidden': $store.app.bytesDownloaded === 0 }"
@@ -1704,9 +1675,6 @@
                 Alpine.store('app').showQuery = true;
                 document.getElementById('run-sql-btn').disabled = false;
 
-                // Set default URL in input for reference
-                document.getElementById('url-input').value = DEFAULT_DATASET_URL;
-
                 // Check URL hash for shared query
                 const hashParams = new URLSearchParams(window.location.hash.slice(1));
                 const sharedSql = hashParams.get('sql');
@@ -1727,6 +1695,9 @@
                     syncQueryTabs(query, 'sql');
                 }
                 setTimeout(runSqlQuery, 100);
+
+                // Load previously uploaded files from OPFS
+                loadOPFSTables();
 
                 // Initialize CLIP and MiniLM after lanceql is loaded
                 initClipWasm();
@@ -2016,9 +1987,6 @@
                 showStatus('Invalid Lance file - missing LANC magic bytes', 'error');
                 return;
             }
-
-            // Clear URL input when loading a local file
-            document.getElementById('url-input').value = '';
 
             if (currentFile) currentFile.close();
             const newFile = lanceql.open(data);
@@ -2999,6 +2967,18 @@
                         hintEl.style.display = 'none';
                     }
 
+                    // Auto-register remote URL to tables list
+                    const tableName = url;  // Use full URL as table name for remote sources
+                    if (!tablesRegistry.has(tableName)) {
+                        registerTable(tableName, {
+                            type: 'remote',
+                            url,
+                            dataset: currentFile,
+                            rows: currentFile._isDataset ? currentFile.rowCount : 0,
+                            cols: currentFile.numColumns
+                        });
+                    }
+
                     // Populate DataFrame builder selects
                     document.getElementById('run-df-btn').disabled = false;
                     const filterCol = document.getElementById('df-filter-col');
@@ -3898,73 +3878,216 @@
             }
         }
 
-        // Event listeners
-        const dropZone = document.getElementById('drop-zone');
-        const fileInputFolder = document.getElementById('file-input-folder');
-        const fileInputFile = document.getElementById('file-input-file');
-        const selectFolderBtn = document.getElementById('select-folder-btn');
-        const selectFileBtn = document.getElementById('select-file-btn');
-        const urlInput = document.getElementById('url-input');
-        const loadUrlBtn = document.getElementById('load-url-btn');
+        // === Tables Registry ===
+        // Stores all loaded tables: { name -> { type: 'local'|'remote', dataset, url?, rows, cols } }
+        const tablesRegistry = new Map();
 
-        // Button clicks trigger respective file inputs
-        selectFolderBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            fileInputFolder.click();
-        });
-        selectFileBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            fileInputFile.click();
+        function renderTablesUI() {
+            const listEl = document.getElementById('tables-list');
+            const emptyEl = document.getElementById('tables-empty');
+
+            if (tablesRegistry.size === 0) {
+                emptyEl.style.display = 'block';
+                listEl.querySelectorAll('.table-item').forEach(el => el.remove());
+                return;
+            }
+
+            emptyEl.style.display = 'none';
+
+            // Build HTML for all tables
+            let html = '';
+            for (const [name, info] of tablesRegistry) {
+                const isLocal = info.type === 'local';
+                const iconClass = isLocal ? 'local' : 'remote';
+                const icon = isLocal
+                    ? '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14,2 14,8 20,8"/></svg>'
+                    : '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>';
+
+                const meta = [];
+                if (info.rows) meta.push(`${info.rows.toLocaleString()} rows`);
+                if (info.cols) meta.push(`${info.cols} cols`);
+                meta.push(isLocal ? 'local' : 'remote');
+
+                html += `
+                    <div class="table-item" data-name="${name}">
+                        <span class="table-icon ${iconClass}">${icon}</span>
+                        <div class="table-info">
+                            <div class="table-name">${name}</div>
+                            <div class="table-meta">${meta.join(' · ')}</div>
+                        </div>
+                        ${isLocal ? `
+                        <div class="table-actions">
+                            <button class="table-action-btn rename" data-name="${name}" title="Rename">✏️</button>
+                            <button class="table-action-btn delete" data-name="${name}" title="Remove">×</button>
+                        </div>
+                        ` : ''}
+                    </div>
+                `;
+            }
+
+            // Keep empty element, replace rest
+            listEl.querySelectorAll('.table-item').forEach(el => el.remove());
+            listEl.insertAdjacentHTML('beforeend', html);
+        }
+
+        // Add table to registry
+        function registerTable(name, info) {
+            tablesRegistry.set(name, info);
+            renderTablesUI();
+        }
+
+        // Remove table from registry
+        function unregisterTable(name) {
+            const info = tablesRegistry.get(name);
+            if (info?.dataset?.close) {
+                try { info.dataset.close(); } catch (e) {}
+            }
+            tablesRegistry.delete(name);
+            renderTablesUI();
+            showStatus(`Removed table "${name}"`, 'info');
+        }
+
+        // Handle table actions (event delegation)
+        document.getElementById('tables-list').addEventListener('click', (e) => {
+            const btn = e.target.closest('.table-action-btn');
+            if (!btn) return;
+
+            const name = btn.dataset.name;
+
+            if (btn.classList.contains('rename')) {
+                const newName = prompt(`Rename "${name}" to:`, name);
+                if (newName && newName !== name) {
+                    const info = tablesRegistry.get(name);
+                    tablesRegistry.delete(name);
+                    tablesRegistry.set(newName, info);
+                    renderTablesUI();
+                    showStatus(`Renamed to "${newName}"`, 'success');
+                }
+            } else if (btn.classList.contains('delete')) {
+                unregisterTable(name);
+            }
         });
 
-        dropZone.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            dropZone.classList.add('dragover');
+        // === File Upload Handling ===
+        const tablesSection = document.querySelector('.tables-section');
+        const uploadBtn = document.getElementById('upload-btn');
+        const fileInputUpload = document.getElementById('file-input-upload');
+        const folderInputUpload = document.getElementById('folder-input-upload');
+
+        uploadBtn.addEventListener('click', () => {
+            // Show menu or just open file picker
+            fileInputUpload.click();
         });
-        dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
-        dropZone.addEventListener('drop', async (e) => {
-            e.preventDefault();
-            dropZone.classList.remove('dragover');
-            urlInput.value = ''; // Clear URL when file dropped
-            // Handle folder drop via DataTransferItemList
-            if (e.dataTransfer.items && e.dataTransfer.items.length > 0) {
-                const item = e.dataTransfer.items[0];
-                if (item.webkitGetAsEntry) {
-                    const entry = item.webkitGetAsEntry();
-                    if (entry && entry.isDirectory) {
-                        await handleLanceFolder(entry);
-                        return;
-                    }
+
+        fileInputUpload.addEventListener('change', async () => {
+            if (fileInputUpload.files && fileInputUpload.files.length > 0) {
+                for (const file of fileInputUpload.files) {
+                    await uploadFileToOPFS(file);
                 }
             }
-            // Fallback to single file
-            if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+            fileInputUpload.value = '';
         });
-        fileInputFolder.addEventListener('change', () => {
-            // With webkitdirectory, files contains all files in the folder
-            if (fileInputFolder.files && fileInputFolder.files.length > 0) {
-                urlInput.value = ''; // Clear URL when file selected
-                handleLanceFiles(Array.from(fileInputFolder.files));
+
+        // Drag and drop on tables section
+        tablesSection.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            tablesSection.classList.add('dragover');
+        });
+        tablesSection.addEventListener('dragleave', (e) => {
+            if (!tablesSection.contains(e.relatedTarget)) {
+                tablesSection.classList.remove('dragover');
             }
         });
-        fileInputFile.addEventListener('change', () => {
-            // Single file selection
-            if (fileInputFile.files && fileInputFile.files.length > 0) {
-                urlInput.value = ''; // Clear URL when file selected
-                handleFile(fileInputFile.files[0]);
+        tablesSection.addEventListener('drop', async (e) => {
+            e.preventDefault();
+            tablesSection.classList.remove('dragover');
+
+            // Handle files
+            if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                for (const file of e.dataTransfer.files) {
+                    await uploadFileToOPFS(file);
+                }
             }
         });
 
-        loadUrlBtn.addEventListener('click', () => {
-            const url = urlInput.value.trim();
-            if (url) loadFromUrl(url);
-        });
-        urlInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') {
-                const url = urlInput.value.trim();
-                if (url) loadFromUrl(url);
+        // Upload file to OPFS and register
+        async function uploadFileToOPFS(file) {
+            const name = file.name.replace(/\.lance$/, '');
+            showStatus(`Uploading ${name}...`, 'info');
+
+            try {
+                // Read file content
+                const buffer = await file.arrayBuffer();
+
+                // Store in OPFS
+                const root = await navigator.storage.getDirectory();
+                const fileHandle = await root.getFileHandle(`${name}.lance`, { create: true });
+                const writable = await fileHandle.createWritable();
+                await writable.write(buffer);
+                await writable.close();
+
+                // Open as Lance file
+                const dataset = await lanceql.openMemory(new Uint8Array(buffer));
+
+                // Detect column types
+                let cols = dataset.numColumns;
+                try {
+                    const types = await dataset.detectColumnTypes();
+                    cols = types.length;
+                    dataset._columnTypes = types;
+                } catch (e) {}
+
+                // Register table
+                registerTable(name, {
+                    type: 'local',
+                    dataset,
+                    rows: dataset.rowCount || 0,
+                    cols
+                });
+
+                // Set as current file
+                $currentFile.set(dataset);
+                $columnTypes.set(dataset._columnTypes || []);
+                showColumnChips();
+
+                showStatus(`Uploaded "${name}" (${(buffer.byteLength / 1024 / 1024).toFixed(2)} MB)`, 'success');
+            } catch (err) {
+                showStatus(`Failed to upload: ${err.message}`, 'error');
+                console.error(err);
             }
-        });
+        }
+
+        // Load OPFS tables on init
+        async function loadOPFSTables() {
+            try {
+                const root = await navigator.storage.getDirectory();
+                for await (const [name, handle] of root.entries()) {
+                    if (handle.kind === 'file' && name.endsWith('.lance')) {
+                        const file = await handle.getFile();
+                        const buffer = await file.arrayBuffer();
+                        const tableName = name.replace(/\.lance$/, '');
+
+                        const dataset = await lanceql.openMemory(new Uint8Array(buffer));
+                        let cols = dataset.numColumns;
+                        try {
+                            const types = await dataset.detectColumnTypes();
+                            cols = types.length;
+                            dataset._columnTypes = types;
+                        } catch (e) {}
+
+                        tablesRegistry.set(tableName, {
+                            type: 'local',
+                            dataset,
+                            rows: dataset.rowCount || 0,
+                            cols
+                        });
+                    }
+                }
+                renderTablesUI();
+            } catch (e) {
+                console.warn('Could not load OPFS tables:', e);
+            }
+        }
 
         document.getElementById('run-sql-btn').addEventListener('click', runSqlQuery);
         document.getElementById('run-df-btn').addEventListener('click', async () => {
