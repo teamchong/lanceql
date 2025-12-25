@@ -4739,7 +4739,16 @@
                 queryVec,
                 topK,
                 (current, total) => {
-                    showProgress(`Scanning vectors...`, current, total);
+                    // Progress phases: 0-80 = downloading, 80-90 = computing, 90-100 = sorting
+                    let label = 'Searching...';
+                    if (current < 80) {
+                        label = `Downloading vectors... (${current}%)`;
+                    } else if (current < 90) {
+                        label = 'Computing similarities...';
+                    } else {
+                        label = 'Finding top results...';
+                    }
+                    showProgress(label, current, total);
                 }
             );
 

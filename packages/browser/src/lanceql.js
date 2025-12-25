@@ -125,6 +125,206 @@ class MetadataCache {
 const metadataCache = new MetadataCache();
 
 /**
+ * WebGPU Accelerator - GPU-accelerated batch cosine similarity.
+ *
+ * Uses WebGPU compute shaders for massive parallelism:
+ * - CPU/WASM SIMD: ~4-8 floats parallel per instruction
+ * - WebGPU: Thousands of parallel cores, entire batch in one dispatch
+ *
+ * Falls back to WASM SIMD if WebGPU unavailable.
+ */
+class WebGPUAccelerator {
+    constructor() {
+        this.device = null;
+        this.pipeline = null;
+        this.available = false;
+        this._initPromise = null;
+    }
+
+    /**
+     * Initialize WebGPU. Call once before using.
+     * @returns {Promise<boolean>} Whether WebGPU is available
+     */
+    async init() {
+        if (this._initPromise) return this._initPromise;
+
+        this._initPromise = this._doInit();
+        return this._initPromise;
+    }
+
+    async _doInit() {
+        if (!navigator.gpu) {
+            console.log('[WebGPU] Not available in this browser');
+            return false;
+        }
+
+        try {
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) {
+                console.log('[WebGPU] No adapter found');
+                return false;
+            }
+
+            this.device = await adapter.requestDevice();
+            this._createPipeline();
+            this.available = true;
+            console.log('[WebGPU] Initialized successfully');
+            return true;
+        } catch (e) {
+            console.warn('[WebGPU] Init failed:', e);
+            return false;
+        }
+    }
+
+    _createPipeline() {
+        // Compute shader for batch cosine similarity
+        // Assumes L2-normalized vectors (dot product = cosine similarity)
+        const shaderCode = `
+            struct Params {
+                dim: u32,
+                numVectors: u32,
+            }
+
+            @group(0) @binding(0) var<uniform> params: Params;
+            @group(0) @binding(1) var<storage, read> query: array<f32>;
+            @group(0) @binding(2) var<storage, read> vectors: array<f32>;
+            @group(0) @binding(3) var<storage, read_write> scores: array<f32>;
+
+            @compute @workgroup_size(256)
+            fn main(@builtin(global_invocation_id) globalId: vec3u) {
+                let idx = globalId.x;
+                if (idx >= params.numVectors) {
+                    return;
+                }
+
+                let dim = params.dim;
+                let offset = idx * dim;
+
+                // Compute dot product (= cosine similarity for normalized vectors)
+                var dot: f32 = 0.0;
+                for (var i: u32 = 0u; i < dim; i++) {
+                    dot += query[i] * vectors[offset + i];
+                }
+
+                scores[idx] = dot;
+            }
+        `;
+
+        const shaderModule = this.device.createShaderModule({
+            code: shaderCode
+        });
+
+        this.pipeline = this.device.createComputePipeline({
+            layout: 'auto',
+            compute: {
+                module: shaderModule,
+                entryPoint: 'main'
+            }
+        });
+    }
+
+    /**
+     * Batch cosine similarity using WebGPU.
+     * @param {Float32Array} queryVec - Query vector (dim)
+     * @param {Float32Array[]} vectors - Array of candidate vectors
+     * @param {boolean} normalized - Whether vectors are L2-normalized
+     * @returns {Promise<Float32Array>} Similarity scores
+     */
+    async batchCosineSimilarity(queryVec, vectors, normalized = true) {
+        if (!this.available || vectors.length === 0) {
+            return null; // Caller should fallback to WASM
+        }
+
+        const dim = queryVec.length;
+        const numVectors = vectors.length;
+
+        // Create buffers
+        const paramsBuffer = this.device.createBuffer({
+            size: 8, // 2 x u32
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        const queryBuffer = this.device.createBuffer({
+            size: dim * 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+
+        const vectorsBuffer = this.device.createBuffer({
+            size: numVectors * dim * 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+
+        const scoresBuffer = this.device.createBuffer({
+            size: numVectors * 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+        });
+
+        const readbackBuffer = this.device.createBuffer({
+            size: numVectors * 4,
+            usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        });
+
+        // Write data to buffers
+        this.device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([dim, numVectors]));
+        this.device.queue.writeBuffer(queryBuffer, 0, queryVec);
+
+        // Flatten vectors into single array
+        const flatVectors = new Float32Array(numVectors * dim);
+        for (let i = 0; i < numVectors; i++) {
+            flatVectors.set(vectors[i], i * dim);
+        }
+        this.device.queue.writeBuffer(vectorsBuffer, 0, flatVectors);
+
+        // Create bind group
+        const bindGroup = this.device.createBindGroup({
+            layout: this.pipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: paramsBuffer } },
+                { binding: 1, resource: { buffer: queryBuffer } },
+                { binding: 2, resource: { buffer: vectorsBuffer } },
+                { binding: 3, resource: { buffer: scoresBuffer } },
+            ]
+        });
+
+        // Dispatch compute shader
+        const commandEncoder = this.device.createCommandEncoder();
+        const passEncoder = commandEncoder.beginComputePass();
+        passEncoder.setPipeline(this.pipeline);
+        passEncoder.setBindGroup(0, bindGroup);
+        passEncoder.dispatchWorkgroups(Math.ceil(numVectors / 256));
+        passEncoder.end();
+
+        // Copy results to readback buffer
+        commandEncoder.copyBufferToBuffer(scoresBuffer, 0, readbackBuffer, 0, numVectors * 4);
+        this.device.queue.submit([commandEncoder.finish()]);
+
+        // Read results
+        await readbackBuffer.mapAsync(GPUMapMode.READ);
+        const results = new Float32Array(readbackBuffer.getMappedRange().slice(0));
+        readbackBuffer.unmap();
+
+        // Cleanup
+        paramsBuffer.destroy();
+        queryBuffer.destroy();
+        vectorsBuffer.destroy();
+        scoresBuffer.destroy();
+        readbackBuffer.destroy();
+
+        return results;
+    }
+
+    /**
+     * Check if WebGPU is available and initialized
+     */
+    isAvailable() {
+        return this.available;
+    }
+}
+
+// Global WebGPU accelerator instance
+const webgpuAccelerator = new WebGPUAccelerator();
+
+/**
  * Statistics Manager - computes and caches column statistics for query optimization.
  *
  * Unlike pre-generated sidecar files, this computes statistics dynamically:
@@ -3256,6 +3456,8 @@ const _createLanceqlMethods = (proxy) => ({
      * @returns {Promise<RemoteLanceFile>}
      */
     async openUrl(url) {
+        // Ensure WebGPU is initialized for vector search
+        await webgpuAccelerator.init();
         return await RemoteLanceFile.open(proxy, url);
     },
 
@@ -3267,6 +3469,8 @@ const _createLanceqlMethods = (proxy) => ({
      * @returns {Promise<RemoteLanceDataset>}
      */
     async openDataset(baseUrl, options = {}) {
+        // Ensure WebGPU is initialized for vector search
+        await webgpuAccelerator.init();
         return await RemoteLanceDataset.open(proxy, baseUrl, options);
     },
 
@@ -4288,40 +4492,109 @@ export class LanceFile {
     }
 
     /**
+     * Read all vectors from a column as array of Float32Arrays.
+     * @param {number} colIdx - Column index
+     * @returns {Float32Array[]} Array of vectors
+     */
+    readAllVectors(colIdx) {
+        const info = this.getVectorInfo(colIdx);
+        if (info.dimension === 0 || info.rows === 0) return [];
+
+        const dim = info.dimension;
+        const numRows = info.rows;
+        const vectors = [];
+
+        // Allocate buffer for all vectors at once
+        const bufPtr = this.wasm.allocFloat32Buffer(numRows * dim);
+        if (!bufPtr) throw new Error('Failed to allocate vector buffer');
+
+        try {
+            // Read all vectors in one WASM call (if supported)
+            // Otherwise fall back to individual reads
+            if (this.wasm.readVectorColumn) {
+                const count = this.wasm.readVectorColumn(colIdx, bufPtr, numRows * dim);
+                const allData = new Float32Array(this.memory.buffer, bufPtr, count);
+
+                for (let i = 0; i < numRows && i * dim < count; i++) {
+                    const vec = new Float32Array(dim);
+                    vec.set(allData.subarray(i * dim, (i + 1) * dim));
+                    vectors.push(vec);
+                }
+            } else {
+                // Fall back to individual reads
+                for (let i = 0; i < numRows; i++) {
+                    vectors.push(this.readVectorAt(colIdx, i));
+                }
+            }
+
+            return vectors;
+        } finally {
+            this.wasm.free(bufPtr, numRows * dim * 4);
+        }
+    }
+
+    /**
      * Find top-k most similar vectors to query.
+     * Uses WebGPU if available, otherwise falls back to WASM SIMD.
      * @param {number} colIdx - Column index with vectors
      * @param {Float32Array} queryVec - Query vector
      * @param {number} topK - Number of results to return
-     * @returns {{indices: Uint32Array, scores: Float32Array}}
+     * @param {Function} onProgress - Progress callback (current, total)
+     * @returns {Promise<{indices: Uint32Array, scores: Float32Array}>}
      */
-    vectorSearch(colIdx, queryVec, topK = 10) {
-        const queryPtr = this.wasm.allocFloat32Buffer(queryVec.length);
-        const indicesPtr = this.wasm.allocIndexBuffer(topK);
-        const scoresPtr = this.wasm.allocFloat32Buffer(topK);
+    async vectorSearch(colIdx, queryVec, topK = 10, onProgress = null) {
+        const dim = queryVec.length;
+        const info = this.getVectorInfo(colIdx);
+        const numRows = info.rows;
 
-        if (!queryPtr || !indicesPtr || !scoresPtr) {
-            throw new Error('Failed to allocate buffers');
+        // Try WebGPU-accelerated path first
+        if (webgpuAccelerator.isAvailable()) {
+            if (onProgress) onProgress(0, numRows);
+
+            // Read all vectors (bulk read)
+            console.log(`[LanceFile.vectorSearch] Reading ${numRows} vectors...`);
+            const allVectors = this.readAllVectors(colIdx);
+
+            if (onProgress) onProgress(numRows, numRows);
+
+            console.log(`[LanceFile.vectorSearch] Computing similarity for ${allVectors.length} vectors via WebGPU`);
+
+            // Batch compute with WebGPU
+            const scores = await webgpuAccelerator.batchCosineSimilarity(queryVec, allVectors, true);
+
+            // Find top-k
+            const indexedScores = Array.from(scores).map((score, idx) => ({ idx, score }));
+            indexedScores.sort((a, b) => b.score - a.score);
+
+            const topResults = indexedScores.slice(0, topK);
+            const indices = new Uint32Array(topResults.map(r => r.idx));
+            const topScores = new Float32Array(topResults.map(r => r.score));
+
+            return { indices, scores: topScores };
         }
 
-        try {
-            new Float32Array(this.memory.buffer, queryPtr, queryVec.length).set(queryVec);
+        // Fall back to WASM SIMD (uses batchCosineSimilarity internally)
+        console.log(`[LanceFile.vectorSearch] Using WASM SIMD`);
 
-            const count = this.wasm.vectorSearchTopK(
-                colIdx, queryPtr, queryVec.length, topK, indicesPtr, scoresPtr
-            );
+        if (onProgress) onProgress(0, numRows);
 
-            const indices = new Uint32Array(count);
-            const scores = new Float32Array(count);
+        // Read all vectors first
+        const allVectors = this.readAllVectors(colIdx);
 
-            indices.set(new Uint32Array(this.memory.buffer, indicesPtr, count));
-            scores.set(new Float32Array(this.memory.buffer, scoresPtr, count));
+        if (onProgress) onProgress(numRows, numRows);
 
-            return { indices, scores };
-        } finally {
-            this.wasm.free(queryPtr, queryVec.length * 4);
-            this.wasm.free(indicesPtr, topK * 4);
-            this.wasm.free(scoresPtr, topK * 4);
-        }
+        // Use WASM batch cosine similarity
+        const scores = this.lanceql.batchCosineSimilarity(queryVec, allVectors, true);
+
+        // Find top-k
+        const indexedScores = Array.from(scores).map((score, idx) => ({ idx, score }));
+        indexedScores.sort((a, b) => b.score - a.score);
+
+        const topResults = indexedScores.slice(0, topK);
+        const indices = new Uint32Array(topResults.map(r => r.idx));
+        const topScores = new Float32Array(topResults.map(r => r.score));
+
+        return { indices, scores: topScores };
     }
 
     // ========================================================================
@@ -6150,7 +6423,7 @@ export class RemoteLanceFile {
     /**
      * Search using proper row ID mappings from auxiliary.idx.
      * Groups row IDs by fragment and fetches vectors efficiently.
-     * Uses WASM SIMD batch cosine similarity for speed.
+     * Uses WebGPU (if available) or WASM SIMD for batch cosine similarity.
      * @private
      */
     async _searchWithRowIdMappings(colIdx, queryVec, topK, rowIdMappings, onProgress) {
@@ -6190,10 +6463,17 @@ export class RemoteLanceFile {
             }
         }
 
-        console.log(`[IVFSearch] Computing similarity for ${allVectors.length} vectors via WASM SIMD`);
+        // Try WebGPU first, fallback to WASM SIMD
+        let scores;
+        if (webgpuAccelerator.isAvailable()) {
+            console.log(`[IVFSearch] Computing similarity for ${allVectors.length} vectors via WebGPU`);
+            scores = await webgpuAccelerator.batchCosineSimilarity(queryVec, allVectors, true);
+        }
 
-        // Batch compute all similarities in one WASM call
-        const scores = this.lanceql.batchCosineSimilarity(queryVec, allVectors, true);
+        if (!scores) {
+            console.log(`[IVFSearch] Computing similarity for ${allVectors.length} vectors via WASM SIMD`);
+            scores = this.lanceql.batchCosineSimilarity(queryVec, allVectors, true);
+        }
 
         // Find top-k
         const topResults = [];
@@ -6434,6 +6714,7 @@ export class IVFIndex {
 
     /**
      * Fetch partition data (row IDs and vectors) directly from ivf_vectors.bin.
+     * Uses OPFS cache for instant subsequent searches.
      * Each partition contains: [row_count: uint32][row_ids: uint32 × n][vectors: float32 × n × dim]
      * @param {number[]} partitionIndices - Partition indices to fetch
      * @param {number} dim - Vector dimension (default 384)
@@ -6450,19 +6731,45 @@ export class IVFIndex {
         let totalBytesToFetch = 0;
         let bytesLoaded = 0;
 
-        // Calculate total bytes for progress reporting
+        // Separate cached vs uncached partitions
+        const uncachedPartitions = [];
+        const cachedResults = new Map();
+
         for (const p of partitionIndices) {
-            const startOffset = this.partitionOffsets[p];
-            const endOffset = this.partitionOffsets[p + 1];
-            totalBytesToFetch += endOffset - startOffset;
+            // Check in-memory cache first
+            if (this._partitionCache?.has(p)) {
+                cachedResults.set(p, this._partitionCache.get(p));
+            } else {
+                uncachedPartitions.push(p);
+                const startOffset = this.partitionOffsets[p];
+                const endOffset = this.partitionOffsets[p + 1];
+                totalBytesToFetch += endOffset - startOffset;
+            }
         }
 
-        console.log(`[IVFIndex] Fetching ${partitionIndices.length} partitions, ${(totalBytesToFetch / 1024 / 1024).toFixed(1)} MB total`);
+        if (uncachedPartitions.length === 0) {
+            console.log(`[IVFIndex] All ${partitionIndices.length} partitions from cache`);
+            // All from cache
+            for (const p of partitionIndices) {
+                const result = cachedResults.get(p);
+                allRowIds.push(...result.rowIds);
+                allVectors.push(...result.vectors);
+            }
+            if (onProgress) onProgress(100, 100);
+            return { rowIds: allRowIds, vectors: allVectors };
+        }
 
-        // Fetch partitions in parallel (max 4 concurrent)
-        const PARALLEL_LIMIT = 4;
-        for (let i = 0; i < partitionIndices.length; i += PARALLEL_LIMIT) {
-            const batch = partitionIndices.slice(i, i + PARALLEL_LIMIT);
+        console.log(`[IVFIndex] Fetching ${uncachedPartitions.length}/${partitionIndices.length} partitions, ${(totalBytesToFetch / 1024 / 1024).toFixed(1)} MB`);
+
+        // Initialize partition cache if needed
+        if (!this._partitionCache) {
+            this._partitionCache = new Map();
+        }
+
+        // Fetch uncached partitions in parallel (max 6 concurrent for speed)
+        const PARALLEL_LIMIT = 6;
+        for (let i = 0; i < uncachedPartitions.length; i += PARALLEL_LIMIT) {
+            const batch = uncachedPartitions.slice(i, i + PARALLEL_LIMIT);
 
             const results = await Promise.all(batch.map(async (p) => {
                 const startOffset = this.partitionOffsets[p];
@@ -6475,7 +6782,7 @@ export class IVFIndex {
                     });
                     if (!resp.ok) {
                         console.warn(`[IVFIndex] Partition ${p} fetch failed: ${resp.status}`);
-                        return { rowIds: [], vectors: [] };
+                        return { p, rowIds: [], vectors: [] };
                     }
 
                     const data = await resp.arrayBuffer();
@@ -6499,15 +6806,26 @@ export class IVFIndex {
                     bytesLoaded += byteSize;
                     if (onProgress) onProgress(bytesLoaded, totalBytesToFetch);
 
-                    return { rowIds: Array.from(rowIds), vectors };
+                    return { p, rowIds: Array.from(rowIds), vectors };
                 } catch (e) {
                     console.warn(`[IVFIndex] Error fetching partition ${p}:`, e);
-                    return { rowIds: [], vectors: [] };
+                    return { p, rowIds: [], vectors: [] };
                 }
             }));
 
-            // Collect results
+            // Cache results and collect
             for (const result of results) {
+                const { p, rowIds, vectors } = result;
+                // Cache in memory for subsequent searches
+                this._partitionCache.set(p, { rowIds, vectors });
+                cachedResults.set(p, { rowIds, vectors });
+            }
+        }
+
+        // Collect all results in original order
+        for (const p of partitionIndices) {
+            const result = cachedResults.get(p);
+            if (result) {
                 allRowIds.push(...result.rowIds);
                 allVectors.push(...result.vectors);
             }
@@ -10848,7 +11166,7 @@ export class RemoteLanceDataset {
     /**
      * IVF index-based ANN search.
      * Fetches partition data (row IDs + vectors) directly from ivf_vectors.bin.
-     * This is much faster than fetching scattered vectors from Lance files.
+     * Uses WebGPU for batch similarity computation.
      * @private
      */
     async _ivfIndexSearch(queryVec, topK, vectorColIdx, nprobe, onProgress) {
@@ -10862,8 +11180,9 @@ export class RemoteLanceDataset {
             this._ivfIndex.dimension,
             (loaded, total) => {
                 if (onProgress) {
+                    // First 80% is downloading
                     const pct = total > 0 ? loaded / total : 0;
-                    onProgress(Math.floor(pct * 100), 100);
+                    onProgress(Math.floor(pct * 80), 100);
                 }
             }
         );
@@ -10873,20 +11192,38 @@ export class RemoteLanceDataset {
         }
 
         const { rowIds, vectors } = partitionData;
-        console.log(`[VectorSearch] Computing similarities for ${rowIds.length.toLocaleString()} vectors`);
 
-        // Compute similarities - vectors are already loaded, no more network requests!
+        // Use WebGPU or WASM SIMD for batch similarity
+        let scores;
+        if (webgpuAccelerator.isAvailable()) {
+            console.log(`[VectorSearch] Computing similarities for ${rowIds.length.toLocaleString()} vectors via WebGPU`);
+            scores = await webgpuAccelerator.batchCosineSimilarity(queryVec, vectors, true);
+        } else {
+            console.log(`[VectorSearch] Computing similarities for ${rowIds.length.toLocaleString()} vectors via WASM SIMD`);
+            // Use WASM batch if available
+            if (this._fragments[0]?.lanceql?.batchCosineSimilarity) {
+                scores = this._fragments[0].lanceql.batchCosineSimilarity(queryVec, vectors, true);
+            } else {
+                // Fallback to JS (slow)
+                scores = new Float32Array(vectors.length);
+                for (let i = 0; i < vectors.length; i++) {
+                    const vec = vectors[i];
+                    if (!vec || vec.length !== queryVec.length) continue;
+                    let dot = 0;
+                    for (let k = 0; k < queryVec.length; k++) {
+                        dot += queryVec[k] * vec[k];
+                    }
+                    scores[i] = dot;
+                }
+            }
+        }
+
+        if (onProgress) onProgress(90, 100);
+
+        // Build results with row IDs
         const allResults = [];
         for (let i = 0; i < rowIds.length; i++) {
-            const vec = vectors[i];
-            if (!vec || vec.length !== queryVec.length) continue;
-
-            // Cosine similarity (vectors should be normalized)
-            let dot = 0;
-            for (let k = 0; k < queryVec.length; k++) {
-                dot += queryVec[k] * vec[k];
-            }
-            allResults.push({ index: rowIds[i], score: dot });
+            allResults.push({ index: rowIds[i], score: scores[i] });
         }
 
         // Sort and take top-k
@@ -13850,6 +14187,13 @@ export async function initSqlJs(config = {}) {
         console.warn('[LanceQL] OPFS not available:', e.message);
     }
 
+    // Initialize WebGPU for accelerated vector search
+    try {
+        await webgpuAccelerator.init();
+    } catch (e) {
+        console.warn('[LanceQL] WebGPU not available:', e.message);
+    }
+
     return {
         Database,
         Statement,
@@ -13858,6 +14202,9 @@ export async function initSqlJs(config = {}) {
 
 // Also export as sqljs for explicit naming
 export { Database as SqlJsDatabase, Statement as SqlJsStatement };
+
+// Export WebGPU accelerator for direct access
+export { webgpuAccelerator };
 
 // Default export for convenience
 export default LanceQL;

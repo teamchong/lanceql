@@ -296,7 +296,263 @@ class Statement {
 // LocalDatabase - CRUD with ACID support
 // ============================================================================
 
-const { LocalDatabase, FileStorage, SQLLexer, LocalSQLParser, HotTierCache, hotTierCache } = require('./local-database');
+const { LocalDatabase, FileStorage, SQLLexer, LocalSQLParser, HotTierCache, hotTierCache, VectorAccelerator, vectorAccelerator } = require('./local-database');
+
+// ============================================================================
+// RemoteLanceDataset - HTTP Range-based remote dataset with IVF vector search
+// ============================================================================
+
+const https = require('https');
+const http = require('http');
+
+/**
+ * Fetch a byte range from a URL.
+ * @param {string} url - URL to fetch
+ * @param {number} start - Start byte
+ * @param {number} end - End byte (inclusive)
+ * @returns {Promise<Buffer>}
+ */
+async function fetchRange(url, start, end) {
+    return new Promise((resolve, reject) => {
+        const protocol = url.startsWith('https') ? https : http;
+        const options = {
+            headers: { 'Range': `bytes=${start}-${end}` }
+        };
+
+        protocol.get(url, options, (res) => {
+            const chunks = [];
+            res.on('data', chunk => chunks.push(chunk));
+            res.on('end', () => resolve(Buffer.concat(chunks)));
+            res.on('error', reject);
+        }).on('error', reject);
+    });
+}
+
+/**
+ * IVF Index for Node.js - mirrors browser implementation.
+ */
+class IVFIndex {
+    constructor(baseUrl) {
+        this.baseUrl = baseUrl;
+        this.centroids = null;
+        this.dimension = 0;
+        this.numPartitions = 0;
+        this.partitionOffsets = null;
+        this.partitionVectorsUrl = null;
+        this.hasPartitionIndex = false;
+        this._partitionCache = new Map();
+    }
+
+    /**
+     * Load IVF index from remote dataset.
+     */
+    async load() {
+        // Try to load centroids
+        const centroidsUrl = `${this.baseUrl}/_indices/vector_idx/centroids.npy`;
+        try {
+            const resp = await fetchRange(centroidsUrl, 0, 1024 * 1024); // First 1MB
+            // Parse numpy header and extract centroids
+            // Simplified: assume float32 array after 128-byte header
+            const headerSize = 128;
+            if (resp.length > headerSize) {
+                const data = new Float32Array(resp.buffer.slice(headerSize));
+                // Detect dimension from data size (256 partitions typical)
+                this.numPartitions = 256;
+                this.dimension = Math.floor(data.length / this.numPartitions);
+                this.centroids = [];
+                for (let i = 0; i < this.numPartitions; i++) {
+                    this.centroids.push(data.slice(i * this.dimension, (i + 1) * this.dimension));
+                }
+                console.log(`[IVFIndex] Loaded ${this.numPartitions} centroids, dim=${this.dimension}`);
+            }
+        } catch (e) {
+            console.log('[IVFIndex] No centroids found');
+            return false;
+        }
+
+        // Try to load partition offsets
+        const offsetsUrl = `${this.baseUrl}/_indices/vector_idx/ivf_partitions.bin`;
+        try {
+            const resp = await fetchRange(offsetsUrl, 0, (this.numPartitions + 1) * 8);
+            this.partitionOffsets = new BigUint64Array(resp.buffer);
+            this.partitionVectorsUrl = `${this.baseUrl}/_indices/vector_idx/ivf_vectors.bin`;
+            this.hasPartitionIndex = true;
+            console.log('[IVFIndex] Loaded partition offsets');
+        } catch (e) {
+            console.log('[IVFIndex] No partition offsets found');
+        }
+
+        return this.centroids !== null;
+    }
+
+    /**
+     * Find nearest partition centroids.
+     */
+    findNearestPartitions(queryVec, nprobe = 10) {
+        if (!this.centroids) return [];
+
+        const distances = this.centroids.map((centroid, idx) => {
+            let dot = 0;
+            for (let i = 0; i < this.dimension; i++) {
+                dot += queryVec[i] * centroid[i];
+            }
+            return { idx, score: dot };
+        });
+
+        distances.sort((a, b) => b.score - a.score);
+        return distances.slice(0, nprobe).map(d => d.idx);
+    }
+
+    /**
+     * Fetch partition data (row IDs + vectors).
+     */
+    async fetchPartitionData(partitionIndices, dim, onProgress = null) {
+        if (!this.hasPartitionIndex) return null;
+
+        const allRowIds = [];
+        const allVectors = [];
+        let totalBytes = 0;
+        let loadedBytes = 0;
+
+        // Check cache and calculate bytes to fetch
+        const uncached = [];
+        for (const p of partitionIndices) {
+            if (this._partitionCache.has(p)) {
+                const cached = this._partitionCache.get(p);
+                allRowIds.push(...cached.rowIds);
+                allVectors.push(...cached.vectors);
+            } else {
+                uncached.push(p);
+                const start = Number(this.partitionOffsets[p]);
+                const end = Number(this.partitionOffsets[p + 1]);
+                totalBytes += end - start;
+            }
+        }
+
+        if (uncached.length === 0) {
+            if (onProgress) onProgress(100, 100);
+            return { rowIds: allRowIds, vectors: allVectors };
+        }
+
+        console.log(`[IVFIndex] Fetching ${uncached.length} partitions, ${(totalBytes / 1024 / 1024).toFixed(1)} MB`);
+
+        // Fetch in parallel
+        const results = await Promise.all(uncached.map(async (p) => {
+            const start = Number(this.partitionOffsets[p]);
+            const end = Number(this.partitionOffsets[p + 1]) - 1;
+
+            const data = await fetchRange(this.partitionVectorsUrl, start, end);
+            const view = new DataView(data.buffer);
+
+            const rowCount = view.getUint32(0, true);
+            const rowIds = new Uint32Array(data.buffer.slice(4, 4 + rowCount * 4));
+            const vectorsFlat = new Float32Array(data.buffer.slice(4 + rowCount * 4));
+
+            const vectors = [];
+            for (let j = 0; j < rowCount; j++) {
+                vectors.push(vectorsFlat.slice(j * dim, (j + 1) * dim));
+            }
+
+            loadedBytes += data.length;
+            if (onProgress) onProgress(loadedBytes, totalBytes);
+
+            return { p, rowIds: Array.from(rowIds), vectors };
+        }));
+
+        // Cache and collect
+        for (const { p, rowIds, vectors } of results) {
+            this._partitionCache.set(p, { rowIds, vectors });
+            allRowIds.push(...rowIds);
+            allVectors.push(...vectors);
+        }
+
+        return { rowIds: allRowIds, vectors: allVectors };
+    }
+}
+
+/**
+ * Remote Lance Dataset with IVF vector search for Node.js.
+ */
+class RemoteLanceDataset {
+    constructor(baseUrl) {
+        this.baseUrl = baseUrl;
+        this._ivfIndex = null;
+    }
+
+    /**
+     * Open a remote dataset.
+     */
+    static async open(baseUrl) {
+        const dataset = new RemoteLanceDataset(baseUrl);
+
+        // Try to load IVF index
+        dataset._ivfIndex = new IVFIndex(baseUrl);
+        await dataset._ivfIndex.load();
+
+        return dataset;
+    }
+
+    /**
+     * Check if dataset has IVF index.
+     */
+    hasIndex() {
+        return this._ivfIndex?.centroids !== null;
+    }
+
+    /**
+     * Vector search using IVF index.
+     * @param {Float32Array} queryVec - Query vector
+     * @param {number} topK - Number of results
+     * @param {Object} options - Search options
+     * @returns {Promise<{indices: number[], scores: Float32Array}>}
+     */
+    async vectorSearch(queryVec, topK = 10, options = {}) {
+        const { nprobe = 10, onProgress = null } = options;
+
+        if (!this.hasIndex()) {
+            throw new Error('No IVF index available');
+        }
+
+        // Find nearest partitions
+        const partitions = this._ivfIndex.findNearestPartitions(queryVec, nprobe);
+
+        // Fetch partition data
+        const data = await this._ivfIndex.fetchPartitionData(
+            partitions,
+            this._ivfIndex.dimension,
+            (loaded, total) => {
+                if (onProgress) onProgress(Math.floor(loaded / total * 80), 100);
+            }
+        );
+
+        if (!data || data.rowIds.length === 0) {
+            throw new Error('No vectors found in partitions');
+        }
+
+        // Compute similarities using VectorAccelerator
+        console.log(`[VectorSearch] Computing similarity for ${data.rowIds.length} vectors`);
+        const scores = vectorAccelerator.batchCosineSimilarity(
+            new Float32Array(queryVec),
+            data.vectors.map(v => new Float32Array(v)),
+            true
+        );
+
+        if (onProgress) onProgress(90, 100);
+
+        // Find top-k
+        const results = data.rowIds.map((idx, i) => ({ idx, score: scores[i] }));
+        results.sort((a, b) => b.score - a.score);
+
+        const topResults = results.slice(0, topK);
+
+        if (onProgress) onProgress(100, 100);
+
+        return {
+            indices: topResults.map(r => r.idx),
+            scores: new Float32Array(topResults.map(r => r.score))
+        };
+    }
+}
 
 // ============================================================================
 // Exports - Match better-sqlite3 export format exactly
@@ -309,3 +565,7 @@ module.exports.LocalDatabase = LocalDatabase;
 module.exports.FileStorage = FileStorage;
 module.exports.HotTierCache = HotTierCache;
 module.exports.hotTierCache = hotTierCache;
+module.exports.VectorAccelerator = VectorAccelerator;
+module.exports.vectorAccelerator = vectorAccelerator;
+module.exports.RemoteLanceDataset = RemoteLanceDataset;
+module.exports.IVFIndex = IVFIndex;
