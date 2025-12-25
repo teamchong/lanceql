@@ -4241,6 +4241,53 @@ export class LanceFile {
     }
 
     /**
+     * Batch cosine similarity using WASM SIMD.
+     * Much faster than calling cosineSimilarity in a loop.
+     * @param {Float32Array} queryVec - Query vector
+     * @param {Float32Array[]} vectors - Array of vectors to compare
+     * @param {boolean} normalized - Whether vectors are L2-normalized
+     * @returns {Float32Array} - Similarity scores
+     */
+    batchCosineSimilarity(queryVec, vectors, normalized = true) {
+        if (vectors.length === 0) return new Float32Array(0);
+
+        const dim = queryVec.length;
+        const numVectors = vectors.length;
+
+        // Allocate WASM buffers
+        const queryPtr = this.wasm.allocFloat32Buffer(dim);
+        const vectorsPtr = this.wasm.allocFloat32Buffer(numVectors * dim);
+        const scoresPtr = this.wasm.allocFloat32Buffer(numVectors);
+
+        if (!queryPtr || !vectorsPtr || !scoresPtr) {
+            throw new Error('Failed to allocate WASM buffers');
+        }
+
+        try {
+            // Copy query vector
+            new Float32Array(this.memory.buffer, queryPtr, dim).set(queryVec);
+
+            // Copy all vectors (flattened)
+            const flatVectors = new Float32Array(this.memory.buffer, vectorsPtr, numVectors * dim);
+            for (let i = 0; i < numVectors; i++) {
+                flatVectors.set(vectors[i], i * dim);
+            }
+
+            // Call WASM batch similarity
+            this.wasm.batchCosineSimilarity(queryPtr, vectorsPtr, dim, numVectors, scoresPtr, normalized ? 1 : 0);
+
+            // Copy results
+            const scores = new Float32Array(numVectors);
+            scores.set(new Float32Array(this.memory.buffer, scoresPtr, numVectors));
+            return scores;
+        } finally {
+            this.wasm.free(queryPtr, dim * 4);
+            this.wasm.free(vectorsPtr, numVectors * dim * 4);
+            this.wasm.free(scoresPtr, numVectors * 4);
+        }
+    }
+
+    /**
      * Find top-k most similar vectors to query.
      * @param {number} colIdx - Column index with vectors
      * @param {Float32Array} queryVec - Query vector
@@ -6103,6 +6150,7 @@ export class RemoteLanceFile {
     /**
      * Search using proper row ID mappings from auxiliary.idx.
      * Groups row IDs by fragment and fetches vectors efficiently.
+     * Uses WASM SIMD batch cosine similarity for speed.
      * @private
      */
     async _searchWithRowIdMappings(colIdx, queryVec, topK, rowIdMappings, onProgress) {
@@ -6119,43 +6167,46 @@ export class RemoteLanceFile {
 
         console.log(`[IVFSearch] Fetching from ${byFragment.size} fragments`);
 
-        const topResults = [];
+        // Collect all vectors and their indices first
+        const allVectors = [];
+        const allIndices = [];
         let processed = 0;
         const total = rowIdMappings.length;
 
-        // Process each fragment
+        // Fetch all vectors
         for (const [fragId, offsets] of byFragment) {
             if (onProgress) onProgress(processed, total);
 
-            // Fetch vectors for this fragment's offsets
             const vectors = await this.readVectorsAtIndices(colIdx, offsets);
 
             for (let i = 0; i < offsets.length; i++) {
                 const vec = vectors[i];
-                if (!vec || vec.length !== dim) continue;
-
-                // Compute cosine similarity
-                let dot = 0, normA = 0, normB = 0;
-                for (let k = 0; k < dim; k++) {
-                    dot += queryVec[k] * vec[k];
-                    normA += queryVec[k] * queryVec[k];
-                    normB += vec[k] * vec[k];
+                if (vec && vec.length === dim) {
+                    allVectors.push(vec);
+                    // Reconstruct global row index
+                    allIndices.push(fragId * 50000 + offsets[i]);
                 }
-                const denom = Math.sqrt(normA) * Math.sqrt(normB);
-                const score = denom === 0 ? 0 : dot / denom;
-
-                // Reconstruct global row index from fragment ID and offset
-                const globalIdx = fragId * 50000 + offsets[i]; // Assuming 50K rows per fragment
-
-                if (topResults.length < topK) {
-                    topResults.push({ idx: globalIdx, score });
-                    topResults.sort((a, b) => b.score - a.score);
-                } else if (score > topResults[topK - 1].score) {
-                    topResults[topK - 1] = { idx: globalIdx, score };
-                    topResults.sort((a, b) => b.score - a.score);
-                }
-
                 processed++;
+            }
+        }
+
+        console.log(`[IVFSearch] Computing similarity for ${allVectors.length} vectors via WASM SIMD`);
+
+        // Batch compute all similarities in one WASM call
+        const scores = this.lanceql.batchCosineSimilarity(queryVec, allVectors, true);
+
+        // Find top-k
+        const topResults = [];
+        for (let i = 0; i < scores.length; i++) {
+            const score = scores[i];
+            const idx = allIndices[i];
+
+            if (topResults.length < topK) {
+                topResults.push({ idx, score });
+                topResults.sort((a, b) => b.score - a.score);
+            } else if (score > topResults[topK - 1].score) {
+                topResults[topK - 1] = { idx, score };
+                topResults.sort((a, b) => b.score - a.score);
             }
         }
 
@@ -6165,7 +6216,7 @@ export class RemoteLanceFile {
             indices: topResults.map(r => r.idx),
             scores: topResults.map(r => r.score),
             usedIndex: true,
-            searchedRows: total
+            searchedRows: allVectors.length
         };
     }
 
