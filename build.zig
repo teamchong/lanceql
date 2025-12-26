@@ -26,10 +26,16 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/value.zig"),
     });
 
+    // Metal/Accelerate module for macOS GPU acceleration (defined early for query module)
+    const metal_mod = b.addModule("lanceql.metal", .{
+        .root_source_file = b.path("src/metal/metal.zig"),
+    });
+
     const query_mod = b.addModule("lanceql.query", .{
         .root_source_file = b.path("src/query/query.zig"),
         .imports = &.{
             .{ .name = "lanceql.value", .module = value_mod },
+            .{ .name = "lanceql.metal", .module = metal_mod },
         },
     });
 
@@ -108,12 +114,6 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lanceql.query", .module = query_mod },
             .{ .name = "lanceql.table", .module = table_mod },
         },
-    });
-
-    // === Platform-specific Modules ===
-    // Metal/Accelerate module for macOS GPU acceleration
-    const metal_mod = b.addModule("lanceql.metal", .{
-        .root_source_file = b.path("src/metal/metal.zig"),
     });
 
     // Root module exports all
@@ -217,7 +217,7 @@ pub fn build(b: *std.Build) void {
     const test_parquet_step = b.step("test-parquet", "Run Parquet parser tests");
     test_parquet_step.dependOn(&run_test_parquet.step);
 
-    // Query module tests
+    // Query module tests (with Metal/Accelerate for logic_table)
     const test_query = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/query/query.zig"),
@@ -225,9 +225,23 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "lanceql.value", .module = value_mod },
+                .{ .name = "lanceql.metal", .module = metal_mod },
             },
         }),
     });
+
+    // Link macOS frameworks for Metal/Accelerate support in logic_table tests
+    if (use_metal) {
+        test_query.root_module.linkFramework("Metal", .{});
+        test_query.root_module.linkFramework("Foundation", .{});
+        test_query.root_module.addCSourceFiles(.{
+            .files = &.{"src/metal/metal_backend.m"},
+            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
+        });
+    }
+    if (use_accelerate) {
+        test_query.root_module.linkFramework("Accelerate", .{});
+    }
 
     const run_test_query = b.addRunArtifact(test_query);
     test_step.dependOn(&run_test_query.step);

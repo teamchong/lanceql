@@ -14,6 +14,7 @@ pub const parser = @import("parser.zig");
 pub const ast = @import("ast.zig");
 pub const executor = @import("executor.zig");
 pub const aggregates = @import("aggregates.zig");
+pub const logic_table = @import("logic_table.zig");
 
 // Re-export main types
 pub const Expr = expr.Expr;
@@ -30,6 +31,15 @@ pub const Executor = executor.Executor;
 pub const ResultSet = executor.ResultSet;
 pub const Aggregate = aggregates.Aggregate;
 pub const GroupKey = aggregates.GroupKey;
+pub const LogicTableContext = logic_table.LogicTableContext;
+pub const LogicTableError = logic_table.LogicTableError;
+pub const ColumnDep = logic_table.ColumnDep;
+pub const MethodMeta = logic_table.MethodMeta;
+
+// Batch vector operations for @logic_table
+pub const batchCosineSimilarity = logic_table.batchCosineSimilarity;
+pub const batchL2Distance = logic_table.batchL2Distance;
+pub const batchDotProduct = logic_table.batchDotProduct;
 
 test {
     std.testing.refAllDecls(@This());
