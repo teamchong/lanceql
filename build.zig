@@ -74,6 +74,15 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Batch code generator for @logic_table GPU/SIMD dispatch
+    _ = b.addModule("lanceql.sql.batch_codegen", .{
+        .root_source_file = b.path("src/sql/batch_codegen.zig"),
+        .imports = &.{
+            .{ .name = "ast", .module = sql_ast_mod },
+            .{ .name = "column_deps", .module = sql_column_deps_mod },
+        },
+    });
+
     const table_mod = b.addModule("lanceql.table", .{
         .root_source_file = b.path("src/table.zig"),
         .imports = &.{
@@ -341,9 +350,25 @@ pub fn build(b: *std.Build) void {
     const run_test_column_deps = b.addRunArtifact(test_column_deps);
     test_step.dependOn(&run_test_column_deps.step);
 
+    // Batch codegen tests
+    const test_batch_codegen = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sql/batch_codegen.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ast", .module = sql_ast_mod },
+                .{ .name = "column_deps", .module = sql_column_deps_mod },
+            },
+        }),
+    });
+    const run_test_batch_codegen = b.addRunArtifact(test_batch_codegen);
+    test_step.dependOn(&run_test_batch_codegen.step);
+
     const test_sql_step = b.step("test-sql", "Run SQL executor tests");
     test_sql_step.dependOn(&run_test_sql_executor.step);
     test_sql_step.dependOn(&run_test_column_deps.step);
+    test_sql_step.dependOn(&run_test_batch_codegen.step);
 
     // Stress tests - large datasets, memory pressure, edge cases
     const test_stress = b.addTest(.{
