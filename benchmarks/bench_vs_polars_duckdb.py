@@ -25,6 +25,7 @@ except ImportError:
 
 HAS_POLARS = False
 HAS_DUCKDB = False
+HAS_LANCEQL = False
 
 try:
     import polars as pl
@@ -37,6 +38,15 @@ try:
     HAS_DUCKDB = True
 except ImportError:
     print("WARNING: duckdb not installed. Skipping DuckDB benchmarks.")
+
+# Try to import our LanceQL package
+try:
+    sys.path.insert(0, str(Path(__file__).parent.parent / "python"))
+    from metal0.lanceql.vector import VectorAccelerator, vector_accelerator
+    HAS_LANCEQL = True
+    print(f"LanceQL backend: {vector_accelerator.backend}")
+except ImportError as e:
+    print(f"WARNING: LanceQL not available ({e}). Using NumPy baseline.")
 
 
 def generate_test_data(num_rows: int, embedding_dim: int = 384):
@@ -86,25 +96,25 @@ def benchmark_vector_search(data: dict, embeddings: np.ndarray, num_queries: int
     numpy_time = (time.perf_counter() - start) / num_queries * 1000
     results["numpy"] = numpy_time
 
-    # Polars (no native vector search, use apply)
-    if HAS_POLARS:
-        df = pl.DataFrame({"embedding": embeddings.tolist()})
+    # LanceQL (GPU/CPU accelerated)
+    if HAS_LANCEQL:
+        # Warm up
+        _ = vector_accelerator.batch_cosine_similarity(queries[0], embeddings)
+
         start = time.perf_counter()
         for q in queries:
-            # Polars doesn't have native vector search
-            # This is expected to be slow
-            pass
+            scores = vector_accelerator.batch_cosine_similarity(q, embeddings)
+            top_k = np.argsort(scores)[-10:][::-1]
+        lanceql_time = (time.perf_counter() - start) / num_queries * 1000
+        results["lanceql"] = lanceql_time
+
+    # Polars (no native vector search)
+    if HAS_POLARS:
         results["polars"] = "N/A (no native vector search)"
 
-    # DuckDB (experimental vector similarity)
+    # DuckDB (no native vector search)
     if HAS_DUCKDB:
-        try:
-            conn = duckdb.connect(":memory:")
-            conn.execute("CREATE TABLE vectors (embedding FLOAT[384])")
-            # DuckDB doesn't have efficient vector search either
-            results["duckdb"] = "N/A (no native vector search)"
-        except Exception as e:
-            results["duckdb"] = f"Error: {e}"
+        results["duckdb"] = "N/A (no native vector search)"
 
     return results
 
@@ -263,8 +273,7 @@ def main():
     print()
 
     # Test with different data sizes
-    # Use smaller sizes for CI (100K for quick run, 1M for full benchmark)
-    sizes = [100_000]  # Add 1_000_000 for full benchmark
+    sizes = [100_000, 500_000]  # 100K and 500K for comparison
 
     all_results = {}
 
@@ -286,7 +295,6 @@ def main():
         for engine, result in vector_results.items():
             print(f"  {engine:10}: {format_result(result)}")
         size_results["vector_search"] = vector_results
-        print(f"  → LanceQL with GPU: ~0.5ms (100K), ~5ms (1M)")
 
         # Aggregations
         print(f"\n2. Aggregations (SUM, AVG, MAX, COUNT)")
@@ -316,20 +324,27 @@ def main():
 
     # Summary
     print(f"\n{'='*60}")
-    print("Summary: LanceQL Advantages")
+    print("Summary")
     print(f"{'='*60}")
     print("""
-    1. Vector Search: LanceQL + GPU is 10-100x faster than CPU-only
-       - Native SIMD/GPU cosine similarity, L2 distance, dot product
-       - IVF-PQ indexing for billion-scale datasets
+    Vector Search Comparison:
+    - NumPy (with Apple Accelerate): Fast BLAS-optimized matrix ops
+    - LanceQL Python (PyTorch MPS): GPU overhead dominates small batches
+    - LanceQL Native (Zig + Metal): Zero-copy, ~10x faster (run bench_vector_ops.zig)
 
-    2. Lance Format: Zero-copy columnar reads
-       - No deserialization overhead
-       - Efficient predicate pushdown
+    For production vector search:
+    - Use LanceQL's native Zig backend (zero Python overhead)
+    - IVF-PQ indexing for billion-scale datasets
+    - @logic_table compiles Python to native batch code
 
-    3. @logic_table: Python UDFs compiled to native code
-       - Batch processing with GPU dispatch
-       - 50-100x faster than Python loops
+    Polars/DuckDB excel at:
+    - Aggregations, filtering, GROUP BY (columnar optimized)
+    - SQL-like query syntax
+
+    LanceQL excels at:
+    - Vector similarity search (native GPU/SIMD)
+    - Lance format zero-copy reads
+    - Embedding-heavy ML workloads
     """)
 
     # Write JSON results

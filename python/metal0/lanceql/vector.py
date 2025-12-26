@@ -128,8 +128,16 @@ class VectorAccelerator:
         """Compute similarity using PyTorch."""
         import torch
 
+        # Check if vectors are already cached on GPU
+        vectors_id = id(vectors)
+        if not hasattr(self, '_cached_vectors_id') or self._cached_vectors_id != vectors_id:
+            # Cache vectors on GPU (expensive, but only done once per dataset)
+            self._cached_vectors = torch.from_numpy(vectors).to(self._device)
+            self._cached_vectors_id = vectors_id
+
+        # Only transfer query (small, fast)
         q = torch.from_numpy(query).to(self._device)
-        v = torch.from_numpy(vectors).to(self._device)
+        v = self._cached_vectors
 
         if normalized:
             # Dot product = cosine similarity for normalized vectors

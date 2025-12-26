@@ -1,19 +1,38 @@
 {
   "100000": {
     "vector_search": {
-      "numpy": 66.41546660102904,
+      "numpy": 43.15555839857552,
+      "lanceql": 65.37695419974625,
       "polars": "N/A (no native vector search)"
     },
     "aggregations": {
-      "polars": 1.5962762499111705,
-      "numpy": 0.050094999896828085
+      "polars": 0.2924191701458767,
+      "numpy": 0.10697791003622115
     },
     "filtering": {
-      "polars": 2.192645420145709,
-      "numpy": 1.1609575001057237
+      "polars": 2.0277649999479763,
+      "numpy": 0.9475779201602563
     },
     "group_by": {
-      "polars": 10.192824580008164
+      "polars": 6.52355499973055
+    }
+  },
+  "500000": {
+    "vector_search": {
+      "numpy": 859.8433666978963,
+      "lanceql": 1863.8669541978743,
+      "polars": "N/A (no native vector search)"
+    },
+    "aggregations": {
+      "polars": 0.5720766700687818,
+      "numpy": 0.2447804098483175
+    },
+    "filtering": {
+      "polars": 4.5456679101334885,
+      "numpy": 4.612017080071382
+    },
+    "group_by": {
+      "polars": 10.12008749996312
     }
   }
 }
