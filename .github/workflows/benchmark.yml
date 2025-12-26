@@ -28,7 +28,7 @@ jobs:
       - name: Build library
         run: zig build lib
 
-      - name: Run Zig tests with benchmarks
+      - name: Run Parquet benchmark
         run: |
           echo "=== LanceQL Benchmark Results ===" > benchmark-results.txt
           echo "Platform: Linux (CPU only)" >> benchmark-results.txt
@@ -38,9 +38,6 @@ jobs:
           echo "=== Parquet Reader ===" >> benchmark-results.txt
           zig build test-parquet 2>&1 | grep -E "(Benchmark|Throughput|Avg|Min|Max|rows)" >> benchmark-results.txt || true
           echo "" >> benchmark-results.txt
-
-          echo "=== Integration Tests ===" >> benchmark-results.txt
-          zig build test-integration 2>&1 | grep -E "(Throughput|docs/ms|us|ms)" >> benchmark-results.txt || true
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
@@ -65,13 +62,25 @@ jobs:
       - name: Build library
         run: zig build lib
 
-      - name: Run vector benchmark (GPU)
+      - name: Run SQL clause benchmark
         run: |
           echo "=== LanceQL Benchmark Results ===" > benchmark-results.txt
           echo "Platform: macOS Apple Silicon (GPU enabled)" >> benchmark-results.txt
           echo "Date: $(date -u)" >> benchmark-results.txt
           echo "" >> benchmark-results.txt
 
+          echo "=== SQL Clause Benchmark ===" >> benchmark-results.txt
+          zig build bench-sql 2>&1 | tee -a benchmark-results.txt
+          echo "" >> benchmark-results.txt
+
+      - name: Run @logic_table workflow benchmark
+        run: |
+          echo "=== @logic_table Workflow Benchmark ===" >> benchmark-results.txt
+          zig build bench-logic-table 2>&1 | tee -a benchmark-results.txt
+          echo "" >> benchmark-results.txt
+
+      - name: Run vector benchmark (GPU)
+        run: |
           echo "=== Vector Operations (GPU vs CPU) ===" >> benchmark-results.txt
           zig build bench-vector 2>&1 | tee -a benchmark-results.txt
           echo "" >> benchmark-results.txt
@@ -80,16 +89,6 @@ jobs:
         run: |
           echo "=== Parquet Reader ===" >> benchmark-results.txt
           zig build test-parquet 2>&1 | grep -E "(Benchmark|Throughput|Avg|Min|Max|rows)" >> benchmark-results.txt || true
-          echo "" >> benchmark-results.txt
-
-      - name: Run integration tests with benchmarks
-        run: |
-          echo "=== Integration Tests ===" >> benchmark-results.txt
-          zig build test-integration 2>&1 | grep -E "(Throughput|docs/ms|us|ms)" >> benchmark-results.txt || true
-          echo "" >> benchmark-results.txt
-
-          echo "=== Logic Table E2E ===" >> benchmark-results.txt
-          zig build test-logic-table 2>&1 | grep -E "(Throughput|docs/ms|us|ms|Top-)" >> benchmark-results.txt || true
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
@@ -120,7 +119,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            let comment = '## 🚀 Benchmark Results\n\n';
+            let comment = '## 🚀 LanceQL Benchmark Results\n\n';
 
             try {
               const macosResults = fs.readFileSync('macos/benchmark-results.txt', 'utf8');

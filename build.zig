@@ -365,6 +365,63 @@ pub fn build(b: *std.Build) void {
     const bench_vector_step = b.step("bench-vector", "Benchmark vector operations (GPU vs CPU)");
     bench_vector_step.dependOn(&run_bench_vector.step);
 
+    // SQL clause benchmark
+    const bench_sql = b.addExecutable(.{
+        .name = "bench_sql",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/bench_sql_clauses.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lanceql", .module = lanceql_mod },
+                .{ .name = "lanceql.metal", .module = metal_mod },
+                .{ .name = "lanceql.query", .module = query_mod },
+            },
+        }),
+    });
+    if (use_metal) {
+        bench_sql.root_module.linkFramework("Metal", .{});
+        bench_sql.root_module.linkFramework("Foundation", .{});
+        bench_sql.root_module.addCSourceFiles(.{
+            .files = &.{"src/metal/metal_backend.m"},
+            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
+        });
+    }
+    if (use_accelerate) {
+        bench_sql.root_module.linkFramework("Accelerate", .{});
+    }
+    const run_bench_sql = b.addRunArtifact(bench_sql);
+    const bench_sql_step = b.step("bench-sql", "Benchmark SQL clauses (SELECT, WHERE, GROUP BY, JOIN, etc.)");
+    bench_sql_step.dependOn(&run_bench_sql.step);
+
+    // @logic_table workflow benchmark
+    const bench_logic_table = b.addExecutable(.{
+        .name = "bench_logic_table",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/bench_logic_table.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lanceql.metal", .module = metal_mod },
+                .{ .name = "lanceql.query", .module = query_mod },
+            },
+        }),
+    });
+    if (use_metal) {
+        bench_logic_table.root_module.linkFramework("Metal", .{});
+        bench_logic_table.root_module.linkFramework("Foundation", .{});
+        bench_logic_table.root_module.addCSourceFiles(.{
+            .files = &.{"src/metal/metal_backend.m"},
+            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
+        });
+    }
+    if (use_accelerate) {
+        bench_logic_table.root_module.linkFramework("Accelerate", .{});
+    }
+    const run_bench_logic_table = b.addRunArtifact(bench_logic_table);
+    const bench_logic_table_step = b.step("bench-logic-table", "Benchmark @logic_table workflows (fraud, recommendation, features)");
+    bench_logic_table_step.dependOn(&run_bench_logic_table.step);
+
     // SQL executor tests
     const test_sql_executor = b.addTest(.{
         .root_module = b.createModule(.{
