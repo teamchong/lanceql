@@ -15,6 +15,7 @@ pub const ast = @import("ast.zig");
 pub const executor = @import("executor.zig");
 pub const aggregates = @import("aggregates.zig");
 pub const logic_table = @import("logic_table.zig");
+pub const gpu_group_by = @import("gpu_group_by.zig");
 
 // Re-export main types
 pub const Expr = expr.Expr;
@@ -35,6 +36,12 @@ pub const LogicTableContext = logic_table.LogicTableContext;
 pub const LogicTableError = logic_table.LogicTableError;
 pub const ColumnDep = logic_table.ColumnDep;
 pub const MethodMeta = logic_table.MethodMeta;
+
+// GPU-accelerated GROUP BY
+pub const GPUGroupBy = gpu_group_by.GPUGroupBy;
+pub const GPUGroupByF64 = gpu_group_by.GPUGroupByF64;
+pub const AggType = gpu_group_by.AggType;
+pub const GroupByResult = gpu_group_by.GroupByResult;
 
 // Batch vector operations for @logic_table
 pub const batchCosineSimilarity = logic_table.batchCosineSimilarity;
