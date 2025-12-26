@@ -114,13 +114,49 @@ pub const SelectItem = struct {
     alias: ?[]const u8,
 };
 
+/// Table-valued function call (e.g., logic_table('path'))
+pub const TableFunction = struct {
+    /// Function name (e.g., "logic_table")
+    name: []const u8,
+
+    /// Function arguments
+    args: []Expr,
+};
+
 /// FROM clause table reference
-pub const TableRef = struct {
+pub const TableRef = union(enum) {
+    /// Simple table name
+    simple: struct {
+        /// Table name
+        name: []const u8,
+
+        /// Optional alias
+        alias: ?[]const u8,
+    },
+
+    /// Table-valued function (e.g., logic_table('fraud.py'))
+    function: struct {
+        /// Function details
+        func: TableFunction,
+
+        /// Optional alias
+        alias: ?[]const u8,
+    },
+};
+
+/// Data binding for WITH DATA clause
+pub const DataBinding = struct {
     /// Table name
     name: []const u8,
 
-    /// Optional alias
-    alias: ?[]const u8,
+    /// Path to data source
+    path: []const u8,
+};
+
+/// WITH DATA clause for logic tables
+pub const WithData = struct {
+    /// Data bindings
+    bindings: []DataBinding,
 };
 
 /// ORDER BY direction
@@ -149,6 +185,9 @@ pub const GroupBy = struct {
 
 /// Complete SELECT statement
 pub const SelectStmt = struct {
+    /// WITH DATA clause (optional, for logic tables)
+    with_data: ?WithData,
+
     /// SELECT clause
     distinct: bool,
     columns: []SelectItem,

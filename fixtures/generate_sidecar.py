@@ -68,7 +68,7 @@ def arrow_type_to_string(arrow_type: pa.DataType) -> str:
 
 
 def get_column_stats(ds: lance.LanceDataset, col_name: str) -> dict[str, Any]:
-    """Get statistics for a column if available."""
+    """Get statistics for a column if available (dataset-level)."""
     stats = {}
     try:
         # Try to compute basic stats for numeric columns
@@ -87,6 +87,69 @@ def get_column_stats(ds: lance.LanceDataset, col_name: str) -> dict[str, Any]:
     except Exception:
         pass
     return stats
+
+
+def get_fragment_column_stats(frag, col_name: str, field_type: pa.DataType) -> dict[str, Any] | None:
+    """Get statistics for a column within a specific fragment."""
+    try:
+        # Only compute stats for numeric and string columns
+        if not (pa.types.is_integer(field_type) or
+                pa.types.is_floating(field_type) or
+                pa.types.is_string(field_type) or
+                pa.types.is_large_string(field_type)):
+            return None
+
+        # Read the column from this fragment
+        scanner = frag.scanner(columns=[col_name])
+        table = scanner.to_table()
+
+        if table.num_rows == 0:
+            return None
+
+        col = table.column(col_name)
+        stats = {
+            "rowCount": table.num_rows,
+            "nullCount": col.null_count,
+        }
+
+        # For numeric columns, compute min/max
+        if pa.types.is_integer(field_type) or pa.types.is_floating(field_type):
+            # Use pyarrow compute for efficient min/max
+            import pyarrow.compute as pc
+            min_val = pc.min(col).as_py()
+            max_val = pc.max(col).as_py()
+            if min_val is not None:
+                stats["min"] = min_val
+            if max_val is not None:
+                stats["max"] = max_val
+
+        # For string columns, just track null count (min/max less useful)
+        # Could add distinct count later for cardinality estimation
+
+        return stats
+    except Exception as e:
+        print(f"  Warning: Could not compute stats for {col_name}: {e}")
+        return None
+
+
+def compute_fragment_statistics(frag, schema: pa.Schema, verbose: bool = False) -> dict[str, dict]:
+    """Compute statistics for all columns in a fragment."""
+    statistics = {}
+
+    for field in schema:
+        # Skip vector/list columns (too expensive to compute stats)
+        if (pa.types.is_fixed_size_list(field.type) or
+            pa.types.is_list(field.type) or
+            pa.types.is_struct(field.type)):
+            continue
+
+        stats = get_fragment_column_stats(frag, field.name, field.type)
+        if stats:
+            statistics[field.name] = stats
+            if verbose:
+                print(f"    {field.name}: min={stats.get('min')}, max={stats.get('max')}, nulls={stats.get('nullCount')}")
+
+    return statistics
 
 
 def get_storage_options(dataset_path: str) -> dict | None:
@@ -127,8 +190,14 @@ def get_storage_options(dataset_path: str) -> dict | None:
     return None
 
 
-def generate_sidecar(dataset_path: str, output_path: str | None = None) -> dict:
-    """Generate sidecar manifest for a Lance dataset."""
+def generate_sidecar(dataset_path: str, output_path: str | None = None, compute_stats: bool = True) -> dict:
+    """Generate sidecar manifest for a Lance dataset.
+
+    Args:
+        dataset_path: Path to Lance dataset (local, HTTP, or S3)
+        output_path: Output path for .meta.json (defaults to dataset/.meta.json)
+        compute_stats: If True, compute per-fragment column statistics (slower but enables fragment pruning)
+    """
     storage_options = get_storage_options(dataset_path)
     if storage_options:
         ds = lance.dataset(dataset_path, storage_options=storage_options)
@@ -144,16 +213,19 @@ def generate_sidecar(dataset_path: str, output_path: str | None = None) -> dict:
             "index": i,
         }
 
-        # Add stats for numeric columns
+        # Add dataset-level stats for numeric columns
         stats = get_column_stats(ds, field.name)
         if stats:
             col_info["stats"] = stats
 
         schema_info.append(col_info)
 
-    # Fragment info
+    # Fragment info with per-fragment statistics
     fragments_info = []
-    for frag in ds.get_fragments():
+    fragments = list(ds.get_fragments())
+    total_frags = len(fragments)
+
+    for idx, frag in enumerate(fragments):
         frag_info = {
             "id": frag.fragment_id,
             "num_rows": frag.count_rows(),
@@ -172,16 +244,24 @@ def generate_sidecar(dataset_path: str, output_path: str | None = None) -> dict:
             frag_info["has_deletions"] = True
             frag_info["deleted_rows"] = frag.metadata.num_rows - frag.count_rows()
 
+        # Compute per-fragment column statistics
+        if compute_stats:
+            print(f"  Computing stats for fragment {idx + 1}/{total_frags} (id={frag.fragment_id})...")
+            statistics = compute_fragment_statistics(frag, ds.schema, verbose=False)
+            if statistics:
+                frag_info["statistics"] = statistics
+
         fragments_info.append(frag_info)
 
     # Build sidecar manifest
     sidecar = {
-        "version": 1,
+        "version": 2,  # Bumped version for statistics support
         "lance_version": ds.version,
         "schema": schema_info,
         "fragments": fragments_info,
         "total_rows": ds.count_rows(),
         "num_columns": len(ds.schema),
+        "has_statistics": compute_stats,
     }
 
     # Determine output path
@@ -198,6 +278,9 @@ def generate_sidecar(dataset_path: str, output_path: str | None = None) -> dict:
     print(f"  Schema: {len(schema_info)} columns")
     print(f"  Fragments: {len(fragments_info)}")
     print(f"  Total rows: {sidecar['total_rows']:,}")
+    if compute_stats:
+        stats_cols = sum(1 for f in fragments_info if f.get("statistics"))
+        print(f"  Fragments with statistics: {stats_cols}")
 
     return sidecar
 

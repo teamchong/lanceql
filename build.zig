@@ -66,6 +66,14 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Column dependency extraction for @logic_table
+    const sql_column_deps_mod = b.addModule("lanceql.sql.column_deps", .{
+        .root_source_file = b.path("src/sql/column_deps.zig"),
+        .imports = &.{
+            .{ .name = "ast", .module = sql_ast_mod },
+        },
+    });
+
     const table_mod = b.addModule("lanceql.table", .{
         .root_source_file = b.path("src/table.zig"),
         .imports = &.{
@@ -311,6 +319,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "lanceql.sql.ast", .module = sql_ast_mod },
                 .{ .name = "lanceql.sql.parser", .module = sql_parser_mod },
                 .{ .name = "lanceql.sql.executor", .module = sql_executor_mod },
+                .{ .name = "lanceql.sql.column_deps", .module = sql_column_deps_mod },
             },
         }),
     });
@@ -318,8 +327,23 @@ pub fn build(b: *std.Build) void {
     const run_test_sql_executor = b.addRunArtifact(test_sql_executor);
     test_step.dependOn(&run_test_sql_executor.step);
 
+    // Column dependency extraction tests
+    const test_column_deps = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/sql/column_deps.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "ast", .module = sql_ast_mod },
+            },
+        }),
+    });
+    const run_test_column_deps = b.addRunArtifact(test_column_deps);
+    test_step.dependOn(&run_test_column_deps.step);
+
     const test_sql_step = b.step("test-sql", "Run SQL executor tests");
     test_sql_step.dependOn(&run_test_sql_executor.step);
+    test_sql_step.dependOn(&run_test_column_deps.step);
 
     // Stress tests - large datasets, memory pressure, edge cases
     const test_stress = b.addTest(.{

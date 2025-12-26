@@ -119,3 +119,108 @@ kernel void top_k_partial(
     top_scores[gid] = best_score;
     top_indices[gid] = best_idx;
 }
+
+// =============================================================================
+// Batch Arithmetic Operations for @logic_table compiled methods
+// =============================================================================
+
+/// Batch multiply array by scalar: out[i] = a[i] * scalar
+kernel void batch_mul_scalar(
+    device const float* a [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant float& scalar [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    out[gid] = a[gid] * scalar;
+}
+
+/// Batch multiply two arrays: out[i] = a[i] * b[i]
+kernel void batch_mul_arrays(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    out[gid] = a[gid] * b[gid];
+}
+
+/// Batch multiply two arrays with scalar: out[i] = a[i] * b[i] * scalar
+kernel void batch_mul_arrays_scalar(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant float& scalar [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    out[gid] = a[gid] * b[gid] * scalar;
+}
+
+/// Batch add two arrays: out[i] = a[i] + b[i]
+kernel void batch_add_arrays(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    out[gid] = a[gid] + b[gid];
+}
+
+/// Batch subtract: out[i] = a[i] - b[i]
+kernel void batch_sub_arrays(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    out[gid] = a[gid] - b[gid];
+}
+
+/// Batch divide: out[i] = a[i] / b[i]
+kernel void batch_div_arrays(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    out[gid] = a[gid] / b[gid];
+}
+
+/// Batch fused multiply-add: out[i] = a[i] * b[i] + c[i]
+kernel void batch_fma(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device const float* c [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    out[gid] = fma(a[gid], b[gid], c[gid]);
+}
+
+/// Batch abs: out[i] = abs(a[i])
+kernel void batch_abs(
+    device const float* a [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    out[gid] = abs(a[gid]);
+}
+
+/// Batch min of two arrays: out[i] = min(a[i], b[i])
+kernel void batch_min_arrays(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    out[gid] = min(a[gid], b[gid]);
+}
+
+/// Batch max of two arrays: out[i] = max(a[i], b[i])
+kernel void batch_max_arrays(
+    device const float* a [[buffer(0)]],
+    device const float* b [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    out[gid] = max(a[gid], b[gid]);
+}

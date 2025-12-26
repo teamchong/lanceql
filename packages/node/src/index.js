@@ -555,6 +555,292 @@ class RemoteLanceDataset {
 }
 
 // ============================================================================
+// LogicTable - Hybrid JavaScript logic + Lance data queries
+// ============================================================================
+
+/**
+ * Table source declaration.
+ * @param {string} path - Path to Lance dataset
+ * @param {Object} options - Options
+ * @returns {Object} Table specification
+ */
+function Table(path, options = {}) {
+    return {
+        type: 'table',
+        path,
+        hotTier: options.hotTier || null,
+        columns: options.columns || null
+    };
+}
+
+/**
+ * Query builder for LogicTable.
+ */
+class LogicTableQuery {
+    constructor(logicDef, bindings = {}) {
+        this._logicDef = logicDef;
+        this._bindings = bindings;
+        this._filters = [];
+        this._projections = [];
+        this._orderSpecs = [];
+        this._limitVal = null;
+        this._offsetVal = null;
+    }
+
+    bind(tables) {
+        const query = this._clone();
+        Object.assign(query._bindings, tables);
+        return query;
+    }
+
+    filter(predicate) {
+        const query = this._clone();
+        query._filters.push(predicate);
+        return query;
+    }
+
+    select(...columns) {
+        const query = this._clone();
+        query._projections = columns;
+        return query;
+    }
+
+    orderBy(column, options = {}) {
+        const query = this._clone();
+        query._orderSpecs.push({ column, desc: options.desc || false });
+        return query;
+    }
+
+    limit(n) {
+        const query = this._clone();
+        query._limitVal = n;
+        return query;
+    }
+
+    offset(n) {
+        const query = this._clone();
+        query._offsetVal = n;
+        return query;
+    }
+
+    _clone() {
+        const query = new LogicTableQuery(this._logicDef, { ...this._bindings });
+        query._filters = [...this._filters];
+        query._projections = [...this._projections];
+        query._orderSpecs = [...this._orderSpecs];
+        query._limitVal = this._limitVal;
+        query._offsetVal = this._offsetVal;
+        return query;
+    }
+
+    _resolvePath(tableName, tableSpec) {
+        return this._bindings[tableName] || tableSpec.path;
+    }
+
+    async _loadTable(path) {
+        // Use LocalDatabase to load Lance files
+        const db = new LocalDatabase(path);
+        const rows = db.prepare('SELECT * FROM data').all();
+        db.close();
+        return rows;
+    }
+
+    async execute() {
+        const { tables, methods } = this._logicDef;
+
+        // Load all tables
+        const tableData = {};
+        for (const [name, spec] of Object.entries(tables)) {
+            const path = this._resolvePath(name, spec);
+            tableData[name] = await this._loadTable(path);
+        }
+
+        // Get primary table
+        const primaryName = Object.keys(tables)[0];
+        const primaryData = tableData[primaryName];
+
+        const results = [];
+
+        for (let i = 0; i < primaryData.length; i++) {
+            // Create logic instance with current row bound
+            const logicInstance = {};
+
+            // Bind table accessors
+            for (const [name, data] of Object.entries(tableData)) {
+                const row = data[i] || data[0];
+                logicInstance[name] = row;
+            }
+
+            // Bind methods
+            for (const [name, fn] of Object.entries(methods || {})) {
+                logicInstance[name] = fn.bind(logicInstance);
+            }
+
+            // Evaluate filters
+            let pass = true;
+            for (const filter of this._filters) {
+                try {
+                    if (!filter(logicInstance)) {
+                        pass = false;
+                        break;
+                    }
+                } catch {
+                    pass = false;
+                    break;
+                }
+            }
+
+            if (!pass) continue;
+
+            // Build result row
+            let row;
+            if (this._projections.length > 0) {
+                row = {};
+                for (const proj of this._projections) {
+                    if (typeof proj === 'string') {
+                        for (const data of Object.values(tableData)) {
+                            if (proj in (data[i] || {})) {
+                                row[proj] = data[i][proj];
+                                break;
+                            }
+                        }
+                    } else if (Array.isArray(proj)) {
+                        const [fn, alias] = proj;
+                        row[alias] = fn(logicInstance);
+                    } else if (typeof proj === 'function') {
+                        const value = proj(logicInstance);
+                        row[`col_${Object.keys(row).length}`] = value;
+                    }
+                }
+            } else {
+                row = { ...primaryData[i] };
+            }
+
+            results.push(row);
+        }
+
+        // Apply ordering
+        if (this._orderSpecs.length > 0) {
+            results.sort((a, b) => {
+                for (const spec of this._orderSpecs) {
+                    let aVal, bVal;
+                    if (typeof spec.column === 'string') {
+                        aVal = a[spec.column];
+                        bVal = b[spec.column];
+                    } else {
+                        aVal = a[Object.keys(a)[0]];
+                        bVal = b[Object.keys(b)[0]];
+                    }
+                    const cmp = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
+                    if (cmp !== 0) return spec.desc ? -cmp : cmp;
+                }
+                return 0;
+            });
+        }
+
+        let finalResults = results;
+        if (this._offsetVal) {
+            finalResults = finalResults.slice(this._offsetVal);
+        }
+        if (this._limitVal) {
+            finalResults = finalResults.slice(0, this._limitVal);
+        }
+
+        return finalResults;
+    }
+
+    explain() {
+        const lines = [`LogicTable: ${this._logicDef.name || 'anonymous'}`];
+
+        lines.push('Tables:');
+        for (const [name, spec] of Object.entries(this._logicDef.tables)) {
+            const path = this._resolvePath(name, spec);
+            const hot = spec.hotTier ? ` (hotTier=${spec.hotTier})` : '';
+            lines.push(`  ${name} = ${path}${hot}`);
+        }
+
+        if (this._filters.length > 0) {
+            lines.push(`Filters: ${this._filters.length} predicate(s)`);
+        }
+        if (this._projections.length > 0) {
+            lines.push(`Projections: ${this._projections.length} column(s)`);
+        }
+        if (this._orderSpecs.length > 0) {
+            lines.push(`Order by: ${this._orderSpecs.length} key(s)`);
+        }
+        if (this._limitVal) {
+            lines.push(`Limit: ${this._limitVal}`);
+        }
+
+        return lines.join('\n');
+    }
+}
+
+/**
+ * Create a LogicTable definition.
+ * @param {Object} def - Definition with tables and methods
+ * @returns {Object} LogicTable with query methods
+ */
+function logicTable(def) {
+    const logicDef = {
+        name: def.name || 'LogicTable',
+        tables: def.tables || {},
+        methods: def.methods || {}
+    };
+
+    return {
+        _def: logicDef,
+
+        filter(predicate) {
+            return new LogicTableQuery(logicDef).filter(predicate);
+        },
+
+        select(...columns) {
+            return new LogicTableQuery(logicDef).select(...columns);
+        },
+
+        bind(tables) {
+            return new LogicTableQuery(logicDef).bind(tables);
+        },
+
+        orderBy(column, options) {
+            return new LogicTableQuery(logicDef).orderBy(column, options);
+        },
+
+        limit(n) {
+            return new LogicTableQuery(logicDef).limit(n);
+        },
+
+        query() {
+            return new LogicTableQuery(logicDef);
+        },
+
+        async execute() {
+            return new LogicTableQuery(logicDef).execute();
+        }
+    };
+}
+
+/**
+ * Load a LogicTable from a JavaScript file.
+ * @param {string} path - Path to JS file
+ * @returns {Object} LogicTable
+ */
+function loadLogicTable(path) {
+    const module = require(path);
+    if (module.default && module.default._def) {
+        return module.default;
+    }
+    if (module.Logic && module.Logic._def) {
+        return module.Logic;
+    }
+    if (module._def) {
+        return module;
+    }
+    throw new Error(`No LogicTable found in ${path}`);
+}
+
+// ============================================================================
 // Exports - Match better-sqlite3 export format exactly
 // ============================================================================
 
@@ -569,3 +855,7 @@ module.exports.VectorAccelerator = VectorAccelerator;
 module.exports.vectorAccelerator = vectorAccelerator;
 module.exports.RemoteLanceDataset = RemoteLanceDataset;
 module.exports.IVFIndex = IVFIndex;
+module.exports.Table = Table;
+module.exports.logicTable = logicTable;
+module.exports.LogicTableQuery = LogicTableQuery;
+module.exports.loadLogicTable = loadLogicTable;

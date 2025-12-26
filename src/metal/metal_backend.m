@@ -17,6 +17,16 @@ static id<MTLLibrary> g_library = nil;
 static id<MTLComputePipelineState> g_cosine_pipeline = nil;
 static id<MTLComputePipelineState> g_dot_pipeline = nil;
 static id<MTLComputePipelineState> g_l2_pipeline = nil;
+// Batch arithmetic pipelines (for @logic_table compiled methods)
+static id<MTLComputePipelineState> g_mul_scalar_pipeline = nil;
+static id<MTLComputePipelineState> g_mul_arrays_pipeline = nil;
+static id<MTLComputePipelineState> g_mul_arrays_scalar_pipeline = nil;
+static id<MTLComputePipelineState> g_add_arrays_pipeline = nil;
+static id<MTLComputePipelineState> g_sub_arrays_pipeline = nil;
+static id<MTLComputePipelineState> g_div_arrays_pipeline = nil;
+static id<MTLComputePipelineState> g_abs_pipeline = nil;
+static id<MTLComputePipelineState> g_min_arrays_pipeline = nil;
+static id<MTLComputePipelineState> g_max_arrays_pipeline = nil;
 static bool g_initialized = false;
 
 // Path to precompiled Metal library (set by build system)
@@ -139,7 +149,10 @@ kernel void l2_distance_batch(
 }
 )";
             MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
             options.fastMathEnabled = YES;
+#pragma clang diagnostic pop
             g_library = [g_device newLibraryWithSource:shaderSource options:options error:&error];
 
             if (!g_library) {
@@ -166,10 +179,38 @@ kernel void l2_distance_batch(
             g_l2_pipeline = [g_device newComputePipelineStateWithFunction:l2_fn error:&error];
         }
 
+        // Create batch arithmetic pipelines (for @logic_table compiled methods)
+        id<MTLFunction> mul_scalar_fn = [g_library newFunctionWithName:@"batch_mul_scalar"];
+        id<MTLFunction> mul_arrays_fn = [g_library newFunctionWithName:@"batch_mul_arrays"];
+        id<MTLFunction> mul_arrays_scalar_fn = [g_library newFunctionWithName:@"batch_mul_arrays_scalar"];
+        id<MTLFunction> add_arrays_fn = [g_library newFunctionWithName:@"batch_add_arrays"];
+        id<MTLFunction> sub_arrays_fn = [g_library newFunctionWithName:@"batch_sub_arrays"];
+        id<MTLFunction> div_arrays_fn = [g_library newFunctionWithName:@"batch_div_arrays"];
+        id<MTLFunction> abs_fn = [g_library newFunctionWithName:@"batch_abs"];
+        id<MTLFunction> min_arrays_fn = [g_library newFunctionWithName:@"batch_min_arrays"];
+        id<MTLFunction> max_arrays_fn = [g_library newFunctionWithName:@"batch_max_arrays"];
+
+        if (mul_scalar_fn) g_mul_scalar_pipeline = [g_device newComputePipelineStateWithFunction:mul_scalar_fn error:&error];
+        if (mul_arrays_fn) g_mul_arrays_pipeline = [g_device newComputePipelineStateWithFunction:mul_arrays_fn error:&error];
+        if (mul_arrays_scalar_fn) g_mul_arrays_scalar_pipeline = [g_device newComputePipelineStateWithFunction:mul_arrays_scalar_fn error:&error];
+        if (add_arrays_fn) g_add_arrays_pipeline = [g_device newComputePipelineStateWithFunction:add_arrays_fn error:&error];
+        if (sub_arrays_fn) g_sub_arrays_pipeline = [g_device newComputePipelineStateWithFunction:sub_arrays_fn error:&error];
+        if (div_arrays_fn) g_div_arrays_pipeline = [g_device newComputePipelineStateWithFunction:div_arrays_fn error:&error];
+        if (abs_fn) g_abs_pipeline = [g_device newComputePipelineStateWithFunction:abs_fn error:&error];
+        if (min_arrays_fn) g_min_arrays_pipeline = [g_device newComputePipelineStateWithFunction:min_arrays_fn error:&error];
+        if (max_arrays_fn) g_max_arrays_pipeline = [g_device newComputePipelineStateWithFunction:max_arrays_fn error:&error];
+
+        int batch_kernels = (g_mul_scalar_pipeline ? 1 : 0) + (g_mul_arrays_pipeline ? 1 : 0) +
+                           (g_mul_arrays_scalar_pipeline ? 1 : 0) + (g_add_arrays_pipeline ? 1 : 0) +
+                           (g_sub_arrays_pipeline ? 1 : 0) + (g_div_arrays_pipeline ? 1 : 0) +
+                           (g_abs_pipeline ? 1 : 0) + (g_min_arrays_pipeline ? 1 : 0) +
+                           (g_max_arrays_pipeline ? 1 : 0);
+
         g_initialized = true;
-        NSLog(@"LanceQL Metal: Initialized GPU '%@' with %d kernels",
+        NSLog(@"LanceQL Metal: Initialized GPU '%@' with %d vector + %d batch kernels",
               g_device.name,
-              (g_cosine_pipeline ? 1 : 0) + (g_dot_pipeline ? 1 : 0) + (g_l2_pipeline ? 1 : 0));
+              (g_cosine_pipeline ? 1 : 0) + (g_dot_pipeline ? 1 : 0) + (g_l2_pipeline ? 1 : 0),
+              batch_kernels);
 
         return 0;
     }
@@ -337,11 +378,265 @@ int lanceql_metal_l2_batch(
     }
 }
 
+// =============================================================================
+// Batch Arithmetic Operations (for @logic_table compiled methods)
+// =============================================================================
+
+// Batch multiply array by scalar: out[i] = a[i] * scalar
+int lanceql_metal_batch_mul_scalar(
+    const float* a,
+    float* out,
+    float scalar,
+    unsigned int len
+) {
+    @autoreleasepool {
+        if (!g_initialized) {
+            if (lanceql_metal_init() != 0) return -1;
+        }
+        if (!g_mul_scalar_pipeline) return -1;
+
+        size_t size = len * sizeof(float);
+
+        id<MTLBuffer> a_buf = [g_device newBufferWithBytes:a length:size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_buf = [g_device newBufferWithLength:size options:MTLResourceStorageModeShared];
+
+        id<MTLCommandBuffer> cmd_buf = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_mul_scalar_pipeline];
+        [encoder setBuffer:a_buf offset:0 atIndex:0];
+        [encoder setBuffer:out_buf offset:0 atIndex:1];
+        [encoder setBytes:&scalar length:sizeof(float) atIndex:2];
+
+        MTLSize grid_size = MTLSizeMake(len, 1, 1);
+        NSUInteger tg_size = MIN(g_mul_scalar_pipeline.maxTotalThreadsPerThreadgroup, 256);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        [encoder endEncoding];
+
+        [cmd_buf commit];
+        [cmd_buf waitUntilCompleted];
+
+        memcpy(out, out_buf.contents, size);
+        return 0;
+    }
+}
+
+// Batch multiply two arrays: out[i] = a[i] * b[i]
+int lanceql_metal_batch_mul_arrays(
+    const float* a,
+    const float* b,
+    float* out,
+    unsigned int len
+) {
+    @autoreleasepool {
+        if (!g_initialized) {
+            if (lanceql_metal_init() != 0) return -1;
+        }
+        if (!g_mul_arrays_pipeline) return -1;
+
+        size_t size = len * sizeof(float);
+
+        id<MTLBuffer> a_buf = [g_device newBufferWithBytes:a length:size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_buf = [g_device newBufferWithBytes:b length:size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_buf = [g_device newBufferWithLength:size options:MTLResourceStorageModeShared];
+
+        id<MTLCommandBuffer> cmd_buf = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_mul_arrays_pipeline];
+        [encoder setBuffer:a_buf offset:0 atIndex:0];
+        [encoder setBuffer:b_buf offset:0 atIndex:1];
+        [encoder setBuffer:out_buf offset:0 atIndex:2];
+
+        MTLSize grid_size = MTLSizeMake(len, 1, 1);
+        NSUInteger tg_size = MIN(g_mul_arrays_pipeline.maxTotalThreadsPerThreadgroup, 256);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        [encoder endEncoding];
+
+        [cmd_buf commit];
+        [cmd_buf waitUntilCompleted];
+
+        memcpy(out, out_buf.contents, size);
+        return 0;
+    }
+}
+
+// Batch multiply two arrays with scalar: out[i] = a[i] * b[i] * scalar
+int lanceql_metal_batch_mul_arrays_scalar(
+    const float* a,
+    const float* b,
+    float* out,
+    float scalar,
+    unsigned int len
+) {
+    @autoreleasepool {
+        if (!g_initialized) {
+            if (lanceql_metal_init() != 0) return -1;
+        }
+        if (!g_mul_arrays_scalar_pipeline) return -1;
+
+        size_t size = len * sizeof(float);
+
+        id<MTLBuffer> a_buf = [g_device newBufferWithBytes:a length:size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_buf = [g_device newBufferWithBytes:b length:size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_buf = [g_device newBufferWithLength:size options:MTLResourceStorageModeShared];
+
+        id<MTLCommandBuffer> cmd_buf = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_mul_arrays_scalar_pipeline];
+        [encoder setBuffer:a_buf offset:0 atIndex:0];
+        [encoder setBuffer:b_buf offset:0 atIndex:1];
+        [encoder setBuffer:out_buf offset:0 atIndex:2];
+        [encoder setBytes:&scalar length:sizeof(float) atIndex:3];
+
+        MTLSize grid_size = MTLSizeMake(len, 1, 1);
+        NSUInteger tg_size = MIN(g_mul_arrays_scalar_pipeline.maxTotalThreadsPerThreadgroup, 256);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        [encoder endEncoding];
+
+        [cmd_buf commit];
+        [cmd_buf waitUntilCompleted];
+
+        memcpy(out, out_buf.contents, size);
+        return 0;
+    }
+}
+
+// Batch add two arrays: out[i] = a[i] + b[i]
+int lanceql_metal_batch_add_arrays(
+    const float* a,
+    const float* b,
+    float* out,
+    unsigned int len
+) {
+    @autoreleasepool {
+        if (!g_initialized) {
+            if (lanceql_metal_init() != 0) return -1;
+        }
+        if (!g_add_arrays_pipeline) return -1;
+
+        size_t size = len * sizeof(float);
+
+        id<MTLBuffer> a_buf = [g_device newBufferWithBytes:a length:size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_buf = [g_device newBufferWithBytes:b length:size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_buf = [g_device newBufferWithLength:size options:MTLResourceStorageModeShared];
+
+        id<MTLCommandBuffer> cmd_buf = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_add_arrays_pipeline];
+        [encoder setBuffer:a_buf offset:0 atIndex:0];
+        [encoder setBuffer:b_buf offset:0 atIndex:1];
+        [encoder setBuffer:out_buf offset:0 atIndex:2];
+
+        MTLSize grid_size = MTLSizeMake(len, 1, 1);
+        NSUInteger tg_size = MIN(g_add_arrays_pipeline.maxTotalThreadsPerThreadgroup, 256);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        [encoder endEncoding];
+
+        [cmd_buf commit];
+        [cmd_buf waitUntilCompleted];
+
+        memcpy(out, out_buf.contents, size);
+        return 0;
+    }
+}
+
+// Batch subtract: out[i] = a[i] - b[i]
+int lanceql_metal_batch_sub_arrays(
+    const float* a,
+    const float* b,
+    float* out,
+    unsigned int len
+) {
+    @autoreleasepool {
+        if (!g_initialized) {
+            if (lanceql_metal_init() != 0) return -1;
+        }
+        if (!g_sub_arrays_pipeline) return -1;
+
+        size_t size = len * sizeof(float);
+
+        id<MTLBuffer> a_buf = [g_device newBufferWithBytes:a length:size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_buf = [g_device newBufferWithBytes:b length:size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_buf = [g_device newBufferWithLength:size options:MTLResourceStorageModeShared];
+
+        id<MTLCommandBuffer> cmd_buf = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_sub_arrays_pipeline];
+        [encoder setBuffer:a_buf offset:0 atIndex:0];
+        [encoder setBuffer:b_buf offset:0 atIndex:1];
+        [encoder setBuffer:out_buf offset:0 atIndex:2];
+
+        MTLSize grid_size = MTLSizeMake(len, 1, 1);
+        NSUInteger tg_size = MIN(g_sub_arrays_pipeline.maxTotalThreadsPerThreadgroup, 256);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        [encoder endEncoding];
+
+        [cmd_buf commit];
+        [cmd_buf waitUntilCompleted];
+
+        memcpy(out, out_buf.contents, size);
+        return 0;
+    }
+}
+
+// Batch divide: out[i] = a[i] / b[i]
+int lanceql_metal_batch_div_arrays(
+    const float* a,
+    const float* b,
+    float* out,
+    unsigned int len
+) {
+    @autoreleasepool {
+        if (!g_initialized) {
+            if (lanceql_metal_init() != 0) return -1;
+        }
+        if (!g_div_arrays_pipeline) return -1;
+
+        size_t size = len * sizeof(float);
+
+        id<MTLBuffer> a_buf = [g_device newBufferWithBytes:a length:size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_buf = [g_device newBufferWithBytes:b length:size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_buf = [g_device newBufferWithLength:size options:MTLResourceStorageModeShared];
+
+        id<MTLCommandBuffer> cmd_buf = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_div_arrays_pipeline];
+        [encoder setBuffer:a_buf offset:0 atIndex:0];
+        [encoder setBuffer:b_buf offset:0 atIndex:1];
+        [encoder setBuffer:out_buf offset:0 atIndex:2];
+
+        MTLSize grid_size = MTLSizeMake(len, 1, 1);
+        NSUInteger tg_size = MIN(g_div_arrays_pipeline.maxTotalThreadsPerThreadgroup, 256);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        [encoder endEncoding];
+
+        [cmd_buf commit];
+        [cmd_buf waitUntilCompleted];
+
+        memcpy(out, out_buf.contents, size);
+        return 0;
+    }
+}
+
 // Cleanup
 void lanceql_metal_cleanup(void) {
     g_cosine_pipeline = nil;
     g_dot_pipeline = nil;
     g_l2_pipeline = nil;
+    g_mul_scalar_pipeline = nil;
+    g_mul_arrays_pipeline = nil;
+    g_mul_arrays_scalar_pipeline = nil;
+    g_add_arrays_pipeline = nil;
+    g_sub_arrays_pipeline = nil;
+    g_div_arrays_pipeline = nil;
+    g_abs_pipeline = nil;
+    g_min_arrays_pipeline = nil;
+    g_max_arrays_pipeline = nil;
     g_library = nil;
     g_queue = nil;
     g_device = nil;

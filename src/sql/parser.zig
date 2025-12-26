@@ -81,8 +81,51 @@ pub const Parser = struct {
 
         return switch (tok.type) {
             .SELECT => Statement{ .select = try self.parseSelect() },
+            .WITH => Statement{ .select = try self.parseWithSelect() },
             else => error.UnsupportedStatement,
         };
+    }
+
+    /// Parse WITH DATA ... SELECT statement
+    fn parseWithSelect(self: *Self) !SelectStmt {
+        _ = try self.expect(.WITH);
+        _ = try self.expect(.DATA);
+
+        // Parse data bindings: (name = 'path', ...)
+        _ = try self.expect(.LPAREN);
+
+        var bindings = std.ArrayList(ast.DataBinding){};
+        errdefer bindings.deinit(self.allocator);
+
+        while (true) {
+            // Parse: name = 'path'
+            const name_tok = try self.expect(.IDENTIFIER);
+            _ = try self.expect(.EQ);
+            const path_tok = try self.expect(.STRING);
+
+            // Remove quotes from path
+            const path = if (path_tok.lexeme.len >= 2)
+                path_tok.lexeme[1 .. path_tok.lexeme.len - 1]
+            else
+                path_tok.lexeme;
+
+            try bindings.append(self.allocator, ast.DataBinding{
+                .name = name_tok.lexeme,
+                .path = path,
+            });
+
+            if (!self.match(&[_]TokenType{.COMMA})) break;
+        }
+
+        _ = try self.expect(.RPAREN);
+
+        // Now parse the SELECT
+        var stmt = try self.parseSelect();
+        stmt.with_data = ast.WithData{
+            .bindings = try bindings.toOwnedSlice(self.allocator),
+        };
+
+        return stmt;
     }
 
     /// Parse SELECT statement
@@ -130,6 +173,7 @@ pub const Parser = struct {
             null;
 
         return SelectStmt{
+            .with_data = null,
             .distinct = distinct,
             .columns = columns,
             .from = from,
@@ -458,6 +502,44 @@ pub const Parser = struct {
     fn parseTableRef(self: *Self) !ast.TableRef {
         const name_tok = try self.expect(.IDENTIFIER);
 
+        // Check if this is a table-valued function (e.g., logic_table('path'))
+        if (self.check(.LPAREN)) {
+            self.advance();
+
+            // Parse function arguments
+            var args = std.ArrayList(Expr){};
+            errdefer args.deinit(self.allocator);
+
+            while (!self.check(.RPAREN) and !self.check(.EOF)) {
+                try args.append(self.allocator, try self.parseExpr());
+                if (!self.match(&[_]TokenType{.COMMA})) break;
+            }
+
+            _ = try self.expect(.RPAREN);
+
+            // Check for alias
+            const alias = if (self.match(&[_]TokenType{.AS})) blk: {
+                const tok = try self.expect(.IDENTIFIER);
+                break :blk tok.lexeme;
+            } else if (self.check(.IDENTIFIER)) blk: {
+                // Alias without AS keyword
+                const tok = self.current().?;
+                self.advance();
+                break :blk tok.lexeme;
+            } else null;
+
+            return ast.TableRef{
+                .function = .{
+                    .func = ast.TableFunction{
+                        .name = name_tok.lexeme,
+                        .args = try args.toOwnedSlice(self.allocator),
+                    },
+                    .alias = alias,
+                },
+            };
+        }
+
+        // Simple table reference
         // Check for alias
         const alias = if (self.match(&[_]TokenType{.AS})) blk: {
             const tok = try self.expect(.IDENTIFIER);
@@ -465,8 +547,10 @@ pub const Parser = struct {
         } else null;
 
         return ast.TableRef{
-            .name = name_tok.lexeme,
-            .alias = alias,
+            .simple = .{
+                .name = name_tok.lexeme,
+                .alias = alias,
+            },
         };
     }
 

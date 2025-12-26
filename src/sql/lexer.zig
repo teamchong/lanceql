@@ -35,6 +35,13 @@ pub const TokenType = enum {
     TOPK,
     FILE,
 
+    // Logic table extension
+    WITH,
+    DATA,
+    LOGIC_TABLE,
+    USING,
+    LOGIC,
+
     // Aggregate functions
     COUNT,
     SUM,
@@ -342,7 +349,12 @@ fn keywordOrIdentifier(word: []const u8) TokenType {
     if (std.mem.eql(u8, upper, "SELECT")) return .SELECT;
     if (std.mem.eql(u8, upper, "SUM")) return .SUM;
     if (std.mem.eql(u8, upper, "TOPK")) return .TOPK;
+    if (std.mem.eql(u8, upper, "USING")) return .USING;
     if (std.mem.eql(u8, upper, "WHERE")) return .WHERE;
+    if (std.mem.eql(u8, upper, "WITH")) return .WITH;
+    if (std.mem.eql(u8, upper, "DATA")) return .DATA;
+    if (std.mem.eql(u8, upper, "LOGIC")) return .LOGIC;
+    if (std.mem.eql(u8, upper, "LOGIC_TABLE")) return .LOGIC_TABLE;
 
     return .IDENTIFIER;
 }
