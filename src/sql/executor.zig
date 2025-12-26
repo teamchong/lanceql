@@ -498,9 +498,8 @@ pub const Executor = struct {
 
         // Apply HAVING clause
         if (stmt.group_by) |gb| {
-            if (gb.having) |_| {
-                // TODO: Apply HAVING filter
-                // For now, skip HAVING
+            if (gb.having) |having_expr| {
+                try self.applyHaving(&result, &having_expr, stmt.columns);
             }
         }
 
@@ -576,23 +575,23 @@ pub const Executor = struct {
 
             switch (cached) {
                 .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| {
-                    var buf: [32]u8 = undefined;
-                    const str = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch unreachable;
+                    var buf: [64]u8 = undefined;
+                    const str = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch |err| return err;
                     try key.appendSlice(self.allocator, str);
                 },
                 .int32, .date32 => |data| {
                     var buf: [32]u8 = undefined;
-                    const str = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch unreachable;
+                    const str = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch |err| return err;
                     try key.appendSlice(self.allocator, str);
                 },
                 .float64 => |data| {
-                    var buf: [32]u8 = undefined;
-                    const str = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch unreachable;
+                    var buf: [64]u8 = undefined;
+                    const str = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch |err| return err;
                     try key.appendSlice(self.allocator, str);
                 },
                 .float32 => |data| {
                     var buf: [32]u8 = undefined;
-                    const str = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch unreachable;
+                    const str = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch |err| return err;
                     try key.appendSlice(self.allocator, str);
                 },
                 .bool_ => |data| {
@@ -1910,8 +1909,9 @@ pub const Executor = struct {
     ) !Result.ColumnData {
         const field = self.table.getFieldById(col_idx) orelse return error.InvalidColumn;
 
-        // For Phase 1: Read ALL rows, then filter by indices
-        // TODO Phase 2: Add readAtIndices() methods to Table for efficiency
+        // Phase 2: Table API now has readAtIndices() methods
+        // Current implementation still uses inline filtering for type-specific handling
+        // Future: refactor to use Table.readInt64AtIndices() etc. for cleaner code
 
         const logical_type = field.logical_type;
 
@@ -2138,23 +2138,23 @@ pub const Executor = struct {
             try key.append(self.allocator, '|'); // Column separator
             switch (col.data) {
                 .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |vals| {
-                    var buf: [32]u8 = undefined;
-                    const str = std.fmt.bufPrint(&buf, "{d}", .{vals[row_idx]}) catch unreachable;
+                    var buf: [64]u8 = undefined;
+                    const str = std.fmt.bufPrint(&buf, "{d}", .{vals[row_idx]}) catch |err| return err;
                     try key.appendSlice(self.allocator, str);
                 },
                 .int32, .date32 => |vals| {
-                    var buf: [16]u8 = undefined;
-                    const str = std.fmt.bufPrint(&buf, "{d}", .{vals[row_idx]}) catch unreachable;
+                    var buf: [32]u8 = undefined;
+                    const str = std.fmt.bufPrint(&buf, "{d}", .{vals[row_idx]}) catch |err| return err;
                     try key.appendSlice(self.allocator, str);
                 },
                 .float64 => |vals| {
                     var buf: [64]u8 = undefined;
-                    const str = std.fmt.bufPrint(&buf, "{d}", .{vals[row_idx]}) catch unreachable;
+                    const str = std.fmt.bufPrint(&buf, "{d}", .{vals[row_idx]}) catch |err| return err;
                     try key.appendSlice(self.allocator, str);
                 },
                 .float32 => |vals| {
                     var buf: [32]u8 = undefined;
-                    const str = std.fmt.bufPrint(&buf, "{d}", .{vals[row_idx]}) catch unreachable;
+                    const str = std.fmt.bufPrint(&buf, "{d}", .{vals[row_idx]}) catch |err| return err;
                     try key.appendSlice(self.allocator, str);
                 },
                 .bool_ => |vals| {
@@ -2639,6 +2639,271 @@ pub const Executor = struct {
             },
         }
     }
+
+    // ========================================================================
+    // HAVING Clause Implementation
+    // ========================================================================
+
+    /// Apply HAVING filter to result, returning filtered result
+    fn applyHaving(
+        self: *Self,
+        result: *Result,
+        having_expr: *const Expr,
+        select_items: []const ast.SelectItem,
+    ) !void {
+        if (result.row_count == 0) return;
+
+        // Collect indices of rows that pass the HAVING filter
+        var passing_indices = std.ArrayList(usize){};
+        defer passing_indices.deinit(self.allocator);
+
+        for (0..result.row_count) |row_idx| {
+            const passes = try self.evaluateHavingExpr(result.columns, select_items, having_expr, row_idx);
+            if (passes) {
+                try passing_indices.append(self.allocator, row_idx);
+            }
+        }
+
+        // If all rows pass, nothing to do
+        if (passing_indices.items.len == result.row_count) return;
+
+        // Build filtered result columns
+        const indices = passing_indices.items;
+        var new_columns = try self.allocator.alloc(Result.Column, result.columns.len);
+        errdefer self.allocator.free(new_columns);
+
+        for (result.columns, 0..) |col, i| {
+            new_columns[i] = try self.filterColumnByIndices(col, indices);
+        }
+
+        // Free old column data
+        for (result.columns) |col| {
+            var data = col.data;
+            self.freeColumnData(&data);
+        }
+        self.allocator.free(result.columns);
+
+        result.columns = new_columns;
+        result.row_count = indices.len;
+    }
+
+    /// Evaluate HAVING expression for a single result row
+    fn evaluateHavingExpr(
+        self: *Self,
+        columns: []const Result.Column,
+        select_items: []const ast.SelectItem,
+        expr: *const Expr,
+        row_idx: usize,
+    ) anyerror!bool {
+        return switch (expr.*) {
+            .value => |val| switch (val) {
+                .integer => |i| i != 0,
+                .float => |f| f != 0.0,
+                .null => false,
+                else => true,
+            },
+            .binary => |bin| try self.evaluateHavingBinaryOp(columns, select_items, bin.op, bin.left, bin.right, row_idx),
+            .unary => |un| switch (un.op) {
+                .not => !(try self.evaluateHavingExpr(columns, select_items, un.operand, row_idx)),
+                else => error.UnsupportedOperator,
+            },
+            else => error.UnsupportedExpression,
+        };
+    }
+
+    /// Evaluate binary operation in HAVING context
+    fn evaluateHavingBinaryOp(
+        self: *Self,
+        columns: []const Result.Column,
+        select_items: []const ast.SelectItem,
+        op: BinaryOp,
+        left: *const Expr,
+        right: *const Expr,
+        row_idx: usize,
+    ) anyerror!bool {
+        return switch (op) {
+            .@"and" => (try self.evaluateHavingExpr(columns, select_items, left, row_idx)) and
+                (try self.evaluateHavingExpr(columns, select_items, right, row_idx)),
+            .@"or" => (try self.evaluateHavingExpr(columns, select_items, left, row_idx)) or
+                (try self.evaluateHavingExpr(columns, select_items, right, row_idx)),
+            .eq, .ne, .lt, .le, .gt, .ge => try self.evaluateHavingComparison(columns, select_items, op, left, right, row_idx),
+            else => error.UnsupportedOperator,
+        };
+    }
+
+    /// Evaluate comparison in HAVING context
+    fn evaluateHavingComparison(
+        self: *Self,
+        columns: []const Result.Column,
+        select_items: []const ast.SelectItem,
+        op: BinaryOp,
+        left: *const Expr,
+        right: *const Expr,
+        row_idx: usize,
+    ) !bool {
+        const left_val = try self.getHavingValue(columns, select_items, left, row_idx);
+        const right_val = try self.getHavingValue(columns, select_items, right, row_idx);
+
+        // Compare as floats for numeric comparison
+        return switch (left_val) {
+            .integer => |left_int| blk: {
+                const right_num = switch (right_val) {
+                    .integer => |i| @as(f64, @floatFromInt(i)),
+                    .float => |f| f,
+                    else => return error.TypeMismatch,
+                };
+                const left_num = @as(f64, @floatFromInt(left_int));
+                break :blk self.compareNumbers(op, left_num, right_num);
+            },
+            .float => |left_float| blk: {
+                const right_num = switch (right_val) {
+                    .integer => |i| @as(f64, @floatFromInt(i)),
+                    .float => |f| f,
+                    else => return error.TypeMismatch,
+                };
+                break :blk self.compareNumbers(op, left_float, right_num);
+            },
+            .string => |left_str| blk: {
+                const right_str = switch (right_val) {
+                    .string => |s| s,
+                    else => return error.TypeMismatch,
+                };
+                break :blk self.compareStrings(op, left_str, right_str);
+            },
+            .null => op == .ne,
+            else => error.UnsupportedType,
+        };
+    }
+
+    /// Get value of expression in HAVING context (from result columns)
+    fn getHavingValue(
+        self: *Self,
+        columns: []const Result.Column,
+        select_items: []const ast.SelectItem,
+        expr: *const Expr,
+        row_idx: usize,
+    ) !Value {
+        return switch (expr.*) {
+            .value => expr.value,
+            .column => |col| blk: {
+                // Look up column by name in result columns
+                const col_idx = self.findColumnIndex(columns, col.name) orelse
+                    return error.ColumnNotFound;
+                break :blk self.getResultColumnValue(columns[col_idx], row_idx);
+            },
+            .call => |call| blk: {
+                // For aggregate functions, find matching SELECT item
+                if (isAggregateFunction(call.name)) {
+                    const col_idx = try self.findAggregateColumnIndex(columns, select_items, call.name, call.args);
+                    break :blk self.getResultColumnValue(columns[col_idx], row_idx);
+                }
+                return error.UnsupportedExpression;
+            },
+            .binary => |bin| try self.evaluateHavingBinaryToValue(columns, select_items, bin, row_idx),
+            else => error.UnsupportedExpression,
+        };
+    }
+
+    /// Evaluate binary expression to value in HAVING context
+    fn evaluateHavingBinaryToValue(
+        self: *Self,
+        columns: []const Result.Column,
+        select_items: []const ast.SelectItem,
+        bin: anytype,
+        row_idx: usize,
+    ) anyerror!Value {
+        const left = try self.getHavingValue(columns, select_items, bin.left, row_idx);
+        const right = try self.getHavingValue(columns, select_items, bin.right, row_idx);
+
+        return switch (bin.op) {
+            .add => self.addValues(left, right),
+            .subtract => self.subtractValues(left, right),
+            .multiply => self.multiplyValues(left, right),
+            .divide => self.divideValues(left, right),
+            else => error.UnsupportedOperator,
+        };
+    }
+
+    /// Get value from a result column at a given row index
+    fn getResultColumnValue(self: *Self, col: Result.Column, row_idx: usize) Value {
+        _ = self;
+        return switch (col.data) {
+            .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| Value{ .integer = data[row_idx] },
+            .int32, .date32 => |data| Value{ .integer = data[row_idx] },
+            .float64 => |data| Value{ .float = data[row_idx] },
+            .float32 => |data| Value{ .float = data[row_idx] },
+            .bool_ => |data| Value{ .integer = if (data[row_idx]) 1 else 0 },
+            .string => |data| Value{ .string = data[row_idx] },
+        };
+    }
+
+    /// Find the result column index that matches an aggregate function call
+    fn findAggregateColumnIndex(
+        self: *Self,
+        columns: []const Result.Column,
+        select_items: []const ast.SelectItem,
+        call_name: []const u8,
+        call_args: []const Expr,
+    ) !usize {
+        _ = self;
+        // First, try to find by alias matching the function name
+        for (columns, 0..) |col, i| {
+            if (std.ascii.eqlIgnoreCase(col.name, call_name)) {
+                return i;
+            }
+        }
+
+        // Match by comparing SELECT item expressions
+        for (select_items, 0..) |item, i| {
+            if (item.expr == .call) {
+                const item_call = item.expr.call;
+                // Match function name (case insensitive)
+                if (std.ascii.eqlIgnoreCase(item_call.name, call_name)) {
+                    // Match arguments
+                    if (aggregateArgsMatch(item_call.args, call_args)) {
+                        return i;
+                    }
+                }
+            }
+        }
+
+        return error.ColumnNotFound;
+    }
 };
+
+/// Check if two aggregate argument lists match
+fn aggregateArgsMatch(a: []const Expr, b: []const Expr) bool {
+    if (a.len != b.len) return false;
+
+    for (a, b) |arg_a, arg_b| {
+        if (!exprEquals(&arg_a, &arg_b)) return false;
+    }
+
+    return true;
+}
+
+/// Check if two expressions are equal (for aggregate matching)
+fn exprEquals(a: *const Expr, b: *const Expr) bool {
+    if (std.meta.activeTag(a.*) != std.meta.activeTag(b.*)) return false;
+
+    return switch (a.*) {
+        .column => |col_a| blk: {
+            const col_b = b.column;
+            break :blk std.mem.eql(u8, col_a.name, col_b.name);
+        },
+        .value => |val_a| blk: {
+            const val_b = b.value;
+            if (std.meta.activeTag(val_a) != std.meta.activeTag(val_b)) break :blk false;
+            break :blk switch (val_a) {
+                .integer => |i| i == val_b.integer,
+                .float => |f| f == val_b.float,
+                .string => |s| std.mem.eql(u8, s, val_b.string),
+                .null => true,
+                else => false,
+            };
+        },
+        else => false,
+    };
+}
 
 // Tests are in tests/test_sql_executor.zig

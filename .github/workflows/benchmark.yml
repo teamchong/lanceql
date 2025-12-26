@@ -1,0 +1,89 @@
+name: Benchmark
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'benchmarks/**'
+      - '.github/workflows/benchmark.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'benchmarks/**'
+      - '.github/workflows/benchmark.yml'
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install Python dependencies
+        run: |
+          pip install pyarrow lancedb polars
+
+      - name: Build Zig library
+        run: zig build lib
+
+      - name: Generate test fixtures
+        run: python fixtures/generate_test_files.py
+        continue-on-error: true
+
+      - name: Run Zig benchmarks
+        run: zig build test-parquet 2>&1 | tee zig-benchmark.txt
+        continue-on-error: true
+
+      - name: Run Python benchmarks
+        working-directory: benchmarks
+        run: python run_all.py 2>&1 | tee ../python-benchmark.txt
+        continue-on-error: true
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            zig-benchmark.txt
+            python-benchmark.txt
+          retention-days: 30
+
+      - name: Comment benchmark results on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let comment = '## Benchmark Results\n\n';
+
+            try {
+              const zigResults = fs.readFileSync('zig-benchmark.txt', 'utf8');
+              comment += '### Zig Benchmarks\n```\n' + zigResults.slice(-2000) + '\n```\n\n';
+            } catch (e) {
+              comment += '### Zig Benchmarks\n_No results available_\n\n';
+            }
+
+            try {
+              const pythonResults = fs.readFileSync('python-benchmark.txt', 'utf8');
+              comment += '### Python Benchmarks\n```\n' + pythonResults.slice(-2000) + '\n```\n';
+            } catch (e) {
+              comment += '### Python Benchmarks\n_No results available_\n';
+            }
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });

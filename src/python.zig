@@ -15,6 +15,9 @@ const arrow_c = @import("arrow_c");
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 const allocator = gpa.allocator();
 
+/// Track allocated strings per handle for proper cleanup
+var tracked_strings = std.AutoHashMap(*Handle, std.ArrayList([]const u8)).init(allocator);
+
 /// Opaque handle for Python (represents a Table)
 pub const Handle = opaque {};
 
@@ -26,6 +29,26 @@ fn tableToHandle(table: *Table) *Handle {
 /// Convert Handle to Table pointer
 fn handleToTable(handle: *Handle) *Table {
     return @ptrCast(@alignCast(handle));
+}
+
+/// Track a string allocation for later cleanup
+fn trackString(handle: *Handle, str: []const u8) !void {
+    const gop = try tracked_strings.getOrPut(handle);
+    if (!gop.found_existing) {
+        gop.value_ptr.* = std.ArrayList([]const u8).init(allocator);
+    }
+    try gop.value_ptr.append(allocator, str);
+}
+
+/// Free all tracked strings for a handle
+fn freeTrackedStrings(handle: *Handle) void {
+    if (tracked_strings.fetchRemove(handle)) |kv| {
+        var list = kv.value;
+        for (list.items) |str| {
+            allocator.free(str);
+        }
+        list.deinit(allocator);
+    }
 }
 
 // ============================================================================
@@ -46,6 +69,9 @@ export fn lance_open_memory(data: [*]const u8, len: usize) ?*Handle {
 
 /// Close a Lance file and free resources
 export fn lance_close(handle: *Handle) void {
+    // Free any tracked strings first
+    freeTrackedStrings(handle);
+
     const table = handleToTable(handle);
     table.deinit();
     allocator.destroy(table);
@@ -105,8 +131,7 @@ export fn lance_column_type(handle: *Handle, col_idx: u32, buf: [*]u8, buf_len: 
 /// Returns number of strings read (0 on error)
 /// out_strings should be pre-allocated array of string pointers
 /// out_lengths should be pre-allocated array for string lengths
-/// NOTE: The returned string pointers are valid only while the table handle is open.
-/// After calling lance_close(), the pointers become invalid.
+/// NOTE: The returned string pointers are valid until lance_close() is called.
 export fn lance_read_string(
     handle: *Handle,
     col_idx: u32,
@@ -117,17 +142,18 @@ export fn lance_read_string(
     const table = handleToTable(handle);
 
     const strings = table.readStringColumn(col_idx) catch return 0;
-    // NOTE: We free the array of pointers, but the individual strings are owned
-    // by the Table's internal data buffer and remain valid until lance_close().
-    // Actually, now that strings are copied, we need to track them for cleanup.
-    // For now, leak the strings - they'll be freed when the process exits.
-    // TODO: Add proper string lifetime management for Python API
     defer allocator.free(strings);
 
     const count = @min(strings.len, max_count);
     for (0..count) |i| {
-        out_strings[i] = strings[i].ptr;
-        out_lengths[i] = strings[i].len;
+        // Duplicate string and track for cleanup on lance_close()
+        const duped = allocator.dupe(u8, strings[i]) catch return i;
+        trackString(handle, duped) catch {
+            allocator.free(duped);
+            return i;
+        };
+        out_strings[i] = duped.ptr;
+        out_lengths[i] = duped.len;
     }
 
     return count;

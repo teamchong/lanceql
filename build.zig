@@ -321,6 +321,25 @@ pub fn build(b: *std.Build) void {
     const test_sql_step = b.step("test-sql", "Run SQL executor tests");
     test_sql_step.dependOn(&run_test_sql_executor.step);
 
+    // Stress tests - large datasets, memory pressure, edge cases
+    const test_stress = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/stress/stress_tests.zig"),
+            .target = target,
+            .optimize = .ReleaseFast, // Use ReleaseFast for performance tests
+            .imports = &.{
+                .{ .name = "lanceql", .module = lanceql_mod },
+                .{ .name = "lanceql.format", .module = format_mod },
+                .{ .name = "lanceql.io", .module = io_mod },
+                .{ .name = "lanceql.table", .module = table_mod },
+            },
+        }),
+    });
+
+    const run_test_stress = b.addRunArtifact(test_stress);
+    const test_stress_step = b.step("test-stress", "Run stress tests (large datasets, memory, edge cases)");
+    test_stress_step.dependOn(&run_test_stress.step);
+
     // === Metal Shader Compilation (macOS with Xcode) ===
     // Compiles .metal shaders to .metallib for faster startup
     if (use_metal) {

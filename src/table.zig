@@ -28,6 +28,7 @@ pub const TableError = error{
     ColumnOutOfBounds,
     NoPages,
     InvalidBufferIndex,
+    IndexOutOfBounds,
 };
 
 /// High-level table reader for Lance files.
@@ -198,6 +199,111 @@ pub const Table = struct {
     pub fn readBoolColumnByName(self: Self, name: []const u8) TableError![]bool {
         const idx = self.columnIndex(name) orelse return TableError.ColumnNotFound;
         return self.readBoolColumn(@intCast(idx));
+    }
+
+    // ========================================================================
+    // Read At Indices - Phase 2 API for efficient sparse reads
+    // ========================================================================
+    // These methods read only specific row indices, enabling efficient
+    // column projection after WHERE filtering.
+    //
+    // Current implementation: reads full column then filters (fallback)
+    // Future optimization: direct byte-range reads for fixed-size types
+
+    /// Read int64 values at specific row indices.
+    pub fn readInt64AtIndices(self: Self, col_idx: u32, indices: []const u32) TableError![]i64 {
+        // Phase 2 implementation: read full column and filter
+        // TODO: Optimize with direct byte-range reads (index * 8 bytes)
+        const all_data = try self.readInt64Column(col_idx);
+        defer self.allocator.free(all_data);
+
+        const result = self.allocator.alloc(i64, indices.len) catch return TableError.OutOfMemory;
+        errdefer self.allocator.free(result);
+
+        for (indices, 0..) |idx, i| {
+            if (idx >= all_data.len) return TableError.IndexOutOfBounds;
+            result[i] = all_data[idx];
+        }
+        return result;
+    }
+
+    /// Read float64 values at specific row indices.
+    pub fn readFloat64AtIndices(self: Self, col_idx: u32, indices: []const u32) TableError![]f64 {
+        const all_data = try self.readFloat64Column(col_idx);
+        defer self.allocator.free(all_data);
+
+        const result = self.allocator.alloc(f64, indices.len) catch return TableError.OutOfMemory;
+        errdefer self.allocator.free(result);
+
+        for (indices, 0..) |idx, i| {
+            if (idx >= all_data.len) return TableError.IndexOutOfBounds;
+            result[i] = all_data[idx];
+        }
+        return result;
+    }
+
+    /// Read int32 values at specific row indices.
+    pub fn readInt32AtIndices(self: Self, col_idx: u32, indices: []const u32) TableError![]i32 {
+        const all_data = try self.readInt32Column(col_idx);
+        defer self.allocator.free(all_data);
+
+        const result = self.allocator.alloc(i32, indices.len) catch return TableError.OutOfMemory;
+        errdefer self.allocator.free(result);
+
+        for (indices, 0..) |idx, i| {
+            if (idx >= all_data.len) return TableError.IndexOutOfBounds;
+            result[i] = all_data[idx];
+        }
+        return result;
+    }
+
+    /// Read float32 values at specific row indices.
+    pub fn readFloat32AtIndices(self: Self, col_idx: u32, indices: []const u32) TableError![]f32 {
+        const all_data = try self.readFloat32Column(col_idx);
+        defer self.allocator.free(all_data);
+
+        const result = self.allocator.alloc(f32, indices.len) catch return TableError.OutOfMemory;
+        errdefer self.allocator.free(result);
+
+        for (indices, 0..) |idx, i| {
+            if (idx >= all_data.len) return TableError.IndexOutOfBounds;
+            result[i] = all_data[idx];
+        }
+        return result;
+    }
+
+    /// Read boolean values at specific row indices.
+    pub fn readBoolAtIndices(self: Self, col_idx: u32, indices: []const u32) TableError![]bool {
+        const all_data = try self.readBoolColumn(col_idx);
+        defer self.allocator.free(all_data);
+
+        const result = self.allocator.alloc(bool, indices.len) catch return TableError.OutOfMemory;
+        errdefer self.allocator.free(result);
+
+        for (indices, 0..) |idx, i| {
+            if (idx >= all_data.len) return TableError.IndexOutOfBounds;
+            result[i] = all_data[idx];
+        }
+        return result;
+    }
+
+    /// Read string values at specific row indices.
+    /// Caller must free both the returned slice and each string.
+    pub fn readStringAtIndices(self: Self, col_idx: u32, indices: []const u32) TableError![][]const u8 {
+        const all_data = try self.readStringColumn(col_idx);
+        defer {
+            for (all_data) |s| self.allocator.free(s);
+            self.allocator.free(all_data);
+        }
+
+        const result = self.allocator.alloc([]const u8, indices.len) catch return TableError.OutOfMemory;
+        errdefer self.allocator.free(result);
+
+        for (indices, 0..) |idx, i| {
+            if (idx >= all_data.len) return TableError.IndexOutOfBounds;
+            result[i] = self.allocator.dupe(u8, all_data[idx]) catch return TableError.OutOfMemory;
+        }
+        return result;
     }
 
     /// Read raw column buffer (first page, first buffer).

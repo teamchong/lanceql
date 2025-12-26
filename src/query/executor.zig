@@ -295,6 +295,11 @@ pub const Executor = struct {
         const owned_rows = try self.allocator.alloc([]Value, final_rows.len);
         @memcpy(owned_rows, final_rows);
 
+        // Free the original result_rows array (not the row contents, just the outer array)
+        // We need to free the original allocation, which might be different from final_rows
+        // if OFFSET was applied
+        self.allocator.free(result_rows);
+
         return ResultSet{
             .columns = result_cols,
             .rows = owned_rows,
@@ -512,14 +517,211 @@ pub const Executor = struct {
         rows: [][]Value,
         col_map: *std.StringHashMap(usize),
     ) !struct { rows: [][]Value, cols: [][]const u8 } {
-        _ = rows;
-        _ = col_map;
-        // TODO: Implement GROUP BY
-        // For now, return empty result
-        return .{
-            .rows = try self.allocator.alloc([]Value, 0),
-            .cols = try self.allocator.alloc([]const u8, 0),
+        if (rows.len == 0) {
+            return .{
+                .rows = try self.allocator.alloc([]Value, 0),
+                .cols = try self.allocator.alloc([]const u8, 0),
+            };
+        }
+
+        // Step 1: Get indices for GROUP BY columns
+        var group_col_indices = try self.allocator.alloc(usize, self.stmt.group_by.len);
+        defer self.allocator.free(group_col_indices);
+
+        for (self.stmt.group_by, 0..) |col_name, i| {
+            group_col_indices[i] = col_map.get(col_name) orelse return error.ColumnNotFound;
+        }
+
+        // Step 2: Determine output columns and aggregate info
+        var result_cols: std.ArrayListUnmanaged([]const u8) = .empty;
+        var agg_infos: std.ArrayListUnmanaged(AggInfo) = .empty;
+        defer agg_infos.deinit(self.allocator);
+
+        for (self.stmt.columns) |item| {
+            switch (item) {
+                .star => {
+                    // For GROUP BY with *, just include group columns
+                    for (self.stmt.group_by) |col_name| {
+                        try result_cols.append(self.allocator, col_name);
+                        try agg_infos.append(self.allocator, .{ .is_group_col = true, .group_col_name = col_name, .agg_type = null, .agg_arg = null, .distinct = false });
+                    }
+                },
+                .expr => |e| {
+                    const name = e.alias orelse switch (e.expression.*) {
+                        .column => |n| n,
+                        .call => |c| c.name,
+                        else => "?",
+                    };
+                    try result_cols.append(self.allocator, name);
+
+                    // Determine if this is a group column or aggregate
+                    switch (e.expression.*) {
+                        .column => |col_name| {
+                            // Check if it's a GROUP BY column
+                            var is_group = false;
+                            for (self.stmt.group_by) |gb| {
+                                if (std.mem.eql(u8, gb, col_name)) {
+                                    is_group = true;
+                                    break;
+                                }
+                            }
+                            try agg_infos.append(self.allocator, .{
+                                .is_group_col = is_group,
+                                .group_col_name = if (is_group) col_name else null,
+                                .agg_type = if (!is_group) AggregateType.min else null, // Use min for non-group columns
+                                .agg_arg = if (!is_group) e.expression else null,
+                                .distinct = false,
+                            });
+                        },
+                        .call => |c| {
+                            const agg_type = AggregateType.fromStr(c.name) orelse .count;
+                            const arg: ?*Expr = if (c.args.len > 0) @constCast(&c.args[0]) else null;
+                            try agg_infos.append(self.allocator, .{
+                                .is_group_col = false,
+                                .group_col_name = null,
+                                .agg_type = agg_type,
+                                .agg_arg = arg,
+                                .distinct = c.distinct,
+                            });
+                        },
+                        else => {
+                            // Expression - evaluate and use first value
+                            try agg_infos.append(self.allocator, .{
+                                .is_group_col = false,
+                                .group_col_name = null,
+                                .agg_type = .min,
+                                .agg_arg = e.expression,
+                                .distinct = false,
+                            });
+                        },
+                    }
+                },
+            }
+        }
+
+        // Step 3: Group rows using HashMap
+        const GroupData = struct {
+            key_values: []Value,
+            aggregates: []Aggregate,
         };
+
+        var groups = std.HashMap(GroupKey, GroupData, GroupKeyContext, 80).init(self.allocator);
+        defer {
+            var iter = groups.iterator();
+            while (iter.next()) |entry| {
+                self.allocator.free(entry.key_ptr.values);
+                self.allocator.free(entry.value_ptr.aggregates);
+            }
+            groups.deinit();
+        }
+
+        // Process each row
+        for (rows) |row| {
+            // Build group key from GROUP BY column values
+            var key_values = try self.allocator.alloc(Value, group_col_indices.len);
+            for (group_col_indices, 0..) |col_idx, i| {
+                key_values[i] = row[col_idx];
+            }
+            const key = GroupKey{ .values = key_values };
+
+            // Get or create group
+            const gop = try groups.getOrPut(key);
+            if (!gop.found_existing) {
+                // Initialize aggregates for this group
+                var aggs = try self.allocator.alloc(Aggregate, agg_infos.items.len);
+                for (agg_infos.items, 0..) |info, i| {
+                    if (info.agg_type) |agg_type| {
+                        aggs[i] = Aggregate.init(agg_type, info.distinct);
+                    } else {
+                        aggs[i] = Aggregate.init(.count, false); // Placeholder for group columns
+                    }
+                }
+                gop.value_ptr.* = .{
+                    .key_values = key_values,
+                    .aggregates = aggs,
+                };
+            } else {
+                // Key already exists, free the duplicate key values
+                self.allocator.free(key_values);
+            }
+
+            // Update aggregates for this row
+            for (agg_infos.items, 0..) |info, i| {
+                if (info.is_group_col) continue; // Group columns don't need aggregation
+
+                if (info.agg_arg) |arg| {
+                    if (arg.* == .star) {
+                        gop.value_ptr.aggregates[i].addRow();
+                    } else {
+                        const val = arg.eval(row, col_map.*) catch Value.nil();
+                        gop.value_ptr.aggregates[i].add(val);
+                    }
+                } else {
+                    gop.value_ptr.aggregates[i].addRow();
+                }
+            }
+        }
+
+        // Step 4: Build result rows from groups
+        var result_rows: std.ArrayListUnmanaged([]Value) = .empty;
+        defer result_rows.deinit(self.allocator);
+
+        var group_iter = groups.iterator();
+        while (group_iter.next()) |entry| {
+            const group_data = entry.value_ptr.*;
+
+            var result_row = try self.allocator.alloc(Value, agg_infos.items.len);
+            for (agg_infos.items, 0..) |info, i| {
+                if (info.is_group_col) {
+                    // Find the value from group key
+                    for (self.stmt.group_by, 0..) |gb, gi| {
+                        if (info.group_col_name != null and std.mem.eql(u8, gb, info.group_col_name.?)) {
+                            result_row[i] = group_data.key_values[gi];
+                            break;
+                        }
+                    }
+                } else {
+                    result_row[i] = group_data.aggregates[i].result();
+                }
+            }
+
+            // Apply HAVING filter if present
+            if (self.stmt.having) |having_expr| {
+                const having_result = try self.evaluateHavingExpr(having_expr, result_row, result_cols.items);
+                if (!having_result) {
+                    self.allocator.free(result_row);
+                    continue;
+                }
+            }
+
+            try result_rows.append(self.allocator, result_row);
+        }
+
+        return .{
+            .rows = try result_rows.toOwnedSlice(self.allocator),
+            .cols = try result_cols.toOwnedSlice(self.allocator),
+        };
+    }
+
+    const AggInfo = struct {
+        is_group_col: bool,
+        group_col_name: ?[]const u8,
+        agg_type: ?AggregateType,
+        agg_arg: ?*Expr,
+        distinct: bool,
+    };
+
+    fn evaluateHavingExpr(self: *Self, expr: *const Expr, row: []Value, col_names: [][]const u8) !bool {
+        // Build a column map for the result columns
+        var result_col_map = std.StringHashMap(usize).init(self.allocator);
+        defer result_col_map.deinit();
+
+        for (col_names, 0..) |name, i| {
+            try result_col_map.put(name, i);
+        }
+
+        const result = expr.eval(row, result_col_map) catch return true;
+        return result.toBool() orelse false;
     }
 
     fn applyOrderBy(self: *Self, rows: *[][]Value, col_names: [][]const u8) !void {
@@ -585,4 +787,295 @@ test "ResultSet format" {
     const output = stream.getWritten();
     try std.testing.expect(std.mem.indexOf(u8, output, "id") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Alice") != null);
+}
+
+// Mock data provider for testing
+const MockProvider = struct {
+    col_names: [][]const u8,
+    int_data: [][]i64,
+    row_count: usize,
+
+    const Self = @This();
+
+    fn getColumnNames(ptr: *anyopaque) [][]const u8 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.col_names;
+    }
+
+    fn getRowCount(ptr: *anyopaque) usize {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.row_count;
+    }
+
+    fn readInt64Column(ptr: *anyopaque, col_idx: usize) ?[]i64 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        if (col_idx < self.int_data.len) {
+            return self.int_data[col_idx];
+        }
+        return null;
+    }
+
+    fn readFloat64Column(_: *anyopaque, _: usize) ?[]f64 {
+        return null;
+    }
+
+    fn toProvider(self: *Self) Executor.DataProvider {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .getColumnNames = getColumnNames,
+                .getRowCount = getRowCount,
+                .readInt64Column = readInt64Column,
+                .readFloat64Column = readFloat64Column,
+            },
+        };
+    }
+};
+
+test "GROUP BY basic" {
+    const allocator = std.testing.allocator;
+
+    // Test data: category (0=A, 1=B), value
+    // A: 10, 20, A: 30 -> sum(A) = 60
+    // B: 15, 25 -> sum(B) = 40
+    var col_names = [_][]const u8{ "category", "value" };
+    var cat_data = [_]i64{ 0, 0, 0, 1, 1 }; // A, A, A, B, B
+    var val_data = [_]i64{ 10, 20, 30, 15, 25 };
+    var int_data = [_][]i64{ &cat_data, &val_data };
+
+    var mock = MockProvider{
+        .col_names = &col_names,
+        .int_data = &int_data,
+        .row_count = 5,
+    };
+
+    // Create SELECT category, SUM(value) FROM t GROUP BY category
+    const sum_arg = Expr{ .column = "value" };
+    var sum_call = Expr{ .call = .{ .name = "SUM", .args = @constCast(&[_]Expr{sum_arg}), .distinct = false } };
+    var cat_expr = Expr{ .column = "category" };
+
+    const stmt = SelectStmt{
+        .columns = @constCast(&[_]SelectItem{
+            .{ .expr = .{ .expression = &cat_expr, .alias = "category" } },
+            .{ .expr = .{ .expression = &sum_call, .alias = "total" } },
+        }),
+        .from = null,
+        .where = null,
+        .group_by = @constCast(&[_][]const u8{"category"}),
+        .having = null,
+        .order_by = &.{},
+        .limit = null,
+        .offset = null,
+        .distinct = false,
+    };
+
+    var exec = Executor.init(allocator, stmt);
+    var result = try exec.execute(mock.toProvider());
+    defer result.deinit();
+
+    // Should have 2 groups
+    try std.testing.expectEqual(@as(usize, 2), result.rowCount());
+    try std.testing.expectEqual(@as(usize, 2), result.columnCount());
+
+    // Verify column names
+    try std.testing.expectEqualStrings("category", result.columns[0]);
+    try std.testing.expectEqualStrings("total", result.columns[1]);
+
+    // Check that we have expected sums (order may vary due to HashMap)
+    var found_cat_0 = false;
+    var found_cat_1 = false;
+
+    for (result.rows) |row| {
+        const cat = row[0].int64;
+        const total = row[1].int64;
+
+        if (cat == 0) {
+            try std.testing.expectEqual(@as(i64, 60), total); // 10 + 20 + 30
+            found_cat_0 = true;
+        } else if (cat == 1) {
+            try std.testing.expectEqual(@as(i64, 40), total); // 15 + 25
+            found_cat_1 = true;
+        }
+    }
+
+    try std.testing.expect(found_cat_0);
+    try std.testing.expect(found_cat_1);
+}
+
+test "GROUP BY with HAVING" {
+    const allocator = std.testing.allocator;
+
+    // Same test data as above
+    var col_names = [_][]const u8{ "category", "value" };
+    var cat_data = [_]i64{ 0, 0, 0, 1, 1 };
+    var val_data = [_]i64{ 10, 20, 30, 15, 25 };
+    var int_data = [_][]i64{ &cat_data, &val_data };
+
+    var mock = MockProvider{
+        .col_names = &col_names,
+        .int_data = &int_data,
+        .row_count = 5,
+    };
+
+    // SELECT category, SUM(value) AS total FROM t GROUP BY category HAVING total > 50
+    const sum_arg = Expr{ .column = "value" };
+    var sum_call = Expr{ .call = .{ .name = "SUM", .args = @constCast(&[_]Expr{sum_arg}), .distinct = false } };
+    var cat_expr = Expr{ .column = "category" };
+
+    // HAVING: total > 50
+    var total_col = Expr{ .column = "total" };
+    var fifty = Expr{ .literal = Value.int(50) };
+    var having_expr = Expr{ .binary = .{
+        .op = .gt,
+        .left = &total_col,
+        .right = &fifty,
+    } };
+
+    const stmt = SelectStmt{
+        .columns = @constCast(&[_]SelectItem{
+            .{ .expr = .{ .expression = &cat_expr, .alias = "category" } },
+            .{ .expr = .{ .expression = &sum_call, .alias = "total" } },
+        }),
+        .from = null,
+        .where = null,
+        .group_by = @constCast(&[_][]const u8{"category"}),
+        .having = &having_expr,
+        .order_by = &.{},
+        .limit = null,
+        .offset = null,
+        .distinct = false,
+    };
+
+    var exec = Executor.init(allocator, stmt);
+    var result = try exec.execute(mock.toProvider());
+    defer result.deinit();
+
+    // Should have 1 group (only category 0 with sum 60 > 50)
+    try std.testing.expectEqual(@as(usize, 1), result.rowCount());
+
+    // Verify it's category 0 with sum 60
+    try std.testing.expectEqual(@as(i64, 0), result.rows[0][0].int64);
+    try std.testing.expectEqual(@as(i64, 60), result.rows[0][1].int64);
+}
+
+test "GROUP BY with COUNT" {
+    const allocator = std.testing.allocator;
+
+    // Test data: category, value
+    // Category 0: 3 rows
+    // Category 1: 2 rows
+    var col_names = [_][]const u8{ "category", "value" };
+    var cat_data = [_]i64{ 0, 0, 0, 1, 1 };
+    var val_data = [_]i64{ 10, 20, 30, 15, 25 };
+    var int_data = [_][]i64{ &cat_data, &val_data };
+
+    var mock = MockProvider{
+        .col_names = &col_names,
+        .int_data = &int_data,
+        .row_count = 5,
+    };
+
+    // SELECT category, COUNT(*) AS cnt FROM t GROUP BY category
+    const star_arg = Expr{ .star = {} };
+    var count_call = Expr{ .call = .{ .name = "COUNT", .args = @constCast(&[_]Expr{star_arg}), .distinct = false } };
+    var cat_expr = Expr{ .column = "category" };
+
+    const stmt = SelectStmt{
+        .columns = @constCast(&[_]SelectItem{
+            .{ .expr = .{ .expression = &cat_expr, .alias = "category" } },
+            .{ .expr = .{ .expression = &count_call, .alias = "cnt" } },
+        }),
+        .from = null,
+        .where = null,
+        .group_by = @constCast(&[_][]const u8{"category"}),
+        .having = null,
+        .order_by = &.{},
+        .limit = null,
+        .offset = null,
+        .distinct = false,
+    };
+
+    var exec = Executor.init(allocator, stmt);
+    var result = try exec.execute(mock.toProvider());
+    defer result.deinit();
+
+    // Should have 2 groups
+    try std.testing.expectEqual(@as(usize, 2), result.rowCount());
+
+    // Check counts (order may vary)
+    var found_cat_0 = false;
+    var found_cat_1 = false;
+
+    for (result.rows) |row| {
+        const cat = row[0].int64;
+        const cnt = row[1].int64;
+
+        if (cat == 0) {
+            try std.testing.expectEqual(@as(i64, 3), cnt); // 3 rows in category 0
+            found_cat_0 = true;
+        } else if (cat == 1) {
+            try std.testing.expectEqual(@as(i64, 2), cnt); // 2 rows in category 1
+            found_cat_1 = true;
+        }
+    }
+
+    try std.testing.expect(found_cat_0);
+    try std.testing.expect(found_cat_1);
+}
+
+test "GROUP BY with AVG" {
+    const allocator = std.testing.allocator;
+
+    // Test data: category, value
+    // Category 0: values 10, 20, 30 -> avg = 20
+    // Category 1: values 15, 25 -> avg = 20
+    var col_names = [_][]const u8{ "category", "value" };
+    var cat_data = [_]i64{ 0, 0, 0, 1, 1 };
+    var val_data = [_]i64{ 10, 20, 30, 15, 25 };
+    var int_data = [_][]i64{ &cat_data, &val_data };
+
+    var mock = MockProvider{
+        .col_names = &col_names,
+        .int_data = &int_data,
+        .row_count = 5,
+    };
+
+    // SELECT category, AVG(value) AS avg_val FROM t GROUP BY category
+    const avg_arg = Expr{ .column = "value" };
+    var avg_call = Expr{ .call = .{ .name = "AVG", .args = @constCast(&[_]Expr{avg_arg}), .distinct = false } };
+    var cat_expr = Expr{ .column = "category" };
+
+    const stmt = SelectStmt{
+        .columns = @constCast(&[_]SelectItem{
+            .{ .expr = .{ .expression = &cat_expr, .alias = "category" } },
+            .{ .expr = .{ .expression = &avg_call, .alias = "avg_val" } },
+        }),
+        .from = null,
+        .where = null,
+        .group_by = @constCast(&[_][]const u8{"category"}),
+        .having = null,
+        .order_by = &.{},
+        .limit = null,
+        .offset = null,
+        .distinct = false,
+    };
+
+    var exec = Executor.init(allocator, stmt);
+    var result = try exec.execute(mock.toProvider());
+    defer result.deinit();
+
+    // Should have 2 groups
+    try std.testing.expectEqual(@as(usize, 2), result.rowCount());
+
+    // Check averages (order may vary)
+    for (result.rows) |row| {
+        const cat = row[0].int64;
+        const avg_val = row[1].float64;
+
+        if (cat == 0) {
+            try std.testing.expectApproxEqAbs(@as(f64, 20.0), avg_val, 0.001); // (10+20+30)/3 = 20
+        } else if (cat == 1) {
+            try std.testing.expectApproxEqAbs(@as(f64, 20.0), avg_val, 0.001); // (15+25)/2 = 20
+        }
+    }
 }

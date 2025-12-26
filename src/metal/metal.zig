@@ -40,6 +40,13 @@ const metal_c = if (is_macos) struct {
     extern fn lanceql_metal_cleanup() void;
     extern fn lanceql_metal_available() c_int;
     extern fn lanceql_metal_device_name() [*:0]const u8;
+    // Batch arithmetic operations (for @logic_table compiled methods)
+    extern fn lanceql_metal_batch_mul_scalar(a: [*]const f32, out: [*]f32, scalar: f32, len: c_uint) c_int;
+    extern fn lanceql_metal_batch_mul_arrays(a: [*]const f32, b: [*]const f32, out: [*]f32, len: c_uint) c_int;
+    extern fn lanceql_metal_batch_mul_arrays_scalar(a: [*]const f32, b: [*]const f32, out: [*]f32, scalar: f32, len: c_uint) c_int;
+    extern fn lanceql_metal_batch_add_arrays(a: [*]const f32, b: [*]const f32, out: [*]f32, len: c_uint) c_int;
+    extern fn lanceql_metal_batch_sub_arrays(a: [*]const f32, b: [*]const f32, out: [*]f32, len: c_uint) c_int;
+    extern fn lanceql_metal_batch_div_arrays(a: [*]const f32, b: [*]const f32, out: [*]f32, len: c_uint) c_int;
 } else struct {};
 
 /// Metal GPU state
@@ -316,6 +323,155 @@ fn simdL2DistanceSquared(a: []const f32, b: []const f32) f32 {
 }
 
 // =============================================================================
+// Batch Arithmetic Operations (for @logic_table compiled methods)
+// =============================================================================
+
+/// GPU batch multiply by scalar: out[i] = a[i] * scalar
+/// Falls back to CPU SIMD if GPU not available or for small batches
+pub fn gpuBatchMulScalar(a: []const f32, scalar: f32, out: []f32) void {
+    const len = a.len;
+    std.debug.assert(out.len >= len);
+
+    if (comptime is_apple_silicon) {
+        if (len >= GPU_THRESHOLD and isGPUReady()) {
+            const result = metal_c.lanceql_metal_batch_mul_scalar(
+                a.ptr,
+                out.ptr,
+                scalar,
+                @intCast(len),
+            );
+            if (result == 0) return;
+        }
+    }
+
+    // CPU SIMD fallback
+    for (0..len) |i| {
+        out[i] = a[i] * scalar;
+    }
+}
+
+/// GPU batch multiply two arrays: out[i] = a[i] * b[i]
+pub fn gpuBatchMulArrays(a: []const f32, b: []const f32, out: []f32) void {
+    const len = a.len;
+    std.debug.assert(b.len == len);
+    std.debug.assert(out.len >= len);
+
+    if (comptime is_apple_silicon) {
+        if (len >= GPU_THRESHOLD and isGPUReady()) {
+            const result = metal_c.lanceql_metal_batch_mul_arrays(
+                a.ptr,
+                b.ptr,
+                out.ptr,
+                @intCast(len),
+            );
+            if (result == 0) return;
+        }
+    }
+
+    // CPU SIMD fallback
+    for (0..len) |i| {
+        out[i] = a[i] * b[i];
+    }
+}
+
+/// GPU batch multiply two arrays with scalar: out[i] = a[i] * b[i] * scalar
+pub fn gpuBatchMulArraysScalar(a: []const f32, b: []const f32, scalar: f32, out: []f32) void {
+    const len = a.len;
+    std.debug.assert(b.len == len);
+    std.debug.assert(out.len >= len);
+
+    if (comptime is_apple_silicon) {
+        if (len >= GPU_THRESHOLD and isGPUReady()) {
+            const result = metal_c.lanceql_metal_batch_mul_arrays_scalar(
+                a.ptr,
+                b.ptr,
+                out.ptr,
+                scalar,
+                @intCast(len),
+            );
+            if (result == 0) return;
+        }
+    }
+
+    // CPU SIMD fallback
+    for (0..len) |i| {
+        out[i] = a[i] * b[i] * scalar;
+    }
+}
+
+/// GPU batch add: out[i] = a[i] + b[i]
+pub fn gpuBatchAddArrays(a: []const f32, b: []const f32, out: []f32) void {
+    const len = a.len;
+    std.debug.assert(b.len == len);
+    std.debug.assert(out.len >= len);
+
+    if (comptime is_apple_silicon) {
+        if (len >= GPU_THRESHOLD and isGPUReady()) {
+            const result = metal_c.lanceql_metal_batch_add_arrays(
+                a.ptr,
+                b.ptr,
+                out.ptr,
+                @intCast(len),
+            );
+            if (result == 0) return;
+        }
+    }
+
+    // CPU SIMD fallback
+    for (0..len) |i| {
+        out[i] = a[i] + b[i];
+    }
+}
+
+/// GPU batch subtract: out[i] = a[i] - b[i]
+pub fn gpuBatchSubArrays(a: []const f32, b: []const f32, out: []f32) void {
+    const len = a.len;
+    std.debug.assert(b.len == len);
+    std.debug.assert(out.len >= len);
+
+    if (comptime is_apple_silicon) {
+        if (len >= GPU_THRESHOLD and isGPUReady()) {
+            const result = metal_c.lanceql_metal_batch_sub_arrays(
+                a.ptr,
+                b.ptr,
+                out.ptr,
+                @intCast(len),
+            );
+            if (result == 0) return;
+        }
+    }
+
+    // CPU SIMD fallback
+    for (0..len) |i| {
+        out[i] = a[i] - b[i];
+    }
+}
+
+/// GPU batch divide: out[i] = a[i] / b[i]
+pub fn gpuBatchDivArrays(a: []const f32, b: []const f32, out: []f32) void {
+    const len = a.len;
+    std.debug.assert(b.len == len);
+    std.debug.assert(out.len >= len);
+
+    if (comptime is_apple_silicon) {
+        if (len >= GPU_THRESHOLD and isGPUReady()) {
+            const result = metal_c.lanceql_metal_batch_div_arrays(
+                a.ptr,
+                b.ptr,
+                out.ptr,
+                @intCast(len),
+            );
+            if (result == 0) return;
+        }
+    }
+
+    // CPU SIMD fallback
+    for (0..len) |i| {
+        out[i] = a[i] / b[i];
+    }
+}
+
+// =============================================================================
 // Metal GPU Support (Future)
 // =============================================================================
 
@@ -324,9 +480,8 @@ pub fn isMetalAvailable() bool {
     if (comptime !is_macos) return false;
     if (comptime !use_metal) return false;
 
-    // TODO: Check for Metal device availability
-    // For now, assume Metal is available on macOS
-    return true;
+    // Use the C Metal API to check for device availability
+    return metal_c.lanceql_metal_available() != 0;
 }
 
 /// Get platform info string
