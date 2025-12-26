@@ -278,6 +278,40 @@ pub fn build(b: *std.Build) void {
     const run_test_dataframe = b.addRunArtifact(test_dataframe);
     test_step.dependOn(&run_test_dataframe.step);
 
+    // LogicTable end-to-end tests (with Metal/Accelerate for GPU acceleration)
+    const test_logic_table_e2e = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/test_logic_table_e2e.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lanceql", .module = lanceql_mod },
+                .{ .name = "lanceql.format", .module = format_mod },
+                .{ .name = "lanceql.table", .module = table_mod },
+                .{ .name = "lanceql.query", .module = query_mod },
+            },
+        }),
+    });
+
+    // Link macOS frameworks for Metal/Accelerate support
+    if (use_metal) {
+        test_logic_table_e2e.root_module.linkFramework("Metal", .{});
+        test_logic_table_e2e.root_module.linkFramework("Foundation", .{});
+        test_logic_table_e2e.root_module.addCSourceFiles(.{
+            .files = &.{"src/metal/metal_backend.m"},
+            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
+        });
+    }
+    if (use_accelerate) {
+        test_logic_table_e2e.root_module.linkFramework("Accelerate", .{});
+    }
+
+    const run_test_logic_table_e2e = b.addRunArtifact(test_logic_table_e2e);
+    test_step.dependOn(&run_test_logic_table_e2e.step);
+
+    const test_logic_table_step = b.step("test-logic-table", "Run @logic_table end-to-end tests");
+    test_logic_table_step.dependOn(&run_test_logic_table_e2e.step);
+
     const test_dataframe_step = b.step("test-dataframe", "Run DataFrame module tests");
     test_dataframe_step.dependOn(&run_test_dataframe.step);
 
