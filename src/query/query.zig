@@ -16,6 +16,7 @@ pub const executor = @import("executor.zig");
 pub const aggregates = @import("aggregates.zig");
 pub const logic_table = @import("logic_table.zig");
 pub const gpu_group_by = @import("gpu_group_by.zig");
+pub const gpu_hash_join = @import("gpu_hash_join.zig");
 
 // Re-export main types
 pub const Expr = expr.Expr;
@@ -42,6 +43,11 @@ pub const GPUGroupBy = gpu_group_by.GPUGroupBy;
 pub const GPUGroupByF64 = gpu_group_by.GPUGroupByF64;
 pub const AggType = gpu_group_by.AggType;
 pub const GroupByResult = gpu_group_by.GroupByResult;
+
+// GPU-accelerated Hash JOIN
+pub const GPUHashJoin = gpu_hash_join.GPUHashJoin;
+pub const JoinResult = gpu_hash_join.JoinResult;
+pub const LeftJoinResult = gpu_hash_join.LeftJoinResult;
 
 // Batch vector operations for @logic_table
 pub const batchCosineSimilarity = logic_table.batchCosineSimilarity;
