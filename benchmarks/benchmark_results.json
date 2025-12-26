@@ -1,0 +1,19 @@
+{
+  "100000": {
+    "vector_search": {
+      "numpy": 66.41546660102904,
+      "polars": "N/A (no native vector search)"
+    },
+    "aggregations": {
+      "polars": 1.5962762499111705,
+      "numpy": 0.050094999896828085
+    },
+    "filtering": {
+      "polars": 2.192645420145709,
+      "numpy": 1.1609575001057237
+    },
+    "group_by": {
+      "polars": 10.192824580008164
+    }
+  }
+}
