@@ -14206,5 +14206,8 @@ export { Database as SqlJsDatabase, Statement as SqlJsStatement };
 // Export WebGPU accelerator for direct access
 export { webgpuAccelerator };
 
+// LogicTable exports
+export { Table, logicTable, LogicTableQuery, loadLogicTable } from './logic-table.js';
+
 // Default export for convenience
 export default LanceQL;
