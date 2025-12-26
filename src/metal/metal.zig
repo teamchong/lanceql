@@ -3,10 +3,16 @@
 //! Provides GPU-accelerated vector operations on macOS using:
 //! - Accelerate framework (vDSP) for SIMD vector math
 //! - Metal framework for GPU compute (batch vector search)
+//! - GPU hash table for GROUP BY and Hash JOIN
 //!
 //! On non-macOS platforms, falls back to pure Zig SIMD implementations.
 
 const std = @import("std");
+
+// Re-export hash table module
+pub const hash_table = @import("hash_table.zig");
+pub const GPUHashTable = hash_table.GPUHashTable;
+pub const HashTableError = hash_table.HashTableError;
 const builtin = @import("builtin");
 
 /// Compile-time platform detection

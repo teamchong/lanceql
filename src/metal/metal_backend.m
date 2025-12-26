@@ -27,6 +27,12 @@ static id<MTLComputePipelineState> g_div_arrays_pipeline = nil;
 static id<MTLComputePipelineState> g_abs_pipeline = nil;
 static id<MTLComputePipelineState> g_min_arrays_pipeline = nil;
 static id<MTLComputePipelineState> g_max_arrays_pipeline = nil;
+// Hash table pipelines (for GROUP BY and Hash JOIN)
+static id<MTLComputePipelineState> g_hash_build_pipeline = nil;
+static id<MTLComputePipelineState> g_hash_probe_pipeline = nil;
+static id<MTLComputePipelineState> g_hash_extract_pipeline = nil;
+static id<MTLComputePipelineState> g_radix_histogram_pipeline = nil;
+static id<MTLComputePipelineState> g_radix_scatter_pipeline = nil;
 static bool g_initialized = false;
 
 // Path to precompiled Metal library (set by build system)
@@ -200,6 +206,23 @@ kernel void l2_distance_batch(
         if (min_arrays_fn) g_min_arrays_pipeline = [g_device newComputePipelineStateWithFunction:min_arrays_fn error:&error];
         if (max_arrays_fn) g_max_arrays_pipeline = [g_device newComputePipelineStateWithFunction:max_arrays_fn error:&error];
 
+        // Create hash table pipelines (for GROUP BY and Hash JOIN)
+        id<MTLFunction> hash_build_fn = [g_library newFunctionWithName:@"hash_table_build"];
+        id<MTLFunction> hash_probe_fn = [g_library newFunctionWithName:@"hash_table_probe"];
+        id<MTLFunction> hash_extract_fn = [g_library newFunctionWithName:@"hash_table_extract"];
+        id<MTLFunction> radix_histogram_fn = [g_library newFunctionWithName:@"radix_histogram"];
+        id<MTLFunction> radix_scatter_fn = [g_library newFunctionWithName:@"radix_scatter"];
+
+        if (hash_build_fn) g_hash_build_pipeline = [g_device newComputePipelineStateWithFunction:hash_build_fn error:&error];
+        if (hash_probe_fn) g_hash_probe_pipeline = [g_device newComputePipelineStateWithFunction:hash_probe_fn error:&error];
+        if (hash_extract_fn) g_hash_extract_pipeline = [g_device newComputePipelineStateWithFunction:hash_extract_fn error:&error];
+        if (radix_histogram_fn) g_radix_histogram_pipeline = [g_device newComputePipelineStateWithFunction:radix_histogram_fn error:&error];
+        if (radix_scatter_fn) g_radix_scatter_pipeline = [g_device newComputePipelineStateWithFunction:radix_scatter_fn error:&error];
+
+        int hash_kernels = (g_hash_build_pipeline ? 1 : 0) + (g_hash_probe_pipeline ? 1 : 0) +
+                          (g_hash_extract_pipeline ? 1 : 0) + (g_radix_histogram_pipeline ? 1 : 0) +
+                          (g_radix_scatter_pipeline ? 1 : 0);
+
         int batch_kernels = (g_mul_scalar_pipeline ? 1 : 0) + (g_mul_arrays_pipeline ? 1 : 0) +
                            (g_mul_arrays_scalar_pipeline ? 1 : 0) + (g_add_arrays_pipeline ? 1 : 0) +
                            (g_sub_arrays_pipeline ? 1 : 0) + (g_div_arrays_pipeline ? 1 : 0) +
@@ -207,10 +230,11 @@ kernel void l2_distance_batch(
                            (g_max_arrays_pipeline ? 1 : 0);
 
         g_initialized = true;
-        NSLog(@"LanceQL Metal: Initialized GPU '%@' with %d vector + %d batch kernels",
+        NSLog(@"LanceQL Metal: Initialized GPU '%@' with %d vector + %d batch + %d hash kernels",
               g_device.name,
               (g_cosine_pipeline ? 1 : 0) + (g_dot_pipeline ? 1 : 0) + (g_l2_pipeline ? 1 : 0),
-              batch_kernels);
+              batch_kernels,
+              hash_kernels);
 
         return 0;
     }
@@ -623,6 +647,164 @@ int lanceql_metal_batch_div_arrays(
     }
 }
 
+// =============================================================================
+// Hash Table Operations (for GROUP BY and Hash JOIN)
+// =============================================================================
+
+// Hash table slot size in bytes: [key: u64, value: u64, occupied: u32, padding: u32]
+#define SLOT_SIZE 24
+#define SLOT_UINTS (SLOT_SIZE / 4)
+
+// Build hash table from key-value pairs
+int lanceql_metal_hash_build(
+    const uint64_t* keys,
+    const uint64_t* values,
+    uint32_t* table,           // Pre-allocated table buffer [capacity * SLOT_SIZE / 4]
+    unsigned int capacity,     // Must be power of 2
+    unsigned int num_keys
+) {
+    @autoreleasepool {
+        if (!g_initialized) {
+            if (lanceql_metal_init() != 0) return -1;
+        }
+        if (!g_hash_build_pipeline) return -1;
+
+        size_t keys_size = num_keys * sizeof(uint64_t);
+        size_t values_size = num_keys * sizeof(uint64_t);
+        size_t table_size = (size_t)capacity * SLOT_UINTS * sizeof(uint32_t);
+
+        // Zero the table first
+        memset(table, 0, table_size);
+
+        id<MTLBuffer> keys_buf = [g_device newBufferWithBytes:keys length:keys_size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> values_buf = [g_device newBufferWithBytes:values length:values_size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> table_buf = [g_device newBufferWithBytes:table length:table_size options:MTLResourceStorageModeShared];
+
+        id<MTLCommandBuffer> cmd_buf = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_hash_build_pipeline];
+        [encoder setBuffer:keys_buf offset:0 atIndex:0];
+        [encoder setBuffer:values_buf offset:0 atIndex:1];
+        [encoder setBuffer:table_buf offset:0 atIndex:2];
+        [encoder setBytes:&capacity length:sizeof(unsigned int) atIndex:3];
+        [encoder setBytes:&num_keys length:sizeof(unsigned int) atIndex:4];
+
+        MTLSize grid_size = MTLSizeMake(num_keys, 1, 1);
+        NSUInteger tg_size = MIN(g_hash_build_pipeline.maxTotalThreadsPerThreadgroup, 256);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        [encoder endEncoding];
+
+        [cmd_buf commit];
+        [cmd_buf waitUntilCompleted];
+
+        memcpy(table, table_buf.contents, table_size);
+        return 0;
+    }
+}
+
+// Probe hash table for keys
+int lanceql_metal_hash_probe(
+    const uint64_t* probe_keys,
+    const uint32_t* table,
+    uint64_t* results,
+    int* found,
+    unsigned int capacity,
+    unsigned int num_probes
+) {
+    @autoreleasepool {
+        if (!g_initialized) {
+            if (lanceql_metal_init() != 0) return -1;
+        }
+        if (!g_hash_probe_pipeline) return -1;
+
+        size_t probe_keys_size = num_probes * sizeof(uint64_t);
+        size_t table_size = (size_t)capacity * SLOT_UINTS * sizeof(uint32_t);
+        size_t results_size = num_probes * sizeof(uint64_t);
+        size_t found_size = num_probes * sizeof(int);
+
+        id<MTLBuffer> probe_keys_buf = [g_device newBufferWithBytes:probe_keys length:probe_keys_size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> table_buf = [g_device newBufferWithBytes:table length:table_size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> results_buf = [g_device newBufferWithLength:results_size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> found_buf = [g_device newBufferWithLength:found_size options:MTLResourceStorageModeShared];
+
+        id<MTLCommandBuffer> cmd_buf = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_hash_probe_pipeline];
+        [encoder setBuffer:probe_keys_buf offset:0 atIndex:0];
+        [encoder setBuffer:table_buf offset:0 atIndex:1];
+        [encoder setBuffer:results_buf offset:0 atIndex:2];
+        [encoder setBuffer:found_buf offset:0 atIndex:3];
+        [encoder setBytes:&capacity length:sizeof(unsigned int) atIndex:4];
+        [encoder setBytes:&num_probes length:sizeof(unsigned int) atIndex:5];
+
+        MTLSize grid_size = MTLSizeMake(num_probes, 1, 1);
+        NSUInteger tg_size = MIN(g_hash_probe_pipeline.maxTotalThreadsPerThreadgroup, 256);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        [encoder endEncoding];
+
+        [cmd_buf commit];
+        [cmd_buf waitUntilCompleted];
+
+        memcpy(results, results_buf.contents, results_size);
+        memcpy(found, found_buf.contents, found_size);
+        return 0;
+    }
+}
+
+// Extract all key-value pairs from hash table
+int lanceql_metal_hash_extract(
+    const uint32_t* table,
+    uint64_t* out_keys,
+    uint64_t* out_values,
+    unsigned int* out_count,  // Output: number of extracted pairs
+    unsigned int capacity
+) {
+    @autoreleasepool {
+        if (!g_initialized) {
+            if (lanceql_metal_init() != 0) return -1;
+        }
+        if (!g_hash_extract_pipeline) return -1;
+
+        size_t table_size = (size_t)capacity * SLOT_UINTS * sizeof(uint32_t);
+        size_t keys_size = capacity * sizeof(uint64_t);  // Max possible
+        size_t values_size = capacity * sizeof(uint64_t);
+
+        id<MTLBuffer> table_buf = [g_device newBufferWithBytes:table length:table_size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_keys_buf = [g_device newBufferWithLength:keys_size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_values_buf = [g_device newBufferWithLength:values_size options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_count_buf = [g_device newBufferWithLength:sizeof(unsigned int) options:MTLResourceStorageModeShared];
+
+        // Initialize count to 0
+        *(unsigned int*)out_count_buf.contents = 0;
+
+        id<MTLCommandBuffer> cmd_buf = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [cmd_buf computeCommandEncoder];
+
+        [encoder setComputePipelineState:g_hash_extract_pipeline];
+        [encoder setBuffer:table_buf offset:0 atIndex:0];
+        [encoder setBuffer:out_keys_buf offset:0 atIndex:1];
+        [encoder setBuffer:out_values_buf offset:0 atIndex:2];
+        [encoder setBuffer:out_count_buf offset:0 atIndex:3];
+        [encoder setBytes:&capacity length:sizeof(unsigned int) atIndex:4];
+
+        MTLSize grid_size = MTLSizeMake(capacity, 1, 1);
+        NSUInteger tg_size = MIN(g_hash_extract_pipeline.maxTotalThreadsPerThreadgroup, 256);
+        [encoder dispatchThreads:grid_size threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        [encoder endEncoding];
+
+        [cmd_buf commit];
+        [cmd_buf waitUntilCompleted];
+
+        unsigned int count = *(unsigned int*)out_count_buf.contents;
+        *out_count = count;
+        memcpy(out_keys, out_keys_buf.contents, count * sizeof(uint64_t));
+        memcpy(out_values, out_values_buf.contents, count * sizeof(uint64_t));
+        return 0;
+    }
+}
+
 // Cleanup
 void lanceql_metal_cleanup(void) {
     g_cosine_pipeline = nil;
@@ -637,6 +819,11 @@ void lanceql_metal_cleanup(void) {
     g_abs_pipeline = nil;
     g_min_arrays_pipeline = nil;
     g_max_arrays_pipeline = nil;
+    g_hash_build_pipeline = nil;
+    g_hash_probe_pipeline = nil;
+    g_hash_extract_pipeline = nil;
+    g_radix_histogram_pipeline = nil;
+    g_radix_scatter_pipeline = nil;
     g_library = nil;
     g_queue = nil;
     g_device = nil;
