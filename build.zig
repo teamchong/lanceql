@@ -422,6 +422,40 @@ pub fn build(b: *std.Build) void {
     const bench_logic_table_step = b.step("bench-logic-table", "Benchmark @logic_table workflows (fraud, recommendation, features)");
     bench_logic_table_step.dependOn(&run_bench_logic_table.step);
 
+    // LanceQL CLI
+    const cli = b.addExecutable(.{
+        .name = "lanceql",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cli.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lanceql", .module = lanceql_mod },
+                .{ .name = "lanceql.metal", .module = metal_mod },
+                .{ .name = "lanceql.query", .module = query_mod },
+            },
+        }),
+    });
+    if (use_metal) {
+        cli.root_module.linkFramework("Metal", .{});
+        cli.root_module.linkFramework("Foundation", .{});
+        cli.root_module.addCSourceFiles(.{
+            .files = &.{"src/metal/metal_backend.m"},
+            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
+        });
+    }
+    if (use_accelerate) {
+        cli.root_module.linkFramework("Accelerate", .{});
+    }
+    b.installArtifact(cli);
+    const run_cli = b.addRunArtifact(cli);
+    run_cli.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_cli.addArgs(args);
+    }
+    const cli_step = b.step("cli", "Build and run LanceQL CLI");
+    cli_step.dependOn(&run_cli.step);
+
     // SQL executor tests
     const test_sql_executor = b.addTest(.{
         .root_module = b.createModule(.{
