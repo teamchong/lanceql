@@ -424,33 +424,20 @@ pub fn build(b: *std.Build) void {
     const bench_sql_step = b.step("bench-sql", "Benchmark SQL clauses (SELECT, WHERE, GROUP BY, JOIN, etc.)");
     bench_sql_step.dependOn(&run_bench_sql.step);
 
-    // @logic_table workflow benchmark
+    // @logic_table benchmark - uses REAL metal0 compiled lib/vector_ops.a
+    // Build with: metal0 build --emit-logic-table benchmarks/vector_ops.py -o lib/vector_ops.a
     const bench_logic_table = b.addExecutable(.{
         .name = "bench_logic_table",
         .root_module = b.createModule(.{
             .root_source_file = b.path("benchmarks/bench_logic_table.zig"),
             .target = target,
             .optimize = .ReleaseFast,
-            .imports = &.{
-                .{ .name = "lanceql.metal", .module = metal_mod },
-                .{ .name = "lanceql.query", .module = query_mod },
-                .{ .name = "lanceql.logic_table", .module = logic_table_mod },
-            },
         }),
     });
-    if (use_metal) {
-        bench_logic_table.root_module.linkFramework("Metal", .{});
-        bench_logic_table.root_module.linkFramework("Foundation", .{});
-        bench_logic_table.root_module.addCSourceFiles(.{
-            .files = &.{"src/metal/metal_backend.m"},
-            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
-        });
-    }
-    if (use_accelerate) {
-        bench_logic_table.root_module.linkFramework("Accelerate", .{});
-    }
+    // Link the REAL metal0-compiled static library
+    bench_logic_table.addObjectFile(b.path("lib/vector_ops.a"));
     const run_bench_logic_table = b.addRunArtifact(bench_logic_table);
-    const bench_logic_table_step = b.step("bench-logic-table", "Benchmark @logic_table workflows (fraud, recommendation, features)");
+    const bench_logic_table_step = b.step("bench-logic-table", "Benchmark REAL @logic_table (metal0 compiled Python)");
     bench_logic_table_step.dependOn(&run_bench_logic_table.step);
 
     // Compiled @logic_table benchmark (uses actual .a library from metal0)
