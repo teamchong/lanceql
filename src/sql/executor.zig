@@ -1085,6 +1085,10 @@ pub const Executor = struct {
                     },
                 };
             },
+            // New expression types - pass through for now (execution support TODO)
+            .case_expr => expr.*,
+            .exists => expr.*,
+            .cast => expr.*,
         };
     }
 

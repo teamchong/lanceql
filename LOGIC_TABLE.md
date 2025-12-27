@@ -61,12 +61,12 @@ from logic_table import logic_table
 @logic_table
 class FeatureEngine:
     def transform(self):
-        # NumPy ops compiled to cblas_ddot, cblas_dgemm
+        # NumPy ops compiled to direct BLAS calls (cblas_ddot, cblas_dgemm)
         normalized = numpy.dot(features, weights)
         return numpy.mean(normalized)
 ```
 
-The `@logic_table` classes are compiled separately by metal0. LanceQL loads the compiled functions and fuses them with query execution.
+The `@logic_table` classes are compiled **ahead-of-time** by metal0. LanceQL loads the compiled functions and fuses them with query execution.
 
 The `@logic_table` decorator:
 1. Parses your Python function
@@ -163,19 +163,6 @@ LanceQL leverages available hardware:
 - **WASM** - Browser and edge deployment
 
 The same Zig code compiles to optimized native binaries across all platforms.
-
-### Why Zig?
-
-The most performant libraries are written in C/C++ - BLAS, LAPACK, Metal, CUDA. Rust and Go treat these as "foreign" and require FFI overhead to call them.
-
-That overhead is tiny for one call. But in a hot path over millions of rows, FFI becomes the bottleneck.
-
-Zig has native C ABI compatibility - no FFI, no overhead. A Zig function calling `cblas_ddot` is as fast as a C function calling it. This matters when you're computing cosine similarity for 1M vectors.
-
-Other benefits:
-- **No runtime** - Compiles to pure machine code
-- **WASM target** - No runtime overhead means the most lightweight WASM binaries (our core is ~3KB)
-- **Comptime** - Specialization at compile time, not runtime
 
 ## Running the Benchmarks
 

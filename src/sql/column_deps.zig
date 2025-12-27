@@ -129,6 +129,22 @@ pub const ColumnDeps = struct {
                 try self.extractFromExpr(between.low);
                 try self.extractFromExpr(between.high);
             },
+            .case_expr => |case| {
+                if (case.operand) |operand| {
+                    try self.extractFromExpr(operand);
+                }
+                for (case.when_clauses) |*when| {
+                    try self.extractFromExpr(&when.condition);
+                    try self.extractFromExpr(&when.result);
+                }
+                if (case.else_result) |else_result| {
+                    try self.extractFromExpr(else_result);
+                }
+            },
+            .exists => {}, // Subquery handled separately
+            .cast => |c| {
+                try self.extractFromExpr(c.expr);
+            },
             .value => {}, // No column references in literals
         }
     }

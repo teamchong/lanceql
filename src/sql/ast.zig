@@ -103,6 +103,37 @@ pub const Expr = union(enum) {
         low: *Expr,
         high: *Expr,
     },
+
+    /// CASE expression: CASE [expr] WHEN val THEN result ... [ELSE default] END
+    case_expr: struct {
+        /// Optional expression to compare (simple CASE)
+        operand: ?*Expr,
+        /// WHEN ... THEN pairs
+        when_clauses: []CaseWhen,
+        /// Optional ELSE result
+        else_result: ?*Expr,
+    },
+
+    /// EXISTS subquery
+    exists: struct {
+        /// The subquery (SELECT statement)
+        subquery: *SelectStmt,
+        negated: bool, // NOT EXISTS
+    },
+
+    /// CAST expression
+    cast: struct {
+        expr: *Expr,
+        target_type: []const u8,
+    },
+};
+
+/// WHEN ... THEN clause for CASE expression
+pub const CaseWhen = struct {
+    /// Condition (for searched CASE) or value (for simple CASE)
+    condition: Expr,
+    /// Result when condition is true
+    result: Expr,
 };
 
 /// SELECT column specification
@@ -123,6 +154,31 @@ pub const TableFunction = struct {
     args: []Expr,
 };
 
+/// JOIN types
+pub const JoinType = enum {
+    inner,       // INNER JOIN (default)
+    left,        // LEFT [OUTER] JOIN
+    right,       // RIGHT [OUTER] JOIN
+    full,        // FULL [OUTER] JOIN
+    cross,       // CROSS JOIN
+    natural,     // NATURAL JOIN
+};
+
+/// JOIN clause
+pub const JoinClause = struct {
+    /// Type of join
+    join_type: JoinType,
+
+    /// Right-hand table
+    table: *TableRef,
+
+    /// ON condition (null for CROSS/NATURAL joins)
+    on_condition: ?Expr,
+
+    /// USING columns (alternative to ON)
+    using_columns: ?[][]const u8,
+};
+
 /// FROM clause table reference
 pub const TableRef = union(enum) {
     /// Simple table name
@@ -141,6 +197,15 @@ pub const TableRef = union(enum) {
 
         /// Optional alias
         alias: ?[]const u8,
+    },
+
+    /// JOIN expression
+    join: struct {
+        /// Left-hand table
+        left: *TableRef,
+
+        /// Join clause (type, right table, condition)
+        join_clause: JoinClause,
     },
 };
 
@@ -257,6 +322,29 @@ pub fn deinitExpr(expr: *Expr, allocator: std.mem.Allocator) void {
             deinitExpr(between.high, allocator);
             allocator.destroy(between.high);
         },
+        .case_expr => |case| {
+            if (case.operand) |operand| {
+                deinitExpr(operand, allocator);
+                allocator.destroy(operand);
+            }
+            for (case.when_clauses) |*when| {
+                deinitExpr(@constCast(&when.condition), allocator);
+                deinitExpr(@constCast(&when.result), allocator);
+            }
+            allocator.free(case.when_clauses);
+            if (case.else_result) |else_result| {
+                deinitExpr(else_result, allocator);
+                allocator.destroy(else_result);
+            }
+        },
+        .exists => |ex| {
+            deinitSelectStmt(ex.subquery, allocator);
+            allocator.destroy(ex.subquery);
+        },
+        .cast => |c| {
+            deinitExpr(c.expr, allocator);
+            allocator.destroy(c.expr);
+        },
         .value, .column => {}, // No heap allocations to free
     }
 }
@@ -334,6 +422,22 @@ pub fn countParameters(expr: *const Expr) u32 {
                 countParameters(between.low) +
                 countParameters(between.high);
         },
+        .case_expr => |case| {
+            var count: u32 = 0;
+            if (case.operand) |operand| {
+                count += countParameters(operand);
+            }
+            for (case.when_clauses) |*when| {
+                count += countParameters(&when.condition);
+                count += countParameters(&when.result);
+            }
+            if (case.else_result) |else_result| {
+                count += countParameters(else_result);
+            }
+            return count;
+        },
+        .exists => 0, // Subquery parameters handled separately
+        .cast => |c| countParameters(c.expr),
     };
 }
 
@@ -393,6 +497,30 @@ pub fn printExpr(expr: *const Expr, writer: anytype, indent: usize) !void {
             try printExpr(between.low, writer, indent + 4);
             try writer.print("{s}  High:\n", .{prefix});
             try printExpr(between.high, writer, indent + 4);
+        },
+        .case_expr => |case| {
+            try writer.print("{s}CASE:\n", .{prefix});
+            if (case.operand) |operand| {
+                try writer.print("{s}  Operand:\n", .{prefix});
+                try printExpr(operand, writer, indent + 4);
+            }
+            for (case.when_clauses) |*when| {
+                try writer.print("{s}  WHEN:\n", .{prefix});
+                try printExpr(&when.condition, writer, indent + 4);
+                try writer.print("{s}  THEN:\n", .{prefix});
+                try printExpr(&when.result, writer, indent + 4);
+            }
+            if (case.else_result) |else_result| {
+                try writer.print("{s}  ELSE:\n", .{prefix});
+                try printExpr(else_result, writer, indent + 4);
+            }
+        },
+        .exists => |ex| {
+            try writer.print("{s}{s}EXISTS (subquery)\n", .{ prefix, if (ex.negated) "NOT " else "" });
+        },
+        .cast => |c| {
+            try writer.print("{s}CAST AS {s}:\n", .{ prefix, c.target_type });
+            try printExpr(c.expr, writer, indent + 2);
         },
     }
 }

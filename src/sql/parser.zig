@@ -451,8 +451,113 @@ pub const Parser = struct {
                 return expr;
             },
 
+            // CASE expression
+            .CASE => {
+                return try self.parseCaseExpr();
+            },
+
+            // CAST expression
+            .CAST => {
+                return try self.parseCastExpr();
+            },
+
+            // EXISTS expression
+            .EXISTS => {
+                self.advance();
+                _ = try self.expect(.LPAREN);
+                // Parse subquery (SELECT statement)
+                const subquery = try self.allocator.create(ast.SelectStmt);
+                subquery.* = try self.parseSelect();
+                _ = try self.expect(.RPAREN);
+                return Expr{
+                    .exists = .{
+                        .subquery = subquery,
+                        .negated = false,
+                    },
+                };
+            },
+
             else => return error.UnexpectedToken,
         }
+    }
+
+    /// Parse CASE expression
+    fn parseCaseExpr(self: *Self) !Expr {
+        _ = try self.expect(.CASE);
+
+        // Check for simple CASE (CASE expr WHEN ...)
+        var operand: ?*Expr = null;
+        if (!self.check(.WHEN)) {
+            operand = try self.allocator.create(Expr);
+            operand.?.* = try self.parseExpr();
+        }
+
+        // Parse WHEN clauses
+        var when_clauses = std.ArrayList(ast.CaseWhen){};
+        errdefer when_clauses.deinit(self.allocator);
+
+        while (self.match(&[_]TokenType{.WHEN})) {
+            const condition = try self.parseExpr();
+            _ = try self.expect(.THEN);
+            const result = try self.parseExpr();
+
+            try when_clauses.append(self.allocator, ast.CaseWhen{
+                .condition = condition,
+                .result = result,
+            });
+        }
+
+        // Parse optional ELSE
+        var else_result: ?*Expr = null;
+        if (self.match(&[_]TokenType{.ELSE})) {
+            else_result = try self.allocator.create(Expr);
+            else_result.?.* = try self.parseExpr();
+        }
+
+        _ = try self.expect(.END);
+
+        return Expr{
+            .case_expr = .{
+                .operand = operand,
+                .when_clauses = try when_clauses.toOwnedSlice(self.allocator),
+                .else_result = else_result,
+            },
+        };
+    }
+
+    /// Parse CAST expression: CAST(expr AS type)
+    fn parseCastExpr(self: *Self) !Expr {
+        _ = try self.expect(.CAST);
+        _ = try self.expect(.LPAREN);
+
+        const expr = try self.allocator.create(Expr);
+        expr.* = try self.parseExpr();
+
+        _ = try self.expect(.AS);
+
+        // Parse type name (can be compound like VARCHAR(255))
+        const type_tok = try self.expect(.IDENTIFIER);
+        const target_type = type_tok.lexeme;
+
+        // Handle type with size like VARCHAR(255)
+        if (self.check(.LPAREN)) {
+            self.advance();
+            _ = try self.expect(.NUMBER); // size
+            if (self.match(&[_]TokenType{.COMMA})) {
+                _ = try self.expect(.NUMBER); // scale for DECIMAL
+            }
+            _ = try self.expect(.RPAREN);
+            // For simplicity, we just keep the base type name
+        }
+
+        _ = try self.expect(.RPAREN);
+
+        return Expr{
+            .cast = .{
+                .expr = expr,
+                .target_type = target_type,
+            },
+        };
     }
 
     fn parseFunctionCall(self: *Self, name: []const u8) anyerror!Expr {
@@ -500,6 +605,109 @@ pub const Parser = struct {
     // ========================================================================
 
     fn parseTableRef(self: *Self) !ast.TableRef {
+        // Parse primary table reference first
+        var table_ref = try self.parsePrimaryTableRef();
+
+        // Check for JOIN clauses
+        while (self.isJoinKeyword()) {
+            const join_clause = try self.parseJoinClause();
+
+            // Wrap in join expression
+            const left_ptr = try self.allocator.create(ast.TableRef);
+            left_ptr.* = table_ref;
+
+            table_ref = ast.TableRef{
+                .join = .{
+                    .left = left_ptr,
+                    .join_clause = join_clause,
+                },
+            };
+        }
+
+        return table_ref;
+    }
+
+    /// Check if current token starts a JOIN clause
+    fn isJoinKeyword(self: *const Self) bool {
+        const tok = self.current() orelse return false;
+        return tok.type == .JOIN or
+            tok.type == .LEFT or
+            tok.type == .RIGHT or
+            tok.type == .INNER or
+            tok.type == .OUTER or
+            tok.type == .FULL or
+            tok.type == .CROSS or
+            tok.type == .NATURAL;
+    }
+
+    /// Parse JOIN clause: [LEFT|RIGHT|INNER|FULL|CROSS] [OUTER] JOIN table ON condition
+    fn parseJoinClause(self: *Self) !ast.JoinClause {
+        var join_type: ast.JoinType = .inner;
+
+        // Parse join type
+        if (self.match(&[_]TokenType{.NATURAL})) {
+            join_type = .natural;
+            _ = self.match(&[_]TokenType{.JOIN}); // Optional JOIN keyword after NATURAL
+        } else if (self.match(&[_]TokenType{.CROSS})) {
+            join_type = .cross;
+            _ = try self.expect(.JOIN);
+        } else if (self.match(&[_]TokenType{.LEFT})) {
+            join_type = .left;
+            _ = self.match(&[_]TokenType{.OUTER}); // Optional OUTER
+            _ = try self.expect(.JOIN);
+        } else if (self.match(&[_]TokenType{.RIGHT})) {
+            join_type = .right;
+            _ = self.match(&[_]TokenType{.OUTER}); // Optional OUTER
+            _ = try self.expect(.JOIN);
+        } else if (self.match(&[_]TokenType{.FULL})) {
+            join_type = .full;
+            _ = self.match(&[_]TokenType{.OUTER}); // Optional OUTER
+            _ = try self.expect(.JOIN);
+        } else if (self.match(&[_]TokenType{.INNER})) {
+            join_type = .inner;
+            _ = try self.expect(.JOIN);
+        } else {
+            // Plain JOIN
+            _ = try self.expect(.JOIN);
+            join_type = .inner;
+        }
+
+        // Parse right table
+        const right_table = try self.allocator.create(ast.TableRef);
+        right_table.* = try self.parsePrimaryTableRef();
+
+        // Parse ON condition or USING clause
+        var on_condition: ?Expr = null;
+        var using_columns: ?[][]const u8 = null;
+
+        if (join_type != .cross and join_type != .natural) {
+            if (self.match(&[_]TokenType{.ON})) {
+                on_condition = try self.parseExpr();
+            } else if (self.match(&[_]TokenType{.USING})) {
+                _ = try self.expect(.LPAREN);
+                var cols = std.ArrayList([]const u8){};
+                errdefer cols.deinit(self.allocator);
+
+                while (true) {
+                    const col_tok = try self.expect(.IDENTIFIER);
+                    try cols.append(self.allocator, col_tok.lexeme);
+                    if (!self.match(&[_]TokenType{.COMMA})) break;
+                }
+                _ = try self.expect(.RPAREN);
+                using_columns = try cols.toOwnedSlice(self.allocator);
+            }
+        }
+
+        return ast.JoinClause{
+            .join_type = join_type,
+            .table = right_table,
+            .on_condition = on_condition,
+            .using_columns = using_columns,
+        };
+    }
+
+    /// Parse a primary (non-joined) table reference
+    fn parsePrimaryTableRef(self: *Self) !ast.TableRef {
         const name_tok = try self.expect(.IDENTIFIER);
 
         // Check if this is a table-valued function (e.g., logic_table('path'))
@@ -521,8 +729,8 @@ pub const Parser = struct {
             const alias = if (self.match(&[_]TokenType{.AS})) blk: {
                 const tok = try self.expect(.IDENTIFIER);
                 break :blk tok.lexeme;
-            } else if (self.check(.IDENTIFIER)) blk: {
-                // Alias without AS keyword
+            } else if (self.check(.IDENTIFIER) and !self.isJoinKeyword()) blk: {
+                // Alias without AS keyword (but not if it's a JOIN keyword)
                 const tok = self.current().?;
                 self.advance();
                 break :blk tok.lexeme;
@@ -540,9 +748,14 @@ pub const Parser = struct {
         }
 
         // Simple table reference
-        // Check for alias
+        // Check for alias (but not if it's a JOIN keyword)
         const alias = if (self.match(&[_]TokenType{.AS})) blk: {
             const tok = try self.expect(.IDENTIFIER);
+            break :blk tok.lexeme;
+        } else if (self.check(.IDENTIFIER) and !self.isJoinKeyword()) blk: {
+            // Alias without AS keyword
+            const tok = self.current().?;
+            self.advance();
             break :blk tok.lexeme;
         } else null;
 
