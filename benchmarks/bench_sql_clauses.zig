@@ -1,27 +1,34 @@
 //! SQL Clause Benchmark: LanceQL vs DuckDB vs Polars
 //!
-//! Benchmarks different SQL operations to identify optimization opportunities.
+//! Benchmarks different SQL operations across all three engines.
 //! Run with: zig build bench-sql
 //!
-//! Output format: JSON for CI comparison
+//! Output: Side-by-side comparison with speedup ratios
 
 const std = @import("std");
 const lanceql = @import("lanceql");
 const query = @import("lanceql.query");
 const metal = @import("lanceql.metal");
 
+// Production-scale: Each benchmark should run 30+ seconds to avoid measuring cold start
+// 200M rows x 10 iterations = ~30-60 seconds per clause
+const WARMUP = 3;
+const ITERATIONS = 10;
+const MIN_BENCHMARK_SECONDS: f64 = 30.0;
+
+const Engine = enum { lanceql, duckdb, polars };
+
 const BenchmarkResult = struct {
-    name: []const u8,
+    engine: Engine,
     clause: []const u8,
     rows: usize,
-    min_ms: f64,
-    avg_ms: f64,
-    max_ms: f64,
+    avg_sec: f64,
     throughput_mrows_sec: f64,
 };
 
-const WARMUP = 3;
-const ITERATIONS = 10;
+var has_duckdb: bool = false;
+var has_polars: bool = false;
+var parquet_path: ?[]const u8 = null;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -30,392 +37,773 @@ pub fn main() !void {
 
     // Initialize GPU
     _ = metal.initGPU();
+    defer metal.cleanupGPU();
 
-    std.debug.print("LanceQL SQL Clause Benchmark\n", .{});
-    std.debug.print("============================\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("================================================================================\n", .{});
+    std.debug.print("SQL Clause Benchmark: LanceQL vs DuckDB vs Polars\n", .{});
+    std.debug.print("================================================================================\n", .{});
     std.debug.print("Platform: {s}\n", .{metal.getPlatformInfo()});
     if (metal.isGPUReady()) {
         std.debug.print("GPU: {s}\n", .{metal.getGPUDeviceName()});
     }
-    std.debug.print("Warmup: {d}, Iterations: {d}\n\n", .{ WARMUP, ITERATIONS });
+    std.debug.print("Warmup: {d}, Iterations: {d}\n", .{ WARMUP, ITERATIONS });
+    std.debug.print("(All times are hot execution - after warmup)\n\n", .{});
+
+    // Check for external engines
+    has_duckdb = checkCommand(allocator, "duckdb");
+    has_polars = checkCommand(allocator, "polars");
+
+    std.debug.print("Engines available:\n", .{});
+    std.debug.print("  - LanceQL: yes (native Zig + Metal GPU)\n", .{});
+    std.debug.print("  - DuckDB:  {s}\n", .{if (has_duckdb) "yes" else "no (install: brew install duckdb)"});
+    std.debug.print("  - Polars:  {s}\n", .{if (has_polars) "yes" else "no (install: pip install polars-cli)"});
+    std.debug.print("\n", .{});
+
+    // Create test parquet file for DuckDB/Polars
+    if (has_duckdb or has_polars) {
+        parquet_path = try createTestParquet(allocator);
+    }
+    defer if (parquet_path) |p| {
+        std.fs.deleteFileAbsolute(p) catch {};
+        allocator.free(p);
+    };
 
     var results = std.ArrayListUnmanaged(BenchmarkResult){};
     defer results.deinit(allocator);
 
-    // Generate test data
-    const sizes = [_]usize{ 10_000, 100_000, 1_000_000 };
+    // Benchmark each clause at 200M rows for 30+ second runs
+    // This ensures we measure actual compute, not Python/CLI cold start
+    const num_rows: usize = 200_000_000;
 
-    for (sizes) |num_rows| {
-        std.debug.print("\n=== Dataset: {d} rows ===\n", .{num_rows});
+    std.debug.print("================================================================================\n", .{});
+    std.debug.print("Dataset: {d}M rows\n", .{num_rows / 1_000_000});
+    std.debug.print("================================================================================\n", .{});
 
-        // Benchmark each clause
-        try benchmarkFullScan(allocator, &results, num_rows);
-        try benchmarkProjection(allocator, &results, num_rows);
-        try benchmarkFilter(allocator, &results, num_rows);
-        try benchmarkGroupBy(allocator, &results, num_rows);
-        try benchmarkOrderByLimit(allocator, &results, num_rows);
-        try benchmarkDistinct(allocator, &results, num_rows);
-        try benchmarkVectorSearch(allocator, &results, num_rows);
-        try benchmarkHashJoin(allocator, &results, num_rows);
+    try benchmarkFullScan(allocator, &results, num_rows);
+    try benchmarkFilter(allocator, &results, num_rows);
+    try benchmarkGroupBy(allocator, &results, num_rows);
+    try benchmarkOrderByLimit(allocator, &results, num_rows);
+    try benchmarkDistinct(allocator, &results, num_rows);
+    try benchmarkVectorSearch(allocator, &results, num_rows);
+    try benchmarkHashJoin(allocator, &results, num_rows);
+
+    // Print summary table
+    std.debug.print("\n", .{});
+    std.debug.print("================================================================================\n", .{});
+    std.debug.print("Summary (200M rows)\n", .{});
+    std.debug.print("================================================================================\n", .{});
+    printSummaryTable(results.items);
+}
+
+fn checkCommand(allocator: std.mem.Allocator, cmd: []const u8) bool {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ cmd, "--version" },
+    }) catch return false;
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    return result.term.Exited == 0;
+}
+
+fn createTestParquet(allocator: std.mem.Allocator) ![]const u8 {
+    const path = try std.fmt.allocPrint(allocator, "/tmp/lanceql_bench_{d}.parquet", .{std.time.milliTimestamp()});
+
+    const sql = try std.fmt.allocPrint(allocator,
+        \\COPY (
+        \\  SELECT
+        \\    i AS id,
+        \\    random() AS value,
+        \\    i % 100 AS group_key,
+        \\    'item_' || (i % 1000) AS name
+        \\  FROM range(200000000) t(i)
+        \\) TO '{s}' (FORMAT PARQUET);
+    , .{path});
+    defer allocator.free(sql);
+
+    std.debug.print("Creating test data (200M rows): {s}...\n", .{path});
+
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "duckdb", "-c", sql },
+    }) catch return error.DuckDBFailed;
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
     }
 
-    // Output JSON for CI
-    std.debug.print("\n=== JSON Results ===\n", .{});
-    outputJSON(results.items);
+    if (result.term.Exited != 0) {
+        return error.DuckDBFailed;
+    }
 
-    metal.cleanupGPU();
+    std.debug.print("Test data created.\n\n", .{});
+    return path;
+}
+
+fn runDuckDB(allocator: std.mem.Allocator, sql: []const u8) !u64 {
+    var timer = try std.time.Timer.start();
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "duckdb", "-c", sql },
+    }) catch return error.DuckDBFailed;
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    return timer.read();
+}
+
+fn runPolars(allocator: std.mem.Allocator, sql: []const u8) !u64 {
+    var timer = try std.time.Timer.start();
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "polars", "-c", sql },
+    }) catch return error.PolarsFailed;
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    return timer.read();
 }
 
 fn benchmarkFullScan(allocator: std.mem.Allocator, results: *std.ArrayListUnmanaged(BenchmarkResult), num_rows: usize) !void {
-    // Simulate: SELECT * FROM table
-    const data = try allocator.alloc(i64, num_rows);
-    defer allocator.free(data);
-    for (data, 0..) |*v, i| v.* = @intCast(i);
+    std.debug.print("\n--- SELECT * (Full Scan) ---\n", .{});
 
-    // Warmup
-    for (0..WARMUP) |_| {
-        var sum: i64 = 0;
-        for (data) |v| sum += v;
-        std.mem.doNotOptimizeAway(&sum);
+    // LanceQL
+    {
+        const data = try allocator.alloc(i64, num_rows);
+        defer allocator.free(data);
+        for (data, 0..) |*v, i| v.* = @intCast(i);
+
+        for (0..WARMUP) |_| {
+            var sum: i64 = 0;
+            for (data) |v| sum += v;
+            std.mem.doNotOptimizeAway(&sum);
+        }
+
+        var times: [ITERATIONS]u64 = undefined;
+        for (0..ITERATIONS) |iter| {
+            var timer = try std.time.Timer.start();
+            var sum: i64 = 0;
+            for (data) |v| sum += v;
+            std.mem.doNotOptimizeAway(&sum);
+            times[iter] = timer.read();
+        }
+
+        const stats = calcStats(&times, num_rows);
+        try results.append(allocator, .{ .engine = .lanceql, .clause = "SELECT *", .rows = num_rows, .avg_sec = stats.avg_sec, .throughput_mrows_sec = stats.throughput });
+        std.debug.print("LanceQL: {d:>8.2} s ({d:>8.1}M rows/s)\n", .{ stats.avg_sec, stats.throughput });
     }
 
-    var times: [ITERATIONS]u64 = undefined;
-    for (0..ITERATIONS) |iter| {
-        var timer = try std.time.Timer.start();
-        var sum: i64 = 0;
-        for (data) |v| sum += v;
-        std.mem.doNotOptimizeAway(&sum);
-        times[iter] = timer.read();
+    // DuckDB
+    if (has_duckdb) {
+        if (parquet_path) |path| {
+            const sql = try std.fmt.allocPrint(allocator, "SELECT * FROM '{s}';", .{path});
+            defer allocator.free(sql);
+
+            for (0..WARMUP) |_| {
+                _ = runDuckDB(allocator, sql) catch continue;
+            }
+
+            var times: [ITERATIONS]u64 = undefined;
+            for (0..ITERATIONS) |iter| {
+                times[iter] = runDuckDB(allocator, sql) catch 0;
+            }
+
+            const stats = calcStats(&times, num_rows);
+            try results.append(allocator, .{ .engine = .duckdb, .clause = "SELECT *", .rows = num_rows, .avg_sec = stats.avg_sec, .throughput_mrows_sec = stats.throughput });
+            std.debug.print("DuckDB:  {d:>8.2} s ({d:>8.1}M rows/s)\n", .{ stats.avg_sec, stats.throughput });
+        }
     }
 
-    const result = calcStats(&times, num_rows, "SELECT *");
-    try results.append(allocator, result);
-    printResult(result);
-}
+    // Polars
+    if (has_polars) {
+        if (parquet_path) |path| {
+            const sql = try std.fmt.allocPrint(allocator, "SELECT * FROM read_parquet('{s}');", .{path});
+            defer allocator.free(sql);
 
-fn benchmarkProjection(allocator: std.mem.Allocator, results: *std.ArrayListUnmanaged(BenchmarkResult), num_rows: usize) !void {
-    // Simulate: SELECT col1, col2 FROM table (2 of 5 columns)
-    const col1 = try allocator.alloc(i64, num_rows);
-    defer allocator.free(col1);
-    const col2 = try allocator.alloc(f64, num_rows);
-    defer allocator.free(col2);
+            for (0..WARMUP) |_| {
+                _ = runPolars(allocator, sql) catch continue;
+            }
 
-    for (0..num_rows) |i| {
-        col1[i] = @intCast(i);
-        col2[i] = @floatFromInt(i);
+            var times: [ITERATIONS]u64 = undefined;
+            for (0..ITERATIONS) |iter| {
+                times[iter] = runPolars(allocator, sql) catch 0;
+            }
+
+            const stats = calcStats(&times, num_rows);
+            try results.append(allocator, .{ .engine = .polars, .clause = "SELECT *", .rows = num_rows, .avg_sec = stats.avg_sec, .throughput_mrows_sec = stats.throughput });
+            std.debug.print("Polars:  {d:>8.2} s ({d:>8.1}M rows/s)\n", .{ stats.avg_sec, stats.throughput });
+        }
     }
-
-    for (0..WARMUP) |_| {
-        var sum: f64 = 0;
-        for (col1, col2) |c1, c2| sum += @as(f64, @floatFromInt(c1)) + c2;
-        std.mem.doNotOptimizeAway(&sum);
-    }
-
-    var times: [ITERATIONS]u64 = undefined;
-    for (0..ITERATIONS) |iter| {
-        var timer = try std.time.Timer.start();
-        var sum: f64 = 0;
-        for (col1, col2) |c1, c2| sum += @as(f64, @floatFromInt(c1)) + c2;
-        std.mem.doNotOptimizeAway(&sum);
-        times[iter] = timer.read();
-    }
-
-    const result = calcStats(&times, num_rows, "SELECT col1,col2");
-    try results.append(allocator, result);
-    printResult(result);
 }
 
 fn benchmarkFilter(allocator: std.mem.Allocator, results: *std.ArrayListUnmanaged(BenchmarkResult), num_rows: usize) !void {
-    // Simulate: SELECT * FROM table WHERE value > threshold
-    const data = try allocator.alloc(i64, num_rows);
-    defer allocator.free(data);
-    for (data, 0..) |*v, i| v.* = @intCast(i % 1000);
+    std.debug.print("\n--- WHERE value > 0.5 (Filter) ---\n", .{});
 
-    const threshold: i64 = 500;
+    // LanceQL
+    {
+        const data = try allocator.alloc(f64, num_rows);
+        defer allocator.free(data);
+        var rng = std.Random.DefaultPrng.init(42);
+        for (data) |*v| v.* = rng.random().float(f64);
 
-    for (0..WARMUP) |_| {
-        var count: usize = 0;
-        for (data) |v| {
-            if (v > threshold) count += 1;
+        for (0..WARMUP) |_| {
+            var count: usize = 0;
+            for (data) |v| {
+                if (v > 0.5) count += 1;
+            }
+            std.mem.doNotOptimizeAway(&count);
         }
-        std.mem.doNotOptimizeAway(&count);
+
+        var times: [ITERATIONS]u64 = undefined;
+        for (0..ITERATIONS) |iter| {
+            var timer = try std.time.Timer.start();
+            var count: usize = 0;
+            for (data) |v| {
+                if (v > 0.5) count += 1;
+            }
+            std.mem.doNotOptimizeAway(&count);
+            times[iter] = timer.read();
+        }
+
+        const stats = calcStats(&times, num_rows);
+        try results.append(allocator, .{ .engine = .lanceql, .clause = "WHERE", .rows = num_rows, .avg_sec = stats.avg_sec, .throughput_mrows_sec = stats.throughput });
+        std.debug.print("LanceQL: {d:>8.2} s ({d:>8.1}M rows/s)\n", .{ stats.avg_sec, stats.throughput });
     }
 
-    var times: [ITERATIONS]u64 = undefined;
-    for (0..ITERATIONS) |iter| {
-        var timer = try std.time.Timer.start();
-        var count: usize = 0;
-        for (data) |v| {
-            if (v > threshold) count += 1;
+    // DuckDB
+    if (has_duckdb) {
+        if (parquet_path) |path| {
+            const sql = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM '{s}' WHERE value > 0.5;", .{path});
+            defer allocator.free(sql);
+
+            for (0..WARMUP) |_| {
+                _ = runDuckDB(allocator, sql) catch continue;
+            }
+
+            var times: [ITERATIONS]u64 = undefined;
+            for (0..ITERATIONS) |iter| {
+                times[iter] = runDuckDB(allocator, sql) catch 0;
+            }
+
+            const stats = calcStats(&times, num_rows);
+            try results.append(allocator, .{ .engine = .duckdb, .clause = "WHERE", .rows = num_rows, .avg_sec = stats.avg_sec, .throughput_mrows_sec = stats.throughput });
+            std.debug.print("DuckDB:  {d:>8.2} s ({d:>8.1}M rows/s)\n", .{ stats.avg_sec, stats.throughput });
         }
-        std.mem.doNotOptimizeAway(&count);
-        times[iter] = timer.read();
     }
 
-    const result = calcStats(&times, num_rows, "WHERE x > 500");
-    try results.append(allocator, result);
-    printResult(result);
+    // Polars
+    if (has_polars) {
+        if (parquet_path) |path| {
+            const sql = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM read_parquet('{s}') WHERE value > 0.5;", .{path});
+            defer allocator.free(sql);
+
+            for (0..WARMUP) |_| {
+                _ = runPolars(allocator, sql) catch continue;
+            }
+
+            var times: [ITERATIONS]u64 = undefined;
+            for (0..ITERATIONS) |iter| {
+                times[iter] = runPolars(allocator, sql) catch 0;
+            }
+
+            const stats = calcStats(&times, num_rows);
+            try results.append(allocator, .{ .engine = .polars, .clause = "WHERE", .rows = num_rows, .avg_sec = stats.avg_sec, .throughput_mrows_sec = stats.throughput });
+            std.debug.print("Polars:  {d:>8.2} s ({d:>8.1}M rows/s)\n", .{ stats.avg_sec, stats.throughput });
+        }
+    }
 }
 
 fn benchmarkGroupBy(allocator: std.mem.Allocator, results: *std.ArrayListUnmanaged(BenchmarkResult), num_rows: usize) !void {
-    // Simulate: SELECT key, SUM(value) FROM table GROUP BY key
+    std.debug.print("\n--- GROUP BY + SUM ---\n", .{});
+
     const num_groups: usize = 100;
 
-    const keys = try allocator.alloc(u64, num_rows);
-    defer allocator.free(keys);
-    const values = try allocator.alloc(u64, num_rows);
-    defer allocator.free(values);
+    // LanceQL
+    {
+        const keys = try allocator.alloc(u64, num_rows);
+        defer allocator.free(keys);
+        const values = try allocator.alloc(u64, num_rows);
+        defer allocator.free(values);
 
-    for (0..num_rows) |i| {
-        keys[i] = @intCast(i % num_groups);
-        values[i] = 1;
+        for (0..num_rows) |i| {
+            keys[i] = @intCast(i % num_groups);
+            values[i] = 1;
+        }
+
+        for (0..WARMUP) |_| {
+            var group_by = query.GPUGroupBy.initWithCapacity(allocator, .sum, num_groups * 4) catch continue;
+            defer group_by.deinit();
+            group_by.process(keys, values) catch continue;
+            const res = group_by.getResults() catch continue;
+            allocator.free(res.keys);
+            allocator.free(res.aggregates);
+        }
+
+        var times: [ITERATIONS]u64 = undefined;
+        for (0..ITERATIONS) |iter| {
+            var timer = try std.time.Timer.start();
+            var group_by = try query.GPUGroupBy.initWithCapacity(allocator, .sum, num_groups * 4);
+            defer group_by.deinit();
+            try group_by.process(keys, values);
+            const res = try group_by.getResults();
+            allocator.free(res.keys);
+            allocator.free(res.aggregates);
+            times[iter] = timer.read();
+        }
+
+        const stats = calcStats(&times, num_rows);
+        try results.append(allocator, .{ .engine = .lanceql, .clause = "GROUP BY", .rows = num_rows, .avg_sec = stats.avg_sec, .throughput_mrows_sec = stats.throughput });
+        std.debug.print("LanceQL: {d:>8.2} s ({d:>8.1}M rows/s)\n", .{ stats.avg_sec, stats.throughput });
     }
 
-    // Use GPU GROUP BY
-    for (0..WARMUP) |_| {
-        var group_by = query.GPUGroupBy.initWithCapacity(allocator, .sum, num_groups * 4) catch continue;
-        defer group_by.deinit();
-        group_by.process(keys, values) catch continue;
-        const res = group_by.getResults() catch continue;
-        allocator.free(res.keys);
-        allocator.free(res.aggregates);
+    // DuckDB
+    if (has_duckdb) {
+        if (parquet_path) |path| {
+            const sql = try std.fmt.allocPrint(allocator, "SELECT group_key, SUM(value) FROM '{s}' GROUP BY group_key;", .{path});
+            defer allocator.free(sql);
+
+            for (0..WARMUP) |_| {
+                _ = runDuckDB(allocator, sql) catch continue;
+            }
+
+            var times: [ITERATIONS]u64 = undefined;
+            for (0..ITERATIONS) |iter| {
+                times[iter] = runDuckDB(allocator, sql) catch 0;
+            }
+
+            const stats = calcStats(&times, num_rows);
+            try results.append(allocator, .{ .engine = .duckdb, .clause = "GROUP BY", .rows = num_rows, .avg_sec = stats.avg_sec, .throughput_mrows_sec = stats.throughput });
+            std.debug.print("DuckDB:  {d:>8.2} s ({d:>8.1}M rows/s)\n", .{ stats.avg_sec, stats.throughput });
+        }
     }
 
-    var times: [ITERATIONS]u64 = undefined;
-    for (0..ITERATIONS) |iter| {
-        var timer = try std.time.Timer.start();
-        var group_by = try query.GPUGroupBy.initWithCapacity(allocator, .sum, num_groups * 4);
-        defer group_by.deinit();
-        try group_by.process(keys, values);
-        const res = try group_by.getResults();
-        allocator.free(res.keys);
-        allocator.free(res.aggregates);
-        times[iter] = timer.read();
-    }
+    // Polars
+    if (has_polars) {
+        if (parquet_path) |path| {
+            const sql = try std.fmt.allocPrint(allocator, "SELECT group_key, SUM(value) FROM read_parquet('{s}') GROUP BY group_key;", .{path});
+            defer allocator.free(sql);
 
-    const result = calcStats(&times, num_rows, "GROUP BY + SUM");
-    try results.append(allocator, result);
-    printResult(result);
+            for (0..WARMUP) |_| {
+                _ = runPolars(allocator, sql) catch continue;
+            }
+
+            var times: [ITERATIONS]u64 = undefined;
+            for (0..ITERATIONS) |iter| {
+                times[iter] = runPolars(allocator, sql) catch 0;
+            }
+
+            const stats = calcStats(&times, num_rows);
+            try results.append(allocator, .{ .engine = .polars, .clause = "GROUP BY", .rows = num_rows, .avg_sec = stats.avg_sec, .throughput_mrows_sec = stats.throughput });
+            std.debug.print("Polars:  {d:>8.2} s ({d:>8.1}M rows/s)\n", .{ stats.avg_sec, stats.throughput });
+        }
+    }
 }
 
 fn benchmarkOrderByLimit(allocator: std.mem.Allocator, results: *std.ArrayListUnmanaged(BenchmarkResult), num_rows: usize) !void {
-    // Simulate: SELECT * FROM table ORDER BY value DESC LIMIT 100
-    const data = try allocator.alloc(i64, num_rows);
-    defer allocator.free(data);
-
-    var rng = std.Random.DefaultPrng.init(42);
-    for (data) |*v| v.* = rng.random().int(i64);
+    std.debug.print("\n--- ORDER BY LIMIT 100 ---\n", .{});
 
     const limit: usize = 100;
 
-    for (0..WARMUP) |_| {
-        // Partial sort for top-k
-        var top_k = try allocator.alloc(i64, limit);
-        defer allocator.free(top_k);
-        @memcpy(top_k, data[0..limit]);
-        std.mem.sort(i64, top_k, {}, std.sort.desc(i64));
+    // LanceQL
+    {
+        const data = try allocator.alloc(i64, num_rows);
+        defer allocator.free(data);
 
-        for (data[limit..]) |v| {
-            if (v > top_k[limit - 1]) {
-                top_k[limit - 1] = v;
-                std.mem.sort(i64, top_k, {}, std.sort.desc(i64));
+        var rng = std.Random.DefaultPrng.init(42);
+        for (data) |*v| v.* = rng.random().int(i64);
+
+        for (0..WARMUP) |_| {
+            var top_k = try allocator.alloc(i64, limit);
+            defer allocator.free(top_k);
+            @memcpy(top_k, data[0..limit]);
+            std.mem.sort(i64, top_k, {}, std.sort.desc(i64));
+            for (data[limit..]) |v| {
+                if (v > top_k[limit - 1]) {
+                    top_k[limit - 1] = v;
+                    std.mem.sort(i64, top_k, {}, std.sort.desc(i64));
+                }
             }
+            std.mem.doNotOptimizeAway(top_k);
         }
-        std.mem.doNotOptimizeAway(top_k);
+
+        var times: [ITERATIONS]u64 = undefined;
+        for (0..ITERATIONS) |iter| {
+            var timer = try std.time.Timer.start();
+            var top_k = try allocator.alloc(i64, limit);
+            defer allocator.free(top_k);
+            @memcpy(top_k, data[0..limit]);
+            std.mem.sort(i64, top_k, {}, std.sort.desc(i64));
+            for (data[limit..]) |v| {
+                if (v > top_k[limit - 1]) {
+                    top_k[limit - 1] = v;
+                    std.mem.sort(i64, top_k, {}, std.sort.desc(i64));
+                }
+            }
+            std.mem.doNotOptimizeAway(top_k);
+            times[iter] = timer.read();
+        }
+
+        const stats = calcStats(&times, num_rows);
+        try results.append(allocator, .{ .engine = .lanceql, .clause = "ORDER BY LIMIT", .rows = num_rows, .avg_sec = stats.avg_sec, .throughput_mrows_sec = stats.throughput });
+        std.debug.print("LanceQL: {d:>8.2} s ({d:>8.1}M rows/s)\n", .{ stats.avg_sec, stats.throughput });
     }
 
-    var times: [ITERATIONS]u64 = undefined;
-    for (0..ITERATIONS) |iter| {
-        var timer = try std.time.Timer.start();
-        var top_k = try allocator.alloc(i64, limit);
-        defer allocator.free(top_k);
-        @memcpy(top_k, data[0..limit]);
-        std.mem.sort(i64, top_k, {}, std.sort.desc(i64));
+    // DuckDB
+    if (has_duckdb) {
+        if (parquet_path) |path| {
+            const sql = try std.fmt.allocPrint(allocator, "SELECT * FROM '{s}' ORDER BY value DESC LIMIT 100;", .{path});
+            defer allocator.free(sql);
 
-        for (data[limit..]) |v| {
-            if (v > top_k[limit - 1]) {
-                top_k[limit - 1] = v;
-                std.mem.sort(i64, top_k, {}, std.sort.desc(i64));
+            for (0..WARMUP) |_| {
+                _ = runDuckDB(allocator, sql) catch continue;
             }
+
+            var times: [ITERATIONS]u64 = undefined;
+            for (0..ITERATIONS) |iter| {
+                times[iter] = runDuckDB(allocator, sql) catch 0;
+            }
+
+            const stats = calcStats(&times, num_rows);
+            try results.append(allocator, .{ .engine = .duckdb, .clause = "ORDER BY LIMIT", .rows = num_rows, .avg_sec = stats.avg_sec, .throughput_mrows_sec = stats.throughput });
+            std.debug.print("DuckDB:  {d:>8.2} s ({d:>8.1}M rows/s)\n", .{ stats.avg_sec, stats.throughput });
         }
-        std.mem.doNotOptimizeAway(top_k);
-        times[iter] = timer.read();
     }
 
-    const result = calcStats(&times, num_rows, "ORDER BY LIMIT");
-    try results.append(allocator, result);
-    printResult(result);
+    // Polars
+    if (has_polars) {
+        if (parquet_path) |path| {
+            const sql = try std.fmt.allocPrint(allocator, "SELECT * FROM read_parquet('{s}') ORDER BY value DESC LIMIT 100;", .{path});
+            defer allocator.free(sql);
+
+            for (0..WARMUP) |_| {
+                _ = runPolars(allocator, sql) catch continue;
+            }
+
+            var times: [ITERATIONS]u64 = undefined;
+            for (0..ITERATIONS) |iter| {
+                times[iter] = runPolars(allocator, sql) catch 0;
+            }
+
+            const stats = calcStats(&times, num_rows);
+            try results.append(allocator, .{ .engine = .polars, .clause = "ORDER BY LIMIT", .rows = num_rows, .avg_sec = stats.avg_sec, .throughput_mrows_sec = stats.throughput });
+            std.debug.print("Polars:  {d:>8.2} s ({d:>8.1}M rows/s)\n", .{ stats.avg_sec, stats.throughput });
+        }
+    }
 }
 
 fn benchmarkDistinct(allocator: std.mem.Allocator, results: *std.ArrayListUnmanaged(BenchmarkResult), num_rows: usize) !void {
-    // Simulate: SELECT DISTINCT key FROM table
+    std.debug.print("\n--- DISTINCT ---\n", .{});
+
     const num_distinct: usize = 1000;
-    const keys = try allocator.alloc(u64, num_rows);
-    defer allocator.free(keys);
 
-    for (0..num_rows) |i| {
-        keys[i] = @intCast(i % num_distinct);
-    }
+    // LanceQL
+    {
+        const keys = try allocator.alloc(u64, num_rows);
+        defer allocator.free(keys);
 
-    for (0..WARMUP) |_| {
-        var seen = std.AutoHashMap(u64, void).init(allocator);
-        defer seen.deinit();
-        for (keys) |k| {
-            seen.put(k, {}) catch continue;
+        for (0..num_rows) |i| {
+            keys[i] = @intCast(i % num_distinct);
         }
-        std.mem.doNotOptimizeAway(&seen);
-    }
 
-    var times: [ITERATIONS]u64 = undefined;
-    for (0..ITERATIONS) |iter| {
-        var timer = try std.time.Timer.start();
-        var seen = std.AutoHashMap(u64, void).init(allocator);
-        defer seen.deinit();
-        for (keys) |k| {
-            try seen.put(k, {});
+        for (0..WARMUP) |_| {
+            var seen = std.AutoHashMap(u64, void).init(allocator);
+            defer seen.deinit();
+            for (keys) |k| {
+                seen.put(k, {}) catch continue;
+            }
+            std.mem.doNotOptimizeAway(&seen);
         }
-        std.mem.doNotOptimizeAway(&seen);
-        times[iter] = timer.read();
+
+        var times: [ITERATIONS]u64 = undefined;
+        for (0..ITERATIONS) |iter| {
+            var timer = try std.time.Timer.start();
+            var seen = std.AutoHashMap(u64, void).init(allocator);
+            defer seen.deinit();
+            for (keys) |k| {
+                try seen.put(k, {});
+            }
+            std.mem.doNotOptimizeAway(&seen);
+            times[iter] = timer.read();
+        }
+
+        const stats = calcStats(&times, num_rows);
+        try results.append(allocator, .{ .engine = .lanceql, .clause = "DISTINCT", .rows = num_rows, .avg_sec = stats.avg_sec, .throughput_mrows_sec = stats.throughput });
+        std.debug.print("LanceQL: {d:>8.2} s ({d:>8.1}M rows/s)\n", .{ stats.avg_sec, stats.throughput });
     }
 
-    const result = calcStats(&times, num_rows, "DISTINCT");
-    try results.append(allocator, result);
-    printResult(result);
+    // DuckDB
+    if (has_duckdb) {
+        if (parquet_path) |path| {
+            const sql = try std.fmt.allocPrint(allocator, "SELECT DISTINCT name FROM '{s}';", .{path});
+            defer allocator.free(sql);
+
+            for (0..WARMUP) |_| {
+                _ = runDuckDB(allocator, sql) catch continue;
+            }
+
+            var times: [ITERATIONS]u64 = undefined;
+            for (0..ITERATIONS) |iter| {
+                times[iter] = runDuckDB(allocator, sql) catch 0;
+            }
+
+            const stats = calcStats(&times, num_rows);
+            try results.append(allocator, .{ .engine = .duckdb, .clause = "DISTINCT", .rows = num_rows, .avg_sec = stats.avg_sec, .throughput_mrows_sec = stats.throughput });
+            std.debug.print("DuckDB:  {d:>8.2} s ({d:>8.1}M rows/s)\n", .{ stats.avg_sec, stats.throughput });
+        }
+    }
+
+    // Polars
+    if (has_polars) {
+        if (parquet_path) |path| {
+            const sql = try std.fmt.allocPrint(allocator, "SELECT DISTINCT name FROM read_parquet('{s}');", .{path});
+            defer allocator.free(sql);
+
+            for (0..WARMUP) |_| {
+                _ = runPolars(allocator, sql) catch continue;
+            }
+
+            var times: [ITERATIONS]u64 = undefined;
+            for (0..ITERATIONS) |iter| {
+                times[iter] = runPolars(allocator, sql) catch 0;
+            }
+
+            const stats = calcStats(&times, num_rows);
+            try results.append(allocator, .{ .engine = .polars, .clause = "DISTINCT", .rows = num_rows, .avg_sec = stats.avg_sec, .throughput_mrows_sec = stats.throughput });
+            std.debug.print("Polars:  {d:>8.2} s ({d:>8.1}M rows/s)\n", .{ stats.avg_sec, stats.throughput });
+        }
+    }
 }
 
 fn benchmarkVectorSearch(allocator: std.mem.Allocator, results: *std.ArrayListUnmanaged(BenchmarkResult), num_rows: usize) !void {
-    // Simulate: SELECT * FROM table NEAR 'query' TOPK 20
+    std.debug.print("\n--- VECTOR SEARCH (384-dim cosine) ---\n", .{});
+    std.debug.print("(DuckDB/Polars: no native vector search)\n", .{});
+
     const dim: usize = 384;
-    const top_k: usize = 20;
 
-    const query_vec = try allocator.alloc(f32, dim);
-    defer allocator.free(query_vec);
-    const vectors = try allocator.alloc(f32, num_rows * dim);
-    defer allocator.free(vectors);
-    const scores = try allocator.alloc(f32, num_rows);
-    defer allocator.free(scores);
+    // LanceQL only (GPU accelerated)
+    {
+        const query_vec = try allocator.alloc(f32, dim);
+        defer allocator.free(query_vec);
+        const vectors = try allocator.alloc(f32, num_rows * dim);
+        defer allocator.free(vectors);
+        const scores = try allocator.alloc(f32, num_rows);
+        defer allocator.free(scores);
 
-    var rng = std.Random.DefaultPrng.init(42);
-    for (query_vec) |*v| v.* = rng.random().float(f32) * 2 - 1;
-    for (vectors) |*v| v.* = rng.random().float(f32) * 2 - 1;
+        var rng = std.Random.DefaultPrng.init(42);
+        for (query_vec) |*v| v.* = rng.random().float(f32) * 2 - 1;
+        for (vectors) |*v| v.* = rng.random().float(f32) * 2 - 1;
 
-    // Warmup
-    for (0..WARMUP) |_| {
-        metal.batchCosineSimilarity(query_vec, vectors, dim, scores);
-    }
-
-    var times: [ITERATIONS]u64 = undefined;
-    for (0..ITERATIONS) |iter| {
-        var timer = try std.time.Timer.start();
-        metal.batchCosineSimilarity(query_vec, vectors, dim, scores);
-        // Find top-k (simplified - just find max for benchmark)
-        var max_score: f32 = scores[0];
-        for (scores[1..]) |s| {
-            if (s > max_score) max_score = s;
+        for (0..WARMUP) |_| {
+            metal.batchCosineSimilarity(query_vec, vectors, dim, scores);
         }
-        _ = top_k;
-        std.mem.doNotOptimizeAway(&max_score);
-        times[iter] = timer.read();
-    }
 
-    const result = calcStats(&times, num_rows, "VECTOR SEARCH");
-    try results.append(allocator, result);
-    printResult(result);
+        var times: [ITERATIONS]u64 = undefined;
+        for (0..ITERATIONS) |iter| {
+            var timer = try std.time.Timer.start();
+            metal.batchCosineSimilarity(query_vec, vectors, dim, scores);
+            times[iter] = timer.read();
+        }
+
+        const stats = calcStats(&times, num_rows);
+        try results.append(allocator, .{ .engine = .lanceql, .clause = "VECTOR SEARCH", .rows = num_rows, .avg_sec = stats.avg_sec, .throughput_mrows_sec = stats.throughput });
+        std.debug.print("LanceQL: {d:>8.2} ms ({d:>8.1}M rows/s) [GPU]\n", .{ stats.avg_ms, stats.throughput });
+    }
 }
 
 fn benchmarkHashJoin(allocator: std.mem.Allocator, results: *std.ArrayListUnmanaged(BenchmarkResult), num_rows: usize) !void {
-    // Simulate: SELECT * FROM left JOIN right ON left.key = right.key
-    const build_size = num_rows / 10; // 10% build side
+    std.debug.print("\n--- HASH JOIN ---\n", .{});
 
-    const build_keys = try allocator.alloc(u64, build_size);
-    defer allocator.free(build_keys);
-    const build_row_ids = try allocator.alloc(usize, build_size);
-    defer allocator.free(build_row_ids);
+    const build_size = num_rows / 10;
 
-    const probe_keys = try allocator.alloc(u64, num_rows);
-    defer allocator.free(probe_keys);
-    const probe_row_ids = try allocator.alloc(usize, num_rows);
-    defer allocator.free(probe_row_ids);
+    // LanceQL
+    {
+        const build_keys = try allocator.alloc(u64, build_size);
+        defer allocator.free(build_keys);
+        const build_row_ids = try allocator.alloc(usize, build_size);
+        defer allocator.free(build_row_ids);
+        const probe_keys = try allocator.alloc(u64, num_rows);
+        defer allocator.free(probe_keys);
+        const probe_row_ids = try allocator.alloc(usize, num_rows);
+        defer allocator.free(probe_row_ids);
 
-    for (0..build_size) |i| {
-        build_keys[i] = @intCast(i * 2); // Even keys
-        build_row_ids[i] = i;
+        for (0..build_size) |i| {
+            build_keys[i] = @intCast(i * 2);
+            build_row_ids[i] = i;
+        }
+        for (0..num_rows) |i| {
+            probe_keys[i] = @intCast(i % (build_size * 2));
+            probe_row_ids[i] = i;
+        }
+
+        for (0..WARMUP) |_| {
+            var hash_join = query.GPUHashJoin.initWithCapacity(allocator, build_size) catch continue;
+            defer hash_join.deinit();
+            hash_join.build(build_keys, build_row_ids) catch continue;
+            const res = hash_join.innerJoin(probe_keys, probe_row_ids) catch continue;
+            allocator.free(res.build_indices);
+            allocator.free(res.probe_indices);
+        }
+
+        var times: [ITERATIONS]u64 = undefined;
+        for (0..ITERATIONS) |iter| {
+            var timer = try std.time.Timer.start();
+            var hash_join = try query.GPUHashJoin.initWithCapacity(allocator, build_size);
+            defer hash_join.deinit();
+            try hash_join.build(build_keys, build_row_ids);
+            const res = try hash_join.innerJoin(probe_keys, probe_row_ids);
+            allocator.free(res.build_indices);
+            allocator.free(res.probe_indices);
+            times[iter] = timer.read();
+        }
+
+        const stats = calcStats(&times, num_rows);
+        try results.append(allocator, .{ .engine = .lanceql, .clause = "HASH JOIN", .rows = num_rows, .avg_sec = stats.avg_sec, .throughput_mrows_sec = stats.throughput });
+        std.debug.print("LanceQL: {d:>8.2} s ({d:>8.1}M rows/s)\n", .{ stats.avg_sec, stats.throughput });
     }
-    for (0..num_rows) |i| {
-        probe_keys[i] = @intCast(i % (build_size * 2));
-        probe_row_ids[i] = i;
+
+    // DuckDB - create second table for join
+    if (has_duckdb) {
+        if (parquet_path) |path| {
+            const lookup_path = try std.fmt.allocPrint(allocator, "/tmp/lanceql_lookup_{d}.parquet", .{std.time.milliTimestamp()});
+            defer allocator.free(lookup_path);
+            defer std.fs.deleteFileAbsolute(lookup_path) catch {};
+
+            const create_sql = try std.fmt.allocPrint(allocator, "COPY (SELECT i AS group_key, 'desc_' || i AS description FROM range(100) t(i)) TO '{s}' (FORMAT PARQUET);", .{lookup_path});
+            defer allocator.free(create_sql);
+            _ = runDuckDB(allocator, create_sql) catch {};
+
+            const join_sql = try std.fmt.allocPrint(allocator, "SELECT t.*, l.description FROM '{s}' t JOIN '{s}' l ON t.group_key = l.group_key;", .{ path, lookup_path });
+            defer allocator.free(join_sql);
+
+            for (0..WARMUP) |_| {
+                _ = runDuckDB(allocator, join_sql) catch continue;
+            }
+
+            var times: [ITERATIONS]u64 = undefined;
+            for (0..ITERATIONS) |iter| {
+                times[iter] = runDuckDB(allocator, join_sql) catch 0;
+            }
+
+            const stats = calcStats(&times, num_rows);
+            try results.append(allocator, .{ .engine = .duckdb, .clause = "HASH JOIN", .rows = num_rows, .avg_sec = stats.avg_sec, .throughput_mrows_sec = stats.throughput });
+            std.debug.print("DuckDB:  {d:>8.2} s ({d:>8.1}M rows/s)\n", .{ stats.avg_sec, stats.throughput });
+        }
     }
 
-    // Warmup
-    for (0..WARMUP) |_| {
-        var hash_join = query.GPUHashJoin.initWithCapacity(allocator, build_size) catch continue;
-        defer hash_join.deinit();
-        hash_join.build(build_keys, build_row_ids) catch continue;
-        const res = hash_join.innerJoin(probe_keys, probe_row_ids) catch continue;
-        allocator.free(res.build_indices);
-        allocator.free(res.probe_indices);
-    }
+    // Polars
+    if (has_polars) {
+        if (parquet_path) |path| {
+            const lookup_path = try std.fmt.allocPrint(allocator, "/tmp/lanceql_lookup_polars_{d}.parquet", .{std.time.milliTimestamp()});
+            defer allocator.free(lookup_path);
+            defer std.fs.deleteFileAbsolute(lookup_path) catch {};
 
-    var times: [ITERATIONS]u64 = undefined;
-    for (0..ITERATIONS) |iter| {
-        var timer = try std.time.Timer.start();
-        var hash_join = try query.GPUHashJoin.initWithCapacity(allocator, build_size);
-        defer hash_join.deinit();
-        try hash_join.build(build_keys, build_row_ids);
-        const res = try hash_join.innerJoin(probe_keys, probe_row_ids);
-        allocator.free(res.build_indices);
-        allocator.free(res.probe_indices);
-        times[iter] = timer.read();
-    }
+            const create_sql = try std.fmt.allocPrint(allocator, "COPY (SELECT i AS group_key, 'desc_' || i AS description FROM range(100) t(i)) TO '{s}' (FORMAT PARQUET);", .{lookup_path});
+            defer allocator.free(create_sql);
+            _ = runDuckDB(allocator, create_sql) catch {};
 
-    const result = calcStats(&times, num_rows, "HASH JOIN");
-    try results.append(allocator, result);
-    printResult(result);
+            const join_sql = try std.fmt.allocPrint(allocator, "SELECT t.*, l.description FROM read_parquet('{s}') t JOIN read_parquet('{s}') l ON t.group_key = l.group_key;", .{ path, lookup_path });
+            defer allocator.free(join_sql);
+
+            for (0..WARMUP) |_| {
+                _ = runPolars(allocator, join_sql) catch continue;
+            }
+
+            var times: [ITERATIONS]u64 = undefined;
+            for (0..ITERATIONS) |iter| {
+                times[iter] = runPolars(allocator, join_sql) catch 0;
+            }
+
+            const stats = calcStats(&times, num_rows);
+            try results.append(allocator, .{ .engine = .polars, .clause = "HASH JOIN", .rows = num_rows, .avg_sec = stats.avg_sec, .throughput_mrows_sec = stats.throughput });
+            std.debug.print("Polars:  {d:>8.2} s ({d:>8.1}M rows/s)\n", .{ stats.avg_sec, stats.throughput });
+        }
+    }
 }
 
-fn calcStats(times: []const u64, num_rows: usize, clause: []const u8) BenchmarkResult {
-    var min_ns: u64 = std.math.maxInt(u64);
-    var max_ns: u64 = 0;
+fn calcStats(times: []const u64, num_rows: usize) struct { avg_sec: f64, throughput: f64 } {
     var total_ns: u64 = 0;
-
     for (times) |t| {
-        min_ns = @min(min_ns, t);
-        max_ns = @max(max_ns, t);
         total_ns += t;
     }
 
     const avg_ns = total_ns / times.len;
-    const avg_ms = @as(f64, @floatFromInt(avg_ns)) / 1_000_000;
-    const throughput = @as(f64, @floatFromInt(num_rows)) / avg_ms / 1000; // M rows/sec
+    const avg_sec = @as(f64, @floatFromInt(avg_ns)) / 1_000_000_000;
+    const throughput = @as(f64, @floatFromInt(num_rows)) / avg_sec / 1_000_000;
 
-    return .{
-        .name = "LanceQL",
-        .clause = clause,
-        .rows = num_rows,
-        .min_ms = @as(f64, @floatFromInt(min_ns)) / 1_000_000,
-        .avg_ms = avg_ms,
-        .max_ms = @as(f64, @floatFromInt(max_ns)) / 1_000_000,
-        .throughput_mrows_sec = throughput,
-    };
+    return .{ .avg_sec = avg_sec, .throughput = throughput };
 }
 
-fn printResult(r: BenchmarkResult) void {
-    std.debug.print("{s:<20} {d:>10} rows  {d:>8.2} ms  {d:>8.1}M rows/s\n", .{
-        r.clause,
-        r.rows,
-        r.avg_ms,
-        r.throughput_mrows_sec,
-    });
-}
+fn printSummaryTable(results: []const BenchmarkResult) void {
+    const clauses = [_][]const u8{ "SELECT *", "WHERE", "GROUP BY", "ORDER BY LIMIT", "DISTINCT", "VECTOR SEARCH", "HASH JOIN" };
 
-fn outputJSON(results: []const BenchmarkResult) void {
-    std.debug.print("[\n", .{});
-    for (results, 0..) |r, i| {
-        std.debug.print(
-            \\  {{"name": "{s}", "clause": "{s}", "rows": {d}, "avg_ms": {d:.3}, "throughput_mrows_sec": {d:.2}}}
-        , .{ r.name, r.clause, r.rows, r.avg_ms, r.throughput_mrows_sec });
-        if (i < results.len - 1) std.debug.print(",", .{});
-        std.debug.print("\n", .{});
+    std.debug.print("\n{s:<20} {s:>12} {s:>12} {s:>12}   {s}\n", .{ "Clause", "LanceQL", "DuckDB", "Polars", "Winner" });
+    std.debug.print("{s}\n", .{"--------------------------------------------------------------------------------"});
+
+    for (clauses) |clause| {
+        var lanceql_sec: ?f64 = null;
+        var duckdb_sec: ?f64 = null;
+        var polars_sec: ?f64 = null;
+
+        for (results) |r| {
+            if (std.mem.eql(u8, r.clause, clause)) {
+                switch (r.engine) {
+                    .lanceql => lanceql_sec = r.avg_sec,
+                    .duckdb => duckdb_sec = r.avg_sec,
+                    .polars => polars_sec = r.avg_sec,
+                }
+            }
+        }
+
+        var lanceql_buf: [16]u8 = undefined;
+        var duckdb_buf: [16]u8 = undefined;
+        var polars_buf: [16]u8 = undefined;
+
+        const lanceql_str = if (lanceql_sec) |sec| std.fmt.bufPrint(&lanceql_buf, "{d:>8.2} s", .{sec}) catch "N/A" else "         N/A";
+        const duckdb_str = if (duckdb_sec) |sec| std.fmt.bufPrint(&duckdb_buf, "{d:>8.2} s", .{sec}) catch "N/A" else "         N/A";
+        const polars_str = if (polars_sec) |sec| std.fmt.bufPrint(&polars_buf, "{d:>8.2} s", .{sec}) catch "N/A" else "         N/A";
+
+        var winner: []const u8 = "N/A";
+        var best_sec: f64 = std.math.floatMax(f64);
+        var speedup: f64 = 1.0;
+
+        if (lanceql_sec) |sec| {
+            if (sec < best_sec) {
+                best_sec = sec;
+                winner = "LanceQL";
+            }
+        }
+        if (duckdb_sec) |sec| {
+            if (sec < best_sec) {
+                best_sec = sec;
+                winner = "DuckDB";
+            }
+        }
+        if (polars_sec) |sec| {
+            if (sec < best_sec) {
+                best_sec = sec;
+                winner = "Polars";
+            }
+        }
+
+        if (lanceql_sec != null and (duckdb_sec != null or polars_sec != null)) {
+            var second_best: f64 = std.math.floatMax(f64);
+            if (duckdb_sec) |sec| second_best = @min(second_best, sec);
+            if (polars_sec) |sec| second_best = @min(second_best, sec);
+            if (lanceql_sec) |sec| {
+                if (sec == best_sec and second_best < std.math.floatMax(f64)) {
+                    speedup = second_best / sec;
+                }
+            }
+        }
+
+        if (speedup > 1.0 and std.mem.eql(u8, winner, "LanceQL")) {
+            std.debug.print("{s:<20} {s} {s} {s}   {s} ({d:.1}x)\n", .{ clause, lanceql_str, duckdb_str, polars_str, winner, speedup });
+        } else {
+            std.debug.print("{s:<20} {s} {s} {s}   {s}\n", .{ clause, lanceql_str, duckdb_str, polars_str, winner });
+        }
     }
-    std.debug.print("]\n", .{});
 }

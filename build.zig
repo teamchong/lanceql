@@ -453,34 +453,6 @@ pub fn build(b: *std.Build) void {
     const bench_logic_table_step = b.step("bench-logic-table", "Benchmark @logic_table workflows (fraud, recommendation, features)");
     bench_logic_table_step.dependOn(&run_bench_logic_table.step);
 
-    // LanceQL vs DuckDB comparison benchmark
-    const bench_vs_duckdb = b.addExecutable(.{
-        .name = "bench_vs_duckdb",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("benchmarks/bench_vs_duckdb.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-            .imports = &.{
-                .{ .name = "lanceql.metal", .module = metal_mod },
-                .{ .name = "lanceql.query", .module = query_mod },
-            },
-        }),
-    });
-    if (use_metal) {
-        bench_vs_duckdb.root_module.linkFramework("Metal", .{});
-        bench_vs_duckdb.root_module.linkFramework("Foundation", .{});
-        bench_vs_duckdb.root_module.addCSourceFiles(.{
-            .files = &.{"src/metal/metal_backend.m"},
-            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
-        });
-    }
-    if (use_accelerate) {
-        bench_vs_duckdb.root_module.linkFramework("Accelerate", .{});
-    }
-    const run_bench_vs_duckdb = b.addRunArtifact(bench_vs_duckdb);
-    const bench_vs_duckdb_step = b.step("bench-vs-duckdb", "Compare LanceQL vs DuckDB (hot execution)");
-    bench_vs_duckdb_step.dependOn(&run_bench_vs_duckdb.step);
-
     // LanceQL CLI
     const cli = b.addExecutable(.{
         .name = "lanceql",

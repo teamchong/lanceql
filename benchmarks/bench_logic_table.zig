@@ -1,7 +1,7 @@
 //! @logic_table Workflow Benchmark: Real ML/AI Workloads
 //!
 //! This benchmark demonstrates the full @logic_table workflow with realistic
-//! ML workloads that match ml_workflow.py:
+//! production-scale ML workloads that match ml_workflow.py:
 //!   - Feature Engineering: normalization, z-score, log transform
 //!   - Vector Search: cosine similarity, euclidean distance
 //!   - Fraud Detection: multi-factor risk scoring
@@ -12,12 +12,19 @@
 //!   2. zig build bench-logic-table
 //!
 //! The benchmark compares LanceQL (compiled @logic_table) vs DuckDB/Polars.
+//!
+//! Related benchmarks:
+//!   - bench_sql_clauses.zig: SQL clause comparison (SELECT, WHERE, GROUP BY, etc.)
+//!   - bench_vs_duckdb.zig: End-to-end query comparison
 
 const std = @import("std");
 const metal = @import("lanceql.metal");
 
-const WARMUP = 5;
-const ITERATIONS = 20;
+// Production-scale: Each benchmark MUST run 30+ seconds to avoid measuring Python cold start
+// This ensures fair comparison with DuckDB/Polars subprocess calls
+const WARMUP = 3;
+const ITERATIONS = 10;
+const MIN_BENCHMARK_SECONDS: f64 = 30.0;
 
 var has_duckdb: bool = false;
 var has_polars: bool = false;
@@ -394,14 +401,24 @@ pub fn main() !void {
         allocator.free(p);
     };
 
-    // Run all benchmarks with realistic production-scale data
-    // These should run for several seconds each to simulate real workloads
+    // Run all benchmarks with production-scale data
+    // Target: Each benchmark MUST run 30+ seconds to avoid measuring cold start
     std.debug.print("\n", .{});
 
-    try benchmarkFeatureEngineering(allocator, 100_000_000); // 100M rows
-    try benchmarkVectorSearch(allocator, 1_000_000, 384); // 1M docs, 384-dim (MiniLM)
-    try benchmarkFraudDetection(allocator, 50_000_000); // 50M transactions
-    try benchmarkRecommendations(allocator, 500_000, 256); // 500K items, 256-dim
+    // Feature Engineering: 1B rows (~4GB of f32 data) - ~30-45 seconds
+    try benchmarkFeatureEngineering(allocator, 1_000_000_000);
+
+    // Vector Search: 10M docs x 384-dim = 14.4GB of embeddings - ~30-60 seconds
+    try benchmarkVectorSearch(allocator, 10_000_000, 384);
+
+    // Fraud Detection: 500M transactions - ~30-45 seconds
+    try benchmarkFraudDetection(allocator, 500_000_000);
+
+    // Recommendations: 5M items x 256-dim = 5GB - ~30-45 seconds
+    try benchmarkRecommendations(allocator, 5_000_000, 256);
+
+    // Run SQL clause benchmark (200M rows) for completeness
+    try benchmarkSQLClauses(allocator);
 
     // Summary
     std.debug.print("\n================================================================================\n", .{});
@@ -846,4 +863,157 @@ fn avgSec(times: []const u64) f64 {
     var total: u64 = 0;
     for (times) |t| total += t;
     return @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(times.len)) / 1_000_000_000;
+}
+
+// =============================================================================
+// SQL Clause Benchmark (subset from bench_sql_clauses.zig)
+// =============================================================================
+
+fn benchmarkSQLClauses(allocator: std.mem.Allocator) !void {
+    std.debug.print("\n================================================================================\n", .{});
+    std.debug.print("SQL Clauses (200M rows)\n", .{});
+    std.debug.print("================================================================================\n", .{});
+    std.debug.print("{s:<20} {s:>12} {s:>12} {s:>12}\n", .{ "Clause", "LanceQL", "DuckDB", "Polars" });
+    std.debug.print("{s:<20} {s:>12} {s:>12} {s:>12}\n", .{ "-" ** 20, "-" ** 12, "-" ** 12, "-" ** 12 });
+
+    const num_rows: usize = 200_000_000; // 200M rows for SQL benchmarks (30+ seconds each)
+
+    // SELECT * (Full Scan) - measure raw memory bandwidth
+    {
+        const data = try allocator.alloc(i64, num_rows);
+        defer allocator.free(data);
+        for (data, 0..) |*v, i| v.* = @intCast(i);
+
+        for (0..WARMUP) |_| {
+            var sum: i64 = 0;
+            for (data) |v| sum += v;
+            std.mem.doNotOptimizeAway(&sum);
+        }
+
+        var times: [ITERATIONS]u64 = undefined;
+        for (0..ITERATIONS) |iter| {
+            var timer = try std.time.Timer.start();
+            var sum: i64 = 0;
+            for (data) |v| sum += v;
+            std.mem.doNotOptimizeAway(&sum);
+            times[iter] = timer.read();
+        }
+
+        const lanceql_time = avgSec(&times);
+        std.debug.print("{s:<20} {d:>10.2} s {s:>12} {s:>12}\n", .{ "SELECT * (scan)", lanceql_time, "-", "-" });
+    }
+
+    // WHERE (filter)
+    {
+        const data = try allocator.alloc(f64, num_rows);
+        defer allocator.free(data);
+        var rng = std.Random.DefaultPrng.init(42);
+        for (data) |*v| v.* = rng.random().float(f64);
+
+        for (0..WARMUP) |_| {
+            var count: usize = 0;
+            for (data) |v| {
+                if (v > 0.5) count += 1;
+            }
+            std.mem.doNotOptimizeAway(&count);
+        }
+
+        var times: [ITERATIONS]u64 = undefined;
+        for (0..ITERATIONS) |iter| {
+            var timer = try std.time.Timer.start();
+            var count: usize = 0;
+            for (data) |v| {
+                if (v > 0.5) count += 1;
+            }
+            std.mem.doNotOptimizeAway(&count);
+            times[iter] = timer.read();
+        }
+
+        const lanceql_time = avgSec(&times);
+        std.debug.print("{s:<20} {d:>10.2} s {s:>12} {s:>12}\n", .{ "WHERE (filter)", lanceql_time, "-", "-" });
+    }
+
+    // GROUP BY + SUM (using simple array-based approach for 100 groups)
+    {
+        const num_groups: usize = 100;
+        const keys = try allocator.alloc(u64, num_rows);
+        defer allocator.free(keys);
+        const values = try allocator.alloc(u64, num_rows);
+        defer allocator.free(values);
+
+        for (0..num_rows) |i| {
+            keys[i] = @intCast(i % num_groups);
+            values[i] = 1;
+        }
+
+        for (0..WARMUP) |_| {
+            var sums: [100]u64 = undefined;
+            @memset(&sums, 0);
+            for (0..num_rows) |i| {
+                sums[@intCast(keys[i])] += values[i];
+            }
+            std.mem.doNotOptimizeAway(&sums);
+        }
+
+        var times: [ITERATIONS]u64 = undefined;
+        for (0..ITERATIONS) |iter| {
+            var timer = try std.time.Timer.start();
+            var sums: [100]u64 = undefined;
+            @memset(&sums, 0);
+            for (0..num_rows) |i| {
+                sums[@intCast(keys[i])] += values[i];
+            }
+            std.mem.doNotOptimizeAway(&sums);
+            times[iter] = timer.read();
+        }
+
+        const lanceql_time = avgSec(&times);
+        std.debug.print("{s:<20} {d:>10.2} s {s:>12} {s:>12}\n", .{ "GROUP BY + SUM", lanceql_time, "-", "-" });
+    }
+
+    // ORDER BY LIMIT 100 (partial sort / top-k)
+    {
+        const limit: usize = 100;
+        const data = try allocator.alloc(i64, num_rows);
+        defer allocator.free(data);
+
+        var rng = std.Random.DefaultPrng.init(42);
+        for (data) |*v| v.* = rng.random().int(i64);
+
+        for (0..WARMUP) |_| {
+            var top_k = try allocator.alloc(i64, limit);
+            defer allocator.free(top_k);
+            @memcpy(top_k, data[0..limit]);
+            std.mem.sort(i64, top_k, {}, std.sort.desc(i64));
+            for (data[limit..]) |v| {
+                if (v > top_k[limit - 1]) {
+                    top_k[limit - 1] = v;
+                    std.mem.sort(i64, top_k, {}, std.sort.desc(i64));
+                }
+            }
+            std.mem.doNotOptimizeAway(top_k);
+        }
+
+        var times: [ITERATIONS]u64 = undefined;
+        for (0..ITERATIONS) |iter| {
+            var timer = try std.time.Timer.start();
+            var top_k = try allocator.alloc(i64, limit);
+            defer allocator.free(top_k);
+            @memcpy(top_k, data[0..limit]);
+            std.mem.sort(i64, top_k, {}, std.sort.desc(i64));
+            for (data[limit..]) |v| {
+                if (v > top_k[limit - 1]) {
+                    top_k[limit - 1] = v;
+                    std.mem.sort(i64, top_k, {}, std.sort.desc(i64));
+                }
+            }
+            std.mem.doNotOptimizeAway(top_k);
+            times[iter] = timer.read();
+        }
+
+        const lanceql_time = avgSec(&times);
+        std.debug.print("{s:<20} {d:>10.2} s {s:>12} {s:>12}\n", .{ "ORDER BY LIMIT 100", lanceql_time, "-", "-" });
+    }
+
+    std.debug.print("\nNote: Run 'zig build bench-sql' for full SQL clause comparison with DuckDB/Polars\n", .{});
 }

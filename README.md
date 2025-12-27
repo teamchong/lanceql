@@ -2,6 +2,8 @@
 
 A browser-based Lance file reader with SQL and vector search support. Query Lance datasets directly in your browser using HTTP Range requests - no server required.
 
+**[@logic_table: Business Logic That Runs WITH Your Data](./LOGIC_TABLE.md)** - Compile Python to native GPU kernels, 525x faster than DuckDB + Python workflows.
+
 **Live Demo:** [https://teamchong.github.io/lanceql](https://teamchong.github.io/lanceql)
 
 ## Features
