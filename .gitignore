@@ -10,10 +10,8 @@ __pycache__/
 venv/
 *.egg-info/
 
-# Test fixtures (generated)
-tests/fixtures/*.lance
+# Test fixture metadata (not the fixtures themselves)
 tests/fixtures/*.expected.json
-!tests/fixtures/.gitkeep
 
 # IDE
 .idea/
