@@ -20,6 +20,7 @@ const WARMUP = 5;
 const ITERATIONS = 20;
 
 var has_duckdb: bool = false;
+var has_polars: bool = false;
 var parquet_path: ?[]const u8 = null;
 
 // =============================================================================
@@ -375,12 +376,17 @@ pub fn main() !void {
     std.debug.print("\nCompile command:\n", .{});
     std.debug.print("  metal0 build --emit-logic-table benchmarks/ml_workflow.py -o lib/logic_table.a\n\n", .{});
 
-    // Check for DuckDB
+    // Check for external engines
     has_duckdb = checkCommand(allocator, "duckdb");
-    std.debug.print("Engines: LanceQL (native), DuckDB ({s})\n", .{if (has_duckdb) "available" else "not found"});
+    has_polars = checkPythonModule(allocator, "polars");
 
-    // Create test data for DuckDB comparison
-    if (has_duckdb) {
+    std.debug.print("Engines:\n", .{});
+    std.debug.print("  - LanceQL: native Zig + Metal GPU (compiled @logic_table)\n", .{});
+    std.debug.print("  - DuckDB:  {s}\n", .{if (has_duckdb) "available" else "not found"});
+    std.debug.print("  - Polars:  {s}\n", .{if (has_polars) "available" else "not found"});
+
+    // Create test data for comparison
+    if (has_duckdb or has_polars) {
         parquet_path = try createTestData(allocator);
     }
     defer if (parquet_path) |p| {
@@ -388,13 +394,14 @@ pub fn main() !void {
         allocator.free(p);
     };
 
-    // Run all benchmarks
+    // Run all benchmarks with realistic production-scale data
+    // These should run for several seconds each to simulate real workloads
     std.debug.print("\n", .{});
 
-    try benchmarkFeatureEngineering(allocator, 10_000_000);
-    try benchmarkVectorSearch(allocator, 100_000, 384);
-    try benchmarkFraudDetection(allocator, 5_000_000);
-    try benchmarkRecommendations(allocator, 50_000, 128);
+    try benchmarkFeatureEngineering(allocator, 100_000_000); // 100M rows
+    try benchmarkVectorSearch(allocator, 1_000_000, 384); // 1M docs, 384-dim (MiniLM)
+    try benchmarkFraudDetection(allocator, 50_000_000); // 50M transactions
+    try benchmarkRecommendations(allocator, 500_000, 256); // 500K items, 256-dim
 
     // Summary
     std.debug.print("\n================================================================================\n", .{});
@@ -418,6 +425,36 @@ fn checkCommand(allocator: std.mem.Allocator, cmd: []const u8) bool {
     return result.term.Exited == 0;
 }
 
+fn checkPythonModule(allocator: std.mem.Allocator, module: []const u8) bool {
+    const check_cmd = std.fmt.allocPrint(allocator, "import {s}", .{module}) catch return false;
+    defer allocator.free(check_cmd);
+
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "python3", "-c", check_cmd },
+    }) catch return false;
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    return result.term.Exited == 0;
+}
+
+fn runPolarsTimed(allocator: std.mem.Allocator, python_code: []const u8) !u64 {
+    var timer = try std.time.Timer.start();
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "python3", "-c", python_code },
+        .max_output_bytes = 1024 * 1024,
+    }) catch return error.PolarsFailed;
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    if (result.term.Exited != 0) return error.PolarsFailed;
+    return timer.read();
+}
+
 fn createTestData(allocator: std.mem.Allocator) ![]const u8 {
     const path = try std.fmt.allocPrint(allocator, "/tmp/lanceql_ml_{d}.parquet", .{std.time.milliTimestamp()});
 
@@ -432,12 +469,12 @@ fn createTestData(allocator: std.mem.Allocator) ![]const u8 {
         \\    (random() * 5)::INTEGER AS fraud_count,
         \\    random() AS score,
         \\    random() AS boost
-        \\  FROM range(10000000) t(i)
+        \\  FROM range(50000000) t(i)
         \\) TO '{s}' (FORMAT PARQUET);
     , .{path});
     defer allocator.free(sql);
 
-    std.debug.print("Creating test data (10M rows)...\n", .{});
+    std.debug.print("Creating test data (50M rows)...\n", .{});
 
     const result = std.process.Child.run(.{
         .allocator = allocator,
@@ -478,6 +515,8 @@ fn benchmarkFeatureEngineering(allocator: std.mem.Allocator, num_rows: usize) !v
     std.debug.print("================================================================================\n", .{});
     std.debug.print("Feature Engineering ({d}M rows)\n", .{num_rows / 1_000_000});
     std.debug.print("================================================================================\n", .{});
+    std.debug.print("{s:<20} {s:>12} {s:>12} {s:>12}\n", .{ "Operation", "LanceQL", "DuckDB", "Polars" });
+    std.debug.print("{s:<20} {s:>12} {s:>12} {s:>12}\n", .{ "-" ** 20, "-" ** 12, "-" ** 12, "-" ** 12 });
 
     const data = try allocator.alloc(f32, num_rows);
     defer allocator.free(data);
@@ -490,23 +529,8 @@ fn benchmarkFeatureEngineering(allocator: std.mem.Allocator, num_rows: usize) !v
         d.* = rng.random().float(f32) * 10000.0; // 0-10000 range
     }
 
-    // Benchmark normalize_minmax
-    {
-        for (0..WARMUP) |_| FeatureEngineering.normalizeMinmax(data, output);
-
-        var times: [ITERATIONS]u64 = undefined;
-        for (0..ITERATIONS) |iter| {
-            var timer = try std.time.Timer.start();
-            FeatureEngineering.normalizeMinmax(data, output);
-            times[iter] = timer.read();
-        }
-
-        const avg_ms = avgMs(&times);
-        const throughput = @as(f64, @floatFromInt(num_rows)) / (avg_ms / 1000.0) / 1_000_000;
-        std.debug.print("  normalize_minmax:  {d:>7.2} ms ({d:>5.1}M rows/sec)\n", .{ avg_ms, throughput });
-    }
-
-    // Benchmark normalize_zscore
+    // Benchmark normalize_zscore (most comparable to SQL/Polars)
+    var lanceql_time: f64 = 0;
     {
         for (0..WARMUP) |_| FeatureEngineering.normalizeZscore(data, output);
 
@@ -516,73 +540,104 @@ fn benchmarkFeatureEngineering(allocator: std.mem.Allocator, num_rows: usize) !v
             FeatureEngineering.normalizeZscore(data, output);
             times[iter] = timer.read();
         }
-
-        const avg_ms = avgMs(&times);
-        const throughput = @as(f64, @floatFromInt(num_rows)) / (avg_ms / 1000.0) / 1_000_000;
-        std.debug.print("  normalize_zscore:  {d:>7.2} ms ({d:>5.1}M rows/sec)\n", .{ avg_ms, throughput });
+        lanceql_time = avgSec(&times);
     }
 
-    // Benchmark log_transform
+    // DuckDB z-score
+    var duckdb_time: f64 = 0;
+    if (has_duckdb and parquet_path != null) {
+        const path = parquet_path.?;
+        const sql = try std.fmt.allocPrint(allocator,
+            \\SELECT (amount - AVG(amount) OVER()) / (STDDEV(amount) OVER() + 1e-8) AS zscore FROM '{s}';
+        , .{path});
+        defer allocator.free(sql);
+
+        for (0..2) |_| { // Less warmup for slow operations
+            _ = runDuckDBTimed(allocator, sql) catch continue;
+        }
+
+        var times: [5]u64 = undefined; // Fewer iterations for slow ops
+        for (0..5) |iter| {
+            times[iter] = runDuckDBTimed(allocator, sql) catch 0;
+        }
+        duckdb_time = avgSec(&times);
+    }
+
+    // Polars z-score
+    var polars_time: f64 = 0;
+    if (has_polars and parquet_path != null) {
+        const path = parquet_path.?;
+        const code = try std.fmt.allocPrint(allocator,
+            \\import polars as pl
+            \\df = pl.read_parquet('{s}')
+            \\result = (df['amount'] - df['amount'].mean()) / (df['amount'].std() + 1e-8)
+        , .{path});
+        defer allocator.free(code);
+
+        for (0..2) |_| {
+            _ = runPolarsTimed(allocator, code) catch continue;
+        }
+
+        var times: [5]u64 = undefined;
+        for (0..5) |iter| {
+            times[iter] = runPolarsTimed(allocator, code) catch 0;
+        }
+        polars_time = avgSec(&times);
+    }
+
+    // Print z-score row
+    std.debug.print("{s:<20} {d:>10.2} s {d:>10.2} s {d:>10.2} s\n", .{
+        "normalize_zscore",
+        lanceql_time,
+        duckdb_time,
+        polars_time,
+    });
+
+    // Benchmark other operations (LanceQL only, no SQL equivalent)
+    {
+        for (0..WARMUP) |_| FeatureEngineering.normalizeMinmax(data, output);
+        var times: [ITERATIONS]u64 = undefined;
+        for (0..ITERATIONS) |iter| {
+            var timer = try std.time.Timer.start();
+            FeatureEngineering.normalizeMinmax(data, output);
+            times[iter] = timer.read();
+        }
+        std.debug.print("{s:<20} {d:>10.2} s {s:>12} {s:>12}\n", .{ "normalize_minmax", avgSec(&times), "-", "-" });
+    }
+
     {
         for (0..WARMUP) |_| FeatureEngineering.logTransform(data, output);
-
         var times: [ITERATIONS]u64 = undefined;
         for (0..ITERATIONS) |iter| {
             var timer = try std.time.Timer.start();
             FeatureEngineering.logTransform(data, output);
             times[iter] = timer.read();
         }
-
-        const avg_ms = avgMs(&times);
-        const throughput = @as(f64, @floatFromInt(num_rows)) / (avg_ms / 1000.0) / 1_000_000;
-        std.debug.print("  log_transform:     {d:>7.2} ms ({d:>5.1}M rows/sec)\n", .{ avg_ms, throughput });
+        std.debug.print("{s:<20} {d:>10.2} s {s:>12} {s:>12}\n", .{ "log_transform", avgSec(&times), "-", "-" });
     }
 
-    // Benchmark clip_outliers
     {
         for (0..WARMUP) |_| FeatureEngineering.clipOutliers(data, output);
-
         var times: [ITERATIONS]u64 = undefined;
         for (0..ITERATIONS) |iter| {
             var timer = try std.time.Timer.start();
             FeatureEngineering.clipOutliers(data, output);
             times[iter] = timer.read();
         }
-
-        const avg_ms = avgMs(&times);
-        const throughput = @as(f64, @floatFromInt(num_rows)) / (avg_ms / 1000.0) / 1_000_000;
-        std.debug.print("  clip_outliers:     {d:>7.2} ms ({d:>5.1}M rows/sec)\n", .{ avg_ms, throughput });
-    }
-
-    // DuckDB comparison
-    if (has_duckdb and parquet_path != null) {
-        const path = parquet_path.?;
-
-        // Z-score in DuckDB (closest equivalent)
-        const sql = try std.fmt.allocPrint(allocator,
-            \\SELECT (amount - AVG(amount) OVER()) / (STDDEV(amount) OVER() + 1e-8) AS zscore
-            \\FROM '{s}' LIMIT 10000000;
-        , .{path});
-        defer allocator.free(sql);
-
-        for (0..WARMUP) |_| {
-            _ = runDuckDBTimed(allocator, sql) catch continue;
-        }
-
-        var times: [ITERATIONS]u64 = undefined;
-        for (0..ITERATIONS) |iter| {
-            times[iter] = runDuckDBTimed(allocator, sql) catch 0;
-        }
-
-        const avg_ms = avgMs(&times);
-        std.debug.print("  DuckDB z-score:    {d:>7.2} ms (window function)\n", .{avg_ms});
+        std.debug.print("{s:<20} {d:>10.2} s {s:>12} {s:>12}\n", .{ "clip_outliers", avgSec(&times), "-", "-" });
     }
 }
 
 fn benchmarkVectorSearch(allocator: std.mem.Allocator, num_docs: usize, dim: usize) !void {
     std.debug.print("\n================================================================================\n", .{});
-    std.debug.print("Vector Search ({d}K docs, {d}-dim embeddings)\n", .{ num_docs / 1000, dim });
+    std.debug.print("Vector Search ({d}M docs x {d}-dim embeddings = {d}GB)\n", .{
+        num_docs / 1_000_000,
+        dim,
+        (num_docs * dim * 4) / (1024 * 1024 * 1024),
+    });
     std.debug.print("================================================================================\n", .{});
+    std.debug.print("{s:<20} {s:>12} {s:>15}\n", .{ "Operation", "Time", "Throughput" });
+    std.debug.print("{s:<20} {s:>12} {s:>15}\n", .{ "-" ** 20, "-" ** 12, "-" ** 15 });
 
     const query = try allocator.alloc(f32, dim);
     defer allocator.free(query);
@@ -607,9 +662,9 @@ fn benchmarkVectorSearch(allocator: std.mem.Allocator, num_docs: usize, dim: usi
             times[iter] = timer.read();
         }
 
-        const avg_ms = avgMs(&times);
-        const throughput = @as(f64, @floatFromInt(num_docs)) / (avg_ms / 1000.0) / 1_000;
-        std.debug.print("  cosine_similarity: {d:>7.2} ms ({d:>5.1}K docs/sec)\n", .{ avg_ms, throughput });
+        const avg_sec = avgSec(&times);
+        const throughput = @as(f64, @floatFromInt(num_docs)) / avg_sec / 1_000_000;
+        std.debug.print("{s:<20} {d:>10.2} s {d:>12.1}M/sec\n", .{ "cosine_similarity", avg_sec, throughput });
     }
 
     // Benchmark euclidean_distance
@@ -623,9 +678,9 @@ fn benchmarkVectorSearch(allocator: std.mem.Allocator, num_docs: usize, dim: usi
             times[iter] = timer.read();
         }
 
-        const avg_ms = avgMs(&times);
-        const throughput = @as(f64, @floatFromInt(num_docs)) / (avg_ms / 1000.0) / 1_000;
-        std.debug.print("  euclidean_distance:{d:>7.2} ms ({d:>5.1}K docs/sec)\n", .{ avg_ms, throughput });
+        const avg_sec = avgSec(&times);
+        const throughput = @as(f64, @floatFromInt(num_docs)) / avg_sec / 1_000_000;
+        std.debug.print("{s:<20} {d:>10.2} s {d:>12.1}M/sec\n", .{ "euclidean_distance", avg_sec, throughput });
     }
 }
 
@@ -633,6 +688,8 @@ fn benchmarkFraudDetection(allocator: std.mem.Allocator, num_txns: usize) !void 
     std.debug.print("\n================================================================================\n", .{});
     std.debug.print("Fraud Detection ({d}M transactions)\n", .{ num_txns / 1_000_000 });
     std.debug.print("================================================================================\n", .{});
+    std.debug.print("{s:<20} {s:>12} {s:>12} {s:>12}\n", .{ "Operation", "LanceQL", "DuckDB", "Polars" });
+    std.debug.print("{s:<20} {s:>12} {s:>12} {s:>12}\n", .{ "-" ** 20, "-" ** 12, "-" ** 12, "-" ** 12 });
 
     const amounts = try allocator.alloc(f32, num_txns);
     defer allocator.free(amounts);
@@ -657,7 +714,8 @@ fn benchmarkFraudDetection(allocator: std.mem.Allocator, num_txns: usize) !void 
         fraud_counts[i] = @floatFromInt(rng.random().uintLessThan(u32, 5));
     }
 
-    // Benchmark transaction_risk_score
+    // LanceQL benchmark
+    var lanceql_time: f64 = 0;
     {
         for (0..WARMUP) |_| {
             FraudDetection.transactionRiskScore(amounts, velocities, location_distances, hours, fraud_counts, output);
@@ -669,16 +727,13 @@ fn benchmarkFraudDetection(allocator: std.mem.Allocator, num_txns: usize) !void 
             FraudDetection.transactionRiskScore(amounts, velocities, location_distances, hours, fraud_counts, output);
             times[iter] = timer.read();
         }
-
-        const avg_ms = avgMs(&times);
-        const throughput = @as(f64, @floatFromInt(num_txns)) / (avg_ms / 1000.0) / 1_000_000;
-        std.debug.print("  risk_score:        {d:>7.2} ms ({d:>5.1}M txns/sec)\n", .{ avg_ms, throughput });
+        lanceql_time = avgSec(&times);
     }
 
-    // DuckDB comparison - multi-factor scoring
+    // DuckDB comparison
+    var duckdb_time: f64 = 0;
     if (has_duckdb and parquet_path != null) {
         const path = parquet_path.?;
-
         const sql = try std.fmt.allocPrint(allocator,
             \\SELECT
             \\  LEAST(0.3, (1.0 - EXP(-amount / 5000.0)) * 0.3) +
@@ -686,28 +741,67 @@ fn benchmarkFraudDetection(allocator: std.mem.Allocator, num_txns: usize) !void 
             \\  LEAST(1.0, location_distance / 1000.0) * 0.2 +
             \\  CASE WHEN hour >= 2 AND hour <= 5 THEN 0.1 ELSE 0 END +
             \\  LEAST(1.0, fraud_count / 3.0) * 0.15 AS risk_score
-            \\FROM '{s}' LIMIT 5000000;
+            \\FROM '{s}';
         , .{path});
         defer allocator.free(sql);
 
-        for (0..WARMUP) |_| {
+        for (0..2) |_| {
             _ = runDuckDBTimed(allocator, sql) catch continue;
         }
 
-        var times: [ITERATIONS]u64 = undefined;
-        for (0..ITERATIONS) |iter| {
+        var times: [5]u64 = undefined;
+        for (0..5) |iter| {
             times[iter] = runDuckDBTimed(allocator, sql) catch 0;
         }
-
-        const avg_ms = avgMs(&times);
-        std.debug.print("  DuckDB risk_score: {d:>7.2} ms (SQL expression)\n", .{avg_ms});
+        duckdb_time = avgSec(&times);
     }
+
+    // Polars comparison
+    var polars_time: f64 = 0;
+    if (has_polars and parquet_path != null) {
+        const path = parquet_path.?;
+        const code = try std.fmt.allocPrint(allocator,
+            \\import polars as pl
+            \\import numpy as np
+            \\df = pl.read_parquet('{s}')
+            \\amount_risk = (1.0 - np.exp(-df['amount'].to_numpy() / 5000.0)) * 0.3
+            \\velocity_risk = np.minimum(1.0, df['velocity'].to_numpy() / 10.0) * 0.25
+            \\location_risk = np.minimum(1.0, df['location_distance'].to_numpy() / 1000.0) * 0.2
+            \\time_risk = np.where((df['hour'].to_numpy() >= 2) & (df['hour'].to_numpy() <= 5), 0.1, 0.0)
+            \\history_risk = np.minimum(1.0, df['fraud_count'].to_numpy() / 3.0) * 0.15
+            \\risk_score = np.clip(np.minimum(0.3, amount_risk) + velocity_risk + location_risk + time_risk + history_risk, 0, 1)
+        , .{path});
+        defer allocator.free(code);
+
+        for (0..2) |_| {
+            _ = runPolarsTimed(allocator, code) catch continue;
+        }
+
+        var times: [5]u64 = undefined;
+        for (0..5) |iter| {
+            times[iter] = runPolarsTimed(allocator, code) catch 0;
+        }
+        polars_time = avgSec(&times);
+    }
+
+    std.debug.print("{s:<20} {d:>10.2} s {d:>10.2} s {d:>10.2} s\n", .{
+        "risk_score",
+        lanceql_time,
+        duckdb_time,
+        polars_time,
+    });
 }
 
 fn benchmarkRecommendations(allocator: std.mem.Allocator, num_items: usize, dim: usize) !void {
     std.debug.print("\n================================================================================\n", .{});
-    std.debug.print("Recommendations ({d}K items, {d}-dim embeddings)\n", .{ num_items / 1000, dim });
+    std.debug.print("Recommendations ({d}K items x {d}-dim = {d}MB)\n", .{
+        num_items / 1000,
+        dim,
+        (num_items * dim * 4) / (1024 * 1024),
+    });
     std.debug.print("================================================================================\n", .{});
+    std.debug.print("{s:<20} {s:>12} {s:>15}\n", .{ "Operation", "Time", "Throughput" });
+    std.debug.print("{s:<20} {s:>12} {s:>15}\n", .{ "-" ** 20, "-" ** 12, "-" ** 15 });
 
     const user_embedding = try allocator.alloc(f32, dim);
     defer allocator.free(user_embedding);
@@ -742,14 +836,14 @@ fn benchmarkRecommendations(allocator: std.mem.Allocator, num_items: usize, dim:
             times[iter] = timer.read();
         }
 
-        const avg_ms = avgMs(&times);
-        const throughput = @as(f64, @floatFromInt(num_items)) / (avg_ms / 1000.0) / 1_000;
-        std.debug.print("  collaborative:     {d:>7.2} ms ({d:>5.1}K items/sec)\n", .{ avg_ms, throughput });
+        const avg_sec = avgSec(&times);
+        const throughput = @as(f64, @floatFromInt(num_items)) / avg_sec / 1_000_000;
+        std.debug.print("{s:<20} {d:>10.2} s {d:>12.1}M/sec\n", .{ "collaborative", avg_sec, throughput });
     }
 }
 
-fn avgMs(times: []const u64) f64 {
+fn avgSec(times: []const u64) f64 {
     var total: u64 = 0;
     for (times) |t| total += t;
-    return @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(times.len)) / 1_000_000;
+    return @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(times.len)) / 1_000_000_000;
 }
