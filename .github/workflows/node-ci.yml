@@ -6,12 +6,14 @@ on:
     paths:
       - 'packages/node/**'
       - 'src/**'
+      - 'tests/**'
       - '.github/workflows/node-ci.yml'
   pull_request:
     branches: [main]
     paths:
       - 'packages/node/**'
       - 'src/**'
+      - 'tests/**'
       - '.github/workflows/node-ci.yml'
 
 jobs:
