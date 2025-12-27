@@ -23,7 +23,7 @@ jobs:
     timeout-minutes: 60  # Each benchmark runs 30+ seconds
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -133,7 +133,7 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
