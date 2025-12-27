@@ -35,6 +35,17 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Free disk space
+        run: |
+          # Show initial disk space
+          df -h
+          # Remove unnecessary tools to free space
+          sudo rm -rf /usr/local/share/powershell || true
+          sudo rm -rf /usr/local/lib/node_modules || true
+          # Clean up any old benchmark files
+          rm -rf /tmp/lanceql_*.parquet || true
+          df -h
+
       - name: Install dependencies
         run: |
           brew install duckdb
