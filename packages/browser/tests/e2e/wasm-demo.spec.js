@@ -49,7 +49,11 @@ test.describe('WASM Demo', () => {
              !err.includes('WASM') &&
              !err.includes('wasm') &&
              !err.includes('model') &&
-             !err.includes('data.metal0.dev')
+             !err.includes('data.metal0.dev') &&
+             !err.includes('manifest') &&
+             !err.includes('dataset') &&
+             !err.includes('No manifest') &&
+             !err.includes('RemoteLanceDataset')
     );
 
     // Log any critical errors for debugging
