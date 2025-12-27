@@ -455,6 +455,23 @@ pub fn build(b: *std.Build) void {
     const bench_compiled_step = b.step("bench-compiled-logic-table", "Benchmark compiled @logic_table (Python -> native via metal0)");
     bench_compiled_step.dependOn(&run_bench_compiled.step);
 
+    // Parquet benchmark - LanceQL vs DuckDB vs Polars
+    const bench_parquet = b.addExecutable(.{
+        .name = "bench_parquet",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/bench_parquet.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lanceql.format", .module = format_mod },
+                .{ .name = "lanceql.encoding.parquet", .module = parquet_encoding_mod },
+            },
+        }),
+    });
+    b.installArtifact(bench_parquet);
+    const bench_parquet_step = b.step("bench-parquet", "Benchmark Parquet reading: LanceQL vs DuckDB vs Polars");
+    bench_parquet_step.dependOn(&b.addInstallArtifact(bench_parquet, .{}).step);
+
     // LanceQL CLI
     const cli = b.addExecutable(.{
         .name = "lanceql",
