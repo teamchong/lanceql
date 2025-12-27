@@ -23,6 +23,7 @@ pub const io = @import("lanceql.io");
 pub const proto = @import("lanceql.proto");
 pub const encoding = @import("lanceql.encoding");
 pub const table = @import("lanceql.table");
+pub const logic_table = @import("lanceql.logic_table");
 
 // Re-export commonly used types
 pub const Footer = format.Footer;
