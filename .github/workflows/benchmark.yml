@@ -211,22 +211,19 @@ jobs:
               comment += '### macOS (Apple Silicon + GPU)\n\n';
 
               if (fs.existsSync('macos/bench-vector.txt')) {
-                comment += '
-#### Vector Operations\n```\n';
+                comment += '#### Vector Operations\n```\n';
                 comment += fs.readFileSync('macos/bench-vector.txt', 'utf8').slice(0, 3000);
                 comment += '\n```\n\n';
               }
 
               if (fs.existsSync('macos/bench-sql.txt')) {
-                comment += '
-#### SQL Clauses (200M rows)\n```\n';
+                comment += '#### SQL Clauses (200M rows)\n```\n';
                 comment += fs.readFileSync('macos/bench-sql.txt', 'utf8').slice(0, 3000);
                 comment += '\n```\n\n';
               }
 
               if (fs.existsSync('macos/bench-logic-table.txt')) {
-                comment += '
-#### ML Workflows\n```\n';
+                comment += '#### ML Workflows\n```\n';
                 comment += fs.readFileSync('macos/bench-logic-table.txt', 'utf8').slice(0, 3000);
                 comment += '\n```\n\n';
               }
@@ -238,8 +235,7 @@ jobs:
               comment += '### Linux (CPU only)\n\n';
 
               if (fs.existsSync('linux/bench-sql.txt')) {
-                comment += '
-#### SQL Clauses\n```\n';
+                comment += '#### SQL Clauses\n```\n';
                 comment += fs.readFileSync('linux/bench-sql.txt', 'utf8').slice(0, 3000);
                 comment += '\n```\n\n';
               }
@@ -273,3 +269,4 @@ jobs:
                 body: comment
               });
             }
+
