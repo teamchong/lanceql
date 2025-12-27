@@ -327,6 +327,18 @@ class WebGPUAccelerator {
     isAvailable() {
         return this.available;
     }
+
+    /**
+     * Get maximum vectors that can fit in a single WebGPU batch.
+     * @param {number} dim - Vector dimension
+     * @returns {number} Maximum vectors per batch
+     */
+    getMaxVectorsPerBatch(dim) {
+        if (!this.available) return 0;
+        const maxBufferSize = this.device.limits?.maxStorageBufferBindingSize || 134217728;
+        // Leave some headroom (use 90% of limit)
+        return Math.floor((maxBufferSize * 0.9) / (dim * 4));
+    }
 }
 
 // Global WebGPU accelerator instance
@@ -11201,32 +11213,65 @@ export class RemoteLanceDataset {
 
         const { rowIds, vectors } = partitionData;
 
-        // Use WebGPU or WASM SIMD for batch similarity
-        let scores;
-        if (webgpuAccelerator.isAvailable()) {
-            console.log(`[VectorSearch] Computing similarities for ${rowIds.length.toLocaleString()} vectors via WebGPU`);
-            try {
-                scores = await webgpuAccelerator.batchCosineSimilarity(queryVec, vectors, true);
-            } catch (e) {
-                console.warn(`[VectorSearch] WebGPU failed, falling back to WASM:`, e.message);
-                scores = null;
-            }
-        }
+        // Use hybrid WebGPU + WASM SIMD for batch similarity
+        const scores = new Float32Array(vectors.length);
+        const dim = queryVec.length;
 
-        // Fall back to WASM SIMD if WebGPU failed or unavailable
-        if (!scores) {
+        if (webgpuAccelerator.isAvailable()) {
+            const maxBatch = webgpuAccelerator.getMaxVectorsPerBatch(dim);
+            let gpuProcessed = 0;
+            let wasmProcessed = 0;
+
+            // Process in chunks that fit in WebGPU buffer
+            for (let start = 0; start < vectors.length; start += maxBatch) {
+                const end = Math.min(start + maxBatch, vectors.length);
+                const chunk = vectors.slice(start, end);
+
+                try {
+                    const chunkScores = await webgpuAccelerator.batchCosineSimilarity(queryVec, chunk, true);
+                    if (chunkScores) {
+                        scores.set(chunkScores, start);
+                        gpuProcessed += chunk.length;
+                        continue;
+                    }
+                } catch (e) {
+                    // Fall through to WASM for this chunk
+                }
+
+                // WASM SIMD fallback for this chunk
+                if (this._fragments[0]?.lanceql?.batchCosineSimilarity) {
+                    const chunkScores = this._fragments[0].lanceql.batchCosineSimilarity(queryVec, chunk, true);
+                    scores.set(chunkScores, start);
+                    wasmProcessed += chunk.length;
+                } else {
+                    // JS fallback (slow)
+                    for (let i = 0; i < chunk.length; i++) {
+                        const vec = chunk[i];
+                        if (!vec || vec.length !== dim) continue;
+                        let dot = 0;
+                        for (let k = 0; k < dim; k++) {
+                            dot += queryVec[k] * vec[k];
+                        }
+                        scores[start + i] = dot;
+                    }
+                    wasmProcessed += chunk.length;
+                }
+            }
+
+            console.log(`[VectorSearch] Processed ${vectors.length.toLocaleString()} vectors: ${gpuProcessed.toLocaleString()} WebGPU, ${wasmProcessed.toLocaleString()} WASM SIMD`);
+        } else {
+            // Pure WASM SIMD path
             console.log(`[VectorSearch] Computing similarities for ${rowIds.length.toLocaleString()} vectors via WASM SIMD`);
-            // Use WASM batch if available
             if (this._fragments[0]?.lanceql?.batchCosineSimilarity) {
-                scores = this._fragments[0].lanceql.batchCosineSimilarity(queryVec, vectors, true);
+                const allScores = this._fragments[0].lanceql.batchCosineSimilarity(queryVec, vectors, true);
+                scores.set(allScores);
             } else {
-                // Fallback to JS (slow)
-                scores = new Float32Array(vectors.length);
+                // JS fallback (slow)
                 for (let i = 0; i < vectors.length; i++) {
                     const vec = vectors[i];
-                    if (!vec || vec.length !== queryVec.length) continue;
+                    if (!vec || vec.length !== dim) continue;
                     let dot = 0;
-                    for (let k = 0; k < queryVec.length; k++) {
+                    for (let k = 0; k < dim; k++) {
                         dot += queryVec[k] * vec[k];
                     }
                     scores[i] = dot;
