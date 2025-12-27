@@ -453,6 +453,21 @@ pub fn build(b: *std.Build) void {
     const bench_logic_table_step = b.step("bench-logic-table", "Benchmark @logic_table workflows (fraud, recommendation, features)");
     bench_logic_table_step.dependOn(&run_bench_logic_table.step);
 
+    // Compiled @logic_table benchmark (uses actual .a library from metal0)
+    const bench_compiled = b.addExecutable(.{
+        .name = "bench_compiled_logic_table",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/bench_compiled_logic_table.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    // Link the compiled @logic_table static library
+    bench_compiled.addObjectFile(b.path("lib/vector_ops.a"));
+    const run_bench_compiled = b.addRunArtifact(bench_compiled);
+    const bench_compiled_step = b.step("bench-compiled-logic-table", "Benchmark compiled @logic_table (Python -> native via metal0)");
+    bench_compiled_step.dependOn(&run_bench_compiled.step);
+
     // LanceQL CLI
     const cli = b.addExecutable(.{
         .name = "lanceql",
