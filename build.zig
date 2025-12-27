@@ -98,9 +98,22 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // metal0 runtime dependency for @logic_table compiled code
+    const metal0_runtime_mod = b.addModule("runtime", .{
+        .root_source_file = .{ .cwd_relative = "../metal0/packages/runtime/src/runtime.zig" },
+    });
+
+    const c_interop_mod = b.addModule("c_interop", .{
+        .root_source_file = .{ .cwd_relative = "../metal0/packages/c_interop/src/registry.zig" },
+    });
+
     // Logic table module - compiled @logic_table functions from metal0
     const logic_table_mod = b.addModule("lanceql.logic_table", .{
         .root_source_file = b.path("src/logic_table/logic_table.zig"),
+        .imports = &.{
+            .{ .name = "runtime", .module = metal0_runtime_mod },
+            .{ .name = "c_interop", .module = c_interop_mod },
+        },
     });
 
     const sql_executor_mod = b.addModule("lanceql.sql.executor", .{
