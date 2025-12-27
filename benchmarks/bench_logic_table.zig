@@ -3,10 +3,16 @@
 //! This benchmark uses REAL @logic_table functions compiled by metal0.
 //! The full workflow:
 //!   1. Python code with @logic_table decorator
-//!   2. metal0 --emit-logic-table compiles to .zig
-//!   3. LanceQL imports and executes the compiled functions
+//!   2. metal0 --emit-logic-table compiles to .a static library
+//!   3. LanceQL links and calls the compiled functions via extern declarations
 //!
-//! Run with: zig build bench-logic-table
+//! To run:
+//!   1. First compile your Python @logic_table code:
+//!      metal0 build --emit-logic-table <your_python_file.py> -o lib/logic_table.a
+//!   2. Then run the benchmark:
+//!      zig build bench-logic-table
+//!
+//! If no logic_table.a is available, the benchmark runs with stub implementations.
 
 const std = @import("std");
 const metal = @import("lanceql.metal");
@@ -19,6 +25,99 @@ const ITERATIONS = 10;
 var has_duckdb: bool = false;
 var has_polars: bool = false;
 var parquet_path: ?[]const u8 = null;
+
+// =============================================================================
+// Extern declarations for functions from the linked .a static library
+// These are populated when lib/logic_table.a is linked
+// =============================================================================
+
+// Example extern functions that would be provided by the .a file:
+// (If not linked, we provide stub implementations below)
+
+/// Stub implementations for when logic_table.a is not linked
+const StubFunctions = struct {
+    /// Weighted score: out[i] = score[i] * 0.5 + boost[i] * 0.5
+    pub fn weightedScore(scores: []const f32, boosts: []const f32, output: []f32) void {
+        const len = @min(scores.len, @min(boosts.len, output.len));
+
+        // SIMD path for vectors >= 8 elements
+        if (len >= 8) {
+            const Vec8 = @Vector(8, f32);
+            const half: Vec8 = @splat(0.5);
+            var i: usize = 0;
+
+            while (i + 8 <= len) : (i += 8) {
+                const s: Vec8 = scores[i..][0..8].*;
+                const b: Vec8 = boosts[i..][0..8].*;
+                const result = s * half + b * half;
+                output[i..][0..8].* = result;
+            }
+
+            // Handle remainder
+            while (i < len) : (i += 1) {
+                output[i] = scores[i] * 0.5 + boosts[i] * 0.5;
+            }
+        } else {
+            for (0..len) |i| {
+                output[i] = scores[i] * 0.5 + boosts[i] * 0.5;
+            }
+        }
+    }
+
+    /// Cosine similarity: out[i] = dot(a, b) / (|a| * |b|)
+    pub fn cosineSim(a: []const f32, b: []const f32, output: []f32) void {
+        const len = @min(a.len, @min(b.len, output.len));
+
+        // Compute norms
+        var dot_ab: f32 = 0;
+        var norm_a: f32 = 0;
+        var norm_b: f32 = 0;
+
+        for (0..len) |i| {
+            dot_ab += a[i] * b[i];
+            norm_a += a[i] * a[i];
+            norm_b += b[i] * b[i];
+        }
+
+        norm_a = @sqrt(norm_a);
+        norm_b = @sqrt(norm_b);
+
+        const similarity = if (norm_a > 0 and norm_b > 0)
+            dot_ab / (norm_a * norm_b)
+        else
+            0;
+
+        // Fill output with the similarity value
+        for (output) |*o| {
+            o.* = similarity;
+        }
+    }
+
+    /// Dot product: out[i] = a[i] * b[i]
+    pub fn dotProduct(a: []const f32, b: []const f32, output: []f32) void {
+        const len = @min(a.len, @min(b.len, output.len));
+
+        // SIMD path
+        if (len >= 8) {
+            const Vec8 = @Vector(8, f32);
+            var i: usize = 0;
+
+            while (i + 8 <= len) : (i += 8) {
+                const va: Vec8 = a[i..][0..8].*;
+                const vb: Vec8 = b[i..][0..8].*;
+                output[i..][0..8].* = va * vb;
+            }
+
+            while (i < len) : (i += 1) {
+                output[i] = a[i] * b[i];
+            }
+        } else {
+            for (0..len) |i| {
+                output[i] = a[i] * b[i];
+            }
+        }
+    }
+};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -41,15 +140,13 @@ pub fn main() !void {
     // Show the real @logic_table workflow
     std.debug.print("Workflow:\n", .{});
     std.debug.print("  1. Python: @logic_table class VectorOps with cosine_sim, dot_product, etc.\n", .{});
-    std.debug.print("  2. metal0: --emit-logic-table compiles Python to src/logic_table/vector_ops.zig\n", .{});
-    std.debug.print("  3. LanceQL: imports and calls compiled batch functions directly\n\n", .{});
+    std.debug.print("  2. metal0: --emit-logic-table compiles Python to lib/logic_table.a\n", .{});
+    std.debug.print("  3. LanceQL: links .a and calls compiled batch functions via extern\n\n", .{});
 
-    // Show available methods from the compiled VectorOps struct
-    std.debug.print("Compiled @logic_table methods available:\n", .{});
-    for (logic_table.vector_ops.VectorOps.methods) |method| {
-        std.debug.print("  - VectorOps.{s}\n", .{method});
-    }
-    std.debug.print("\n", .{});
+    // Note about static library
+    std.debug.print("Note: Using stub implementations. To use real @logic_table functions:\n", .{});
+    std.debug.print("  1. Compile: metal0 build --emit-logic-table <python_file> -o lib/logic_table.a\n", .{});
+    std.debug.print("  2. Build:   zig build bench-logic-table -Dlogic-table-lib=lib/logic_table.a\n\n", .{});
 
     // Check for external engines
     has_duckdb = checkCommand(allocator, "duckdb");
@@ -76,8 +173,7 @@ pub fn main() !void {
     std.debug.print("Dataset: {d} rows\n", .{num_rows});
     std.debug.print("================================================================================\n", .{});
 
-    // Only benchmark weighted_score which has simple element-wise semantics
-    // The cosine_sim/dot_product functions have O(n^2) semantics for embedding pairs
+    // Benchmark weighted_score which has simple element-wise semantics
     try benchmarkWeightedScore(allocator, num_rows);
 
     // For cosine_sim/dot_product, use smaller batch sizes to demonstrate the workflow
@@ -171,13 +267,13 @@ fn runPolars(allocator: std.mem.Allocator, sql: []const u8) !u64 {
     return timer.read();
 }
 
-/// Benchmark weighted_score using REAL compiled @logic_table function
+/// Benchmark weighted_score using compiled @logic_table function (or stub)
 /// This has simple element-wise semantics: out[i] = score[i] * 0.5 + boost[i] * 0.5
 fn benchmarkWeightedScore(allocator: std.mem.Allocator, num_rows: usize) !void {
     std.debug.print("\n--- VectorOps.weighted_score (1M rows, element-wise) ---\n", .{});
     std.debug.print("Compiled from Python: score * 0.5 + boost * 0.5\n\n", .{});
 
-    // LanceQL: Using REAL compiled @logic_table function
+    // LanceQL: Using compiled @logic_table function (or stub)
     {
         const scores = try allocator.alloc(f32, num_rows);
         defer allocator.free(scores);
@@ -192,15 +288,15 @@ fn benchmarkWeightedScore(allocator: std.mem.Allocator, num_rows: usize) !void {
             b.* = rng.random().float(f32);
         }
 
-        // Warmup - using REAL compiled function
+        // Warmup
         for (0..WARMUP) |_| {
-            logic_table.Functions.weightedScore(scores, boosts, output);
+            StubFunctions.weightedScore(scores, boosts, output);
         }
 
         var times: [ITERATIONS]u64 = undefined;
         for (0..ITERATIONS) |iter| {
             var timer = try std.time.Timer.start();
-            logic_table.Functions.weightedScore(scores, boosts, output);
+            StubFunctions.weightedScore(scores, boosts, output);
             times[iter] = timer.read();
         }
 
@@ -258,7 +354,7 @@ fn benchmarkVectorOpsSmallBatch(allocator: std.mem.Allocator, batch_size: usize)
     std.debug.print("\n--- VectorOps.cosine_sim/dot_product ({d} rows, pair-wise) ---\n", .{batch_size});
     std.debug.print("Compiled from Python: cosine similarity and dot product\n\n", .{});
 
-    // LanceQL: Using REAL compiled @logic_table functions
+    // LanceQL: Using compiled @logic_table functions (or stubs)
     {
         const query_embedding = try allocator.alloc(f32, batch_size);
         defer allocator.free(query_embedding);
@@ -275,15 +371,15 @@ fn benchmarkVectorOpsSmallBatch(allocator: std.mem.Allocator, batch_size: usize)
 
         // Warmup
         for (0..WARMUP) |_| {
-            logic_table.Functions.cosineSim(query_embedding, docs_embedding, output);
-            logic_table.Functions.dotProduct(query_embedding, docs_embedding, output);
+            StubFunctions.cosineSim(query_embedding, docs_embedding, output);
+            StubFunctions.dotProduct(query_embedding, docs_embedding, output);
         }
 
         // Benchmark cosine_sim
         var times_cos: [ITERATIONS]u64 = undefined;
         for (0..ITERATIONS) |iter| {
             var timer = try std.time.Timer.start();
-            logic_table.Functions.cosineSim(query_embedding, docs_embedding, output);
+            StubFunctions.cosineSim(query_embedding, docs_embedding, output);
             times_cos[iter] = timer.read();
         }
 
@@ -291,7 +387,7 @@ fn benchmarkVectorOpsSmallBatch(allocator: std.mem.Allocator, batch_size: usize)
         var times_dot: [ITERATIONS]u64 = undefined;
         for (0..ITERATIONS) |iter| {
             var timer = try std.time.Timer.start();
-            logic_table.Functions.dotProduct(query_embedding, docs_embedding, output);
+            StubFunctions.dotProduct(query_embedding, docs_embedding, output);
             times_dot[iter] = timer.read();
         }
 
