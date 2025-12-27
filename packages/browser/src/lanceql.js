@@ -238,6 +238,14 @@ class WebGPUAccelerator {
         const dim = queryVec.length;
         const numVectors = vectors.length;
 
+        // Check buffer size limit (default 128MB, but check device limits)
+        const vectorsBufferSize = numVectors * dim * 4;
+        const maxBufferSize = this.device.limits?.maxStorageBufferBindingSize || 134217728;
+        if (vectorsBufferSize > maxBufferSize) {
+            console.warn(`[WebGPU] Buffer size ${(vectorsBufferSize/1024/1024).toFixed(1)}MB exceeds limit ${(maxBufferSize/1024/1024).toFixed(1)}MB, falling back`);
+            return null; // Caller should fallback to WASM
+        }
+
         // Create buffers
         const paramsBuffer = this.device.createBuffer({
             size: 8, // 2 x u32
@@ -11197,8 +11205,16 @@ export class RemoteLanceDataset {
         let scores;
         if (webgpuAccelerator.isAvailable()) {
             console.log(`[VectorSearch] Computing similarities for ${rowIds.length.toLocaleString()} vectors via WebGPU`);
-            scores = await webgpuAccelerator.batchCosineSimilarity(queryVec, vectors, true);
-        } else {
+            try {
+                scores = await webgpuAccelerator.batchCosineSimilarity(queryVec, vectors, true);
+            } catch (e) {
+                console.warn(`[VectorSearch] WebGPU failed, falling back to WASM:`, e.message);
+                scores = null;
+            }
+        }
+
+        // Fall back to WASM SIMD if WebGPU failed or unavailable
+        if (!scores) {
             console.log(`[VectorSearch] Computing similarities for ${rowIds.length.toLocaleString()} vectors via WASM SIMD`);
             // Use WASM batch if available
             if (this._fragments[0]?.lanceql?.batchCosineSimilarity) {
