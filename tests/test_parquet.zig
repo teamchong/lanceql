@@ -471,8 +471,8 @@ test "read column data with DICTIONARY encoding" {
 }
 
 test "benchmark parquet reader" {
-    // Use c_allocator for faster benchmark (testing.allocator has overhead)
-    const allocator = std.heap.c_allocator;
+    // Use testing.allocator for CI compatibility
+    const allocator = std.testing.allocator;
 
     // Use benchmark file (100K rows)
     const file = std.fs.cwd().openFile("tests/fixtures/benchmark_100k.parquet", .{}) catch {
@@ -563,7 +563,7 @@ test "benchmark parquet reader" {
 
 test "benchmark uncompressed parquet" {
     // Test without Snappy to isolate decompression overhead
-    const allocator = std.heap.c_allocator;
+    const allocator = std.testing.allocator;
 
     const file = std.fs.cwd().openFile("tests/fixtures/benchmark_100k_uncompressed.parquet", .{}) catch {
         std.debug.print("\nSkipping uncompressed benchmark - file not found\n", .{});
