@@ -167,15 +167,15 @@ pub const LogicTableRegistry = struct {
 
     /// List all registered table names
     pub fn listTables(self: *const LogicTableRegistry, allocator: std.mem.Allocator) LogicTableError![]const []const u8 {
-        var names = std.ArrayList([]const u8).init(allocator);
-        errdefer names.deinit();
+        var names = std.ArrayListUnmanaged([]const u8){};
+        errdefer names.deinit(allocator);
 
         var iter = self.tables.keyIterator();
         while (iter.next()) |key| {
-            names.append(key.*) catch return LogicTableError.OutOfMemory;
+            names.append(allocator, key.*) catch return LogicTableError.OutOfMemory;
         }
 
-        return names.toOwnedSlice() catch LogicTableError.OutOfMemory;
+        return names.toOwnedSlice(allocator) catch LogicTableError.OutOfMemory;
     }
 };
 

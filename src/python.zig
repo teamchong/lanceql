@@ -16,7 +16,7 @@ var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 const allocator = gpa.allocator();
 
 /// Track allocated strings per handle for proper cleanup
-var tracked_strings = std.AutoHashMap(*Handle, std.ArrayList([]const u8)).init(allocator);
+var tracked_strings = std.AutoHashMap(*Handle, std.ArrayListUnmanaged([]const u8)).init(allocator);
 
 /// Opaque handle for Python (represents a Table)
 pub const Handle = opaque {};
@@ -35,7 +35,7 @@ fn handleToTable(handle: *Handle) *Table {
 fn trackString(handle: *Handle, str: []const u8) !void {
     const gop = try tracked_strings.getOrPut(handle);
     if (!gop.found_existing) {
-        gop.value_ptr.* = std.ArrayList([]const u8).init(allocator);
+        gop.value_ptr.* = std.ArrayListUnmanaged([]const u8){};
     }
     try gop.value_ptr.append(allocator, str);
 }

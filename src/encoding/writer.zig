@@ -53,18 +53,20 @@ pub const ColumnBatch = struct {
 
 /// Plain encoder - encodes values to bytes
 pub const PlainEncoder = struct {
-    buffer: std.ArrayList(u8),
+    buffer: std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
 
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return Self{
-            .buffer = std.ArrayList(u8).init(allocator),
+            .buffer = std.ArrayListUnmanaged(u8){},
+            .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.buffer.deinit();
+        self.buffer.deinit(self.allocator);
     }
 
     pub fn reset(self: *Self) void {
@@ -82,7 +84,7 @@ pub const PlainEncoder = struct {
     pub fn writeInt64(self: *Self, value: i64) !void {
         var bytes: [8]u8 = undefined;
         std.mem.writeInt(i64, &bytes, value, .little);
-        try self.buffer.appendSlice(&bytes);
+        try self.buffer.appendSlice(self.allocator, &bytes);
     }
 
     pub fn writeInt64Slice(self: *Self, values: []const i64) !void {
@@ -98,7 +100,7 @@ pub const PlainEncoder = struct {
     pub fn writeInt32(self: *Self, value: i32) !void {
         var bytes: [4]u8 = undefined;
         std.mem.writeInt(i32, &bytes, value, .little);
-        try self.buffer.appendSlice(&bytes);
+        try self.buffer.appendSlice(self.allocator, &bytes);
     }
 
     pub fn writeInt32Slice(self: *Self, values: []const i32) !void {
@@ -115,7 +117,7 @@ pub const PlainEncoder = struct {
         var bytes: [8]u8 = undefined;
         const bits: u64 = @bitCast(value);
         std.mem.writeInt(u64, &bytes, bits, .little);
-        try self.buffer.appendSlice(&bytes);
+        try self.buffer.appendSlice(self.allocator, &bytes);
     }
 
     pub fn writeFloat64Slice(self: *Self, values: []const f64) !void {
@@ -132,7 +134,7 @@ pub const PlainEncoder = struct {
         var bytes: [4]u8 = undefined;
         const bits: u32 = @bitCast(value);
         std.mem.writeInt(u32, &bytes, bits, .little);
-        try self.buffer.appendSlice(&bytes);
+        try self.buffer.appendSlice(self.allocator, &bytes);
     }
 
     pub fn writeFloat32Slice(self: *Self, values: []const f32) !void {
@@ -145,18 +147,18 @@ pub const PlainEncoder = struct {
     // String encoding (produces offsets + data buffers)
     // ========================================================================
 
-    pub fn writeStrings(self: *Self, values: []const []const u8, offsets_out: *std.ArrayList(u8)) !void {
+    pub fn writeStrings(self: *Self, values: []const []const u8, offsets_out: *std.ArrayListUnmanaged(u8), offsets_allocator: std.mem.Allocator) !void {
         var current_offset: u32 = 0;
 
         for (values) |str| {
             // Write string data
-            try self.buffer.appendSlice(str);
+            try self.buffer.appendSlice(self.allocator, str);
             current_offset += @intCast(str.len);
 
             // Write offset (end position)
             var offset_bytes: [4]u8 = undefined;
             std.mem.writeInt(u32, &offset_bytes, current_offset, .little);
-            try offsets_out.appendSlice(&offset_bytes);
+            try offsets_out.appendSlice(offsets_allocator, &offset_bytes);
         }
     }
 
@@ -176,7 +178,7 @@ pub const PlainEncoder = struct {
                     byte |= @as(u8, 1) << bit;
                 }
             }
-            try self.buffer.append(byte);
+            try self.buffer.append(self.allocator, byte);
         }
     }
 
@@ -217,18 +219,20 @@ pub const FooterWriter = struct {
 
 /// Protobuf encoder for column metadata
 pub const ProtobufEncoder = struct {
-    buffer: std.ArrayList(u8),
+    buffer: std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
 
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return Self{
-            .buffer = std.ArrayList(u8).init(allocator),
+            .buffer = std.ArrayListUnmanaged(u8){},
+            .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.buffer.deinit();
+        self.buffer.deinit(self.allocator);
     }
 
     pub fn getBytes(self: Self) []const u8 {
@@ -239,10 +243,10 @@ pub const ProtobufEncoder = struct {
     pub fn writeVarint(self: *Self, value: u64) !void {
         var v = value;
         while (v >= 0x80) {
-            try self.buffer.append(@as(u8, @truncate(v)) | 0x80);
+            try self.buffer.append(self.allocator, @as(u8, @truncate(v)) | 0x80);
             v >>= 7;
         }
-        try self.buffer.append(@truncate(v));
+        try self.buffer.append(self.allocator, @truncate(v));
     }
 
     /// Write field tag (field number + wire type)
@@ -255,7 +259,7 @@ pub const ProtobufEncoder = struct {
     pub fn writeBytes(self: *Self, field_number: u32, data: []const u8) !void {
         try self.writeTag(field_number, 2);
         try self.writeVarint(data.len);
-        try self.buffer.appendSlice(data);
+        try self.buffer.appendSlice(self.allocator, data);
     }
 
     /// Write string (same as bytes)
@@ -274,7 +278,7 @@ pub const ProtobufEncoder = struct {
         try self.writeTag(field_number, 1);
         var bytes: [8]u8 = undefined;
         std.mem.writeInt(u64, &bytes, value, .little);
-        try self.buffer.appendSlice(&bytes);
+        try self.buffer.appendSlice(self.allocator, &bytes);
     }
 
     /// Write fixed32 field (wire type 5)
@@ -282,17 +286,17 @@ pub const ProtobufEncoder = struct {
         try self.writeTag(field_number, 5);
         var bytes: [4]u8 = undefined;
         std.mem.writeInt(u32, &bytes, value, .little);
-        try self.buffer.appendSlice(&bytes);
+        try self.buffer.appendSlice(self.allocator, &bytes);
     }
 };
 
 /// Lance file writer
 pub const LanceWriter = struct {
     allocator: std.mem.Allocator,
-    output: std.ArrayList(u8),
+    output: std.ArrayListUnmanaged(u8),
     schema: []const ColumnSchema,
-    column_data_offsets: std.ArrayList(u64),
-    column_metadata: std.ArrayList([]const u8),
+    column_data_offsets: std.ArrayListUnmanaged(u64),
+    column_metadata: std.ArrayListUnmanaged([]const u8),
     row_count: u64,
 
     const Self = @This();
@@ -300,34 +304,34 @@ pub const LanceWriter = struct {
     pub fn init(allocator: std.mem.Allocator, schema: []const ColumnSchema) Self {
         return Self{
             .allocator = allocator,
-            .output = std.ArrayList(u8).init(allocator),
+            .output = std.ArrayListUnmanaged(u8){},
             .schema = schema,
-            .column_data_offsets = std.ArrayList(u64).init(allocator),
-            .column_metadata = std.ArrayList([]const u8).init(allocator),
+            .column_data_offsets = std.ArrayListUnmanaged(u64){},
+            .column_metadata = std.ArrayListUnmanaged([]const u8){},
             .row_count = 0,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.output.deinit();
-        self.column_data_offsets.deinit();
+        self.output.deinit(self.allocator);
+        self.column_data_offsets.deinit(self.allocator);
         for (self.column_metadata.items) |meta| {
             self.allocator.free(meta);
         }
-        self.column_metadata.deinit();
+        self.column_metadata.deinit(self.allocator);
     }
 
     /// Write a batch of column data
     pub fn writeColumnBatch(self: *Self, batch: ColumnBatch) !void {
         // Record offset before writing
-        try self.column_data_offsets.append(self.output.items.len);
+        try self.column_data_offsets.append(self.allocator, self.output.items.len);
 
         // Write column data
-        try self.output.appendSlice(batch.data);
+        try self.output.appendSlice(self.allocator, batch.data);
 
         // If strings, also write offsets
         if (batch.offsets) |offsets| {
-            try self.output.appendSlice(offsets);
+            try self.output.appendSlice(self.allocator, offsets);
         }
 
         // Track row count
@@ -379,8 +383,8 @@ pub const LanceWriter = struct {
 
             // Copy metadata bytes
             const meta = try self.allocator.dupe(u8, proto.getBytes());
-            try self.column_metadata.append(meta);
-            try self.output.appendSlice(meta);
+            try self.column_metadata.append(self.allocator, meta);
+            try self.output.appendSlice(self.allocator, meta);
         }
 
         // Record column metadata offsets start
@@ -391,7 +395,7 @@ pub const LanceWriter = struct {
         for (self.column_metadata.items) |meta| {
             var bytes: [8]u8 = undefined;
             std.mem.writeInt(u64, &bytes, meta_offset, .little);
-            try self.output.appendSlice(&bytes);
+            try self.output.appendSlice(self.allocator, &bytes);
             meta_offset += meta.len;
         }
 
@@ -408,7 +412,7 @@ pub const LanceWriter = struct {
             0, // major_version (Lance 2.0)
             3, // minor_version
         );
-        try self.output.appendSlice(&footer);
+        try self.output.appendSlice(self.allocator, &footer);
 
         return self.output.items;
     }

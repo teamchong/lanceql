@@ -424,7 +424,7 @@ pub const Executor = struct {
         const group_cols = if (stmt.group_by) |gb| gb.columns else &[_][]const u8{};
 
         // Build groups: maps group key to list of row indices
-        var groups = std.StringHashMap(std.ArrayList(u32)).init(self.allocator);
+        var groups = std.StringHashMap(std.ArrayListUnmanaged(u32)).init(self.allocator);
         defer {
             var iter = groups.valueIterator();
             while (iter.next()) |list| {
@@ -434,7 +434,7 @@ pub const Executor = struct {
         }
 
         // Also need to track key strings for proper cleanup
-        var key_strings = std.ArrayList([]const u8){};
+        var key_strings = std.ArrayListUnmanaged([]const u8){};
         defer {
             for (key_strings.items) |key| {
                 self.allocator.free(key);
@@ -452,7 +452,7 @@ pub const Executor = struct {
                 self.allocator.free(key);
             } else {
                 // New group
-                var list = std.ArrayList(u32){};
+                var list = std.ArrayListUnmanaged(u32){};
                 try list.append(self.allocator, row_idx);
                 try groups.put(key, list);
                 try key_strings.append(self.allocator, key);
@@ -466,7 +466,7 @@ pub const Executor = struct {
             groups.count();
 
         // Build result columns
-        var result_columns = std.ArrayList(Result.Column){};
+        var result_columns = std.ArrayListUnmanaged(Result.Column){};
         errdefer {
             for (result_columns.items) |col| {
                 switch (col.data) {

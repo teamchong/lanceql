@@ -250,24 +250,24 @@ test "parse minimal parquet file" {
     const allocator = std.testing.allocator;
 
     // Create a minimal file with just headers
-    var file_data = std.ArrayList(u8).init(allocator);
-    defer file_data.deinit();
+    var file_data = std.ArrayListUnmanaged(u8){};
+    defer file_data.deinit(allocator);
 
     // Magic
-    try file_data.appendSlice("PAR1");
+    try file_data.appendSlice(allocator, "PAR1");
 
     // Empty metadata (just STOP)
     const metadata_start = file_data.items.len;
-    try file_data.append(0x00); // STOP (empty struct)
+    try file_data.append(allocator, 0x00); // STOP (empty struct)
     const metadata_len = file_data.items.len - metadata_start;
 
     // Metadata length (little-endian)
     var len_bytes: [4]u8 = undefined;
     std.mem.writeInt(u32, &len_bytes, @intCast(metadata_len), .little);
-    try file_data.appendSlice(&len_bytes);
+    try file_data.appendSlice(allocator, &len_bytes);
 
     // Magic
-    try file_data.appendSlice("PAR1");
+    try file_data.appendSlice(allocator, "PAR1");
 
     // Try to parse (should succeed with empty metadata)
     var pf = try ParquetFile.init(allocator, file_data.items);

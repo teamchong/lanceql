@@ -254,22 +254,22 @@ pub const Expr = union(enum) {
 
     /// Get referenced column names.
     pub fn getColumns(self: Self, allocator: std.mem.Allocator) ![][]const u8 {
-        var list = std.ArrayList([]const u8).init(allocator);
-        try self.collectColumns(&list);
-        return list.toOwnedSlice();
+        var list = std.ArrayListUnmanaged([]const u8){};
+        try self.collectColumns(allocator, &list);
+        return list.toOwnedSlice(allocator);
     }
 
-    fn collectColumns(self: Self, list: *std.ArrayList([]const u8)) !void {
+    fn collectColumns(self: Self, allocator: std.mem.Allocator, list: *std.ArrayListUnmanaged([]const u8)) !void {
         switch (self) {
-            .column => |name| try list.append(name),
+            .column => |name| try list.append(allocator, name),
             .binary => |b| {
-                try b.left.collectColumns(list);
-                try b.right.collectColumns(list);
+                try b.left.collectColumns(allocator, list);
+                try b.right.collectColumns(allocator, list);
             },
-            .unary => |u| try u.operand.collectColumns(list),
+            .unary => |u| try u.operand.collectColumns(allocator, list),
             .call => |c| {
                 for (c.args) |arg| {
-                    try arg.collectColumns(list);
+                    try arg.collectColumns(allocator, list);
                 }
             },
             .literal, .star => {},
