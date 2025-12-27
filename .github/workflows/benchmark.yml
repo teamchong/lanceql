@@ -52,7 +52,10 @@ jobs:
           echo "## Vector Operations Benchmark" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          ./scripts/bench-vector.sh 2>&1 | tee bench-vector.txt
+          # Note: GitHub Actions macOS runners don't expose Metal GPU
+          # Skip the GPU vector benchmark in CI - it would timeout on CPU
+          echo "Skipped: GitHub Actions macOS doesn't expose Metal GPU" | tee bench-vector.txt
+          echo "Vector benchmarks require GPU and should be run locally on Apple Silicon" >> bench-vector.txt
           cat bench-vector.txt >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
