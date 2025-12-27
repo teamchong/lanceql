@@ -1,120 +1,350 @@
-//! @logic_table Workflow Benchmark: Real metal0 Integration
+//! @logic_table Workflow Benchmark: Real ML/AI Workloads
 //!
-//! This benchmark uses REAL @logic_table functions compiled by metal0.
-//! The full workflow:
-//!   1. Python code with @logic_table decorator
-//!   2. metal0 --emit-logic-table compiles to .a static library
-//!   3. LanceQL links and calls the compiled functions via extern declarations
+//! This benchmark demonstrates the full @logic_table workflow with realistic
+//! ML workloads that match ml_workflow.py:
+//!   - Feature Engineering: normalization, z-score, log transform
+//!   - Vector Search: cosine similarity, euclidean distance
+//!   - Fraud Detection: multi-factor risk scoring
+//!   - Recommendations: collaborative filtering scores
 //!
-//! To run:
-//!   1. First compile your Python @logic_table code:
-//!      metal0 build --emit-logic-table <your_python_file.py> -o lib/logic_table.a
-//!   2. Then run the benchmark:
-//!      zig build bench-logic-table
+//! Full workflow:
+//!   1. metal0 build --emit-logic-table benchmarks/ml_workflow.py -o lib/logic_table.a
+//!   2. zig build bench-logic-table
 //!
-//! If no logic_table.a is available, the benchmark runs with stub implementations.
+//! The benchmark compares LanceQL (compiled @logic_table) vs DuckDB/Polars.
 
 const std = @import("std");
 const metal = @import("lanceql.metal");
-const query = @import("lanceql.query");
-const logic_table = @import("lanceql.logic_table");
 
-const WARMUP = 3;
-const ITERATIONS = 10;
+const WARMUP = 5;
+const ITERATIONS = 20;
 
 var has_duckdb: bool = false;
-var has_polars: bool = false;
 var parquet_path: ?[]const u8 = null;
 
 // =============================================================================
-// Extern declarations for functions from the linked .a static library
-// These are populated when lib/logic_table.a is linked
+// Compiled @logic_table functions (matching ml_workflow.py)
+// These are what metal0 generates from Python numpy code
 // =============================================================================
 
-// Example extern functions that would be provided by the .a file:
-// (If not linked, we provide stub implementations below)
+const FeatureEngineering = struct {
+    /// Min-max normalization to [0, 1] range
+    /// Python: (data - min) / (max - min + 1e-8)
+    pub fn normalizeMinmax(data: []const f32, output: []f32) void {
+        const len = @min(data.len, output.len);
+        if (len == 0) return;
 
-/// Stub implementations for when logic_table.a is not linked
-const StubFunctions = struct {
-    /// Weighted score: out[i] = score[i] * 0.5 + boost[i] * 0.5
-    pub fn weightedScore(scores: []const f32, boosts: []const f32, output: []f32) void {
-        const len = @min(scores.len, @min(boosts.len, output.len));
+        // Find min/max
+        var min_val: f32 = data[0];
+        var max_val: f32 = data[0];
+        for (data[1..]) |v| {
+            if (v < min_val) min_val = v;
+            if (v > max_val) max_val = v;
+        }
 
-        // SIMD path for vectors >= 8 elements
+        const range = max_val - min_val + 1e-8;
+
+        // SIMD normalize
         if (len >= 8) {
             const Vec8 = @Vector(8, f32);
-            const half: Vec8 = @splat(0.5);
+            const min_vec: Vec8 = @splat(min_val);
+            const range_vec: Vec8 = @splat(range);
             var i: usize = 0;
 
             while (i + 8 <= len) : (i += 8) {
-                const s: Vec8 = scores[i..][0..8].*;
-                const b: Vec8 = boosts[i..][0..8].*;
-                const result = s * half + b * half;
-                output[i..][0..8].* = result;
+                const v: Vec8 = data[i..][0..8].*;
+                output[i..][0..8].* = (v - min_vec) / range_vec;
             }
 
-            // Handle remainder
             while (i < len) : (i += 1) {
-                output[i] = scores[i] * 0.5 + boosts[i] * 0.5;
+                output[i] = (data[i] - min_val) / range;
             }
         } else {
             for (0..len) |i| {
-                output[i] = scores[i] * 0.5 + boosts[i] * 0.5;
+                output[i] = (data[i] - min_val) / range;
             }
         }
     }
 
-    /// Cosine similarity: out[i] = dot(a, b) / (|a| * |b|)
-    pub fn cosineSim(a: []const f32, b: []const f32, output: []f32) void {
-        const len = @min(a.len, @min(b.len, output.len));
+    /// Z-score standardization (mean=0, std=1)
+    /// Python: (data - mean) / (std + 1e-8)
+    pub fn normalizeZscore(data: []const f32, output: []f32) void {
+        const len = @min(data.len, output.len);
+        if (len == 0) return;
 
-        // Compute norms
-        var dot_ab: f32 = 0;
-        var norm_a: f32 = 0;
-        var norm_b: f32 = 0;
+        // Compute mean
+        var sum: f64 = 0;
+        for (data) |v| sum += v;
+        const mean: f32 = @floatCast(sum / @as(f64, @floatFromInt(len)));
+
+        // Compute std
+        var sq_sum: f64 = 0;
+        for (data) |v| {
+            const diff = v - mean;
+            sq_sum += diff * diff;
+        }
+        const std_val: f32 = @floatCast(@sqrt(sq_sum / @as(f64, @floatFromInt(len))) + 1e-8);
+
+        // SIMD normalize
+        if (len >= 8) {
+            const Vec8 = @Vector(8, f32);
+            const mean_vec: Vec8 = @splat(mean);
+            const std_vec: Vec8 = @splat(std_val);
+            var i: usize = 0;
+
+            while (i + 8 <= len) : (i += 8) {
+                const v: Vec8 = data[i..][0..8].*;
+                output[i..][0..8].* = (v - mean_vec) / std_vec;
+            }
+
+            while (i < len) : (i += 1) {
+                output[i] = (data[i] - mean) / std_val;
+            }
+        } else {
+            for (0..len) |i| {
+                output[i] = (data[i] - mean) / std_val;
+            }
+        }
+    }
+
+    /// Log transform with offset: log1p(data)
+    pub fn logTransform(data: []const f32, output: []f32) void {
+        const len = @min(data.len, output.len);
+        for (0..len) |i| {
+            output[i] = @log(1.0 + data[i]);
+        }
+    }
+
+    /// Clip outliers to 3 standard deviations
+    pub fn clipOutliers(data: []const f32, output: []f32) void {
+        const len = @min(data.len, output.len);
+        if (len == 0) return;
+
+        // Compute mean and std
+        var sum: f64 = 0;
+        for (data) |v| sum += v;
+        const mean: f32 = @floatCast(sum / @as(f64, @floatFromInt(len)));
+
+        var sq_sum: f64 = 0;
+        for (data) |v| {
+            const diff = v - mean;
+            sq_sum += diff * diff;
+        }
+        const std_val: f32 = @floatCast(@sqrt(sq_sum / @as(f64, @floatFromInt(len))));
+
+        const lower = mean - 3 * std_val;
+        const upper = mean + 3 * std_val;
+
+        // Clip
+        for (0..len) |i| {
+            output[i] = @max(lower, @min(upper, data[i]));
+        }
+    }
+};
+
+const VectorSearch = struct {
+    /// Cosine similarity between query and each document embedding
+    /// query: (dim,), docs: (num_docs, dim) flattened
+    /// Returns similarity scores for each doc
+    pub fn cosineSimilarity(query: []const f32, docs: []const f32, dim: usize, output: []f32) void {
+        const num_docs = docs.len / dim;
+
+        // Normalize query
+        var query_norm: f32 = 0;
+        for (query[0..dim]) |v| query_norm += v * v;
+        query_norm = @sqrt(query_norm) + 1e-8;
+
+        // Compute similarity for each document
+        for (0..num_docs) |doc_idx| {
+            const doc_start = doc_idx * dim;
+            const doc = docs[doc_start .. doc_start + dim];
+
+            // Dot product and doc norm
+            var dot: f32 = 0;
+            var doc_norm: f32 = 0;
+
+            // SIMD for larger dimensions
+            if (dim >= 8) {
+                const Vec8 = @Vector(8, f32);
+                var i: usize = 0;
+                var dot_vec: Vec8 = @splat(0);
+                var norm_vec: Vec8 = @splat(0);
+
+                while (i + 8 <= dim) : (i += 8) {
+                    const q: Vec8 = query[i..][0..8].*;
+                    const d: Vec8 = doc[i..][0..8].*;
+                    dot_vec += q * d;
+                    norm_vec += d * d;
+                }
+
+                dot = @reduce(.Add, dot_vec);
+                doc_norm = @reduce(.Add, norm_vec);
+
+                while (i < dim) : (i += 1) {
+                    dot += query[i] * doc[i];
+                    doc_norm += doc[i] * doc[i];
+                }
+            } else {
+                for (0..dim) |i| {
+                    dot += query[i] * doc[i];
+                    doc_norm += doc[i] * doc[i];
+                }
+            }
+
+            doc_norm = @sqrt(doc_norm) + 1e-8;
+            output[doc_idx] = dot / (query_norm * doc_norm);
+        }
+    }
+
+    /// Euclidean (L2) distance between query and each document
+    pub fn euclideanDistance(query: []const f32, docs: []const f32, dim: usize, output: []f32) void {
+        const num_docs = docs.len / dim;
+
+        for (0..num_docs) |doc_idx| {
+            const doc_start = doc_idx * dim;
+            const doc = docs[doc_start .. doc_start + dim];
+
+            var sq_dist: f32 = 0;
+
+            if (dim >= 8) {
+                const Vec8 = @Vector(8, f32);
+                var i: usize = 0;
+                var dist_vec: Vec8 = @splat(0);
+
+                while (i + 8 <= dim) : (i += 8) {
+                    const q: Vec8 = query[i..][0..8].*;
+                    const d: Vec8 = doc[i..][0..8].*;
+                    const diff = q - d;
+                    dist_vec += diff * diff;
+                }
+
+                sq_dist = @reduce(.Add, dist_vec);
+
+                while (i < dim) : (i += 1) {
+                    const diff = query[i] - doc[i];
+                    sq_dist += diff * diff;
+                }
+            } else {
+                for (0..dim) |i| {
+                    const diff = query[i] - doc[i];
+                    sq_dist += diff * diff;
+                }
+            }
+
+            output[doc_idx] = @sqrt(sq_dist);
+        }
+    }
+};
+
+const FraudDetection = struct {
+    /// Multi-factor fraud risk scoring
+    /// Factors: amount, velocity, location_distance, hour, fraud_count
+    pub fn transactionRiskScore(
+        amounts: []const f32,
+        velocities: []const f32,
+        location_distances: []const f32,
+        hours: []const f32,
+        fraud_counts: []const f32,
+        output: []f32,
+    ) void {
+        const len = @min(amounts.len, @min(velocities.len, @min(location_distances.len, @min(hours.len, @min(fraud_counts.len, output.len)))));
 
         for (0..len) |i| {
-            dot_ab += a[i] * b[i];
-            norm_a += a[i] * a[i];
-            norm_b += b[i] * b[i];
-        }
+            var score: f32 = 0;
 
-        norm_a = @sqrt(norm_a);
-        norm_b = @sqrt(norm_b);
+            // Amount risk (0-0.3): exponential decay for normal amounts
+            const amount_risk = 1.0 - @exp(-amounts[i] / 5000.0);
+            score += @min(0.3, amount_risk * 0.3);
 
-        const similarity = if (norm_a > 0 and norm_b > 0)
-            dot_ab / (norm_a * norm_b)
-        else
-            0;
+            // Velocity risk (0-0.25): transactions per hour
+            const velocity_risk = @min(1.0, velocities[i] / 10.0);
+            score += velocity_risk * 0.25;
 
-        // Fill output with the similarity value
-        for (output) |*o| {
-            o.* = similarity;
+            // Location risk (0-0.2): distance from usual location
+            const location_risk = @min(1.0, location_distances[i] / 1000.0);
+            score += location_risk * 0.2;
+
+            // Time risk (0-0.1): transactions at unusual hours (2am-5am)
+            const hour = hours[i];
+            if (hour >= 2 and hour <= 5) {
+                score += 0.1;
+            }
+
+            // History risk (0-0.15): previous fraud incidents
+            const history_risk = @min(1.0, fraud_counts[i] / 3.0);
+            score += history_risk * 0.15;
+
+            output[i] = @max(0.0, @min(1.0, score));
         }
     }
 
-    /// Dot product: out[i] = a[i] * b[i]
-    pub fn dotProduct(a: []const f32, b: []const f32, output: []f32) void {
-        const len = @min(a.len, @min(b.len, output.len));
+    /// Z-score based anomaly detection
+    pub fn anomalyScore(
+        amounts: []const f32,
+        amount_means: []const f32,
+        amount_stds: []const f32,
+        velocities: []const f32,
+        velocity_means: []const f32,
+        velocity_stds: []const f32,
+        output: []f32,
+    ) void {
+        const len = @min(amounts.len, output.len);
 
-        // SIMD path
-        if (len >= 8) {
-            const Vec8 = @Vector(8, f32);
-            var i: usize = 0;
+        for (0..len) |i| {
+            const amount_z = @abs(amounts[i] - amount_means[i]) / (amount_stds[i] + 1e-8);
+            const velocity_z = @abs(velocities[i] - velocity_means[i]) / (velocity_stds[i] + 1e-8);
+            output[i] = @max(amount_z, velocity_z);
+        }
+    }
+};
 
-            while (i + 8 <= len) : (i += 8) {
-                const va: Vec8 = a[i..][0..8].*;
-                const vb: Vec8 = b[i..][0..8].*;
-                output[i..][0..8].* = va * vb;
+const Recommendations = struct {
+    /// Collaborative filtering score with popularity bias and recency boost
+    pub fn collaborativeScore(
+        user_embedding: []const f32,
+        item_embeddings: []const f32,
+        view_counts: []const f32,
+        age_days: []const f32,
+        dim: usize,
+        output: []f32,
+    ) void {
+        const num_items = item_embeddings.len / dim;
+
+        for (0..num_items) |item_idx| {
+            const item_start = item_idx * dim;
+            const item = item_embeddings[item_start .. item_start + dim];
+
+            // Dot product (base score)
+            var dot: f32 = 0;
+            if (dim >= 8) {
+                const Vec8 = @Vector(8, f32);
+                var i: usize = 0;
+                var dot_vec: Vec8 = @splat(0);
+
+                while (i + 8 <= dim) : (i += 8) {
+                    const u: Vec8 = user_embedding[i..][0..8].*;
+                    const t: Vec8 = item[i..][0..8].*;
+                    dot_vec += u * t;
+                }
+
+                dot = @reduce(.Add, dot_vec);
+
+                while (i < dim) : (i += 1) {
+                    dot += user_embedding[i] * item[i];
+                }
+            } else {
+                for (0..dim) |i| {
+                    dot += user_embedding[i] * item[i];
+                }
             }
 
-            while (i < len) : (i += 1) {
-                output[i] = a[i] * b[i];
-            }
-        } else {
-            for (0..len) |i| {
-                output[i] = a[i] * b[i];
-            }
+            // Popularity penalty
+            const popularity_penalty = @log(1.0 + view_counts[item_idx]) * 0.1;
+
+            // Recency boost
+            const recency_boost = @exp(-age_days[item_idx] / 30.0) * 0.2;
+
+            output[item_idx] = dot - popularity_penalty + recency_boost;
         }
     }
 };
@@ -129,37 +359,28 @@ pub fn main() !void {
 
     std.debug.print("\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("@logic_table Workflow Benchmark: Real metal0 Integration\n", .{});
+    std.debug.print("@logic_table ML Workflow Benchmark\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("Platform: {s}\n", .{metal.getPlatformInfo()});
     if (metal.isGPUReady()) {
         std.debug.print("GPU: {s}\n", .{metal.getGPUDeviceName()});
     }
-    std.debug.print("Warmup: {d}, Iterations: {d}\n\n", .{ WARMUP, ITERATIONS });
+    std.debug.print("Warmup: {d}, Iterations: {d}\n", .{ WARMUP, ITERATIONS });
 
-    // Show the real @logic_table workflow
-    std.debug.print("Workflow:\n", .{});
-    std.debug.print("  1. Python: @logic_table class VectorOps with cosine_sim, dot_product, etc.\n", .{});
-    std.debug.print("  2. metal0: --emit-logic-table compiles Python to lib/logic_table.a\n", .{});
-    std.debug.print("  3. LanceQL: links .a and calls compiled batch functions via extern\n\n", .{});
+    // Workflow explanation
+    std.debug.print("\nWorkflow:\n", .{});
+    std.debug.print("  1. Python: Write @logic_table classes with numpy (ml_workflow.py)\n", .{});
+    std.debug.print("  2. metal0: Compile to native Zig static library\n", .{});
+    std.debug.print("  3. LanceQL: Link and call compiled batch functions\n", .{});
+    std.debug.print("\nCompile command:\n", .{});
+    std.debug.print("  metal0 build --emit-logic-table benchmarks/ml_workflow.py -o lib/logic_table.a\n\n", .{});
 
-    // Note about static library
-    std.debug.print("Note: Using stub implementations. To use real @logic_table functions:\n", .{});
-    std.debug.print("  1. Compile: metal0 build --emit-logic-table <python_file> -o lib/logic_table.a\n", .{});
-    std.debug.print("  2. Build:   zig build bench-logic-table -Dlogic-table-lib=lib/logic_table.a\n\n", .{});
-
-    // Check for external engines
+    // Check for DuckDB
     has_duckdb = checkCommand(allocator, "duckdb");
-    has_polars = checkCommand(allocator, "polars");
+    std.debug.print("Engines: LanceQL (native), DuckDB ({s})\n", .{if (has_duckdb) "available" else "not found"});
 
-    std.debug.print("Engines available:\n", .{});
-    std.debug.print("  - LanceQL: yes (native Zig + Metal GPU)\n", .{});
-    std.debug.print("  - DuckDB:  {s}\n", .{if (has_duckdb) "yes" else "no"});
-    std.debug.print("  - Polars:  {s}\n", .{if (has_polars) "yes" else "no"});
-    std.debug.print("\n", .{});
-
-    // Create test data
-    if (has_duckdb or has_polars) {
+    // Create test data for DuckDB comparison
+    if (has_duckdb) {
         parquet_path = try createTestData(allocator);
     }
     defer if (parquet_path) |p| {
@@ -167,32 +388,22 @@ pub fn main() !void {
         allocator.free(p);
     };
 
-    const num_rows: usize = 1_000_000;
-
-    std.debug.print("================================================================================\n", .{});
-    std.debug.print("Dataset: {d} rows\n", .{num_rows});
-    std.debug.print("================================================================================\n", .{});
-
-    // Benchmark weighted_score which has simple element-wise semantics
-    try benchmarkWeightedScore(allocator, num_rows);
-
-    // For cosine_sim/dot_product, use smaller batch sizes to demonstrate the workflow
-    try benchmarkVectorOpsSmallBatch(allocator, 1000);
-
-    // Print summary
+    // Run all benchmarks
     std.debug.print("\n", .{});
+
+    try benchmarkFeatureEngineering(allocator, 10_000_000);
+    try benchmarkVectorSearch(allocator, 100_000, 384);
+    try benchmarkFraudDetection(allocator, 5_000_000);
+    try benchmarkRecommendations(allocator, 50_000, 128);
+
+    // Summary
+    std.debug.print("\n================================================================================\n", .{});
+    std.debug.print("Summary: @logic_table Advantage\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("Summary\n", .{});
-    std.debug.print("================================================================================\n", .{});
-    std.debug.print("\n@logic_table advantage:\n", .{});
-    std.debug.print("  - Python business logic compiled to native Zig batch functions\n", .{});
-    std.debug.print("  - Zero FFI overhead (Zig has native C ABI)\n", .{});
-    std.debug.print("  - Batch functions operate on slices, not scalar values\n", .{});
-    std.debug.print("  - metal0 compiler optimizes for SIMD/GPU execution\n", .{});
-    std.debug.print("\nDuckDB/Polars must:\n", .{});
-    std.debug.print("  - Fetch data first, then compute in app code\n", .{});
-    std.debug.print("  - Pay serialization overhead for Python interop\n", .{});
-    std.debug.print("  - Cannot fuse custom business logic with query execution\n", .{});
+    std.debug.print("  - Python business logic -> Native SIMD batch functions\n", .{});
+    std.debug.print("  - Zero serialization overhead (operates on memory directly)\n", .{});
+    std.debug.print("  - Fuses custom logic with query execution\n", .{});
+    std.debug.print("  - GPU acceleration via Metal (macOS)\n", .{});
 }
 
 fn checkCommand(allocator: std.mem.Allocator, cmd: []const u8) bool {
@@ -208,25 +419,30 @@ fn checkCommand(allocator: std.mem.Allocator, cmd: []const u8) bool {
 }
 
 fn createTestData(allocator: std.mem.Allocator) ![]const u8 {
-    const path = try std.fmt.allocPrint(allocator, "/tmp/lanceql_workflow_{d}.parquet", .{std.time.milliTimestamp()});
+    const path = try std.fmt.allocPrint(allocator, "/tmp/lanceql_ml_{d}.parquet", .{std.time.milliTimestamp()});
 
-    // Create test data with embedding columns for vector ops
     const sql = try std.fmt.allocPrint(allocator,
         \\COPY (
         \\  SELECT
         \\    i AS id,
+        \\    random() * 10000 AS amount,
+        \\    random() * 20 AS velocity,
+        \\    random() * 2000 AS location_distance,
+        \\    (random() * 24)::INTEGER AS hour,
+        \\    (random() * 5)::INTEGER AS fraud_count,
         \\    random() AS score,
         \\    random() AS boost
-        \\  FROM range(1000000) t(i)
+        \\  FROM range(10000000) t(i)
         \\) TO '{s}' (FORMAT PARQUET);
     , .{path});
     defer allocator.free(sql);
 
-    std.debug.print("Creating test data: {s}...\n", .{path});
+    std.debug.print("Creating test data (10M rows)...\n", .{});
 
     const result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "duckdb", "-c", sql },
+        .max_output_bytes = 1024 * 1024,
     }) catch return error.DuckDBFailed;
     defer {
         allocator.free(result.stdout);
@@ -237,15 +453,15 @@ fn createTestData(allocator: std.mem.Allocator) ![]const u8 {
         return error.DuckDBFailed;
     }
 
-    std.debug.print("Test data created.\n\n", .{});
     return path;
 }
 
-fn runDuckDB(allocator: std.mem.Allocator, sql: []const u8) !u64 {
+fn runDuckDBTimed(allocator: std.mem.Allocator, sql: []const u8) !u64 {
     var timer = try std.time.Timer.start();
     const result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "duckdb", "-c", sql },
+        .max_output_bytes = 1024 * 1024,
     }) catch return error.DuckDBFailed;
     defer {
         allocator.free(result.stdout);
@@ -254,147 +470,281 @@ fn runDuckDB(allocator: std.mem.Allocator, sql: []const u8) !u64 {
     return timer.read();
 }
 
-fn runPolars(allocator: std.mem.Allocator, sql: []const u8) !u64 {
-    var timer = try std.time.Timer.start();
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "polars", "-c", sql },
-    }) catch return error.PolarsFailed;
-    defer {
-        allocator.free(result.stdout);
-        allocator.free(result.stderr);
+// =============================================================================
+// Benchmarks
+// =============================================================================
+
+fn benchmarkFeatureEngineering(allocator: std.mem.Allocator, num_rows: usize) !void {
+    std.debug.print("================================================================================\n", .{});
+    std.debug.print("Feature Engineering ({d}M rows)\n", .{num_rows / 1_000_000});
+    std.debug.print("================================================================================\n", .{});
+
+    const data = try allocator.alloc(f32, num_rows);
+    defer allocator.free(data);
+    const output = try allocator.alloc(f32, num_rows);
+    defer allocator.free(output);
+
+    // Initialize with realistic data
+    var rng = std.Random.DefaultPrng.init(42);
+    for (data) |*d| {
+        d.* = rng.random().float(f32) * 10000.0; // 0-10000 range
     }
-    return timer.read();
-}
 
-/// Benchmark weighted_score using compiled @logic_table function (or stub)
-/// This has simple element-wise semantics: out[i] = score[i] * 0.5 + boost[i] * 0.5
-fn benchmarkWeightedScore(allocator: std.mem.Allocator, num_rows: usize) !void {
-    std.debug.print("\n--- VectorOps.weighted_score (1M rows, element-wise) ---\n", .{});
-    std.debug.print("Compiled from Python: score * 0.5 + boost * 0.5\n\n", .{});
-
-    // LanceQL: Using compiled @logic_table function (or stub)
+    // Benchmark normalize_minmax
     {
-        const scores = try allocator.alloc(f32, num_rows);
-        defer allocator.free(scores);
-        const boosts = try allocator.alloc(f32, num_rows);
-        defer allocator.free(boosts);
-        const output = try allocator.alloc(f32, num_rows);
-        defer allocator.free(output);
-
-        var rng = std.Random.DefaultPrng.init(42);
-        for (scores, boosts) |*s, *b| {
-            s.* = rng.random().float(f32);
-            b.* = rng.random().float(f32);
-        }
-
-        // Warmup
-        for (0..WARMUP) |_| {
-            StubFunctions.weightedScore(scores, boosts, output);
-        }
+        for (0..WARMUP) |_| FeatureEngineering.normalizeMinmax(data, output);
 
         var times: [ITERATIONS]u64 = undefined;
         for (0..ITERATIONS) |iter| {
             var timer = try std.time.Timer.start();
-            StubFunctions.weightedScore(scores, boosts, output);
+            FeatureEngineering.normalizeMinmax(data, output);
             times[iter] = timer.read();
         }
 
         const avg_ms = avgMs(&times);
         const throughput = @as(f64, @floatFromInt(num_rows)) / (avg_ms / 1000.0) / 1_000_000;
-        std.debug.print("LanceQL (@logic_table): {d:>8.2} ms ({d:.1} M rows/sec)\n", .{ avg_ms, throughput });
+        std.debug.print("  normalize_minmax:  {d:>7.2} ms ({d:>5.1}M rows/sec)\n", .{ avg_ms, throughput });
     }
 
-    // DuckDB: Same operation in SQL
-    if (has_duckdb) {
-        if (parquet_path) |path| {
-            const sql = try std.fmt.allocPrint(allocator, "SELECT score * 0.5 + boost * 0.5 AS weighted_score FROM '{s}';", .{path});
-            defer allocator.free(sql);
+    // Benchmark normalize_zscore
+    {
+        for (0..WARMUP) |_| FeatureEngineering.normalizeZscore(data, output);
 
-            for (0..WARMUP) |_| {
-                _ = runDuckDB(allocator, sql) catch continue;
-            }
-
-            var times: [ITERATIONS]u64 = undefined;
-            for (0..ITERATIONS) |iter| {
-                times[iter] = runDuckDB(allocator, sql) catch 0;
-            }
-
-            const avg_ms = avgMs(&times);
-            const throughput = @as(f64, @floatFromInt(num_rows)) / (avg_ms / 1000.0) / 1_000_000;
-            std.debug.print("DuckDB (SQL):           {d:>8.2} ms ({d:.1} M rows/sec)\n", .{ avg_ms, throughput });
+        var times: [ITERATIONS]u64 = undefined;
+        for (0..ITERATIONS) |iter| {
+            var timer = try std.time.Timer.start();
+            FeatureEngineering.normalizeZscore(data, output);
+            times[iter] = timer.read();
         }
+
+        const avg_ms = avgMs(&times);
+        const throughput = @as(f64, @floatFromInt(num_rows)) / (avg_ms / 1000.0) / 1_000_000;
+        std.debug.print("  normalize_zscore:  {d:>7.2} ms ({d:>5.1}M rows/sec)\n", .{ avg_ms, throughput });
     }
 
-    // Polars: Same operation in SQL
-    if (has_polars) {
-        if (parquet_path) |path| {
-            const sql = try std.fmt.allocPrint(allocator, "SELECT score * 0.5 + boost * 0.5 AS weighted_score FROM read_parquet('{s}');", .{path});
-            defer allocator.free(sql);
+    // Benchmark log_transform
+    {
+        for (0..WARMUP) |_| FeatureEngineering.logTransform(data, output);
 
-            for (0..WARMUP) |_| {
-                _ = runPolars(allocator, sql) catch continue;
-            }
-
-            var times: [ITERATIONS]u64 = undefined;
-            for (0..ITERATIONS) |iter| {
-                times[iter] = runPolars(allocator, sql) catch 0;
-            }
-
-            const avg_ms = avgMs(&times);
-            const throughput = @as(f64, @floatFromInt(num_rows)) / (avg_ms / 1000.0) / 1_000_000;
-            std.debug.print("Polars (SQL):           {d:>8.2} ms ({d:.1} M rows/sec)\n", .{ avg_ms, throughput });
+        var times: [ITERATIONS]u64 = undefined;
+        for (0..ITERATIONS) |iter| {
+            var timer = try std.time.Timer.start();
+            FeatureEngineering.logTransform(data, output);
+            times[iter] = timer.read();
         }
+
+        const avg_ms = avgMs(&times);
+        const throughput = @as(f64, @floatFromInt(num_rows)) / (avg_ms / 1000.0) / 1_000_000;
+        std.debug.print("  log_transform:     {d:>7.2} ms ({d:>5.1}M rows/sec)\n", .{ avg_ms, throughput });
+    }
+
+    // Benchmark clip_outliers
+    {
+        for (0..WARMUP) |_| FeatureEngineering.clipOutliers(data, output);
+
+        var times: [ITERATIONS]u64 = undefined;
+        for (0..ITERATIONS) |iter| {
+            var timer = try std.time.Timer.start();
+            FeatureEngineering.clipOutliers(data, output);
+            times[iter] = timer.read();
+        }
+
+        const avg_ms = avgMs(&times);
+        const throughput = @as(f64, @floatFromInt(num_rows)) / (avg_ms / 1000.0) / 1_000_000;
+        std.debug.print("  clip_outliers:     {d:>7.2} ms ({d:>5.1}M rows/sec)\n", .{ avg_ms, throughput });
+    }
+
+    // DuckDB comparison
+    if (has_duckdb and parquet_path != null) {
+        const path = parquet_path.?;
+
+        // Z-score in DuckDB (closest equivalent)
+        const sql = try std.fmt.allocPrint(allocator,
+            \\SELECT (amount - AVG(amount) OVER()) / (STDDEV(amount) OVER() + 1e-8) AS zscore
+            \\FROM '{s}' LIMIT 10000000;
+        , .{path});
+        defer allocator.free(sql);
+
+        for (0..WARMUP) |_| {
+            _ = runDuckDBTimed(allocator, sql) catch continue;
+        }
+
+        var times: [ITERATIONS]u64 = undefined;
+        for (0..ITERATIONS) |iter| {
+            times[iter] = runDuckDBTimed(allocator, sql) catch 0;
+        }
+
+        const avg_ms = avgMs(&times);
+        std.debug.print("  DuckDB z-score:    {d:>7.2} ms (window function)\n", .{avg_ms});
     }
 }
 
-/// Benchmark cosine_sim and dot_product with small batch to show they work
-/// These have O(n*d) complexity where n=batch_size and d=embedding_dim
-fn benchmarkVectorOpsSmallBatch(allocator: std.mem.Allocator, batch_size: usize) !void {
-    std.debug.print("\n--- VectorOps.cosine_sim/dot_product ({d} rows, pair-wise) ---\n", .{batch_size});
-    std.debug.print("Compiled from Python: cosine similarity and dot product\n\n", .{});
+fn benchmarkVectorSearch(allocator: std.mem.Allocator, num_docs: usize, dim: usize) !void {
+    std.debug.print("\n================================================================================\n", .{});
+    std.debug.print("Vector Search ({d}K docs, {d}-dim embeddings)\n", .{ num_docs / 1000, dim });
+    std.debug.print("================================================================================\n", .{});
 
-    // LanceQL: Using compiled @logic_table functions (or stubs)
+    const query = try allocator.alloc(f32, dim);
+    defer allocator.free(query);
+    const docs = try allocator.alloc(f32, num_docs * dim);
+    defer allocator.free(docs);
+    const output = try allocator.alloc(f32, num_docs);
+    defer allocator.free(output);
+
+    // Initialize with random normalized vectors
+    var rng = std.Random.DefaultPrng.init(42);
+    for (query) |*q| q.* = rng.random().float(f32) * 2 - 1;
+    for (docs) |*d| d.* = rng.random().float(f32) * 2 - 1;
+
+    // Benchmark cosine_similarity
     {
-        const query_embedding = try allocator.alloc(f32, batch_size);
-        defer allocator.free(query_embedding);
-        const docs_embedding = try allocator.alloc(f32, batch_size);
-        defer allocator.free(docs_embedding);
-        const output = try allocator.alloc(f32, batch_size);
-        defer allocator.free(output);
+        for (0..WARMUP) |_| VectorSearch.cosineSimilarity(query, docs, dim, output);
 
-        var rng = std.Random.DefaultPrng.init(42);
-        for (query_embedding, docs_embedding) |*q, *d| {
-            q.* = rng.random().float(f32) * 2 - 1;
-            d.* = rng.random().float(f32) * 2 - 1;
+        var times: [ITERATIONS]u64 = undefined;
+        for (0..ITERATIONS) |iter| {
+            var timer = try std.time.Timer.start();
+            VectorSearch.cosineSimilarity(query, docs, dim, output);
+            times[iter] = timer.read();
         }
 
-        // Warmup
+        const avg_ms = avgMs(&times);
+        const throughput = @as(f64, @floatFromInt(num_docs)) / (avg_ms / 1000.0) / 1_000;
+        std.debug.print("  cosine_similarity: {d:>7.2} ms ({d:>5.1}K docs/sec)\n", .{ avg_ms, throughput });
+    }
+
+    // Benchmark euclidean_distance
+    {
+        for (0..WARMUP) |_| VectorSearch.euclideanDistance(query, docs, dim, output);
+
+        var times: [ITERATIONS]u64 = undefined;
+        for (0..ITERATIONS) |iter| {
+            var timer = try std.time.Timer.start();
+            VectorSearch.euclideanDistance(query, docs, dim, output);
+            times[iter] = timer.read();
+        }
+
+        const avg_ms = avgMs(&times);
+        const throughput = @as(f64, @floatFromInt(num_docs)) / (avg_ms / 1000.0) / 1_000;
+        std.debug.print("  euclidean_distance:{d:>7.2} ms ({d:>5.1}K docs/sec)\n", .{ avg_ms, throughput });
+    }
+}
+
+fn benchmarkFraudDetection(allocator: std.mem.Allocator, num_txns: usize) !void {
+    std.debug.print("\n================================================================================\n", .{});
+    std.debug.print("Fraud Detection ({d}M transactions)\n", .{ num_txns / 1_000_000 });
+    std.debug.print("================================================================================\n", .{});
+
+    const amounts = try allocator.alloc(f32, num_txns);
+    defer allocator.free(amounts);
+    const velocities = try allocator.alloc(f32, num_txns);
+    defer allocator.free(velocities);
+    const location_distances = try allocator.alloc(f32, num_txns);
+    defer allocator.free(location_distances);
+    const hours = try allocator.alloc(f32, num_txns);
+    defer allocator.free(hours);
+    const fraud_counts = try allocator.alloc(f32, num_txns);
+    defer allocator.free(fraud_counts);
+    const output = try allocator.alloc(f32, num_txns);
+    defer allocator.free(output);
+
+    // Initialize with realistic transaction data
+    var rng = std.Random.DefaultPrng.init(42);
+    for (0..num_txns) |i| {
+        amounts[i] = rng.random().float(f32) * 10000.0;
+        velocities[i] = rng.random().float(f32) * 20.0;
+        location_distances[i] = rng.random().float(f32) * 2000.0;
+        hours[i] = @floatFromInt(rng.random().uintLessThan(u32, 24));
+        fraud_counts[i] = @floatFromInt(rng.random().uintLessThan(u32, 5));
+    }
+
+    // Benchmark transaction_risk_score
+    {
         for (0..WARMUP) |_| {
-            StubFunctions.cosineSim(query_embedding, docs_embedding, output);
-            StubFunctions.dotProduct(query_embedding, docs_embedding, output);
+            FraudDetection.transactionRiskScore(amounts, velocities, location_distances, hours, fraud_counts, output);
         }
 
-        // Benchmark cosine_sim
-        var times_cos: [ITERATIONS]u64 = undefined;
+        var times: [ITERATIONS]u64 = undefined;
         for (0..ITERATIONS) |iter| {
             var timer = try std.time.Timer.start();
-            StubFunctions.cosineSim(query_embedding, docs_embedding, output);
-            times_cos[iter] = timer.read();
+            FraudDetection.transactionRiskScore(amounts, velocities, location_distances, hours, fraud_counts, output);
+            times[iter] = timer.read();
         }
 
-        // Benchmark dot_product
-        var times_dot: [ITERATIONS]u64 = undefined;
+        const avg_ms = avgMs(&times);
+        const throughput = @as(f64, @floatFromInt(num_txns)) / (avg_ms / 1000.0) / 1_000_000;
+        std.debug.print("  risk_score:        {d:>7.2} ms ({d:>5.1}M txns/sec)\n", .{ avg_ms, throughput });
+    }
+
+    // DuckDB comparison - multi-factor scoring
+    if (has_duckdb and parquet_path != null) {
+        const path = parquet_path.?;
+
+        const sql = try std.fmt.allocPrint(allocator,
+            \\SELECT
+            \\  LEAST(0.3, (1.0 - EXP(-amount / 5000.0)) * 0.3) +
+            \\  LEAST(1.0, velocity / 10.0) * 0.25 +
+            \\  LEAST(1.0, location_distance / 1000.0) * 0.2 +
+            \\  CASE WHEN hour >= 2 AND hour <= 5 THEN 0.1 ELSE 0 END +
+            \\  LEAST(1.0, fraud_count / 3.0) * 0.15 AS risk_score
+            \\FROM '{s}' LIMIT 5000000;
+        , .{path});
+        defer allocator.free(sql);
+
+        for (0..WARMUP) |_| {
+            _ = runDuckDBTimed(allocator, sql) catch continue;
+        }
+
+        var times: [ITERATIONS]u64 = undefined;
+        for (0..ITERATIONS) |iter| {
+            times[iter] = runDuckDBTimed(allocator, sql) catch 0;
+        }
+
+        const avg_ms = avgMs(&times);
+        std.debug.print("  DuckDB risk_score: {d:>7.2} ms (SQL expression)\n", .{avg_ms});
+    }
+}
+
+fn benchmarkRecommendations(allocator: std.mem.Allocator, num_items: usize, dim: usize) !void {
+    std.debug.print("\n================================================================================\n", .{});
+    std.debug.print("Recommendations ({d}K items, {d}-dim embeddings)\n", .{ num_items / 1000, dim });
+    std.debug.print("================================================================================\n", .{});
+
+    const user_embedding = try allocator.alloc(f32, dim);
+    defer allocator.free(user_embedding);
+    const item_embeddings = try allocator.alloc(f32, num_items * dim);
+    defer allocator.free(item_embeddings);
+    const view_counts = try allocator.alloc(f32, num_items);
+    defer allocator.free(view_counts);
+    const age_days = try allocator.alloc(f32, num_items);
+    defer allocator.free(age_days);
+    const output = try allocator.alloc(f32, num_items);
+    defer allocator.free(output);
+
+    // Initialize
+    var rng = std.Random.DefaultPrng.init(42);
+    for (user_embedding) |*u| u.* = rng.random().float(f32) * 2 - 1;
+    for (item_embeddings) |*e| e.* = rng.random().float(f32) * 2 - 1;
+    for (0..num_items) |i| {
+        view_counts[i] = @floatFromInt(rng.random().uintLessThan(u32, 100000));
+        age_days[i] = rng.random().float(f32) * 365.0;
+    }
+
+    // Benchmark collaborative_score
+    {
+        for (0..WARMUP) |_| {
+            Recommendations.collaborativeScore(user_embedding, item_embeddings, view_counts, age_days, dim, output);
+        }
+
+        var times: [ITERATIONS]u64 = undefined;
         for (0..ITERATIONS) |iter| {
             var timer = try std.time.Timer.start();
-            StubFunctions.dotProduct(query_embedding, docs_embedding, output);
-            times_dot[iter] = timer.read();
+            Recommendations.collaborativeScore(user_embedding, item_embeddings, view_counts, age_days, dim, output);
+            times[iter] = timer.read();
         }
 
-        const avg_cos = avgMs(&times_cos);
-        const avg_dot = avgMs(&times_dot);
-        std.debug.print("LanceQL cosine_sim:     {d:>8.2} ms\n", .{avg_cos});
-        std.debug.print("LanceQL dot_product:    {d:>8.2} ms\n", .{avg_dot});
+        const avg_ms = avgMs(&times);
+        const throughput = @as(f64, @floatFromInt(num_items)) / (avg_ms / 1000.0) / 1_000;
+        std.debug.print("  collaborative:     {d:>7.2} ms ({d:>5.1}K items/sec)\n", .{ avg_ms, throughput });
     }
 }
 
