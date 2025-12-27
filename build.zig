@@ -540,6 +540,23 @@ pub fn build(b: *std.Build) void {
     test_sql_step.dependOn(&run_test_column_deps.step);
     test_sql_step.dependOn(&run_test_batch_codegen.step);
 
+    // @logic_table FFI tests - verify compiled Python functions work via C FFI
+    const test_logic_table_ffi = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests/test_logic_table_ffi.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    // Link against the compiled @logic_table static library
+    test_logic_table_ffi.addObjectFile(b.path("lib/simple_logic_table.a"));
+    // Link system libraries that the .a depends on
+    test_logic_table_ffi.linkLibC();
+
+    const run_test_logic_table_ffi = b.addRunArtifact(test_logic_table_ffi);
+    const test_logic_table_ffi_step = b.step("test-logic-table-ffi", "Run @logic_table FFI tests (compiled Python functions)");
+    test_logic_table_ffi_step.dependOn(&run_test_logic_table_ffi.step);
+
     // Stress tests - large datasets, memory pressure, edge cases
     const test_stress = b.addTest(.{
         .root_module = b.createModule(.{
