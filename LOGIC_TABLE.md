@@ -285,6 +285,308 @@ FROM logic_table('metrics.py') t
 GROUP BY t.time_bucket('1 hour')
 ```
 
+## Life Cycle
+
+### Instance Life Cycle
+
+A `@logic_table` instance follows this life cycle:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        QUERY EXECUTION                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. COMPILE (once)                                              │
+│     ├─ Parse Python @logic_table class                          │
+│     ├─ Extract Table dependencies                               │
+│     ├─ Compile methods to Zig IR → native code                  │
+│     └─ Register in LogicTableRegistry                           │
+│                                                                 │
+│  2. INIT (per query)                                            │
+│     ├─ Create QueryContext                                      │
+│     │   ├─ total_rows, matched_rows                             │
+│     │   ├─ filtered_indices (from WHERE)                        │
+│     │   ├─ predicates (pushdown)                                │
+│     │   └─ result_cache (memoization)                           │
+│     │                                                           │
+│     └─ Create LogicTableContext                                 │
+│         ├─ Link to QueryContext                                 │
+│         └─ Initialize column caches                             │
+│                                                                 │
+│  3. BIND (per table in FROM/JOIN)                               │
+│     ├─ Load required columns from Lance files                   │
+│     ├─ ctx.bindF32("orders", "amount", [...])                   │
+│     └─ ctx.bindI64("customers", "days_since_signup", [...])     │
+│                                                                 │
+│  4. EXECUTE (per method call)                                   │
+│     ├─ Check result_cache for memoized result                   │
+│     ├─ If miss: compute using bound columns                     │
+│     ├─ GPU dispatch for ≥10K rows                               │
+│     ├─ SIMD for 16-10K rows                                     │
+│     ├─ Scalar for <16 rows                                      │
+│     └─ Cache result for repeated calls                          │
+│                                                                 │
+│  5. CLEANUP (query end)                                         │
+│     ├─ Free result_cache entries                                │
+│     ├─ Free QueryContext                                        │
+│     └─ Free LogicTableContext                                   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Code Example
+
+```zig
+// Life cycle in executor
+pub fn executeQuery(sql: []const u8) !Result {
+    var allocator = std.heap.page_allocator;
+
+    // 2. INIT
+    var query_ctx = QueryContext.init(allocator);
+    defer query_ctx.deinit();  // 5. CLEANUP
+
+    var ctx = LogicTableContext.initWithQuery(allocator, &query_ctx);
+    defer ctx.deinit();  // 5. CLEANUP
+
+    // 3. BIND (after parsing SQL and loading tables)
+    try ctx.bindF32("orders", "amount", orders_amount_data);
+    try ctx.bindI64("customers", "days_since_signup", customer_data);
+
+    // Set query context (after WHERE evaluation)
+    query_ctx.total_rows = 100000;
+    query_ctx.matched_rows = 1500;
+    query_ctx.filtered_indices = filtered;
+
+    // 4. EXECUTE methods on filtered rows
+    for (query_ctx.filtered_indices) |idx| {
+        const score = compute_risk_score(&ctx, idx);
+        // ...
+    }
+}
+```
+
+## Context Sharing
+
+### Shared State Between Methods
+
+All methods in a `@logic_table` share the same `LogicTableContext`, enabling:
+
+1. **Column Data Sharing**: Bound once, used by all methods
+2. **Result Memoization**: Cache expensive computations
+3. **Query Context**: All methods see same filtered indices
+
+```python
+@logic_table
+class FraudDetector:
+    orders = Table('orders.lance')
+
+    def amount_score(self) -> float:
+        # Accesses shared column data
+        return min(1.0, self.orders.amount / 50000)
+
+    def velocity_score(self) -> float:
+        # Same column data, different computation
+        return self.orders.amount / self.orders.avg_amount
+
+    def risk_score(self) -> float:
+        # Calls other methods - results may be memoized
+        return self.amount_score() * 0.5 + self.velocity_score() * 0.5
+```
+
+### Context Hierarchy
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ QueryContext (per query)                                        │
+│   ├─ total_rows: 100,000                                        │
+│   ├─ matched_rows: 1,500                                        │
+│   ├─ filtered_indices: [5, 12, 45, ...]                         │
+│   ├─ predicates: [{column: "amount", op: ">", value: 1000}]     │
+│   └─ result_cache: {"risk_score_row_5": 0.85, ...}              │
+│                                                                 │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │ LogicTableContext (per logic_table in FROM/JOIN)        │   │
+│   │   ├─ query_context: *QueryContext (shared reference)    │   │
+│   │   ├─ column_cache_f32: {"orders.amount": [...]}         │   │
+│   │   └─ column_cache_i64: {"customers.days_since": [...]}  │   │
+│   └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│   ┌─────────────────────────────────────────────────────────┐   │
+│   │ LogicTableContext (another logic_table)                 │   │
+│   │   └─ query_context: *QueryContext (SAME reference)      │   │
+│   └─────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Cross-Table Joins
+
+When multiple `@logic_table` classes are joined, they share the same `QueryContext`:
+
+```sql
+SELECT
+    f.risk_score(),
+    p.priority_score()
+FROM logic_table('fraud_detector.py') AS f
+JOIN logic_table('priority_scorer.py') AS p
+  ON f.orders.id = p.orders.id
+WHERE f.risk_score() > 0.5
+```
+
+Both `f` and `p` see:
+- Same `filtered_indices` (rows passing WHERE)
+- Same `predicates` (pushdown from WHERE)
+- Shared `result_cache` (cross-table memoization)
+
+## External Cache Provider
+
+### Why External Caching?
+
+The default `result_cache` in `QueryContext` is in-memory and query-scoped. For:
+- **Cross-query caching**: Reuse expensive computations across queries
+- **Persistent caching**: Survive process restarts
+- **Distributed caching**: Share across workers/nodes
+
+You need an external cache provider.
+
+### Cache Provider Interface
+
+```python
+# Python interface (for @logic_table authors)
+from lanceql import CacheProvider
+
+class RedisCacheProvider(CacheProvider):
+    """External cache using Redis."""
+
+    def __init__(self, redis_url: str, ttl: int = 3600):
+        self.client = redis.from_url(redis_url)
+        self.ttl = ttl
+
+    def get(self, key: str) -> Optional[Any]:
+        """Get cached value, return None if miss."""
+        data = self.client.get(key)
+        return pickle.loads(data) if data else None
+
+    def set(self, key: str, value: Any) -> None:
+        """Cache a value with TTL."""
+        self.client.setex(key, self.ttl, pickle.dumps(value))
+
+    def invalidate(self, pattern: str) -> None:
+        """Invalidate keys matching pattern."""
+        for key in self.client.scan_iter(pattern):
+            self.client.delete(key)
+
+@logic_table(cache=RedisCacheProvider("redis://localhost:6379"))
+class ExpensiveProcessor:
+    data = Table('large_dataset.lance')
+
+    def expensive_score(self) -> float:
+        # Result cached in Redis, survives across queries
+        return self.complex_calculation()
+```
+
+### Zig Interface
+
+```zig
+/// External cache provider interface
+pub const CacheProvider = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        get: *const fn (ptr: *anyopaque, key: []const u8) ?CachedResult,
+        set: *const fn (ptr: *anyopaque, key: []const u8, value: CachedResult) void,
+        invalidate: *const fn (ptr: *anyopaque, pattern: []const u8) void,
+    };
+
+    pub fn get(self: CacheProvider, key: []const u8) ?CachedResult {
+        return self.vtable.get(self.ptr, key);
+    }
+
+    pub fn set(self: CacheProvider, key: []const u8, value: CachedResult) void {
+        self.vtable.set(self.ptr, key, value);
+    }
+};
+
+/// QueryContext with external cache support
+pub const QueryContext = struct {
+    // ... existing fields ...
+
+    /// In-memory cache (query-scoped)
+    result_cache: std.StringHashMap(CachedResult),
+
+    /// External cache provider (optional, cross-query)
+    external_cache: ?CacheProvider,
+
+    pub fn getCached(self: *Self, key: []const u8) ?CachedResult {
+        // Check in-memory first
+        if (self.result_cache.get(key)) |result| {
+            return result;
+        }
+        // Fall back to external cache
+        if (self.external_cache) |ext| {
+            if (ext.get(key)) |result| {
+                // Promote to in-memory for this query
+                self.result_cache.put(key, result) catch {};
+                return result;
+            }
+        }
+        return null;
+    }
+};
+```
+
+### Built-in Cache Providers
+
+| Provider | Scope | Use Case |
+|----------|-------|----------|
+| `InMemoryCache` | Query | Default, fast, no persistence |
+| `IndexedDBCache` | Browser session | WASM, survives page refresh |
+| `FileCache` | Process | CLI tools, local persistence |
+| `RedisCache` | Cluster | Distributed, shared state |
+
+### Browser (IndexedDB) Cache
+
+For WASM deployments, we use IndexedDB:
+
+```javascript
+// Already implemented in src/core/cache.js
+import { metadataCache } from './cache.js';
+
+// Cache schema and metadata
+await metadataCache.set(datasetUrl, {
+    schema: schema,
+    columnTypes: types,
+    fragments: fragmentInfo
+});
+
+// Retrieve on next visit
+const cached = await metadataCache.get(datasetUrl);
+if (cached) {
+    // Skip expensive schema parsing
+}
+```
+
+### Cache Key Generation
+
+Cache keys include context to ensure correctness:
+
+```python
+def generate_cache_key(method_name: str, ctx: QueryContext) -> str:
+    """Generate cache key including query context."""
+    components = [
+        method_name,
+        f"rows:{ctx.total_rows}",
+        f"matched:{ctx.matched_rows}",
+        # Include predicate hash if method depends on it
+        f"pred:{hash(tuple(ctx.predicates))}",
+    ]
+    return ":".join(components)
+
+# Example keys:
+# "risk_score:rows:100000:matched:1500:pred:a1b2c3"
+# "amount_score:rows:100000:matched:1500:pred:a1b2c3"
+```
+
 ## Architecture
 
 ### Compilation Flow
@@ -353,7 +655,11 @@ SQL Query                                     Result
 ```
 src/logic_table/
 ├── logic_table.zig      # LogicTableContext, QueryContext, FilterPredicate
+│                        # CachedResult, LogicTableRegistry
 └── vector_ops.zig       # metal0-compiled example (VectorOps, FeatureEngineering)
+
+src/query/
+└── logic_table.zig      # Batch vector operations with GPU/SIMD dispatch
 
 src/sql/
 ├── ast.zig              # AST with WindowSpec for OVER clause
@@ -361,6 +667,9 @@ src/sql/
 ├── executor.zig         # Execute with QueryContext
 ├── column_deps.zig      # Extract column dependencies from methods
 └── batch_codegen.zig    # Generate GPU/SIMD dispatch code
+
+src/core/
+└── cache.js             # IndexedDB MetadataCache for browser (WASM)
 
 examples/python/
 └── fraud_detector.py    # Complete @logic_table example

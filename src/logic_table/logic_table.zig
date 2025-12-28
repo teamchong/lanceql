@@ -110,8 +110,12 @@ pub const QueryContext = struct {
     predicates: []const FilterPredicate,
 
     // Result cache for memoization
-    /// Cache key -> cached result (for repeated calls)
+    /// Cache key -> cached result (for repeated calls, query-scoped)
     result_cache: std.StringHashMap(CachedResult),
+
+    // External cache provider (optional, cross-query)
+    /// Pluggable cache for Redis, file-based, or other persistent caches
+    external_cache: ?CacheProvider,
 
     // Query metadata
     /// Current query depth (for nested subqueries)
@@ -131,6 +135,23 @@ pub const QueryContext = struct {
             .filtered_indices = null,
             .predicates = &.{},
             .result_cache = std.StringHashMap(CachedResult).init(allocator),
+            .external_cache = null,
+            .query_depth = 0,
+            .is_aggregation = false,
+            .group_key = null,
+        };
+    }
+
+    /// Initialize with external cache provider
+    pub fn initWithCache(allocator: std.mem.Allocator, cache: CacheProvider) Self {
+        return .{
+            .allocator = allocator,
+            .total_rows = 0,
+            .matched_rows = 0,
+            .filtered_indices = null,
+            .predicates = &.{},
+            .result_cache = std.StringHashMap(CachedResult).init(allocator),
+            .external_cache = cache,
             .query_depth = 0,
             .is_aggregation = false,
             .group_key = null,
@@ -144,6 +165,7 @@ pub const QueryContext = struct {
             cached.deinit(self.allocator);
         }
         self.result_cache.deinit();
+        // Note: external_cache cleanup is caller's responsibility
     }
 
     /// Check if a column has a predicate pushed down
@@ -170,18 +192,46 @@ pub const QueryContext = struct {
         return true;
     }
 
-    /// Get or create cached result
+    /// Get cached result (checks in-memory first, then external cache)
     pub fn getCached(self: *Self, key: []const u8) ?CachedResult {
-        return self.result_cache.get(key);
+        // Check in-memory cache first (fast path)
+        if (self.result_cache.get(key)) |result| {
+            return result;
+        }
+        // Fall back to external cache if available
+        if (self.external_cache) |ext| {
+            if (ext.get(key)) |result| {
+                // Promote to in-memory for this query
+                self.result_cache.put(
+                    self.allocator.dupe(u8, key) catch return null,
+                    result,
+                ) catch {};
+                return result;
+            }
+        }
+        return null;
     }
 
-    /// Store result in cache
+    /// Store result in cache (both in-memory and external if available)
     pub fn putCached(self: *Self, key: []const u8, result: CachedResult) LogicTableError!void {
         const key_copy = self.allocator.dupe(u8, key) catch return LogicTableError.OutOfMemory;
         self.result_cache.put(key_copy, result) catch {
             self.allocator.free(key_copy);
             return LogicTableError.OutOfMemory;
         };
+        // Also store in external cache if available
+        if (self.external_cache) |ext| {
+            ext.set(key, result);
+        }
+    }
+
+    /// Invalidate cache entries matching pattern
+    pub fn invalidateCache(self: *Self, pattern: []const u8) void {
+        // For in-memory cache, we'd need to iterate and match
+        // For simplicity, external cache handles pattern matching
+        if (self.external_cache) |ext| {
+            ext.invalidate(pattern);
+        }
     }
 
     /// Get selectivity ratio (matched_rows / total_rows)
@@ -213,6 +263,69 @@ pub const CachedResult = union(enum) {
             else => {},
         }
     }
+};
+
+// =============================================================================
+// External Cache Provider - for cross-query and persistent caching
+// =============================================================================
+
+/// External cache provider interface (vtable pattern)
+/// Allows plugging in Redis, file-based, or other persistent caches
+pub const CacheProvider = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Get cached value by key, returns null on miss
+        get: *const fn (ptr: *anyopaque, key: []const u8) ?CachedResult,
+        /// Set cached value with key
+        set: *const fn (ptr: *anyopaque, key: []const u8, value: CachedResult) void,
+        /// Invalidate cache entries matching pattern (e.g., "fraud_*")
+        invalidate: *const fn (ptr: *anyopaque, pattern: []const u8) void,
+        /// Close/cleanup the cache provider
+        deinit: *const fn (ptr: *anyopaque) void,
+    };
+
+    pub fn get(self: CacheProvider, key: []const u8) ?CachedResult {
+        return self.vtable.get(self.ptr, key);
+    }
+
+    pub fn set(self: CacheProvider, key: []const u8, value: CachedResult) void {
+        self.vtable.set(self.ptr, key, value);
+    }
+
+    pub fn invalidate(self: CacheProvider, pattern: []const u8) void {
+        self.vtable.invalidate(self.ptr, pattern);
+    }
+
+    pub fn deinit(self: CacheProvider) void {
+        self.vtable.deinit(self.ptr);
+    }
+};
+
+/// No-op cache provider (does nothing, for testing or when caching disabled)
+pub const NoOpCacheProvider = struct {
+    pub fn provider(self: *NoOpCacheProvider) CacheProvider {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .get = get,
+                .set = set,
+                .invalidate = invalidate,
+                .deinit = deinitFn,
+            },
+        };
+    }
+
+    fn get(_: *anyopaque, _: []const u8) ?CachedResult {
+        return null;
+    }
+
+    fn set(_: *anyopaque, _: []const u8, _: CachedResult) void {}
+
+    fn invalidate(_: *anyopaque, _: []const u8) void {}
+
+    fn deinitFn(_: *anyopaque) void {}
 };
 
 /// Runtime context for executing LogicTable methods
