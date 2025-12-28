@@ -54,8 +54,12 @@ jobs:
       - name: Build Metal shaders
         run: zig build metal-shaders
 
-      - name: Build library
-        run: zig build lib
+      - name: Build library and CLI
+        run: |
+          zig build lib
+          zig build cli
+          sudo cp zig-out/bin/lanceql /usr/local/bin/
+          lanceql --version || echo "LanceQL CLI installed"
 
       - name: Run Vector benchmark (GPU vs CPU)
         id: bench-vector
@@ -153,8 +157,12 @@ jobs:
           sudo mv duckdb /usr/local/bin/
           pip install polars numpy
 
-      - name: Build library
-        run: zig build lib
+      - name: Build library and CLI
+        run: |
+          zig build lib
+          zig build cli
+          sudo cp zig-out/bin/lanceql /usr/local/bin/
+          lanceql --version || echo "LanceQL CLI installed"
 
       - name: Run SQL clause benchmark (LanceQL vs DuckDB vs Polars)
         run: |

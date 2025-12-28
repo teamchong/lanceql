@@ -708,6 +708,29 @@ pub const Parser = struct {
 
     /// Parse a primary (non-joined) table reference
     fn parsePrimaryTableRef(self: *Self) !ast.TableRef {
+        // Support string literals as file paths (DuckDB-style): FROM 'path/to/file.lance'
+        if (self.check(.STRING)) {
+            const path_tok = self.current().?;
+            self.advance();
+
+            // Check for alias
+            const alias = if (self.match(&[_]TokenType{.AS})) blk: {
+                const tok = try self.expect(.IDENTIFIER);
+                break :blk tok.lexeme;
+            } else if (self.check(.IDENTIFIER) and !self.isJoinKeyword()) blk: {
+                const tok = self.current().?;
+                self.advance();
+                break :blk tok.lexeme;
+            } else null;
+
+            return ast.TableRef{
+                .simple = .{
+                    .name = path_tok.lexeme,
+                    .alias = alias,
+                },
+            };
+        }
+
         const name_tok = try self.expect(.IDENTIFIER);
 
         // Check if this is a table-valued function (e.g., logic_table('path'))

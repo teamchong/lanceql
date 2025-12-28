@@ -608,6 +608,11 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "lanceql", .module = lanceql_mod },
                 .{ .name = "lanceql.metal", .module = metal_mod },
                 .{ .name = "lanceql.query", .module = query_mod },
+                .{ .name = "lanceql.table", .module = table_mod },
+                .{ .name = "lanceql.sql.ast", .module = sql_ast_mod },
+                .{ .name = "lanceql.sql.lexer", .module = sql_lexer_mod },
+                .{ .name = "lanceql.sql.parser", .module = sql_parser_mod },
+                .{ .name = "lanceql.sql.executor", .module = sql_executor_mod },
             },
         }),
     });
