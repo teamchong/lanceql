@@ -70,6 +70,27 @@ pub const TokenType = enum {
     FOLLOWING,
     CURRENT,
 
+    // Ranking functions
+    ROW_NUMBER,
+    RANK,
+    DENSE_RANK,
+    NTILE,
+    PERCENT_RANK,
+    CUME_DIST,
+
+    // Offset/Analytic functions
+    LAG,
+    LEAD,
+    FIRST_VALUE,
+    LAST_VALUE,
+    NTH_VALUE,
+
+    // Time window functions
+    INTERVAL,
+    SESSION,
+    TUMBLE,
+    HOP,
+
     // Vector search extension
     NEAR,
     TOPK,
@@ -372,8 +393,10 @@ fn keywordOrIdentifier(word: []const u8) TokenType {
     if (std.mem.eql(u8, upper, "CAST")) return .CAST;
     if (std.mem.eql(u8, upper, "COUNT")) return .COUNT;
     if (std.mem.eql(u8, upper, "CROSS")) return .CROSS;
+    if (std.mem.eql(u8, upper, "CUME_DIST")) return .CUME_DIST;
     if (std.mem.eql(u8, upper, "CURRENT")) return .CURRENT;
     if (std.mem.eql(u8, upper, "DATA")) return .DATA;
+    if (std.mem.eql(u8, upper, "DENSE_RANK")) return .DENSE_RANK;
     if (std.mem.eql(u8, upper, "DESC")) return .DESC;
     if (std.mem.eql(u8, upper, "DISTINCT")) return .DISTINCT;
     if (std.mem.eql(u8, upper, "ELSE")) return .ELSE;
@@ -381,16 +404,22 @@ fn keywordOrIdentifier(word: []const u8) TokenType {
     if (std.mem.eql(u8, upper, "EXCEPT")) return .EXCEPT;
     if (std.mem.eql(u8, upper, "EXISTS")) return .EXISTS;
     if (std.mem.eql(u8, upper, "FILE")) return .FILE;
+    if (std.mem.eql(u8, upper, "FIRST_VALUE")) return .FIRST_VALUE;
     if (std.mem.eql(u8, upper, "FOLLOWING")) return .FOLLOWING;
     if (std.mem.eql(u8, upper, "FROM")) return .FROM;
     if (std.mem.eql(u8, upper, "FULL")) return .FULL;
     if (std.mem.eql(u8, upper, "GROUP")) return .GROUP;
     if (std.mem.eql(u8, upper, "HAVING")) return .HAVING;
+    if (std.mem.eql(u8, upper, "HOP")) return .HOP;
     if (std.mem.eql(u8, upper, "IN")) return .IN;
     if (std.mem.eql(u8, upper, "INNER")) return .INNER;
     if (std.mem.eql(u8, upper, "INTERSECT")) return .INTERSECT;
+    if (std.mem.eql(u8, upper, "INTERVAL")) return .INTERVAL;
     if (std.mem.eql(u8, upper, "IS")) return .IS;
     if (std.mem.eql(u8, upper, "JOIN")) return .JOIN;
+    if (std.mem.eql(u8, upper, "LAG")) return .LAG;
+    if (std.mem.eql(u8, upper, "LAST_VALUE")) return .LAST_VALUE;
+    if (std.mem.eql(u8, upper, "LEAD")) return .LEAD;
     if (std.mem.eql(u8, upper, "LEFT")) return .LEFT;
     if (std.mem.eql(u8, upper, "LIKE")) return .LIKE;
     if (std.mem.eql(u8, upper, "LIMIT")) return .LIMIT;
@@ -401,6 +430,8 @@ fn keywordOrIdentifier(word: []const u8) TokenType {
     if (std.mem.eql(u8, upper, "NATURAL")) return .NATURAL;
     if (std.mem.eql(u8, upper, "NEAR")) return .NEAR;
     if (std.mem.eql(u8, upper, "NOT")) return .NOT;
+    if (std.mem.eql(u8, upper, "NTH_VALUE")) return .NTH_VALUE;
+    if (std.mem.eql(u8, upper, "NTILE")) return .NTILE;
     if (std.mem.eql(u8, upper, "NULL")) return .NULL;
     if (std.mem.eql(u8, upper, "OFFSET")) return .OFFSET;
     if (std.mem.eql(u8, upper, "ON")) return .ON;
@@ -410,13 +441,18 @@ fn keywordOrIdentifier(word: []const u8) TokenType {
     if (std.mem.eql(u8, upper, "OVER")) return .OVER;
     if (std.mem.eql(u8, upper, "PARTITION")) return .PARTITION;
     if (std.mem.eql(u8, upper, "PRECEDING")) return .PRECEDING;
+    if (std.mem.eql(u8, upper, "PERCENT_RANK")) return .PERCENT_RANK;
     if (std.mem.eql(u8, upper, "RANGE")) return .RANGE;
+    if (std.mem.eql(u8, upper, "RANK")) return .RANK;
     if (std.mem.eql(u8, upper, "RIGHT")) return .RIGHT;
     if (std.mem.eql(u8, upper, "ROWS")) return .ROWS;
+    if (std.mem.eql(u8, upper, "ROW_NUMBER")) return .ROW_NUMBER;
     if (std.mem.eql(u8, upper, "SELECT")) return .SELECT;
+    if (std.mem.eql(u8, upper, "SESSION")) return .SESSION;
     if (std.mem.eql(u8, upper, "SUM")) return .SUM;
     if (std.mem.eql(u8, upper, "THEN")) return .THEN;
     if (std.mem.eql(u8, upper, "TOPK")) return .TOPK;
+    if (std.mem.eql(u8, upper, "TUMBLE")) return .TUMBLE;
     if (std.mem.eql(u8, upper, "UNBOUNDED")) return .UNBOUNDED;
     if (std.mem.eql(u8, upper, "UNION")) return .UNION;
     if (std.mem.eql(u8, upper, "USING")) return .USING;

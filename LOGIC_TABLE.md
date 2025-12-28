@@ -198,6 +198,206 @@ pip install polars numpy
 pip install polars numpy
 ```
 
+## Protocol: Python ↔ Query Engine Contract
+
+The `@logic_table` protocol defines how Python code and the SQL engine communicate:
+
+### Schema Declaration
+
+```python
+from lanceql.protocol import logic_table, DataType, ColumnSchema, TableSchema
+
+@logic_table(
+    input_schema={"amount": float, "vendor": str, "user_id": int},
+    output_schema={"is_fraud": bool, "confidence": float, "risk_level": str}
+)
+def fraud_detector(batch: pa.RecordBatch) -> pa.RecordBatch:
+    """
+    Input:  amount (float64), vendor (string), user_id (int64)
+    Output: is_fraud (bool), confidence (float64), risk_level (string)
+    """
+    amounts = batch.column("amount").to_numpy()
+    is_fraud = amounts > 10000
+    confidence = np.minimum(amounts / 10000, 1.0)
+    risk_level = np.where(confidence > 0.8, "high", "medium")
+    return pa.RecordBatch.from_pydict({
+        "is_fraud": is_fraud,
+        "confidence": confidence,
+        "risk_level": risk_level
+    })
+```
+
+### Supported Data Types
+
+| Type | Python | Arrow | Description |
+|------|--------|-------|-------------|
+| `INT64` | `int` | `pa.int64()` | 64-bit integer |
+| `FLOAT64` | `float` | `pa.float64()` | 64-bit float |
+| `STRING` | `str` | `pa.string()` | UTF-8 string |
+| `BOOL` | `bool` | `pa.bool_()` | Boolean |
+| `TIMESTAMP` | `datetime` | `pa.timestamp('us')` | Microsecond timestamp |
+| `BINARY` | `bytes` | `pa.binary()` | Binary data |
+| `VECTOR_F32` | `np.ndarray` | `pa.list_(pa.float32())` | Float32 vector |
+| `VECTOR_F64` | `np.ndarray` | `pa.list_(pa.float64())` | Float64 vector |
+
+### Window Function Support
+
+Logic tables support SQL window functions via `OVER(PARTITION BY ...)`:
+
+```sql
+-- Partition-parallel processing
+SELECT fraud_detector(amount, vendor) OVER(PARTITION BY user_id)
+FROM transactions
+
+-- With ordering (for time-series)
+SELECT anomaly_score(value) OVER(PARTITION BY sensor_id ORDER BY timestamp)
+FROM readings
+
+-- Ranking within partitions
+SELECT ROW_NUMBER() OVER(PARTITION BY category ORDER BY score DESC)
+FROM products
+```
+
+Window specification passed to logic table:
+```python
+@dataclass
+class WindowSpec:
+    partition_by: List[str]       # PARTITION BY columns
+    order_by: List[tuple]         # [(column, 'asc'|'desc'), ...]
+    frame_type: str               # 'rows' | 'range'
+    frame_start: Any              # Frame start bound
+    frame_end: Any                # Frame end bound
+```
+
+### Available Window Functions
+
+| Category | Functions | Description |
+|----------|-----------|-------------|
+| **Ranking** | `ROW_NUMBER()`, `RANK()`, `DENSE_RANK()`, `NTILE(n)` | Row numbering and ranking |
+| **Offset** | `LAG(col, n)`, `LEAD(col, n)`, `FIRST_VALUE()`, `LAST_VALUE()` | Access other rows |
+| **Aggregate** | `SUM()`, `AVG()`, `COUNT()`, `MIN()`, `MAX()` | Running aggregates |
+| **Time** | `TUMBLE()`, `HOP()`, `SESSION()` | Time-based windows |
+
+### Vector-Specific Logic Tables
+
+For ML workloads with embeddings:
+
+```python
+@vector_logic_table(
+    vector_column="embedding",
+    dimensions=384,
+    output_schema={"similarity": float, "cluster_id": int}
+)
+def cluster_vectors(vectors: np.ndarray) -> Dict[str, np.ndarray]:
+    """Input: (N, 384) float32 array"""
+    similarities = cosine_sim(vectors, centroids)
+    cluster_ids = kmeans.predict(vectors)
+    return {"similarity": similarities, "cluster_id": cluster_ids}
+```
+
+### Time Window Logic Tables
+
+For streaming/time-series:
+
+```python
+@time_window_logic_table(
+    time_window=TimeWindow(
+        timestamp_column="event_time",
+        window_duration="1 hour",
+        slide_duration="15 minutes"  # Hopping window
+    ),
+    input_schema={"value": float},
+    output_schema={"window_start": datetime, "avg_value": float}
+)
+def hourly_stats(batch: pa.RecordBatch) -> pa.RecordBatch:
+    """Process all events in one time window"""
+    ...
+```
+
+## Implementation Architecture
+
+### Core Files
+
+```
+src/logic_table/
+├── logic_table.zig      # Runtime: LogicTableContext, QueryContext, FilterPredicate
+├── protocol.py          # Python protocol definitions
+└── vector_ops.zig       # metal0-compiled vector operations
+
+src/sql/
+├── ast.zig              # AST with WindowSpec support
+├── parser.zig           # SQL parser with OVER clause
+├── executor.zig         # Query executor
+├── column_deps.zig      # Column dependency extraction
+└── batch_codegen.zig    # Batch operation code generation
+
+src/query/
+└── logic_table.zig      # Query-focused context with GPU dispatch
+```
+
+### Execution Flow
+
+```
+SQL Query                                     Result
+    │                                            ▲
+    ▼                                            │
+┌─────────────────────────────────────────────────────┐
+│ Parser: Extract function calls + window specs       │
+└─────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│ Column Deps: Identify required columns for @logic_table │
+└─────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│ Batch CodeGen: Generate GPU/SIMD dispatch code      │
+│   - GPU_THRESHOLD: 10K rows                         │
+│   - SIMD_THRESHOLD: 16 elements                     │
+└─────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│ LogicTableContext: Bind columns to @logic_table     │
+│   - Load only needed columns                        │
+│   - Pass WHERE predicates for pushdown              │
+└─────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────┐
+│ Execute: Run compiled @logic_table function         │
+│   - Metal GPU (macOS)                               │
+│   - CUDA (Linux)                                    │
+│   - SIMD (CPU fallback)                             │
+└─────────────────────────────────────────────────────┘
+```
+
+### GPU Dispatch Thresholds
+
+| Threshold | Dispatch | Use Case |
+|-----------|----------|----------|
+| ≥10K rows | GPU | Large batch vector ops |
+| ≥16 elements | SIMD | Small vectors, CPU-bound |
+| <16 elements | Scalar | Single values |
+
+### Predicate Pushdown
+
+WHERE clause predicates are exposed to `@logic_table` functions:
+
+```python
+# SQL: SELECT fraud_score(...) FROM t WHERE amount > 1000
+
+@logic_table
+class FraudDetector:
+    def fraud_score(self, ctx: QueryContext):
+        # ctx.predicates contains: [FilterPredicate(col="amount", op=">", value=1000)]
+        # Skip processing rows that don't match!
+        if ctx.has_predicate("amount"):
+            threshold = ctx.get_predicate_value("amount")
+            # Early exit for filtered rows
+```
+
 ## Current Status
 
 - [x] GPU hash table for GROUP BY
@@ -208,6 +408,11 @@ pip install polars numpy
 - [x] metal0 Python-to-Zig compiler (working, passing CPython unittests in progress)
 - [x] @logic_table decorator implementation
 - [x] Edge/WASM deployment (JavaScript via frozen interpreter + WAMR AOT, Python support coming)
+- [x] Window function syntax (OVER, PARTITION BY, ORDER BY, frame specs)
+- [x] Ranking functions (ROW_NUMBER, RANK, DENSE_RANK, NTILE)
+- [x] Offset functions (LAG, LEAD, FIRST_VALUE, LAST_VALUE)
+- [x] Time window functions (TUMBLE, HOP, SESSION)
+- [x] Python ↔ Query protocol with Arrow schema
 
 ## License
 
