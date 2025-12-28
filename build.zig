@@ -472,6 +472,24 @@ pub fn build(b: *std.Build) void {
     const bench_parquet_step = b.step("bench-parquet", "Benchmark Parquet reading: LanceQL vs DuckDB vs Polars");
     bench_parquet_step.dependOn(&b.addInstallArtifact(bench_parquet, .{}).step);
 
+    // In-process benchmark: LanceQL vs DuckDB C API (FAIR comparison)
+    const bench_inprocess = b.addExecutable(.{
+        .name = "bench_inprocess",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/bench_inprocess.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    bench_inprocess.addObjectFile(b.path("lib/vector_ops.a"));
+    bench_inprocess.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+    bench_inprocess.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
+    bench_inprocess.linkSystemLibrary("duckdb");
+    bench_inprocess.linkLibC();
+    const run_bench_inprocess = b.addRunArtifact(bench_inprocess);
+    const bench_inprocess_step = b.step("bench-inprocess", "FAIR comparison: LanceQL vs DuckDB C API (no subprocess)");
+    bench_inprocess_step.dependOn(&run_bench_inprocess.step);
+
     // LanceQL CLI
     const cli = b.addExecutable(.{
         .name = "lanceql",
