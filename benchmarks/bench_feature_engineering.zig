@@ -221,18 +221,42 @@ pub fn main() !void {
     const lanceql_zscore_tput = @as(f64, @floatFromInt(NUM_ROWS)) / lanceql_zscore_s / 1_000_000;
     std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M/s {s:>10}\n", .{ "LanceQL", lanceql_zscore_s * 1000, lanceql_zscore_tput, "1.0x" });
 
+    // DuckDB
+    if (has_duckdb) {
+        const sql =
+            \\WITH data AS (
+            \\  SELECT random() * 1000 as val FROM generate_series(1, 100000)
+            \\),
+            \\stats AS (
+            \\  SELECT avg(val) as mean, stddev(val) as std FROM data
+            \\)
+            \\SELECT (d.val - s.mean) / s.std as normalized
+            \\FROM data d, stats s;
+        ;
+
+        var duckdb_ns: u64 = 0;
+        for (0..WARMUP) |_| _ = runDuckDB(allocator, sql) catch 0;
+        for (0..SUBPROCESS_ITERATIONS) |_| duckdb_ns += runDuckDB(allocator, sql) catch 0;
+
+        const duckdb_s = @as(f64, @floatFromInt(duckdb_ns)) / @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS)) / 1_000_000_000.0;
+        const duckdb_tput = 100000.0 / duckdb_s / 1_000_000;
+        const duckdb_ratio = duckdb_s / lanceql_zscore_s;
+        std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M/s {d:>9.1}x (100K rows)\n", .{ "DuckDB", duckdb_s * 1000, duckdb_tput, duckdb_ratio });
+    }
+
     // Polars
     if (has_polars) {
         const py_code = try std.fmt.allocPrint(allocator,
+            \\import polars as pl
             \\import numpy as np
             \\import time
             \\np.random.seed(42)
-            \\data = np.random.rand({d}) * 1000
+            \\df = pl.DataFrame({{'val': np.random.rand({d}) * 1000}})
             \\start = time.time()
             \\for _ in range(10):
-            \\    mean = np.mean(data)
-            \\    std = np.std(data)
-            \\    normalized = (data - mean) / std
+            \\    result = df.with_columns([
+            \\        ((pl.col('val') - pl.col('val').mean()) / pl.col('val').std()).alias('normalized')
+            \\    ])
             \\elapsed = time.time() - start
             \\print(f"{{elapsed:.4f}}")
         , .{NUM_ROWS});
@@ -245,7 +269,7 @@ pub fn main() !void {
         const polars_s = @as(f64, @floatFromInt(polars_ns)) / 5.0 / 10.0 / 1_000_000_000.0;
         const polars_tput = @as(f64, @floatFromInt(NUM_ROWS)) / polars_s / 1_000_000;
         const polars_ratio = polars_s / lanceql_zscore_s;
-        std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M/s {d:>9.1}x\n", .{ "NumPy", polars_s * 1000, polars_tput, polars_ratio });
+        std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M/s {d:>9.1}x\n", .{ "Polars", polars_s * 1000, polars_tput, polars_ratio });
     }
 
     // =========================================================================
@@ -269,16 +293,33 @@ pub fn main() !void {
     const lanceql_log_tput = @as(f64, @floatFromInt(NUM_ROWS)) / lanceql_log_s / 1_000_000;
     std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M/s {s:>10}\n", .{ "LanceQL", lanceql_log_s * 1000, lanceql_log_tput, "1.0x" });
 
+    // DuckDB
+    if (has_duckdb) {
+        const sql =
+            \\SELECT ln(random() * 1000 + 1) as log_val FROM generate_series(1, 100000);
+        ;
+
+        var duckdb_ns: u64 = 0;
+        for (0..WARMUP) |_| _ = runDuckDB(allocator, sql) catch 0;
+        for (0..SUBPROCESS_ITERATIONS) |_| duckdb_ns += runDuckDB(allocator, sql) catch 0;
+
+        const duckdb_s = @as(f64, @floatFromInt(duckdb_ns)) / @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS)) / 1_000_000_000.0;
+        const duckdb_tput = 100000.0 / duckdb_s / 1_000_000;
+        const duckdb_ratio = duckdb_s / lanceql_log_s;
+        std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M/s {d:>9.1}x (100K rows)\n", .{ "DuckDB", duckdb_s * 1000, duckdb_tput, duckdb_ratio });
+    }
+
     // Polars
     if (has_polars) {
         const py_code = try std.fmt.allocPrint(allocator,
+            \\import polars as pl
             \\import numpy as np
             \\import time
             \\np.random.seed(42)
-            \\data = np.random.rand({d}) * 1000
+            \\df = pl.DataFrame({{'val': np.random.rand({d}) * 1000}})
             \\start = time.time()
             \\for _ in range(10):
-            \\    result = np.log1p(data)
+            \\    result = df.with_columns([pl.col('val').log1p().alias('log_val')])
             \\elapsed = time.time() - start
             \\print(f"{{elapsed:.4f}}")
         , .{NUM_ROWS});
@@ -291,7 +332,7 @@ pub fn main() !void {
         const polars_s = @as(f64, @floatFromInt(polars_ns)) / 5.0 / 10.0 / 1_000_000_000.0;
         const polars_tput = @as(f64, @floatFromInt(NUM_ROWS)) / polars_s / 1_000_000;
         const polars_ratio = polars_s / lanceql_log_s;
-        std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M/s {d:>9.1}x\n", .{ "NumPy", polars_s * 1000, polars_tput, polars_ratio });
+        std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M/s {d:>9.1}x\n", .{ "Polars", polars_s * 1000, polars_tput, polars_ratio });
     }
 
     // =========================================================================
@@ -315,17 +356,33 @@ pub fn main() !void {
     const lanceql_cross_tput = @as(f64, @floatFromInt(NUM_ROWS)) / lanceql_cross_s / 1_000_000;
     std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M/s {s:>10}\n", .{ "LanceQL", lanceql_cross_s * 1000, lanceql_cross_tput, "1.0x" });
 
+    // DuckDB
+    if (has_duckdb) {
+        const sql =
+            \\SELECT (random() * 1000) * (random() * 1000) as crossed FROM generate_series(1, 100000);
+        ;
+
+        var duckdb_ns: u64 = 0;
+        for (0..WARMUP) |_| _ = runDuckDB(allocator, sql) catch 0;
+        for (0..SUBPROCESS_ITERATIONS) |_| duckdb_ns += runDuckDB(allocator, sql) catch 0;
+
+        const duckdb_s = @as(f64, @floatFromInt(duckdb_ns)) / @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS)) / 1_000_000_000.0;
+        const duckdb_tput = 100000.0 / duckdb_s / 1_000_000;
+        const duckdb_ratio = duckdb_s / lanceql_cross_s;
+        std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M/s {d:>9.1}x (100K rows)\n", .{ "DuckDB", duckdb_s * 1000, duckdb_tput, duckdb_ratio });
+    }
+
     // Polars
     if (has_polars) {
         const py_code = try std.fmt.allocPrint(allocator,
+            \\import polars as pl
             \\import numpy as np
             \\import time
             \\np.random.seed(42)
-            \\a = np.random.rand({d}) * 1000
-            \\b = np.random.rand({d}) * 1000
+            \\df = pl.DataFrame({{'a': np.random.rand({d}) * 1000, 'b': np.random.rand({d}) * 1000}})
             \\start = time.time()
             \\for _ in range(10):
-            \\    result = a * b
+            \\    result = df.with_columns([(pl.col('a') * pl.col('b')).alias('crossed')])
             \\elapsed = time.time() - start
             \\print(f"{{elapsed:.4f}}")
         , .{ NUM_ROWS, NUM_ROWS });
@@ -338,7 +395,7 @@ pub fn main() !void {
         const polars_s = @as(f64, @floatFromInt(polars_ns)) / 5.0 / 10.0 / 1_000_000_000.0;
         const polars_tput = @as(f64, @floatFromInt(NUM_ROWS)) / polars_s / 1_000_000;
         const polars_ratio = polars_s / lanceql_cross_s;
-        std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M/s {d:>9.1}x\n", .{ "NumPy", polars_s * 1000, polars_tput, polars_ratio });
+        std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M/s {d:>9.1}x\n", .{ "Polars", polars_s * 1000, polars_tput, polars_ratio });
     }
 
     // =========================================================================
@@ -362,16 +419,34 @@ pub fn main() !void {
     const lanceql_bin_tput = @as(f64, @floatFromInt(NUM_ROWS)) / lanceql_bin_s / 1_000_000;
     std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M/s {s:>10}\n", .{ "LanceQL", lanceql_bin_s * 1000, lanceql_bin_tput, "1.0x" });
 
+    // DuckDB
+    if (has_duckdb) {
+        const sql =
+            \\SELECT width_bucket(random() * 1000, 0, 1000, 10) as bin FROM generate_series(1, 100000);
+        ;
+
+        var duckdb_ns: u64 = 0;
+        for (0..WARMUP) |_| _ = runDuckDB(allocator, sql) catch 0;
+        for (0..SUBPROCESS_ITERATIONS) |_| duckdb_ns += runDuckDB(allocator, sql) catch 0;
+
+        const duckdb_s = @as(f64, @floatFromInt(duckdb_ns)) / @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS)) / 1_000_000_000.0;
+        const duckdb_tput = 100000.0 / duckdb_s / 1_000_000;
+        const duckdb_ratio = duckdb_s / lanceql_bin_s;
+        std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M/s {d:>9.1}x (100K rows)\n", .{ "DuckDB", duckdb_s * 1000, duckdb_tput, duckdb_ratio });
+    }
+
     // Polars
     if (has_polars) {
         const py_code = try std.fmt.allocPrint(allocator,
+            \\import polars as pl
             \\import numpy as np
             \\import time
             \\np.random.seed(42)
-            \\data = np.random.rand({d}) * 1000
+            \\df = pl.DataFrame({{'val': np.random.rand({d}) * 1000}})
+            \\bins = [0, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
             \\start = time.time()
             \\for _ in range(10):
-            \\    bins = np.digitize(data, np.linspace(0, 1000, 11))
+            \\    result = df.with_columns([pl.col('val').cut(bins).alias('bin')])
             \\elapsed = time.time() - start
             \\print(f"{{elapsed:.4f}}")
         , .{NUM_ROWS});
@@ -384,7 +459,7 @@ pub fn main() !void {
         const polars_s = @as(f64, @floatFromInt(polars_ns)) / 5.0 / 10.0 / 1_000_000_000.0;
         const polars_tput = @as(f64, @floatFromInt(NUM_ROWS)) / polars_s / 1_000_000;
         const polars_ratio = polars_s / lanceql_bin_s;
-        std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M/s {d:>9.1}x\n", .{ "NumPy", polars_s * 1000, polars_tput, polars_ratio });
+        std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M/s {d:>9.1}x\n", .{ "Polars", polars_s * 1000, polars_tput, polars_ratio });
     }
 
     // =========================================================================

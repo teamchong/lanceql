@@ -226,6 +226,89 @@ pub fn main() !void {
     const lanceql_vf_qps = @as(f64, @floatFromInt(NUM_QUERIES)) / lanceql_vf_total_s;
     std.debug.print("{s:<25} {d:>9.2} ms {d:>10.2}s {d:>9.0}\n", .{ "LanceQL", lanceql_vf_per_query / 1_000_000, lanceql_vf_total_s, lanceql_vf_qps });
 
+    // DuckDB vector-first (uses VSS extension concept)
+    if (has_duckdb) {
+        const sql =
+            \\WITH products AS (
+            \\  SELECT
+            \\    row_number() OVER () as id,
+            \\    random() * 500 as price,
+            \\    (random() * 10)::INT as category,
+            \\    random() < 0.8 as in_stock,
+            \\    list_transform(range(384), x -> random()::FLOAT) as embedding
+            \\  FROM generate_series(1, 10000)
+            \\),
+            \\query AS (
+            \\  SELECT list_transform(range(384), x -> random()::FLOAT) as vec
+            \\)
+            \\SELECT p.id, list_cosine_similarity(p.embedding, q.vec) as score
+            \\FROM products p, query q
+            \\WHERE p.price < 100 AND p.category = 3 AND p.in_stock
+            \\ORDER BY score DESC
+            \\LIMIT 20;
+        ;
+
+        var duckdb_ns: u64 = 0;
+        for (0..WARMUP) |_| _ = runDuckDB(allocator, sql) catch 0;
+        for (0..SUBPROCESS_ITERATIONS) |_| duckdb_ns += runDuckDB(allocator, sql) catch 0;
+
+        const duckdb_per_query = @as(f64, @floatFromInt(duckdb_ns)) / @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS));
+        const duckdb_total_s = @as(f64, @floatFromInt(duckdb_ns)) / 1_000_000_000.0;
+        const duckdb_qps = @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS)) / duckdb_total_s;
+        const duckdb_ratio = duckdb_per_query / lanceql_vf_per_query;
+        std.debug.print("{s:<25} {d:>9.0} ms {d:>10.2}s {d:>9.0}  ({d:.0}x, 10K products)\n", .{ "DuckDB", duckdb_per_query / 1_000_000, duckdb_total_s, duckdb_qps, duckdb_ratio });
+    }
+
+    // Polars vector-first
+    if (has_polars) {
+        const py_code_vf = try std.fmt.allocPrint(allocator,
+            \\import polars as pl
+            \\import numpy as np
+            \\import time
+            \\
+            \\np.random.seed(42)
+            \\n = 10000
+            \\dim = 384
+            \\
+            \\# Create Polars DataFrame with metadata
+            \\df = pl.DataFrame({{
+            \\    'id': range(n),
+            \\    'price': np.random.rand(n) * 500,
+            \\    'category': np.random.randint(0, 10, n),
+            \\    'in_stock': np.random.rand(n) < 0.8,
+            \\}})
+            \\embeddings = np.random.randn(n, dim).astype(np.float32)
+            \\embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
+            \\query = np.random.randn(dim).astype(np.float32)
+            \\query = query / np.linalg.norm(query)
+            \\
+            \\# Polars vector-first: compute all scores, then filter
+            \\start = time.time()
+            \\for _ in range(50):
+            \\    # Vector search (NumPy)
+            \\    scores = embeddings @ query
+            \\    # Add scores to Polars DataFrame and filter
+            \\    result = df.with_columns(pl.Series('score', scores)).filter(
+            \\        (pl.col('price') < 100) &
+            \\        (pl.col('category') == 3) &
+            \\        pl.col('in_stock')
+            \\    ).sort('score', descending=True).head(20)
+            \\elapsed = time.time() - start
+            \\print(f"{{elapsed:.4f}}")
+        , .{});
+        defer allocator.free(py_code_vf);
+
+        var polars_ns: u64 = 0;
+        for (0..WARMUP) |_| _ = runPolars(allocator, py_code_vf) catch 0;
+        for (0..5) |_| polars_ns += runPolars(allocator, py_code_vf) catch 0;
+
+        const polars_per_query = @as(f64, @floatFromInt(polars_ns)) / 5.0 / 50.0;
+        const polars_total_s = @as(f64, @floatFromInt(polars_ns)) / 5.0 / 1_000_000_000.0;
+        const polars_qps = 50.0 / polars_total_s;
+        const polars_ratio = polars_per_query / lanceql_vf_per_query;
+        std.debug.print("{s:<25} {d:>9.2} ms {d:>10.2}s {d:>9.0}  ({d:.1}x, 10K products)\n", .{ "Polars", polars_per_query / 1_000_000, polars_total_s, polars_qps, polars_ratio });
+    }
+
     // =========================================================================
     // Benchmark 2: Filter-first approach (filter then search)
     // =========================================================================
@@ -272,36 +355,82 @@ pub fn main() !void {
     const speedup = lanceql_vf_per_query / lanceql_ff_per_query;
     std.debug.print("{s:<25} {d:>9.2} ms {d:>10.2}s {d:>9.0}  ({d:.1}x faster)\n", .{ "LanceQL", lanceql_ff_per_query / 1_000_000, lanceql_ff_total_s, lanceql_ff_qps, speedup });
 
-    // Polars hybrid search
+    // DuckDB filter-first
+    if (has_duckdb) {
+        const sql =
+            \\WITH products AS (
+            \\  SELECT
+            \\    row_number() OVER () as id,
+            \\    random() * 500 as price,
+            \\    (random() * 10)::INT as category,
+            \\    random() < 0.8 as in_stock,
+            \\    list_transform(range(384), x -> random()::FLOAT) as embedding
+            \\  FROM generate_series(1, 10000)
+            \\),
+            \\filtered AS (
+            \\  SELECT * FROM products
+            \\  WHERE price < 100 AND category = 3 AND in_stock
+            \\),
+            \\query AS (
+            \\  SELECT list_transform(range(384), x -> random()::FLOAT) as vec
+            \\)
+            \\SELECT f.id, list_cosine_similarity(f.embedding, q.vec) as score
+            \\FROM filtered f, query q
+            \\ORDER BY score DESC
+            \\LIMIT 20;
+        ;
+
+        var duckdb_ns: u64 = 0;
+        for (0..WARMUP) |_| _ = runDuckDB(allocator, sql) catch 0;
+        for (0..SUBPROCESS_ITERATIONS) |_| duckdb_ns += runDuckDB(allocator, sql) catch 0;
+
+        const duckdb_per_query = @as(f64, @floatFromInt(duckdb_ns)) / @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS));
+        const duckdb_total_s = @as(f64, @floatFromInt(duckdb_ns)) / 1_000_000_000.0;
+        const duckdb_qps = @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS)) / duckdb_total_s;
+        const duckdb_ratio = duckdb_per_query / lanceql_ff_per_query;
+        std.debug.print("{s:<25} {d:>9.0} ms {d:>10.2}s {d:>9.0}  ({d:.0}x, 10K products)\n", .{ "DuckDB", duckdb_per_query / 1_000_000, duckdb_total_s, duckdb_qps, duckdb_ratio });
+    }
+
+    // Polars filter-first
     if (has_polars) {
         const py_code = try std.fmt.allocPrint(allocator,
+            \\import polars as pl
             \\import numpy as np
             \\import time
             \\
             \\np.random.seed(42)
-            \\n = {d}
-            \\dim = {d}
+            \\n = 10000
+            \\dim = 384
             \\
-            \\# Generate data
+            \\# Create Polars DataFrame
+            \\df = pl.DataFrame({{
+            \\    'id': range(n),
+            \\    'price': np.random.rand(n) * 500,
+            \\    'category': np.random.randint(0, 10, n),
+            \\    'in_stock': np.random.rand(n) < 0.8,
+            \\}})
             \\embeddings = np.random.randn(n, dim).astype(np.float32)
             \\embeddings = embeddings / np.linalg.norm(embeddings, axis=1, keepdims=True)
-            \\prices = np.random.rand(n) * 500
-            \\categories = np.random.randint(0, 10, n)
-            \\in_stock = np.random.rand(n) < 0.8
-            \\
             \\query = np.random.randn(dim).astype(np.float32)
             \\query = query / np.linalg.norm(query)
             \\
-            \\# Hybrid search: filter first
+            \\# Polars filter-first hybrid search
             \\start = time.time()
-            \\for _ in range({d}):
-            \\    mask = (prices < 100) & (categories == 3) & in_stock
-            \\    filtered = embeddings[mask]
-            \\    scores = filtered @ query
-            \\    top_k = np.argsort(scores)[-{d}:][::-1]
+            \\for _ in range(50):
+            \\    # Filter with Polars
+            \\    filtered = df.filter(
+            \\        (pl.col('price') < 100) &
+            \\        (pl.col('category') == 3) &
+            \\        pl.col('in_stock')
+            \\    )
+            \\    mask = filtered['id'].to_numpy()
+            \\    # Vector search with NumPy
+            \\    filtered_emb = embeddings[mask]
+            \\    scores = filtered_emb @ query
+            \\    top_k = np.argsort(scores)[-20:][::-1]
             \\elapsed = time.time() - start
             \\print(f"{{elapsed:.4f}}")
-        , .{ NUM_PRODUCTS, EMBEDDING_DIM, NUM_QUERIES, TOP_K });
+        , .{});
         defer allocator.free(py_code);
 
         var polars_ns: u64 = 0;
@@ -310,11 +439,11 @@ pub fn main() !void {
             polars_ns += runPolars(allocator, py_code) catch 0;
         }
 
-        const polars_per_query = @as(f64, @floatFromInt(polars_ns)) / 5.0 / @as(f64, @floatFromInt(NUM_QUERIES));
+        const polars_per_query = @as(f64, @floatFromInt(polars_ns)) / 5.0 / 50.0;
         const polars_total_s = @as(f64, @floatFromInt(polars_ns)) / 5.0 / 1_000_000_000.0;
-        const polars_qps = @as(f64, @floatFromInt(NUM_QUERIES)) / polars_total_s;
+        const polars_qps = 50.0 / polars_total_s;
         const polars_ratio = polars_per_query / lanceql_ff_per_query;
-        std.debug.print("{s:<25} {d:>9.2} ms {d:>10.2}s {d:>9.0}  ({d:.1}x slower)\n", .{ "NumPy", polars_per_query / 1_000_000, polars_total_s, polars_qps, polars_ratio });
+        std.debug.print("{s:<25} {d:>9.2} ms {d:>10.2}s {d:>9.0}  ({d:.1}x, 10K products)\n", .{ "Polars", polars_per_query / 1_000_000, polars_total_s, polars_qps, polars_ratio });
     }
 
     // =========================================================================
