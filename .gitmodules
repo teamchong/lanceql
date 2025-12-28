@@ -1,0 +1,3 @@
+[submodule "deps/metal0"]
+	path = deps/metal0
+	url = ../metal0

@@ -118,6 +118,19 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/logic_table/logic_table.zig"),
     });
 
+    // metal0 module - Python to native compiler (as submodule)
+    const metal0_mod = b.addModule("metal0", .{
+        .root_source_file = b.path("deps/metal0/src/main.zig"),
+    });
+
+    // Codegen module - JIT compilation integration with metal0
+    const codegen_mod = b.addModule("lanceql.codegen", .{
+        .root_source_file = b.path("src/codegen/metal0_jit.zig"),
+        .imports = &.{
+            .{ .name = "metal0", .module = metal0_mod },
+        },
+    });
+
     // Helper to link logic_table.a to a compile step
     const linkLogicTableLib = struct {
         fn link(step: *std.Build.Step.Compile, lib_path: ?[]const u8, builder: *std.Build) void {
@@ -167,6 +180,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lanceql.dataframe", .module = dataframe_mod },
             .{ .name = "lanceql.metal", .module = metal_mod },
             .{ .name = "lanceql.logic_table", .module = logic_table_mod },
+            .{ .name = "lanceql.codegen", .module = codegen_mod },
         },
     });
 
