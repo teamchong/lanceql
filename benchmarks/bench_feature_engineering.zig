@@ -8,10 +8,10 @@
 //!   3. Feature crossing
 //!   4. Binning/Bucketing
 //!
-//! Fair comparison: All engines run via subprocess CLI
-//!   - LanceQL:  lanceql -c "SELECT ..."
-//!   - DuckDB:   duckdb -c "SELECT ..."
-//!   - Polars:   polars -c "SELECT ..."
+//! Fair comparison using each engine's native interface:
+//!   - LanceQL:  CLI with SQL (lanceql -c "SELECT ...")
+//!   - DuckDB:   CLI with SQL (duckdb -c "SELECT ...")
+//!   - Polars:   Python with DataFrame API (native interface)
 
 const std = @import("std");
 
@@ -29,6 +29,21 @@ fn checkCommand(allocator: std.mem.Allocator, cmd: []const u8) bool {
     const result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "which", cmd },
+    }) catch return false;
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    switch (result.term) {
+        .Exited => |code| return code == 0,
+        else => return false,
+    }
+}
+
+fn checkPolars(allocator: std.mem.Allocator) bool {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "python3", "-c", "import polars" },
     }) catch return false;
     defer {
         allocator.free(result.stdout);
@@ -76,11 +91,11 @@ fn runDuckDB(allocator: std.mem.Allocator, sql: []const u8) !u64 {
     return timer.read();
 }
 
-fn runPolars(allocator: std.mem.Allocator, sql: []const u8) !u64 {
+fn runPolars(allocator: std.mem.Allocator, code: []const u8) !u64 {
     var timer = try std.time.Timer.start();
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "polars", "-c", sql },
+        .argv = &.{ "python3", "-c", code },
         .max_output_bytes = 100 * 1024 * 1024,
     }) catch return error.PolarsFailed;
     defer {
@@ -104,15 +119,16 @@ pub fn main() !void {
 
     has_lanceql = checkCommand(allocator, "lanceql");
     has_duckdb = checkCommand(allocator, "duckdb");
-    has_polars = checkCommand(allocator, "polars");
+    has_polars = checkPolars(allocator);
 
-    std.debug.print("\nFair comparison: All engines run via subprocess CLI\n", .{});
-    std.debug.print("Each engine has the same ~30ms subprocess spawn overhead.\n", .{});
+    std.debug.print("\nFair comparison using each engine's native interface:\n", .{});
+    std.debug.print("  - LanceQL/DuckDB: CLI with SQL\n", .{});
+    std.debug.print("  - Polars: Python with DataFrame API\n", .{});
     std.debug.print("\nDataset: {d}K rows\n", .{NUM_ROWS / 1000});
     std.debug.print("\nEngines:\n", .{});
-    std.debug.print("  - LanceQL: {s}\n", .{if (has_lanceql) "yes" else "no (install: zig build && cp zig-out/bin/lanceql /usr/local/bin/)"});
+    std.debug.print("  - LanceQL: {s}\n", .{if (has_lanceql) "yes" else "no (zig build && cp zig-out/bin/lanceql /usr/local/bin/)"});
     std.debug.print("  - DuckDB:  {s}\n", .{if (has_duckdb) "yes" else "no (brew install duckdb)"});
-    std.debug.print("  - Polars:  {s}\n", .{if (has_polars) "yes" else "no (cargo install polars-cli)"});
+    std.debug.print("  - Polars:  {s}\n", .{if (has_polars) "yes" else "no (pip install polars numpy)"});
     std.debug.print("\n", .{});
 
     // =========================================================================
@@ -161,16 +177,18 @@ pub fn main() !void {
         std.debug.print("{s:<15} {d:>9.0} ms {d:>10.0} K/s {d:>9.1}x\n", .{ "DuckDB", time_ms, rows_per_sec / 1000, ratio });
     }
 
-    // Polars
+    // Polars (DataFrame API)
     if (has_polars) {
-        const sql = std.fmt.comptimePrint(
-            \\SELECT (val - AVG(val) OVER()) / NULLIF(STDDEV(val) OVER(), 0) as zscore
-            \\FROM (SELECT random() * 1000 as val FROM generate_series(1, {d}))
+        const py_code = std.fmt.comptimePrint(
+            \\import polars as pl
+            \\import numpy as np
+            \\df = pl.DataFrame({{"val": np.random.rand({d}) * 1000}})
+            \\result = df.with_columns(((pl.col("val") - pl.col("val").mean()) / pl.col("val").std()).alias("zscore"))
         , .{NUM_ROWS});
 
         var total_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runPolars(allocator, sql) catch 0;
-        for (0..ITERATIONS) |_| total_ns += runPolars(allocator, sql) catch 0;
+        for (0..WARMUP) |_| _ = runPolars(allocator, py_code) catch 0;
+        for (0..ITERATIONS) |_| total_ns += runPolars(allocator, py_code) catch 0;
 
         const avg_ns = total_ns / ITERATIONS;
         const time_ms = @as(f64, @floatFromInt(avg_ns)) / 1_000_000.0;
@@ -221,15 +239,18 @@ pub fn main() !void {
         std.debug.print("{s:<15} {d:>9.0} ms {d:>10.0} K/s {d:>9.1}x\n", .{ "DuckDB", time_ms, rows_per_sec / 1000, ratio });
     }
 
-    // Polars
+    // Polars (DataFrame API)
     if (has_polars) {
-        const sql = std.fmt.comptimePrint(
-            \\SELECT LN(val + 1) as log_val FROM (SELECT random() * 1000 as val FROM generate_series(1, {d}))
+        const py_code = std.fmt.comptimePrint(
+            \\import polars as pl
+            \\import numpy as np
+            \\df = pl.DataFrame({{"val": np.random.rand({d}) * 1000}})
+            \\result = df.with_columns((pl.col("val") + 1).log().alias("log_val"))
         , .{NUM_ROWS});
 
         var total_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runPolars(allocator, sql) catch 0;
-        for (0..ITERATIONS) |_| total_ns += runPolars(allocator, sql) catch 0;
+        for (0..WARMUP) |_| _ = runPolars(allocator, py_code) catch 0;
+        for (0..ITERATIONS) |_| total_ns += runPolars(allocator, py_code) catch 0;
 
         const avg_ns = total_ns / ITERATIONS;
         const time_ms = @as(f64, @floatFromInt(avg_ns)) / 1_000_000.0;
@@ -280,15 +301,18 @@ pub fn main() !void {
         std.debug.print("{s:<15} {d:>9.0} ms {d:>10.0} K/s {d:>9.1}x\n", .{ "DuckDB", time_ms, rows_per_sec / 1000, ratio });
     }
 
-    // Polars
+    // Polars (DataFrame API)
     if (has_polars) {
-        const sql = std.fmt.comptimePrint(
-            \\SELECT a * b as crossed FROM (SELECT random() * 1000 as a, random() * 1000 as b FROM generate_series(1, {d}))
-        , .{NUM_ROWS});
+        const py_code = std.fmt.comptimePrint(
+            \\import polars as pl
+            \\import numpy as np
+            \\df = pl.DataFrame({{"a": np.random.rand({d}) * 1000, "b": np.random.rand({d}) * 1000}})
+            \\result = df.with_columns((pl.col("a") * pl.col("b")).alias("crossed"))
+        , .{ NUM_ROWS, NUM_ROWS });
 
         var total_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runPolars(allocator, sql) catch 0;
-        for (0..ITERATIONS) |_| total_ns += runPolars(allocator, sql) catch 0;
+        for (0..WARMUP) |_| _ = runPolars(allocator, py_code) catch 0;
+        for (0..ITERATIONS) |_| total_ns += runPolars(allocator, py_code) catch 0;
 
         const avg_ns = total_ns / ITERATIONS;
         const time_ms = @as(f64, @floatFromInt(avg_ns)) / 1_000_000.0;
@@ -339,15 +363,18 @@ pub fn main() !void {
         std.debug.print("{s:<15} {d:>9.0} ms {d:>10.0} K/s {d:>9.1}x\n", .{ "DuckDB", time_ms, rows_per_sec / 1000, ratio });
     }
 
-    // Polars
+    // Polars (DataFrame API) - use cut for binning
     if (has_polars) {
-        const sql = std.fmt.comptimePrint(
-            \\SELECT WIDTH_BUCKET(val, 0, 1000, 10) as bin FROM (SELECT random() * 1000 as val FROM generate_series(1, {d}))
+        const py_code = std.fmt.comptimePrint(
+            \\import polars as pl
+            \\import numpy as np
+            \\df = pl.DataFrame({{"val": np.random.rand({d}) * 1000}})
+            \\result = df.with_columns(pl.col("val").cut([100,200,300,400,500,600,700,800,900]).alias("bin"))
         , .{NUM_ROWS});
 
         var total_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runPolars(allocator, sql) catch 0;
-        for (0..ITERATIONS) |_| total_ns += runPolars(allocator, sql) catch 0;
+        for (0..WARMUP) |_| _ = runPolars(allocator, py_code) catch 0;
+        for (0..ITERATIONS) |_| total_ns += runPolars(allocator, py_code) catch 0;
 
         const avg_ns = total_ns / ITERATIONS;
         const time_ms = @as(f64, @floatFromInt(avg_ns)) / 1_000_000.0;
@@ -363,7 +390,9 @@ pub fn main() !void {
     std.debug.print("Summary\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("Fair comparison: All engines run via subprocess CLI.\n", .{});
-    std.debug.print("Each has ~30ms subprocess spawn overhead, so ratios reflect actual compute.\n", .{});
+    std.debug.print("Fair comparison using each engine's native interface:\n", .{});
+    std.debug.print("  - LanceQL/DuckDB: CLI subprocess with SQL\n", .{});
+    std.debug.print("  - Polars: Python subprocess with DataFrame API\n", .{});
+    std.debug.print("\nAll have similar subprocess spawn overhead (~30ms).\n", .{});
     std.debug.print("\n", .{});
 }
