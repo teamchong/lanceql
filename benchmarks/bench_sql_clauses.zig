@@ -72,9 +72,9 @@ pub fn main() !void {
     var results = std.ArrayListUnmanaged(BenchmarkResult){};
     defer results.deinit(allocator);
 
-    // Benchmark each clause at 200M rows for 30+ second runs
-    // This ensures we measure actual compute, not Python/CLI cold start
-    const num_rows: usize = 200_000_000;
+    // Benchmark each clause at 10M rows to avoid memory issues
+    // GROUP BY with 200M rows needs 3.2GB which causes OOM
+    const num_rows: usize = 10_000_000;
 
     std.debug.print("================================================================================\n", .{});
     std.debug.print("Dataset: {d}M rows\n", .{num_rows / 1_000_000});
@@ -138,12 +138,12 @@ fn createTestParquet(allocator: std.mem.Allocator) ![]const u8 {
         \\    random() AS value,
         \\    i % 100 AS group_key,
         \\    'item_' || (i % 1000) AS name
-        \\  FROM range(200000000) t(i)
+        \\  FROM range(10000000) t(i)
         \\) TO '{s}' (FORMAT PARQUET);
     , .{path});
     defer allocator.free(sql);
 
-    std.debug.print("Creating test data (200M rows): {s}...\n", .{path});
+    std.debug.print("Creating test data (10M rows): {s}...\n", .{path});
 
     const result = std.process.Child.run(.{
         .allocator = allocator,
