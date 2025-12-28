@@ -62,19 +62,18 @@ fn nativeSumValues(a: []const f64) f64 {
 // =============================================================================
 
 const WARMUP = 5;
-const ITERATIONS = 100_000;
-const DUCKDB_ITERATIONS = 2000;
-const POLARS_ITERATIONS = 100_000;
+const ITERATIONS = 50_000_000; // ~5 seconds at ~100ns per op
+const TARGET_SECONDS: f64 = 5.0;
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     std.debug.print("\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("Compiled @logic_table Benchmark: LanceQL vs DuckDB vs Polars\n", .{});
+    std.debug.print("Compiled @logic_table Benchmark\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("Comparing: @logic_table (compiled) vs Native Zig vs DuckDB vs Polars\n", .{});
-    std.debug.print("Warmup: {}, Iterations: {}K\n", .{ WARMUP, ITERATIONS / 1000 });
+    std.debug.print("Comparing: @logic_table (compiled) vs Native Zig\n", .{});
+    std.debug.print("Target: ~{d:.0} seconds per dimension | Iterations: {d}M\n", .{ TARGET_SECONDS, ITERATIONS / 1_000_000 });
     std.debug.print("\n", .{});
 
     // Test vectors

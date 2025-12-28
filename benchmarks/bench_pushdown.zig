@@ -22,9 +22,11 @@ fn computeRiskScore(amount: f64, days_since_signup: i64, previous_fraud: bool) f
     return @min(1.0, score);
 }
 
-const ROWS: usize = 100_000; // 100K rows for reasonable Python benchmark time
-const WARMUP: usize = 3;
-const ITERATIONS: usize = 5;
+// Target ~5 seconds per benchmark for meaningful results
+const ROWS: usize = 1_000_000; // 1M rows
+const WARMUP: usize = 2;
+const LANCEQL_ITERATIONS: usize = 1000; // Native code is fast, need many iterations
+const PYTHON_ITERATIONS: usize = 3; // Python is slow, fewer iterations
 
 fn runPythonBenchmark(allocator: std.mem.Allocator, script: []const u8) !u64 {
     const result = std.process.Child.run(.{
@@ -57,7 +59,7 @@ pub fn main() !void {
     std.debug.print("@logic_table Pushdown Benchmark: LanceQL vs DuckDB vs Polars\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("Rows: {d} | Filter: amount > 25000 (~50pct selectivity)\n", .{ROWS});
+    std.debug.print("Rows: {d} | Target: ~5 seconds per method\n", .{ROWS});
     std.debug.print("\n", .{});
     std.debug.print("Comparing:\n", .{});
     std.debug.print("  1. LanceQL @logic_table  - Pushdown (only compute filtered rows)\n", .{});
@@ -110,14 +112,16 @@ pub fn main() !void {
     {
         const filtered = filtered_indices.items;
 
+        // Warmup
         for (0..WARMUP) |_| {
             for (filtered) |idx| {
                 results[idx] = computeRiskScore(amounts[idx], days_since_signup[idx], previous_fraud[idx]);
             }
         }
 
+        // Benchmark - run many iterations to get ~5 seconds
         var total_ns: u64 = 0;
-        for (0..ITERATIONS) |_| {
+        for (0..LANCEQL_ITERATIONS) |_| {
             var timer = try std.time.Timer.start();
             for (filtered) |idx| {
                 results[idx] = computeRiskScore(amounts[idx], days_since_signup[idx], previous_fraud[idx]);
@@ -125,7 +129,7 @@ pub fn main() !void {
             std.mem.doNotOptimizeAway(results);
             total_ns += timer.read();
         }
-        lanceql_ns = total_ns / ITERATIONS;
+        lanceql_ns = total_ns / LANCEQL_ITERATIONS;
         const ms = @as(f64, @floatFromInt(lanceql_ns)) / 1_000_000.0;
         const per_row = @as(f64, @floatFromInt(lanceql_ns)) / @as(f64, @floatFromInt(filtered.len));
         std.debug.print("{s:<30} {d:>9.2} ms {d:>9.0} ns {s:>10}\n", .{
@@ -140,12 +144,12 @@ pub fn main() !void {
             \\import time
             \\import numpy as np
             \\
-            \\ROWS = 100000
-            \\ITERATIONS = 5
+            \\ROWS = 1000000
+            \\ITERATIONS = 3
             \\
             \\con = duckdb.connect()
             \\
-            \\# Generate same test data
+            \\# Generate test data
             \\np.random.seed(42)
             \\amounts = np.random.uniform(0, 50000, ROWS)
             \\days = np.random.randint(1, 366, ROWS)
@@ -172,13 +176,12 @@ pub fn main() !void {
             \\    parameters=['DOUBLE', 'BIGINT', 'BOOLEAN'], return_type='DOUBLE')
             \\
             \\# Warmup
-            \\con.execute("SELECT risk_score(amount, days_since_signup, previous_fraud) FROM orders WHERE amount > 25000 LIMIT 100").fetchall()
+            \\con.execute("SELECT risk_score(amount, days_since_signup, previous_fraud) FROM orders LIMIT 1000").fetchall()
             \\
             \\# Benchmark - UDF called for ALL rows, THEN filtered
             \\times = []
             \\for _ in range(ITERATIONS):
             \\    start = time.perf_counter_ns()
-            \\    # Note: DuckDB calls UDF for ALL rows, filters AFTER
             \\    results = con.execute("""
             \\        SELECT risk_score(amount, days_since_signup, previous_fraud)
             \\        FROM orders
@@ -212,12 +215,12 @@ pub fn main() !void {
             \\import time
             \\import numpy as np
             \\
-            \\ROWS = 100000
-            \\ITERATIONS = 5
+            \\ROWS = 1000000
+            \\ITERATIONS = 10
             \\
             \\con = duckdb.connect()
             \\
-            \\# Generate same test data
+            \\# Generate test data
             \\np.random.seed(42)
             \\amounts = np.random.uniform(0, 50000, ROWS)
             \\days = np.random.randint(1, 366, ROWS)
@@ -233,22 +236,20 @@ pub fn main() !void {
             \\""", [amounts.tolist(), days.tolist(), fraud.tolist()])
             \\
             \\# Warmup
-            \\_ = con.execute("SELECT * FROM orders WHERE amount > 25000 LIMIT 100").fetchnumpy()
+            \\_ = con.execute("SELECT * FROM orders WHERE amount > 25000 LIMIT 1000").fetchnumpy()
             \\
             \\# Benchmark - pull filtered data, then process in NumPy
             \\times = []
             \\for _ in range(ITERATIONS):
             \\    start = time.perf_counter_ns()
-            \\    # Pull filtered data
             \\    data = con.execute("SELECT * FROM orders WHERE amount > 25000").fetchnumpy()
-            \\    # Process in NumPy
-            \\    amounts = data['amount']
-            \\    days = data['days_since_signup']
-            \\    fraud = data['previous_fraud']
-            \\    scores = np.zeros(len(amounts))
-            \\    scores += np.where(amounts > 10000, np.minimum(0.4, amounts / 125000), 0)
-            \\    scores += np.where(days < 30, 0.3, 0)
-            \\    scores += np.where(fraud, 0.5, 0)
+            \\    amounts_f = data['amount']
+            \\    days_f = data['days_since_signup']
+            \\    fraud_f = data['previous_fraud']
+            \\    scores = np.zeros(len(amounts_f))
+            \\    scores += np.where(amounts_f > 10000, np.minimum(0.4, amounts_f / 125000), 0)
+            \\    scores += np.where(days_f < 30, 0.3, 0)
+            \\    scores += np.where(fraud_f, 0.5, 0)
             \\    scores = np.minimum(1.0, scores)
             \\    times.append(time.perf_counter_ns() - start)
             \\
@@ -278,10 +279,10 @@ pub fn main() !void {
             \\import time
             \\import numpy as np
             \\
-            \\ROWS = 100000
-            \\ITERATIONS = 5
+            \\ROWS = 1000000
+            \\ITERATIONS = 3
             \\
-            \\# Generate same test data
+            \\# Generate test data
             \\np.random.seed(42)
             \\df = pl.DataFrame({
             \\    'amount': np.random.uniform(0, 50000, ROWS),
@@ -298,19 +299,18 @@ pub fn main() !void {
             \\    return min(1.0, score)
             \\
             \\# Warmup
-            \\_ = df.head(100).select(
+            \\_ = df.head(1000).select(
             \\    pl.struct(pl.all()).map_elements(risk_score_udf, return_dtype=pl.Float64)
             \\)
             \\
-            \\# Benchmark - UDF called for ALL rows, then filter
+            \\# Benchmark - UDF called for filtered rows
             \\times = []
             \\for _ in range(ITERATIONS):
             \\    start = time.perf_counter_ns()
-            \\    # Polars evaluates UDF for ALL rows, filters AFTER
             \\    result = df.filter(pl.col('amount') > 25000).select(
             \\        pl.struct(pl.all()).map_elements(risk_score_udf, return_dtype=pl.Float64)
             \\    )
-            \\    _ = result.to_numpy()  # Force evaluation
+            \\    _ = result.to_numpy()
             \\    times.append(time.perf_counter_ns() - start)
             \\
             \\avg_ns = sum(times) // len(times)
@@ -339,10 +339,10 @@ pub fn main() !void {
             \\import time
             \\import numpy as np
             \\
-            \\ROWS = 100000
-            \\ITERATIONS = 5
+            \\ROWS = 1000000
+            \\ITERATIONS = 10
             \\
-            \\# Generate same test data
+            \\# Generate test data
             \\np.random.seed(42)
             \\df = pl.DataFrame({
             \\    'amount': np.random.uniform(0, 50000, ROWS),
@@ -351,23 +351,20 @@ pub fn main() !void {
             \\})
             \\
             \\# Warmup
-            \\_ = df.head(100).filter(pl.col('amount') > 25000).to_numpy()
+            \\_ = df.filter(pl.col('amount') > 25000).head(1000).to_numpy()
             \\
             \\# Benchmark - filter in Polars, then NumPy batch
             \\times = []
             \\for _ in range(ITERATIONS):
             \\    start = time.perf_counter_ns()
-            \\    # Filter first
             \\    filtered = df.filter(pl.col('amount') > 25000)
-            \\    # Pull to NumPy
-            \\    amounts = filtered['amount'].to_numpy()
-            \\    days = filtered['days_since_signup'].to_numpy()
-            \\    fraud = filtered['previous_fraud'].to_numpy()
-            \\    # Process in NumPy
-            \\    scores = np.zeros(len(amounts))
-            \\    scores += np.where(amounts > 10000, np.minimum(0.4, amounts / 125000), 0)
-            \\    scores += np.where(days < 30, 0.3, 0)
-            \\    scores += np.where(fraud, 0.5, 0)
+            \\    amounts_f = filtered['amount'].to_numpy()
+            \\    days_f = filtered['days_since_signup'].to_numpy()
+            \\    fraud_f = filtered['previous_fraud'].to_numpy()
+            \\    scores = np.zeros(len(amounts_f))
+            \\    scores += np.where(amounts_f > 10000, np.minimum(0.4, amounts_f / 125000), 0)
+            \\    scores += np.where(days_f < 30, 0.3, 0)
+            \\    scores += np.where(fraud_f, 0.5, 0)
             \\    scores = np.minimum(1.0, scores)
             \\    times.append(time.perf_counter_ns() - start)
             \\
@@ -397,9 +394,8 @@ pub fn main() !void {
     std.debug.print("\n", .{});
     std.debug.print("DuckDB/Polars UDF:\n", .{});
     std.debug.print("  SELECT risk_score(amount, days, fraud) FROM orders WHERE amount > 25000\n", .{});
-    std.debug.print("  -> Python UDF called for ALL {d} rows\n", .{ROWS});
-    std.debug.print("  -> Filter applied AFTER UDF execution\n", .{});
-    std.debug.print("  -> Wasted computation on {d} rows\n", .{ROWS - filtered_indices.items.len});
+    std.debug.print("  -> Python UDF processes rows, then filter applied\n", .{});
+    std.debug.print("  -> Significant Python interpreter overhead per row\n", .{});
     std.debug.print("\n", .{});
     std.debug.print("LanceQL @logic_table:\n", .{});
     std.debug.print("  SELECT t.risk_score() FROM logic_table('fraud.py') t WHERE amount > 25000\n", .{});

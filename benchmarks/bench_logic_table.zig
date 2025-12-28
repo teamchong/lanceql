@@ -15,8 +15,9 @@
 const std = @import("std");
 
 const WARMUP = 3;
-const ITERATIONS = 100_000;
+const LANCEQL_ITERATIONS = 500_000; // Native code needs many iterations for ~5 seconds
 const BATCH_SIZE = 10_000; // Number of vectors to process
+const PYTHON_ITERATIONS = 5; // Python benchmarks run multiple times
 
 // Compiled @logic_table function (from lib/vector_ops.a)
 extern fn VectorOps_dot_product(a: [*]const f64, b: [*]const f64, len: usize) f64;
@@ -46,6 +47,7 @@ fn runDuckDBUDF(allocator: std.mem.Allocator, batch_size: usize) !u64 {
         \\import time
         \\import numpy as np
         \\
+        \\ITERATIONS = {d}
         \\con = duckdb.connect()
         \\
         \\# Create Python UDF (row-by-row, no pushdown)
@@ -62,12 +64,14 @@ fn runDuckDBUDF(allocator: std.mem.Allocator, batch_size: usize) !u64 {
         \\# Warmup
         \\con.execute("SELECT dot_product(a, b) FROM vectors LIMIT 10").fetchall()
         \\
-        \\# Benchmark: DuckDB calls Python UDF for EACH ROW
-        \\start = time.perf_counter_ns()
-        \\results = con.execute("SELECT dot_product(a, b) FROM vectors").fetchall()
-        \\elapsed = time.perf_counter_ns() - start
-        \\print(elapsed)
-    , .{batch_size});
+        \\# Benchmark: Run multiple iterations
+        \\times = []
+        \\for _ in range(ITERATIONS):
+        \\    start = time.perf_counter_ns()
+        \\    results = con.execute("SELECT dot_product(a, b) FROM vectors").fetchall()
+        \\    times.append(time.perf_counter_ns() - start)
+        \\print(sum(times) // len(times))
+    , .{ PYTHON_ITERATIONS, batch_size });
     defer allocator.free(py_code);
 
     const result = std.process.Child.run(.{
@@ -91,6 +95,7 @@ fn runDuckDBBatch(allocator: std.mem.Allocator, batch_size: usize) !u64 {
         \\import time
         \\import numpy as np
         \\
+        \\ITERATIONS = {d}
         \\con = duckdb.connect()
         \\
         \\# Generate test data in DuckDB
@@ -101,15 +106,17 @@ fn runDuckDBBatch(allocator: std.mem.Allocator, batch_size: usize) !u64 {
         \\# Warmup
         \\_ = con.execute("SELECT * FROM vectors LIMIT 10").fetchnumpy()
         \\
-        \\# Benchmark: Pull ALL data, then process in Python batch
-        \\start = time.perf_counter_ns()
-        \\df = con.execute("SELECT * FROM vectors").fetchnumpy()
-        \\a_arr = np.array(df['a'].tolist())
-        \\b_arr = np.array(df['b'].tolist())
-        \\results = np.sum(a_arr * b_arr, axis=1)
-        \\elapsed = time.perf_counter_ns() - start
-        \\print(elapsed)
-    , .{batch_size});
+        \\# Benchmark: Run multiple iterations
+        \\times = []
+        \\for _ in range(ITERATIONS):
+        \\    start = time.perf_counter_ns()
+        \\    df = con.execute("SELECT * FROM vectors").fetchnumpy()
+        \\    a_arr = np.array(df['a'].tolist())
+        \\    b_arr = np.array(df['b'].tolist())
+        \\    results = np.sum(a_arr * b_arr, axis=1)
+        \\    times.append(time.perf_counter_ns() - start)
+        \\print(sum(times) // len(times))
+    , .{ PYTHON_ITERATIONS, batch_size });
     defer allocator.free(py_code);
 
     const result = std.process.Child.run(.{
@@ -133,6 +140,8 @@ fn runPolarsUDF(allocator: std.mem.Allocator, batch_size: usize) !u64 {
         \\import time
         \\import numpy as np
         \\
+        \\ITERATIONS = {d}
+        \\
         \\# Generate test data
         \\np.random.seed(42)
         \\df = pl.DataFrame({{
@@ -147,12 +156,14 @@ fn runPolarsUDF(allocator: std.mem.Allocator, batch_size: usize) !u64 {
         \\# Warmup
         \\_ = df.head(10).select(pl.struct('a', 'b').map_elements(dot_product_udf, return_dtype=pl.Float64))
         \\
-        \\# Benchmark: Polars calls Python for EACH ROW
-        \\start = time.perf_counter_ns()
-        \\results = df.select(pl.struct('a', 'b').map_elements(dot_product_udf, return_dtype=pl.Float64))
-        \\elapsed = time.perf_counter_ns() - start
-        \\print(elapsed)
-    , .{ batch_size, batch_size });
+        \\# Benchmark: Run multiple iterations
+        \\times = []
+        \\for _ in range(ITERATIONS):
+        \\    start = time.perf_counter_ns()
+        \\    results = df.select(pl.struct('a', 'b').map_elements(dot_product_udf, return_dtype=pl.Float64))
+        \\    times.append(time.perf_counter_ns() - start)
+        \\print(sum(times) // len(times))
+    , .{ PYTHON_ITERATIONS, batch_size, batch_size });
     defer allocator.free(py_code);
 
     const result = std.process.Child.run(.{
@@ -176,6 +187,8 @@ fn runPolarsBatch(allocator: std.mem.Allocator, batch_size: usize) !u64 {
         \\import time
         \\import numpy as np
         \\
+        \\ITERATIONS = {d}
+        \\
         \\# Generate test data
         \\np.random.seed(42)
         \\df = pl.DataFrame({{
@@ -186,14 +199,16 @@ fn runPolarsBatch(allocator: std.mem.Allocator, batch_size: usize) !u64 {
         \\# Warmup
         \\_ = np.array(df.head(10)['a'].to_list())
         \\
-        \\# Benchmark: Pull ALL data to NumPy, then batch process
-        \\start = time.perf_counter_ns()
-        \\a_arr = np.array(df['a'].to_list())
-        \\b_arr = np.array(df['b'].to_list())
-        \\results = np.sum(a_arr * b_arr, axis=1)
-        \\elapsed = time.perf_counter_ns() - start
-        \\print(elapsed)
-    , .{ batch_size, batch_size });
+        \\# Benchmark: Run multiple iterations
+        \\times = []
+        \\for _ in range(ITERATIONS):
+        \\    start = time.perf_counter_ns()
+        \\    a_arr = np.array(df['a'].to_list())
+        \\    b_arr = np.array(df['b'].to_list())
+        \\    results = np.sum(a_arr * b_arr, axis=1)
+        \\    times.append(time.perf_counter_ns() - start)
+        \\print(sum(times) // len(times))
+    , .{ PYTHON_ITERATIONS, batch_size, batch_size });
     defer allocator.free(py_code);
 
     const result = std.process.Child.run(.{
@@ -217,6 +232,10 @@ pub fn main() !void {
     std.debug.print("================================================================================\n", .{});
     std.debug.print("@logic_table Benchmark: LanceQL vs DuckDB vs Polars\n", .{});
     std.debug.print("================================================================================\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("Target: ~5 seconds per method\n", .{});
+    std.debug.print("  LanceQL: {d}K iterations × {d} vectors\n", .{ LANCEQL_ITERATIONS / 1000, BATCH_SIZE });
+    std.debug.print("  Python:  {d} iterations × {d} vectors\n", .{ PYTHON_ITERATIONS, BATCH_SIZE });
     std.debug.print("\n", .{});
     std.debug.print("Comparing ALL approaches for custom compute on {d} vectors (384-dim):\n", .{BATCH_SIZE});
     std.debug.print("  1. LanceQL @logic_table  - Native pushdown (no Python overhead)\n", .{});
@@ -257,19 +276,27 @@ pub fn main() !void {
     std.debug.print("{s:<25} {s:>12} {s:>12} {s:>10}\n", .{ "-" ** 25, "-" ** 12, "-" ** 12, "-" ** 10 });
 
     // 1. LanceQL @logic_table (pushdown) - baseline
+    // Run many iterations to get ~5 seconds total
     var lanceql_ns: u64 = 0;
     {
         // Warmup
-        for (0..10) |i| {
-            results[i] = VectorOps_dot_product(data_a.ptr + i * dim, data_b.ptr + i * dim, dim);
+        for (0..WARMUP) |_| {
+            for (0..BATCH_SIZE) |i| {
+                results[i] = VectorOps_dot_product(data_a.ptr + i * dim, data_b.ptr + i * dim, dim);
+            }
         }
 
-        var timer = try std.time.Timer.start();
-        for (0..BATCH_SIZE) |i| {
-            results[i] = VectorOps_dot_product(data_a.ptr + i * dim, data_b.ptr + i * dim, dim);
+        // Benchmark with many iterations
+        var total_ns: u64 = 0;
+        for (0..LANCEQL_ITERATIONS) |_| {
+            var timer = try std.time.Timer.start();
+            for (0..BATCH_SIZE) |i| {
+                results[i] = VectorOps_dot_product(data_a.ptr + i * dim, data_b.ptr + i * dim, dim);
+            }
+            std.mem.doNotOptimizeAway(results);
+            total_ns += timer.read();
         }
-        std.mem.doNotOptimizeAway(results);
-        lanceql_ns = timer.read();
+        lanceql_ns = total_ns / LANCEQL_ITERATIONS;
     }
     const lt_per_row = @as(f64, @floatFromInt(lanceql_ns)) / @as(f64, @floatFromInt(BATCH_SIZE));
     const lt_total_ms = @as(f64, @floatFromInt(lanceql_ns)) / 1_000_000.0;
