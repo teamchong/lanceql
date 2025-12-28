@@ -744,6 +744,24 @@ pub fn build(b: *std.Build) void {
     const test_logic_table_ffi_step = b.step("test-logic-table-ffi", "Run @logic_table FFI tests (compiled Python functions)");
     test_logic_table_ffi_step.dependOn(&run_test_logic_table_ffi.step);
 
+    // JIT codegen tests - metal0 integration and JIT compilation
+    const test_codegen = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/codegen/metal0_jit.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "metal0", .module = metal0_mod },
+                .{ .name = "lanceql.format", .module = format_mod },
+                .{ .name = "lanceql.proto", .module = proto_mod },
+            },
+        }),
+    });
+    const run_test_codegen = b.addRunArtifact(test_codegen);
+    const test_codegen_step = b.step("test-codegen", "Run JIT codegen tests (metal0 integration)");
+    test_codegen_step.dependOn(&run_test_codegen.step);
+    test_step.dependOn(&run_test_codegen.step);
+
     // Stress tests - large datasets, memory pressure, edge cases
     const test_stress = b.addTest(.{
         .root_module = b.createModule(.{
