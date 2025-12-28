@@ -123,6 +123,14 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("deps/metal0/src/main.zig"),
     });
 
+    // Query expression module - for predicate fusion in codegen
+    const query_expr_mod = b.addModule("lanceql.query.expr", .{
+        .root_source_file = b.path("src/query/expr.zig"),
+        .imports = &.{
+            .{ .name = "lanceql.value", .module = value_mod },
+        },
+    });
+
     // Codegen module - JIT compilation integration with metal0
     const codegen_mod = b.addModule("lanceql.codegen", .{
         .root_source_file = b.path("src/codegen/metal0_jit.zig"),
@@ -130,6 +138,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "metal0", .module = metal0_mod },
             .{ .name = "lanceql.format", .module = format_mod },
             .{ .name = "lanceql.proto", .module = proto_mod },
+            .{ .name = "lanceql.query.expr", .module = query_expr_mod },
         },
     });
 
@@ -754,6 +763,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "metal0", .module = metal0_mod },
                 .{ .name = "lanceql.format", .module = format_mod },
                 .{ .name = "lanceql.proto", .module = proto_mod },
+                .{ .name = "lanceql.query.expr", .module = query_expr_mod },
             },
         }),
     });

@@ -1,19 +1,23 @@
-//! @logic_table Pushdown Benchmark
+//! @logic_table Benchmark - HONEST Comparison
 //!
-//! Compares ALL approaches for custom compute with filtering:
-//!   1. LanceQL @logic_table  - Native pushdown (only compute filtered rows)
-//!   2. DuckDB Python UDF     - Row-by-row, NO pushdown (compute ALL then filter)
-//!   3. DuckDB → Python batch - Pull ALL data, then process in Python
-//!   4. Polars .apply() UDF   - Row-by-row, NO pushdown (compute ALL then filter)
-//!   5. Polars → Python batch - Pull ALL data, then process in Python
+//! What we're actually comparing:
+//!   1. LanceQL native Zig  - Hand-written Zig code (filter + compute)
+//!   2. DuckDB Python UDF   - Row-by-row Python calls through DuckDB
+//!   3. DuckDB + NumPy      - Filter in DuckDB, batch compute in NumPy
+//!   4. Polars Python UDF   - Row-by-row Python calls (filter DOES pushdown)
+//!   5. Polars + NumPy      - Filter in Polars, batch compute in NumPy
 //!
-//! KEY INSIGHT: @logic_table only computes on filtered rows!
-//!   - UDFs compute on ALL rows, then WHERE filters results
-//!   - @logic_table gets filtered_indices FIRST, then only computes on those
+//! HONEST NOTES:
+//!   - LanceQL is native Zig, NOT JIT-compiled Python (JIT is WIP)
+//!   - Polars .filter().apply() DOES pushdown - UDF runs on filtered rows only
+//!   - The comparison is: native Zig vs Python, NOT @logic_table vs UDF
+//!
+//! This benchmark shows the POTENTIAL of @logic_table when JIT is complete.
+//! Current implementation uses hand-written Zig as a proxy.
 
 const std = @import("std");
 
-// Simulated compiled @logic_table function (what metal0 would generate)
+// Hand-written native function (NOT JIT compiled from Python yet)
 fn computeRiskScore(amount: f64, days_since_signup: i64, previous_fraud: bool) f64 {
     var score: f64 = 0.0;
     if (amount > 10000) score += @min(0.4, amount / 125000.0);
@@ -22,11 +26,10 @@ fn computeRiskScore(amount: f64, days_since_signup: i64, previous_fraud: bool) f
     return @min(1.0, score);
 }
 
-// Target ~5 seconds per benchmark for meaningful results
-const ROWS: usize = 1_000_000; // 1M rows
+const ROWS: usize = 1_000_000;
 const WARMUP: usize = 2;
-const LANCEQL_ITERATIONS: usize = 1000; // Native code is fast, need many iterations
-const PYTHON_ITERATIONS: usize = 3; // Python is slow, fewer iterations
+const ZIG_ITERATIONS: usize = 100; // Fewer iterations, include filter time
+const PYTHON_ITERATIONS: usize = 3;
 
 fn runPythonBenchmark(allocator: std.mem.Allocator, script: []const u8) !u64 {
     const result = std.process.Child.run(.{
@@ -39,7 +42,6 @@ fn runPythonBenchmark(allocator: std.mem.Allocator, script: []const u8) !u64 {
         allocator.free(result.stderr);
     }
 
-    // Parse RESULT_NS:xxxxx from output
     if (std.mem.indexOf(u8, result.stdout, "RESULT_NS:")) |idx| {
         const start = idx + 10;
         var end = start;
@@ -56,17 +58,13 @@ pub fn main() !void {
 
     std.debug.print("\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("@logic_table Pushdown Benchmark: LanceQL vs DuckDB vs Polars\n", .{});
+    std.debug.print("HONEST Benchmark: Native Zig vs Python (filter + compute)\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("Rows: {d} | Target: ~5 seconds per method\n", .{ROWS});
+    std.debug.print("NOTE: LanceQL uses hand-written Zig, NOT JIT-compiled Python.\n", .{});
+    std.debug.print("      This shows POTENTIAL speedup when JIT is complete.\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("Comparing:\n", .{});
-    std.debug.print("  1. LanceQL @logic_table  - Pushdown (only compute filtered rows)\n", .{});
-    std.debug.print("  2. DuckDB Python UDF     - NO pushdown (compute ALL rows)\n", .{});
-    std.debug.print("  3. DuckDB -> Python batch - Pull data, then NumPy\n", .{});
-    std.debug.print("  4. Polars .apply() UDF   - NO pushdown (compute ALL rows)\n", .{});
-    std.debug.print("  5. Polars -> Python batch - Pull data, then NumPy\n", .{});
+    std.debug.print("Rows: {d} | All timings include filter + compute\n", .{ROWS});
     std.debug.print("\n", .{});
 
     // Generate test data
@@ -86,58 +84,57 @@ pub fn main() !void {
         previous_fraud[i] = rng.random().float(f64) < 0.05;
     }
 
-    // Pre-compute filtered indices (what QueryContext.filtered_indices provides)
-    var filtered_indices = std.ArrayListUnmanaged(u32){};
-    defer filtered_indices.deinit(allocator);
+    // Count filtered rows for reference
+    var filtered_count: usize = 0;
     for (0..ROWS) |i| {
-        if (amounts[i] > 25000) {
-            try filtered_indices.append(allocator, @intCast(i));
-        }
+        if (amounts[i] > 25000) filtered_count += 1;
     }
 
-    std.debug.print("Filtered rows: {d} / {d} ({d:.1}pct selectivity)\n", .{
-        filtered_indices.items.len,
-        ROWS,
-        @as(f64, @floatFromInt(filtered_indices.items.len)) / @as(f64, @floatFromInt(ROWS)) * 100,
+    std.debug.print("Filtered rows: {d} / {d} ({d:.1}%% selectivity)\n", .{
+        filtered_count, ROWS,
+        @as(f64, @floatFromInt(filtered_count)) / @as(f64, @floatFromInt(ROWS)) * 100,
     });
     std.debug.print("\n", .{});
 
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("{s:<30} {s:>12} {s:>12} {s:>10}\n", .{ "Method", "Total (ms)", "Per Row", "Speedup" });
-    std.debug.print("{s:<30} {s:>12} {s:>12} {s:>10}\n", .{ "-" ** 30, "-" ** 12, "-" ** 12, "-" ** 10 });
+    std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "Method", "Total (ms)", "Per Row", "Speedup" });
+    std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "-" ** 35, "-" ** 12, "-" ** 12, "-" ** 10 });
 
-    var lanceql_ns: u64 = 0;
+    var zig_ns: u64 = 0;
 
-    // 1. LanceQL @logic_table with pushdown (only compute filtered rows)
+    // 1. Native Zig (filter + compute IN SAME TIMING)
     {
-        const filtered = filtered_indices.items;
-
         // Warmup
         for (0..WARMUP) |_| {
-            for (filtered) |idx| {
-                results[idx] = computeRiskScore(amounts[idx], days_since_signup[idx], previous_fraud[idx]);
+            for (0..ROWS) |i| {
+                if (amounts[i] > 25000) {
+                    results[i] = computeRiskScore(amounts[i], days_since_signup[i], previous_fraud[i]);
+                }
             }
         }
 
-        // Benchmark - run many iterations to get ~5 seconds
+        // Benchmark - INCLUDES filter time
         var total_ns: u64 = 0;
-        for (0..LANCEQL_ITERATIONS) |_| {
+        for (0..ZIG_ITERATIONS) |_| {
             var timer = try std.time.Timer.start();
-            for (filtered) |idx| {
-                results[idx] = computeRiskScore(amounts[idx], days_since_signup[idx], previous_fraud[idx]);
+            // Filter AND compute in one pass
+            for (0..ROWS) |i| {
+                if (amounts[i] > 25000) {
+                    results[i] = computeRiskScore(amounts[i], days_since_signup[i], previous_fraud[i]);
+                }
             }
             std.mem.doNotOptimizeAway(results);
             total_ns += timer.read();
         }
-        lanceql_ns = total_ns / LANCEQL_ITERATIONS;
-        const ms = @as(f64, @floatFromInt(lanceql_ns)) / 1_000_000.0;
-        const per_row = @as(f64, @floatFromInt(lanceql_ns)) / @as(f64, @floatFromInt(filtered.len));
-        std.debug.print("{s:<30} {d:>9.2} ms {d:>9.0} ns {s:>10}\n", .{
-            "LanceQL @logic_table", ms, per_row, "1.0x",
+        zig_ns = total_ns / ZIG_ITERATIONS;
+        const ms = @as(f64, @floatFromInt(zig_ns)) / 1_000_000.0;
+        const per_row = @as(f64, @floatFromInt(zig_ns)) / @as(f64, @floatFromInt(filtered_count));
+        std.debug.print("{s:<35} {d:>9.2} ms {d:>9.0} ns {s:>10}\n", .{
+            "Native Zig (filter+compute)", ms, per_row, "1.0x",
         });
     }
 
-    // 2. DuckDB Python UDF (NO pushdown - computes ALL rows)
+    // 2. DuckDB Python UDF (filter pushdown, Python UDF per row)
     {
         const script =
             \\import duckdb
@@ -149,7 +146,6 @@ pub fn main() !void {
             \\
             \\con = duckdb.connect()
             \\
-            \\# Generate test data
             \\np.random.seed(42)
             \\amounts = np.random.uniform(0, 50000, ROWS)
             \\days = np.random.randint(1, 366, ROWS)
@@ -164,7 +160,6 @@ pub fn main() !void {
             \\    )
             \\""", [amounts.tolist(), days.tolist(), fraud.tolist()])
             \\
-            \\# Python UDF - called for EACH ROW (no pushdown!)
             \\def risk_score_udf(amount, days, fraud):
             \\    score = 0.0
             \\    if amount > 10000: score += min(0.4, amount / 125000)
@@ -176,12 +171,12 @@ pub fn main() !void {
             \\    parameters=['DOUBLE', 'BIGINT', 'BOOLEAN'], return_type='DOUBLE')
             \\
             \\# Warmup
-            \\con.execute("SELECT risk_score(amount, days_since_signup, previous_fraud) FROM orders LIMIT 1000").fetchall()
+            \\con.execute("SELECT risk_score(amount, days_since_signup, previous_fraud) FROM orders WHERE amount > 25000 LIMIT 1000").fetchall()
             \\
-            \\# Benchmark - UDF called for ALL rows, THEN filtered
             \\times = []
             \\for _ in range(ITERATIONS):
             \\    start = time.perf_counter_ns()
+            \\    # DuckDB filters first, then calls UDF on filtered rows
             \\    results = con.execute("""
             \\        SELECT risk_score(amount, days_since_signup, previous_fraud)
             \\        FROM orders
@@ -196,19 +191,19 @@ pub fn main() !void {
         const ns = try runPythonBenchmark(allocator, script);
         if (ns > 0) {
             const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
-            const per_row = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(ROWS)); // ALL rows processed
-            const speedup = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(lanceql_ns));
-            std.debug.print("{s:<30} {d:>9.2} ms {d:>9.0} ns {d:>9.0}x\n", .{
-                "DuckDB Python UDF", ms, per_row, speedup,
+            const per_row = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(filtered_count));
+            const speedup = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(zig_ns));
+            std.debug.print("{s:<35} {d:>9.2} ms {d:>9.0} ns {d:>9.0}x\n", .{
+                "DuckDB + Python UDF", ms, per_row, speedup,
             });
         } else {
-            std.debug.print("{s:<30} {s:>12} {s:>12} {s:>10}\n", .{
-                "DuckDB Python UDF", "SKIP", "-", "-",
+            std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{
+                "DuckDB + Python UDF", "SKIP", "-", "-",
             });
         }
     }
 
-    // 3. DuckDB -> Python batch (pull data, then NumPy)
+    // 3. DuckDB -> NumPy batch
     {
         const script =
             \\import duckdb
@@ -220,7 +215,6 @@ pub fn main() !void {
             \\
             \\con = duckdb.connect()
             \\
-            \\# Generate test data
             \\np.random.seed(42)
             \\amounts = np.random.uniform(0, 50000, ROWS)
             \\days = np.random.randint(1, 366, ROWS)
@@ -238,7 +232,6 @@ pub fn main() !void {
             \\# Warmup
             \\_ = con.execute("SELECT * FROM orders WHERE amount > 25000 LIMIT 1000").fetchnumpy()
             \\
-            \\# Benchmark - pull filtered data, then process in NumPy
             \\times = []
             \\for _ in range(ITERATIONS):
             \\    start = time.perf_counter_ns()
@@ -260,19 +253,19 @@ pub fn main() !void {
         const ns = try runPythonBenchmark(allocator, script);
         if (ns > 0) {
             const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
-            const per_row = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(filtered_indices.items.len));
-            const speedup = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(lanceql_ns));
-            std.debug.print("{s:<30} {d:>9.2} ms {d:>9.0} ns {d:>9.1}x\n", .{
-                "DuckDB -> Python batch", ms, per_row, speedup,
+            const per_row = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(filtered_count));
+            const speedup = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(zig_ns));
+            std.debug.print("{s:<35} {d:>9.2} ms {d:>9.0} ns {d:>9.1}x\n", .{
+                "DuckDB + NumPy batch", ms, per_row, speedup,
             });
         } else {
-            std.debug.print("{s:<30} {s:>12} {s:>12} {s:>10}\n", .{
-                "DuckDB -> Python batch", "SKIP", "-", "-",
+            std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{
+                "DuckDB + NumPy batch", "SKIP", "-", "-",
             });
         }
     }
 
-    // 4. Polars .apply() UDF (NO pushdown - computes ALL rows)
+    // 4. Polars Python UDF (filter DOES pushdown, then UDF on filtered rows)
     {
         const script =
             \\import polars as pl
@@ -282,7 +275,6 @@ pub fn main() !void {
             \\ROWS = 1000000
             \\ITERATIONS = 3
             \\
-            \\# Generate test data
             \\np.random.seed(42)
             \\df = pl.DataFrame({
             \\    'amount': np.random.uniform(0, 50000, ROWS),
@@ -290,7 +282,6 @@ pub fn main() !void {
             \\    'previous_fraud': np.random.random(ROWS) < 0.05,
             \\})
             \\
-            \\# Python UDF - called for EACH ROW
             \\def risk_score_udf(row):
             \\    score = 0.0
             \\    if row['amount'] > 10000: score += min(0.4, row['amount'] / 125000)
@@ -303,10 +294,10 @@ pub fn main() !void {
             \\    pl.struct(pl.all()).map_elements(risk_score_udf, return_dtype=pl.Float64)
             \\)
             \\
-            \\# Benchmark - UDF called for filtered rows
             \\times = []
             \\for _ in range(ITERATIONS):
             \\    start = time.perf_counter_ns()
+            \\    # Polars filters FIRST, then UDF runs on filtered rows only
             \\    result = df.filter(pl.col('amount') > 25000).select(
             \\        pl.struct(pl.all()).map_elements(risk_score_udf, return_dtype=pl.Float64)
             \\    )
@@ -320,19 +311,19 @@ pub fn main() !void {
         const ns = try runPythonBenchmark(allocator, script);
         if (ns > 0) {
             const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
-            const per_row = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(filtered_indices.items.len));
-            const speedup = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(lanceql_ns));
-            std.debug.print("{s:<30} {d:>9.2} ms {d:>9.0} ns {d:>9.0}x\n", .{
-                "Polars .apply() UDF", ms, per_row, speedup,
+            const per_row = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(filtered_count));
+            const speedup = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(zig_ns));
+            std.debug.print("{s:<35} {d:>9.2} ms {d:>9.0} ns {d:>9.0}x\n", .{
+                "Polars + Python UDF (pushdown)", ms, per_row, speedup,
             });
         } else {
-            std.debug.print("{s:<30} {s:>12} {s:>12} {s:>10}\n", .{
-                "Polars .apply() UDF", "SKIP", "-", "-",
+            std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{
+                "Polars + Python UDF (pushdown)", "SKIP", "-", "-",
             });
         }
     }
 
-    // 5. Polars -> Python batch (pull data, then NumPy)
+    // 5. Polars -> NumPy batch
     {
         const script =
             \\import polars as pl
@@ -342,7 +333,6 @@ pub fn main() !void {
             \\ROWS = 1000000
             \\ITERATIONS = 10
             \\
-            \\# Generate test data
             \\np.random.seed(42)
             \\df = pl.DataFrame({
             \\    'amount': np.random.uniform(0, 50000, ROWS),
@@ -353,7 +343,6 @@ pub fn main() !void {
             \\# Warmup
             \\_ = df.filter(pl.col('amount') > 25000).head(1000).to_numpy()
             \\
-            \\# Benchmark - filter in Polars, then NumPy batch
             \\times = []
             \\for _ in range(ITERATIONS):
             \\    start = time.perf_counter_ns()
@@ -375,32 +364,33 @@ pub fn main() !void {
         const ns = try runPythonBenchmark(allocator, script);
         if (ns > 0) {
             const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
-            const per_row = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(filtered_indices.items.len));
-            const speedup = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(lanceql_ns));
-            std.debug.print("{s:<30} {d:>9.2} ms {d:>9.0} ns {d:>9.1}x\n", .{
-                "Polars -> Python batch", ms, per_row, speedup,
+            const per_row = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(filtered_count));
+            const speedup = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(zig_ns));
+            std.debug.print("{s:<35} {d:>9.2} ms {d:>9.0} ns {d:>9.1}x\n", .{
+                "Polars + NumPy batch", ms, per_row, speedup,
             });
         } else {
-            std.debug.print("{s:<30} {s:>12} {s:>12} {s:>10}\n", .{
-                "Polars -> Python batch", "SKIP", "-", "-",
+            std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{
+                "Polars + NumPy batch", "SKIP", "-", "-",
             });
         }
     }
 
     std.debug.print("\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("Key Insight: @logic_table Pushdown\n", .{});
+    std.debug.print("What This Benchmark Shows\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("DuckDB/Polars UDF:\n", .{});
-    std.debug.print("  SELECT risk_score(amount, days, fraud) FROM orders WHERE amount > 25000\n", .{});
-    std.debug.print("  -> Python UDF processes rows, then filter applied\n", .{});
-    std.debug.print("  -> Significant Python interpreter overhead per row\n", .{});
+    std.debug.print("This is a comparison of NATIVE ZIG vs PYTHON, not @logic_table vs UDF.\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("LanceQL @logic_table:\n", .{});
-    std.debug.print("  SELECT t.risk_score() FROM logic_table('fraud.py') t WHERE amount > 25000\n", .{});
-    std.debug.print("  -> WHERE evaluated first, QueryContext.filtered_indices populated\n", .{});
-    std.debug.print("  -> Native code runs ONLY on {d} filtered rows\n", .{filtered_indices.items.len});
-    std.debug.print("  -> No Python interpreter at runtime (metal0 compiled)\n", .{});
+    std.debug.print("Native Zig advantages:\n", .{});
+    std.debug.print("  - No Python interpreter overhead\n", .{});
+    std.debug.print("  - Compiler optimizations (SIMD, inlining)\n", .{});
+    std.debug.print("  - No data marshaling between languages\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("@logic_table STATUS: JIT compilation implemented but not used here.\n", .{});
+    std.debug.print("  - compileWithPredicate() generates fused Zig code\n", .{});
+    std.debug.print("  - jitCompileSource() compiles to .dylib\n", .{});
+    std.debug.print("  - TODO: Wire this into the benchmark\n", .{});
     std.debug.print("\n", .{});
 }
