@@ -8,7 +8,12 @@
 //!   2. SQL filter (price, category, stock status)
 //!   3. Combine results with proper ranking
 //!
-//! Comparison: LanceQL vs DuckDB vs Polars
+//! ⚠️  IMPORTANT: This benchmark compares WORKFLOWS, not raw compute:
+//!   - LanceQL:  In-process GPU/CPU compute (no overhead)
+//!   - DuckDB:   Subprocess (~30ms spawn) + SQL parsing
+//!   - Polars:   Subprocess (~30ms spawn) + Python startup
+//!
+//! For fair in-process comparison, see bench_inprocess.zig which uses DuckDB C API.
 
 const std = @import("std");
 const metal = @import("lanceql.metal");
@@ -454,7 +459,10 @@ pub fn main() !void {
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
     std.debug.print("Filter-first is {d:.1}x faster than vector-first for this filter selectivity.\n", .{speedup});
-    std.debug.print("LanceQL automatically chooses optimal strategy based on filter selectivity.\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("⚠️  NOTE: DuckDB/Polars use subprocess execution (~30ms spawn overhead).\n", .{});
+    std.debug.print("The ratios include process spawn time, not just compute difference.\n", .{});
+    std.debug.print("For fair in-process comparison, run: zig build bench-inprocess\n", .{});
     std.debug.print("\n", .{});
 
     metal.cleanupGPU();

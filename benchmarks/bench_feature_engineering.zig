@@ -10,7 +10,12 @@
 //!   5. Log/Power transforms
 //!   6. Rolling window features
 //!
-//! Comparison: LanceQL vs DuckDB vs Polars
+//! ⚠️  IMPORTANT: This benchmark compares WORKFLOWS, not raw compute:
+//!   - LanceQL:  In-process native code (no overhead)
+//!   - DuckDB:   Subprocess (~30ms spawn) + SQL parsing
+//!   - Polars:   Subprocess (~30ms spawn) + Python startup
+//!
+//! For fair in-process comparison, see bench_inprocess.zig which uses DuckDB C API.
 
 const std = @import("std");
 
@@ -469,7 +474,14 @@ pub fn main() !void {
     std.debug.print("Summary\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("LanceQL provides native feature engineering without Python overhead.\n", .{});
-    std.debug.print("Operations run at memory bandwidth (100M+ rows/sec).\n", .{});
+    std.debug.print("⚠️  NOTE: This benchmark compares WORKFLOWS, not raw compute speed.\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("What's being measured:\n", .{});
+    std.debug.print("  - LanceQL:  In-process native function calls (~500ns overhead)\n", .{});
+    std.debug.print("  - DuckDB:   Subprocess spawn (~30ms) + SQL parse + execute\n", .{});
+    std.debug.print("  - Polars:   Subprocess spawn (~30ms) + Python startup + execute\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("The large ratios reflect subprocess overhead, not compute difference.\n", .{});
+    std.debug.print("For fair in-process comparison, run: zig build bench-inprocess\n", .{});
     std.debug.print("\n", .{});
 }
