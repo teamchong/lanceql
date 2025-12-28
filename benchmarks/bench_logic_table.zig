@@ -15,8 +15,9 @@
 
 const std = @import("std");
 
-const WARMUP = 3;
-const ITERATIONS = 1000; // Reduced for subprocess overhead
+const WARMUP = 5;
+const ITERATIONS = 10_000_000; // 10M iterations for native ops (~30s)
+const SUBPROCESS_ITERATIONS = 20; // Few iterations for subprocess (overhead dominates)
 
 // Engine detection
 var has_duckdb: bool = false;
@@ -137,7 +138,8 @@ pub fn main() !void {
     const dim: usize = 384;
 
     std.debug.print("Vector dimension: {}\n", .{dim});
-    std.debug.print("Warmup: {}, Iterations: {}\n", .{ WARMUP, ITERATIONS });
+    std.debug.print("Warmup: {}, Iterations: {}M (native), {} (subprocess)\n", .{ WARMUP, ITERATIONS / 1_000_000, SUBPROCESS_ITERATIONS });
+    std.debug.print("Target: 30+ seconds per benchmark\n", .{});
     std.debug.print("\n", .{});
 
     const a = try allocator.alloc(f64, dim);
@@ -156,8 +158,8 @@ pub fn main() !void {
     std.debug.print("================================================================================\n", .{});
     std.debug.print("DOT PRODUCT\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("{s:<25} {s:>15} {s:>12}\n", .{ "Engine", "Time/op", "Ratio" });
-    std.debug.print("{s:<25} {s:>15} {s:>12}\n", .{ "-" ** 25, "-" ** 15, "-" ** 12 });
+    std.debug.print("{s:<25} {s:>12} {s:>12} {s:>10}\n", .{ "Engine", "Time/op", "Total", "Ratio" });
+    std.debug.print("{s:<25} {s:>12} {s:>12} {s:>10}\n", .{ "-" ** 25, "-" ** 12, "-" ** 12, "-" ** 10 });
 
     // Native Zig (baseline)
     var native_ns: u64 = 0;
@@ -170,7 +172,8 @@ pub fn main() !void {
         std.mem.doNotOptimizeAway(&checksum);
     }
     const native_per_op = @as(f64, @floatFromInt(native_ns)) / @as(f64, @floatFromInt(ITERATIONS));
-    std.debug.print("{s:<25} {d:>12.1} ns {s:>12}\n", .{ "Native Zig", native_per_op, "1.0x" });
+    const native_total_s = @as(f64, @floatFromInt(native_ns)) / 1_000_000_000.0;
+    std.debug.print("{s:<25} {d:>9.0} ns {d:>10.1}s {s:>10}\n", .{ "Native Zig", native_per_op, native_total_s, "1.0x" });
 
     // LanceQL @logic_table
     var lanceql_ns: u64 = 0;
@@ -183,8 +186,9 @@ pub fn main() !void {
         std.mem.doNotOptimizeAway(&checksum);
     }
     const lanceql_per_op = @as(f64, @floatFromInt(lanceql_ns)) / @as(f64, @floatFromInt(ITERATIONS));
+    const lanceql_total_s = @as(f64, @floatFromInt(lanceql_ns)) / 1_000_000_000.0;
     const lanceql_ratio = lanceql_per_op / native_per_op;
-    std.debug.print("{s:<25} {d:>12.1} ns {d:>11.1}x\n", .{ "LanceQL @logic_table", lanceql_per_op, lanceql_ratio });
+    std.debug.print("{s:<25} {d:>9.0} ns {d:>10.1}s {d:>9.1}x\n", .{ "LanceQL @logic_table", lanceql_per_op, lanceql_total_s, lanceql_ratio });
 
     // DuckDB
     if (has_duckdb) {
@@ -214,12 +218,13 @@ pub fn main() !void {
 
         var total_ns: u64 = 0;
         for (0..WARMUP) |_| _ = runDuckDB(allocator, sql) catch 0;
-        for (0..@min(ITERATIONS, 100)) |_| { // Limit iterations for subprocess
+        for (0..SUBPROCESS_ITERATIONS) |_| {
             total_ns += runDuckDB(allocator, sql) catch 0;
         }
-        const duckdb_per_op = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(@min(ITERATIONS, 100)));
+        const duckdb_per_op = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS));
+        const duckdb_total_s = @as(f64, @floatFromInt(total_ns)) / 1_000_000_000.0;
         const duckdb_ratio = duckdb_per_op / native_per_op;
-        std.debug.print("{s:<25} {d:>12.1} ns {d:>11.1}x\n", .{ "DuckDB (subprocess)", duckdb_per_op, duckdb_ratio });
+        std.debug.print("{s:<25} {d:>9.0} ms {d:>10.1}s {d:>9.0}x\n", .{ "DuckDB (subprocess)", duckdb_per_op / 1_000_000.0, duckdb_total_s, duckdb_ratio });
     }
 
     // Polars
@@ -253,12 +258,13 @@ pub fn main() !void {
 
         var total_ns: u64 = 0;
         for (0..WARMUP) |_| _ = runPolars(allocator, py_code) catch 0;
-        for (0..@min(ITERATIONS, 100)) |_| {
+        for (0..SUBPROCESS_ITERATIONS) |_| {
             total_ns += runPolars(allocator, py_code) catch 0;
         }
-        const polars_per_op = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(@min(ITERATIONS, 100)));
+        const polars_per_op = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS));
+        const polars_total_s = @as(f64, @floatFromInt(total_ns)) / 1_000_000_000.0;
         const polars_ratio = polars_per_op / native_per_op;
-        std.debug.print("{s:<25} {d:>12.1} ns {d:>11.1}x\n", .{ "Polars (subprocess)", polars_per_op, polars_ratio });
+        std.debug.print("{s:<25} {d:>9.0} ms {d:>10.1}s {d:>9.0}x\n", .{ "Polars (subprocess)", polars_per_op / 1_000_000.0, polars_total_s, polars_ratio });
     }
 
     // =========================================================================
@@ -267,8 +273,8 @@ pub fn main() !void {
     std.debug.print("\n================================================================================\n", .{});
     std.debug.print("SUM SQUARES\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("{s:<25} {s:>15} {s:>12}\n", .{ "Engine", "Time/op", "Ratio" });
-    std.debug.print("{s:<25} {s:>15} {s:>12}\n", .{ "-" ** 25, "-" ** 15, "-" ** 12 });
+    std.debug.print("{s:<25} {s:>12} {s:>12} {s:>10}\n", .{ "Engine", "Time/op", "Total", "Ratio" });
+    std.debug.print("{s:<25} {s:>12} {s:>12} {s:>10}\n", .{ "-" ** 25, "-" ** 12, "-" ** 12, "-" ** 10 });
 
     // Native Zig
     {
@@ -280,7 +286,8 @@ pub fn main() !void {
         std.mem.doNotOptimizeAway(&checksum);
     }
     const native_ss_per_op = @as(f64, @floatFromInt(native_ns)) / @as(f64, @floatFromInt(ITERATIONS));
-    std.debug.print("{s:<25} {d:>12.1} ns {s:>12}\n", .{ "Native Zig", native_ss_per_op, "1.0x" });
+    const native_ss_total_s = @as(f64, @floatFromInt(native_ns)) / 1_000_000_000.0;
+    std.debug.print("{s:<25} {d:>9.0} ns {d:>10.1}s {s:>10}\n", .{ "Native Zig", native_ss_per_op, native_ss_total_s, "1.0x" });
 
     // LanceQL @logic_table
     {
@@ -292,8 +299,9 @@ pub fn main() !void {
         std.mem.doNotOptimizeAway(&checksum);
     }
     const lanceql_ss_per_op = @as(f64, @floatFromInt(lanceql_ns)) / @as(f64, @floatFromInt(ITERATIONS));
+    const lanceql_ss_total_s = @as(f64, @floatFromInt(lanceql_ns)) / 1_000_000_000.0;
     const lanceql_ss_ratio = lanceql_ss_per_op / native_ss_per_op;
-    std.debug.print("{s:<25} {d:>12.1} ns {d:>11.1}x\n", .{ "LanceQL @logic_table", lanceql_ss_per_op, lanceql_ss_ratio });
+    std.debug.print("{s:<25} {d:>9.0} ns {d:>10.1}s {d:>9.1}x\n", .{ "LanceQL @logic_table", lanceql_ss_per_op, lanceql_ss_total_s, lanceql_ss_ratio });
 
     // DuckDB
     if (has_duckdb) {
@@ -313,12 +321,13 @@ pub fn main() !void {
 
         var total_ns: u64 = 0;
         for (0..WARMUP) |_| _ = runDuckDB(allocator, sql) catch 0;
-        for (0..@min(ITERATIONS, 100)) |_| {
+        for (0..SUBPROCESS_ITERATIONS) |_| {
             total_ns += runDuckDB(allocator, sql) catch 0;
         }
-        const duckdb_per_op = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(@min(ITERATIONS, 100)));
+        const duckdb_per_op = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS));
+        const duckdb_ss_total_s = @as(f64, @floatFromInt(total_ns)) / 1_000_000_000.0;
         const duckdb_ratio = duckdb_per_op / native_ss_per_op;
-        std.debug.print("{s:<25} {d:>12.1} ns {d:>11.1}x\n", .{ "DuckDB (subprocess)", duckdb_per_op, duckdb_ratio });
+        std.debug.print("{s:<25} {d:>9.0} ms {d:>10.1}s {d:>9.0}x\n", .{ "DuckDB (subprocess)", duckdb_per_op / 1_000_000.0, duckdb_ss_total_s, duckdb_ratio });
     }
 
     // Polars
@@ -341,12 +350,13 @@ pub fn main() !void {
 
         var total_ns: u64 = 0;
         for (0..WARMUP) |_| _ = runPolars(allocator, py_code) catch 0;
-        for (0..@min(ITERATIONS, 100)) |_| {
+        for (0..SUBPROCESS_ITERATIONS) |_| {
             total_ns += runPolars(allocator, py_code) catch 0;
         }
-        const polars_per_op = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(@min(ITERATIONS, 100)));
+        const polars_per_op = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS));
+        const polars_ss_total_s = @as(f64, @floatFromInt(total_ns)) / 1_000_000_000.0;
         const polars_ratio = polars_per_op / native_ss_per_op;
-        std.debug.print("{s:<25} {d:>12.1} ns {d:>11.1}x\n", .{ "Polars (subprocess)", polars_per_op, polars_ratio });
+        std.debug.print("{s:<25} {d:>9.0} ms {d:>10.1}s {d:>9.0}x\n", .{ "Polars (subprocess)", polars_per_op / 1_000_000.0, polars_ss_total_s, polars_ratio });
     }
 
     // =========================================================================
