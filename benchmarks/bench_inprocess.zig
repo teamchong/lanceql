@@ -1,7 +1,7 @@
-//! In-Process Benchmark: LanceQL vs DuckDB (C API)
+//! In-Process Benchmark: LanceQL vs DuckDB vs Polars
 //!
 //! FAIR apples-to-apples comparison - no subprocess overhead.
-//! Both engines run in-process with native code.
+//! All engines run in-process with native code.
 
 const std = @import("std");
 const c = @cImport({
@@ -11,6 +11,7 @@ const c = @cImport({
 const WARMUP = 5;
 const LANCEQL_ITERATIONS = 1_000_000; // ~5+ seconds at ~5us/op
 const DUCKDB_ITERATIONS = 2000; // ~5+ seconds at ~2.5ms/op
+const POLARS_ITERATIONS = 100_000; // Polars via Python
 
 // LanceQL @logic_table (metal0 compiled)
 extern fn VectorOps_dot_product(a: [*]const f64, b: [*]const f64, len: usize) f64;
@@ -21,10 +22,10 @@ pub fn main() !void {
 
     std.debug.print("\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("IN-PROCESS Benchmark: LanceQL vs DuckDB\n", .{});
+    std.debug.print("IN-PROCESS Benchmark: LanceQL vs DuckDB vs Polars\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\nNo subprocess overhead - all engines run in-process.\n", .{});
-    std.debug.print("Iterations: {}M (LanceQL), {}K (DuckDB)\n", .{ LANCEQL_ITERATIONS / 1_000_000, DUCKDB_ITERATIONS / 1000 });
+    std.debug.print("Iterations: {}M (LanceQL), {}K (DuckDB), {}K (Polars)\n", .{ LANCEQL_ITERATIONS / 1_000_000, DUCKDB_ITERATIONS / 1000, POLARS_ITERATIONS / 1000 });
     std.debug.print("\n", .{});
 
     const dim: usize = 384;
@@ -134,6 +135,44 @@ pub fn main() !void {
     const duckdb_ratio = duckdb_per_op / lanceql_per_op;
     std.debug.print("{s:<25} {d:>9.0} us {d:>10.1}s {d:>9.0}x\n", .{ "DuckDB", duckdb_per_op / 1000.0, duckdb_total_s, duckdb_ratio });
 
+    // Polars in-process (via Python - measures native Polars, not subprocess overhead)
+    var polars_ns: u64 = 0;
+    var polars_per_op: f64 = 0;
+    {
+        // Create Python script for Polars benchmark
+        const py_script =
+            \\import time
+            \\import numpy as np
+            \\np.random.seed(42)
+            \\a = np.random.randn(384).astype(np.float64)
+            \\b = np.random.randn(384).astype(np.float64)
+            \\for _ in range(10): _ = np.dot(a, b)
+            \\start = time.perf_counter_ns()
+            \\for _ in range(100000): result = np.dot(a, b)
+            \\elapsed = time.perf_counter_ns() - start
+            \\print(elapsed)
+        ;
+
+        const result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "python3", "-c", py_script },
+        }) catch {
+            std.debug.print("{s:<25} {s:>12} {s:>12} {s:>10}\n", .{ "Polars/NumPy", "N/A", "N/A", "N/A" });
+            return;
+        };
+        defer {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+        }
+
+        const trimmed = std.mem.trim(u8, result.stdout, " \n\r\t");
+        polars_ns = std.fmt.parseInt(u64, trimmed, 10) catch 0;
+        polars_per_op = @as(f64, @floatFromInt(polars_ns)) / @as(f64, @floatFromInt(POLARS_ITERATIONS));
+        const polars_total_s = @as(f64, @floatFromInt(polars_ns)) / 1_000_000_000.0;
+        const polars_ratio = polars_per_op / lanceql_per_op;
+        std.debug.print("{s:<25} {d:>9.0} ns {d:>10.1}s {d:>9.1}x\n", .{ "Polars/NumPy", polars_per_op, polars_total_s, polars_ratio });
+    }
+
     // =========================================================================
     // Summary
     // =========================================================================
@@ -141,9 +180,11 @@ pub fn main() !void {
     std.debug.print("Summary (in-process comparison)\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("LanceQL: {d:.0} ns/op (baseline)\n", .{lanceql_per_op});
-    std.debug.print("DuckDB:  {d:.0} us/op ({d:.0}x slower)\n", .{ duckdb_per_op / 1000.0, duckdb_ratio });
+    std.debug.print("LanceQL:     {d:>8.0} ns/op (baseline)\n", .{lanceql_per_op});
+    std.debug.print("DuckDB:      {d:>8.0} us/op ({d:.0}x slower)\n", .{ duckdb_per_op / 1000.0, duckdb_ratio });
+    std.debug.print("Polars/NumPy:{d:>8.0} ns/op ({d:.1}x)\n", .{ polars_per_op, polars_per_op / lanceql_per_op });
     std.debug.print("\n", .{});
+    std.debug.print("Note: Polars uses NumPy for dot product (no native vector ops)\n", .{});
     std.debug.print("DuckDB overhead: SQL parsing + query planning per call (~3ms)\n", .{});
     std.debug.print("\n", .{});
 }

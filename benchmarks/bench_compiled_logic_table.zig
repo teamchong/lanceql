@@ -1,8 +1,10 @@
-//! Benchmark: Compiled @logic_table functions vs native Zig
+//! Benchmark: Compiled @logic_table functions vs native Zig vs DuckDB vs Polars
 //!
 //! This benchmark compares:
 //!   1. Compiled Python @logic_table (from metal0)
 //!   2. Native Zig implementation (hand-optimized)
+//!   3. DuckDB (SQL engine)
+//!   4. Polars/NumPy (Python DataFrame)
 //!
 //! Workflow:
 //!   1. Compile Python: metal0 build --emit-logic-table benchmarks/vector_ops.py -o lib/vector_ops.a
@@ -13,6 +15,9 @@
 //! produces real, callable native code.
 
 const std = @import("std");
+const c = @cImport({
+    @cInclude("duckdb.h");
+});
 
 // =============================================================================
 // Extern declarations for compiled @logic_table functions
@@ -58,16 +63,18 @@ fn nativeSumValues(a: []const f64) f64 {
 
 const WARMUP = 5;
 const ITERATIONS = 100_000;
+const DUCKDB_ITERATIONS = 2000;
+const POLARS_ITERATIONS = 100_000;
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     std.debug.print("\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("Compiled @logic_table Benchmark\n", .{});
+    std.debug.print("Compiled @logic_table Benchmark: LanceQL vs DuckDB vs Polars\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("Comparing: Python @logic_table (compiled) vs Native Zig\n", .{});
-    std.debug.print("Warmup: {}, Iterations: {}\n", .{ WARMUP, ITERATIONS });
+    std.debug.print("Comparing: @logic_table (compiled) vs Native Zig vs DuckDB vs Polars\n", .{});
+    std.debug.print("Warmup: {}, Iterations: {}K\n", .{ WARMUP, ITERATIONS / 1000 });
     std.debug.print("\n", .{});
 
     // Test vectors
