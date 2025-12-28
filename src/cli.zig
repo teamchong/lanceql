@@ -14,10 +14,32 @@ const std = @import("std");
 const lanceql = @import("lanceql");
 const metal = @import("lanceql.metal");
 const Table = @import("lanceql.table").Table;
+const ParquetTable = @import("lanceql.parquet_table").ParquetTable;
 const executor = @import("lanceql.sql.executor");
 const lexer = @import("lanceql.sql.lexer");
 const parser = @import("lanceql.sql.parser");
 const ast = @import("lanceql.sql.ast");
+
+/// File type detection
+const FileType = enum {
+    lance,
+    parquet,
+    unknown,
+};
+
+fn detectFileType(path: []const u8, data: []const u8) FileType {
+    // Check by extension first
+    if (std.mem.endsWith(u8, path, ".parquet")) return .parquet;
+    if (std.mem.endsWith(u8, path, ".lance")) return .lance;
+
+    // Check magic bytes
+    if (data.len >= 4) {
+        if (std.mem.eql(u8, data[0..4], "PAR1")) return .parquet;
+        if (data.len >= 40 and std.mem.eql(u8, data[data.len - 4 ..], "LANC")) return .lance;
+    }
+
+    return .unknown;
+}
 
 const version = "0.1.0";
 
@@ -260,7 +282,7 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, args: Args) !void {
     // Extract table path from query
     const table_path = extractTablePath(query) orelse {
         std.debug.print("Error: Could not extract table path from query\n", .{});
-        std.debug.print("Query should be: SELECT ... FROM 'path/to/file.lance'\n", .{});
+        std.debug.print("Query should be: SELECT ... FROM 'path/to/file.parquet'\n", .{});
         return;
     };
 
@@ -271,10 +293,35 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, args: Args) !void {
     };
     defer allocator.free(data);
 
-    // Initialize Table
+    // Detect file type
+    const file_type = detectFileType(table_path, data);
+
+    switch (file_type) {
+        .parquet => {
+            runParquetQuery(allocator, data, query, args) catch |err| {
+                std.debug.print("Parquet query error: {}\n", .{err});
+            };
+        },
+        .lance => {
+            runLanceQuery(allocator, data, query, args) catch |err| {
+                std.debug.print("Lance query error: {}\n", .{err});
+            };
+        },
+        .unknown => {
+            // Try Lance first, then Parquet
+            runLanceQuery(allocator, data, query, args) catch {
+                runParquetQuery(allocator, data, query, args) catch |err| {
+                    std.debug.print("Query error: {}\n", .{err});
+                };
+            };
+        },
+    }
+}
+
+fn runLanceQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, args: Args) !void {
+    // Initialize Lance Table
     var table = Table.init(allocator, data) catch |err| {
-        std.debug.print("Error parsing '{s}': {}\n", .{ table_path, err });
-        return;
+        return err;
     };
     defer table.deinit();
 
@@ -284,32 +331,20 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, args: Args) !void {
     defer tokens.deinit(allocator);
 
     while (true) {
-        const tok = lex.nextToken() catch |err| {
-            std.debug.print("Lexer error: {}\n", .{err});
-            return;
-        };
-        tokens.append(allocator, tok) catch {
-            std.debug.print("Error: out of memory during tokenization\n", .{});
-            return;
-        };
+        const tok = try lex.nextToken();
+        try tokens.append(allocator, tok);
         if (tok.type == .EOF) break;
     }
 
     // Parse
     var parse = parser.Parser.init(tokens.items, allocator);
-    const stmt = parse.parseStatement() catch |err| {
-        std.debug.print("Parse error: {}\n", .{err});
-        return;
-    };
+    const stmt = try parse.parseStatement();
 
     // Execute
     var exec = executor.Executor.init(&table, allocator);
     defer exec.deinit();
 
-    var result = exec.execute(&stmt.select, &[_]ast.Value{}) catch |err| {
-        std.debug.print("Execution error: {}\n", .{err});
-        return;
-    };
+    var result = try exec.execute(&stmt.select, &[_]ast.Value{});
     defer result.deinit();
 
     // Output results
@@ -319,6 +354,134 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, args: Args) !void {
         printResultsCsv(&result);
     } else {
         printResultsTable(&result);
+    }
+}
+
+fn runParquetQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, args: Args) !void {
+    _ = query; // TODO: Parse and execute full SQL
+
+    // Initialize Parquet Table
+    var pq_table = ParquetTable.init(allocator, data) catch |err| {
+        return err;
+    };
+    defer pq_table.deinit();
+
+    const col_names = pq_table.getColumnNames();
+    const num_rows = pq_table.numRows();
+
+    // For now, do a simple full scan (SELECT *)
+    // TODO: Implement full SQL parsing for Parquet
+
+    // Print header
+    if (args.json) {
+        std.debug.print("[", .{});
+    } else {
+        for (col_names, 0..) |name, i| {
+            if (i > 0) {
+                if (args.csv) std.debug.print(",", .{}) else std.debug.print("\t", .{});
+            }
+            std.debug.print("{s}", .{name});
+        }
+        std.debug.print("\n", .{});
+    }
+
+    // Read and print rows (limit to first 1000 for safety)
+    const limit = @min(num_rows, 1000);
+
+    // Read all columns
+    var col_data = std.ArrayList(ColumnValues){};
+    defer {
+        for (col_data.items) |*cv| cv.deinit(allocator);
+        col_data.deinit(allocator);
+    }
+
+    for (0..col_names.len) |col_idx| {
+        const col_type = pq_table.getColumnType(col_idx);
+        var cv = ColumnValues{};
+
+        if (col_type) |ct| {
+            switch (ct) {
+                .int64 => cv.int64 = pq_table.readInt64Column(col_idx) catch null,
+                .int32 => cv.int32 = pq_table.readInt32Column(col_idx) catch null,
+                .double => cv.float64 = pq_table.readFloat64Column(col_idx) catch null,
+                .float => cv.float32 = pq_table.readFloat32Column(col_idx) catch null,
+                .byte_array => cv.string = pq_table.readStringColumn(col_idx) catch null,
+                .boolean => cv.bool_ = pq_table.readBoolColumn(col_idx) catch null,
+                else => {},
+            }
+        }
+        col_data.append(allocator, cv) catch {};
+    }
+
+    // Print rows
+    for (0..limit) |row| {
+        if (args.json) {
+            if (row > 0) std.debug.print(",", .{});
+            std.debug.print("{{", .{});
+        }
+
+        for (col_data.items, 0..) |cv, i| {
+            if (args.json) {
+                if (i > 0) std.debug.print(",", .{});
+                std.debug.print("\"{s}\":", .{col_names[i]});
+            } else if (i > 0) {
+                if (args.csv) std.debug.print(",", .{}) else std.debug.print("\t", .{});
+            }
+            printParquetValue(cv, row, args.json);
+        }
+
+        if (args.json) {
+            std.debug.print("}}", .{});
+        } else {
+            std.debug.print("\n", .{});
+        }
+    }
+
+    if (args.json) {
+        std.debug.print("]\n", .{});
+    }
+}
+
+const ColumnValues = struct {
+    int64: ?[]i64 = null,
+    int32: ?[]i32 = null,
+    float64: ?[]f64 = null,
+    float32: ?[]f32 = null,
+    string: ?[][]const u8 = null,
+    bool_: ?[]bool = null,
+
+    fn deinit(self: *ColumnValues, allocator: std.mem.Allocator) void {
+        if (self.int64) |v| allocator.free(v);
+        if (self.int32) |v| allocator.free(v);
+        if (self.float64) |v| allocator.free(v);
+        if (self.float32) |v| allocator.free(v);
+        if (self.string) |v| {
+            for (v) |s| allocator.free(s);
+            allocator.free(v);
+        }
+        if (self.bool_) |v| allocator.free(v);
+    }
+};
+
+fn printParquetValue(cv: ColumnValues, row: usize, json: bool) void {
+    if (cv.int64) |arr| {
+        if (row < arr.len) std.debug.print("{d}", .{arr[row]}) else std.debug.print("null", .{});
+    } else if (cv.int32) |arr| {
+        if (row < arr.len) std.debug.print("{d}", .{arr[row]}) else std.debug.print("null", .{});
+    } else if (cv.float64) |arr| {
+        if (row < arr.len) std.debug.print("{d:.6}", .{arr[row]}) else std.debug.print("null", .{});
+    } else if (cv.float32) |arr| {
+        if (row < arr.len) std.debug.print("{d:.6}", .{arr[row]}) else std.debug.print("null", .{});
+    } else if (cv.string) |arr| {
+        if (row < arr.len) {
+            if (json) std.debug.print("\"{s}\"", .{arr[row]}) else std.debug.print("{s}", .{arr[row]});
+        } else {
+            std.debug.print("null", .{});
+        }
+    } else if (cv.bool_) |arr| {
+        if (row < arr.len) std.debug.print("{}", .{arr[row]}) else std.debug.print("null", .{});
+    } else {
+        std.debug.print("null", .{});
     }
 }
 

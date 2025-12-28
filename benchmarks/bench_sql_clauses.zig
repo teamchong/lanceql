@@ -188,6 +188,22 @@ fn runPolars(allocator: std.mem.Allocator, sql: []const u8) !u64 {
     return timer.read();
 }
 
+fn runLanceQL(allocator: std.mem.Allocator, sql: []const u8) !u64 {
+    var timer = try std.time.Timer.start();
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "lanceql", "-c", sql },
+    }) catch return error.LanceQLFailed;
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    return timer.read();
+}
+
+var has_lanceql: bool = false;
+var lance_path: ?[]const u8 = null;
+
 fn benchmarkFullScan(allocator: std.mem.Allocator, results: *std.ArrayListUnmanaged(BenchmarkResult), num_rows: usize) !void {
     std.debug.print("\n--- SELECT * (Full Scan) ---\n", .{});
 
