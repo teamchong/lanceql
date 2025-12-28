@@ -490,6 +490,113 @@ pub fn build(b: *std.Build) void {
     const bench_inprocess_step = b.step("bench-inprocess", "FAIR comparison: LanceQL vs DuckDB C API (no subprocess)");
     bench_inprocess_step.dependOn(&run_bench_inprocess.step);
 
+    // RAG Pipeline benchmark - end-to-end document retrieval
+    const bench_rag = b.addExecutable(.{
+        .name = "bench_rag_pipeline",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/bench_rag_pipeline.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lanceql.metal", .module = metal_mod },
+            },
+        }),
+    });
+    if (use_metal) {
+        bench_rag.root_module.linkFramework("Metal", .{});
+        bench_rag.root_module.linkFramework("Foundation", .{});
+        bench_rag.root_module.addCSourceFiles(.{
+            .files = &.{"src/metal/metal_backend.m"},
+            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
+        });
+    }
+    if (use_accelerate) {
+        bench_rag.root_module.linkFramework("Accelerate", .{});
+    }
+    const run_bench_rag = b.addRunArtifact(bench_rag);
+    const bench_rag_step = b.step("bench-rag", "RAG pipeline: chunking, embedding, vector search");
+    bench_rag_step.dependOn(&run_bench_rag.step);
+
+    // Hybrid Search benchmark - vector + SQL filters
+    const bench_hybrid = b.addExecutable(.{
+        .name = "bench_hybrid_search",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/bench_hybrid_search.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lanceql.metal", .module = metal_mod },
+            },
+        }),
+    });
+    if (use_metal) {
+        bench_hybrid.root_module.linkFramework("Metal", .{});
+        bench_hybrid.root_module.linkFramework("Foundation", .{});
+        bench_hybrid.root_module.addCSourceFiles(.{
+            .files = &.{"src/metal/metal_backend.m"},
+            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
+        });
+    }
+    if (use_accelerate) {
+        bench_hybrid.root_module.linkFramework("Accelerate", .{});
+    }
+    const run_bench_hybrid = b.addRunArtifact(bench_hybrid);
+    const bench_hybrid_step = b.step("bench-hybrid", "Hybrid search: vector similarity + SQL filters");
+    bench_hybrid_step.dependOn(&run_bench_hybrid.step);
+
+    // Feature Engineering benchmark - ML transformations
+    const bench_feature = b.addExecutable(.{
+        .name = "bench_feature_engineering",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/bench_feature_engineering.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const run_bench_feature = b.addRunArtifact(bench_feature);
+    const bench_feature_step = b.step("bench-feature", "Feature engineering: normalization, binning, transforms");
+    bench_feature_step.dependOn(&run_bench_feature.step);
+
+    // Analytics benchmark - aggregations, window functions
+    const bench_analytics = b.addExecutable(.{
+        .name = "bench_analytics",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/bench_analytics.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const run_bench_analytics = b.addRunArtifact(bench_analytics);
+    const bench_analytics_step = b.step("bench-analytics", "Analytics: aggregations, GROUP BY, window functions");
+    bench_analytics_step.dependOn(&run_bench_analytics.step);
+
+    // Embedding Pipeline benchmark - text to vector
+    const bench_embed = b.addExecutable(.{
+        .name = "bench_embedding_pipeline",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/bench_embedding_pipeline.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lanceql.metal", .module = metal_mod },
+            },
+        }),
+    });
+    if (use_metal) {
+        bench_embed.root_module.linkFramework("Metal", .{});
+        bench_embed.root_module.linkFramework("Foundation", .{});
+        bench_embed.root_module.addCSourceFiles(.{
+            .files = &.{"src/metal/metal_backend.m"},
+            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
+        });
+    }
+    if (use_accelerate) {
+        bench_embed.root_module.linkFramework("Accelerate", .{});
+    }
+    const run_bench_embed = b.addRunArtifact(bench_embed);
+    const bench_embed_step = b.step("bench-embed", "Embedding pipeline: chunking, tokenization, embedding");
+    bench_embed_step.dependOn(&run_bench_embed.step);
+
     // LanceQL CLI
     const cli = b.addExecutable(.{
         .name = "lanceql",
