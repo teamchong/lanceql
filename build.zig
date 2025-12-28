@@ -128,6 +128,8 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/codegen/metal0_jit.zig"),
         .imports = &.{
             .{ .name = "metal0", .module = metal0_mod },
+            .{ .name = "lanceql.format", .module = format_mod },
+            .{ .name = "lanceql.proto", .module = proto_mod },
         },
     });
 

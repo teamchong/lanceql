@@ -17,6 +17,10 @@
 const std = @import("std");
 const metal0 = @import("metal0");
 
+// Import Lance format types for schema extraction
+const format = @import("lanceql.format");
+const proto = @import("lanceql.proto");
+
 /// Column type from Lance schema
 pub const ColumnType = enum {
     i64,
@@ -35,7 +39,7 @@ pub const ColumnType = enum {
     vec_f32, // Fixed-size list of f32 (embeddings)
     vec_f64,
 
-    /// Convert from Lance physical type
+    /// Convert from Lance physical type (Arrow naming)
     pub fn fromLanceType(lance_type: []const u8) ?ColumnType {
         const map = std.StaticStringMap(ColumnType).initComptime(.{
             .{ "int64", .i64 },
@@ -53,6 +57,39 @@ pub const ColumnType = enum {
             .{ "binary", .bytes },
         });
         return map.get(lance_type);
+    }
+
+    /// Convert from Lance schema logical_type string
+    /// Lance uses these strings in the schema protobuf
+    pub fn fromLogicalType(logical_type: []const u8) ?ColumnType {
+        const map = std.StaticStringMap(ColumnType).initComptime(.{
+            // Integer types
+            .{ "int64", .i64 },
+            .{ "int32", .i32 },
+            .{ "int16", .i16 },
+            .{ "int8", .i8 },
+            .{ "uint64", .u64 },
+            .{ "uint32", .u32 },
+            .{ "uint16", .u16 },
+            .{ "uint8", .u8 },
+            // Float types
+            .{ "double", .f64 },
+            .{ "float", .f32 },
+            .{ "float64", .f64 },
+            .{ "float32", .f32 },
+            // Boolean
+            .{ "bool", .bool },
+            .{ "boolean", .bool },
+            // String types
+            .{ "string", .string },
+            .{ "utf8", .string },
+            .{ "large_string", .string },
+            .{ "large_utf8", .string },
+            // Binary
+            .{ "binary", .bytes },
+            .{ "large_binary", .bytes },
+        });
+        return map.get(logical_type);
     }
 
     /// Get Zig type string
@@ -90,6 +127,9 @@ pub const LanceSchema = struct {
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *LanceSchema) void {
+        for (self.columns) |col| {
+            self.allocator.free(col.name);
+        }
         self.allocator.free(self.columns);
     }
 };
@@ -137,12 +177,72 @@ pub const JitContext = struct {
     }
 
     /// Load schema from Lance file
-    pub fn loadSchema(self: *JitContext, lance_file: anytype) !void {
-        _ = lance_file;
-        // TODO: Extract schema from LanceFile
-        // For now, use a placeholder
+    /// Extracts column names and types from the Lance file's schema buffer
+    pub fn loadSchema(self: *JitContext, lance_file: *format.LanceFile) !void {
+        // Schema is in global buffer 0
+        const schema_bytes = lance_file.getGlobalBuffer(0) catch |err| {
+            return switch (err) {
+                error.ColumnOutOfBounds => error.NoSchema,
+                else => error.SchemaReadError,
+            };
+        };
+
+        // Parse the schema protobuf
+        var schema = proto.Schema.parse(self.allocator, schema_bytes) catch {
+            return error.SchemaParseError;
+        };
+        defer schema.deinit();
+
+        // Convert to our ColumnDef format
+        var columns = std.ArrayList(ColumnDef).init(self.allocator);
+        errdefer columns.deinit();
+
+        for (schema.fields) |field| {
+            // Only include top-level (leaf) columns
+            if (!field.isTopLevel()) continue;
+
+            const col_type = ColumnType.fromLogicalType(field.logical_type) orelse {
+                // Skip columns with unknown types
+                continue;
+            };
+
+            try columns.append(.{
+                .name = try self.allocator.dupe(u8, field.name),
+                .column_type = col_type,
+                .nullable = field.nullable,
+            });
+        }
+
         self.schema = LanceSchema{
-            .columns = &.{},
+            .columns = try columns.toOwnedSlice(),
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Load schema from raw bytes (for testing or when LanceFile not available)
+    pub fn loadSchemaFromBytes(self: *JitContext, schema_bytes: []const u8) !void {
+        var schema = proto.Schema.parse(self.allocator, schema_bytes) catch {
+            return error.SchemaParseError;
+        };
+        defer schema.deinit();
+
+        var columns = std.ArrayList(ColumnDef).init(self.allocator);
+        errdefer columns.deinit();
+
+        for (schema.fields) |field| {
+            if (!field.isTopLevel()) continue;
+
+            const col_type = ColumnType.fromLogicalType(field.logical_type) orelse continue;
+
+            try columns.append(.{
+                .name = try self.allocator.dupe(u8, field.name),
+                .column_type = col_type,
+                .nullable = field.nullable,
+            });
+        }
+
+        self.schema = LanceSchema{
+            .columns = try columns.toOwnedSlice(),
             .allocator = self.allocator,
         };
     }
@@ -292,4 +392,75 @@ test "JitContext basic" {
     defer func.deinit();
 
     try std.testing.expect(func.source.len > 0);
+}
+
+test "ColumnType.fromLogicalType" {
+    // Test various Lance logical types
+    try std.testing.expectEqual(ColumnType.i64, ColumnType.fromLogicalType("int64").?);
+    try std.testing.expectEqual(ColumnType.f64, ColumnType.fromLogicalType("double").?);
+    try std.testing.expectEqual(ColumnType.f64, ColumnType.fromLogicalType("float64").?);
+    try std.testing.expectEqual(ColumnType.string, ColumnType.fromLogicalType("string").?);
+    try std.testing.expectEqual(ColumnType.string, ColumnType.fromLogicalType("utf8").?);
+    try std.testing.expectEqual(ColumnType.bool, ColumnType.fromLogicalType("bool").?);
+    try std.testing.expectEqual(ColumnType.bool, ColumnType.fromLogicalType("boolean").?);
+    try std.testing.expectEqual(@as(?ColumnType, null), ColumnType.fromLogicalType("custom_type"));
+}
+
+test "loadSchemaFromBytes" {
+    const allocator = std.testing.allocator;
+    var jit = JitContext.init(allocator);
+    defer jit.deinit();
+
+    // Schema bytes from a lancedb-created file with columns: id (int64), name (string)
+    // Same bytes used in proto/schema.zig tests
+    const schema_bytes = [_]u8{
+        0x0a, 0x4f, 0x0a, 0x23, 0x12, 0x02, 0x69, 0x64, 0x20, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0x01, 0x2a, 0x05, 0x69, 0x6e, 0x74, 0x36, 0x34, 0x30, 0x01, 0x38, 0x01, 0x5a, 0x07,
+        0x64, 0x65, 0x66, 0x61, 0x75, 0x6c, 0x74, 0x0a, 0x28, 0x12, 0x04, 0x6e, 0x61, 0x6d, 0x65, 0x18,
+        0x01, 0x20, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x2a, 0x06, 0x73, 0x74,
+        0x72, 0x69, 0x6e, 0x67, 0x30, 0x01, 0x38, 0x02, 0x5a, 0x07, 0x64, 0x65, 0x66, 0x61, 0x75, 0x6c,
+        0x74, 0x10, 0x03,
+    };
+
+    try jit.loadSchemaFromBytes(&schema_bytes);
+
+    // Verify schema was loaded
+    try std.testing.expect(jit.schema != null);
+    const schema = jit.schema.?;
+
+    // Should have 2 columns: id (int64), name (string)
+    try std.testing.expectEqual(@as(usize, 2), schema.columns.len);
+    try std.testing.expectEqualStrings("id", schema.columns[0].name);
+    try std.testing.expectEqual(ColumnType.i64, schema.columns[0].column_type);
+    try std.testing.expectEqualStrings("name", schema.columns[1].name);
+    try std.testing.expectEqual(ColumnType.string, schema.columns[1].column_type);
+}
+
+test "compileLogicTable with schema" {
+    const allocator = std.testing.allocator;
+    var jit = JitContext.init(allocator);
+    defer jit.deinit();
+
+    // Schema bytes from lancedb with: id (int64), name (string)
+    const schema_bytes = [_]u8{
+        0x0a, 0x4f, 0x0a, 0x23, 0x12, 0x02, 0x69, 0x64, 0x20, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0x01, 0x2a, 0x05, 0x69, 0x6e, 0x74, 0x36, 0x34, 0x30, 0x01, 0x38, 0x01, 0x5a, 0x07,
+        0x64, 0x65, 0x66, 0x61, 0x75, 0x6c, 0x74, 0x0a, 0x28, 0x12, 0x04, 0x6e, 0x61, 0x6d, 0x65, 0x18,
+        0x01, 0x20, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x2a, 0x06, 0x73, 0x74,
+        0x72, 0x69, 0x6e, 0x67, 0x30, 0x01, 0x38, 0x02, 0x5a, 0x07, 0x64, 0x65, 0x66, 0x61, 0x75, 0x6c,
+        0x74, 0x10, 0x03,
+    };
+
+    try jit.loadSchemaFromBytes(&schema_bytes);
+
+    // Compile with schema
+    var func = try jit.compileLogicTable(
+        \\def compute(id: int) -> int:
+        \\    return id * 2
+    , "compute");
+    defer func.deinit();
+
+    // Should generate Zig source with schema comments
+    try std.testing.expect(func.source.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, func.source, "schema") != null);
 }
