@@ -591,13 +591,160 @@ pub const Parser = struct {
 
         _ = try self.expect(.RPAREN);
 
+        // Check for OVER clause (window function)
+        var window: ?*ast.WindowSpec = null;
+        if (self.match(&[_]TokenType{.OVER})) {
+            window = try self.parseWindowSpec();
+        }
+
         return Expr{
             .call = .{
                 .name = name,
                 .args = try args.toOwnedSlice(self.allocator),
                 .distinct = distinct,
+                .window = window,
             },
         };
+    }
+
+    /// Parse window specification: OVER([PARTITION BY cols] [ORDER BY cols] [frame])
+    fn parseWindowSpec(self: *Self) !*ast.WindowSpec {
+        _ = try self.expect(.LPAREN);
+
+        var partition_by: ?[][]const u8 = null;
+        var order_by: ?[]ast.OrderBy = null;
+        var frame: ?ast.WindowFrame = null;
+
+        // Parse PARTITION BY (optional)
+        if (self.match(&[_]TokenType{.PARTITION})) {
+            _ = try self.expect(.BY);
+
+            var cols = std.ArrayList([]const u8){};
+            errdefer cols.deinit(self.allocator);
+
+            while (true) {
+                const col_tok = try self.expect(.IDENTIFIER);
+                try cols.append(self.allocator, col_tok.lexeme);
+                if (!self.match(&[_]TokenType{.COMMA})) break;
+            }
+
+            partition_by = try cols.toOwnedSlice(self.allocator);
+        }
+
+        // Parse ORDER BY (optional)
+        if (self.match(&[_]TokenType{.ORDER})) {
+            _ = try self.expect(.BY);
+
+            var items = std.ArrayList(ast.OrderBy){};
+            errdefer items.deinit(self.allocator);
+
+            while (true) {
+                const col_tok = try self.expect(.IDENTIFIER);
+
+                const direction = if (self.match(&[_]TokenType{.DESC}))
+                    ast.OrderDirection.desc
+                else blk: {
+                    _ = self.match(&[_]TokenType{.ASC}); // Optional ASC
+                    break :blk ast.OrderDirection.asc;
+                };
+
+                try items.append(self.allocator, ast.OrderBy{
+                    .column = col_tok.lexeme,
+                    .direction = direction,
+                });
+
+                if (!self.match(&[_]TokenType{.COMMA})) break;
+            }
+
+            order_by = try items.toOwnedSlice(self.allocator);
+        }
+
+        // Parse frame specification (optional): ROWS/RANGE BETWEEN ... AND ...
+        if (self.match(&[_]TokenType{.ROWS}) or self.check(.RANGE)) {
+            frame = try self.parseWindowFrame();
+        }
+
+        _ = try self.expect(.RPAREN);
+
+        const spec = try self.allocator.create(ast.WindowSpec);
+        spec.* = ast.WindowSpec{
+            .partition_by = partition_by,
+            .order_by = order_by,
+            .frame = frame,
+        };
+
+        return spec;
+    }
+
+    /// Parse window frame: ROWS/RANGE [BETWEEN start AND end | start]
+    fn parseWindowFrame(self: *Self) !ast.WindowFrame {
+        // Note: ROWS token was already matched in parseWindowSpec when checking for frame
+        const frame_type: @TypeOf(@as(ast.WindowFrame, undefined).frame_type) = if (self.check(.RANGE)) blk: {
+            self.advance();
+            break :blk .range;
+        } else .rows;
+
+        // Parse frame bounds
+        var start_bound: ast.FrameBound = .unbounded_preceding;
+        var start_offset: ?i64 = null;
+        var end_bound: ?ast.FrameBound = null;
+        var end_offset: ?i64 = null;
+
+        if (self.match(&[_]TokenType{.BETWEEN})) {
+            // BETWEEN start AND end
+            const start = try self.parseFrameBound();
+            start_bound = start.bound;
+            start_offset = start.offset;
+
+            _ = try self.expect(.AND);
+
+            const end = try self.parseFrameBound();
+            end_bound = end.bound;
+            end_offset = end.offset;
+        } else {
+            // Single bound (start only, end defaults to CURRENT ROW)
+            const start = try self.parseFrameBound();
+            start_bound = start.bound;
+            start_offset = start.offset;
+            end_bound = .current_row;
+        }
+
+        return ast.WindowFrame{
+            .frame_type = frame_type,
+            .start_bound = start_bound,
+            .start_offset = start_offset,
+            .end_bound = end_bound,
+            .end_offset = end_offset,
+        };
+    }
+
+    /// Parse a single frame bound
+    fn parseFrameBound(self: *Self) !struct { bound: ast.FrameBound, offset: ?i64 } {
+        if (self.match(&[_]TokenType{.UNBOUNDED})) {
+            if (self.match(&[_]TokenType{.PRECEDING})) {
+                return .{ .bound = .unbounded_preceding, .offset = null };
+            } else if (self.match(&[_]TokenType{.FOLLOWING})) {
+                return .{ .bound = .unbounded_following, .offset = null };
+            }
+            return error.UnexpectedToken;
+        } else if (self.match(&[_]TokenType{.CURRENT})) {
+            // CURRENT ROW (ROW is optional but expected)
+            _ = self.match(&[_]TokenType{.IDENTIFIER}); // Skip ROW if present
+            return .{ .bound = .current_row, .offset = null };
+        } else if (self.check(.NUMBER)) {
+            // N PRECEDING or N FOLLOWING
+            const num_tok = try self.expect(.NUMBER);
+            const offset = try std.fmt.parseInt(i64, num_tok.lexeme, 10);
+
+            if (self.match(&[_]TokenType{.PRECEDING})) {
+                return .{ .bound = .preceding, .offset = offset };
+            } else if (self.match(&[_]TokenType{.FOLLOWING})) {
+                return .{ .bound = .following, .offset = offset };
+            }
+            return error.UnexpectedToken;
+        }
+
+        return error.UnexpectedToken;
     }
 
     // ========================================================================
@@ -922,4 +1069,60 @@ test "parse SELECT with multiple parameters" {
     const right_binary = where.binary.right.*.binary;
     try std.testing.expectEqual(ast.BinaryOp.eq, right_binary.op);
     try std.testing.expectEqual(@as(u32, 1), right_binary.right.*.value.parameter);
+}
+
+test "parse window function with PARTITION BY" {
+    const sql = "SELECT SUM(amount) OVER(PARTITION BY category) FROM transactions";
+    const allocator = std.testing.allocator;
+
+    const stmt = try parseSQL(sql, allocator);
+    try std.testing.expect(stmt == .select);
+    try std.testing.expectEqual(@as(usize, 1), stmt.select.columns.len);
+
+    // Verify it's a function call with window spec
+    const expr = stmt.select.columns[0].expr;
+    try std.testing.expect(expr == .call);
+    try std.testing.expectEqualStrings("SUM", expr.call.name);
+    try std.testing.expect(expr.call.window != null);
+
+    // Verify PARTITION BY
+    const window = expr.call.window.?;
+    try std.testing.expect(window.partition_by != null);
+    try std.testing.expectEqual(@as(usize, 1), window.partition_by.?.len);
+    try std.testing.expectEqualStrings("category", window.partition_by.?[0]);
+}
+
+test "parse window function with PARTITION BY and ORDER BY" {
+    const sql = "SELECT ROW_NUMBER() OVER(PARTITION BY dept ORDER BY salary DESC) FROM employees";
+    const allocator = std.testing.allocator;
+
+    const stmt = try parseSQL(sql, allocator);
+    try std.testing.expect(stmt == .select);
+
+    const expr = stmt.select.columns[0].expr;
+    try std.testing.expect(expr == .call);
+    try std.testing.expect(expr.call.window != null);
+
+    const window = expr.call.window.?;
+    // PARTITION BY dept
+    try std.testing.expect(window.partition_by != null);
+    try std.testing.expectEqualStrings("dept", window.partition_by.?[0]);
+    // ORDER BY salary DESC
+    try std.testing.expect(window.order_by != null);
+    try std.testing.expectEqualStrings("salary", window.order_by.?[0].column);
+    try std.testing.expectEqual(ast.OrderDirection.desc, window.order_by.?[0].direction);
+}
+
+test "parse window function with multiple PARTITION BY columns" {
+    const sql = "SELECT AVG(score) OVER(PARTITION BY region, category) FROM sales";
+    const allocator = std.testing.allocator;
+
+    const stmt = try parseSQL(sql, allocator);
+    const expr = stmt.select.columns[0].expr;
+    const window = expr.call.window.?;
+
+    try std.testing.expect(window.partition_by != null);
+    try std.testing.expectEqual(@as(usize, 2), window.partition_by.?.len);
+    try std.testing.expectEqualStrings("region", window.partition_by.?[0]);
+    try std.testing.expectEqualStrings("category", window.partition_by.?[1]);
 }

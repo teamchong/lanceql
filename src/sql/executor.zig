@@ -1038,6 +1038,7 @@ pub const Executor = struct {
                         .name = call.name,
                         .args = new_args,
                         .distinct = call.distinct,
+                        .window = call.window,
                     },
                 };
             },

@@ -21,7 +21,7 @@ import sys
 import subprocess
 import time
 
-NUM_ROWS = int(sys.argv[1]) if len(sys.argv) > 1 else 100_000
+NUM_ROWS = int(sys.argv[1]) if len(sys.argv) > 1 else 50_000  # Target ~5s per benchmark
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARQUET_FILE = f"/tmp/logic_table_bench_{NUM_ROWS}.parquet"
 

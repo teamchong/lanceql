@@ -60,6 +60,16 @@ pub const TokenType = enum {
     // Type casting
     CAST,
 
+    // Window functions
+    OVER,
+    PARTITION,
+    ROWS,
+    RANGE,
+    UNBOUNDED,
+    PRECEDING,
+    FOLLOWING,
+    CURRENT,
+
     // Vector search extension
     NEAR,
     TOPK,
@@ -362,6 +372,7 @@ fn keywordOrIdentifier(word: []const u8) TokenType {
     if (std.mem.eql(u8, upper, "CAST")) return .CAST;
     if (std.mem.eql(u8, upper, "COUNT")) return .COUNT;
     if (std.mem.eql(u8, upper, "CROSS")) return .CROSS;
+    if (std.mem.eql(u8, upper, "CURRENT")) return .CURRENT;
     if (std.mem.eql(u8, upper, "DATA")) return .DATA;
     if (std.mem.eql(u8, upper, "DESC")) return .DESC;
     if (std.mem.eql(u8, upper, "DISTINCT")) return .DISTINCT;
@@ -370,6 +381,7 @@ fn keywordOrIdentifier(word: []const u8) TokenType {
     if (std.mem.eql(u8, upper, "EXCEPT")) return .EXCEPT;
     if (std.mem.eql(u8, upper, "EXISTS")) return .EXISTS;
     if (std.mem.eql(u8, upper, "FILE")) return .FILE;
+    if (std.mem.eql(u8, upper, "FOLLOWING")) return .FOLLOWING;
     if (std.mem.eql(u8, upper, "FROM")) return .FROM;
     if (std.mem.eql(u8, upper, "FULL")) return .FULL;
     if (std.mem.eql(u8, upper, "GROUP")) return .GROUP;
@@ -395,11 +407,17 @@ fn keywordOrIdentifier(word: []const u8) TokenType {
     if (std.mem.eql(u8, upper, "OR")) return .OR;
     if (std.mem.eql(u8, upper, "ORDER")) return .ORDER;
     if (std.mem.eql(u8, upper, "OUTER")) return .OUTER;
+    if (std.mem.eql(u8, upper, "OVER")) return .OVER;
+    if (std.mem.eql(u8, upper, "PARTITION")) return .PARTITION;
+    if (std.mem.eql(u8, upper, "PRECEDING")) return .PRECEDING;
+    if (std.mem.eql(u8, upper, "RANGE")) return .RANGE;
     if (std.mem.eql(u8, upper, "RIGHT")) return .RIGHT;
+    if (std.mem.eql(u8, upper, "ROWS")) return .ROWS;
     if (std.mem.eql(u8, upper, "SELECT")) return .SELECT;
     if (std.mem.eql(u8, upper, "SUM")) return .SUM;
     if (std.mem.eql(u8, upper, "THEN")) return .THEN;
     if (std.mem.eql(u8, upper, "TOPK")) return .TOPK;
+    if (std.mem.eql(u8, upper, "UNBOUNDED")) return .UNBOUNDED;
     if (std.mem.eql(u8, upper, "UNION")) return .UNION;
     if (std.mem.eql(u8, upper, "USING")) return .USING;
     if (std.mem.eql(u8, upper, "WHEN")) return .WHEN;

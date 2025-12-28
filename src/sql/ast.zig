@@ -85,10 +85,13 @@ pub const Expr = union(enum) {
     },
 
     /// Function call (e.g., COUNT(*), AVG(salary))
+    /// With optional OVER clause for window functions
     call: struct {
         name: []const u8,
         args: []Expr,
         distinct: bool,
+        /// Optional window specification (OVER clause)
+        window: ?*WindowSpec,
     },
 
     /// IN expression: col IN (val1, val2, ...)
@@ -134,6 +137,37 @@ pub const CaseWhen = struct {
     condition: Expr,
     /// Result when condition is true
     result: Expr,
+};
+
+/// Window frame bound type
+pub const FrameBound = enum {
+    unbounded_preceding,
+    current_row,
+    unbounded_following,
+    preceding, // N PRECEDING
+    following, // N FOLLOWING
+};
+
+/// Window frame specification
+pub const WindowFrame = struct {
+    /// Frame type (ROWS or RANGE)
+    frame_type: enum { rows, range },
+    /// Start bound
+    start_bound: FrameBound,
+    start_offset: ?i64,
+    /// End bound (optional, defaults to CURRENT ROW)
+    end_bound: ?FrameBound,
+    end_offset: ?i64,
+};
+
+/// Window specification for OVER clause
+pub const WindowSpec = struct {
+    /// PARTITION BY columns
+    partition_by: ?[][]const u8,
+    /// ORDER BY columns with directions
+    order_by: ?[]OrderBy,
+    /// Optional frame specification
+    frame: ?WindowFrame,
 };
 
 /// SELECT column specification
@@ -305,6 +339,16 @@ pub fn deinitExpr(expr: *Expr, allocator: std.mem.Allocator) void {
                 deinitExpr(arg, allocator);
             }
             allocator.free(call.args);
+            // Free window specification if present
+            if (call.window) |window| {
+                if (window.partition_by) |cols| {
+                    allocator.free(cols);
+                }
+                if (window.order_by) |order| {
+                    allocator.free(order);
+                }
+                allocator.destroy(window);
+            }
         },
         .in_list => |in| {
             deinitExpr(in.expr, allocator);
