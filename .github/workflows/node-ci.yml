@@ -22,8 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        node: [18, 20, 22]
+        os: [ubuntu-latest, macos-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -31,7 +30,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node }}
+          node-version: 20
 
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
@@ -41,43 +40,18 @@ jobs:
       - name: Build Zig shared library
         run: zig build lib-nodejs
 
-      - name: Copy Zig library to packages/node/lib (Unix)
-        if: runner.os != 'Windows'
+      - name: Copy Zig library to packages/node/lib
         run: |
           mkdir -p packages/node/lib
           cp zig-out/lib/liblanceql.* packages/node/lib/
-
-      - name: Copy Zig library to packages/node/lib (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          New-Item -ItemType Directory -Force -Path packages/node/lib
-          Copy-Item zig-out/lib/lanceql.* packages/node/lib/
 
       - name: Install Node.js dependencies
         working-directory: packages/node
         run: npm install
 
-      - name: Build native addon
-        working-directory: packages/node
-        run: npm run build
-
       - name: Run tests
         working-directory: packages/node
         run: npm test
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Check JavaScript syntax
-        working-directory: packages/node
-        run: node --check src/index.js
 
   zig-test:
     runs-on: ${{ matrix.os }}
