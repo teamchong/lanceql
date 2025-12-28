@@ -20,7 +20,7 @@ on:
 jobs:
   benchmark-macos:
     runs-on: macos-14  # Apple Silicon (M1)
-    timeout-minutes: 60  # Each benchmark runs 30+ seconds
+    timeout-minutes: 120  # 200M row benchmarks need more time
 
     steps:
       - uses: actions/checkout@v4
@@ -130,7 +130,7 @@ jobs:
 
   benchmark-linux:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120  # 200M row benchmarks need more time
 
     steps:
       - uses: actions/checkout@v4
