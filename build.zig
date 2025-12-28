@@ -463,6 +463,19 @@ pub fn build(b: *std.Build) void {
     const bench_compiled_step = b.step("bench-compiled-logic-table", "Benchmark compiled @logic_table (Python -> native via metal0)");
     bench_compiled_step.dependOn(&run_bench_compiled.step);
 
+    // @logic_table Pushdown benchmark - demonstrates filtered_indices optimization
+    const bench_pushdown = b.addExecutable(.{
+        .name = "bench_pushdown",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/bench_pushdown.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const run_bench_pushdown = b.addRunArtifact(bench_pushdown);
+    const bench_pushdown_step = b.step("bench-pushdown", "Benchmark @logic_table pushdown (filtered_indices optimization)");
+    bench_pushdown_step.dependOn(&run_bench_pushdown.step);
+
     // Parquet benchmark - LanceQL vs DuckDB vs Polars
     const bench_parquet = b.addExecutable(.{
         .name = "bench_parquet",

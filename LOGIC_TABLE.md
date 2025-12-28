@@ -40,6 +40,32 @@ Each step adds latency. The Python interpreter processes one row at a time. Even
 
 Machines are more powerful now. A laptop can process millions of rows per second. So I built [metal0](https://github.com/metal0-tech/metal0) - a compiler that transpiles Python to native code (Zig, WASM, GPU shaders). The logic stays in Python (testable, versionable, proper tooling) but EXECUTES like stored procedures (compiled, runs on data, hardware-accelerated).
 
+### Zero Python at Runtime
+
+**Critical distinction**: Python in `@logic_table` is **compile-time only**.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  COMPILE TIME (development)                                     │
+│  ┌─────────────┐      ┌─────────────┐      ┌─────────────────┐  │
+│  │ Python      │ ───► │   metal0    │ ───► │ Zig/WASM/GPU    │  │
+│  │ @logic_table│      │  compiler   │      │ native code     │  │
+│  └─────────────┘      └─────────────┘      └─────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│  RUNTIME (production)                                           │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  Native execution only                                   │    │
+│  │  • No Python interpreter                                 │    │
+│  │  • No Python dependencies                                │    │
+│  │  • GPU/SIMD acceleration                                 │    │
+│  └─────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+This is why `@logic_table` is 100-1000x faster than Python UDFs - there's simply no Python at runtime.
+
 ## @logic_table: The Solution
 
 A `@logic_table` is a **Python class that becomes a virtual table** in SQL. It's NOT a UDF (user-defined function) - it's a table source with computed columns.
@@ -450,41 +476,25 @@ You need an external cache provider.
 
 ### Cache Provider Interface
 
+**Important**: Python code in `@logic_table` is **compile-time only**. metal0 transpiles Python to native Zig/WASM/GPU code. There is **zero Python at runtime**.
+
+The cache provider is configured at the Zig level:
+
 ```python
-# Python interface (for @logic_table authors)
-from lanceql import CacheProvider
+# Python @logic_table (COMPILE-TIME ONLY)
+# metal0 transpiles this to native Zig code
 
-class RedisCacheProvider(CacheProvider):
-    """External cache using Redis."""
-
-    def __init__(self, redis_url: str, ttl: int = 3600):
-        self.client = redis.from_url(redis_url)
-        self.ttl = ttl
-
-    def get(self, key: str) -> Optional[Any]:
-        """Get cached value, return None if miss."""
-        data = self.client.get(key)
-        return pickle.loads(data) if data else None
-
-    def set(self, key: str, value: Any) -> None:
-        """Cache a value with TTL."""
-        self.client.setex(key, self.ttl, pickle.dumps(value))
-
-    def invalidate(self, pattern: str) -> None:
-        """Invalidate keys matching pattern."""
-        for key in self.client.scan_iter(pattern):
-            self.client.delete(key)
-
-@logic_table(cache=RedisCacheProvider("redis://localhost:6379"))
+@logic_table
 class ExpensiveProcessor:
+    """This Python is compiled away - runs as native code."""
     data = Table('large_dataset.lance')
 
     def expensive_score(self) -> float:
-        # Result cached in Redis, survives across queries
+        # At runtime, this is native Zig, not Python!
         return self.complex_calculation()
 ```
 
-### Zig Interface
+### Zig Interface (Runtime)
 
 ```zig
 /// External cache provider interface
@@ -570,21 +580,30 @@ if (cached) {
 
 Cache keys include context to ensure correctness:
 
-```python
-def generate_cache_key(method_name: str, ctx: QueryContext) -> str:
-    """Generate cache key including query context."""
-    components = [
-        method_name,
-        f"rows:{ctx.total_rows}",
-        f"matched:{ctx.matched_rows}",
-        # Include predicate hash if method depends on it
-        f"pred:{hash(tuple(ctx.predicates))}",
-    ]
-    return ":".join(components)
+```zig
+/// Generate cache key including query context
+fn generateCacheKey(
+    allocator: std.mem.Allocator,
+    method_name: []const u8,
+    ctx: *const QueryContext,
+) ![]u8 {
+    // Key format: "method:rows:N:matched:M:pred:HASH"
+    var hasher = std.hash.Wyhash.init(0);
+    for (ctx.predicates) |pred| {
+        hasher.update(pred.column);
+        hasher.update(std.mem.asBytes(&@intFromEnum(pred.op)));
+    }
+    const pred_hash = hasher.final();
 
-# Example keys:
-# "risk_score:rows:100000:matched:1500:pred:a1b2c3"
-# "amount_score:rows:100000:matched:1500:pred:a1b2c3"
+    return std.fmt.allocPrint(allocator,
+        "{s}:rows:{d}:matched:{d}:pred:{x}",
+        .{ method_name, ctx.total_rows, ctx.matched_rows, pred_hash },
+    );
+}
+
+// Example keys:
+// "risk_score:rows:100000:matched:1500:pred:a1b2c3d4"
+// "amount_score:rows:100000:matched:1500:pred:a1b2c3d4"
 ```
 
 ## Architecture
