@@ -231,7 +231,7 @@ pub fn main() !void {
         const polars_s = @as(f64, @floatFromInt(polars_ns)) / 5.0 / 10.0 / 1_000_000_000.0;
         const polars_tput = @as(f64, @floatFromInt(NUM_ROWS)) / polars_s / 1_000_000;
         const polars_ratio = polars_s / lanceql_agg_s;
-        std.debug.print("{s:<25} {d:>9.0} ms {d:>12.0}M/s {d:>9.1}x\n", .{ "NumPy", polars_s * 1000, polars_tput, polars_ratio });
+        std.debug.print("{s:<25} {d:>9.0} ms {d:>12.0}M/s {d:>9.1}x\n", .{ "Polars", polars_s * 1000, polars_tput, polars_ratio });
     }
 
     // =========================================================================
@@ -297,7 +297,7 @@ pub fn main() !void {
         const polars_s = @as(f64, @floatFromInt(polars_ns)) / 5.0 / 10.0 / 1_000_000_000.0;
         const polars_tput = @as(f64, @floatFromInt(NUM_ROWS)) / polars_s / 1_000_000;
         const polars_ratio = polars_s / lanceql_group_s;
-        std.debug.print("{s:<25} {d:>9.0} ms {d:>12.0}M/s {d:>9.1}x\n", .{ "NumPy", polars_s * 1000, polars_tput, polars_ratio });
+        std.debug.print("{s:<25} {d:>9.0} ms {d:>12.0}M/s {d:>9.1}x\n", .{ "Polars", polars_s * 1000, polars_tput, polars_ratio });
     }
 
     // =========================================================================

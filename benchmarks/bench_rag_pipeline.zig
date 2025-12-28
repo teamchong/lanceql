@@ -281,7 +281,7 @@ pub fn main() !void {
         const polars_total_s = @as(f64, @floatFromInt(polars_ns)) / 5.0 / 1_000_000_000.0;
         const polars_qps = @as(f64, @floatFromInt(NUM_QUERIES)) / polars_total_s;
         const polars_ratio = polars_per_query / lanceql_per_query;
-        std.debug.print("{s:<25} {d:>9.2} ms {d:>10.2}s {d:>9.0}  ({d:.0}x, {d} vectors)\n", .{ "NumPy", polars_per_query / 1_000_000, polars_total_s, polars_qps, polars_ratio, polars_scale });
+        std.debug.print("{s:<25} {d:>9.2} ms {d:>10.2}s {d:>9.0}  ({d:.0}x, {d} vectors)\n", .{ "Polars", polars_per_query / 1_000_000, polars_total_s, polars_qps, polars_ratio, polars_scale });
     }
 
     // =========================================================================
@@ -294,7 +294,7 @@ pub fn main() !void {
     std.debug.print("LanceQL processes {d} queries over {d} vectors at {d:.0} QPS.\n", .{ NUM_QUERIES, TOTAL_CHUNKS, lanceql_qps });
     std.debug.print("GPU acceleration enables real-time RAG retrieval.\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("Note: DuckDB/NumPy tested at smaller scale due to memory/performance limits.\n", .{});
+    std.debug.print("Note: DuckDB/Polars tested at smaller scale due to memory/performance limits.\n", .{});
     std.debug.print("\n", .{});
 
     metal.cleanupGPU();

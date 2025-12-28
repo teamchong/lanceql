@@ -170,7 +170,7 @@ pub fn main() !void {
         polars_per_op = @as(f64, @floatFromInt(polars_ns)) / @as(f64, @floatFromInt(POLARS_ITERATIONS));
         const polars_total_s = @as(f64, @floatFromInt(polars_ns)) / 1_000_000_000.0;
         const polars_ratio = polars_per_op / lanceql_per_op;
-        std.debug.print("{s:<25} {d:>9.0} ns {d:>10.1}s {d:>9.1}x\n", .{ "Polars/NumPy", polars_per_op, polars_total_s, polars_ratio });
+        std.debug.print("{s:<25} {d:>9.0} ns {d:>10.1}s {d:>9.1}x\n", .{ "Polars", polars_per_op, polars_total_s, polars_ratio });
     }
 
     // =========================================================================
@@ -182,9 +182,8 @@ pub fn main() !void {
     std.debug.print("\n", .{});
     std.debug.print("LanceQL:     {d:>8.0} ns/op (baseline)\n", .{lanceql_per_op});
     std.debug.print("DuckDB:      {d:>8.0} us/op ({d:.0}x slower)\n", .{ duckdb_per_op / 1000.0, duckdb_ratio });
-    std.debug.print("Polars/NumPy:{d:>8.0} ns/op ({d:.1}x)\n", .{ polars_per_op, polars_per_op / lanceql_per_op });
+    std.debug.print("Polars:      {d:>8.0} ns/op ({d:.1}x)\n", .{ polars_per_op, polars_per_op / lanceql_per_op });
     std.debug.print("\n", .{});
-    std.debug.print("Note: Polars uses NumPy for dot product (no native vector ops)\n", .{});
     std.debug.print("DuckDB overhead: SQL parsing + query planning per call (~3ms)\n", .{});
     std.debug.print("\n", .{});
 }

@@ -216,7 +216,7 @@ pub fn main() !void {
             }
             const polars_per_op = @as(f64, @floatFromInt(polars_ns)) / @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS));
             const polars_ratio = polars_per_op / lanceql_cos_ns;
-            std.debug.print("{s:<25} {d:>12.1} ns   {d:.0}x slower\n", .{ "NumPy (subprocess)", polars_per_op, polars_ratio });
+            std.debug.print("{s:<25} {d:>12.1} ns   {d:.0}x slower\n", .{ "Polars (subprocess)", polars_per_op, polars_ratio });
         }
 
         std.debug.print("\nNote: Subprocess times include process startup overhead.\n", .{});
