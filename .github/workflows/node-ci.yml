@@ -41,6 +41,18 @@ jobs:
       - name: Build Zig shared library
         run: zig build lib-nodejs
 
+      - name: Copy Zig library to packages/node/lib (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p packages/node/lib
+          cp zig-out/lib/liblanceql.* packages/node/lib/
+
+      - name: Copy Zig library to packages/node/lib (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force -Path packages/node/lib
+          Copy-Item zig-out/lib/lanceql.* packages/node/lib/
+
       - name: Install Node.js dependencies
         working-directory: packages/node
         run: npm install
