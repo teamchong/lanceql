@@ -6,11 +6,12 @@
 const std = @import("std");
 const metal = @import("lanceql.metal");
 
-// Each benchmark should run 30+ seconds
+// Each benchmark should run 5+ seconds
 const WARMUP = 3;
-const ITERATIONS = 20;
-const SUBPROCESS_ITERATIONS: usize = 10; // Fewer for subprocess overhead
-const MIN_BENCHMARK_SECONDS: f64 = 30.0;
+const BATCH_ITERATIONS = 200; // Batch benchmarks (~5+ seconds at ~50ms/batch)
+const SINGLE_ITERATIONS: usize = 100_000_000; // Single vector ops (~5+ seconds at ~50ns)
+const SUBPROCESS_ITERATIONS: usize = 200; // Subprocess (~5+ seconds at ~30ms)
+const MIN_BENCHMARK_SECONDS: f64 = 5.0;
 
 // Engine availability
 var has_duckdb: bool = false;
@@ -118,40 +119,37 @@ pub fn main() !void {
     for (query) |*v| v.* = rng.random().float(f32) * 2 - 1;
     for (vec) |*v| v.* = rng.random().float(f32) * 2 - 1;
 
-    // 10M iterations to get 30+ seconds
-    const single_iters: usize = 10_000_000;
-
-    std.debug.print("Running {d}M iterations per operation...\n\n", .{single_iters / 1_000_000});
+    std.debug.print("Running {d}M iterations per operation...\n\n", .{SINGLE_ITERATIONS / 1_000_000});
 
     var timer = try std.time.Timer.start();
     var dot_ns: u64 = 0;
-    for (0..single_iters) |_| {
+    for (0..SINGLE_ITERATIONS) |_| {
         var t = try std.time.Timer.start();
         _ = metal.dotProduct(query, vec);
         dot_ns += t.read();
     }
     const dot_total = timer.read();
-    std.debug.print("Dot product:  {d:.0} ns/op  (total: {d:.1} s)\n", .{ @as(f64, @floatFromInt(dot_ns)) / @as(f64, @floatFromInt(single_iters)), @as(f64, @floatFromInt(dot_total)) / 1_000_000_000 });
+    std.debug.print("Dot product:  {d:.0} ns/op  (total: {d:.1} s)\n", .{ @as(f64, @floatFromInt(dot_ns)) / @as(f64, @floatFromInt(SINGLE_ITERATIONS)), @as(f64, @floatFromInt(dot_total)) / 1_000_000_000 });
 
     timer = try std.time.Timer.start();
     var cos_ns: u64 = 0;
-    for (0..single_iters) |_| {
+    for (0..SINGLE_ITERATIONS) |_| {
         var t = try std.time.Timer.start();
         _ = metal.cosineSimilarity(query, vec);
         cos_ns += t.read();
     }
     const cos_total = timer.read();
-    std.debug.print("Cosine sim:   {d:.0} ns/op  (total: {d:.1} s)\n", .{ @as(f64, @floatFromInt(cos_ns)) / @as(f64, @floatFromInt(single_iters)), @as(f64, @floatFromInt(cos_total)) / 1_000_000_000 });
+    std.debug.print("Cosine sim:   {d:.0} ns/op  (total: {d:.1} s)\n", .{ @as(f64, @floatFromInt(cos_ns)) / @as(f64, @floatFromInt(SINGLE_ITERATIONS)), @as(f64, @floatFromInt(cos_total)) / 1_000_000_000 });
 
     timer = try std.time.Timer.start();
     var l2_ns: u64 = 0;
-    for (0..single_iters) |_| {
+    for (0..SINGLE_ITERATIONS) |_| {
         var t = try std.time.Timer.start();
         _ = metal.l2DistanceSquared(query, vec);
         l2_ns += t.read();
     }
     const l2_total = timer.read();
-    const lanceql_l2_ns = @as(f64, @floatFromInt(l2_ns)) / @as(f64, @floatFromInt(single_iters));
+    const lanceql_l2_ns = @as(f64, @floatFromInt(l2_ns)) / @as(f64, @floatFromInt(SINGLE_ITERATIONS));
     std.debug.print("L2 distance:  {d:.0} ns/op  (total: {d:.1} s)\n", .{ lanceql_l2_ns, @as(f64, @floatFromInt(l2_total)) / 1_000_000_000 });
 
     // ==========================================================================
@@ -181,7 +179,7 @@ pub fn main() !void {
         }
         try vec_str.appendSlice(allocator, "]");
 
-        const lanceql_cos_ns = @as(f64, @floatFromInt(cos_ns)) / @as(f64, @floatFromInt(single_iters));
+        const lanceql_cos_ns = @as(f64, @floatFromInt(cos_ns)) / @as(f64, @floatFromInt(SINGLE_ITERATIONS));
         std.debug.print("{s:<25} {d:>12.1} ns   (baseline)\n", .{ "LanceQL", lanceql_cos_ns });
 
         // DuckDB cosine similarity
@@ -250,17 +248,17 @@ fn benchmarkBatch(allocator: std.mem.Allocator, num_vectors: usize, dim: usize) 
         metal.batchCosineSimilarity(query, vectors, dim, scores);
     }
 
-    // Run enough iterations to get 30+ seconds
+    // Run enough iterations to get 5+ seconds
     var total_timer = try std.time.Timer.start();
     var total_ns: u64 = 0;
-    for (0..ITERATIONS) |_| {
+    for (0..BATCH_ITERATIONS) |_| {
         var timer = try std.time.Timer.start();
         metal.batchCosineSimilarity(query, vectors, dim, scores);
         total_ns += timer.read();
     }
     const wall_time = total_timer.read();
 
-    const avg_sec = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(ITERATIONS)) / 1_000_000_000;
+    const avg_sec = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(BATCH_ITERATIONS)) / 1_000_000_000;
     const total_sec = @as(f64, @floatFromInt(wall_time)) / 1_000_000_000;
     const mvps = @as(f64, @floatFromInt(num_vectors)) / avg_sec / 1_000_000;
 

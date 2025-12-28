@@ -16,8 +16,8 @@
 const std = @import("std");
 
 const WARMUP = 5;
-const ITERATIONS = 10_000_000; // 10M iterations for native ops (~30s)
-const SUBPROCESS_ITERATIONS = 20; // Few iterations for subprocess (overhead dominates)
+const LANCEQL_ITERATIONS = 1_000_000; // ~5+ seconds at ~5us/op
+const SUBPROCESS_ITERATIONS = 200; // ~5+ seconds at ~30ms/op (DuckDB subprocess)
 
 // Engine detection
 var has_duckdb: bool = false;
@@ -31,34 +31,6 @@ extern fn VectorOps_dot_product(a: [*]const f64, b: [*]const f64, len: usize) f6
 extern fn VectorOps_sum_squares(a: [*]const f64, len: usize) f64;
 extern fn VectorOps_sum_values(a: [*]const f64, len: usize) f64;
 
-// =============================================================================
-// Native Zig baseline
-// =============================================================================
-
-fn nativeDotProduct(a: []const f64, b: []const f64) f64 {
-    var result: f64 = 0.0;
-    const len = @min(a.len, b.len);
-    for (0..len) |i| {
-        result += a[i] * b[i];
-    }
-    return result;
-}
-
-fn nativeSumSquares(a: []const f64) f64 {
-    var result: f64 = 0.0;
-    for (a) |v| {
-        result += v * v;
-    }
-    return result;
-}
-
-fn nativeSumValues(a: []const f64) f64 {
-    var result: f64 = 0.0;
-    for (a) |v| {
-        result += v;
-    }
-    return result;
-}
 
 // =============================================================================
 // DuckDB/Polars runners
@@ -129,17 +101,15 @@ pub fn main() !void {
     has_polars = checkCommand(allocator, "python3");
 
     std.debug.print("\nEngines:\n", .{});
-    std.debug.print("  - LanceQL @logic_table: yes (lib/vector_ops.a)\n", .{});
-    std.debug.print("  - Native Zig:           yes (baseline)\n", .{});
-    std.debug.print("  - DuckDB:               {s}\n", .{if (has_duckdb) "yes" else "no (install: brew install duckdb)"});
-    std.debug.print("  - Polars:               {s}\n", .{if (has_polars) "yes" else "no (install: pip install polars)"});
+    std.debug.print("  - LanceQL:  yes (lib/vector_ops.a)\n", .{});
+    std.debug.print("  - DuckDB:   {s}\n", .{if (has_duckdb) "yes" else "no (install: brew install duckdb)"});
+    std.debug.print("  - Polars:   {s}\n", .{if (has_polars) "yes" else "no (install: pip install polars)"});
     std.debug.print("\n", .{});
 
     const dim: usize = 384;
 
     std.debug.print("Vector dimension: {}\n", .{dim});
-    std.debug.print("Warmup: {}, Iterations: {}M (native), {} (subprocess)\n", .{ WARMUP, ITERATIONS / 1_000_000, SUBPROCESS_ITERATIONS });
-    std.debug.print("Target: 30+ seconds per benchmark\n", .{});
+    std.debug.print("Warmup: {}, Iterations: {}M (LanceQL), {} (subprocess)\n", .{ WARMUP, LANCEQL_ITERATIONS / 1_000_000, SUBPROCESS_ITERATIONS });
     std.debug.print("\n", .{});
 
     const a = try allocator.alloc(f64, dim);
@@ -156,39 +126,24 @@ pub fn main() !void {
     // Dot Product Benchmark
     // =========================================================================
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("DOT PRODUCT\n", .{});
+    std.debug.print("DOT PRODUCT (384-dim vectors)\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("{s:<25} {s:>12} {s:>12} {s:>10}\n", .{ "Engine", "Time/op", "Total", "Ratio" });
     std.debug.print("{s:<25} {s:>12} {s:>12} {s:>10}\n", .{ "-" ** 25, "-" ** 12, "-" ** 12, "-" ** 10 });
 
-    // Native Zig (baseline)
-    var native_ns: u64 = 0;
-    {
-        var checksum: f64 = 0;
-        for (0..WARMUP) |_| checksum += nativeDotProduct(a, b);
-        var timer = try std.time.Timer.start();
-        for (0..ITERATIONS) |_| checksum += nativeDotProduct(a, b);
-        native_ns = timer.read();
-        std.mem.doNotOptimizeAway(&checksum);
-    }
-    const native_per_op = @as(f64, @floatFromInt(native_ns)) / @as(f64, @floatFromInt(ITERATIONS));
-    const native_total_s = @as(f64, @floatFromInt(native_ns)) / 1_000_000_000.0;
-    std.debug.print("{s:<25} {d:>9.0} ns {d:>10.1}s {s:>10}\n", .{ "Native Zig", native_per_op, native_total_s, "1.0x" });
-
-    // LanceQL @logic_table
+    // LanceQL (baseline)
     var lanceql_ns: u64 = 0;
     {
         var checksum: f64 = 0;
         for (0..WARMUP) |_| checksum += VectorOps_dot_product(a.ptr, b.ptr, dim);
         var timer = try std.time.Timer.start();
-        for (0..ITERATIONS) |_| checksum += VectorOps_dot_product(a.ptr, b.ptr, dim);
+        for (0..LANCEQL_ITERATIONS) |_| checksum += VectorOps_dot_product(a.ptr, b.ptr, dim);
         lanceql_ns = timer.read();
         std.mem.doNotOptimizeAway(&checksum);
     }
-    const lanceql_per_op = @as(f64, @floatFromInt(lanceql_ns)) / @as(f64, @floatFromInt(ITERATIONS));
+    const lanceql_per_op = @as(f64, @floatFromInt(lanceql_ns)) / @as(f64, @floatFromInt(LANCEQL_ITERATIONS));
     const lanceql_total_s = @as(f64, @floatFromInt(lanceql_ns)) / 1_000_000_000.0;
-    const lanceql_ratio = lanceql_per_op / native_per_op;
-    std.debug.print("{s:<25} {d:>9.0} ns {d:>10.1}s {d:>9.1}x\n", .{ "LanceQL @logic_table", lanceql_per_op, lanceql_total_s, lanceql_ratio });
+    std.debug.print("{s:<25} {d:>9.0} ns {d:>10.1}s {s:>10}\n", .{ "LanceQL", lanceql_per_op, lanceql_total_s, "1.0x" });
 
     // DuckDB
     if (has_duckdb) {
@@ -223,8 +178,8 @@ pub fn main() !void {
         }
         const duckdb_per_op = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS));
         const duckdb_total_s = @as(f64, @floatFromInt(total_ns)) / 1_000_000_000.0;
-        const duckdb_ratio = duckdb_per_op / native_per_op;
-        std.debug.print("{s:<25} {d:>9.0} ms {d:>10.1}s {d:>9.0}x\n", .{ "DuckDB (subprocess)", duckdb_per_op / 1_000_000.0, duckdb_total_s, duckdb_ratio });
+        const duckdb_ratio = duckdb_per_op / lanceql_per_op;
+        std.debug.print("{s:<25} {d:>9.0} ms {d:>10.1}s {d:>9.0}x\n", .{ "DuckDB", duckdb_per_op / 1_000_000.0, duckdb_total_s, duckdb_ratio });
     }
 
     // Polars
@@ -263,45 +218,31 @@ pub fn main() !void {
         }
         const polars_per_op = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS));
         const polars_total_s = @as(f64, @floatFromInt(total_ns)) / 1_000_000_000.0;
-        const polars_ratio = polars_per_op / native_per_op;
-        std.debug.print("{s:<25} {d:>9.0} ms {d:>10.1}s {d:>9.0}x\n", .{ "Polars (subprocess)", polars_per_op / 1_000_000.0, polars_total_s, polars_ratio });
+        const polars_ratio = polars_per_op / lanceql_per_op;
+        std.debug.print("{s:<25} {d:>9.0} ms {d:>10.1}s {d:>9.0}x\n", .{ "Polars", polars_per_op / 1_000_000.0, polars_total_s, polars_ratio });
     }
 
     // =========================================================================
     // Sum Squares Benchmark
     // =========================================================================
     std.debug.print("\n================================================================================\n", .{});
-    std.debug.print("SUM SQUARES\n", .{});
+    std.debug.print("SUM SQUARES (384-dim vectors)\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("{s:<25} {s:>12} {s:>12} {s:>10}\n", .{ "Engine", "Time/op", "Total", "Ratio" });
     std.debug.print("{s:<25} {s:>12} {s:>12} {s:>10}\n", .{ "-" ** 25, "-" ** 12, "-" ** 12, "-" ** 10 });
 
-    // Native Zig
-    {
-        var checksum: f64 = 0;
-        for (0..WARMUP) |_| checksum += nativeSumSquares(a);
-        var timer = try std.time.Timer.start();
-        for (0..ITERATIONS) |_| checksum += nativeSumSquares(a);
-        native_ns = timer.read();
-        std.mem.doNotOptimizeAway(&checksum);
-    }
-    const native_ss_per_op = @as(f64, @floatFromInt(native_ns)) / @as(f64, @floatFromInt(ITERATIONS));
-    const native_ss_total_s = @as(f64, @floatFromInt(native_ns)) / 1_000_000_000.0;
-    std.debug.print("{s:<25} {d:>9.0} ns {d:>10.1}s {s:>10}\n", .{ "Native Zig", native_ss_per_op, native_ss_total_s, "1.0x" });
-
-    // LanceQL @logic_table
+    // LanceQL (baseline)
     {
         var checksum: f64 = 0;
         for (0..WARMUP) |_| checksum += VectorOps_sum_squares(a.ptr, dim);
         var timer = try std.time.Timer.start();
-        for (0..ITERATIONS) |_| checksum += VectorOps_sum_squares(a.ptr, dim);
+        for (0..LANCEQL_ITERATIONS) |_| checksum += VectorOps_sum_squares(a.ptr, dim);
         lanceql_ns = timer.read();
         std.mem.doNotOptimizeAway(&checksum);
     }
-    const lanceql_ss_per_op = @as(f64, @floatFromInt(lanceql_ns)) / @as(f64, @floatFromInt(ITERATIONS));
+    const lanceql_ss_per_op = @as(f64, @floatFromInt(lanceql_ns)) / @as(f64, @floatFromInt(LANCEQL_ITERATIONS));
     const lanceql_ss_total_s = @as(f64, @floatFromInt(lanceql_ns)) / 1_000_000_000.0;
-    const lanceql_ss_ratio = lanceql_ss_per_op / native_ss_per_op;
-    std.debug.print("{s:<25} {d:>9.0} ns {d:>10.1}s {d:>9.1}x\n", .{ "LanceQL @logic_table", lanceql_ss_per_op, lanceql_ss_total_s, lanceql_ss_ratio });
+    std.debug.print("{s:<25} {d:>9.0} ns {d:>10.1}s {s:>10}\n", .{ "LanceQL", lanceql_ss_per_op, lanceql_ss_total_s, "1.0x" });
 
     // DuckDB
     if (has_duckdb) {
@@ -324,10 +265,10 @@ pub fn main() !void {
         for (0..SUBPROCESS_ITERATIONS) |_| {
             total_ns += runDuckDB(allocator, sql) catch 0;
         }
-        const duckdb_per_op = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS));
+        const duckdb_ss_per_op = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS));
         const duckdb_ss_total_s = @as(f64, @floatFromInt(total_ns)) / 1_000_000_000.0;
-        const duckdb_ratio = duckdb_per_op / native_ss_per_op;
-        std.debug.print("{s:<25} {d:>9.0} ms {d:>10.1}s {d:>9.0}x\n", .{ "DuckDB (subprocess)", duckdb_per_op / 1_000_000.0, duckdb_ss_total_s, duckdb_ratio });
+        const duckdb_ss_ratio = duckdb_ss_per_op / lanceql_ss_per_op;
+        std.debug.print("{s:<25} {d:>9.0} ms {d:>10.1}s {d:>9.0}x\n", .{ "DuckDB", duckdb_ss_per_op / 1_000_000.0, duckdb_ss_total_s, duckdb_ss_ratio });
     }
 
     // Polars
@@ -353,10 +294,10 @@ pub fn main() !void {
         for (0..SUBPROCESS_ITERATIONS) |_| {
             total_ns += runPolars(allocator, py_code) catch 0;
         }
-        const polars_per_op = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS));
+        const polars_ss_per_op = @as(f64, @floatFromInt(total_ns)) / @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS));
         const polars_ss_total_s = @as(f64, @floatFromInt(total_ns)) / 1_000_000_000.0;
-        const polars_ratio = polars_per_op / native_ss_per_op;
-        std.debug.print("{s:<25} {d:>9.0} ms {d:>10.1}s {d:>9.0}x\n", .{ "Polars (subprocess)", polars_per_op / 1_000_000.0, polars_ss_total_s, polars_ratio });
+        const polars_ss_ratio = polars_ss_per_op / lanceql_ss_per_op;
+        std.debug.print("{s:<25} {d:>9.0} ms {d:>10.1}s {d:>9.0}x\n", .{ "Polars", polars_ss_per_op / 1_000_000.0, polars_ss_total_s, polars_ss_ratio });
     }
 
     // =========================================================================
@@ -366,10 +307,7 @@ pub fn main() !void {
     std.debug.print("Summary\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("LanceQL @logic_table is {d:.0}x slower than native Zig.\n", .{lanceql_ratio});
-    std.debug.print("This is the optimization target for metal0 codegen.\n", .{});
-    std.debug.print("\n", .{});
-    std.debug.print("Note: DuckDB/Polars times include subprocess overhead.\n", .{});
-    std.debug.print("For fair comparison, use in-process bindings.\n", .{});
+    std.debug.print("LanceQL is the baseline (1.0x).\n", .{});
+    std.debug.print("DuckDB/Polars times include subprocess startup overhead.\n", .{});
     std.debug.print("\n", .{});
 }

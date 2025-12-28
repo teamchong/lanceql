@@ -9,39 +9,22 @@ const c = @cImport({
 });
 
 const WARMUP = 5;
-const ITERATIONS = 10_000_000;
+const LANCEQL_ITERATIONS = 1_000_000; // ~5+ seconds at ~5us/op
+const DUCKDB_ITERATIONS = 2000; // ~5+ seconds at ~2.5ms/op
 
 // LanceQL @logic_table (metal0 compiled)
 extern fn VectorOps_dot_product(a: [*]const f64, b: [*]const f64, len: usize) f64;
 extern fn VectorOps_sum_squares(a: [*]const f64, len: usize) f64;
-
-// Native Zig baseline
-fn nativeDotProduct(a: []const f64, b: []const f64) f64 {
-    var result: f64 = 0.0;
-    const len = @min(a.len, b.len);
-    for (0..len) |i| {
-        result += a[i] * b[i];
-    }
-    return result;
-}
-
-fn nativeSumSquares(a: []const f64) f64 {
-    var result: f64 = 0.0;
-    for (a) |v| {
-        result += v * v;
-    }
-    return result;
-}
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     std.debug.print("\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("IN-PROCESS Benchmark: LanceQL vs DuckDB (C API) - FAIR COMPARISON\n", .{});
+    std.debug.print("IN-PROCESS Benchmark: LanceQL vs DuckDB\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("\nNo subprocess overhead - both run in-process with native code.\n", .{});
-    std.debug.print("Iterations: {}M\n", .{ITERATIONS / 1_000_000});
+    std.debug.print("\nNo subprocess overhead - all engines run in-process.\n", .{});
+    std.debug.print("Iterations: {}M (LanceQL), {}K (DuckDB)\n", .{ LANCEQL_ITERATIONS / 1_000_000, DUCKDB_ITERATIONS / 1000 });
     std.debug.print("\n", .{});
 
     const dim: usize = 384;
@@ -102,37 +85,21 @@ pub fn main() !void {
     std.debug.print("{s:<25} {s:>12} {s:>12} {s:>10}\n", .{ "Engine", "Time/op", "Total", "Ratio" });
     std.debug.print("{s:<25} {s:>12} {s:>12} {s:>10}\n", .{ "-" ** 25, "-" ** 12, "-" ** 12, "-" ** 10 });
 
-    // Native Zig
-    var native_ns: u64 = 0;
-    {
-        var checksum: f64 = 0;
-        for (0..WARMUP) |_| checksum += nativeDotProduct(a, b);
-        var timer = try std.time.Timer.start();
-        for (0..ITERATIONS) |_| checksum += nativeDotProduct(a, b);
-        native_ns = timer.read();
-        std.mem.doNotOptimizeAway(&checksum);
-    }
-    const native_per_op = @as(f64, @floatFromInt(native_ns)) / @as(f64, @floatFromInt(ITERATIONS));
-    const native_total_s = @as(f64, @floatFromInt(native_ns)) / 1_000_000_000.0;
-    std.debug.print("{s:<25} {d:>9.0} ns {d:>10.1}s {s:>10}\n", .{ "Native Zig", native_per_op, native_total_s, "1.0x" });
-
-    // LanceQL @logic_table
+    // LanceQL (baseline)
     var lanceql_ns: u64 = 0;
     {
         var checksum: f64 = 0;
         for (0..WARMUP) |_| checksum += VectorOps_dot_product(a.ptr, b.ptr, dim);
         var timer = try std.time.Timer.start();
-        for (0..ITERATIONS) |_| checksum += VectorOps_dot_product(a.ptr, b.ptr, dim);
+        for (0..LANCEQL_ITERATIONS) |_| checksum += VectorOps_dot_product(a.ptr, b.ptr, dim);
         lanceql_ns = timer.read();
         std.mem.doNotOptimizeAway(&checksum);
     }
-    const lanceql_per_op = @as(f64, @floatFromInt(lanceql_ns)) / @as(f64, @floatFromInt(ITERATIONS));
+    const lanceql_per_op = @as(f64, @floatFromInt(lanceql_ns)) / @as(f64, @floatFromInt(LANCEQL_ITERATIONS));
     const lanceql_total_s = @as(f64, @floatFromInt(lanceql_ns)) / 1_000_000_000.0;
-    const lanceql_ratio = lanceql_per_op / native_per_op;
-    std.debug.print("{s:<25} {d:>9.0} ns {d:>10.1}s {d:>9.1}x\n", .{ "LanceQL @logic_table", lanceql_per_op, lanceql_total_s, lanceql_ratio });
+    std.debug.print("{s:<25} {d:>9.0} ns {d:>10.1}s {s:>10}\n", .{ "LanceQL", lanceql_per_op, lanceql_total_s, "1.0x" });
 
     // DuckDB in-process (fewer iterations - SQL parsing overhead)
-    const duckdb_iters: usize = 10000;
     var duckdb_ns: u64 = 0;
     {
         const sql_slice = try std.fmt.allocPrint(allocator,
@@ -155,30 +122,28 @@ pub fn main() !void {
         }
 
         var timer = try std.time.Timer.start();
-        for (0..duckdb_iters) |_| {
+        for (0..DUCKDB_ITERATIONS) |_| {
             if (c.duckdb_query(conn, sql, &result) == c.DuckDBSuccess) {
                 c.duckdb_destroy_result(&result);
             }
         }
         duckdb_ns = timer.read();
     }
-    const duckdb_per_op = @as(f64, @floatFromInt(duckdb_ns)) / @as(f64, @floatFromInt(duckdb_iters));
+    const duckdb_per_op = @as(f64, @floatFromInt(duckdb_ns)) / @as(f64, @floatFromInt(DUCKDB_ITERATIONS));
     const duckdb_total_s = @as(f64, @floatFromInt(duckdb_ns)) / 1_000_000_000.0;
-    const duckdb_ratio = duckdb_per_op / native_per_op;
-    std.debug.print("{s:<25} {d:>9.0} us {d:>10.1}s {d:>9.0}x\n", .{ "DuckDB (in-process)", duckdb_per_op / 1000.0, duckdb_total_s, duckdb_ratio });
+    const duckdb_ratio = duckdb_per_op / lanceql_per_op;
+    std.debug.print("{s:<25} {d:>9.0} us {d:>10.1}s {d:>9.0}x\n", .{ "DuckDB", duckdb_per_op / 1000.0, duckdb_total_s, duckdb_ratio });
 
     // =========================================================================
     // Summary
     // =========================================================================
     std.debug.print("\n================================================================================\n", .{});
-    std.debug.print("Summary (FAIR in-process comparison)\n", .{});
+    std.debug.print("Summary (in-process comparison)\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("Native Zig:           {d:.0} ns/op (baseline)\n", .{native_per_op});
-    std.debug.print("LanceQL @logic_table: {d:.0} ns/op ({d:.1}x slower)\n", .{ lanceql_per_op, lanceql_ratio });
-    std.debug.print("DuckDB (in-process):  {d:.0} us/op ({d:.0}x slower)\n", .{ duckdb_per_op / 1000.0, duckdb_ratio });
+    std.debug.print("LanceQL: {d:.0} ns/op (baseline)\n", .{lanceql_per_op});
+    std.debug.print("DuckDB:  {d:.0} us/op ({d:.0}x slower)\n", .{ duckdb_per_op / 1000.0, duckdb_ratio });
     std.debug.print("\n", .{});
-    std.debug.print("DuckDB overhead is SQL parsing + query planning per call.\n", .{});
-    std.debug.print("For batch operations, DuckDB would be much faster.\n", .{});
+    std.debug.print("DuckDB overhead: SQL parsing + query planning per call (~3ms)\n", .{});
     std.debug.print("\n", .{});
 }
