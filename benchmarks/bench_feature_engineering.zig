@@ -112,7 +112,7 @@ pub fn main() !void {
     std.debug.print("\nEngines:\n", .{});
     std.debug.print("  - LanceQL: {s}\n", .{if (has_lanceql) "yes" else "no (install: zig build && cp zig-out/bin/lanceql /usr/local/bin/)"});
     std.debug.print("  - DuckDB:  {s}\n", .{if (has_duckdb) "yes" else "no (brew install duckdb)"});
-    std.debug.print("  - Polars:  {s}\n", .{if (has_polars) "yes" else "no (pip install polars-cli)"});
+    std.debug.print("  - Polars:  {s}\n", .{if (has_polars) "yes" else "no (cargo install polars-cli)"});
     std.debug.print("\n", .{});
 
     // =========================================================================
