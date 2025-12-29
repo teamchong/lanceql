@@ -133,6 +133,294 @@ fn vectorizedGroupBySum(
     }
 }
 
+// =============================================================================
+// Phase 3: Parallel Execution (morsel-driven parallelism)
+// =============================================================================
+
+const MAX_THREADS = 16;
+const MIN_ROWS_PER_THREAD = 32 * 1024; // Each thread needs at least 32K rows to be worth it
+
+/// Thread context for parallel filter
+const FilterThreadContext = struct {
+    amounts: []const f64,
+    threshold: f64,
+    result: u64 = 0,
+};
+
+/// Thread worker for parallel filter
+fn parallelFilterWorker(ctx: *FilterThreadContext) void {
+    ctx.result = vectorizedFilterCount(ctx.amounts, ctx.threshold);
+}
+
+/// Parallel SIMD filter: COUNT(*) WHERE value > threshold
+/// Uses morsel-driven parallelism across multiple threads
+fn parallelFilterCount(amounts: []const f64, threshold: f64, num_threads: usize) u64 {
+    // Only parallelize if each thread gets enough work to offset overhead
+    if (num_threads <= 1 or amounts.len / num_threads < MIN_ROWS_PER_THREAD) {
+        return vectorizedFilterCount(amounts, threshold);
+    }
+
+    const actual_threads = @min(num_threads, MAX_THREADS);
+    const chunk_size = amounts.len / actual_threads;
+
+    var contexts: [MAX_THREADS]FilterThreadContext = undefined;
+    var threads: [MAX_THREADS]std.Thread = undefined;
+    var spawned: usize = 0;
+
+    // Spawn worker threads for all but the last chunk
+    for (0..actual_threads - 1) |t| {
+        const start = t * chunk_size;
+        const end = start + chunk_size;
+        contexts[t] = FilterThreadContext{
+            .amounts = amounts[start..end],
+            .threshold = threshold,
+        };
+        threads[t] = std.Thread.spawn(.{}, parallelFilterWorker, .{&contexts[t]}) catch {
+            // Fallback to single-threaded if spawn fails
+            contexts[t].result = vectorizedFilterCount(contexts[t].amounts, threshold);
+            continue;
+        };
+        spawned += 1;
+    }
+
+    // Last thread handles remaining rows (including any remainder)
+    const last_start = (actual_threads - 1) * chunk_size;
+    contexts[actual_threads - 1] = FilterThreadContext{
+        .amounts = amounts[last_start..],
+        .threshold = threshold,
+    };
+    contexts[actual_threads - 1].result = vectorizedFilterCount(contexts[actual_threads - 1].amounts, threshold);
+
+    // Wait for all threads and accumulate results
+    var total: u64 = contexts[actual_threads - 1].result;
+    for (0..spawned) |t| {
+        threads[t].join();
+        total += contexts[t].result;
+    }
+
+    return total;
+}
+
+/// Thread context for parallel sum
+const SumThreadContext = struct {
+    amounts: []const f64,
+    result: f64 = 0,
+};
+
+/// Thread worker for parallel sum
+fn parallelSumWorker(ctx: *SumThreadContext) void {
+    ctx.result = vectorizedSum(ctx.amounts);
+}
+
+/// Parallel SIMD aggregate: SUM(values)
+/// Uses morsel-driven parallelism across multiple threads
+fn parallelSum(amounts: []const f64, num_threads: usize) f64 {
+    // Only parallelize if each thread gets enough work to offset overhead
+    if (num_threads <= 1 or amounts.len / num_threads < MIN_ROWS_PER_THREAD) {
+        return vectorizedSum(amounts);
+    }
+
+    const actual_threads = @min(num_threads, MAX_THREADS);
+    const chunk_size = amounts.len / actual_threads;
+
+    var contexts: [MAX_THREADS]SumThreadContext = undefined;
+    var threads: [MAX_THREADS]std.Thread = undefined;
+    var spawned: usize = 0;
+
+    // Spawn worker threads for all but the last chunk
+    for (0..actual_threads - 1) |t| {
+        const start = t * chunk_size;
+        const end = start + chunk_size;
+        contexts[t] = SumThreadContext{
+            .amounts = amounts[start..end],
+        };
+        threads[t] = std.Thread.spawn(.{}, parallelSumWorker, .{&contexts[t]}) catch {
+            contexts[t].result = vectorizedSum(contexts[t].amounts);
+            continue;
+        };
+        spawned += 1;
+    }
+
+    // Last thread handles remaining rows
+    const last_start = (actual_threads - 1) * chunk_size;
+    contexts[actual_threads - 1] = SumThreadContext{
+        .amounts = amounts[last_start..],
+    };
+    contexts[actual_threads - 1].result = vectorizedSum(contexts[actual_threads - 1].amounts);
+
+    // Wait for all threads and accumulate results
+    var total: f64 = contexts[actual_threads - 1].result;
+    for (0..spawned) |t| {
+        threads[t].join();
+        total += contexts[t].result;
+    }
+
+    return total;
+}
+
+/// Thread context for parallel GROUP BY
+const GroupByThreadContext = struct {
+    amounts: []const f64,
+    customer_ids: []const i64,
+    local_sums: [10000]f64 = [_]f64{0} ** 10000, // Thread-local aggregation
+};
+
+/// Thread worker for parallel GROUP BY
+fn parallelGroupByWorker(ctx: *GroupByThreadContext) void {
+    vectorizedGroupBySum(ctx.amounts, ctx.customer_ids, &ctx.local_sums);
+}
+
+/// Parallel GROUP BY with thread-local aggregation
+/// Each thread aggregates its chunk, then results are merged
+fn parallelGroupBySum(
+    amounts: []const f64,
+    customer_ids: []const i64,
+    group_sums: []f64,
+    num_threads: usize,
+    allocator: std.mem.Allocator,
+) void {
+    // Only parallelize if each thread gets enough work to offset overhead
+    if (num_threads <= 1 or amounts.len / num_threads < MIN_ROWS_PER_THREAD) {
+        vectorizedGroupBySum(amounts, customer_ids, group_sums);
+        return;
+    }
+
+    const actual_threads = @min(num_threads, MAX_THREADS);
+    const chunk_size = amounts.len / actual_threads;
+
+    // Allocate thread contexts on heap to avoid stack overflow
+    const contexts = allocator.alloc(GroupByThreadContext, actual_threads) catch {
+        vectorizedGroupBySum(amounts, customer_ids, group_sums);
+        return;
+    };
+    defer allocator.free(contexts);
+
+    var threads: [MAX_THREADS]std.Thread = undefined;
+    var spawned: usize = 0;
+
+    // Initialize all contexts
+    for (0..actual_threads) |t| {
+        contexts[t] = GroupByThreadContext{
+            .amounts = undefined,
+            .customer_ids = undefined,
+        };
+    }
+
+    // Spawn worker threads for all but the last chunk
+    for (0..actual_threads - 1) |t| {
+        const start = t * chunk_size;
+        const end = start + chunk_size;
+        contexts[t].amounts = amounts[start..end];
+        contexts[t].customer_ids = customer_ids[start..end];
+        threads[t] = std.Thread.spawn(.{}, parallelGroupByWorker, .{&contexts[t]}) catch {
+            parallelGroupByWorker(&contexts[t]);
+            continue;
+        };
+        spawned += 1;
+    }
+
+    // Last thread handles remaining rows
+    const last_start = (actual_threads - 1) * chunk_size;
+    contexts[actual_threads - 1].amounts = amounts[last_start..];
+    contexts[actual_threads - 1].customer_ids = customer_ids[last_start..];
+    parallelGroupByWorker(&contexts[actual_threads - 1]);
+
+    // Wait for all threads
+    for (0..spawned) |t| {
+        threads[t].join();
+    }
+
+    // Merge thread-local results into final output
+    for (0..10000) |i| {
+        var sum: f64 = 0;
+        for (0..actual_threads) |t| {
+            sum += contexts[t].local_sums[i];
+        }
+        group_sums[i] = sum;
+    }
+}
+
+/// Thread context for parallel JOIN probe (exists check)
+const JoinProbeContext = struct {
+    customer_ids: []const i64,
+    customer_exists: *const [10000]bool,
+    result_count: u64 = 0,
+};
+
+/// Thread worker for parallel JOIN probe
+fn parallelJoinProbeWorker(ctx: *JoinProbeContext) void {
+    var count: u64 = 0;
+    for (ctx.customer_ids) |cid| {
+        if (cid >= 0 and cid < 10000 and ctx.customer_exists.*[@intCast(cid)]) {
+            count += 1;
+        }
+    }
+    ctx.result_count = count;
+}
+
+/// Parallel JOIN probe using array lookup
+fn parallelJoinProbe(
+    customer_ids: []const i64,
+    customer_exists: *const [10000]bool,
+    num_threads: usize,
+) u64 {
+    // Only parallelize if each thread gets enough work to offset overhead
+    if (num_threads <= 1 or customer_ids.len / num_threads < MIN_ROWS_PER_THREAD) {
+        // Single-threaded fallback
+        var count: u64 = 0;
+        for (customer_ids) |cid| {
+            if (cid >= 0 and cid < 10000 and customer_exists.*[@intCast(cid)]) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    const actual_threads = @min(num_threads, MAX_THREADS);
+    const chunk_size = customer_ids.len / actual_threads;
+
+    var contexts: [MAX_THREADS]JoinProbeContext = undefined;
+    var threads: [MAX_THREADS]std.Thread = undefined;
+    var spawned: usize = 0;
+
+    // Spawn worker threads for all but the last chunk
+    for (0..actual_threads - 1) |t| {
+        const start = t * chunk_size;
+        const end = start + chunk_size;
+        contexts[t] = JoinProbeContext{
+            .customer_ids = customer_ids[start..end],
+            .customer_exists = customer_exists,
+        };
+        threads[t] = std.Thread.spawn(.{}, parallelJoinProbeWorker, .{&contexts[t]}) catch {
+            parallelJoinProbeWorker(&contexts[t]);
+            continue;
+        };
+        spawned += 1;
+    }
+
+    // Last thread handles remaining rows
+    const last_start = (actual_threads - 1) * chunk_size;
+    contexts[actual_threads - 1] = JoinProbeContext{
+        .customer_ids = customer_ids[last_start..],
+        .customer_exists = customer_exists,
+    };
+    parallelJoinProbeWorker(&contexts[actual_threads - 1]);
+
+    // Wait for all threads and accumulate results
+    var total: u64 = contexts[actual_threads - 1].result_count;
+    for (0..spawned) |t| {
+        threads[t].join();
+        total += contexts[t].result_count;
+    }
+
+    return total;
+}
+
+// Get number of CPU cores for parallel execution
+fn getNumThreads() usize {
+    return std.Thread.getCpuCount() catch 4;
+}
+
 // Legacy SIMD functions (for comparison)
 fn simdFilterCount(amounts: []const f64, threshold: f64) u64 {
     return vectorizedFilterCount(amounts, threshold);
@@ -292,8 +580,11 @@ pub fn main() !void {
     const has_duckdb = checkPythonModule(allocator, "duckdb");
     const has_polars = checkPythonModule(allocator, "polars");
 
+    // Get CPU count for parallel execution
+    const num_threads = getNumThreads();
+
     std.debug.print("\nEngines:\n", .{});
-    std.debug.print("  LanceQL native: yes\n", .{});
+    std.debug.print("  LanceQL native: yes ({d} threads)\n", .{num_threads});
     std.debug.print("  DuckDB:               {s}\n", .{if (has_duckdb) "yes" else "no"});
     std.debug.print("  Polars:               {s}\n", .{if (has_polars) "yes" else "no"});
     std.debug.print("\n", .{});
@@ -325,7 +616,7 @@ pub fn main() !void {
             defer table.deinit();
             const amounts = table.readFloat64Column(1) catch break;
             defer allocator.free(amounts);
-            const count = simdFilterCount(amounts, 100.0);
+            const count = parallelFilterCount(amounts, 100.0, num_threads);
             std.mem.doNotOptimizeAway(&count);
         }
 
@@ -336,7 +627,7 @@ pub fn main() !void {
             defer table.deinit();
             const amounts = table.readFloat64Column(1) catch break;
             defer allocator.free(amounts);
-            const count = simdFilterCount(amounts, 100.0);
+            const count = parallelFilterCount(amounts, 100.0, num_threads);
             std.mem.doNotOptimizeAway(&count);
             iterations += 1;
             total_rows += amounts.len;
@@ -346,7 +637,7 @@ pub fn main() !void {
         const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
         lanceql_filter_rps = @as(f64, @floatFromInt(total_rows)) / elapsed_s;
         std.debug.print("{s:<40} {d:>10.0}K {d:>12} {s:>10}\n", .{
-            "LanceQL mmap+SIMD (FILTER)",
+            "LanceQL parallel+SIMD (FILTER)",
             lanceql_filter_rps / 1000.0,
             iterations,
             "1.0x",
@@ -508,7 +799,7 @@ pub fn main() !void {
             defer table.deinit();
             const amounts = table.readFloat64Column(1) catch break;
             defer allocator.free(amounts);
-            const sum = simdSum(amounts);
+            const sum = parallelSum(amounts, num_threads);
             std.mem.doNotOptimizeAway(&sum);
         }
 
@@ -519,7 +810,7 @@ pub fn main() !void {
             defer table.deinit();
             const amounts = table.readFloat64Column(1) catch break;
             defer allocator.free(amounts);
-            const sum = simdSum(amounts);
+            const sum = parallelSum(amounts, num_threads);
             std.mem.doNotOptimizeAway(&sum);
             iterations += 1;
             total_rows += amounts.len;
@@ -529,7 +820,7 @@ pub fn main() !void {
         const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
         lanceql_agg_rps = @as(f64, @floatFromInt(total_rows)) / elapsed_s;
         std.debug.print("{s:<40} {d:>10.0}K {d:>12} {s:>10}\n", .{
-            "LanceQL SIMD (AGGREGATE)",
+            "LanceQL parallel+SIMD (AGGREGATE)",
             lanceql_agg_rps / 1000.0,
             iterations,
             "1.0x",
@@ -698,7 +989,7 @@ pub fn main() !void {
             defer allocator.free(customer_ids);
 
             @memset(&group_sums, 0.0);
-            vectorizedGroupBySum(amounts, customer_ids, &group_sums);
+            parallelGroupBySum(amounts, customer_ids, &group_sums, num_threads, allocator);
         }
 
         const benchmark_end_time = std.time.nanoTimestamp() + BENCHMARK_SECONDS * 1_000_000_000;
@@ -712,7 +1003,7 @@ pub fn main() !void {
             defer allocator.free(customer_ids);
 
             @memset(&group_sums, 0.0);
-            vectorizedGroupBySum(amounts, customer_ids, &group_sums);
+            parallelGroupBySum(amounts, customer_ids, &group_sums, num_threads, allocator);
 
             iterations += 1;
             total_rows += amounts.len;
@@ -722,7 +1013,7 @@ pub fn main() !void {
         const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
         lanceql_groupby_rps = @as(f64, @floatFromInt(total_rows)) / elapsed_s;
         std.debug.print("{s:<40} {d:>10.0}K {d:>12} {s:>10}\n", .{
-            "LanceQL mmap+vectorized (GROUP BY)",
+            "LanceQL parallel+SIMD (GROUP BY)",
             lanceql_groupby_rps / 1000.0,
             iterations,
             "1.0x",
@@ -902,16 +1193,13 @@ pub fn main() !void {
                 if (cid >= 0 and cid < 10000) customer_exists[@intCast(cid)] = true;
             }
 
-            // Probe phase: read orders
+            // Probe phase: read orders with parallel execution
             var table = Table.init(allocator, orders_mmap.data) catch break;
             defer table.deinit();
             const order_customer_ids = table.readInt64Column(2) catch break;
             defer allocator.free(order_customer_ids);
 
-            var match_count: u64 = 0;
-            for (order_customer_ids) |cid| {
-                if (cid >= 0 and cid < 10000 and customer_exists[@intCast(cid)]) match_count += 1;
-            }
+            const match_count = parallelJoinProbe(order_customer_ids, &customer_exists, num_threads);
             std.mem.doNotOptimizeAway(&match_count);
         }
 
@@ -929,16 +1217,13 @@ pub fn main() !void {
                 if (cid >= 0 and cid < 10000) customer_exists[@intCast(cid)] = true;
             }
 
-            // Probe phase
+            // Probe phase with parallel execution
             var table = Table.init(allocator, orders_mmap.data) catch break;
             defer table.deinit();
             const order_customer_ids = table.readInt64Column(2) catch break;
             defer allocator.free(order_customer_ids);
 
-            var match_count: u64 = 0;
-            for (order_customer_ids) |cid| {
-                if (cid >= 0 and cid < 10000 and customer_exists[@intCast(cid)]) match_count += 1;
-            }
+            const match_count = parallelJoinProbe(order_customer_ids, &customer_exists, num_threads);
             std.mem.doNotOptimizeAway(&match_count);
 
             iterations += 1;
@@ -949,7 +1234,7 @@ pub fn main() !void {
         const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
         lanceql_join_rps = @as(f64, @floatFromInt(total_rows)) / elapsed_s;
         std.debug.print("{s:<40} {d:>10.0}K {d:>12} {s:>10}\n", .{
-            "LanceQL mmap+array (JOIN)",
+            "LanceQL parallel+SIMD (JOIN)",
             lanceql_join_rps / 1000.0,
             iterations,
             "1.0x",
