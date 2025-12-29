@@ -498,6 +498,22 @@ pub fn build(b: *std.Build) void {
     const bench_pushdown_step = b.step("bench-pushdown", "Benchmark @logic_table pushdown (filtered_indices optimization)");
     bench_pushdown_step.dependOn(&run_bench_pushdown.step);
 
+    // Window functions benchmark - @logic_table vs Python UDFs
+    const bench_window = b.addExecutable(.{
+        .name = "bench_window",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/bench_window_functions.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lanceql.table", .module = table_mod },
+            },
+        }),
+    });
+    const run_bench_window = b.addRunArtifact(bench_window);
+    const bench_window_step = b.step("bench-window", "Window functions: @logic_table (compiled) vs Python UDFs");
+    bench_window_step.dependOn(&run_bench_window.step);
+
     // Tiered dispatch benchmark - SIMD vs GPU for batch vector operations
     const bench_tiered = b.addExecutable(.{
         .name = "bench_tiered_dispatch",
