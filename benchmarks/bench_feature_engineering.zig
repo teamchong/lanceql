@@ -1,7 +1,7 @@
 //! Feature Engineering Benchmark - End-to-End Comparison
 //!
 //! HONEST benchmark measuring feature engineering from cold start:
-//!   1. LanceQL @logic_table  - Read Lance file → transform features
+//!   1. LanceQL native  - Read Lance file → transform features
 //!   2. DuckDB SQL           - Read Parquet → SQL transformations
 //!   3. Polars DataFrame     - Read Parquet → DataFrame transforms
 //!
@@ -137,7 +137,7 @@ pub fn main() !void {
     std.debug.print("  Parquet: {s} ✓\n", .{PARQUET_PATH});
     std.debug.print("\n", .{});
     std.debug.print("Engines:\n", .{});
-    std.debug.print("  LanceQL @logic_table: yes\n", .{});
+    std.debug.print("  LanceQL native: yes\n", .{});
     std.debug.print("  DuckDB:               {s}\n", .{if (has_duckdb) "yes" else "no (pip install duckdb)"});
     std.debug.print("  Polars:               {s}\n", .{if (has_polars) "yes" else "no (pip install polars)"});
     std.debug.print("\n", .{});
@@ -148,7 +148,7 @@ pub fn main() !void {
 
     var lanceql_throughput: f64 = 0;
 
-    // 1. LanceQL @logic_table (read Lance file → z-score)
+    // 1. LanceQL native (read Lance file → z-score)
     {
         const warmup_end = std.time.nanoTimestamp() + WARMUP_SECONDS * std.time.ns_per_s;
         const benchmark_end_time = warmup_end + BENCHMARK_SECONDS * std.time.ns_per_s;
@@ -221,7 +221,7 @@ pub fn main() !void {
         lanceql_throughput = @as(f64, @floatFromInt(total_rows)) / elapsed_s;
 
         std.debug.print("{s:<35} {d:>12.0} {d:>12} {s:>10}\n", .{
-            "LanceQL @logic_table",
+            "LanceQL native",
             lanceql_throughput,
             iterations,
             "baseline",

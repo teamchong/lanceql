@@ -1,7 +1,7 @@
-//! @logic_table Pushdown Benchmark - End-to-End Comparison
+//! LanceQL native Pushdown Benchmark - End-to-End Comparison
 //!
 //! HONEST benchmark measuring filter + compute from cold start:
-//!   1. LanceQL @logic_table  - Read Lance file → filter → compute
+//!   1. LanceQL native  - Read Lance file → filter → compute
 //!   2. DuckDB Python UDF     - Read Parquet → filter → row-by-row Python
 //!   3. DuckDB → NumPy batch  - Read Parquet → filter → NumPy compute
 //!   4. Polars Python UDF     - Read Parquet → filter → row-by-row Python
@@ -26,7 +26,7 @@ const LANCE_PATH = "benchmarks/benchmark_e2e.lance";
 const PARQUET_PATH = "benchmarks/benchmark_e2e.parquet";
 const EMBEDDING_DIM = 384;
 
-// Simulated @logic_table function (filter + compute)
+// Simulated LanceQL native function (filter + compute)
 fn computeScore(embedding: []const f32) f64 {
     var score: f64 = 0.0;
     for (embedding) |v| {
@@ -90,7 +90,7 @@ pub fn main() !void {
 
     std.debug.print("\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("@logic_table Pushdown Benchmark: End-to-End (Filter + Compute)\n", .{});
+    std.debug.print("LanceQL native Pushdown Benchmark: End-to-End (Filter + Compute)\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
     std.debug.print("Each method runs for {d} seconds. Measuring throughput (rows/sec).\n", .{BENCHMARK_SECONDS});
@@ -116,7 +116,7 @@ pub fn main() !void {
     std.debug.print("  Parquet: {s} ✓\n", .{PARQUET_PATH});
     std.debug.print("\n", .{});
     std.debug.print("Engines:\n", .{});
-    std.debug.print("  LanceQL @logic_table: yes\n", .{});
+    std.debug.print("  LanceQL native: yes\n", .{});
     std.debug.print("  DuckDB:               {s}\n", .{if (has_duckdb) "yes" else "no (pip install duckdb)"});
     std.debug.print("  Polars:               {s}\n", .{if (has_polars) "yes" else "no (pip install polars)"});
     std.debug.print("\n", .{});
@@ -127,7 +127,7 @@ pub fn main() !void {
 
     var lanceql_throughput: f64 = 0;
 
-    // 1. LanceQL @logic_table (read Lance file → filter → compute)
+    // 1. LanceQL native (read Lance file → filter → compute)
     {
         const warmup_end = std.time.nanoTimestamp() + WARMUP_SECONDS * std.time.ns_per_s;
         const benchmark_end_time = warmup_end + BENCHMARK_SECONDS * std.time.ns_per_s;
@@ -194,7 +194,7 @@ pub fn main() !void {
 
         lanceql_throughput = @as(f64, @floatFromInt(total_rows)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0);
         std.debug.print("{s:<35} {d:>12.0} {d:>12} {s:>10}\n", .{
-            "LanceQL @logic_table", lanceql_throughput, iterations, "1.0x",
+            "LanceQL native", lanceql_throughput, iterations, "1.0x",
         });
     }
 

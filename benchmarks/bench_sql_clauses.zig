@@ -1,7 +1,7 @@
 //! SQL Clauses Benchmark - End-to-End Comparison
 //!
 //! HONEST benchmark testing SQL operations from files:
-//!   1. LanceQL @logic_table  - Read Lance file → SQL operations
+//!   1. LanceQL native  - Read Lance file → SQL operations
 //!   2. DuckDB SQL           - Read Parquet → SQL operations
 //!   3. Polars DataFrame     - Read Parquet → DataFrame operations
 //!
@@ -108,7 +108,7 @@ pub fn main() !void {
     const has_polars = checkPythonModule(allocator, "polars");
 
     std.debug.print("\nEngines:\n", .{});
-    std.debug.print("  LanceQL @logic_table: yes\n", .{});
+    std.debug.print("  LanceQL native: yes\n", .{});
     std.debug.print("  DuckDB:               {s}\n", .{if (has_duckdb) "yes" else "no"});
     std.debug.print("  Polars:               {s}\n", .{if (has_polars) "yes" else "no"});
     std.debug.print("\n", .{});
@@ -164,7 +164,7 @@ pub fn main() !void {
         const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
         lanceql_filter_rps = @as(f64, @floatFromInt(total_rows)) / elapsed_s;
         std.debug.print("{s:<40} {d:>10.0}K {d:>12} {s:>10}\n", .{
-            "@logic_table (FILTER)",
+            "LanceQL native (FILTER)",
             lanceql_filter_rps / 1000.0,
             iterations,
             "1.0x",
@@ -346,7 +346,7 @@ pub fn main() !void {
         const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
         lanceql_agg_rps = @as(f64, @floatFromInt(total_rows)) / elapsed_s;
         std.debug.print("{s:<40} {d:>10.0}K {d:>12} {s:>10}\n", .{
-            "@logic_table (AGGREGATE)",
+            "LanceQL native (AGGREGATE)",
             lanceql_agg_rps / 1000.0,
             iterations,
             "1.0x",

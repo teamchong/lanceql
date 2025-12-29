@@ -1,7 +1,7 @@
 //! RAG Pipeline Benchmark - End-to-End Comparison
 //!
 //! HONEST benchmark simulating RAG (Retrieval-Augmented Generation) pipeline:
-//!   1. LanceQL @logic_table  - Read Lance file → compute similarity scores
+//!   1. LanceQL native  - Read Lance file → compute similarity scores
 //!   2. DuckDB SQL           - Read Parquet → compute similarity via SQL
 //!   3. Polars DataFrame     - Read Parquet → compute similarity
 //!
@@ -109,7 +109,7 @@ pub fn main() !void {
     const has_polars = checkPythonModule(allocator, "polars");
 
     std.debug.print("\nEngines:\n", .{});
-    std.debug.print("  LanceQL @logic_table: yes\n", .{});
+    std.debug.print("  LanceQL native: yes\n", .{});
     std.debug.print("  DuckDB:               {s}\n", .{if (has_duckdb) "yes" else "no"});
     std.debug.print("  Polars:               {s}\n", .{if (has_polars) "yes" else "no"});
     std.debug.print("\n", .{});
@@ -124,7 +124,7 @@ pub fn main() !void {
     const query_value: f64 = 150.0;
 
     // =========================================================================
-    // LanceQL @logic_table - Read Lance file, compute similarity scores
+    // LanceQL native - Read Lance file, compute similarity scores
     // =========================================================================
     {
         var iterations: u64 = 0;
@@ -184,7 +184,7 @@ pub fn main() !void {
         lanceql_rows_per_sec = @as(f64, @floatFromInt(total_rows)) / elapsed_s;
 
         std.debug.print("{s:<40} {d:>10.0}K {d:>12} {s:>10}\n", .{
-            "@logic_table (similarity search)",
+            "LanceQL native (similarity search)",
             lanceql_rows_per_sec / 1000.0,
             iterations,
             "1.0x",

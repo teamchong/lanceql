@@ -1,7 +1,7 @@
 //! Tiered Dispatch Benchmark - End-to-End Comparison
 //!
 //! HONEST benchmark testing SIMD operations from files:
-//!   1. LanceQL @logic_table  - Read Lance file → SIMD dot product
+//!   1. LanceQL native  - Read Lance file → SIMD dot product
 //!   2. DuckDB SQL           - Read Parquet → SQL computation
 //!   3. Polars DataFrame     - Read Parquet → vectorized ops
 //!
@@ -128,7 +128,7 @@ pub fn main() !void {
     const has_polars = checkPythonModule(allocator, "polars");
 
     std.debug.print("\nEngines:\n", .{});
-    std.debug.print("  LanceQL @logic_table: yes (SIMD optimized)\n", .{});
+    std.debug.print("  LanceQL native: yes (SIMD optimized)\n", .{});
     std.debug.print("  DuckDB:               {s}\n", .{if (has_duckdb) "yes" else "no"});
     std.debug.print("  Polars:               {s}\n", .{if (has_polars) "yes" else "no"});
     std.debug.print("\n", .{});
@@ -140,7 +140,7 @@ pub fn main() !void {
     var lanceql_rows_per_sec: f64 = 0;
 
     // =========================================================================
-    // LanceQL @logic_table - Read Lance file, SIMD dot product
+    // LanceQL native - Read Lance file, SIMD dot product
     // =========================================================================
     {
         var iterations: u64 = 0;
@@ -191,7 +191,7 @@ pub fn main() !void {
         lanceql_rows_per_sec = @as(f64, @floatFromInt(total_rows)) / elapsed_s;
 
         std.debug.print("{s:<40} {d:>10.0}K {d:>12} {s:>10}\n", .{
-            "@logic_table (SIMD dot product)",
+            "LanceQL native (SIMD dot product)",
             lanceql_rows_per_sec / 1000.0,
             iterations,
             "1.0x",

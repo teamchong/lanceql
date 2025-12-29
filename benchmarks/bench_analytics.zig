@@ -1,7 +1,7 @@
 //! Analytics Benchmark - End-to-End Comparison
 //!
 //! HONEST benchmark measuring analytics queries from cold start:
-//!   1. LanceQL @logic_table  - Read Lance file → aggregate
+//!   1. LanceQL native  - Read Lance file → aggregate
 //!   2. DuckDB SQL           - Read Parquet → SQL aggregations
 //!   3. Polars DataFrame     - Read Parquet → DataFrame aggregations
 //!
@@ -101,7 +101,7 @@ pub fn main() !void {
     std.debug.print("  Parquet: {s} ✓\n", .{PARQUET_PATH});
     std.debug.print("\n", .{});
     std.debug.print("Engines:\n", .{});
-    std.debug.print("  LanceQL @logic_table: yes\n", .{});
+    std.debug.print("  LanceQL native: yes\n", .{});
     std.debug.print("  DuckDB:               {s}\n", .{if (has_duckdb) "yes" else "no (pip install duckdb)"});
     std.debug.print("  Polars:               {s}\n", .{if (has_polars) "yes" else "no (pip install polars)"});
     std.debug.print("\n", .{});
@@ -112,7 +112,7 @@ pub fn main() !void {
 
     var lanceql_throughput: f64 = 0;
 
-    // 1. LanceQL @logic_table (read Lance file → aggregate)
+    // 1. LanceQL native (read Lance file → aggregate)
     {
         const warmup_end = std.time.nanoTimestamp() + WARMUP_SECONDS * std.time.ns_per_s;
         const benchmark_end_time = warmup_end + BENCHMARK_SECONDS * std.time.ns_per_s;
@@ -179,7 +179,7 @@ pub fn main() !void {
 
         lanceql_throughput = @as(f64, @floatFromInt(total_rows)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0);
         std.debug.print("{s:<35} {d:>12.0} {d:>12} {s:>10}\n", .{
-            "LanceQL @logic_table", lanceql_throughput, iterations, "1.0x",
+            "LanceQL native", lanceql_throughput, iterations, "1.0x",
         });
     }
 
