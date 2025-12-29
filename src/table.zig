@@ -135,11 +135,52 @@ pub const Table = struct {
     // Typed Column Readers
     // ========================================================================
 
-    /// Read all int64 values from a column.
+    /// Read all int64 values from a column (reads ALL pages).
     pub fn readInt64Column(self: Self, col_idx: u32) TableError![]i64 {
-        const buffer_data = try self.getColumnBuffer(col_idx);
-        const decoder = PlainDecoder.init(buffer_data);
-        return decoder.readAllInt64(self.allocator) catch return TableError.OutOfMemory;
+        const col_meta_bytes = self.lance_file.getColumnMetadataBytes(col_idx) catch {
+            return TableError.ColumnOutOfBounds;
+        };
+
+        var col_meta = ColumnMetadata.parse(self.allocator, col_meta_bytes) catch {
+            return TableError.InvalidMetadata;
+        };
+        defer col_meta.deinit(self.allocator);
+
+        if (col_meta.pages.len == 0) return TableError.NoPages;
+
+        // Calculate total values across all pages
+        var total_values: usize = 0;
+        for (col_meta.pages) |page| {
+            if (page.buffer_sizes.len > 0) {
+                total_values += page.buffer_sizes[0] / @sizeOf(i64);
+            }
+        }
+
+        // Allocate result buffer for all pages
+        var result = self.allocator.alloc(i64, total_values) catch return TableError.OutOfMemory;
+        errdefer self.allocator.free(result);
+
+        // Read each page's buffer and decode
+        var offset: usize = 0;
+        for (col_meta.pages) |page| {
+            if (page.buffer_offsets.len == 0 or page.buffer_sizes.len == 0) continue;
+
+            const buffer_offset = page.buffer_offsets[0];
+            const buffer_size = page.buffer_sizes[0];
+
+            const buffer_data = self.lance_file.readBytes(buffer_offset, buffer_size) catch {
+                return TableError.InvalidMetadata;
+            };
+
+            const decoder = PlainDecoder.init(buffer_data);
+            const page_values = decoder.readAllInt64(self.allocator) catch return TableError.OutOfMemory;
+            defer self.allocator.free(page_values);
+
+            @memcpy(result[offset .. offset + page_values.len], page_values);
+            offset += page_values.len;
+        }
+
+        return result;
     }
 
     /// Read all int64 values from a column by name.
@@ -148,11 +189,52 @@ pub const Table = struct {
         return self.readInt64Column(@intCast(idx));
     }
 
-    /// Read all float64 values from a column.
+    /// Read all float64 values from a column (reads ALL pages).
     pub fn readFloat64Column(self: Self, col_idx: u32) TableError![]f64 {
-        const buffer_data = try self.getColumnBuffer(col_idx);
-        const decoder = PlainDecoder.init(buffer_data);
-        return decoder.readAllFloat64(self.allocator) catch return TableError.OutOfMemory;
+        const col_meta_bytes = self.lance_file.getColumnMetadataBytes(col_idx) catch {
+            return TableError.ColumnOutOfBounds;
+        };
+
+        var col_meta = ColumnMetadata.parse(self.allocator, col_meta_bytes) catch {
+            return TableError.InvalidMetadata;
+        };
+        defer col_meta.deinit(self.allocator);
+
+        if (col_meta.pages.len == 0) return TableError.NoPages;
+
+        // Calculate total values across all pages
+        var total_values: usize = 0;
+        for (col_meta.pages) |page| {
+            if (page.buffer_sizes.len > 0) {
+                total_values += page.buffer_sizes[0] / @sizeOf(f64);
+            }
+        }
+
+        // Allocate result buffer for all pages
+        var result = self.allocator.alloc(f64, total_values) catch return TableError.OutOfMemory;
+        errdefer self.allocator.free(result);
+
+        // Read each page's buffer and decode
+        var offset: usize = 0;
+        for (col_meta.pages) |page| {
+            if (page.buffer_offsets.len == 0 or page.buffer_sizes.len == 0) continue;
+
+            const buffer_offset = page.buffer_offsets[0];
+            const buffer_size = page.buffer_sizes[0];
+
+            const buffer_data = self.lance_file.readBytes(buffer_offset, buffer_size) catch {
+                return TableError.InvalidMetadata;
+            };
+
+            const decoder = PlainDecoder.init(buffer_data);
+            const page_values = decoder.readAllFloat64(self.allocator) catch return TableError.OutOfMemory;
+            defer self.allocator.free(page_values);
+
+            @memcpy(result[offset .. offset + page_values.len], page_values);
+            offset += page_values.len;
+        }
+
+        return result;
     }
 
     /// Read all float64 values from a column by name.
@@ -161,11 +243,52 @@ pub const Table = struct {
         return self.readFloat64Column(@intCast(idx));
     }
 
-    /// Read all int32 values from a column.
+    /// Read all int32 values from a column (reads ALL pages).
     pub fn readInt32Column(self: Self, col_idx: u32) TableError![]i32 {
-        const buffer_data = try self.getColumnBuffer(col_idx);
-        const decoder = PlainDecoder.init(buffer_data);
-        return decoder.readAllInt32(self.allocator) catch return TableError.OutOfMemory;
+        const col_meta_bytes = self.lance_file.getColumnMetadataBytes(col_idx) catch {
+            return TableError.ColumnOutOfBounds;
+        };
+
+        var col_meta = ColumnMetadata.parse(self.allocator, col_meta_bytes) catch {
+            return TableError.InvalidMetadata;
+        };
+        defer col_meta.deinit(self.allocator);
+
+        if (col_meta.pages.len == 0) return TableError.NoPages;
+
+        // Calculate total values across all pages
+        var total_values: usize = 0;
+        for (col_meta.pages) |page| {
+            if (page.buffer_sizes.len > 0) {
+                total_values += page.buffer_sizes[0] / @sizeOf(i32);
+            }
+        }
+
+        // Allocate result buffer for all pages
+        var result = self.allocator.alloc(i32, total_values) catch return TableError.OutOfMemory;
+        errdefer self.allocator.free(result);
+
+        // Read each page's buffer and decode
+        var offset: usize = 0;
+        for (col_meta.pages) |page| {
+            if (page.buffer_offsets.len == 0 or page.buffer_sizes.len == 0) continue;
+
+            const buffer_offset = page.buffer_offsets[0];
+            const buffer_size = page.buffer_sizes[0];
+
+            const buffer_data = self.lance_file.readBytes(buffer_offset, buffer_size) catch {
+                return TableError.InvalidMetadata;
+            };
+
+            const decoder = PlainDecoder.init(buffer_data);
+            const page_values = decoder.readAllInt32(self.allocator) catch return TableError.OutOfMemory;
+            defer self.allocator.free(page_values);
+
+            @memcpy(result[offset .. offset + page_values.len], page_values);
+            offset += page_values.len;
+        }
+
+        return result;
     }
 
     /// Read all int32 values from a column by name.
@@ -228,12 +351,51 @@ pub const Table = struct {
         return self.readFloat32Column(@intCast(idx));
     }
 
-    /// Read all boolean values from a column.
+    /// Read all boolean values from a column (reads ALL pages).
     pub fn readBoolColumn(self: Self, col_idx: u32) TableError![]bool {
-        const buffer_data = try self.getColumnBuffer(col_idx);
-        const row_count = try self.numRows(col_idx);
-        const decoder = PlainDecoder.init(buffer_data);
-        return decoder.readAllBool(self.allocator, row_count) catch return TableError.OutOfMemory;
+        const col_meta_bytes = self.lance_file.getColumnMetadataBytes(col_idx) catch {
+            return TableError.ColumnOutOfBounds;
+        };
+
+        var col_meta = ColumnMetadata.parse(self.allocator, col_meta_bytes) catch {
+            return TableError.InvalidMetadata;
+        };
+        defer col_meta.deinit(self.allocator);
+
+        if (col_meta.pages.len == 0) return TableError.NoPages;
+
+        // Calculate total rows across all pages
+        var total_rows: usize = 0;
+        for (col_meta.pages) |page| {
+            total_rows += @intCast(page.length);
+        }
+
+        // Allocate result buffer for all pages
+        var result = self.allocator.alloc(bool, total_rows) catch return TableError.OutOfMemory;
+        errdefer self.allocator.free(result);
+
+        // Read each page's buffer and decode
+        var offset: usize = 0;
+        for (col_meta.pages) |page| {
+            if (page.buffer_offsets.len == 0 or page.buffer_sizes.len == 0) continue;
+
+            const buffer_offset = page.buffer_offsets[0];
+            const buffer_size = page.buffer_sizes[0];
+            const page_rows: usize = @intCast(page.length);
+
+            const buffer_data = self.lance_file.readBytes(buffer_offset, buffer_size) catch {
+                return TableError.InvalidMetadata;
+            };
+
+            const decoder = PlainDecoder.init(buffer_data);
+            const page_values = decoder.readAllBool(self.allocator, page_rows) catch return TableError.OutOfMemory;
+            defer self.allocator.free(page_values);
+
+            @memcpy(result[offset .. offset + page_values.len], page_values);
+            offset += page_values.len;
+        }
+
+        return result;
     }
 
     /// Read all boolean values from a column by name.
@@ -348,6 +510,7 @@ pub const Table = struct {
     }
 
     /// Read raw column buffer (first page, first buffer).
+    /// For multi-page support, use typed column readers (readInt64Column, etc.).
     pub fn getColumnBuffer(self: Self, col_idx: u32) TableError![]const u8 {
         const col_meta_bytes = self.lance_file.getColumnMetadataBytes(col_idx) catch {
             return TableError.ColumnOutOfBounds;
@@ -428,7 +591,7 @@ pub const Table = struct {
         return total_rows;
     }
 
-    /// Read a string column by index.
+    /// Read a string column by index (reads ALL pages).
     /// Returns a slice of allocated strings (UTF-8 byte slices).
     /// Caller must free each string AND the slice itself using the same allocator.
     pub fn readStringColumn(self: Self, col_idx: u32) TableError![][]const u8 {
@@ -443,35 +606,15 @@ pub const Table = struct {
         defer col_meta.deinit(self.allocator);
 
         if (col_meta.pages.len == 0) return TableError.NoPages;
-        const page = col_meta.pages[0];
 
-        // Lance stores string columns with TWO separate buffers per page:
-        // - Buffer 0: offsets array (uint32 or uint64, marking END positions)
-        // - Buffer 1: string data (concatenated UTF-8 bytes)
-        if (page.buffer_offsets.len < 2) return TableError.InvalidMetadata;
+        // Calculate total rows across all pages
+        var total_rows: usize = 0;
+        for (col_meta.pages) |page| {
+            total_rows += @intCast(page.length);
+        }
 
-        // Buffer 0 = offsets array
-        const offsets_offset = page.buffer_offsets[0];
-        const offsets_size = page.buffer_sizes[0];
-        const offsets_buffer = self.lance_file.readBytes(offsets_offset, offsets_size) catch {
-            return TableError.InvalidMetadata;
-        };
-
-        // Buffer 1 = string data
-        const data_offset = page.buffer_offsets[1];
-        const data_size = page.buffer_sizes[1];
-        const data_buffer = self.lance_file.readBytes(data_offset, data_size) catch {
-            return TableError.InvalidMetadata;
-        };
-
-        // Decode strings (returns slices into data_buffer, not owned copies)
-        const string_slices = PlainDecoder.readAllStrings(offsets_buffer, data_buffer, self.allocator) catch {
-            return TableError.InvalidMetadata;
-        };
-        defer self.allocator.free(string_slices);
-
-        // Copy each string into owned memory so caller can safely free
-        var owned_strings = self.allocator.alloc([]const u8, string_slices.len) catch {
+        // Allocate result buffer for all pages
+        var owned_strings = self.allocator.alloc([]const u8, total_rows) catch {
             return TableError.OutOfMemory;
         };
         errdefer {
@@ -481,14 +624,45 @@ pub const Table = struct {
             self.allocator.free(owned_strings);
         }
 
-        for (string_slices, 0..) |slice, i| {
-            const copy = self.allocator.alloc(u8, slice.len) catch {
-                // Mark how many we successfully allocated for errdefer
-                owned_strings = owned_strings[0..i];
-                return TableError.OutOfMemory;
+        // Read each page
+        var result_offset: usize = 0;
+        for (col_meta.pages) |page| {
+            // Lance stores string columns with TWO separate buffers per page:
+            // - Buffer 0: offsets array (uint32 or uint64, marking END positions)
+            // - Buffer 1: string data (concatenated UTF-8 bytes)
+            if (page.buffer_offsets.len < 2) return TableError.InvalidMetadata;
+
+            // Buffer 0 = offsets array
+            const offsets_offset = page.buffer_offsets[0];
+            const offsets_size = page.buffer_sizes[0];
+            const offsets_buffer = self.lance_file.readBytes(offsets_offset, offsets_size) catch {
+                return TableError.InvalidMetadata;
             };
-            @memcpy(copy, slice);
-            owned_strings[i] = copy;
+
+            // Buffer 1 = string data
+            const data_offset = page.buffer_offsets[1];
+            const data_size = page.buffer_sizes[1];
+            const data_buffer = self.lance_file.readBytes(data_offset, data_size) catch {
+                return TableError.InvalidMetadata;
+            };
+
+            // Decode strings (returns slices into data_buffer, not owned copies)
+            const string_slices = PlainDecoder.readAllStrings(offsets_buffer, data_buffer, self.allocator) catch {
+                return TableError.InvalidMetadata;
+            };
+            defer self.allocator.free(string_slices);
+
+            // Copy each string into owned memory
+            for (string_slices, 0..) |slice, i| {
+                const copy = self.allocator.alloc(u8, slice.len) catch {
+                    // Mark how many we successfully allocated for errdefer
+                    owned_strings = owned_strings[0 .. result_offset + i];
+                    return TableError.OutOfMemory;
+                };
+                @memcpy(copy, slice);
+                owned_strings[result_offset + i] = copy;
+            }
+            result_offset += string_slices.len;
         }
 
         return owned_strings;
@@ -506,8 +680,9 @@ pub const Table = struct {
         data: []const u8, // Raw string data buffer
     };
 
-    /// Get raw string column buffers for zero-copy Arrow export.
-    /// Returns the raw offsets and data buffers without decoding.
+    /// Get raw string column buffers for zero-copy Arrow export (reads ALL pages).
+    /// Returns merged offsets and data buffers.
+    /// Caller must free both buffers using the table's allocator.
     pub fn getStringColumnBuffers(self: Self, col_idx: u32) TableError!StringBuffers {
         const col_meta_bytes = self.lance_file.getColumnMetadataBytes(col_idx) catch {
             return TableError.ColumnOutOfBounds;
@@ -519,27 +694,79 @@ pub const Table = struct {
         defer col_meta.deinit(self.allocator);
 
         if (col_meta.pages.len == 0) return TableError.NoPages;
-        const page = col_meta.pages[0];
 
-        if (page.buffer_offsets.len < 2) return TableError.InvalidMetadata;
+        // Single page - return directly (zero-copy)
+        if (col_meta.pages.len == 1) {
+            const page = col_meta.pages[0];
+            if (page.buffer_offsets.len < 2) return TableError.InvalidMetadata;
 
-        // Buffer 0 = offsets array
-        const offsets_offset = page.buffer_offsets[0];
-        const offsets_size = page.buffer_sizes[0];
-        const offsets_buffer = self.lance_file.readBytes(offsets_offset, offsets_size) catch {
-            return TableError.InvalidMetadata;
-        };
+            const offsets_buffer = self.lance_file.readBytes(page.buffer_offsets[0], page.buffer_sizes[0]) catch {
+                return TableError.InvalidMetadata;
+            };
+            const data_buffer = self.lance_file.readBytes(page.buffer_offsets[1], page.buffer_sizes[1]) catch {
+                return TableError.InvalidMetadata;
+            };
 
-        // Buffer 1 = string data
-        const data_offset = page.buffer_offsets[1];
-        const data_size = page.buffer_sizes[1];
-        const data_buffer = self.lance_file.readBytes(data_offset, data_size) catch {
-            return TableError.InvalidMetadata;
-        };
+            return StringBuffers{
+                .offsets = offsets_buffer,
+                .data = data_buffer,
+            };
+        }
+
+        // Multiple pages - need to merge offsets and data buffers
+        // Calculate total sizes
+        var total_offsets_size: usize = 0;
+        var total_data_size: usize = 0;
+        for (col_meta.pages) |page| {
+            if (page.buffer_sizes.len >= 2) {
+                total_offsets_size += page.buffer_sizes[0];
+                total_data_size += page.buffer_sizes[1];
+            }
+        }
+
+        // Allocate merged buffers
+        const merged_offsets = self.allocator.alloc(u8, total_offsets_size) catch return TableError.OutOfMemory;
+        errdefer self.allocator.free(merged_offsets);
+
+        const merged_data = self.allocator.alloc(u8, total_data_size) catch return TableError.OutOfMemory;
+        errdefer self.allocator.free(merged_data);
+
+        // Copy data from each page, adjusting offsets
+        var offsets_pos: usize = 0;
+        var data_pos: usize = 0;
+        var data_offset_adjustment: u32 = 0;
+
+        for (col_meta.pages) |page| {
+            if (page.buffer_offsets.len < 2) continue;
+
+            // Read page buffers
+            const page_offsets = self.lance_file.readBytes(page.buffer_offsets[0], page.buffer_sizes[0]) catch {
+                return TableError.InvalidMetadata;
+            };
+            const page_data = self.lance_file.readBytes(page.buffer_offsets[1], page.buffer_sizes[1]) catch {
+                return TableError.InvalidMetadata;
+            };
+
+            // Copy and adjust offsets (Lance uses i32 end-offsets)
+            const num_offsets = page_offsets.len / @sizeOf(i32);
+            const src_offsets = @as([*]const i32, @ptrCast(@alignCast(page_offsets.ptr)))[0..num_offsets];
+            const dst_offsets = @as([*]i32, @ptrCast(@alignCast(merged_offsets.ptr + offsets_pos)))[0..num_offsets];
+
+            for (src_offsets, 0..) |offset, i| {
+                dst_offsets[i] = offset + @as(i32, @intCast(data_offset_adjustment));
+            }
+
+            // Copy data
+            @memcpy(merged_data[data_pos .. data_pos + page_data.len], page_data);
+
+            offsets_pos += page_offsets.len;
+            data_pos += page_data.len;
+            data_offset_adjustment = @intCast(data_pos);
+        }
 
         return StringBuffers{
-            .offsets = offsets_buffer,
-            .data = data_buffer,
+            .offsets = merged_offsets,
+            .data = merged_data,
         };
     }
 };

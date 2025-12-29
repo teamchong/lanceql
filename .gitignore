@@ -45,3 +45,6 @@ node_modules/
 CLAUDE.md
 tests/fixtures/lance-repo
 .claude/TODO.md
+benchmarks/benchmark_e2e.lance/
+benchmarks/benchmark_e2e.parquet
+.metal0/
