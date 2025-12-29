@@ -31,6 +31,12 @@ const std = @import("std");
 pub const executor = @import("executor.zig");
 pub const LogicTableExecutor = executor.LogicTableExecutor;
 
+// Re-export DataFrame module
+pub const dataframe = @import("dataframe.zig");
+pub const LogicTableDataFrame = dataframe.LogicTableDataFrame;
+pub const QueryResult = dataframe.QueryResult;
+pub const FilterOp = dataframe.FilterOp;
+
 /// LogicTable struct metadata - describes a compiled @logic_table class
 pub const LogicTableMeta = struct {
     name: []const u8,
