@@ -508,6 +508,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("benchmarks/bench_logic_table_e2e.zig"),
             .target = target,
             .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lanceql.table", .module = table_mod },
+            },
         }),
     });
     // Link the compiled @logic_table static library

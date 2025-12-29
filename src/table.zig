@@ -174,11 +174,52 @@ pub const Table = struct {
         return self.readInt32Column(@intCast(idx));
     }
 
-    /// Read all float32 values from a column.
+    /// Read all float32 values from a column (reads ALL pages).
     pub fn readFloat32Column(self: Self, col_idx: u32) TableError![]f32 {
-        const buffer_data = try self.getColumnBuffer(col_idx);
-        const decoder = PlainDecoder.init(buffer_data);
-        return decoder.readAllFloat32(self.allocator) catch return TableError.OutOfMemory;
+        const col_meta_bytes = self.lance_file.getColumnMetadataBytes(col_idx) catch {
+            return TableError.ColumnOutOfBounds;
+        };
+
+        var col_meta = ColumnMetadata.parse(self.allocator, col_meta_bytes) catch {
+            return TableError.InvalidMetadata;
+        };
+        defer col_meta.deinit(self.allocator);
+
+        if (col_meta.pages.len == 0) return TableError.NoPages;
+
+        // Calculate total values across all pages
+        var total_values: usize = 0;
+        for (col_meta.pages) |page| {
+            if (page.buffer_sizes.len > 0) {
+                total_values += page.buffer_sizes[0] / @sizeOf(f32);
+            }
+        }
+
+        // Allocate result buffer for all pages
+        var result = self.allocator.alloc(f32, total_values) catch return TableError.OutOfMemory;
+        errdefer self.allocator.free(result);
+
+        // Read each page's buffer and decode
+        var offset: usize = 0;
+        for (col_meta.pages) |page| {
+            if (page.buffer_offsets.len == 0 or page.buffer_sizes.len == 0) continue;
+
+            const buffer_offset = page.buffer_offsets[0];
+            const buffer_size = page.buffer_sizes[0];
+
+            const buffer_data = self.lance_file.readBytes(buffer_offset, buffer_size) catch {
+                return TableError.InvalidMetadata;
+            };
+
+            const decoder = PlainDecoder.init(buffer_data);
+            const page_values = decoder.readAllFloat32(self.allocator) catch return TableError.OutOfMemory;
+            defer self.allocator.free(page_values);
+
+            @memcpy(result[offset .. offset + page_values.len], page_values);
+            offset += page_values.len;
+        }
+
+        return result;
     }
 
     /// Read all float32 values from a column by name.

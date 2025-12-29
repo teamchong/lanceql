@@ -254,15 +254,28 @@ import { LanceQL } from './lanceql.js';
 
 ## Benchmarks
 
-### LanceQL vs lancedb (Lance files)
+### End-to-End: LanceQL vs DuckDB vs Polars
 
-*Benchmarked on Apple M2 Pro (ARM64). Results may vary on other platforms.*
+*100K rows × 384-dim embeddings. Full pipeline from cold start: file I/O → parse → decode → compute.*
 
-| Test | Dataset | lancedb | LanceQL | Speedup |
-|------|---------|---------|---------|---------|
-| Full Table Scan | 100K rows | 24.2ms | 2.4ms | **10x faster** |
-| Full Table Scan | 1M rows | 492ms | 16.5ms | **30x faster** |
-| Throughput | 1M rows | 2.0M rows/s | 60.7M rows/s | **30x faster** |
+| Engine | Time | Rows/sec | vs LanceQL |
+|--------|------|----------|------------|
+| **LanceQL (Zig)** | 279ms | 358K/s | 1.0x |
+| DuckDB + NumPy | 1,886ms | 53K/s | 6.8x slower |
+| Polars + NumPy | 11,932ms | 8K/s | 42.8x slower |
+
+**What's measured:**
+1. Read file from disk (Lance/Parquet)
+2. Parse schema and metadata
+3. Decode all columns (38.4M float32 values)
+4. Compute dot product for each row
+5. Return result
+
+Run benchmark:
+```bash
+python benchmarks/generate_benchmark_data.py  # Generate 100K row test data
+zig build bench-logic-table-e2e && ./zig-out/bin/bench-logic-table-e2e
+```
 
 ### LanceQL vs PyArrow (Parquet files)
 
@@ -287,7 +300,6 @@ Run benchmarks yourself:
 ```bash
 zig build test-parquet                           # Native Zig Parquet decoder benchmark
 python benchmarks/bench_parquet_vs_pyarrow.py    # vs PyArrow (Parquet files)
-python benchmarks/06_read_performance.py         # vs lancedb (Lance files)
 python benchmarks/10_parquet_api.py              # vs pyarrow.parquet (drop-in API)
 ```
 
