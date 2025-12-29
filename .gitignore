@@ -28,6 +28,11 @@ Thumbs.db
 *.o
 *.a
 *.so
+
+# Generated benchmark data
+benchmarks/*.lance/
+benchmarks/*.parquet
+data/
 *.dylib
 *.wasm
 !zig-out/bin/*.wasm
