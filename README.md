@@ -254,29 +254,6 @@ import { LanceQL } from './lanceql.js';
 
 ## Benchmarks
 
-### End-to-End: LanceQL vs DuckDB vs Polars
-
-*100K rows × 384-dim embeddings. Full pipeline from cold start: file I/O → parse → decode → compute.*
-
-| Engine | Time | Rows/sec | vs LanceQL |
-|--------|------|----------|------------|
-| **LanceQL (Zig)** | 621ms | 161K/s | 1.0x |
-| DuckDB + NumPy | 2,556ms | 39K/s | 4.1x slower |
-| Polars + NumPy | 43,003ms | 2K/s | 69x slower |
-
-**What's measured:**
-1. Read file from disk (Lance/Parquet)
-2. Parse schema and metadata
-3. Decode all columns (38.4M float32 values)
-4. Compute dot product for each row
-5. Return result
-
-Run benchmark:
-```bash
-python benchmarks/generate_benchmark_data.py  # Generate 100K row test data
-zig build bench-logic-table-e2e && ./zig-out/bin/bench-logic-table-e2e
-```
-
 ### LanceQL vs PyArrow (Parquet files)
 
 *Benchmarked on Apple M2 Pro (ARM64). Results may vary on other platforms.*
