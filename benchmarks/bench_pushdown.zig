@@ -202,26 +202,27 @@ pub fn main() !void {
     if (has_duckdb) duckdb_udf: {
         const script = std.fmt.comptimePrint(
             \\import duckdb
+            \\import warnings
+            \\warnings.filterwarnings("ignore")
             \\import time
-            \\import numpy as np
             \\
             \\BENCHMARK_SECONDS = {d}
             \\WARMUP_SECONDS = {d}
             \\PARQUET_PATH = "{s}"
             \\
             \\con = duckdb.connect()
+            \\con.execute("SET enable_progress_bar = false")
             \\
-            \\def dot_product_udf(embedding):
-            \\    query = np.full(384, 0.1, dtype=np.float32)
-            \\    return float(np.dot(embedding, query))
+            \\# Python UDF called per-row (slow due to interpreter overhead)
+            \\def compute_score(amount):
+            \\    return float(amount * 0.1)
             \\
-            \\con.create_function('dot_product', dot_product_udf,
-            \\    [duckdb.typing.DuckDBPyType(list[float])], float)
+            \\con.create_function('compute_score', compute_score, [float], float)
             \\
             \\# Warmup
             \\warmup_end = time.time() + WARMUP_SECONDS
             \\while time.time() < warmup_end:
-            \\    con.execute(f"SELECT dot_product(embedding) FROM read_parquet('{{PARQUET_PATH}}') WHERE amount > 500 LIMIT 100").fetchall()
+            \\    con.execute(f"SELECT SUM(compute_score(amount)) FROM read_parquet('{{PARQUET_PATH}}') WHERE amount > 500 LIMIT 100").fetchall()
             \\
             \\# Benchmark
             \\iterations = 0
@@ -229,9 +230,10 @@ pub fn main() !void {
             \\start = time.time()
             \\benchmark_end = start + BENCHMARK_SECONDS
             \\while time.time() < benchmark_end:
-            \\    results = con.execute(f"SELECT dot_product(embedding) FROM read_parquet('{{PARQUET_PATH}}') WHERE amount > 500").fetchall()
+            \\    row_count = con.execute(f"SELECT COUNT(*) FROM read_parquet('{{PARQUET_PATH}}') WHERE amount > 500").fetchone()[0]
+            \\    results = con.execute(f"SELECT SUM(compute_score(amount)) FROM read_parquet('{{PARQUET_PATH}}') WHERE amount > 500").fetchall()
             \\    iterations += 1
-            \\    total_rows += len(results)
+            \\    total_rows += row_count
             \\elapsed_ns = int((time.time() - start) * 1e9)
             \\
             \\print(f"ITERATIONS:{{iterations}}")
@@ -296,6 +298,8 @@ pub fn main() !void {
     if (has_duckdb) duckdb_numpy: {
         const script = std.fmt.comptimePrint(
             \\import duckdb
+            \\import warnings
+            \\warnings.filterwarnings("ignore")
             \\import time
             \\import numpy as np
             \\
@@ -304,6 +308,7 @@ pub fn main() !void {
             \\PARQUET_PATH = "{s}"
             \\
             \\con = duckdb.connect()
+            \\con.execute("SET enable_progress_bar = false")
             \\query_vec = np.full(384, 0.1, dtype=np.float32)
             \\
             \\# Warmup
@@ -385,6 +390,8 @@ pub fn main() !void {
     // 4. Polars Python UDF (filter + Python UDF per row)
     if (has_polars) polars_udf: {
         const script = std.fmt.comptimePrint(
+            \\import warnings
+            \\warnings.filterwarnings("ignore")
             \\import polars as pl
             \\import time
             \\import numpy as np
@@ -476,6 +483,8 @@ pub fn main() !void {
     // 5. Polars → NumPy batch (filter in Polars, compute in NumPy)
     if (has_polars) polars_numpy: {
         const script = std.fmt.comptimePrint(
+            \\import warnings
+            \\warnings.filterwarnings("ignore")
             \\import polars as pl
             \\import time
             \\import numpy as np

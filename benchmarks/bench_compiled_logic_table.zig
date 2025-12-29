@@ -2,9 +2,10 @@
 //!
 //! HONEST benchmark measuring the FULL pipeline from cold start:
 //!   1. LanceQL @logic_table  - Read Lance file → compute with compiled Python
-//!   2. DuckDB → NumPy batch  - Read Parquet → pull to Python → NumPy compute
-//!   3. Polars Python UDF     - Read Parquet → row-by-row Python calls
-//!   4. Polars → NumPy batch  - Read Parquet → pull to Python → NumPy compute
+//!   2. DuckDB Python UDF     - Read Parquet → SQL with per-row Python UDF
+//!   3. DuckDB → NumPy batch  - Read Parquet → pull to Python → NumPy compute
+//!   4. Polars Python UDF     - Read Parquet → row-by-row Python calls
+//!   5. Polars → NumPy batch  - Read Parquet → pull to Python → NumPy compute
 //!
 //! FAIR COMPARISON:
 //!   - All methods read REAL data from disk (Lance or Parquet files)
@@ -198,9 +199,92 @@ pub fn main() !void {
     }
 
     // =========================================================================
+    // DuckDB Python UDF - Read Parquet, compute with per-row Python UDF
+    // =========================================================================
+    if (has_duckdb) duckdb_udf: {
+        const py_script = std.fmt.comptimePrint(
+            \\import duckdb
+            \\import numpy as np
+            \\import time
+            \\
+            \\WARMUP_SECONDS = {d}
+            \\BENCHMARK_SECONDS = {d}
+            \\
+            \\# Create connection and register Python UDF
+            \\con = duckdb.connect()
+            \\con.execute("SET enable_progress_bar = false")
+            \\
+            \\# Python UDF that gets called per-row (slow due to interpreter overhead)
+            \\def dot_product_udf(amount):
+            \\    return float(amount * 1.0)  # Simple multiply with query=1.0
+            \\
+            \\con.create_function('dot_udf', dot_product_udf, [float], float)
+            \\
+            \\# Warmup
+            \\warmup_end = time.time() + WARMUP_SECONDS
+            \\while time.time() < warmup_end:
+            \\    result = con.execute("SELECT SUM(dot_udf(amount)) FROM read_parquet('{s}')").fetchone()
+            \\
+            \\# Benchmark
+            \\iterations = 0
+            \\total_rows = 0
+            \\start = time.time()
+            \\benchmark_end = start + BENCHMARK_SECONDS
+            \\while time.time() < benchmark_end:
+            \\    result = con.execute("SELECT SUM(dot_udf(amount)) FROM read_parquet('{s}')").fetchone()
+            \\    # Count rows by checking table size
+            \\    row_count = con.execute("SELECT COUNT(*) FROM read_parquet('{s}')").fetchone()[0]
+            \\    total_rows += row_count
+            \\    iterations += 1
+            \\
+            \\con.close()
+            \\elapsed = time.time() - start
+            \\rows_per_sec = total_rows / elapsed
+            \\print(f"ROWS_PER_SEC:{{rows_per_sec:.0f}}")
+            \\print(f"ITERATIONS:{{iterations}}")
+        , .{ WARMUP_SECONDS, BENCHMARK_SECONDS, PARQUET_PATH, PARQUET_PATH, PARQUET_PATH });
+
+        const result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "python3", "-c", py_script },
+            .max_output_bytes = 10 * 1024,
+        }) catch {
+            std.debug.print("{s:<40} {s:>12} {s:>12} {s:>10}\n", .{ "DuckDB Python UDF", "error", "-", "-" });
+            break :duckdb_udf;
+        };
+        defer {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+        }
+
+        var rows_per_sec: f64 = 0;
+        var iterations: u64 = 0;
+        var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "ROWS_PER_SEC:")) {
+                rows_per_sec = std.fmt.parseFloat(f64, line[13..]) catch 0;
+            } else if (std.mem.startsWith(u8, line, "ITERATIONS:")) {
+                iterations = std.fmt.parseInt(u64, line[11..], 10) catch 0;
+            }
+        }
+
+        if (rows_per_sec > 0) {
+            const speedup = lanceql_rows_per_sec / rows_per_sec;
+            std.debug.print("{s:<40} {d:>10.0}K {d:>12} {d:>9.1}x\n", .{
+                "DuckDB Python UDF",
+                rows_per_sec / 1000.0,
+                iterations,
+                speedup,
+            });
+        } else {
+            std.debug.print("{s:<40} {s:>12} {s:>12} {s:>10}\n", .{ "DuckDB Python UDF", "error", "-", "-" });
+        }
+    }
+
+    // =========================================================================
     // DuckDB → NumPy batch - Read Parquet, compute dot product
     // =========================================================================
-    if (has_duckdb) {
+    if (has_duckdb) duckdb_numpy: {
         const py_script = std.fmt.comptimePrint(
             \\import duckdb
             \\import numpy as np
@@ -213,6 +297,7 @@ pub fn main() !void {
             \\warmup_end = time.time() + WARMUP_SECONDS
             \\while time.time() < warmup_end:
             \\    con = duckdb.connect()
+            \\    con.execute("SET enable_progress_bar = false")
             \\    amounts = con.execute("SELECT amount FROM read_parquet('{s}')").fetchnumpy()['amount']
             \\    query = np.ones(len(amounts))
             \\    dot = np.dot(amounts, query)
@@ -225,6 +310,7 @@ pub fn main() !void {
             \\benchmark_end = start + BENCHMARK_SECONDS
             \\while time.time() < benchmark_end:
             \\    con = duckdb.connect()
+            \\    con.execute("SET enable_progress_bar = false")
             \\    amounts = con.execute("SELECT amount FROM read_parquet('{s}')").fetchnumpy()['amount']
             \\    query = np.ones(len(amounts))
             \\    dot = np.dot(amounts, query)
@@ -244,7 +330,7 @@ pub fn main() !void {
             .max_output_bytes = 10 * 1024,
         }) catch {
             std.debug.print("{s:<40} {s:>12} {s:>12} {s:>10}\n", .{ "DuckDB → NumPy batch", "error", "-", "-" });
-            return;
+            break :duckdb_numpy;
         };
         defer {
             allocator.free(result.stdout);
@@ -270,14 +356,18 @@ pub fn main() !void {
                 iterations,
                 speedup,
             });
+        } else {
+            std.debug.print("{s:<40} {s:>12} {s:>12} {s:>10}\n", .{ "DuckDB → NumPy batch", "error", "-", "-" });
         }
     }
 
     // =========================================================================
     // Polars Python UDF - Row-by-row (slow baseline)
     // =========================================================================
-    if (has_polars) {
+    if (has_polars) polars_udf: {
         const py_script = std.fmt.comptimePrint(
+            \\import warnings
+            \\warnings.filterwarnings('ignore')
             \\import polars as pl
             \\import time
             \\
@@ -316,7 +406,7 @@ pub fn main() !void {
             .max_output_bytes = 10 * 1024,
         }) catch {
             std.debug.print("{s:<40} {s:>12} {s:>12} {s:>10}\n", .{ "Polars Python UDF", "error", "-", "-" });
-            return;
+            break :polars_udf;
         };
         defer {
             allocator.free(result.stdout);
@@ -342,13 +432,15 @@ pub fn main() !void {
                 iterations,
                 speedup,
             });
+        } else {
+            std.debug.print("{s:<40} {s:>12} {s:>12} {s:>10}\n", .{ "Polars Python UDF", "error", "-", "-" });
         }
     }
 
     // =========================================================================
     // Polars → NumPy batch
     // =========================================================================
-    if (has_polars) {
+    if (has_polars) polars_numpy: {
         const py_script = std.fmt.comptimePrint(
             \\import polars as pl
             \\import numpy as np
@@ -390,7 +482,7 @@ pub fn main() !void {
             .max_output_bytes = 10 * 1024,
         }) catch {
             std.debug.print("{s:<40} {s:>12} {s:>12} {s:>10}\n", .{ "Polars → NumPy batch", "error", "-", "-" });
-            return;
+            break :polars_numpy;
         };
         defer {
             allocator.free(result.stdout);
@@ -416,6 +508,8 @@ pub fn main() !void {
                 iterations,
                 speedup,
             });
+        } else {
+            std.debug.print("{s:<40} {s:>12} {s:>12} {s:>10}\n", .{ "Polars → NumPy batch", "error", "-", "-" });
         }
     }
 

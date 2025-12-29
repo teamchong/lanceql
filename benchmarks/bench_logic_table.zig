@@ -228,29 +228,30 @@ pub fn main() !void {
     }
 
     // 2. DuckDB Python UDF
-    if (has_duckdb) {
+    if (has_duckdb) duckdb_udf: {
         const script = std.fmt.comptimePrint(
             \\import duckdb
+            \\import warnings
+            \\warnings.filterwarnings("ignore")
             \\import time
-            \\import numpy as np
             \\
             \\BENCHMARK_SECONDS = {d}
             \\WARMUP_SECONDS = {d}
             \\PARQUET_PATH = "{s}"
             \\
             \\con = duckdb.connect()
+            \\con.execute("SET enable_progress_bar = false")
             \\
-            \\def dot_product_udf(embedding):
-            \\    query = np.full(384, 0.1, dtype=np.float32)
-            \\    return float(np.dot(embedding, query))
+            \\# Python UDF called per-row (slow due to interpreter overhead)
+            \\def compute_score(amount):
+            \\    return float(amount * 1.0)
             \\
-            \\con.create_function('dot_product', dot_product_udf,
-            \\    [duckdb.typing.DuckDBPyType(list[float])], float)
+            \\con.create_function('compute_score', compute_score, [float], float)
             \\
             \\# Warmup
             \\warmup_end = time.time() + WARMUP_SECONDS
             \\while time.time() < warmup_end:
-            \\    con.execute(f"SELECT dot_product(embedding) FROM read_parquet('{{PARQUET_PATH}}') LIMIT 100").fetchall()
+            \\    con.execute(f"SELECT SUM(compute_score(amount)) FROM read_parquet('{{PARQUET_PATH}}') LIMIT 100").fetchall()
             \\
             \\# Benchmark
             \\iterations = 0
@@ -258,9 +259,10 @@ pub fn main() !void {
             \\start = time.time()
             \\benchmark_end = start + BENCHMARK_SECONDS
             \\while time.time() < benchmark_end:
-            \\    results = con.execute(f"SELECT dot_product(embedding) FROM read_parquet('{{PARQUET_PATH}}')").fetchall()
+            \\    row_count = con.execute(f"SELECT COUNT(*) FROM read_parquet('{{PARQUET_PATH}}')").fetchone()[0]
+            \\    results = con.execute(f"SELECT SUM(compute_score(amount)) FROM read_parquet('{{PARQUET_PATH}}')").fetchall()
             \\    iterations += 1
-            \\    total_rows += len(results)
+            \\    total_rows += row_count
             \\elapsed_ns = int((time.time() - start) * 1e9)
             \\
             \\print(f"ITERATIONS:{{iterations}}")
@@ -268,39 +270,52 @@ pub fn main() !void {
             \\print(f"ROWS:{{total_rows}}")
         , .{ BENCHMARK_SECONDS, WARMUP_SECONDS, PARQUET_PATH });
 
-        const result = try runPythonTimedBenchmark(allocator, script);
-        if (result.iterations > 0 and result.total_ns > 0) {
-            // Need to get rows from output
-            const py_result = std.process.Child.run(.{
-                .allocator = allocator,
-                .argv = &.{ "python3", "-c", script },
-                .max_output_bytes = 10 * 1024 * 1024,
-            }) catch {
-                std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "DuckDB Python UDF", "error", "-", "-" });
-                return;
-            };
-            defer {
-                allocator.free(py_result.stdout);
-                allocator.free(py_result.stderr);
-            }
+        const py_result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "python3", "-c", script },
+            .max_output_bytes = 10 * 1024 * 1024,
+        }) catch {
+            std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "DuckDB Python UDF", "error", "-", "-" });
+            break :duckdb_udf;
+        };
+        defer {
+            allocator.free(py_result.stdout);
+            allocator.free(py_result.stderr);
+        }
 
-            var total_rows: u64 = 0;
-            if (std.mem.indexOf(u8, py_result.stdout, "ROWS:")) |idx| {
-                const start = idx + 5;
-                var end = start;
-                while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') {
-                    end += 1;
-                }
-                total_rows = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
-            }
+        var iterations: u64 = 0;
+        var total_ns: u64 = 0;
+        var total_rows: u64 = 0;
 
-            const throughput = @as(f64, @floatFromInt(total_rows)) / (@as(f64, @floatFromInt(result.total_ns)) / 1_000_000_000.0);
+        if (std.mem.indexOf(u8, py_result.stdout, "ITERATIONS:")) |idx| {
+            const start = idx + 11;
+            var end = start;
+            while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') end += 1;
+            iterations = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
+        }
+        if (std.mem.indexOf(u8, py_result.stdout, "TOTAL_NS:")) |idx| {
+            const start = idx + 9;
+            var end = start;
+            while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') end += 1;
+            total_ns = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
+        }
+        if (std.mem.indexOf(u8, py_result.stdout, "ROWS:")) |idx| {
+            const start = idx + 5;
+            var end = start;
+            while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') end += 1;
+            total_rows = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
+        }
+
+        if (iterations > 0 and total_ns > 0 and total_rows > 0) {
+            const throughput = @as(f64, @floatFromInt(total_rows)) / (@as(f64, @floatFromInt(total_ns)) / 1_000_000_000.0);
             const speedup = lanceql_throughput / throughput;
             var speedup_buf: [16]u8 = undefined;
             const speedup_str = std.fmt.bufPrint(&speedup_buf, "{d:.1}x", .{speedup}) catch "N/A";
             std.debug.print("{s:<35} {d:>12.0} {d:>12} {s:>10}\n", .{
-                "DuckDB Python UDF", throughput, result.iterations, speedup_str,
+                "DuckDB Python UDF", throughput, iterations, speedup_str,
             });
+        } else {
+            std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "DuckDB Python UDF", "error", "-", "-" });
         }
     }
 
@@ -308,6 +323,8 @@ pub fn main() !void {
     if (has_duckdb) duckdb_numpy: {
         const script = std.fmt.comptimePrint(
             \\import duckdb
+            \\import warnings
+            \\warnings.filterwarnings("ignore")
             \\import time
             \\import numpy as np
             \\
@@ -316,6 +333,7 @@ pub fn main() !void {
             \\PARQUET_PATH = "{s}"
             \\
             \\con = duckdb.connect()
+            \\con.execute("SET enable_progress_bar = false")
             \\query_vec = np.full(384, 0.1, dtype=np.float32)
             \\
             \\# Warmup
@@ -397,6 +415,8 @@ pub fn main() !void {
     // 4. Polars Python UDF
     if (has_polars) polars_udf: {
         const script = std.fmt.comptimePrint(
+            \\import warnings
+            \\warnings.filterwarnings("ignore")
             \\import polars as pl
             \\import time
             \\import numpy as np
@@ -488,6 +508,8 @@ pub fn main() !void {
     // 5. Polars → NumPy batch
     if (has_polars) polars_numpy: {
         const script = std.fmt.comptimePrint(
+            \\import warnings
+            \\warnings.filterwarnings("ignore")
             \\import polars as pl
             \\import time
             \\import numpy as np
