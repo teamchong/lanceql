@@ -6,6 +6,7 @@
 const std = @import("std");
 const ast = @import("ast");
 const Table = @import("lanceql.table").Table;
+const logic_table_dispatch = @import("logic_table_dispatch.zig");
 
 const Expr = ast.Expr;
 const SelectStmt = ast.SelectStmt;
@@ -160,6 +161,10 @@ pub const Executor = struct {
     table: *Table,
     allocator: std.mem.Allocator,
     column_cache: std.StringHashMap(CachedColumn),
+    /// Optional dispatcher for @logic_table method calls
+    dispatcher: ?*logic_table_dispatch.Dispatcher = null,
+    /// Maps table alias to class name for @logic_table instances
+    logic_table_aliases: std.StringHashMap([]const u8),
 
     const Self = @This();
 
@@ -168,7 +173,29 @@ pub const Executor = struct {
             .table = table,
             .allocator = allocator,
             .column_cache = std.StringHashMap(CachedColumn).init(allocator),
+            .dispatcher = null,
+            .logic_table_aliases = std.StringHashMap([]const u8).init(allocator),
         };
+    }
+
+    /// Set the dispatcher for @logic_table method calls
+    pub fn setDispatcher(self: *Self, dispatcher: *logic_table_dispatch.Dispatcher) void {
+        self.dispatcher = dispatcher;
+    }
+
+    /// Register a @logic_table alias with its class name
+    /// Returns error.DuplicateAlias if alias already registered
+    pub fn registerLogicTableAlias(self: *Self, alias: []const u8, class_name: []const u8) !void {
+        // Check for existing alias first - we don't support overwriting
+        if (self.logic_table_aliases.contains(alias)) {
+            return error.DuplicateAlias;
+        }
+
+        const alias_copy = try self.allocator.dupe(u8, alias);
+        errdefer self.allocator.free(alias_copy);
+        const class_copy = try self.allocator.dupe(u8, class_name);
+        errdefer self.allocator.free(class_copy);
+        try self.logic_table_aliases.put(alias_copy, class_copy);
     }
 
     pub fn deinit(self: *Self) void {
@@ -190,6 +217,14 @@ pub const Executor = struct {
             }
         }
         self.column_cache.deinit();
+
+        // Free logic_table alias keys and values
+        var alias_iter = self.logic_table_aliases.iterator();
+        while (alias_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.logic_table_aliases.deinit();
     }
 
     // ========================================================================
@@ -1295,6 +1330,8 @@ pub const Executor = struct {
                     .string => |data| Value{ .string = data[row_idx] },
                 };
             },
+            .method_call => |mc| try self.evaluateMethodCall(mc, row_idx),
+            .call => |call| try self.evaluateScalarFunction(call, row_idx),
             else => error.UnsupportedExpression,
         };
     }
@@ -1322,8 +1359,40 @@ pub const Executor = struct {
             .binary => |bin| try self.evaluateBinaryToValue(bin, row_idx),
             .unary => |un| try self.evaluateUnaryToValue(un, row_idx),
             .call => |call| try self.evaluateScalarFunction(call, row_idx),
+            .method_call => |mc| try self.evaluateMethodCall(mc, row_idx),
             else => error.UnsupportedExpression,
         };
+    }
+
+    /// Evaluate a @logic_table method call (e.g., t.risk_score())
+    fn evaluateMethodCall(self: *Self, mc: anytype, row_idx: u32) !Value {
+        _ = row_idx; // TODO: Support row-wise method calls
+
+        // Get class name from alias
+        const class_name = self.logic_table_aliases.get(mc.object) orelse
+            return error.TableAliasNotFound;
+
+        // Get dispatcher
+        const dispatcher = self.dispatcher orelse
+            return error.NoDispatcherConfigured;
+
+        // For now, we only support methods with no runtime arguments
+        // The compiled method operates on batch data loaded in the LogicTableContext
+        if (mc.args.len > 0) {
+            return error.MethodArgsNotSupported;
+        }
+
+        // Call the method via dispatcher (0-arg methods for now)
+        // TODO: This is placeholder - real impl needs LogicTableContext data binding
+        const result = dispatcher.callMethod0(class_name, mc.method) catch |err| {
+            return switch (err) {
+                error.MethodNotFound => error.MethodNotFound,
+                error.ArgumentCountMismatch => error.ArgumentCountMismatch,
+                else => error.ExecutionFailed,
+            };
+        };
+
+        return Value{ .float = result };
     }
 
     /// Evaluate binary expression to a Value (arithmetic operations)

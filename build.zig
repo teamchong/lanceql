@@ -116,6 +116,9 @@ pub fn build(b: *std.Build) void {
     // Logic table module - provides LogicTableContext, LogicTableRegistry, etc.
     const logic_table_mod = b.addModule("lanceql.logic_table", .{
         .root_source_file = b.path("src/logic_table/logic_table.zig"),
+        .imports = &.{
+            .{ .name = "lanceql.table", .module = table_mod },
+        },
     });
 
     // metal0 module - Python to native compiler (as submodule)
@@ -165,6 +168,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "ast", .module = sql_ast_mod },
             .{ .name = "parser", .module = sql_parser_mod },
             .{ .name = "lanceql.table", .module = table_mod },
+            .{ .name = "lanceql.logic_table", .module = logic_table_mod },
         },
     });
 

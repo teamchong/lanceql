@@ -1076,3 +1076,46 @@ test "execute SELECT DISTINCT on strings" {
     // All should be unique so row count should match original
     try std.testing.expect(result.row_count > 0);
 }
+
+// =============================================================================
+// @logic_table Integration Tests
+// =============================================================================
+
+test "executor registerLogicTableAlias" {
+    const allocator = std.testing.allocator;
+
+    // Open test Lance file
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+
+    // Register alias
+    try executor.registerLogicTableAlias("t", "FraudDetector");
+
+    // Check it's stored
+    const class_name = executor.logic_table_aliases.get("t");
+    try std.testing.expect(class_name != null);
+    try std.testing.expectEqualStrings("FraudDetector", class_name.?);
+}
+
+test "executor registerLogicTableAlias rejects duplicates" {
+    const allocator = std.testing.allocator;
+
+    // Open test Lance file
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+
+    // Register alias once
+    try executor.registerLogicTableAlias("t", "FraudDetector");
+
+    // Attempt to register again - should fail
+    const result = executor.registerLogicTableAlias("t", "OtherClass");
+    try std.testing.expectError(error.DuplicateAlias, result);
+}

@@ -17,8 +17,8 @@ const std = @import("std");
 const ast = @import("ast");
 const logic_table = @import("lanceql.logic_table");
 
-const LogicTableContext = logic_table.LogicTableContext;
-const LogicTableExecutor = logic_table.LogicTableExecutor;
+pub const LogicTableContext = logic_table.LogicTableContext;
+pub const LogicTableExecutor = logic_table.LogicTableExecutor;
 
 /// Error type for logic_table dispatch
 pub const DispatchError = error{
@@ -135,13 +135,11 @@ pub const Dispatcher = struct {
         return self.executors.get(alias);
     }
 
-    /// Call a registered method
-    /// Returns the method result as f64
-    pub fn callMethod(
+    /// Call a 0-argument method
+    pub fn callMethod0(
         self: *Self,
         class_name: []const u8,
         method_name: []const u8,
-        args: anytype,
     ) DispatchError!f64 {
         var key_buf: [256]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ class_name, method_name }) catch
@@ -149,27 +147,58 @@ pub const Dispatcher = struct {
 
         const method = self.methods.get(key) orelse return DispatchError.MethodNotFound;
 
-        // Dispatch based on argument count
-        switch (method.arg_count) {
-            2 => {
-                const fn_ptr: MethodFnF64_2Args = @ptrCast(@alignCast(method.fn_ptr));
-                const a = args[0];
-                const b = args[1];
-                const len = args[2];
-                return fn_ptr(a, b, len);
-            },
-            1 => {
-                const fn_ptr: MethodFnF64_1Arg = @ptrCast(@alignCast(method.fn_ptr));
-                const a = args[0];
-                const len = args[1];
-                return fn_ptr(a, len);
-            },
-            0 => {
-                const fn_ptr: MethodFnF64_NoArg = @ptrCast(@alignCast(method.fn_ptr));
-                return fn_ptr();
-            },
-            else => return DispatchError.ArgumentCountMismatch,
-        }
+        if (method.arg_count != 0) return DispatchError.ArgumentCountMismatch;
+
+        const fn_ptr: MethodFnF64_NoArg = @ptrCast(@alignCast(method.fn_ptr));
+        return fn_ptr();
+    }
+
+    /// Call a 1-argument method (vector + len)
+    pub fn callMethod1(
+        self: *Self,
+        class_name: []const u8,
+        method_name: []const u8,
+        a: [*]const f64,
+        len: usize,
+    ) DispatchError!f64 {
+        var key_buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ class_name, method_name }) catch
+            return DispatchError.MethodNotFound;
+
+        const method = self.methods.get(key) orelse return DispatchError.MethodNotFound;
+
+        if (method.arg_count != 1) return DispatchError.ArgumentCountMismatch;
+
+        const fn_ptr: MethodFnF64_1Arg = @ptrCast(@alignCast(method.fn_ptr));
+        return fn_ptr(a, len);
+    }
+
+    /// Call a 2-argument method (two vectors + len)
+    pub fn callMethod2(
+        self: *Self,
+        class_name: []const u8,
+        method_name: []const u8,
+        a: [*]const f64,
+        b: [*]const f64,
+        len: usize,
+    ) DispatchError!f64 {
+        var key_buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ class_name, method_name }) catch
+            return DispatchError.MethodNotFound;
+
+        const method = self.methods.get(key) orelse return DispatchError.MethodNotFound;
+
+        if (method.arg_count != 2) return DispatchError.ArgumentCountMismatch;
+
+        const fn_ptr: MethodFnF64_2Args = @ptrCast(@alignCast(method.fn_ptr));
+        return fn_ptr(a, b, len);
+    }
+
+    /// Get registered method info (for argument count checking)
+    pub fn getMethodInfo(self: *Self, class_name: []const u8, method_name: []const u8) ?RegisteredMethod {
+        var key_buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ class_name, method_name }) catch return null;
+        return self.methods.get(key);
     }
 };
 
@@ -236,7 +265,7 @@ test "Dispatcher basic" {
     // Call the method
     const a = [_]f64{ 1.0, 2.0, 3.0 };
     const b = [_]f64{ 4.0, 5.0, 6.0 };
-    const result = try dispatcher.callMethod("TestClass", "add", .{ @as([*]const f64, &a), @as([*]const f64, &b), @as(usize, 3) });
+    const result = try dispatcher.callMethod2("TestClass", "add", &a, &b, 3);
 
     try std.testing.expectEqual(@as(f64, 21.0), result);
 }
@@ -247,6 +276,6 @@ test "Dispatcher method not found" {
     var dispatcher = Dispatcher.init(allocator);
     defer dispatcher.deinit();
 
-    const result = dispatcher.callMethod("Unknown", "method", .{});
+    const result = dispatcher.callMethod0("Unknown", "method");
     try std.testing.expectError(DispatchError.MethodNotFound, result);
 }
