@@ -129,6 +129,16 @@ pub const Expr = union(enum) {
         expr: *Expr,
         target_type: []const u8,
     },
+
+    /// Method call on table alias (e.g., t.risk_score() for @logic_table methods)
+    method_call: struct {
+        /// Table alias (e.g., "t")
+        object: []const u8,
+        /// Method name (e.g., "risk_score")
+        method: []const u8,
+        /// Method arguments
+        args: []Expr,
+    },
 };
 
 /// WHEN ... THEN clause for CASE expression
@@ -389,6 +399,12 @@ pub fn deinitExpr(expr: *Expr, allocator: std.mem.Allocator) void {
             deinitExpr(c.expr, allocator);
             allocator.destroy(c.expr);
         },
+        .method_call => |mc| {
+            for (mc.args) |*arg| {
+                deinitExpr(arg, allocator);
+            }
+            allocator.free(mc.args);
+        },
         .value, .column => {}, // No heap allocations to free
     }
 }
@@ -482,6 +498,13 @@ pub fn countParameters(expr: *const Expr) u32 {
         },
         .exists => 0, // Subquery parameters handled separately
         .cast => |c| countParameters(c.expr),
+        .method_call => |mc| {
+            var count: u32 = 0;
+            for (mc.args) |*arg| {
+                count += countParameters(arg);
+            }
+            return count;
+        },
     };
 }
 
@@ -565,6 +588,13 @@ pub fn printExpr(expr: *const Expr, writer: anytype, indent: usize) !void {
         .cast => |c| {
             try writer.print("{s}CAST AS {s}:\n", .{ prefix, c.target_type });
             try printExpr(c.expr, writer, indent + 2);
+        },
+        .method_call => |mc| {
+            try writer.print("{s}MethodCall: {s}.{s}(\n", .{ prefix, mc.object, mc.method });
+            for (mc.args) |*arg| {
+                try printExpr(arg, writer, indent + 2);
+            }
+            try writer.print("{s})\n", .{prefix});
         },
     }
 }

@@ -1090,6 +1090,23 @@ pub const Executor = struct {
             .case_expr => expr.*,
             .exists => expr.*,
             .cast => expr.*,
+            .method_call => |mc| blk: {
+                // Bind parameters in method call arguments
+                const new_args = try self.allocator.alloc(Expr, mc.args.len);
+                errdefer self.allocator.free(new_args);
+
+                for (mc.args, 0..) |*arg, i| {
+                    new_args[i] = try self.bindParameters(arg, params);
+                }
+
+                break :blk Expr{
+                    .method_call = .{
+                        .object = mc.object,
+                        .method = mc.method,
+                        .args = new_args,
+                    },
+                };
+            },
         };
     }
 

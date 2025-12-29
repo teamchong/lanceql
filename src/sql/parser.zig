@@ -417,7 +417,7 @@ pub const Parser = struct {
                 return Expr{ .value = ast.Value{ .parameter = param_idx } };
             },
 
-            // Identifiers (columns or function calls)
+            // Identifiers (columns, function calls, or method calls)
             .IDENTIFIER => {
                 const name = tok.lexeme;
                 self.advance();
@@ -427,7 +427,27 @@ pub const Parser = struct {
                     return try self.parseFunctionCall(name);
                 }
 
-                // Column reference
+                // Check for method call or qualified column: name.something
+                if (self.check(.DOT)) {
+                    self.advance(); // consume DOT
+                    const member_tok = try self.expect(.IDENTIFIER);
+                    const member_name = member_tok.lexeme;
+
+                    // Check if it's a method call: name.member()
+                    if (self.check(.LPAREN)) {
+                        return try self.parseMethodCall(name, member_name);
+                    }
+
+                    // Otherwise it's a qualified column reference: table.column
+                    return Expr{
+                        .column = .{
+                            .table = name,
+                            .name = member_name,
+                        },
+                    };
+                }
+
+                // Simple column reference
                 return Expr{
                     .column = .{
                         .table = null,
@@ -603,6 +623,34 @@ pub const Parser = struct {
                 .args = try args.toOwnedSlice(self.allocator),
                 .distinct = distinct,
                 .window = window,
+            },
+        };
+    }
+
+    /// Parse method call on a table alias (e.g., t.risk_score())
+    /// Used for @logic_table computed columns
+    fn parseMethodCall(self: *Self, object: []const u8, method: []const u8) anyerror!Expr {
+        _ = try self.expect(.LPAREN);
+
+        // Parse arguments
+        var args = std.ArrayList(Expr){};
+        errdefer args.deinit(self.allocator);
+
+        // Check for empty argument list
+        if (!self.check(.RPAREN)) {
+            while (true) {
+                try args.append(self.allocator, try self.parseExpr());
+                if (!self.match(&[_]TokenType{.COMMA})) break;
+            }
+        }
+
+        _ = try self.expect(.RPAREN);
+
+        return Expr{
+            .method_call = .{
+                .object = object,
+                .method = method,
+                .args = try args.toOwnedSlice(self.allocator),
             },
         };
     }
@@ -1125,4 +1173,63 @@ test "parse window function with multiple PARTITION BY columns" {
     try std.testing.expectEqual(@as(usize, 2), window.partition_by.?.len);
     try std.testing.expectEqualStrings("region", window.partition_by.?[0]);
     try std.testing.expectEqualStrings("category", window.partition_by.?[1]);
+}
+
+test "parse method call expression" {
+    const sql = "SELECT t.risk_score() FROM logic_table('fraud.py') AS t";
+    const allocator = std.testing.allocator;
+
+    const stmt = try parseSQL(sql, allocator);
+    try std.testing.expect(stmt == .select);
+    try std.testing.expectEqual(@as(usize, 1), stmt.select.columns.len);
+
+    // Verify it's a method call
+    const expr = stmt.select.columns[0].expr;
+    try std.testing.expect(expr == .method_call);
+    try std.testing.expectEqualStrings("t", expr.method_call.object);
+    try std.testing.expectEqualStrings("risk_score", expr.method_call.method);
+    try std.testing.expectEqual(@as(usize, 0), expr.method_call.args.len);
+}
+
+test "parse method call with arguments" {
+    const sql = "SELECT t.compute(100, 0.5) FROM table1 AS t";
+    const allocator = std.testing.allocator;
+
+    const stmt = try parseSQL(sql, allocator);
+    const expr = stmt.select.columns[0].expr;
+
+    try std.testing.expect(expr == .method_call);
+    try std.testing.expectEqualStrings("t", expr.method_call.object);
+    try std.testing.expectEqualStrings("compute", expr.method_call.method);
+    try std.testing.expectEqual(@as(usize, 2), expr.method_call.args.len);
+
+    // Check first argument
+    try std.testing.expect(expr.method_call.args[0] == .value);
+    try std.testing.expectEqual(@as(i64, 100), expr.method_call.args[0].value.integer);
+
+    // Check second argument
+    try std.testing.expect(expr.method_call.args[1] == .value);
+    try std.testing.expectEqual(@as(f64, 0.5), expr.method_call.args[1].value.float);
+}
+
+test "parse qualified column vs method call" {
+    const allocator = std.testing.allocator;
+
+    // Qualified column: table.column (no parentheses)
+    const sql1 = "SELECT t.name FROM table1 AS t";
+    const stmt1 = try parseSQL(sql1, allocator);
+    const expr1 = stmt1.select.columns[0].expr;
+
+    try std.testing.expect(expr1 == .column);
+    try std.testing.expectEqualStrings("t", expr1.column.table.?);
+    try std.testing.expectEqualStrings("name", expr1.column.name);
+
+    // Method call: table.method() (with parentheses)
+    const sql2 = "SELECT t.name() FROM table1 AS t";
+    const stmt2 = try parseSQL(sql2, allocator);
+    const expr2 = stmt2.select.columns[0].expr;
+
+    try std.testing.expect(expr2 == .method_call);
+    try std.testing.expectEqualStrings("t", expr2.method_call.object);
+    try std.testing.expectEqualStrings("name", expr2.method_call.method);
 }

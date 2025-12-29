@@ -56,15 +56,15 @@ Machines are more powerful now. A laptop can process millions of rows per second
 ┌─────────────────────────────────────────────────────────────────┐
 │  RUNTIME (production)                                           │
 │  ┌─────────────────────────────────────────────────────────┐    │
-│  │  Native execution only                                   │    │
-│  │  • No Python interpreter                                 │    │
-│  │  • No Python dependencies                                │    │
-│  │  • GPU/SIMD acceleration                                 │    │
+│  │  Native execution only                                  │    │
+│  │  • No CPython interpreter (Python semantics compiled)   │    │
+│  │  • No CPython/Python runtime dependencies               │    │
+│  │  • GPU/SIMD acceleration                                │    │
 │  └─────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-This is why `@logic_table` is 100-1000x faster than Python UDFs - there's simply no Python at runtime.
+This is why `@logic_table` can be 100–1000× faster than Python UDF-style execution in practice: there is **zero CPython/Python runtime at runtime** (no interpreter). We still preserve Python semantics by compiling them into native code, including a Python-compatible object model implemented in Zig where needed.
 
 ## @logic_table: The Solution
 
@@ -183,44 +183,63 @@ WHERE fraud.should_block() = false
 
 ## Key Difference from UDFs
 
-### Traditional UDF (Black Box)
+### Traditional UDF (Opaque, Limited Context)
 
 ```python
-# UDF is called for EACH ROW, no query context
+# UDF: opaque to optimizer, limited context
 def fraud_udf(amount, customer_id):
-    # Can't see WHERE clause
-    # Can't skip filtered rows
-    # Can't batch operations
+    # No query phase awareness
+    # No window/partition context
+    # No selectivity information
+    # No cross-method caching scope
     return calculate_score(amount, customer_id)
 ```
 
 ```sql
--- DuckDB/Polars: calls Python for EACH ROW
+-- DuckDB/Polars: treats UDF as opaque
+-- Limited pushdown/rewrite opportunities
 SELECT fraud_udf(amount, customer_id) FROM orders
--- 100μs+ overhead per row!
 ```
 
-### @logic_table (Query-Aware)
+**Note**: UDFs in SELECT won't run for rows filtered by WHERE (that's SQL semantics).
+The real limitation is: UDFs are **opaque** to the optimizer, have **weak pushdown**
+opportunities, and lack **rich query context** (predicates, selectivity, window specs, cache scope).
+
+### @logic_table (Query-Planned, Context-Aware)
 
 ```python
 @logic_table
 class FraudDetector:
     def risk_score(self):
         # Has access to QueryContext:
-        # - Which rows passed WHERE clause
-        # - Pushdown predicates
-        # - Can skip filtered rows
-        # - Batch operations
+        # - clause/phase (WHERE, SELECT, HAVING, ORDER BY, WINDOW)
+        # - window_spec (partition keys, order keys, frame bounds)
+        # - filtered_indices or selection mask
+        # - predicates for pushdown
+        # - selectivity for algorithm selection
+        # - result_cache with correct scope
         return self.amount_score() + self.customer_score()
 ```
 
 ```sql
--- LanceQL: compiled, runs ON data
+-- LanceQL: query-planned, fused with scan
 SELECT t.risk_score()
 FROM logic_table('fraud_detector.py') t
 WHERE amount > 1000
--- t.risk_score() only computed for rows where amount > 1000!
+-- Optimizer can fuse filter + projection
+-- Method runs batch-wise on surviving rows only
 ```
+
+### The Real Differences
+
+| Aspect | Traditional UDF | @logic_table |
+|--------|-----------------|--------------|
+| Optimizer visibility | Opaque black box | Query-planned, participates in optimization |
+| Pushdown | Weak/none | Full predicate pushdown |
+| Context | Row values only | Phase, window spec, selectivity, predicates |
+| Execution | Often row-wise | Batch vectorized (vectors + selection mask) |
+| Caching | None or manual | Automatic with correct scope (phase, window, snapshot) |
+| Rewrite | Cannot reorder/fuse | Optimizer can reorder, fuse, eliminate |
 
 ## Query Context Access
 
@@ -276,6 +295,86 @@ def smart_join(self, ctx: QueryContext):
         return self.merge_join()
 ```
 
+## Phase-Aware Execution
+
+Methods can be used in any SQL clause, but they must know which **phase** they're in for correctness.
+
+### Execution Phases
+
+| Phase | SQL Clause | When It Runs | Context Available |
+|-------|------------|--------------|-------------------|
+| `filter` | WHERE | Before aggregation | predicates, selectivity |
+| `projection` | SELECT | After filter | filtered_indices |
+| `group_filter` | HAVING | After aggregation | group keys, aggregates |
+| `ordering` | ORDER BY | After projection | sort requirements |
+| `window` | OVER(...) | Partition + frame | partition_keys, order_keys, frame_bounds |
+
+### QueryContext with Phase
+
+```zig
+pub const ExecutionPhase = enum {
+    filter,       // WHERE clause
+    projection,   // SELECT clause
+    group_filter, // HAVING clause
+    ordering,     // ORDER BY clause
+    window,       // OVER(PARTITION BY ... ORDER BY ... ROWS/RANGE ...)
+};
+
+pub const WindowSpec = struct {
+    partition_keys: []const []const u8,  // PARTITION BY columns
+    order_keys: []const OrderKey,        // ORDER BY columns + direction
+    frame_start: FrameBound,             // ROWS/RANGE start
+    frame_end: FrameBound,               // ROWS/RANGE end
+};
+
+pub const QueryContext = struct {
+    // Existing fields
+    total_rows: usize,
+    matched_rows: usize,
+    filtered_indices: ?[]const usize,
+    predicates: []const FilterPredicate,
+
+    // Phase-aware fields
+    phase: ExecutionPhase,
+    window_spec: ?WindowSpec,           // Only set when phase == .window
+    partition_id: ?usize,               // Current partition (for window)
+    partition_row_indices: ?[]const usize, // Rows in current partition
+};
+```
+
+### Why Phase Matters
+
+The same method can behave differently depending on phase:
+
+```python
+@logic_table
+class Metrics:
+    def score(self, ctx: QueryContext):
+        if ctx.phase == 'filter':
+            # Quick estimate for filtering
+            return self.quick_estimate()
+        elif ctx.phase == 'projection':
+            # Full computation for output
+            return self.full_calculation()
+        elif ctx.phase == 'window':
+            # Partition-aware computation
+            return self.partition_aggregate(ctx.partition_id)
+```
+
+### Cache Keys Must Include Phase
+
+```zig
+fn generateCacheKey(method: []const u8, ctx: *QueryContext) []u8 {
+    // Key must include phase to avoid incorrect reuse
+    return fmt("{s}:phase:{s}:window:{x}:snap:{d}",
+        method,
+        @tagName(ctx.phase),
+        hashWindowSpec(ctx.window_spec),
+        ctx.dataset_snapshot,
+    );
+}
+```
+
 ## Window Functions with @logic_table
 
 Methods can be used in PARTITION BY for parallel processing:
@@ -310,6 +409,142 @@ SELECT
 FROM logic_table('metrics.py') t
 GROUP BY t.time_bucket('1 hour')
 ```
+
+## ORDER BY and Window Execution Details
+
+### Top-Level ORDER BY
+
+When a method is used in ORDER BY:
+
+```sql
+SELECT amount, t.risk_score()
+FROM logic_table('fraud.py') t
+WHERE amount > 1000
+ORDER BY t.risk_score() DESC
+LIMIT 100
+```
+
+**Execution requirements**:
+1. Method output must be a **sortable vector** with defined type
+2. **Null ordering** must be specified (NULLS FIRST/LAST)
+3. **Stable tie behavior** must be deterministic
+4. For LIMIT, consider **Top-K optimization** (heap instead of full sort)
+
+```zig
+pub const OrderKey = struct {
+    column_or_method: []const u8,
+    ascending: bool,
+    nulls_first: bool,
+};
+
+/// ORDER BY execution
+fn executeOrderBy(
+    rows: []const usize,        // Filtered row indices
+    order_keys: []const OrderKey,
+    limit: ?usize,
+) []usize {
+    if (limit) |k| {
+        // Top-K: use heap, O(n log k)
+        return topK(rows, order_keys, k);
+    } else {
+        // Full sort: O(n log n)
+        return fullSort(rows, order_keys);
+    }
+}
+```
+
+### Window Function Execution
+
+Window functions require **partition + order + frame** context:
+
+```sql
+SELECT
+    order_id,
+    SUM(amount) OVER(
+        PARTITION BY t.risk_category()
+        ORDER BY t.risk_score() DESC
+        ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    )
+FROM logic_table('fraud.py') t
+```
+
+**Execution phases**:
+
+1. **Compute partition keys**: `t.risk_category()` for all rows
+2. **Group by partition**: Rows with same partition key
+3. **Order within partition**: By `t.risk_score() DESC`
+4. **Apply frame**: ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+5. **Compute aggregate**: SUM(amount) over frame
+
+```zig
+pub const FrameBound = union(enum) {
+    unbounded_preceding,
+    preceding: usize,    // N PRECEDING
+    current_row,
+    following: usize,    // N FOLLOWING
+    unbounded_following,
+};
+
+pub const WindowFrame = struct {
+    mode: enum { rows, range, groups },
+    start: FrameBound,
+    end: FrameBound,
+};
+
+/// Window execution context
+pub const WindowContext = struct {
+    partition_id: usize,
+    partition_start: usize,          // Start index in sorted order
+    partition_end: usize,            // End index in sorted order
+    current_row: usize,              // Current row within partition
+    frame: WindowFrame,
+
+    /// Get rows in current frame
+    pub fn getFrameRows(self: *const WindowContext) []const usize {
+        const start = switch (self.frame.start) {
+            .current_row => self.current_row,
+            .preceding => |n| @max(self.partition_start, self.current_row -| n),
+            .unbounded_preceding => self.partition_start,
+            // ...
+        };
+        const end = switch (self.frame.end) {
+            .current_row => self.current_row + 1,
+            .following => |n| @min(self.partition_end, self.current_row + n + 1),
+            .unbounded_following => self.partition_end,
+            // ...
+        };
+        return self.sorted_indices[start..end];
+    }
+};
+```
+
+### Batch Execution for Windows
+
+Methods in window context run **per-partition batches**, not per-row:
+
+```zig
+/// Execute window function with batch method
+fn executeWindowFunction(
+    partitions: []const Partition,
+    method: BatchMethodFn,
+    aggregate: AggregateFn,
+    frame: WindowFrame,
+    out: []f64,
+) void {
+    for (partitions) |partition| {
+        // Compute method for entire partition (batch)
+        const method_results = method(partition.rows, ...);
+
+        // Apply frame and aggregate
+        for (partition.rows, 0..) |_, row_idx| {
+            const frame_rows = getFrameRows(partition, row_idx, frame);
+            out[row_idx] = aggregate(method_results[frame_rows]);
+        }
+    }
+}
+```
+
+**Key insight**: The method computes once per partition, then the aggregate slides over the frame. This is much faster than computing the method for each frame position.
 
 ## Life Cycle
 
@@ -476,7 +711,7 @@ You need an external cache provider.
 
 ### Cache Provider Interface
 
-**Important**: Python code in `@logic_table` is **compile-time only**. metal0 transpiles Python to native Zig/WASM/GPU code. There is **zero Python at runtime**.
+**Important**: Python code in `@logic_table` is **compile-time only**. metal0 transpiles Python to native Zig/WASM/GPU code. There is **no CPython interpreter at runtime**.
 
 The cache provider is configured at the Zig level:
 
@@ -578,32 +813,198 @@ if (cached) {
 
 ### Cache Key Generation
 
-Cache keys include context to ensure correctness:
+Cache keys must include **all context that affects correctness**:
 
 ```zig
-/// Generate cache key including query context
+/// Generate cache key with full correctness scope
 fn generateCacheKey(
     allocator: std.mem.Allocator,
     method_name: []const u8,
     ctx: *const QueryContext,
 ) ![]u8 {
-    // Key format: "method:rows:N:matched:M:pred:HASH"
     var hasher = std.hash.Wyhash.init(0);
-    for (ctx.predicates) |pred| {
-        hasher.update(pred.column);
-        hasher.update(std.mem.asBytes(&@intFromEnum(pred.op)));
+
+    // 1. Method identity
+    hasher.update(method_name);
+
+    // 2. Execution phase (WHERE vs SELECT vs WINDOW behave differently)
+    hasher.update(@tagName(ctx.phase));
+
+    // 3. Selection identity (which rows)
+    if (ctx.filtered_indices) |indices| {
+        hasher.update(std.mem.sliceAsBytes(indices));
     }
-    const pred_hash = hasher.final();
+
+    // 4. Window spec (for window phase)
+    if (ctx.window_spec) |spec| {
+        for (spec.partition_keys) |key| hasher.update(key);
+        for (spec.order_keys) |key| {
+            hasher.update(key.column);
+            hasher.update(std.mem.asBytes(&key.ascending));
+        }
+        hasher.update(std.mem.asBytes(&spec.frame_start));
+        hasher.update(std.mem.asBytes(&spec.frame_end));
+    }
+
+    // 5. Dataset snapshot/version (Lance version + delete state)
+    hasher.update(std.mem.asBytes(&ctx.dataset_snapshot));
+    hasher.update(std.mem.asBytes(&ctx.fragment_id));
+    hasher.update(std.mem.asBytes(&ctx.delete_version));
 
     return std.fmt.allocPrint(allocator,
-        "{s}:rows:{d}:matched:{d}:pred:{x}",
-        .{ method_name, ctx.total_rows, ctx.matched_rows, pred_hash },
+        "{s}:{x}",
+        .{ method_name, hasher.final() },
     );
 }
+```
 
-// Example keys:
-// "risk_score:rows:100000:matched:1500:pred:a1b2c3d4"
-// "amount_score:rows:100000:matched:1500:pred:a1b2c3d4"
+**Critical**: Without snapshot/version in the key, you get "fast and wrong" results after deletes/updates/compaction.
+
+### The One Rule: Never Recompute
+
+The same method used in multiple places (SELECT + ORDER BY) must not recompute:
+
+```sql
+SELECT t.risk_score(), amount
+FROM logic_table('fraud.py') t
+ORDER BY t.risk_score() DESC
+```
+
+The cache ensures `risk_score()` computes once, reused for both SELECT output and ORDER BY sorting.
+
+## Batch Vectorized ABI
+
+Methods compile to batch operations, not row-by-row calls. This is the key to performance.
+
+### Method Input/Output Contract
+
+```zig
+/// Batch method signature - operates on vectors, not rows
+pub const BatchMethodFn = fn (
+    // Input columns (bound from Lance)
+    columns: *const ColumnBindings,
+
+    // Selection: which rows to process
+    selection: Selection,
+
+    // Output buffer (caller-allocated)
+    out: OutputBuffer,
+
+    // Query context for phase-aware behavior
+    ctx: *const QueryContext,
+) void;
+
+/// Selection can be indices or mask
+pub const Selection = union(enum) {
+    /// Indices array: [5, 12, 45, ...] - process only these rows
+    indices: []const usize,
+
+    /// Boolean mask: [false, false, true, ...] - process where true
+    mask: []const bool,
+
+    /// All rows (no filter)
+    all: usize, // total count
+};
+
+/// Output depends on clause
+pub const OutputBuffer = union(enum) {
+    /// For SELECT/ORDER BY: vector of computed values
+    vector_f64: []f64,
+    vector_i64: []i64,
+    vector_bool: []bool,
+
+    /// For WHERE/HAVING: boolean predicate result
+    predicate: []bool,
+};
+```
+
+### Why Both Indices and Mask?
+
+| Selection Type | Best For | Memory | Access Pattern |
+|----------------|----------|--------|----------------|
+| `indices` | Sparse selection (<10%) | O(matched) | Gather |
+| `mask` | Dense selection (>10%) | O(total) | Sequential scan |
+| `all` | No filter | O(1) | Sequential |
+
+The optimizer chooses based on selectivity:
+
+```zig
+fn chooseSelectionType(selectivity: f64) SelectionType {
+    if (selectivity < 0.1) return .indices;  // Sparse: use gather
+    if (selectivity < 0.9) return .mask;     // Medium: use mask
+    return .all;                              // Dense: process all
+}
+```
+
+### Generated Code Example
+
+Python:
+```python
+@logic_table
+class FraudDetector:
+    orders = Table('orders.lance')
+
+    def amount_score(self) -> float:
+        return min(1.0, self.orders.amount / 50000)
+```
+
+Compiles to:
+```zig
+/// Batch vectorized implementation
+pub fn amount_score_batch(
+    columns: *const ColumnBindings,
+    selection: Selection,
+    out: []f64,
+    ctx: *const QueryContext,
+) void {
+    const amount = columns.getF64("orders", "amount");
+
+    switch (selection) {
+        .indices => |indices| {
+            // Gather pattern: only process selected rows
+            for (indices, 0..) |row_idx, out_idx| {
+                out[out_idx] = @min(1.0, amount[row_idx] / 50000.0);
+            }
+        },
+        .mask => |mask| {
+            // Scan pattern: skip false entries
+            var out_idx: usize = 0;
+            for (mask, 0..) |selected, row_idx| {
+                if (selected) {
+                    out[out_idx] = @min(1.0, amount[row_idx] / 50000.0);
+                    out_idx += 1;
+                }
+            }
+        },
+        .all => |count| {
+            // SIMD pattern: process all rows
+            simd.vectorizedMinDiv(amount[0..count], 50000.0, 1.0, out);
+        },
+    }
+}
+```
+
+### GPU Dispatch Threshold
+
+```zig
+fn dispatchMethod(selection: Selection, ...) void {
+    const count = switch (selection) {
+        .indices => |i| i.len,
+        .mask => |m| countTrue(m),
+        .all => |n| n,
+    };
+
+    if (count >= 10_000 and metal.isGPUReady()) {
+        // GPU: large batches
+        metal.gpuDispatch(...);
+    } else if (count >= 16) {
+        // SIMD: medium batches
+        simd.vectorized(...);
+    } else {
+        // Scalar: small batches
+        scalar.loop(...);
+    }
+}
 ```
 
 ## Architecture
@@ -625,39 +1026,39 @@ SQL Query                                     Result
     │                                            ▲
     ▼                                            │
 ┌─────────────────────────────────────────────────────┐
-│ Parser: Identify logic_table() in FROM/JOIN        │
-│         Extract method calls (t.risk_score(), etc) │
+│ Parser: Identify logic_table() in FROM/JOIN         │
+│         Extract method calls (t.risk_score(), etc)  │
 └─────────────────────────────────────────────────────┘
     │
     ▼
 ┌─────────────────────────────────────────────────────┐
-│ Column Deps: Analyze which Table columns needed    │
-│   FraudDetector.risk_score() needs:                │
+│ Column Deps: Analyze which Table columns needed     │
+│   FraudDetector.risk_score() needs:                 │
 │   - orders.amount                                   │
-│   - customers.days_since_signup                    │
-│   - customers.previous_fraud                       │
+│   - customers.days_since_signup                     │
+│   - customers.previous_fraud                        │
 └─────────────────────────────────────────────────────┘
     │
     ▼
 ┌─────────────────────────────────────────────────────┐
-│ Load Data: Only load required columns              │
-│   ctx.bindF32("orders", "amount", [...])           │
-│   ctx.bindI64("customers", "days_since_signup")    │
+│ Load Data: Only load required columns               │
+│   ctx.bindF32("orders", "amount", [...])            │
+│   ctx.bindI64("customers", "days_since_signup")     │
 └─────────────────────────────────────────────────────┘
     │
     ▼
 ┌─────────────────────────────────────────────────────┐
-│ Execute WHERE: Get filtered indices                │
-│   Push predicates to QueryContext                  │
-│   filtered_indices = [5, 12, 45, ...]              │
+│ Execute WHERE: Get filtered indices                 │
+│   Push predicates to QueryContext                   │
+│   filtered_indices = [5, 12, 45, ...]               │
 └─────────────────────────────────────────────────────┘
     │
     ▼
 ┌─────────────────────────────────────────────────────┐
-│ Execute Methods: Run compiled @logic_table code    │
-│   - Only on filtered_indices (not all rows!)       │
-│   - GPU for 10K+ rows                              │
-│   - SIMD for smaller batches                       │
+│ Execute Methods: Run compiled @logic_table code     │
+│   - Only on filtered_indices (not all rows!)        │
+│   - GPU for 10K+ rows                               │
+│   - SIMD for smaller batches                        │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -705,8 +1106,8 @@ examples/python/
 | DuckDB → Python Batch | 1,805 | 18 | Pull then process |
 | Polars .map_elements() | 9,376 | 94 | Row-by-row Python calls |
 
-**Key insight**: @logic_table is 100-1000x faster than Python UDFs because:
-1. No Python interpreter overhead
+**Key insight**: @logic_table can be 100–1000× faster than Python UDF-style execution in these benchmarks because:
+1. Zero Python at runtime (compiled Zig/WASM/GPU code only)
 2. Only processes filtered rows (pushdown)
 3. GPU/SIMD acceleration
 4. No serialization/deserialization

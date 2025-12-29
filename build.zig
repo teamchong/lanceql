@@ -168,6 +168,15 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const sql_dispatch_mod = b.addModule("lanceql.sql.logic_table_dispatch", .{
+        .root_source_file = b.path("src/sql/logic_table_dispatch.zig"),
+        .imports = &.{
+            .{ .name = "ast", .module = sql_ast_mod },
+            .{ .name = "lanceql.logic_table", .module = logic_table_mod },
+        },
+    });
+    _ = sql_dispatch_mod; // Used in SQL tests and CLI
+
     const dataframe_mod = b.addModule("lanceql.dataframe", .{
         .root_source_file = b.path("src/dataframe.zig"),
         .imports = &.{
@@ -487,6 +496,21 @@ pub fn build(b: *std.Build) void {
     const run_bench_compiled = b.addRunArtifact(bench_compiled);
     const bench_compiled_step = b.step("bench-compiled-logic-table", "Benchmark compiled @logic_table (Python -> native via metal0)");
     bench_compiled_step.dependOn(&run_bench_compiled.step);
+
+    // @logic_table End-to-End benchmark - full pipeline with comparisons
+    const bench_logic_table_e2e = b.addExecutable(.{
+        .name = "bench_logic_table_e2e",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/bench_logic_table_e2e.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    // Link the compiled @logic_table static library
+    bench_logic_table_e2e.addObjectFile(b.path("lib/vector_ops.a"));
+    const run_bench_logic_table_e2e = b.addRunArtifact(bench_logic_table_e2e);
+    const bench_logic_table_e2e_step = b.step("bench-logic-table-e2e", "End-to-end @logic_table benchmark with DuckDB/Polars comparison");
+    bench_logic_table_e2e_step.dependOn(&run_bench_logic_table_e2e.step);
 
     // @logic_table Pushdown benchmark - demonstrates filtered_indices optimization
     const bench_pushdown = b.addExecutable(.{

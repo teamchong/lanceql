@@ -145,6 +145,12 @@ pub const ColumnDeps = struct {
             .cast => |c| {
                 try self.extractFromExpr(c.expr);
             },
+            .method_call => |mc| {
+                // Method calls (e.g., t.risk_score()) - extract from args
+                for (mc.args) |*arg| {
+                    try self.extractFromExpr(arg);
+                }
+            },
             .value => {}, // No column references in literals
         }
     }

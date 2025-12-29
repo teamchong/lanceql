@@ -27,6 +27,10 @@
 
 const std = @import("std");
 
+// Re-export executor module
+pub const executor = @import("executor.zig");
+pub const LogicTableExecutor = executor.LogicTableExecutor;
+
 /// LogicTable struct metadata - describes a compiled @logic_table class
 pub const LogicTableMeta = struct {
     name: []const u8,
