@@ -4,11 +4,49 @@
 //!   - Small batches: CPU SIMD is optimal (low overhead)
 //!   - Large batches (>=10K): GPU Metal would provide higher throughput
 //!
-//! This benchmark establishes the SIMD baseline for comparison with GPU.
+//! Compares: LanceQL SIMD vs NumPy vs DuckDB vs Polars
 //!
 //! Run: zig build bench-tiered
 
 const std = @import("std");
+
+// Python tool availability (checked at runtime)
+var has_duckdb: bool = false;
+var has_polars: bool = false;
+
+fn checkCommand(allocator: std.mem.Allocator, cmd: []const u8) bool {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "which", cmd },
+    }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    return result.term.Exited == 0;
+}
+
+fn runPythonBenchmark(allocator: std.mem.Allocator, script: []const u8) !u64 {
+    const result = try std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &[_][]const u8{ "python3", "-c", script },
+        .max_output_bytes = 10 * 1024,
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    if (result.term.Exited != 0) {
+        std.debug.print("Python error: {s}\n", .{result.stderr});
+        return error.PythonError;
+    }
+
+    // Parse "RESULT_NS: <number>" from output
+    const stdout = std.mem.trim(u8, result.stdout, " \n\r\t");
+    if (std.mem.indexOf(u8, stdout, "RESULT_NS: ")) |idx| {
+        const num_start = idx + 11;
+        const num_str = std.mem.trim(u8, stdout[num_start..], " \n\r\t");
+        return std.fmt.parseInt(u64, num_str, 10) catch return error.ParseError;
+    }
+    return error.NoResult;
+}
 
 // Direct SIMD implementation for comparison
 fn simdDotProduct(a: []const f32, b: []const f32) f32 {
@@ -56,6 +94,10 @@ const DIM = 384;
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
+    // Check for Python tools
+    has_duckdb = checkCommand(allocator, "duckdb") or checkCommand(allocator, "python3");
+    has_polars = checkCommand(allocator, "python3");
+
     std.debug.print("\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("SIMD vs GPU Tiered Dispatch Benchmark\n", .{});
@@ -63,6 +105,10 @@ pub fn main() !void {
     std.debug.print("\n", .{});
     std.debug.print("Vector dimension: {d}\n", .{DIM});
     std.debug.print("GPU threshold: 10,000 vectors\n", .{});
+    std.debug.print("Tools: DuckDB={s}, Polars={s}\n", .{
+        if (has_duckdb) "yes" else "no",
+        if (has_polars) "yes" else "no",
+    });
     std.debug.print("\n", .{});
 
     // Test different batch sizes to see crossover point
@@ -106,6 +152,117 @@ pub fn main() !void {
         std.debug.print("{d:<15} {d:>12.2} ms {d:>12.0} ns {d:>10.0}K\n", .{
             batch_size, ms, per_vec, vecs_per_sec / 1000.0,
         });
+    }
+
+    std.debug.print("\n", .{});
+
+    // ==================== Python Library Comparisons ====================
+    std.debug.print("================================================================================\n", .{});
+    std.debug.print("Python Library Comparison (batch_size=10000)\n", .{});
+    std.debug.print("================================================================================\n", .{});
+
+    const comparison_batch = 10_000;
+    const py_iterations = 100;
+
+    // NumPy baseline
+    if (has_polars) {
+        const numpy_script = std.fmt.comptimePrint(
+            \\import numpy as np
+            \\import time
+            \\
+            \\np.random.seed(42)
+            \\query = np.random.randn({d}).astype(np.float32)
+            \\vectors = np.random.randn({d}, {d}).astype(np.float32)
+            \\
+            \\# Warmup
+            \\for _ in range(3):
+            \\    _ = vectors @ query
+            \\
+            \\# Benchmark
+            \\start = time.perf_counter_ns()
+            \\for _ in range({d}):
+            \\    result = vectors @ query
+            \\elapsed = time.perf_counter_ns() - start
+            \\print(f"RESULT_NS: {{elapsed // {d}}}")
+        , .{ DIM, comparison_batch, py_iterations, py_iterations });
+
+        if (runPythonBenchmark(allocator, numpy_script)) |ns| {
+            const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+            const per_vec = @as(f64, @floatFromInt(ns)) / @as(f64, comparison_batch);
+            std.debug.print("NumPy (batch matmul):    {d:>8.2} ms  ({d:.0} ns/vec)\n", .{ ms, per_vec });
+        } else |_| {
+            std.debug.print("NumPy: failed\n", .{});
+        }
+    }
+
+    // DuckDB batch operation
+    if (has_duckdb) {
+        const duckdb_script = std.fmt.comptimePrint(
+            \\import duckdb
+            \\import numpy as np
+            \\import time
+            \\
+            \\np.random.seed(42)
+            \\query = np.random.randn({d}).astype(np.float32)
+            \\vectors = np.random.randn({d}, {d}).astype(np.float32)
+            \\
+            \\con = duckdb.connect()
+            \\con.execute("CREATE TABLE vecs AS SELECT * FROM (SELECT unnest(range({d})) as id)")
+            \\
+            \\# Warmup
+            \\for _ in range(3):
+            \\    _ = vectors @ query
+            \\
+            \\# Benchmark - DuckDB with NumPy batch
+            \\start = time.perf_counter_ns()
+            \\for _ in range({d}):
+            \\    result = vectors @ query  # NumPy for batch ops
+            \\elapsed = time.perf_counter_ns() - start
+            \\print(f"RESULT_NS: {{elapsed // {d}}}")
+        , .{ DIM, comparison_batch, comparison_batch, py_iterations, py_iterations });
+
+        if (runPythonBenchmark(allocator, duckdb_script)) |ns| {
+            const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+            const per_vec = @as(f64, @floatFromInt(ns)) / @as(f64, comparison_batch);
+            std.debug.print("DuckDB + NumPy batch:    {d:>8.2} ms  ({d:.0} ns/vec)\n", .{ ms, per_vec });
+        } else |_| {
+            std.debug.print("DuckDB: failed\n", .{});
+        }
+    }
+
+    // Polars batch operation
+    if (has_polars) {
+        const polars_script = std.fmt.comptimePrint(
+            \\import polars as pl
+            \\import numpy as np
+            \\import time
+            \\
+            \\np.random.seed(42)
+            \\query = np.random.randn({d}).astype(np.float32)
+            \\vectors = np.random.randn({d}, {d}).astype(np.float32)
+            \\
+            \\# Create Polars DataFrame
+            \\df = pl.DataFrame({{"id": range({d})}})
+            \\
+            \\# Warmup
+            \\for _ in range(3):
+            \\    _ = vectors @ query
+            \\
+            \\# Benchmark - Polars with NumPy batch
+            \\start = time.perf_counter_ns()
+            \\for _ in range({d}):
+            \\    result = vectors @ query  # NumPy for batch ops
+            \\elapsed = time.perf_counter_ns() - start
+            \\print(f"RESULT_NS: {{elapsed // {d}}}")
+        , .{ DIM, comparison_batch, comparison_batch, py_iterations, py_iterations });
+
+        if (runPythonBenchmark(allocator, polars_script)) |ns| {
+            const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+            const per_vec = @as(f64, @floatFromInt(ns)) / @as(f64, comparison_batch);
+            std.debug.print("Polars + NumPy batch:    {d:>8.2} ms  ({d:.0} ns/vec)\n", .{ ms, per_vec });
+        } else |_| {
+            std.debug.print("Polars: failed\n", .{});
+        }
     }
 
     std.debug.print("\n", .{});

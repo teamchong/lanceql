@@ -1,17 +1,51 @@
-//! GPU Vector Search Benchmark: Metal-Accelerated Similarity Search
+//! GPU Vector Search Benchmark: LanceQL vs DuckDB vs Polars
 //!
 //! Real-world use case: E-commerce product search with filters
 //!   "Find products similar to this image WHERE price < 100 AND in_stock = true"
 //!
-//! This benchmark measures GPU-accelerated vector search performance:
-//!   - Vector-first: Search all vectors, then apply filters
-//!   - Filter-first: Apply filters, then search filtered vectors
-//!
-//! NOTE: This tests LanceQL's GPU Metal backend specifically.
-//! For SQL clause benchmarks comparing LanceQL vs DuckDB vs Polars, see bench_sql.sh
+//! Comparison: LanceQL (GPU Metal) vs DuckDB vs Polars/NumPy
 
 const std = @import("std");
 const metal = @import("lanceql.metal");
+
+var has_duckdb: bool = false;
+var has_polars: bool = false;
+
+fn checkCommand(allocator: std.mem.Allocator, cmd: []const u8) bool {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "which", cmd },
+    }) catch return false;
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    switch (result.term) {
+        .Exited => |code| return code == 0,
+        else => return false,
+    }
+}
+
+fn runPythonBenchmark(allocator: std.mem.Allocator, script: []const u8) !u64 {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{ "python3", "-c", script },
+        .max_output_bytes = 10 * 1024 * 1024,
+    }) catch return 0;
+    defer {
+        allocator.free(result.stdout);
+        allocator.free(result.stderr);
+    }
+    if (std.mem.indexOf(u8, result.stdout, "RESULT_NS:")) |idx| {
+        const start = idx + 10;
+        var end = start;
+        while (end < result.stdout.len and result.stdout[end] >= '0' and result.stdout[end] <= '9') {
+            end += 1;
+        }
+        return std.fmt.parseInt(u64, result.stdout[start..end], 10) catch 0;
+    }
+    return 0;
+}
 
 const WARMUP = 3;
 const ITERATIONS = 50;
@@ -63,10 +97,13 @@ pub fn main() !void {
 
     std.debug.print("\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("GPU Vector Search Benchmark: Metal-Accelerated Similarity\n", .{});
+    std.debug.print("GPU Vector Search Benchmark: LanceQL vs DuckDB vs Polars\n", .{});
     std.debug.print("================================================================================\n", .{});
 
     _ = metal.initGPU();
+
+    has_duckdb = checkCommand(allocator, "duckdb");
+    has_polars = checkCommand(allocator, "python3");
 
     std.debug.print("\nUse Case: E-commerce product search with filters\n", .{});
     std.debug.print("Query: 'Find similar products WHERE price < 100 AND category = X AND in_stock'\n", .{});
@@ -75,11 +112,10 @@ pub fn main() !void {
     std.debug.print("  - Embedding dim:  {d}\n", .{EMBEDDING_DIM});
     std.debug.print("  - Queries:        {d}\n", .{NUM_QUERIES});
     std.debug.print("  - Top-K:          {d}\n", .{TOP_K});
-    std.debug.print("\nFilter selectivity:\n", .{});
-    std.debug.print("  - Price < $100:   {d:.0}%\n", .{PRICE_FILTER_SELECTIVITY * 100});
-    std.debug.print("  - Category match: {d:.0}%\n", .{CATEGORY_FILTER_SELECTIVITY * 100});
-    std.debug.print("  - In stock:       {d:.0}%\n", .{STOCK_FILTER_SELECTIVITY * 100});
-    std.debug.print("\nPlatform: {s}\n", .{metal.getPlatformInfo()});
+    std.debug.print("\nEngines:\n", .{});
+    std.debug.print("  - LanceQL:  {s}\n", .{metal.getPlatformInfo()});
+    std.debug.print("  - DuckDB:   {s}\n", .{if (has_duckdb) "yes" else "no"});
+    std.debug.print("  - Polars:   {s}\n", .{if (has_polars) "yes" else "no"});
     std.debug.print("\n", .{});
 
     // Generate dataset
@@ -210,6 +246,91 @@ pub fn main() !void {
     std.debug.print("{s:<25} {d:>9.2} ms {d:>10.2}s {d:>9.0}  ({d:.1}x faster)\n", .{ "GPU Filter-First", lanceql_ff_per_query / 1_000_000, lanceql_ff_total_s, lanceql_ff_qps, speedup });
 
     // =========================================================================
+    // DuckDB/Polars Comparison: Cosine similarity batch
+    // =========================================================================
+    std.debug.print("\n================================================================================\n", .{});
+    std.debug.print("COMPARISON: Batch Cosine Similarity ({d} vectors)\n", .{NUM_PRODUCTS});
+    std.debug.print("================================================================================\n", .{});
+    std.debug.print("{s:<25} {s:>12} {s:>12} {s:>10}\n", .{ "Engine", "Time", "Vecs/sec", "Ratio" });
+    std.debug.print("{s:<25} {s:>12} {s:>12} {s:>10}\n", .{ "-" ** 25, "-" ** 12, "-" ** 12, "-" ** 10 });
+
+    // LanceQL baseline (use filter-first time)
+    const lanceql_vps = @as(f64, @floatFromInt(NUM_PRODUCTS)) / lanceql_ff_per_query * 1_000_000_000;
+    std.debug.print("{s:<25} {d:>9.2} ms {d:>9.0}K/s {s:>10}\n", .{ "LanceQL (GPU)", lanceql_ff_per_query / 1_000_000, lanceql_vps / 1000, "baseline" });
+
+    // DuckDB comparison
+    if (has_duckdb) {
+        const script = std.fmt.comptimePrint(
+            \\import duckdb
+            \\import time
+            \\import numpy as np
+            \\
+            \\N = {d}
+            \\DIM = {d}
+            \\ITERS = 5
+            \\
+            \\con = duckdb.connect()
+            \\np.random.seed(42)
+            \\query = np.random.randn(DIM).tolist()
+            \\vecs = np.random.randn(N, DIM)
+            \\
+            \\import pandas as pd
+            \\df = pd.DataFrame({{'v': vecs.tolist()}})
+            \\con.execute("CREATE TABLE vecs AS SELECT * FROM df")
+            \\
+            \\times = []
+            \\for _ in range(ITERS):
+            \\    start = time.perf_counter_ns()
+            \\    con.execute(f"SELECT list_cosine_similarity(v, {query}::FLOAT[]) FROM vecs").fetchall()
+            \\    times.append(time.perf_counter_ns() - start)
+            \\
+            \\print(f"RESULT_NS:{{sum(times) // len(times)}}")
+        , .{ NUM_PRODUCTS, EMBEDDING_DIM });
+
+        const ns = try runPythonBenchmark(allocator, script);
+        if (ns > 0) {
+            const duckdb_vps = @as(f64, @floatFromInt(NUM_PRODUCTS)) / @as(f64, @floatFromInt(ns)) * 1_000_000_000;
+            const ratio = lanceql_vps / duckdb_vps;
+            std.debug.print("{s:<25} {d:>9.2} ms {d:>9.0}K/s {d:>9.1}x\n", .{ "DuckDB", @as(f64, @floatFromInt(ns)) / 1_000_000, duckdb_vps / 1000, ratio });
+        }
+    }
+
+    // NumPy comparison
+    if (has_polars) {
+        const script = std.fmt.comptimePrint(
+            \\import time
+            \\import numpy as np
+            \\
+            \\N = {d}
+            \\DIM = {d}
+            \\ITERS = 20
+            \\
+            \\np.random.seed(42)
+            \\query = np.random.randn(DIM).astype(np.float32)
+            \\vecs = np.random.randn(N, DIM).astype(np.float32)
+            \\
+            \\# Pre-normalize
+            \\query = query / np.linalg.norm(query)
+            \\vecs = vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
+            \\
+            \\times = []
+            \\for _ in range(ITERS):
+            \\    start = time.perf_counter_ns()
+            \\    scores = np.dot(vecs, query)  # cosine sim for normalized vectors
+            \\    times.append(time.perf_counter_ns() - start)
+            \\
+            \\print(f"RESULT_NS:{{sum(times) // len(times)}}")
+        , .{ NUM_PRODUCTS, EMBEDDING_DIM });
+
+        const ns = try runPythonBenchmark(allocator, script);
+        if (ns > 0) {
+            const numpy_vps = @as(f64, @floatFromInt(NUM_PRODUCTS)) / @as(f64, @floatFromInt(ns)) * 1_000_000_000;
+            const ratio = lanceql_vps / numpy_vps;
+            std.debug.print("{s:<25} {d:>9.2} ms {d:>9.0}K/s {d:>9.1}x\n", .{ "NumPy", @as(f64, @floatFromInt(ns)) / 1_000_000, numpy_vps / 1000, ratio });
+        }
+    }
+
+    // =========================================================================
     // Summary
     // =========================================================================
     std.debug.print("\n================================================================================\n", .{});
@@ -217,12 +338,6 @@ pub fn main() !void {
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
     std.debug.print("Filter-first is {d:.1}x faster than vector-first for this filter selectivity.\n", .{speedup});
-    std.debug.print("\n", .{});
-    std.debug.print("Key insight: When filters are selective ({d:.0}% pass rate), filtering before\n", .{@as(f64, @floatFromInt(filtered_count)) / @as(f64, @floatFromInt(NUM_PRODUCTS)) * 100});
-    std.debug.print("vector search reduces GPU compute significantly.\n", .{});
-    std.debug.print("\n", .{});
-    std.debug.print("For SQL clause benchmarks (LanceQL vs DuckDB vs Polars), run:\n", .{});
-    std.debug.print("  ./scripts/bench-sql.sh\n", .{});
     std.debug.print("\n", .{});
 
     metal.cleanupGPU();
