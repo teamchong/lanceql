@@ -222,7 +222,52 @@ pub fn main() !void {
         }
     }
 
-    // 4. Polars with pre-loaded DataFrame (fair - data already loaded)
+    // 4. DuckDB + NumPy batch (fetch to Python, compute with NumPy)
+    if (has_duckdb) {
+        const script = std.fmt.comptimePrint(
+            \\import duckdb
+            \\import time
+            \\import numpy as np
+            \\import pandas as pd
+            \\
+            \\BATCH_SIZE = {d}
+            \\DIM = {d}
+            \\ITERATIONS = {d}
+            \\
+            \\con = duckdb.connect()
+            \\
+            \\# Setup: Load data into DuckDB ONCE (not timed)
+            \\np.random.seed(42)
+            \\vec_a = np.random.randn(BATCH_SIZE, DIM)
+            \\vec_b = np.random.randn(BATCH_SIZE, DIM)
+            \\df = pd.DataFrame({{'a': vec_a.tolist(), 'b': vec_b.tolist()}})
+            \\con.execute("CREATE TABLE vectors AS SELECT * FROM df")
+            \\
+            \\# Benchmark: Fetch + NumPy compute
+            \\times = []
+            \\for _ in range(ITERATIONS):
+            \\    start = time.perf_counter_ns()
+            \\    data = con.execute("SELECT * FROM vectors").fetchnumpy()
+            \\    a_arr = np.array([np.array(x) for x in data['a']])
+            \\    b_arr = np.array([np.array(x) for x in data['b']])
+            \\    results = np.einsum('ij,ij->i', a_arr, b_arr)
+            \\    times.append(time.perf_counter_ns() - start)
+            \\
+            \\print(f"RESULT_NS:{{sum(times) // len(times)}}")
+        , .{ BATCH_SIZE, DIM, ITERATIONS });
+
+        const ns = try runPythonBenchmark(allocator, script);
+        if (ns > 0) {
+            const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+            const per_vec = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(BATCH_SIZE));
+            const speedup = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(logic_table_ns));
+            std.debug.print("{s:<35} {d:>9.2} ms {d:>9.0} ns {d:>9.1}x\n", .{
+                "DuckDB + NumPy batch", ms, per_vec, speedup,
+            });
+        }
+    }
+
+    // 5. Polars Python UDF (pre-loaded DataFrame)
     if (has_polars) {
         const script = std.fmt.comptimePrint(
             \\import polars as pl
@@ -261,7 +306,47 @@ pub fn main() !void {
             const per_vec = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(BATCH_SIZE));
             const speedup = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(logic_table_ns));
             std.debug.print("{s:<35} {d:>9.2} ms {d:>9.0} ns {d:>9.0}x\n", .{
-                "Polars Python UDF (pre-loaded)", ms, per_vec, speedup,
+                "Polars Python UDF", ms, per_vec, speedup,
+            });
+        }
+    }
+
+    // 6. Polars + NumPy batch (fetch to Python, compute with NumPy)
+    if (has_polars) {
+        const script = std.fmt.comptimePrint(
+            \\import polars as pl
+            \\import time
+            \\import numpy as np
+            \\
+            \\BATCH_SIZE = {d}
+            \\DIM = {d}
+            \\ITERATIONS = {d}
+            \\
+            \\# Setup: Load data ONCE (not timed)
+            \\np.random.seed(42)
+            \\vec_a = np.random.randn(BATCH_SIZE, DIM)
+            \\vec_b = np.random.randn(BATCH_SIZE, DIM)
+            \\df = pl.DataFrame({{'a': vec_a.tolist(), 'b': vec_b.tolist()}})
+            \\
+            \\# Benchmark: Fetch + NumPy compute
+            \\times = []
+            \\for _ in range(ITERATIONS):
+            \\    start = time.perf_counter_ns()
+            \\    a_arr = np.array([np.array(x) for x in df['a'].to_list()])
+            \\    b_arr = np.array([np.array(x) for x in df['b'].to_list()])
+            \\    results = np.einsum('ij,ij->i', a_arr, b_arr)
+            \\    times.append(time.perf_counter_ns() - start)
+            \\
+            \\print(f"RESULT_NS:{{sum(times) // len(times)}}")
+        , .{ BATCH_SIZE, DIM, ITERATIONS });
+
+        const ns = try runPythonBenchmark(allocator, script);
+        if (ns > 0) {
+            const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+            const per_vec = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(BATCH_SIZE));
+            const speedup = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(logic_table_ns));
+            std.debug.print("{s:<35} {d:>9.2} ms {d:>9.0} ns {d:>9.1}x\n", .{
+                "Polars + NumPy batch", ms, per_vec, speedup,
             });
         }
     }
