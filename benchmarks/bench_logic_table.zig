@@ -227,13 +227,14 @@ pub fn main() !void {
         });
     }
 
-    // 2. DuckDB Python UDF
+    // 2. DuckDB + Python loop (per-row Python calls on 384-dim embeddings)
     if (has_duckdb) duckdb_udf: {
         const script = std.fmt.comptimePrint(
             \\import duckdb
             \\import warnings
             \\warnings.filterwarnings("ignore")
             \\import time
+            \\import numpy as np
             \\
             \\BENCHMARK_SECONDS = {d}
             \\WARMUP_SECONDS = {d}
@@ -242,27 +243,36 @@ pub fn main() !void {
             \\con = duckdb.connect()
             \\con.execute("SET enable_progress_bar = false")
             \\
-            \\# Python UDF called per-row (slow due to interpreter overhead)
-            \\def compute_score(amount):
-            \\    return float(amount * 1.0)
+            \\query = np.full(384, 0.1, dtype=np.float32)
             \\
-            \\con.create_function('compute_score', compute_score, [float], float)
+            \\# Python function for 384-dim dot product (called per row)
+            \\def dot_product(embedding):
+            \\    result = 0.0
+            \\    for i in range(384):
+            \\        result += embedding[i] * query[i]
+            \\    return result
             \\
             \\# Warmup
             \\warmup_end = time.time() + WARMUP_SECONDS
             \\while time.time() < warmup_end:
-            \\    con.execute(f"SELECT SUM(compute_score(amount)) FROM read_parquet('{{PARQUET_PATH}}') LIMIT 100").fetchall()
+            \\    df = con.execute(f"SELECT embedding FROM read_parquet('{{PARQUET_PATH}}') LIMIT 100").fetch_arrow_table()
+            \\    embeddings = df['embedding'].to_pylist()
+            \\    for emb in embeddings:
+            \\        _ = dot_product(emb)
             \\
-            \\# Benchmark
+            \\# Benchmark: Read file + per-row Python function calls
             \\iterations = 0
             \\total_rows = 0
             \\start = time.time()
             \\benchmark_end = start + BENCHMARK_SECONDS
             \\while time.time() < benchmark_end:
-            \\    row_count = con.execute(f"SELECT COUNT(*) FROM read_parquet('{{PARQUET_PATH}}')").fetchone()[0]
-            \\    results = con.execute(f"SELECT SUM(compute_score(amount)) FROM read_parquet('{{PARQUET_PATH}}')").fetchall()
+            \\    df = con.execute(f"SELECT embedding FROM read_parquet('{{PARQUET_PATH}}')").fetch_arrow_table()
+            \\    embeddings = df['embedding'].to_pylist()
+            \\    total_score = 0.0
+            \\    for emb in embeddings:
+            \\        total_score += dot_product(emb)  # Per-row Python call
             \\    iterations += 1
-            \\    total_rows += row_count
+            \\    total_rows += len(embeddings)
             \\elapsed_ns = int((time.time() - start) * 1e9)
             \\
             \\print(f"ITERATIONS:{{iterations}}")
@@ -312,10 +322,10 @@ pub fn main() !void {
             var speedup_buf: [16]u8 = undefined;
             const speedup_str = std.fmt.bufPrint(&speedup_buf, "{d:.1}x", .{speedup}) catch "N/A";
             std.debug.print("{s:<35} {d:>12.0} {d:>12} {s:>10}\n", .{
-                "DuckDB Python UDF", throughput, iterations, speedup_str,
+                "DuckDB + Python loop", throughput, iterations, speedup_str,
             });
         } else {
-            std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "DuckDB Python UDF", "error", "-", "-" });
+            std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "DuckDB + Python loop", "error", "-", "-" });
         }
     }
 
@@ -341,15 +351,15 @@ pub fn main() !void {
             \\while time.time() < warmup_end:
             \\    df = con.execute(f"SELECT embedding FROM read_parquet('{{PARQUET_PATH}}') LIMIT 100").fetchdf()
             \\
-            \\# Benchmark
+            \\# Benchmark: Read file + batch NumPy matrix multiply
             \\iterations = 0
             \\total_rows = 0
             \\start = time.time()
             \\benchmark_end = start + BENCHMARK_SECONDS
             \\while time.time() < benchmark_end:
             \\    df = con.execute(f"SELECT embedding FROM read_parquet('{{PARQUET_PATH}}')").fetchdf()
-            \\    embeddings = np.vstack(df['embedding'].values)
-            \\    scores = embeddings @ query_vec
+            \\    embeddings = np.array(df['embedding'].tolist())  # More efficient than vstack
+            \\    scores = embeddings @ query_vec  # Vectorized SIMD dot product
             \\    iterations += 1
             \\    total_rows += len(df)
             \\elapsed_ns = int((time.time() - start) * 1e9)
@@ -412,7 +422,7 @@ pub fn main() !void {
         }
     }
 
-    // 4. Polars Python UDF
+    // 4. Polars + Python UDF (per-row Python calls on 384-dim embeddings)
     if (has_polars) polars_udf: {
         const script = std.fmt.comptimePrint(
             \\import warnings
@@ -500,12 +510,14 @@ pub fn main() !void {
             var speedup_buf: [16]u8 = undefined;
             const speedup_str = std.fmt.bufPrint(&speedup_buf, "{d:.1}x", .{speedup}) catch "N/A";
             std.debug.print("{s:<35} {d:>12.0} {d:>12} {s:>10}\n", .{
-                "Polars Python UDF", throughput, iterations, speedup_str,
+                "Polars + Python UDF", throughput, iterations, speedup_str,
             });
+        } else {
+            std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "Polars + Python UDF", "error", "-", "-" });
         }
     }
 
-    // 5. Polars → NumPy batch
+    // 5. Polars → NumPy batch (384-dim embeddings)
     if (has_polars) polars_numpy: {
         const script = std.fmt.comptimePrint(
             \\import warnings
@@ -525,15 +537,15 @@ pub fn main() !void {
             \\while time.time() < warmup_end:
             \\    df = pl.read_parquet(PARQUET_PATH).head(100)
             \\
-            \\# Benchmark
+            \\# Benchmark: Read file + batch NumPy matrix multiply
             \\iterations = 0
             \\total_rows = 0
             \\start = time.time()
             \\benchmark_end = start + BENCHMARK_SECONDS
             \\while time.time() < benchmark_end:
             \\    df = pl.read_parquet(PARQUET_PATH)
-            \\    embeddings = np.vstack(df['embedding'].to_list())
-            \\    scores = embeddings @ query_vec
+            \\    embeddings = np.array(df['embedding'].to_list())  # More efficient than vstack
+            \\    scores = embeddings @ query_vec  # Vectorized SIMD dot product
             \\    iterations += 1
             \\    total_rows += len(df)
             \\elapsed_ns = int((time.time() - start) * 1e9)

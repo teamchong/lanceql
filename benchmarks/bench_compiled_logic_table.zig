@@ -1,11 +1,11 @@
 //! Compiled @logic_table Benchmark - End-to-End Comparison
 //!
 //! HONEST benchmark measuring the FULL pipeline from cold start:
-//!   1. LanceQL @logic_table  - Read Lance file → compute with compiled Python
-//!   2. DuckDB Python UDF     - Read Parquet → SQL with per-row Python UDF
-//!   3. DuckDB → NumPy batch  - Read Parquet → pull to Python → NumPy compute
-//!   4. Polars Python UDF     - Read Parquet → row-by-row Python calls
-//!   5. Polars → NumPy batch  - Read Parquet → pull to Python → NumPy compute
+//!   1. LanceQL @logic_table  - Read Lance → compute with compiled extern function
+//!   2. DuckDB + Python loop  - Read Parquet → per-row Python function calls
+//!   3. DuckDB → NumPy batch  - Read Parquet → NumPy vectorized dot product
+//!   4. Polars + Python loop  - Read Parquet → per-row Python function calls
+//!   5. Polars → NumPy batch  - Read Parquet → NumPy vectorized dot product
 //!
 //! FAIR COMPARISON:
 //!   - All methods read REAL data from disk (Lance or Parquet files)
@@ -199,7 +199,7 @@ pub fn main() !void {
     }
 
     // =========================================================================
-    // DuckDB Python UDF - Read Parquet, compute with per-row Python UDF
+    // DuckDB + Python loop - Read Parquet, per-row Python function calls
     // =========================================================================
     if (has_duckdb) duckdb_udf: {
         const py_script = std.fmt.comptimePrint(
@@ -210,31 +210,31 @@ pub fn main() !void {
             \\WARMUP_SECONDS = {d}
             \\BENCHMARK_SECONDS = {d}
             \\
-            \\# Create connection and register Python UDF
             \\con = duckdb.connect()
             \\con.execute("SET enable_progress_bar = false")
             \\
-            \\# Python UDF that gets called per-row (slow due to interpreter overhead)
-            \\def dot_product_udf(amount):
-            \\    return float(amount * 1.0)  # Simple multiply with query=1.0
-            \\
-            \\con.create_function('dot_udf', dot_product_udf, [float], float)
+            \\# Python function called per-row (slow due to interpreter overhead)
+            \\def multiply_by_one(amount):
+            \\    return float(amount * 1.0)
             \\
             \\# Warmup
             \\warmup_end = time.time() + WARMUP_SECONDS
             \\while time.time() < warmup_end:
-            \\    result = con.execute("SELECT SUM(dot_udf(amount)) FROM read_parquet('{s}')").fetchone()
+            \\    amounts = con.execute("SELECT amount FROM read_parquet('{s}') LIMIT 100").fetchnumpy()['amount']
+            \\    for a in amounts:
+            \\        _ = multiply_by_one(a)
             \\
-            \\# Benchmark
+            \\# Benchmark: Per-row Python function calls (shows interpreter overhead)
             \\iterations = 0
             \\total_rows = 0
             \\start = time.time()
             \\benchmark_end = start + BENCHMARK_SECONDS
             \\while time.time() < benchmark_end:
-            \\    result = con.execute("SELECT SUM(dot_udf(amount)) FROM read_parquet('{s}')").fetchone()
-            \\    # Count rows by checking table size
-            \\    row_count = con.execute("SELECT COUNT(*) FROM read_parquet('{s}')").fetchone()[0]
-            \\    total_rows += row_count
+            \\    amounts = con.execute("SELECT amount FROM read_parquet('{s}')").fetchnumpy()['amount']
+            \\    total = 0.0
+            \\    for a in amounts:
+            \\        total += multiply_by_one(a)  # Per-row Python call
+            \\    total_rows += len(amounts)
             \\    iterations += 1
             \\
             \\con.close()
@@ -242,7 +242,7 @@ pub fn main() !void {
             \\rows_per_sec = total_rows / elapsed
             \\print(f"ROWS_PER_SEC:{{rows_per_sec:.0f}}")
             \\print(f"ITERATIONS:{{iterations}}")
-        , .{ WARMUP_SECONDS, BENCHMARK_SECONDS, PARQUET_PATH, PARQUET_PATH, PARQUET_PATH });
+        , .{ WARMUP_SECONDS, BENCHMARK_SECONDS, PARQUET_PATH, PARQUET_PATH });
 
         const result = std.process.Child.run(.{
             .allocator = allocator,
@@ -271,13 +271,13 @@ pub fn main() !void {
         if (rows_per_sec > 0) {
             const speedup = lanceql_rows_per_sec / rows_per_sec;
             std.debug.print("{s:<40} {d:>10.0}K {d:>12} {d:>9.1}x\n", .{
-                "DuckDB Python UDF",
+                "DuckDB + Python loop",
                 rows_per_sec / 1000.0,
                 iterations,
                 speedup,
             });
         } else {
-            std.debug.print("{s:<40} {s:>12} {s:>12} {s:>10}\n", .{ "DuckDB Python UDF", "error", "-", "-" });
+            std.debug.print("{s:<40} {s:>12} {s:>12} {s:>10}\n", .{ "DuckDB + Python loop", "error", "-", "-" });
         }
     }
 
@@ -362,7 +362,7 @@ pub fn main() !void {
     }
 
     // =========================================================================
-    // Polars Python UDF - Row-by-row (slow baseline)
+    // Polars + Python loop - Read Parquet, per-row Python function calls
     // =========================================================================
     if (has_polars) polars_udf: {
         const py_script = std.fmt.comptimePrint(
@@ -374,24 +374,30 @@ pub fn main() !void {
             \\WARMUP_SECONDS = {d}
             \\BENCHMARK_SECONDS = {d}
             \\
-            \\def dot_with_ones(val):
-            \\    return val * 1.0  # Multiply by 1 (unit query)
+            \\# Python function called per-row (slow due to interpreter overhead)
+            \\def multiply_by_one(amount):
+            \\    return float(amount * 1.0)
             \\
             \\# Warmup
             \\warmup_end = time.time() + WARMUP_SECONDS
             \\while time.time() < warmup_end:
             \\    df = pl.read_parquet("{s}")
-            \\    result = df.select(pl.col("amount").map_elements(dot_with_ones, return_dtype=pl.Float64).sum())
+            \\    amounts = df["amount"].to_list()
+            \\    for a in amounts[:100]:
+            \\        _ = multiply_by_one(a)
             \\
-            \\# Benchmark
+            \\# Benchmark: Per-row Python function calls (shows interpreter overhead)
             \\iterations = 0
             \\total_rows = 0
             \\start = time.time()
             \\benchmark_end = start + BENCHMARK_SECONDS
             \\while time.time() < benchmark_end:
             \\    df = pl.read_parquet("{s}")
-            \\    result = df.select(pl.col("amount").map_elements(dot_with_ones, return_dtype=pl.Float64).sum())
-            \\    total_rows += len(df)
+            \\    amounts = df["amount"].to_list()
+            \\    total = 0.0
+            \\    for a in amounts:
+            \\        total += multiply_by_one(a)  # Per-row Python call
+            \\    total_rows += len(amounts)
             \\    iterations += 1
             \\
             \\elapsed = time.time() - start
@@ -427,13 +433,13 @@ pub fn main() !void {
         if (rows_per_sec > 0) {
             const speedup = lanceql_rows_per_sec / rows_per_sec;
             std.debug.print("{s:<40} {d:>10.0}K {d:>12} {d:>9.1}x\n", .{
-                "Polars Python UDF",
+                "Polars + Python loop",
                 rows_per_sec / 1000.0,
                 iterations,
                 speedup,
             });
         } else {
-            std.debug.print("{s:<40} {s:>12} {s:>12} {s:>10}\n", .{ "Polars Python UDF", "error", "-", "-" });
+            std.debug.print("{s:<40} {s:>12} {s:>12} {s:>10}\n", .{ "Polars + Python loop", "error", "-", "-" });
         }
     }
 
