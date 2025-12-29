@@ -1,10 +1,17 @@
-//! Benchmark: End-to-End Vector Computation
+//! Benchmark: Compiled Python @logic_table vs Native Libraries
 //!
-//! HONEST COMPARISON measuring real workflow:
-//!   Open file → Read columns → Compute dot products → Return results
+//! HONEST COMPARISON - what this actually benchmarks:
+//!   - @logic_table: REAL Python for loops compiled to Zig by metal0
+//!   - NumPy einsum: Optimized C/Fortran batch operations
+//!   - DuckDB/Polars UDF: Python callback per row
+//!   - DuckDB/Polars batch: Fetch to Python, compute with NumPy
 //!
-//! All methods run the SAME number of iterations with SAME conditions.
-//! This measures what users actually experience, not synthetic micro-benchmarks.
+//! The @logic_table code is ACTUAL compiled Python:
+//!   for i in range(len(a)):
+//!       result = result + a[i] * b[i]
+//!
+//! Metal0 compiles this to Zig with runtime dispatch (not SIMD).
+//! This is an honest comparison of compiled Python vs native libraries.
 //!
 //! Workflow:
 //!   1. Compile Python: metal0 build --emit-logic-table benchmarks/vector_ops.py -o lib/vector_ops.a
@@ -353,15 +360,14 @@ pub fn main() !void {
 
     std.debug.print("\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("INTERPRETATION:\n", .{});
+    std.debug.print("HONEST INTERPRETATION:\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("  @logic_table advantage: Pre-compiled SIMD code, no Python interpreter overhead\n", .{});
-    std.debug.print("  NumPy einsum: Optimized C/Fortran, close to native for batch operations\n", .{});
+    std.debug.print("  @logic_table: REAL Python for loops compiled to Zig (no SIMD)\n", .{});
+    std.debug.print("  NumPy einsum: Optimized C/Fortran with SIMD - much faster for batch ops\n", .{});
     std.debug.print("  DuckDB/Polars UDF: Python callback per row = interpreter overhead\n", .{});
+    std.debug.print("  DuckDB/Polars batch: Fetch + NumPy = slower than pure NumPy\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("  For REAL end-to-end comparison, need to include:\n", .{});
-    std.debug.print("    - Lance file I/O and column decoding\n", .{});
-    std.debug.print("    - Query planning and execution\n", .{});
-    std.debug.print("    - Memory allocation for real data\n", .{});
+    std.debug.print("  Key insight: Compiled Python loops are slower than NumPy SIMD\n", .{});
+    std.debug.print("  but faster than Python UDF callbacks per row.\n", .{});
     std.debug.print("================================================================================\n", .{});
 }
