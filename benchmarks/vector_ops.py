@@ -1,8 +1,8 @@
 # Vector operations for @logic_table benchmark
 # Compiled by metal0: metal0 build --emit-logic-table benchmarks/vector_ops.py -o lib/vector_ops.a
 #
-# Uses SIMD-vectorized built-in functions from logic_table module for maximum performance.
-# These compile to @Vector operations in Zig, achieving near-native SIMD performance.
+# Uses SIMD @Vector(4, f64) for 4-way vectorization on CPU.
+# On 384-dimensional vectors, this processes 96 SIMD iterations instead of 384 scalar.
 
 import logic_table
 
@@ -10,8 +10,7 @@ import logic_table
 class VectorOps:
     """Core vector operations for similarity search and ML.
 
-    Uses SIMD-accelerated built-in functions for 4-way vectorization.
-    On 384-dimensional vectors, this processes 96 iterations instead of 384.
+    All operations use SIMD (4-way vectorization) for high performance.
     """
 
     def dot_product(self, a: list, b: list) -> float:

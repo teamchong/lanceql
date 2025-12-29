@@ -501,6 +501,19 @@ pub fn build(b: *std.Build) void {
     const bench_pushdown_step = b.step("bench-pushdown", "Benchmark @logic_table pushdown (filtered_indices optimization)");
     bench_pushdown_step.dependOn(&run_bench_pushdown.step);
 
+    // Tiered dispatch benchmark - SIMD vs GPU for batch vector operations
+    const bench_tiered = b.addExecutable(.{
+        .name = "bench_tiered_dispatch",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/bench_tiered_dispatch.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+        }),
+    });
+    const run_bench_tiered = b.addRunArtifact(bench_tiered);
+    const bench_tiered_step = b.step("bench-tiered", "Benchmark SIMD vs GPU tiered dispatch");
+    bench_tiered_step.dependOn(&run_bench_tiered.step);
+
     // Parquet benchmark - LanceQL vs DuckDB vs Polars
     const bench_parquet = b.addExecutable(.{
         .name = "bench_parquet",
