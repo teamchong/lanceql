@@ -126,13 +126,14 @@ pub fn main() !void {
 
     // =========================================================================
     // LanceQL @logic_table - Read REAL data from Lance file, use compiled extern
+    // FAIR: Call VectorOps_dot_product PER ROW (same as Python UDF)
     // =========================================================================
     {
         var iterations: u64 = 0;
         var total_rows: u64 = 0;
 
-        // Pre-allocate query vector (filled once, reused)
-        var query_buf: [100000]f64 = undefined;
+        // Query value for per-row dot product (length=1)
+        const query_val: [1]f64 = .{1.0};
 
         // Warmup
         const warmup_end = std.time.nanoTimestamp() + WARMUP_SECONDS * 1_000_000_000;
@@ -147,15 +148,13 @@ pub fn main() !void {
             const amounts = table.readFloat64Column(1) catch break;
             defer allocator.free(amounts);
 
-            // Create query vector of same length
-            const query_len = @min(amounts.len, query_buf.len);
-            for (0..query_len) |i| {
-                query_buf[i] = 1.0; // Unit query vector
+            // Call VectorOps_dot_product PER ROW (same as Python UDF)
+            var total: f64 = 0;
+            for (amounts) |amount| {
+                const row_val: [1]f64 = .{amount};
+                total += VectorOps_dot_product(&row_val, &query_val, 1);
             }
-
-            // Use REAL compiled @logic_table extern function
-            const dot = VectorOps_dot_product(amounts.ptr, &query_buf, query_len);
-            std.mem.doNotOptimizeAway(&dot);
+            std.mem.doNotOptimizeAway(&total);
         }
 
         // Benchmark
@@ -172,15 +171,13 @@ pub fn main() !void {
             const amounts = table.readFloat64Column(1) catch break;
             defer allocator.free(amounts);
 
-            // Create query vector of same length
-            const query_len = @min(amounts.len, query_buf.len);
-            for (0..query_len) |i| {
-                query_buf[i] = 1.0;
+            // Call VectorOps_dot_product PER ROW (same as Python UDF)
+            var total: f64 = 0;
+            for (amounts) |amount| {
+                const row_val: [1]f64 = .{amount};
+                total += VectorOps_dot_product(&row_val, &query_val, 1);
             }
-
-            // Use REAL compiled @logic_table extern function
-            const dot = VectorOps_dot_product(amounts.ptr, &query_buf, query_len);
-            std.mem.doNotOptimizeAway(&dot);
+            std.mem.doNotOptimizeAway(&total);
 
             iterations += 1;
             total_rows += amounts.len;
