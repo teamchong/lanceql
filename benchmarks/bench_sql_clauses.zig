@@ -23,6 +23,58 @@
 const std = @import("std");
 const Table = @import("lanceql.table").Table;
 
+// =============================================================================
+// SIMD Operations - Close the gap with DuckDB
+// =============================================================================
+
+const Vec4 = @Vector(4, f64);
+
+/// SIMD filter: COUNT(*) WHERE value > threshold
+fn simdFilterCount(amounts: []const f64, threshold: f64) u64 {
+    var count: u64 = 0;
+    var i: usize = 0;
+    const len = amounts.len;
+    const thresh_vec: Vec4 = @splat(threshold);
+
+    // Process 4 elements at a time with SIMD
+    while (i + 4 <= len) : (i += 4) {
+        const vals: Vec4 = amounts[i..][0..4].*;
+        const mask = vals > thresh_vec;
+        // Count true values in mask
+        count += @popCount(@as(u4, @bitCast(mask)));
+    }
+
+    // Handle remaining elements
+    while (i < len) : (i += 1) {
+        if (amounts[i] > threshold) count += 1;
+    }
+
+    return count;
+}
+
+/// SIMD aggregate: SUM(values)
+fn simdSum(amounts: []const f64) f64 {
+    var sum_vec: Vec4 = @splat(0.0);
+    var i: usize = 0;
+    const len = amounts.len;
+
+    // Process 4 elements at a time with SIMD
+    while (i + 4 <= len) : (i += 4) {
+        const vals: Vec4 = amounts[i..][0..4].*;
+        sum_vec += vals;
+    }
+
+    // Horizontal sum of vector
+    var sum: f64 = @reduce(.Add, sum_vec);
+
+    // Handle remaining elements
+    while (i < len) : (i += 1) {
+        sum += amounts[i];
+    }
+
+    return sum;
+}
+
 const WARMUP_SECONDS = 2;
 const BENCHMARK_SECONDS = 15;
 const LANCE_PATH = "benchmarks/benchmark_e2e.lance";
@@ -153,10 +205,8 @@ pub fn main() !void {
             defer table.deinit();
             const amounts = table.readFloat64Column(1) catch break;
             defer allocator.free(amounts);
-            var count: u64 = 0;
-            for (amounts) |a| {
-                if (a > 100.0) count += 1;
-            }
+            // SIMD filter: 4 elements at a time
+            const count = simdFilterCount(amounts, 100.0);
             std.mem.doNotOptimizeAway(&count);
         }
 
@@ -169,10 +219,8 @@ pub fn main() !void {
             defer table.deinit();
             const amounts = table.readFloat64Column(1) catch break;
             defer allocator.free(amounts);
-            var count: u64 = 0;
-            for (amounts) |a| {
-                if (a > 100.0) count += 1;
-            }
+            // SIMD filter: 4 elements at a time
+            const count = simdFilterCount(amounts, 100.0);
             std.mem.doNotOptimizeAway(&count);
             iterations += 1;
             total_rows += amounts.len;
@@ -182,7 +230,7 @@ pub fn main() !void {
         const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
         lanceql_filter_rps = @as(f64, @floatFromInt(total_rows)) / elapsed_s;
         std.debug.print("{s:<40} {d:>10.0}K {d:>12} {s:>10}\n", .{
-            "LanceQL native (FILTER)",
+            "LanceQL SIMD (FILTER)",
             lanceql_filter_rps / 1000.0,
             iterations,
             "1.0x",
@@ -339,8 +387,8 @@ pub fn main() !void {
             defer table.deinit();
             const amounts = table.readFloat64Column(1) catch break;
             defer allocator.free(amounts);
-            var sum: f64 = 0;
-            for (amounts) |a| sum += a;
+            // SIMD sum: 4 elements at a time
+            const sum = simdSum(amounts);
             std.mem.doNotOptimizeAway(&sum);
         }
 
@@ -353,8 +401,8 @@ pub fn main() !void {
             defer table.deinit();
             const amounts = table.readFloat64Column(1) catch break;
             defer allocator.free(amounts);
-            var sum: f64 = 0;
-            for (amounts) |a| sum += a;
+            // SIMD sum: 4 elements at a time
+            const sum = simdSum(amounts);
             std.mem.doNotOptimizeAway(&sum);
             iterations += 1;
             total_rows += amounts.len;
@@ -364,7 +412,7 @@ pub fn main() !void {
         const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
         lanceql_agg_rps = @as(f64, @floatFromInt(total_rows)) / elapsed_s;
         std.debug.print("{s:<40} {d:>10.0}K {d:>12} {s:>10}\n", .{
-            "LanceQL native (AGGREGATE)",
+            "LanceQL SIMD (AGGREGATE)",
             lanceql_agg_rps / 1000.0,
             iterations,
             "1.0x",
