@@ -1,17 +1,20 @@
 //! @logic_table Benchmark - HONEST Comparison
 //!
-//! What we're actually comparing:
-//!   1. Native Zig dot product  - Compiled Zig code (from lib/vector_ops.a)
+//! What we're comparing:
+//!   1. @logic_table           - REAL Python for loops compiled to Zig by metal0
 //!   2. DuckDB Python UDF       - Row-by-row Python calls
 //!   3. DuckDB + NumPy batch    - Pull data, batch process with NumPy
 //!   4. Polars Python UDF       - Row-by-row Python calls
 //!   5. Polars + NumPy batch    - Pull data, batch process with NumPy
 //!
 //! HONEST NOTES:
-//!   - "LanceQL @logic_table" is actually hand-written Zig in lib/vector_ops.a
-//!   - It is NOT JIT-compiled Python code
-//!   - This benchmark shows: native code vs Python runtime, NOT @logic_table vs UDF
-//!   - When JIT is complete, @logic_table will generate similar native code FROM Python
+//!   - @logic_table is REAL compiled Python (see benchmarks/vector_ops.py)
+//!   - Python code: for i in range(len(a)): result += a[i] * b[i]
+//!   - Metal0 compiles this to Zig with runtime dispatch (NOT hand-written SIMD)
+//!   - This shows compiled Python vs Python UDF callbacks
+//!
+//! Compile the @logic_table Python code:
+//!   metal0 build --emit-logic-table benchmarks/vector_ops.py -o lib/vector_ops.a
 
 const std = @import("std");
 
@@ -20,7 +23,8 @@ const ZIG_ITERATIONS = 50_000; // Adjusted for fair timing
 const BATCH_SIZE = 10_000;
 const PYTHON_ITERATIONS = 5;
 
-// Native Zig function from lib/vector_ops.a (NOT JIT compiled from Python)
+// @logic_table compiled from benchmarks/vector_ops.py
+// This is REAL Python code compiled to native Zig by metal0
 extern fn VectorOps_dot_product(a: [*]const f64, b: [*]const f64, len: usize) f64;
 
 var has_duckdb: bool = false;
@@ -71,11 +75,12 @@ pub fn main() !void {
 
     std.debug.print("\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("HONEST Benchmark: Native Zig vs Python (dot product)\n", .{});
+    std.debug.print("@logic_table Benchmark: Compiled Python vs Python UDFs\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("NOTE: 'Native Zig' is hand-written code in lib/vector_ops.a,\n", .{});
-    std.debug.print("      NOT JIT-compiled Python. This shows POTENTIAL speedup.\n", .{});
+    std.debug.print("@logic_table: REAL Python for loops compiled to Zig by metal0\n", .{});
+    std.debug.print("  Source: benchmarks/vector_ops.py\n", .{});
+    std.debug.print("  Python: for i in range(len(a)): result += a[i] * b[i]\n", .{});
     std.debug.print("\n", .{});
     std.debug.print("Vectors: {d} × 384 dimensions\n", .{BATCH_SIZE});
     std.debug.print("\n", .{});
@@ -85,9 +90,9 @@ pub fn main() !void {
     has_polars = checkPythonModule(allocator, "polars");
 
     std.debug.print("Available:\n", .{});
-    std.debug.print("  - Native Zig: yes (lib/vector_ops.a)\n", .{});
-    std.debug.print("  - DuckDB:     {s}\n", .{if (has_duckdb) "yes" else "no"});
-    std.debug.print("  - Polars:     {s}\n", .{if (has_polars) "yes" else "no"});
+    std.debug.print("  - @logic_table: yes (compiled from Python)\n", .{});
+    std.debug.print("  - DuckDB:       {s}\n", .{if (has_duckdb) "yes" else "no"});
+    std.debug.print("  - Polars:       {s}\n", .{if (has_polars) "yes" else "no"});
     std.debug.print("\n", .{});
 
     // Generate test data
@@ -141,7 +146,7 @@ pub fn main() !void {
         const ms = @as(f64, @floatFromInt(zig_ns)) / 1_000_000.0;
         const per_vec = @as(f64, @floatFromInt(zig_ns)) / @as(f64, @floatFromInt(BATCH_SIZE));
         std.debug.print("{s:<35} {d:>9.2} ms {d:>9.0} ns {s:>10}\n", .{
-            "Native Zig (lib/vector_ops.a)", ms, per_vec, "1.0x",
+            "@logic_table (compiled Python)", ms, per_vec, "1.0x",
         });
     }
 
@@ -336,16 +341,15 @@ pub fn main() !void {
     std.debug.print("What This Benchmark Shows\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("This compares NATIVE ZIG vs PYTHON for vector operations.\n", .{});
+    std.debug.print("@logic_table is REAL Python code compiled to native Zig by metal0:\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("The 'Native Zig' code is:\n", .{});
-    std.debug.print("  - Hand-written in lib/vector_ops.a\n", .{});
-    std.debug.print("  - Compiled with SIMD optimizations\n", .{});
-    std.debug.print("  - NOT JIT-compiled from Python\n", .{});
+    std.debug.print("  Source: benchmarks/vector_ops.py\n", .{});
+    std.debug.print("  Python: for i in range(len(a)): result += a[i] * b[i]\n", .{});
+    std.debug.print("  Compiled: Zig with runtime dispatch (NOT hand-written SIMD)\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("@logic_table GOAL:\n", .{});
-    std.debug.print("  - JIT compile Python to native code with similar performance\n", .{});
-    std.debug.print("  - JIT infrastructure exists (compileWithPredicate, jitCompileSource)\n", .{});
-    std.debug.print("  - TODO: Complete metal0 Python parser integration\n", .{});
+    std.debug.print("This compares:\n", .{});
+    std.debug.print("  - Compiled Python loops (fast, no interpreter)\n", .{});
+    std.debug.print("  - Python UDF callbacks (slow, interpreter per row)\n", .{});
+    std.debug.print("  - NumPy batch (fast, optimized C/Fortran SIMD)\n", .{});
     std.debug.print("\n", .{});
 }

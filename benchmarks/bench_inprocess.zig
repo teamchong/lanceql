@@ -1,7 +1,18 @@
-//! In-Process Benchmark: LanceQL vs DuckDB vs Polars
+//! In-Process Benchmark: @logic_table (Compiled Python) vs DuckDB vs Polars
 //!
-//! FAIR apples-to-apples comparison - no subprocess overhead.
-//! All engines run in-process with native code.
+//! What we're comparing:
+//!   - @logic_table: REAL Python for loops compiled to native Zig by metal0
+//!   - DuckDB: In-process SQL with C API (list_dot_product built-in)
+//!   - Polars: Python DataFrame API (df["a"] * df["b"]).sum()
+//!
+//! HONEST NOTES:
+//!   - @logic_table is REAL compiled Python (see benchmarks/vector_ops.py)
+//!   - Python code: for i in range(len(a)): result += a[i] * b[i]
+//!   - Metal0 compiles this to Zig with runtime dispatch (NOT hand-written SIMD)
+//!   - DuckDB/Polars have their own optimized implementations
+//!
+//! Compile the @logic_table Python code:
+//!   metal0 build --emit-logic-table benchmarks/vector_ops.py -o lib/vector_ops.a
 
 const std = @import("std");
 const c = @cImport({
@@ -13,7 +24,8 @@ const LANCEQL_ITERATIONS = 1_000_000; // ~5+ seconds at ~5us/op
 const DUCKDB_ITERATIONS = 2000; // ~5+ seconds at ~2.5ms/op
 const POLARS_ITERATIONS = 100_000; // Polars via Python
 
-// LanceQL @logic_table (metal0 compiled)
+// @logic_table compiled from benchmarks/vector_ops.py
+// This is REAL Python code compiled to native Zig by metal0
 extern fn VectorOps_dot_product(a: [*]const f64, b: [*]const f64, len: usize) f64;
 extern fn VectorOps_sum_squares(a: [*]const f64, len: usize) f64;
 
@@ -98,7 +110,7 @@ pub fn main() !void {
     }
     const lanceql_per_op = @as(f64, @floatFromInt(lanceql_ns)) / @as(f64, @floatFromInt(LANCEQL_ITERATIONS));
     const lanceql_total_s = @as(f64, @floatFromInt(lanceql_ns)) / 1_000_000_000.0;
-    std.debug.print("{s:<25} {d:>9.0} ns {d:>10.1}s {s:>10}\n", .{ "LanceQL", lanceql_per_op, lanceql_total_s, "1.0x" });
+    std.debug.print("{s:<25} {d:>9.0} ns {d:>10.1}s {s:>10}\n", .{ "@logic_table", lanceql_per_op, lanceql_total_s, "1.0x" });
 
     // DuckDB in-process (fewer iterations - SQL parsing overhead)
     var duckdb_ns: u64 = 0;
@@ -192,10 +204,11 @@ pub fn main() !void {
     std.debug.print("Summary (in-process comparison)\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("LanceQL:     {d:>8.0} ns/op (baseline)\n", .{lanceql_per_op});
-    std.debug.print("DuckDB:      {d:>8.0} us/op ({d:.0}x slower)\n", .{ duckdb_per_op / 1000.0, duckdb_ratio });
-    std.debug.print("Polars:      {d:>8.0} ns/op ({d:.1}x)\n", .{ polars_per_op, polars_per_op / lanceql_per_op });
+    std.debug.print("@logic_table:  {d:>8.0} ns/op (compiled Python for loops)\n", .{lanceql_per_op});
+    std.debug.print("DuckDB:        {d:>8.0} us/op ({d:.0}x slower - SQL parsing overhead)\n", .{ duckdb_per_op / 1000.0, duckdb_ratio });
+    std.debug.print("Polars:        {d:>8.0} ns/op ({d:.1}x)\n", .{ polars_per_op, polars_per_op / lanceql_per_op });
     std.debug.print("\n", .{});
-    std.debug.print("DuckDB overhead: SQL parsing + query planning per call (~3ms)\n", .{});
+    std.debug.print("NOTE: @logic_table = Python for loops compiled to native Zig by metal0\n", .{});
+    std.debug.print("      See benchmarks/vector_ops.py for the actual Python code.\n", .{});
     std.debug.print("\n", .{});
 }
