@@ -1,16 +1,17 @@
 //! @logic_table Benchmark - HONEST End-to-End Comparison
 //!
 //! What we're comparing (all read from files, same 15-second duration):
-//!   1. LanceQL @logic_table  - Read Lance file → compute with compiled Python
-//!   2. DuckDB Python UDF     - Read Parquet → row-by-row Python calls
+//!   1. LanceQL @logic_table  - Read Lance file → compute with COMPILED Python
+//!   2. DuckDB + Python loop  - Read Parquet → row-by-row Python calls
 //!   3. DuckDB → NumPy batch  - Read Parquet → pull to Python → NumPy compute
-//!   4. Polars Python UDF     - Read Parquet → row-by-row Python calls
+//!   4. Polars + Python loop  - Read Parquet → row-by-row Python calls
 //!   5. Polars → NumPy batch  - Read Parquet → pull to Python → NumPy compute
 //!
 //! FAIR COMPARISON:
 //!   - All methods read from disk (Lance or Parquet)
 //!   - All methods run for exactly 15 seconds
 //!   - Throughput measured as rows processed per second
+//!   - LanceQL uses VectorOps.dot_product - compiled from Python @logic_table
 //!
 //! Setup:
 //!   python3 benchmarks/generate_benchmark_data.py  # Creates test data
@@ -18,6 +19,11 @@
 
 const std = @import("std");
 const Table = @import("lanceql.table").Table;
+
+// Extern declaration for COMPILED @logic_table function
+// This is Python code compiled to native Zig by metal0
+// Source: benchmarks/vector_ops.py -> lib/vector_ops.a
+extern fn VectorOps_dot_product(a: [*]const f64, b: [*]const f64, len: usize) f64;
 
 const WARMUP_SECONDS = 2;
 const BENCHMARK_SECONDS = 15;
@@ -156,13 +162,20 @@ pub fn main() !void {
 
     var lanceql_throughput: f64 = 0;
 
-    // 1. LanceQL @logic_table (read Lance file → compute)
+    // 1. LanceQL @logic_table (read Lance file → compute with COMPILED Python)
     {
         const warmup_end = std.time.nanoTimestamp() + WARMUP_SECONDS * std.time.ns_per_s;
         const benchmark_end_time = warmup_end + BENCHMARK_SECONDS * std.time.ns_per_s;
 
         var iterations: u64 = 0;
         var total_rows: u64 = 0;
+
+        // Query vector as f64 (VectorOps_dot_product expects f64)
+        var query_vec: [EMBEDDING_DIM]f64 = undefined;
+        for (&query_vec) |*v| v.* = 0.1;
+
+        // Pre-allocate conversion buffer for f32 -> f64
+        var emb_f64: [EMBEDDING_DIM]f64 = undefined;
 
         // Warmup
         while (std.time.nanoTimestamp() < warmup_end) {
@@ -177,14 +190,14 @@ pub fn main() !void {
 
             const num_rows = embeddings.len / EMBEDDING_DIM;
 
-            // Compute dot products
+            // Compute dot products using COMPILED @logic_table function
             var total_score: f64 = 0;
             for (0..num_rows) |row| {
                 const emb = embeddings[row * EMBEDDING_DIM .. (row + 1) * EMBEDDING_DIM];
-                var dot: f32 = 0;
-                for (emb) |e| {
-                    dot += e * 0.1;
-                }
+                // Convert f32 -> f64 for the compiled function
+                for (emb, 0..) |v, i| emb_f64[i] = v;
+                // VectorOps_dot_product is COMPILED from Python @logic_table
+                const dot = VectorOps_dot_product(&emb_f64, &query_vec, EMBEDDING_DIM);
                 total_score += dot;
             }
             std.mem.doNotOptimizeAway(&total_score);
@@ -204,14 +217,14 @@ pub fn main() !void {
 
             const num_rows = embeddings.len / EMBEDDING_DIM;
 
-            // Compute dot products
+            // Compute dot products using COMPILED @logic_table function
             var total_score: f64 = 0;
             for (0..num_rows) |row| {
                 const emb = embeddings[row * EMBEDDING_DIM .. (row + 1) * EMBEDDING_DIM];
-                var dot: f32 = 0;
-                for (emb) |e| {
-                    dot += e * 0.1;
-                }
+                // Convert f32 -> f64 for the compiled function
+                for (emb, 0..) |v, i| emb_f64[i] = v;
+                // VectorOps_dot_product is COMPILED from Python @logic_table
+                const dot = VectorOps_dot_product(&emb_f64, &query_vec, EMBEDDING_DIM);
                 total_score += dot;
             }
             std.mem.doNotOptimizeAway(&total_score);
@@ -246,11 +259,9 @@ pub fn main() !void {
             \\query = np.full(384, 0.1, dtype=np.float32)
             \\
             \\# Python function for 384-dim dot product (called per row)
+            \\# Uses np.dot - same as Polars UDF for fair comparison
             \\def dot_product(embedding):
-            \\    result = 0.0
-            \\    for i in range(384):
-            \\        result += embedding[i] * query[i]
-            \\    return result
+            \\    return float(np.dot(embedding, query))
             \\
             \\# Warmup
             \\warmup_end = time.time() + WARMUP_SECONDS
@@ -435,8 +446,8 @@ pub fn main() !void {
             \\WARMUP_SECONDS = {d}
             \\PARQUET_PATH = "{s}"
             \\
+            \\query = np.full(384, 0.1, dtype=np.float32)  # Defined ONCE outside function
             \\def dot_product_udf(embedding):
-            \\    query = np.full(384, 0.1, dtype=np.float32)
             \\    return float(np.dot(embedding, query))
             \\
             \\# Warmup

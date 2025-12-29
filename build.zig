@@ -510,6 +510,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // Link the REAL metal0-compiled @logic_table static library
+    bench_pushdown.addObjectFile(b.path("lib/vector_ops.a"));
     const run_bench_pushdown = b.addRunArtifact(bench_pushdown);
     const bench_pushdown_step = b.step("bench-pushdown", "Benchmark @logic_table pushdown (filtered_indices optimization)");
     bench_pushdown_step.dependOn(&run_bench_pushdown.step);

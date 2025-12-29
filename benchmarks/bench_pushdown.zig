@@ -1,10 +1,10 @@
-//! LanceQL native Pushdown Benchmark - End-to-End Comparison
+//! @logic_table Pushdown Benchmark - End-to-End Comparison
 //!
 //! HONEST benchmark measuring filter + compute from cold start:
-//!   1. LanceQL native  - Read Lance file → filter → compute
-//!   2. DuckDB Python UDF     - Read Parquet → filter → row-by-row Python
+//!   1. LanceQL @logic_table  - Read Lance file → filter → compute with COMPILED Python
+//!   2. DuckDB + Python loop  - Read Parquet → filter → row-by-row Python
 //!   3. DuckDB → NumPy batch  - Read Parquet → filter → NumPy compute
-//!   4. Polars Python UDF     - Read Parquet → filter → row-by-row Python
+//!   4. Polars + Python loop  - Read Parquet → filter → row-by-row Python
 //!   5. Polars → NumPy batch  - Read Parquet → filter → NumPy compute
 //!
 //! FAIR COMPARISON:
@@ -20,20 +20,16 @@
 const std = @import("std");
 const Table = @import("lanceql.table").Table;
 
+// Extern declaration for COMPILED @logic_table function
+// This is Python code compiled to native Zig by metal0
+// Source: benchmarks/vector_ops.py -> lib/vector_ops.a
+extern fn VectorOps_dot_product(a: [*]const f64, b: [*]const f64, len: usize) f64;
+
 const WARMUP_SECONDS = 2;
 const BENCHMARK_SECONDS = 15;
 const LANCE_PATH = "benchmarks/benchmark_e2e.lance";
 const PARQUET_PATH = "benchmarks/benchmark_e2e.parquet";
 const EMBEDDING_DIM = 384;
-
-// Simulated LanceQL native function (filter + compute)
-fn computeScore(embedding: []const f32) f64 {
-    var score: f64 = 0.0;
-    for (embedding) |v| {
-        score += v * 0.1;
-    }
-    return score;
-}
 
 fn checkPythonModule(allocator: std.mem.Allocator, module: []const u8) bool {
     const py_code = std.fmt.allocPrint(allocator, "import {s}", .{module}) catch return false;
@@ -90,7 +86,7 @@ pub fn main() !void {
 
     std.debug.print("\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("LanceQL native Pushdown Benchmark: End-to-End (Filter + Compute)\n", .{});
+    std.debug.print("@logic_table Pushdown Benchmark: End-to-End (Filter + Compute)\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
     std.debug.print("Each method runs for {d} seconds. Measuring throughput (rows/sec).\n", .{BENCHMARK_SECONDS});
@@ -116,7 +112,7 @@ pub fn main() !void {
     std.debug.print("  Parquet: {s} ✓\n", .{PARQUET_PATH});
     std.debug.print("\n", .{});
     std.debug.print("Engines:\n", .{});
-    std.debug.print("  LanceQL native: yes\n", .{});
+    std.debug.print("  LanceQL @logic_table: yes\n", .{});
     std.debug.print("  DuckDB:               {s}\n", .{if (has_duckdb) "yes" else "no (pip install duckdb)"});
     std.debug.print("  Polars:               {s}\n", .{if (has_polars) "yes" else "no (pip install polars)"});
     std.debug.print("\n", .{});
@@ -127,13 +123,20 @@ pub fn main() !void {
 
     var lanceql_throughput: f64 = 0;
 
-    // 1. LanceQL native (read Lance file → filter → compute)
+    // 1. LanceQL @logic_table (read Lance file → filter → compute with COMPILED Python)
     {
         const warmup_end = std.time.nanoTimestamp() + WARMUP_SECONDS * std.time.ns_per_s;
         const benchmark_end_time = warmup_end + BENCHMARK_SECONDS * std.time.ns_per_s;
 
         var iterations: u64 = 0;
         var total_rows: u64 = 0;
+
+        // Query vector as f64 (VectorOps_dot_product expects f64)
+        var query_vec: [EMBEDDING_DIM]f64 = undefined;
+        for (&query_vec) |*v| v.* = 0.1;
+
+        // Pre-allocate conversion buffer for f32 -> f64
+        var emb_f64: [EMBEDDING_DIM]f64 = undefined;
 
         // Warmup
         while (std.time.nanoTimestamp() < warmup_end) {
@@ -154,7 +157,10 @@ pub fn main() !void {
                 // Filter: amount > 500
                 if (amounts[row] > 500.0) {
                     const emb = embeddings[row * EMBEDDING_DIM .. (row + 1) * EMBEDDING_DIM];
-                    total_score += computeScore(emb);
+                    // Convert f32 -> f64 for the compiled function
+                    for (emb, 0..) |v, i| emb_f64[i] = v;
+                    // VectorOps_dot_product is COMPILED from Python @logic_table
+                    total_score += VectorOps_dot_product(&emb_f64, &query_vec, EMBEDDING_DIM);
                 }
             }
             std.mem.doNotOptimizeAway(&total_score);
@@ -181,7 +187,10 @@ pub fn main() !void {
                 // Filter: amount > 500
                 if (amounts[row] > 500.0) {
                     const emb = embeddings[row * EMBEDDING_DIM .. (row + 1) * EMBEDDING_DIM];
-                    total_score += computeScore(emb);
+                    // Convert f32 -> f64 for the compiled function
+                    for (emb, 0..) |v, i| emb_f64[i] = v;
+                    // VectorOps_dot_product is COMPILED from Python @logic_table
+                    total_score += VectorOps_dot_product(&emb_f64, &query_vec, EMBEDDING_DIM);
                     filtered_rows += 1;
                 }
             }
@@ -194,7 +203,7 @@ pub fn main() !void {
 
         lanceql_throughput = @as(f64, @floatFromInt(total_rows)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0);
         std.debug.print("{s:<35} {d:>12.0} {d:>12} {s:>10}\n", .{
-            "LanceQL native", lanceql_throughput, iterations, "1.0x",
+            "LanceQL @logic_table", lanceql_throughput, iterations, "1.0x",
         });
     }
 
@@ -217,11 +226,9 @@ pub fn main() !void {
             \\query = np.full(384, 0.1, dtype=np.float32)
             \\
             \\# Python function for 384-dim dot product (called per row)
+            \\# Uses np.dot - same as Polars UDF for fair comparison
             \\def dot_product(embedding):
-            \\    result = 0.0
-            \\    for i in range(384):
-            \\        result += embedding[i] * query[i]
-            \\    return result
+            \\    return float(np.dot(embedding, query))
             \\
             \\# Warmup
             \\warmup_end = time.time() + WARMUP_SECONDS
@@ -412,8 +419,8 @@ pub fn main() !void {
             \\WARMUP_SECONDS = {d}
             \\PARQUET_PATH = "{s}"
             \\
+            \\query = np.full(384, 0.1, dtype=np.float32)  # Defined ONCE outside function
             \\def dot_product_udf(embedding):
-            \\    query = np.full(384, 0.1, dtype=np.float32)
             \\    return float(np.dot(embedding, query))
             \\
             \\# Warmup
