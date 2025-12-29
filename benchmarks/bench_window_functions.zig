@@ -439,7 +439,7 @@ pub fn main() !void {
             \\# Warmup
             \\warmup_end = time.time() + WARMUP_SECONDS
             \\while time.time() < warmup_end:
-            \\    df = pl.read_parquet("{s}")
+            \\    df = pl.read_parquet("{s}", columns=["amount", "id"])
             \\    values = df["amount"].to_numpy()
             \\    weights = df["id"].to_numpy().astype(float) + 1.0
             \\    _ = cumulative_weighted_avg(values, weights)
@@ -450,7 +450,7 @@ pub fn main() !void {
             \\start = time.time()
             \\benchmark_end = start + BENCHMARK_SECONDS
             \\while time.time() < benchmark_end:
-            \\    df = pl.read_parquet("{s}")
+            \\    df = pl.read_parquet("{s}", columns=["amount", "id"])
             \\    values = df["amount"].to_numpy()
             \\    weights = df["id"].to_numpy().astype(float) + 1.0
             \\    _ = cumulative_weighted_avg(values, weights)
@@ -517,7 +517,7 @@ pub fn main() !void {
             \\# Warmup
             \\warmup_end = time.time() + WARMUP_SECONDS
             \\while time.time() < warmup_end:
-            \\    df = pl.read_parquet("{s}")
+            \\    df = pl.read_parquet("{s}", columns=["amount", "id"])
             \\    values = df["amount"].to_numpy()
             \\    weights = df["id"].to_numpy().astype(float) + 1.0
             \\    _ = cumulative_weighted_avg_numpy(values, weights)
@@ -528,7 +528,7 @@ pub fn main() !void {
             \\start = time.time()
             \\benchmark_end = start + BENCHMARK_SECONDS
             \\while time.time() < benchmark_end:
-            \\    df = pl.read_parquet("{s}")
+            \\    df = pl.read_parquet("{s}", columns=["amount", "id"])
             \\    values = df["amount"].to_numpy()
             \\    weights = df["id"].to_numpy().astype(float) + 1.0
             \\    _ = cumulative_weighted_avg_numpy(values, weights)
