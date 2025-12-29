@@ -260,9 +260,9 @@ import { LanceQL } from './lanceql.js';
 
 | Engine | Time | Rows/sec | vs LanceQL |
 |--------|------|----------|------------|
-| **LanceQL (Zig)** | 279ms | 358K/s | 1.0x |
-| DuckDB + NumPy | 1,886ms | 53K/s | 6.8x slower |
-| Polars + NumPy | 11,932ms | 8K/s | 42.8x slower |
+| **LanceQL (Zig)** | 621ms | 161K/s | 1.0x |
+| DuckDB + NumPy | 2,556ms | 39K/s | 4.1x slower |
+| Polars + NumPy | 43,003ms | 2K/s | 69x slower |
 
 **What's measured:**
 1. Read file from disk (Lance/Parquet)
