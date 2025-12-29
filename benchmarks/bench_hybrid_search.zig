@@ -295,15 +295,16 @@ pub fn main() !void {
         }
     }
 
-    // NumPy comparison
+    // Polars batch cosine similarity (using DataFrame)
     if (has_polars) {
         const script = std.fmt.comptimePrint(
             \\import time
+            \\import polars as pl
             \\import numpy as np
             \\
             \\N = {d}
             \\DIM = {d}
-            \\ITERS = 20
+            \\ITERS = 10
             \\
             \\np.random.seed(42)
             \\query = np.random.randn(DIM).astype(np.float32)
@@ -313,10 +314,19 @@ pub fn main() !void {
             \\query = query / np.linalg.norm(query)
             \\vecs = vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
             \\
+            \\# Create Polars DataFrame with vectors
+            \\df = pl.DataFrame({{"vec": vecs.tolist()}})
+            \\query_list = query.tolist()
+            \\
+            \\def cosine_sim(vec):
+            \\    return float(np.dot(vec, query_list))
+            \\
             \\times = []
             \\for _ in range(ITERS):
             \\    start = time.perf_counter_ns()
-            \\    scores = np.dot(vecs, query)  # cosine sim for normalized vectors
+            \\    result = df.with_columns(
+            \\        pl.col("vec").map_elements(cosine_sim, return_dtype=pl.Float64).alias("score")
+            \\    )
             \\    times.append(time.perf_counter_ns() - start)
             \\
             \\print(f"RESULT_NS:{{sum(times) // len(times)}}")
@@ -324,9 +334,9 @@ pub fn main() !void {
 
         const ns = try runPythonBenchmark(allocator, script);
         if (ns > 0) {
-            const numpy_vps = @as(f64, @floatFromInt(NUM_PRODUCTS)) / @as(f64, @floatFromInt(ns)) * 1_000_000_000;
-            const ratio = lanceql_vps / numpy_vps;
-            std.debug.print("{s:<25} {d:>9.2} ms {d:>9.0}K/s {d:>9.1}x\n", .{ "NumPy", @as(f64, @floatFromInt(ns)) / 1_000_000, numpy_vps / 1000, ratio });
+            const polars_vps = @as(f64, @floatFromInt(NUM_PRODUCTS)) / @as(f64, @floatFromInt(ns)) * 1_000_000_000;
+            const ratio = lanceql_vps / polars_vps;
+            std.debug.print("{s:<25} {d:>9.2} ms {d:>9.0}K/s {d:>9.1}x\n", .{ "Polars", @as(f64, @floatFromInt(ns)) / 1_000_000, polars_vps / 1000, ratio });
         }
     }
 

@@ -230,7 +230,7 @@ pub fn main() !void {
         }
     }
 
-    // Polars batch operation
+    // Polars batch dot product (using DataFrame with list columns)
     if (has_polars) {
         const polars_script = std.fmt.comptimePrint(
             \\import polars as pl
@@ -241,25 +241,29 @@ pub fn main() !void {
             \\query = np.random.randn({d}).astype(np.float32)
             \\vectors = np.random.randn({d}, {d}).astype(np.float32)
             \\
-            \\# Create Polars DataFrame
-            \\df = pl.DataFrame({{"id": range({d})}})
+            \\# Create Polars DataFrame with vector column
+            \\df = pl.DataFrame({{"vec": vectors.tolist()}})
+            \\query_list = query.tolist()
+            \\
+            \\def dot_product(vec):
+            \\    return float(np.dot(vec, query_list))
             \\
             \\# Warmup
             \\for _ in range(3):
-            \\    _ = vectors @ query
+            \\    _ = df.with_columns(pl.col("vec").map_elements(dot_product, return_dtype=pl.Float64))
             \\
-            \\# Benchmark - Polars with NumPy batch
+            \\# Benchmark - Polars DataFrame API
             \\start = time.perf_counter_ns()
             \\for _ in range({d}):
-            \\    result = vectors @ query  # NumPy for batch ops
+            \\    result = df.with_columns(pl.col("vec").map_elements(dot_product, return_dtype=pl.Float64).alias("dot"))
             \\elapsed = time.perf_counter_ns() - start
             \\print(f"RESULT_NS: {{elapsed // {d}}}")
-        , .{ DIM, comparison_batch, comparison_batch, py_iterations, py_iterations });
+        , .{ DIM, comparison_batch, py_iterations, py_iterations });
 
         if (runPythonBenchmark(allocator, polars_script)) |ns| {
             const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
             const per_vec = @as(f64, @floatFromInt(ns)) / @as(f64, comparison_batch);
-            std.debug.print("Polars + NumPy batch:    {d:>8.2} ms  ({d:.0} ns/vec)\n", .{ ms, per_vec });
+            std.debug.print("Polars (DataFrame):      {d:>8.2} ms  ({d:.0} ns/vec)\n", .{ ms, per_vec });
         } else |_| {
             std.debug.print("Polars: failed\n", .{});
         }

@@ -347,24 +347,33 @@ pub fn main() !void {
         }
     }
 
-    // Polars/NumPy L2 normalization comparison
+    // Polars L2 normalization (using DataFrame with list columns)
     if (has_polars) {
         const script = std.fmt.comptimePrint(
             \\import time
+            \\import polars as pl
             \\import numpy as np
             \\
             \\CHUNKS = {d}
             \\DIM = {d}
-            \\ITERS = 100
+            \\ITERS = 10
             \\
             \\np.random.seed(42)
             \\vecs = np.random.randn(CHUNKS, DIM).astype(np.float32)
             \\
+            \\# Create Polars DataFrame with vector column
+            \\df = pl.DataFrame({{"vec": vecs.tolist()}})
+            \\
+            \\def l2_normalize(vec):
+            \\    arr = np.array(vec, dtype=np.float32)
+            \\    return (arr / np.linalg.norm(arr)).tolist()
+            \\
             \\times = []
             \\for _ in range(ITERS):
             \\    start = time.perf_counter_ns()
-            \\    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-            \\    normalized = vecs / norms
+            \\    result = df.with_columns(
+            \\        pl.col("vec").map_elements(l2_normalize, return_dtype=pl.List(pl.Float32)).alias("normalized")
+            \\    )
             \\    times.append(time.perf_counter_ns() - start)
             \\
             \\print(f"RESULT_NS:{{sum(times) // len(times)}}")
@@ -375,7 +384,7 @@ pub fn main() !void {
             const polars_s = @as(f64, @floatFromInt(ns)) / 1_000_000_000.0;
             const polars_tput = @as(f64, @floatFromInt(total_chunks)) / polars_s / 1_000_000;
             const ratio = lanceql_norm_tput / polars_tput;
-            std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M vecs/s {d:>9.1}x\n", .{ "NumPy", polars_s * 1000, polars_tput, ratio });
+            std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M vecs/s {d:>9.1}x\n", .{ "Polars", polars_s * 1000, polars_tput, ratio });
         }
     }
 

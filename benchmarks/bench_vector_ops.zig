@@ -199,13 +199,19 @@ pub fn main() !void {
             std.debug.print("{s:<25} {d:>12.1} ns   {d:.0}x slower\n", .{ "DuckDB (subprocess)", duckdb_per_op, duckdb_ratio });
         }
 
-        // Polars cosine similarity
+        // Polars cosine similarity (using DataFrame operations)
         if (has_polars) {
             const py_code = try std.fmt.allocPrint(allocator,
+                \\import polars as pl
                 \\import numpy as np
-                \\a = np.array({s})
-                \\b = np.array({s})
-                \\cos = np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+                \\a = {s}
+                \\b = {s}
+                \\df_a = pl.DataFrame({{"val": a}})
+                \\df_b = pl.DataFrame({{"val": b}})
+                \\dot = (df_a["val"] * df_b["val"]).sum()
+                \\norm_a = (df_a["val"] ** 2).sum() ** 0.5
+                \\norm_b = (df_b["val"] ** 2).sum() ** 0.5
+                \\cos = dot / (norm_a * norm_b)
             , .{ query_str.items, vec_str.items });
             defer allocator.free(py_code);
 

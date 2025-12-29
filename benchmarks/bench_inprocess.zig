@@ -135,20 +135,32 @@ pub fn main() !void {
     const duckdb_ratio = duckdb_per_op / lanceql_per_op;
     std.debug.print("{s:<25} {d:>9.0} us {d:>10.1}s {d:>9.0}x\n", .{ "DuckDB", duckdb_per_op / 1000.0, duckdb_total_s, duckdb_ratio });
 
-    // Polars in-process (via Python - measures native Polars, not subprocess overhead)
+    // Polars in-process (via Python - uses actual Polars DataFrame API)
     var polars_ns: u64 = 0;
     var polars_per_op: f64 = 0;
     {
-        // Create Python script for Polars benchmark
+        // Create Python script for Polars benchmark using DataFrame
         const py_script =
             \\import time
+            \\import polars as pl
             \\import numpy as np
+            \\
             \\np.random.seed(42)
             \\a = np.random.randn(384).astype(np.float64)
             \\b = np.random.randn(384).astype(np.float64)
-            \\for _ in range(10): _ = np.dot(a, b)
+            \\
+            \\# Create DataFrames
+            \\df_a = pl.DataFrame({"val": a.tolist()})
+            \\df_b = pl.DataFrame({"val": b.tolist()})
+            \\
+            \\# Warmup
+            \\for _ in range(10):
+            \\    _ = (df_a["val"] * df_b["val"]).sum()
+            \\
+            \\# Benchmark Polars dot product
             \\start = time.perf_counter_ns()
-            \\for _ in range(100000): result = np.dot(a, b)
+            \\for _ in range(100000):
+            \\    result = (df_a["val"] * df_b["val"]).sum()
             \\elapsed = time.perf_counter_ns() - start
             \\print(elapsed)
         ;
@@ -157,7 +169,7 @@ pub fn main() !void {
             .allocator = allocator,
             .argv = &.{ "python3", "-c", py_script },
         }) catch {
-            std.debug.print("{s:<25} {s:>12} {s:>12} {s:>10}\n", .{ "Polars/NumPy", "N/A", "N/A", "N/A" });
+            std.debug.print("{s:<25} {s:>12} {s:>12} {s:>10}\n", .{ "Polars", "N/A", "N/A", "N/A" });
             return;
         };
         defer {

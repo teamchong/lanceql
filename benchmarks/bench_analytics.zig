@@ -204,22 +204,37 @@ pub fn main() !void {
         std.debug.print("{s:<25} {d:>9.0} ms {d:>12.1}M/s {d:>9.1}x  (1M rows)\n", .{ "DuckDB", duckdb_s * 1000, duckdb_tput, duckdb_ratio });
     }
 
-    // Polars
+    // Polars (actual DataFrame API)
     if (has_polars) {
         const py_code =
+            \\import polars as pl
             \\import numpy as np
             \\import time
+            \\
             \\np.random.seed(42)
             \\n = 10000000
-            \\prices = np.random.rand(n) * 1000
-            \\quantities = np.random.randint(1, 11, n)
+            \\df = pl.DataFrame({
+            \\    "price": np.random.rand(n) * 1000,
+            \\    "quantity": np.random.randint(1, 11, n)
+            \\})
+            \\
+            \\# Warmup
+            \\for _ in range(3):
+            \\    _ = df.select([
+            \\        (pl.col("price") * pl.col("quantity")).sum().alias("revenue"),
+            \\        pl.col("price").mean().alias("avg"),
+            \\        pl.col("price").min().alias("min"),
+            \\        pl.col("price").max().alias("max")
+            \\    ])
+            \\
             \\start = time.time()
             \\for _ in range(10):
-            \\    revenue = prices * quantities
-            \\    total = np.sum(revenue)
-            \\    avg = np.mean(prices)
-            \\    min_p = np.min(prices)
-            \\    max_p = np.max(prices)
+            \\    result = df.select([
+            \\        (pl.col("price") * pl.col("quantity")).sum().alias("revenue"),
+            \\        pl.col("price").mean().alias("avg"),
+            \\        pl.col("price").min().alias("min"),
+            \\        pl.col("price").max().alias("max")
+            \\    ])
             \\elapsed = time.time() - start
             \\print(f"{elapsed:.4f}")
         ;
@@ -270,22 +285,34 @@ pub fn main() !void {
     const lanceql_group_tput = @as(f64, @floatFromInt(NUM_ROWS)) / lanceql_group_s / 1_000_000;
     std.debug.print("{s:<25} {d:>9.0} ms {d:>12.0}M/s {s:>10}\n", .{ "LanceQL", lanceql_group_s * 1000, lanceql_group_tput, "1.0x" });
 
-    // Polars GROUP BY
+    // Polars GROUP BY (actual DataFrame API)
     if (has_polars) {
         const py_code =
+            \\import polars as pl
             \\import numpy as np
             \\import time
+            \\
             \\np.random.seed(42)
             \\n = 10000000
-            \\categories = np.random.randint(0, 50, n)
-            \\prices = np.random.rand(n) * 1000
-            \\quantities = np.random.randint(1, 11, n)
-            \\revenues = prices * quantities
+            \\df = pl.DataFrame({
+            \\    "category": np.random.randint(0, 50, n),
+            \\    "price": np.random.rand(n) * 1000,
+            \\    "quantity": np.random.randint(1, 11, n)
+            \\}).with_columns((pl.col("price") * pl.col("quantity")).alias("revenue"))
+            \\
+            \\# Warmup
+            \\for _ in range(3):
+            \\    _ = df.group_by("category").agg([
+            \\        pl.col("revenue").sum().alias("total_revenue"),
+            \\        pl.col("revenue").count().alias("count")
+            \\    ])
+            \\
             \\start = time.time()
             \\for _ in range(10):
-            \\    # Manual group by with bincount
-            \\    sums = np.bincount(categories, weights=revenues, minlength=50)
-            \\    counts = np.bincount(categories, minlength=50)
+            \\    result = df.group_by("category").agg([
+            \\        pl.col("revenue").sum().alias("total_revenue"),
+            \\        pl.col("revenue").count().alias("count")
+            \\    ])
             \\elapsed = time.time() - start
             \\print(f"{elapsed:.4f}")
         ;

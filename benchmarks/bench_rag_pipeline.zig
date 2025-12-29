@@ -246,11 +246,12 @@ pub fn main() !void {
         std.debug.print("{s:<25} {d:>9.0} ms {d:>10.2}s {d:>9.0}  ({d:.0}x, {d} vectors)\n", .{ "DuckDB", duckdb_per_query / 1_000_000, duckdb_total_s, duckdb_qps, duckdb_ratio, duckdb_scale });
     }
 
-    // Polars (numpy for vector ops)
+    // Polars vector search (using DataFrame with list columns)
     if (has_polars) {
         const polars_scale = 10000; // Test with 10K vectors
 
         const py_code = try std.fmt.allocPrint(allocator,
+            \\import polars as pl
             \\import numpy as np
             \\import time
             \\
@@ -261,11 +262,19 @@ pub fn main() !void {
             \\query = np.random.randn({d}).astype(np.float32)
             \\query = query / np.linalg.norm(query)
             \\
-            \\# Search
+            \\# Create Polars DataFrame
+            \\df = pl.DataFrame({{"vec": vectors.tolist()}})
+            \\query_list = query.tolist()
+            \\
+            \\def dot_product(vec):
+            \\    return float(np.dot(vec, query_list))
+            \\
+            \\# Search using Polars
             \\start = time.time()
             \\for _ in range({d}):
-            \\    scores = vectors @ query
-            \\    top_k = np.argsort(scores)[-{d}:][::-1]
+            \\    result = df.with_columns(
+            \\        pl.col("vec").map_elements(dot_product, return_dtype=pl.Float64).alias("score")
+            \\    ).sort("score", descending=True).head({d})
             \\elapsed = time.time() - start
             \\print(f"{{elapsed:.4f}}")
         , .{ polars_scale, EMBEDDING_DIM, EMBEDDING_DIM, NUM_QUERIES, TOP_K });
