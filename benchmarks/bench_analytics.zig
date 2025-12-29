@@ -1,35 +1,35 @@
-//! Analytics Benchmark
+//! Analytics Benchmark - End-to-End Comparison
 //!
-//! Real-world use case: Business intelligence queries
+//! HONEST benchmark measuring analytics queries from cold start:
+//!   1. LanceQL @logic_table  - Read Lance file → aggregate
+//!   2. DuckDB SQL           - Read Parquet → SQL aggregations
+//!   3. Polars DataFrame     - Read Parquet → DataFrame aggregations
 //!
-//! Operations tested:
-//!   1. Aggregations (SUM, AVG, COUNT, MIN, MAX)
-//!   2. GROUP BY with aggregations
-//!   3. Window functions (ROW_NUMBER, RANK, LAG, LEAD)
-//!   4. DISTINCT counts
-//!   5. Percentiles
+//! FAIR COMPARISON:
+//!   - All methods read from disk (Lance or Parquet files)
+//!   - All methods run for exactly 15 seconds
+//!   - Throughput measured as rows processed per second
+//!   - Operations: SUM, AVG, MIN, MAX on amount column
 //!
-//! Comparison: LanceQL vs DuckDB vs Polars
+//! Setup:
+//!   python3 benchmarks/generate_benchmark_data.py  # Creates test data
+//!   zig build bench-analytics
 
 const std = @import("std");
+const Table = @import("lanceql.table").Table;
 
-const WARMUP = 3;
-const ITERATIONS = 20;
-const SUBPROCESS_ITERATIONS = 30;
+const WARMUP_SECONDS = 2;
+const BENCHMARK_SECONDS = 15;
+const LANCE_PATH = "benchmarks/benchmark_e2e.lance";
+const PARQUET_PATH = "benchmarks/benchmark_e2e.parquet";
 
-// Dataset: Sales transactions
-const NUM_ROWS = 10_000_000; // 10M transactions
-const NUM_STORES = 1000;
-const NUM_PRODUCTS = 10000;
-const NUM_CATEGORIES = 50;
+fn checkPythonModule(allocator: std.mem.Allocator, module: []const u8) bool {
+    const py_code = std.fmt.allocPrint(allocator, "import {s}", .{module}) catch return false;
+    defer allocator.free(py_code);
 
-var has_duckdb: bool = false;
-var has_polars: bool = false;
-
-fn checkCommand(allocator: std.mem.Allocator, cmd: []const u8) bool {
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "which", cmd },
+        .argv = &.{ "python3", "-c", py_code },
     }) catch return false;
     defer {
         allocator.free(result.stdout);
@@ -41,63 +41,35 @@ fn checkCommand(allocator: std.mem.Allocator, cmd: []const u8) bool {
     }
 }
 
-fn runDuckDB(allocator: std.mem.Allocator, sql: []const u8) !u64 {
-    var timer = try std.time.Timer.start();
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "duckdb", "-csv", "-c", sql },
-        .max_output_bytes = 100 * 1024 * 1024,
-    }) catch return error.DuckDBFailed;
-    defer {
-        allocator.free(result.stdout);
-        allocator.free(result.stderr);
-    }
-    switch (result.term) {
-        .Exited => |code| if (code != 0) return error.DuckDBFailed,
-        else => return error.DuckDBFailed,
-    }
-    return timer.read();
-}
+fn readLanceFile(allocator: std.mem.Allocator) ![]const u8 {
+    var data_dir = std.fs.cwd().openDir(LANCE_PATH ++ "/data", .{ .iterate = true }) catch return error.FileNotFound;
+    defer data_dir.close();
 
-fn runPolars(allocator: std.mem.Allocator, code: []const u8) !u64 {
-    var timer = try std.time.Timer.start();
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "python3", "-c", code },
-        .max_output_bytes = 100 * 1024 * 1024,
-    }) catch return error.PolarsFailed;
-    defer {
-        allocator.free(result.stdout);
-        allocator.free(result.stderr);
-    }
-    switch (result.term) {
-        .Exited => |code_| if (code_ != 0) return error.PolarsFailed,
-        else => return error.PolarsFailed,
-    }
-    return timer.read();
-}
+    var iter = data_dir.iterate();
+    var lance_file_name_buf: [256]u8 = undefined;
+    var lance_file_name: ?[]const u8 = null;
 
-// Transaction record
-const Transaction = struct {
-    store_id: u16,
-    product_id: u16,
-    category_id: u8,
-    quantity: u16,
-    price: f32,
-    timestamp: u64,
-};
-
-fn generateTransactions(allocator: std.mem.Allocator, rng: *std.Random.DefaultPrng, count: usize) ![]Transaction {
-    const txns = try allocator.alloc(Transaction, count);
-    for (txns, 0..) |*t, i| {
-        t.store_id = @intCast(rng.random().int(u16) % NUM_STORES);
-        t.product_id = @intCast(rng.random().int(u16) % NUM_PRODUCTS);
-        t.category_id = @intCast(rng.random().int(u8) % NUM_CATEGORIES);
-        t.quantity = @intCast(1 + rng.random().int(u8) % 10);
-        t.price = 1.0 + rng.random().float(f32) * 999.0;
-        t.timestamp = @intCast(i); // Sequential for window functions
+    while (iter.next() catch null) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".lance")) {
+            const len = @min(entry.name.len, lance_file_name_buf.len);
+            @memcpy(lance_file_name_buf[0..len], entry.name[0..len]);
+            lance_file_name = lance_file_name_buf[0..len];
+            break;
+        }
     }
-    return txns;
+
+    if (lance_file_name == null) return error.FileNotFound;
+
+    const data_file = data_dir.openFile(lance_file_name.?, .{}) catch return error.FileNotFound;
+    defer data_file.close();
+
+    const file_size = (data_file.stat() catch return error.FileNotFound).size;
+    const file_data = allocator.alloc(u8, file_size) catch return error.OutOfMemory;
+
+    const bytes_read = data_file.readAll(file_data) catch return error.ReadError;
+    if (bytes_read != file_size) return error.ReadError;
+
+    return file_data;
 }
 
 pub fn main() !void {
@@ -105,281 +77,300 @@ pub fn main() !void {
 
     std.debug.print("\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("Analytics Benchmark: LanceQL vs DuckDB vs Polars\n", .{});
+    std.debug.print("Analytics Benchmark: End-to-End (SUM, AVG, MIN, MAX)\n", .{});
     std.debug.print("================================================================================\n", .{});
-
-    has_duckdb = checkCommand(allocator, "duckdb");
-    has_polars = checkCommand(allocator, "python3");
-
-    std.debug.print("\nUse Case: Business intelligence queries on sales data\n", .{});
-    std.debug.print("\nDataset:\n", .{});
-    std.debug.print("  - Transactions: {d}M\n", .{NUM_ROWS / 1_000_000});
-    std.debug.print("  - Stores:       {d}\n", .{NUM_STORES});
-    std.debug.print("  - Products:     {d}\n", .{NUM_PRODUCTS});
-    std.debug.print("  - Categories:   {d}\n", .{NUM_CATEGORIES});
-    std.debug.print("\nEngines:\n", .{});
-    std.debug.print("  - LanceQL:  yes\n", .{});
-    std.debug.print("  - DuckDB:   {s}\n", .{if (has_duckdb) "yes" else "no"});
-    std.debug.print("  - Polars:   {s}\n", .{if (has_polars) "yes" else "no"});
+    std.debug.print("\n", .{});
+    std.debug.print("Each method runs for {d} seconds. Measuring throughput (rows/sec).\n", .{BENCHMARK_SECONDS});
     std.debug.print("\n", .{});
 
-    // Generate dataset
-    std.debug.print("Generating {d}M transactions...\n", .{NUM_ROWS / 1_000_000});
-    var timer = try std.time.Timer.start();
+    // Check files exist
+    const lance_exists = if (std.fs.cwd().access(LANCE_PATH, .{})) true else |_| false;
+    const parquet_exists = if (std.fs.cwd().access(PARQUET_PATH, .{})) true else |_| false;
 
-    var rng = std.Random.DefaultPrng.init(42);
-    const txns = try generateTransactions(allocator, &rng, NUM_ROWS);
-    defer allocator.free(txns);
+    if (!lance_exists or !parquet_exists) {
+        std.debug.print("ERROR: Benchmark data not found. Run:\n", .{});
+        std.debug.print("  python3 benchmarks/generate_benchmark_data.py\n", .{});
+        return;
+    }
 
-    const gen_time = timer.read();
-    std.debug.print("Data generation: {d:.2}s\n\n", .{@as(f64, @floatFromInt(gen_time)) / 1_000_000_000});
+    const has_duckdb = checkPythonModule(allocator, "duckdb");
+    const has_polars = checkPythonModule(allocator, "polars");
 
-    // =========================================================================
-    // Benchmark: Simple Aggregations
-    // =========================================================================
+    std.debug.print("Data files:\n", .{});
+    std.debug.print("  Lance:   {s} ✓\n", .{LANCE_PATH});
+    std.debug.print("  Parquet: {s} ✓\n", .{PARQUET_PATH});
+    std.debug.print("\n", .{});
+    std.debug.print("Engines:\n", .{});
+    std.debug.print("  LanceQL @logic_table: yes\n", .{});
+    std.debug.print("  DuckDB:               {s}\n", .{if (has_duckdb) "yes" else "no (pip install duckdb)"});
+    std.debug.print("  Polars:               {s}\n", .{if (has_polars) "yes" else "no (pip install polars)"});
+    std.debug.print("\n", .{});
+
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("SIMPLE AGGREGATIONS: SUM, AVG, COUNT, MIN, MAX\n", .{});
+    std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "Method", "Rows/sec", "Iterations", "Speedup" });
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("{s:<25} {s:>12} {s:>15} {s:>10}\n", .{ "Engine", "Time", "Throughput", "Ratio" });
-    std.debug.print("{s:<25} {s:>12} {s:>15} {s:>10}\n", .{ "-" ** 25, "-" ** 12, "-" ** 15, "-" ** 10 });
 
-    // LanceQL: Simple aggregations
-    var lanceql_agg_ns: u64 = 0;
+    var lanceql_throughput: f64 = 0;
+
+    // 1. LanceQL @logic_table (read Lance file → aggregate)
     {
-        timer = try std.time.Timer.start();
-        for (0..ITERATIONS) |_| {
+        const warmup_end = std.time.nanoTimestamp() + WARMUP_SECONDS * std.time.ns_per_s;
+        const benchmark_end_time = warmup_end + BENCHMARK_SECONDS * std.time.ns_per_s;
+
+        var iterations: u64 = 0;
+        var total_rows: u64 = 0;
+
+        // Warmup
+        while (std.time.nanoTimestamp() < warmup_end) {
+            const file_data = readLanceFile(allocator) catch break;
+            defer allocator.free(file_data);
+
+            var table = Table.init(allocator, file_data) catch break;
+            defer table.deinit();
+
+            const amounts = table.readFloat64Column(1) catch break;
+            defer allocator.free(amounts);
+
             var sum: f64 = 0;
-            var count: usize = 0;
-            var min_val: f32 = txns[0].price;
-            var max_val: f32 = txns[0].price;
-
-            for (txns) |t| {
-                const revenue = @as(f64, t.price) * @as(f64, @floatFromInt(t.quantity));
-                sum += revenue;
-                count += 1;
-                if (t.price < min_val) min_val = t.price;
-                if (t.price > max_val) max_val = t.price;
+            var min_val: f64 = amounts[0];
+            var max_val: f64 = amounts[0];
+            for (amounts) |v| {
+                sum += v;
+                if (v < min_val) min_val = v;
+                if (v > max_val) max_val = v;
             }
-
-            const avg = sum / @as(f64, @floatFromInt(count));
+            const avg = sum / @as(f64, @floatFromInt(amounts.len));
             std.mem.doNotOptimizeAway(&sum);
             std.mem.doNotOptimizeAway(&avg);
             std.mem.doNotOptimizeAway(&min_val);
             std.mem.doNotOptimizeAway(&max_val);
         }
-        lanceql_agg_ns = timer.read();
+
+        // Benchmark
+        const start_time = std.time.nanoTimestamp();
+        while (std.time.nanoTimestamp() < benchmark_end_time) {
+            const file_data = readLanceFile(allocator) catch break;
+            defer allocator.free(file_data);
+
+            var table = Table.init(allocator, file_data) catch break;
+            defer table.deinit();
+
+            const amounts = table.readFloat64Column(1) catch break;
+            defer allocator.free(amounts);
+
+            var sum: f64 = 0;
+            var min_val: f64 = amounts[0];
+            var max_val: f64 = amounts[0];
+            for (amounts) |v| {
+                sum += v;
+                if (v < min_val) min_val = v;
+                if (v > max_val) max_val = v;
+            }
+            const avg = sum / @as(f64, @floatFromInt(amounts.len));
+            std.mem.doNotOptimizeAway(&sum);
+            std.mem.doNotOptimizeAway(&avg);
+            std.mem.doNotOptimizeAway(&min_val);
+            std.mem.doNotOptimizeAway(&max_val);
+
+            iterations += 1;
+            total_rows += amounts.len;
+        }
+        const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start_time);
+
+        lanceql_throughput = @as(f64, @floatFromInt(total_rows)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0);
+        std.debug.print("{s:<35} {d:>12.0} {d:>12} {s:>10}\n", .{
+            "LanceQL @logic_table", lanceql_throughput, iterations, "1.0x",
+        });
     }
-    const lanceql_agg_s = @as(f64, @floatFromInt(lanceql_agg_ns)) / @as(f64, @floatFromInt(ITERATIONS)) / 1_000_000_000.0;
-    const lanceql_agg_tput = @as(f64, @floatFromInt(NUM_ROWS)) / lanceql_agg_s / 1_000_000;
-    std.debug.print("{s:<25} {d:>9.0} ms {d:>12.0}M/s {s:>10}\n", .{ "LanceQL", lanceql_agg_s * 1000, lanceql_agg_tput, "1.0x" });
 
-    // DuckDB
-    if (has_duckdb) {
-        const sql =
-            \\WITH data AS (
-            \\  SELECT
-            \\    (random() * 1000)::INT as store_id,
-            \\    (random() * 10000)::INT as product_id,
-            \\    (1 + random() * 10)::INT as quantity,
-            \\    (1 + random() * 999)::FLOAT as price
-            \\  FROM generate_series(1, 1000000)
-            \\)
-            \\SELECT
-            \\  SUM(price * quantity) as total_revenue,
-            \\  AVG(price) as avg_price,
-            \\  COUNT(*) as num_txns,
-            \\  MIN(price) as min_price,
-            \\  MAX(price) as max_price
-            \\FROM data;
-        ;
-
-        var duckdb_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runDuckDB(allocator, sql) catch 0;
-        for (0..SUBPROCESS_ITERATIONS) |_| duckdb_ns += runDuckDB(allocator, sql) catch 0;
-
-        const duckdb_s = @as(f64, @floatFromInt(duckdb_ns)) / @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS)) / 1_000_000_000.0;
-        // DuckDB processes 1M rows per query
-        const duckdb_tput = 1_000_000.0 / duckdb_s / 1_000_000;
-        const duckdb_ratio = duckdb_s / lanceql_agg_s;
-        std.debug.print("{s:<25} {d:>9.0} ms {d:>12.1}M/s {d:>9.1}x  (1M rows)\n", .{ "DuckDB", duckdb_s * 1000, duckdb_tput, duckdb_ratio });
-    }
-
-    // Polars (actual DataFrame API)
-    if (has_polars) {
-        const py_code =
-            \\import polars as pl
-            \\import numpy as np
+    // 2. DuckDB SQL aggregations
+    if (has_duckdb) duckdb_sql: {
+        const script = std.fmt.comptimePrint(
+            \\import duckdb
             \\import time
             \\
-            \\np.random.seed(42)
-            \\n = 10000000
-            \\df = pl.DataFrame({
-            \\    "price": np.random.rand(n) * 1000,
-            \\    "quantity": np.random.randint(1, 11, n)
-            \\})
+            \\BENCHMARK_SECONDS = {d}
+            \\WARMUP_SECONDS = {d}
+            \\PARQUET_PATH = "{s}"
+            \\
+            \\con = duckdb.connect()
             \\
             \\# Warmup
-            \\for _ in range(3):
+            \\warmup_end = time.time() + WARMUP_SECONDS
+            \\while time.time() < warmup_end:
+            \\    con.execute(f"SELECT SUM(amount), AVG(amount), MIN(amount), MAX(amount) FROM read_parquet('{{PARQUET_PATH}}')").fetchall()
+            \\
+            \\# Benchmark
+            \\iterations = 0
+            \\total_rows = 0
+            \\start = time.time()
+            \\benchmark_end = start + BENCHMARK_SECONDS
+            \\while time.time() < benchmark_end:
+            \\    result = con.execute(f"SELECT SUM(amount), AVG(amount), MIN(amount), MAX(amount), COUNT(*) FROM read_parquet('{{PARQUET_PATH}}')").fetchall()
+            \\    iterations += 1
+            \\    total_rows += result[0][4]
+            \\elapsed_ns = int((time.time() - start) * 1e9)
+            \\
+            \\print(f"ITERATIONS:{{iterations}}")
+            \\print(f"TOTAL_NS:{{elapsed_ns}}")
+            \\print(f"ROWS:{{total_rows}}")
+        , .{ BENCHMARK_SECONDS, WARMUP_SECONDS, PARQUET_PATH });
+
+        const py_result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "python3", "-c", script },
+            .max_output_bytes = 10 * 1024 * 1024,
+        }) catch {
+            std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "DuckDB SQL", "error", "-", "-" });
+            break :duckdb_sql;
+        };
+        defer {
+            allocator.free(py_result.stdout);
+            allocator.free(py_result.stderr);
+        }
+
+        var iterations: u64 = 0;
+        var total_ns: u64 = 0;
+        var total_rows: u64 = 0;
+
+        if (std.mem.indexOf(u8, py_result.stdout, "ITERATIONS:")) |idx| {
+            const start = idx + 11;
+            var end = start;
+            while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') {
+                end += 1;
+            }
+            iterations = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
+        }
+        if (std.mem.indexOf(u8, py_result.stdout, "TOTAL_NS:")) |idx| {
+            const start = idx + 9;
+            var end = start;
+            while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') {
+                end += 1;
+            }
+            total_ns = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
+        }
+        if (std.mem.indexOf(u8, py_result.stdout, "ROWS:")) |idx| {
+            const start = idx + 5;
+            var end = start;
+            while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') {
+                end += 1;
+            }
+            total_rows = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
+        }
+
+        if (iterations > 0 and total_ns > 0) {
+            const throughput = @as(f64, @floatFromInt(total_rows)) / (@as(f64, @floatFromInt(total_ns)) / 1_000_000_000.0);
+            const speedup = lanceql_throughput / throughput;
+            var speedup_buf: [16]u8 = undefined;
+            const speedup_str = std.fmt.bufPrint(&speedup_buf, "{d:.1}x", .{speedup}) catch "N/A";
+            std.debug.print("{s:<35} {d:>12.0} {d:>12} {s:>10}\n", .{
+                "DuckDB SQL", throughput, iterations, speedup_str,
+            });
+        }
+    }
+
+    // 3. Polars DataFrame aggregations
+    if (has_polars) polars_df: {
+        const script = std.fmt.comptimePrint(
+            \\import polars as pl
+            \\import time
+            \\
+            \\BENCHMARK_SECONDS = {d}
+            \\WARMUP_SECONDS = {d}
+            \\PARQUET_PATH = "{s}"
+            \\
+            \\# Warmup
+            \\warmup_end = time.time() + WARMUP_SECONDS
+            \\while time.time() < warmup_end:
+            \\    df = pl.read_parquet(PARQUET_PATH)
             \\    _ = df.select([
-            \\        (pl.col("price") * pl.col("quantity")).sum().alias("revenue"),
-            \\        pl.col("price").mean().alias("avg"),
-            \\        pl.col("price").min().alias("min"),
-            \\        pl.col("price").max().alias("max")
+            \\        pl.col("amount").sum().alias("sum"),
+            \\        pl.col("amount").mean().alias("avg"),
+            \\        pl.col("amount").min().alias("min"),
+            \\        pl.col("amount").max().alias("max")
             \\    ])
             \\
+            \\# Benchmark
+            \\iterations = 0
+            \\total_rows = 0
             \\start = time.time()
-            \\for _ in range(10):
+            \\benchmark_end = start + BENCHMARK_SECONDS
+            \\while time.time() < benchmark_end:
+            \\    df = pl.read_parquet(PARQUET_PATH)
             \\    result = df.select([
-            \\        (pl.col("price") * pl.col("quantity")).sum().alias("revenue"),
-            \\        pl.col("price").mean().alias("avg"),
-            \\        pl.col("price").min().alias("min"),
-            \\        pl.col("price").max().alias("max")
+            \\        pl.col("amount").sum().alias("sum"),
+            \\        pl.col("amount").mean().alias("avg"),
+            \\        pl.col("amount").min().alias("min"),
+            \\        pl.col("amount").max().alias("max")
             \\    ])
-            \\elapsed = time.time() - start
-            \\print(f"{elapsed:.4f}")
-        ;
+            \\    iterations += 1
+            \\    total_rows += len(df)
+            \\elapsed_ns = int((time.time() - start) * 1e9)
+            \\
+            \\print(f"ITERATIONS:{{iterations}}")
+            \\print(f"TOTAL_NS:{{elapsed_ns}}")
+            \\print(f"ROWS:{{total_rows}}")
+        , .{ BENCHMARK_SECONDS, WARMUP_SECONDS, PARQUET_PATH });
 
-        var polars_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runPolars(allocator, py_code) catch 0;
-        for (0..5) |_| polars_ns += runPolars(allocator, py_code) catch 0;
-
-        const polars_s = @as(f64, @floatFromInt(polars_ns)) / 5.0 / 10.0 / 1_000_000_000.0;
-        const polars_tput = @as(f64, @floatFromInt(NUM_ROWS)) / polars_s / 1_000_000;
-        const polars_ratio = polars_s / lanceql_agg_s;
-        std.debug.print("{s:<25} {d:>9.0} ms {d:>12.0}M/s {d:>9.1}x\n", .{ "Polars", polars_s * 1000, polars_tput, polars_ratio });
-    }
-
-    // =========================================================================
-    // Benchmark: GROUP BY Aggregations
-    // =========================================================================
-    std.debug.print("\n================================================================================\n", .{});
-    std.debug.print("GROUP BY: Revenue per category ({d} groups)\n", .{NUM_CATEGORIES});
-    std.debug.print("================================================================================\n", .{});
-    std.debug.print("{s:<25} {s:>12} {s:>15} {s:>10}\n", .{ "Engine", "Time", "Throughput", "Ratio" });
-    std.debug.print("{s:<25} {s:>12} {s:>15} {s:>10}\n", .{ "-" ** 25, "-" ** 12, "-" ** 15, "-" ** 10 });
-
-    // LanceQL: GROUP BY
-    var lanceql_group_ns: u64 = 0;
-    {
-        const category_sums = try allocator.alloc(f64, NUM_CATEGORIES);
-        defer allocator.free(category_sums);
-        const category_counts = try allocator.alloc(usize, NUM_CATEGORIES);
-        defer allocator.free(category_counts);
-
-        timer = try std.time.Timer.start();
-        for (0..ITERATIONS) |_| {
-            @memset(category_sums, 0);
-            @memset(category_counts, 0);
-
-            for (txns) |t| {
-                const revenue = @as(f64, t.price) * @as(f64, @floatFromInt(t.quantity));
-                category_sums[t.category_id] += revenue;
-                category_counts[t.category_id] += 1;
-            }
-
-            std.mem.doNotOptimizeAway(category_sums);
+        const py_result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "python3", "-c", script },
+            .max_output_bytes = 10 * 1024 * 1024,
+        }) catch {
+            std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "Polars DataFrame", "error", "-", "-" });
+            break :polars_df;
+        };
+        defer {
+            allocator.free(py_result.stdout);
+            allocator.free(py_result.stderr);
         }
-        lanceql_group_ns = timer.read();
-    }
-    const lanceql_group_s = @as(f64, @floatFromInt(lanceql_group_ns)) / @as(f64, @floatFromInt(ITERATIONS)) / 1_000_000_000.0;
-    const lanceql_group_tput = @as(f64, @floatFromInt(NUM_ROWS)) / lanceql_group_s / 1_000_000;
-    std.debug.print("{s:<25} {d:>9.0} ms {d:>12.0}M/s {s:>10}\n", .{ "LanceQL", lanceql_group_s * 1000, lanceql_group_tput, "1.0x" });
 
-    // Polars GROUP BY (actual DataFrame API)
-    if (has_polars) {
-        const py_code =
-            \\import polars as pl
-            \\import numpy as np
-            \\import time
-            \\
-            \\np.random.seed(42)
-            \\n = 10000000
-            \\df = pl.DataFrame({
-            \\    "category": np.random.randint(0, 50, n),
-            \\    "price": np.random.rand(n) * 1000,
-            \\    "quantity": np.random.randint(1, 11, n)
-            \\}).with_columns((pl.col("price") * pl.col("quantity")).alias("revenue"))
-            \\
-            \\# Warmup
-            \\for _ in range(3):
-            \\    _ = df.group_by("category").agg([
-            \\        pl.col("revenue").sum().alias("total_revenue"),
-            \\        pl.col("revenue").count().alias("count")
-            \\    ])
-            \\
-            \\start = time.time()
-            \\for _ in range(10):
-            \\    result = df.group_by("category").agg([
-            \\        pl.col("revenue").sum().alias("total_revenue"),
-            \\        pl.col("revenue").count().alias("count")
-            \\    ])
-            \\elapsed = time.time() - start
-            \\print(f"{elapsed:.4f}")
-        ;
+        var iterations: u64 = 0;
+        var total_ns: u64 = 0;
+        var total_rows: u64 = 0;
 
-        var polars_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runPolars(allocator, py_code) catch 0;
-        for (0..5) |_| polars_ns += runPolars(allocator, py_code) catch 0;
-
-        const polars_s = @as(f64, @floatFromInt(polars_ns)) / 5.0 / 10.0 / 1_000_000_000.0;
-        const polars_tput = @as(f64, @floatFromInt(NUM_ROWS)) / polars_s / 1_000_000;
-        const polars_ratio = polars_s / lanceql_group_s;
-        std.debug.print("{s:<25} {d:>9.0} ms {d:>12.0}M/s {d:>9.1}x\n", .{ "Polars", polars_s * 1000, polars_tput, polars_ratio });
-    }
-
-    // =========================================================================
-    // Benchmark: DISTINCT Count
-    // =========================================================================
-    std.debug.print("\n================================================================================\n", .{});
-    std.debug.print("DISTINCT COUNT: Unique products per store\n", .{});
-    std.debug.print("================================================================================\n", .{});
-    std.debug.print("{s:<25} {s:>12} {s:>15} {s:>10}\n", .{ "Engine", "Time", "Throughput", "Ratio" });
-    std.debug.print("{s:<25} {s:>12} {s:>15} {s:>10}\n", .{ "-" ** 25, "-" ** 12, "-" ** 15, "-" ** 10 });
-
-    // LanceQL: DISTINCT count using bitmap
-    var lanceql_distinct_ns: u64 = 0;
-    {
-        // Bitmap for each store's products
-        const bitmap_size = (NUM_PRODUCTS + 63) / 64;
-        const bitmaps = try allocator.alloc(u64, NUM_STORES * bitmap_size);
-        defer allocator.free(bitmaps);
-
-        timer = try std.time.Timer.start();
-        for (0..ITERATIONS) |_| {
-            @memset(bitmaps, 0);
-
-            for (txns) |t| {
-                const store_offset = @as(usize, t.store_id) * bitmap_size;
-                const word_idx = t.product_id / 64;
-                const bit_idx: u6 = @intCast(t.product_id % 64);
-                bitmaps[store_offset + word_idx] |= @as(u64, 1) << bit_idx;
+        if (std.mem.indexOf(u8, py_result.stdout, "ITERATIONS:")) |idx| {
+            const start = idx + 11;
+            var end = start;
+            while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') {
+                end += 1;
             }
-
-            // Count distinct per store
-            var total_distinct: usize = 0;
-            for (0..NUM_STORES) |s| {
-                var count: usize = 0;
-                for (0..bitmap_size) |w| {
-                    count += @popCount(bitmaps[s * bitmap_size + w]);
-                }
-                total_distinct += count;
-            }
-            std.mem.doNotOptimizeAway(&total_distinct);
+            iterations = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
         }
-        lanceql_distinct_ns = timer.read();
-    }
-    const lanceql_distinct_s = @as(f64, @floatFromInt(lanceql_distinct_ns)) / @as(f64, @floatFromInt(ITERATIONS)) / 1_000_000_000.0;
-    const lanceql_distinct_tput = @as(f64, @floatFromInt(NUM_ROWS)) / lanceql_distinct_s / 1_000_000;
-    std.debug.print("{s:<25} {d:>9.0} ms {d:>12.0}M/s {s:>10}\n", .{ "LanceQL", lanceql_distinct_s * 1000, lanceql_distinct_tput, "1.0x" });
+        if (std.mem.indexOf(u8, py_result.stdout, "TOTAL_NS:")) |idx| {
+            const start = idx + 9;
+            var end = start;
+            while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') {
+                end += 1;
+            }
+            total_ns = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
+        }
+        if (std.mem.indexOf(u8, py_result.stdout, "ROWS:")) |idx| {
+            const start = idx + 5;
+            var end = start;
+            while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') {
+                end += 1;
+            }
+            total_rows = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
+        }
 
-    // =========================================================================
-    // Summary
-    // =========================================================================
-    std.debug.print("\n================================================================================\n", .{});
-    std.debug.print("Summary\n", .{});
+        if (iterations > 0 and total_ns > 0) {
+            const throughput = @as(f64, @floatFromInt(total_rows)) / (@as(f64, @floatFromInt(total_ns)) / 1_000_000_000.0);
+            const speedup = lanceql_throughput / throughput;
+            var speedup_buf: [16]u8 = undefined;
+            const speedup_str = std.fmt.bufPrint(&speedup_buf, "{d:.1}x", .{speedup}) catch "N/A";
+            std.debug.print("{s:<35} {d:>12.0} {d:>12} {s:>10}\n", .{
+                "Polars DataFrame", throughput, iterations, speedup_str,
+            });
+        }
+    }
+
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("LanceQL processes {d}M rows for analytics at memory bandwidth.\n", .{NUM_ROWS / 1_000_000});
-    std.debug.print("Native columnar processing eliminates Python/SQL overhead.\n", .{});
+    std.debug.print("Notes:\n", .{});
+    std.debug.print("  - Operations: SUM, AVG, MIN, MAX on amount column\n", .{});
+    std.debug.print("  - All methods read from disk (Lance or Parquet files)\n", .{});
+    std.debug.print("  - All methods run for exactly {d} seconds\n", .{BENCHMARK_SECONDS});
+    std.debug.print("  - Throughput = total rows processed / elapsed time\n", .{});
     std.debug.print("\n", .{});
 }

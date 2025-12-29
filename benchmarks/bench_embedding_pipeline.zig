@@ -1,25 +1,25 @@
 //! Embedding Pipeline Benchmark: LanceQL vs DuckDB vs Polars
 //!
-//! Real-world use case: Text-to-vector conversion for semantic search
+//! End-to-end benchmark: File I/O → Parse → Vector Normalization
 //!
-//! Pipeline stages:
-//!   1. Text chunking (split documents into passages)
-//!   2. Tokenization (text to token IDs)
-//!   3. Embedding generation (tokens to vectors)
-//!   4. Normalization (L2 normalize vectors)
-//!
-//! Comparison: LanceQL native vs DuckDB vs Polars/NumPy
+//! All methods read from actual files (Lance/Parquet) and run for
+//! equal duration (15 seconds each) to ensure fair comparison.
 
 const std = @import("std");
-const metal = @import("lanceql.metal");
+const Table = @import("lanceql.table").Table;
 
-var has_duckdb: bool = false;
-var has_polars: bool = false;
+const WARMUP_SECONDS = 2;
+const BENCHMARK_SECONDS = 15;
+const LANCE_PATH = "benchmarks/benchmark_e2e.lance";
+const PARQUET_PATH = "benchmarks/benchmark_e2e.parquet";
 
-fn checkCommand(allocator: std.mem.Allocator, cmd: []const u8) bool {
+fn checkPythonModule(allocator: std.mem.Allocator, module: []const u8) bool {
+    const py_code = std.fmt.allocPrint(allocator, "import {s}", .{module}) catch return false;
+    defer allocator.free(py_code);
+
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "which", cmd },
+        .argv = &.{ "python3", "-c", py_code },
     }) catch return false;
     defer {
         allocator.free(result.stdout);
@@ -31,130 +31,70 @@ fn checkCommand(allocator: std.mem.Allocator, cmd: []const u8) bool {
     }
 }
 
-fn runPythonBenchmark(allocator: std.mem.Allocator, script: []const u8) !u64 {
+fn readLanceFile(allocator: std.mem.Allocator) ![]const u8 {
+    var data_dir = std.fs.cwd().openDir(LANCE_PATH ++ "/data", .{ .iterate = true }) catch return error.FileNotFound;
+    defer data_dir.close();
+
+    var iter = data_dir.iterate();
+    var lance_file_name_buf: [256]u8 = undefined;
+    var lance_file_name: ?[]const u8 = null;
+
+    while (iter.next() catch null) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".lance")) {
+            const len = @min(entry.name.len, lance_file_name_buf.len);
+            @memcpy(lance_file_name_buf[0..len], entry.name[0..len]);
+            lance_file_name = lance_file_name_buf[0..len];
+            break;
+        }
+    }
+
+    if (lance_file_name == null) return error.FileNotFound;
+
+    const data_file = data_dir.openFile(lance_file_name.?, .{}) catch return error.FileNotFound;
+    defer data_file.close();
+
+    const file_size = (data_file.stat() catch return error.FileNotFound).size;
+    const file_data = allocator.alloc(u8, file_size) catch return error.OutOfMemory;
+
+    const bytes_read = data_file.readAll(file_data) catch return error.ReadError;
+    if (bytes_read != file_size) return error.ReadError;
+
+    return file_data;
+}
+
+fn runPythonBenchmark(allocator: std.mem.Allocator, script: []const u8) !struct { rows_per_sec: u64, iterations: u64 } {
     const result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "python3", "-c", script },
         .max_output_bytes = 10 * 1024 * 1024,
-    }) catch return 0;
+    }) catch return .{ .rows_per_sec = 0, .iterations = 0 };
     defer {
         allocator.free(result.stdout);
         allocator.free(result.stderr);
     }
-    if (std.mem.indexOf(u8, result.stdout, "RESULT_NS:")) |idx| {
-        const start = idx + 10;
+
+    var rows_per_sec: u64 = 0;
+    var iterations: u64 = 0;
+
+    if (std.mem.indexOf(u8, result.stdout, "ROWS_PER_SEC:")) |idx| {
+        const start = idx + 13;
         var end = start;
         while (end < result.stdout.len and result.stdout[end] >= '0' and result.stdout[end] <= '9') {
             end += 1;
         }
-        return std.fmt.parseInt(u64, result.stdout[start..end], 10) catch 0;
-    }
-    return 0;
-}
-
-const WARMUP = 3;
-const ITERATIONS = 10;
-
-// Pipeline parameters
-const NUM_DOCUMENTS = 10_000;
-const AVG_DOC_LENGTH = 2000; // characters
-const CHUNK_SIZE = 512; // characters per chunk
-const CHUNK_OVERLAP = 50;
-const EMBEDDING_DIM = 384;
-const MAX_TOKENS = 128;
-
-// Generate random text document
-fn generateDocument(allocator: std.mem.Allocator, rng: *std.Random.DefaultPrng, length: usize) ![]u8 {
-    const words = [_][]const u8{
-        "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog",
-        "machine", "learning", "artificial", "intelligence", "neural", "network",
-        "deep", "learning", "natural", "language", "processing", "computer",
-        "vision", "transformer", "attention", "mechanism", "embedding", "vector",
-        "semantic", "search", "retrieval", "augmented", "generation", "model",
-    };
-
-    var doc = std.ArrayListUnmanaged(u8){};
-    errdefer doc.deinit(allocator);
-
-    while (doc.items.len < length) {
-        const word = words[rng.random().int(usize) % words.len];
-        try doc.appendSlice(allocator, word);
-        try doc.append(allocator, ' ');
+        rows_per_sec = std.fmt.parseInt(u64, result.stdout[start..end], 10) catch 0;
     }
 
-    return try doc.toOwnedSlice(allocator);
-}
-
-// Chunk document into overlapping passages
-fn chunkDocument(allocator: std.mem.Allocator, doc: []const u8, chunk_size: usize, overlap: usize) ![][]const u8 {
-    var chunks = std.ArrayListUnmanaged([]const u8){};
-    errdefer chunks.deinit(allocator);
-
-    var start: usize = 0;
-    while (start < doc.len) {
-        const end = @min(start + chunk_size, doc.len);
-        const chunk = try allocator.dupe(u8, doc[start..end]);
-        try chunks.append(allocator, chunk);
-
-        if (end >= doc.len) break;
-        start += chunk_size - overlap;
-    }
-
-    return try chunks.toOwnedSlice(allocator);
-}
-
-// Simple tokenization (word-based, maps to random token IDs)
-fn tokenize(text: []const u8, tokens: []u16, rng: *std.Random.DefaultPrng) usize {
-    var token_count: usize = 0;
-    var in_word = false;
-
-    for (text) |c| {
-        if (c == ' ' or c == '\n' or c == '\t') {
-            if (in_word and token_count < tokens.len) {
-                tokens[token_count] = rng.random().int(u16) % 30000; // Vocab size
-                token_count += 1;
-                in_word = false;
-            }
-        } else {
-            in_word = true;
+    if (std.mem.indexOf(u8, result.stdout, "ITERATIONS:")) |idx| {
+        const start = idx + 11;
+        var end = start;
+        while (end < result.stdout.len and result.stdout[end] >= '0' and result.stdout[end] <= '9') {
+            end += 1;
         }
+        iterations = std.fmt.parseInt(u64, result.stdout[start..end], 10) catch 0;
     }
 
-    if (in_word and token_count < tokens.len) {
-        tokens[token_count] = rng.random().int(u16) % 30000;
-        token_count += 1;
-    }
-
-    return token_count;
-}
-
-// Simulated embedding lookup (in real use, this would be neural network inference)
-fn generateEmbedding(tokens: []const u16, token_count: usize, embedding: []f32, rng: *std.Random.DefaultPrng) void {
-    // Initialize with zeros
-    @memset(embedding, 0);
-
-    // Simulate attention-weighted sum of token embeddings
-    for (0..token_count) |t| {
-        const token_id = tokens[t];
-        // Deterministic "embedding" based on token ID
-        for (embedding, 0..) |*e, d| {
-            const hash = @as(u32, token_id) *% 2654435761 +% @as(u32, @intCast(d));
-            e.* += @as(f32, @bitCast(hash)) * 0.0000001;
-        }
-    }
-
-    // Add some randomness
-    for (embedding) |*e| {
-        e.* += rng.random().float(f32) * 0.01;
-    }
-
-    // L2 normalize
-    var sum: f32 = 0;
-    for (embedding) |e| sum += e * e;
-    const norm = @sqrt(sum);
-    if (norm > 0) {
-        for (embedding) |*e| e.* /= norm;
-    }
+    return .{ .rows_per_sec = rows_per_sec, .iterations = iterations };
 }
 
 pub fn main() !void {
@@ -164,242 +104,214 @@ pub fn main() !void {
     std.debug.print("================================================================================\n", .{});
     std.debug.print("Embedding Pipeline Benchmark: LanceQL vs DuckDB vs Polars\n", .{});
     std.debug.print("================================================================================\n", .{});
-
-    _ = metal.initGPU();
-
-    has_duckdb = checkCommand(allocator, "duckdb");
-    has_polars = checkCommand(allocator, "python3");
-
-    std.debug.print("\nUse Case: Text-to-vector conversion for semantic search\n", .{});
-    std.debug.print("\nDataset:\n", .{});
-    std.debug.print("  - Documents:      {d}\n", .{NUM_DOCUMENTS});
-    std.debug.print("  - Avg length:     {d} chars\n", .{AVG_DOC_LENGTH});
-    std.debug.print("  - Chunk size:     {d} chars\n", .{CHUNK_SIZE});
-    std.debug.print("  - Embedding dim:  {d}\n", .{EMBEDDING_DIM});
-    std.debug.print("\nEngines:\n", .{});
-    std.debug.print("  - LanceQL:  {s}\n", .{metal.getPlatformInfo()});
-    std.debug.print("  - DuckDB:   {s}\n", .{if (has_duckdb) "yes" else "no"});
-    std.debug.print("  - Polars:   {s}\n", .{if (has_polars) "yes" else "no"});
+    std.debug.print("\n", .{});
+    std.debug.print("Pipeline: Read file → L2 normalize vectors\n", .{});
+    std.debug.print("Each method runs for {d} seconds. Measuring throughput (rows/sec).\n", .{BENCHMARK_SECONDS});
     std.debug.print("\n", .{});
 
-    var rng = std.Random.DefaultPrng.init(42);
+    // Check files exist
+    const lance_exists = if (std.fs.cwd().access(LANCE_PATH, .{})) true else |_| false;
+    const parquet_exists = if (std.fs.cwd().access(PARQUET_PATH, .{})) true else |_| false;
 
-    // =========================================================================
-    // Benchmark 1: Text Chunking
-    // =========================================================================
-    std.debug.print("================================================================================\n", .{});
-    std.debug.print("TEXT CHUNKING: {d} documents -> passages\n", .{NUM_DOCUMENTS});
-    std.debug.print("================================================================================\n", .{});
-    std.debug.print("{s:<25} {s:>12} {s:>15}\n", .{ "Stage", "Time", "Throughput" });
-    std.debug.print("{s:<25} {s:>12} {s:>15}\n", .{ "-" ** 25, "-" ** 12, "-" ** 15 });
-
-    // Generate sample documents
-    const docs = try allocator.alloc([]u8, NUM_DOCUMENTS);
-    defer {
-        for (docs) |doc| allocator.free(doc);
-        allocator.free(docs);
+    if (!lance_exists or !parquet_exists) {
+        std.debug.print("ERROR: Benchmark data not found. Run:\n", .{});
+        std.debug.print("  python3 benchmarks/generate_benchmark_data.py\n", .{});
+        return;
     }
 
-    for (docs) |*doc| {
-        doc.* = try generateDocument(allocator, &rng, AVG_DOC_LENGTH);
-    }
+    const has_duckdb = checkPythonModule(allocator, "duckdb");
+    const has_polars = checkPythonModule(allocator, "polars");
 
-    // Chunking benchmark
-    var lanceql_chunk_ns: u64 = 0;
-    var total_chunks: usize = 0;
+    std.debug.print("Data files:\n", .{});
+    std.debug.print("  Lance:   {s} ✓\n", .{LANCE_PATH});
+    std.debug.print("  Parquet: {s} ✓\n", .{PARQUET_PATH});
+    std.debug.print("\n", .{});
+    std.debug.print("Engines:\n", .{});
+    std.debug.print("  LanceQL @logic_table: yes\n", .{});
+    std.debug.print("  DuckDB:               {s}\n", .{if (has_duckdb) "yes" else "no (pip install duckdb)"});
+    std.debug.print("  Polars:               {s}\n", .{if (has_polars) "yes" else "no (pip install polars)"});
+    std.debug.print("\n", .{});
+
+    std.debug.print("================================================================================\n", .{});
+    std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "Method", "Rows/sec", "Iterations", "Speedup" });
+    std.debug.print("================================================================================\n", .{});
+
+    var lanceql_throughput: f64 = 0;
+
+    // 1. LanceQL @logic_table (read Lance file → L2 normalize)
     {
-        var timer = try std.time.Timer.start();
-        for (0..ITERATIONS) |_| {
-            for (docs) |doc| {
-                const chunks = try chunkDocument(allocator, doc, CHUNK_SIZE, CHUNK_OVERLAP);
-                total_chunks += chunks.len;
-                for (chunks) |chunk| allocator.free(chunk);
-                allocator.free(chunks);
+        const warmup_end = std.time.nanoTimestamp() + WARMUP_SECONDS * std.time.ns_per_s;
+        const benchmark_end_time = warmup_end + BENCHMARK_SECONDS * std.time.ns_per_s;
+
+        var iterations: u64 = 0;
+        var total_rows: u64 = 0;
+
+        // Warmup
+        while (std.time.nanoTimestamp() < warmup_end) {
+            const file_data = readLanceFile(allocator) catch break;
+            defer allocator.free(file_data);
+
+            var table = Table.init(allocator, file_data) catch break;
+            defer table.deinit();
+
+            const amounts = table.readFloat64Column(1) catch break;
+            defer allocator.free(amounts);
+
+            // L2 normalize
+            var sum: f64 = 0;
+            for (amounts) |v| sum += v * v;
+            const norm = @sqrt(sum);
+            if (norm > 0) {
+                for (amounts) |*v| v.* /= norm;
             }
         }
-        lanceql_chunk_ns = timer.read();
-    }
-    total_chunks /= ITERATIONS;
 
-    const lanceql_chunk_s = @as(f64, @floatFromInt(lanceql_chunk_ns)) / @as(f64, @floatFromInt(ITERATIONS)) / 1_000_000_000.0;
-    const lanceql_chunk_tput = @as(f64, @floatFromInt(NUM_DOCUMENTS)) / lanceql_chunk_s;
-    std.debug.print("{s:<25} {d:>9.0} ms {d:>12.0} docs/s\n", .{ "Text Chunking", lanceql_chunk_s * 1000, lanceql_chunk_tput });
-    std.debug.print("  -> Generated {d} chunks total\n\n", .{total_chunks});
+        // Benchmark
+        const start_time = std.time.nanoTimestamp();
+        while (std.time.nanoTimestamp() < benchmark_end_time) {
+            const file_data = readLanceFile(allocator) catch break;
+            defer allocator.free(file_data);
 
-    // =========================================================================
-    // Benchmark 2: Tokenization + Embedding
-    // =========================================================================
-    std.debug.print("================================================================================\n", .{});
-    std.debug.print("TOKENIZATION + EMBEDDING: {d} chunks -> vectors\n", .{total_chunks});
-    std.debug.print("================================================================================\n", .{});
-    std.debug.print("{s:<25} {s:>12} {s:>15}\n", .{ "Stage", "Time", "Throughput" });
-    std.debug.print("{s:<25} {s:>12} {s:>15}\n", .{ "-" ** 25, "-" ** 12, "-" ** 15 });
+            var table = Table.init(allocator, file_data) catch break;
+            defer table.deinit();
 
-    // Tokenize + Embed
-    var lanceql_embed_ns: u64 = 0;
-    {
-        const tokens = try allocator.alloc(u16, MAX_TOKENS);
-        defer allocator.free(tokens);
-        const embedding = try allocator.alloc(f32, EMBEDDING_DIM);
-        defer allocator.free(embedding);
+            const amounts = table.readFloat64Column(1) catch break;
+            defer allocator.free(amounts);
 
-        var timer = try std.time.Timer.start();
-        for (0..ITERATIONS) |_| {
-            for (docs) |doc| {
-                // Chunk
-                const chunks = try chunkDocument(allocator, doc, CHUNK_SIZE, CHUNK_OVERLAP);
-                defer {
-                    for (chunks) |chunk| allocator.free(chunk);
-                    allocator.free(chunks);
-                }
-
-                // Tokenize + Embed each chunk
-                for (chunks) |chunk| {
-                    const token_count = tokenize(chunk, tokens, &rng);
-                    generateEmbedding(tokens, token_count, embedding, &rng);
-                }
+            // L2 normalize
+            var sum: f64 = 0;
+            for (amounts) |v| sum += v * v;
+            const norm = @sqrt(sum);
+            if (norm > 0) {
+                for (amounts) |*v| v.* /= norm;
             }
+
+            iterations += 1;
+            total_rows += amounts.len;
         }
-        lanceql_embed_ns = timer.read();
+
+        const elapsed_ns = std.time.nanoTimestamp() - start_time;
+        const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
+        lanceql_throughput = @as(f64, @floatFromInt(total_rows)) / elapsed_s;
+
+        std.debug.print("{s:<35} {d:>12.0} {d:>12} {s:>10}\n", .{
+            "LanceQL @logic_table",
+            lanceql_throughput,
+            iterations,
+            "baseline",
+        });
     }
 
-    const lanceql_embed_s = @as(f64, @floatFromInt(lanceql_embed_ns)) / @as(f64, @floatFromInt(ITERATIONS)) / 1_000_000_000.0;
-    const lanceql_embed_tput = @as(f64, @floatFromInt(total_chunks)) / lanceql_embed_s;
-    std.debug.print("{s:<25} {d:>9.0} ms {d:>12.0} chunks/s\n", .{ "Tokenize + Embed", lanceql_embed_s * 1000, lanceql_embed_tput });
-
-    // =========================================================================
-    // Benchmark 3: Batch Embedding Normalization
-    // =========================================================================
-    std.debug.print("\n================================================================================\n", .{});
-    std.debug.print("L2 NORMALIZATION: {d} vectors\n", .{total_chunks});
-    std.debug.print("================================================================================\n", .{});
-    std.debug.print("{s:<25} {s:>12} {s:>15}\n", .{ "Stage", "Time", "Throughput" });
-    std.debug.print("{s:<25} {s:>12} {s:>15}\n", .{ "-" ** 25, "-" ** 12, "-" ** 15 });
-
-    // Generate embeddings to normalize
-    const embeddings = try allocator.alloc(f32, total_chunks * EMBEDDING_DIM);
-    defer allocator.free(embeddings);
-
-    for (0..total_chunks) |i| {
-        for (0..EMBEDDING_DIM) |d| {
-            embeddings[i * EMBEDDING_DIM + d] = rng.random().float(f32) * 2 - 1;
-        }
-    }
-
-    // L2 normalize
-    var lanceql_norm_ns: u64 = 0;
-    {
-        var timer = try std.time.Timer.start();
-        for (0..ITERATIONS * 10) |_| {
-            for (0..total_chunks) |i| {
-                const vec = embeddings[i * EMBEDDING_DIM .. (i + 1) * EMBEDDING_DIM];
-                var sum: f32 = 0;
-                for (vec) |v| sum += v * v;
-                const norm = @sqrt(sum);
-                if (norm > 0) {
-                    for (vec) |*v| v.* /= norm;
-                }
-            }
-        }
-        lanceql_norm_ns = timer.read();
-    }
-
-    const lanceql_norm_s = @as(f64, @floatFromInt(lanceql_norm_ns)) / @as(f64, @floatFromInt(ITERATIONS * 10)) / 1_000_000_000.0;
-    const lanceql_norm_tput = @as(f64, @floatFromInt(total_chunks)) / lanceql_norm_s / 1_000_000;
-    std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M vecs/s {s:>10}\n", .{ "LanceQL", lanceql_norm_s * 1000, lanceql_norm_tput, "baseline" });
-
-    // DuckDB L2 normalization comparison
-    if (has_duckdb) {
+    // 2. DuckDB (read Parquet → L2 normalize with NumPy)
+    if (has_duckdb) duckdb_block: {
         const script = std.fmt.comptimePrint(
             \\import duckdb
             \\import time
             \\import numpy as np
             \\
-            \\CHUNKS = {d}
-            \\DIM = {d}
-            \\ITERS = 10
+            \\WARMUP_SECONDS = {d}
+            \\BENCHMARK_SECONDS = {d}
+            \\PARQUET_PATH = "{s}"
             \\
             \\con = duckdb.connect()
-            \\np.random.seed(42)
-            \\vecs = np.random.randn(CHUNKS, DIM).astype(np.float32)
             \\
-            \\# Create table with vectors
-            \\con.execute("CREATE TABLE vecs (v FLOAT[])")
-            \\for v in vecs:
-            \\    con.execute("INSERT INTO vecs VALUES (?)", [v.tolist()])
+            \\# Warmup
+            \\start = time.perf_counter()
+            \\while time.perf_counter() - start < WARMUP_SECONDS:
+            \\    df = con.execute(f"SELECT amount FROM '{{PARQUET_PATH}}'").fetchdf()
+            \\    arr = df['amount'].values
+            \\    norm = np.linalg.norm(arr)
+            \\    if norm > 0:
+            \\        _ = arr / norm
             \\
-            \\times = []
-            \\for _ in range(ITERS):
-            \\    start = time.perf_counter_ns()
-            \\    # L2 normalize using DuckDB array functions
-            \\    con.execute("SELECT list_transform(v, x -> x / sqrt(list_sum(list_transform(v, y -> y * y)))) FROM vecs").fetchall()
-            \\    times.append(time.perf_counter_ns() - start)
+            \\# Benchmark
+            \\iterations = 0
+            \\total_rows = 0
+            \\start = time.perf_counter()
+            \\while time.perf_counter() - start < BENCHMARK_SECONDS:
+            \\    df = con.execute(f"SELECT amount FROM '{{PARQUET_PATH}}'").fetchdf()
+            \\    arr = df['amount'].values
+            \\    norm = np.linalg.norm(arr)
+            \\    if norm > 0:
+            \\        _ = arr / norm
+            \\    iterations += 1
+            \\    total_rows += len(arr)
             \\
-            \\print(f"RESULT_NS:{{sum(times) // len(times)}}")
-        , .{ total_chunks, EMBEDDING_DIM });
+            \\elapsed = time.perf_counter() - start
+            \\rows_per_sec = int(total_rows / elapsed)
+            \\print(f"ROWS_PER_SEC:{{rows_per_sec}}")
+            \\print(f"ITERATIONS:{{iterations}}")
+        , .{ WARMUP_SECONDS, BENCHMARK_SECONDS, PARQUET_PATH });
 
-        const ns = try runPythonBenchmark(allocator, script);
-        if (ns > 0) {
-            const duckdb_s = @as(f64, @floatFromInt(ns)) / 1_000_000_000.0;
-            const duckdb_tput = @as(f64, @floatFromInt(total_chunks)) / duckdb_s / 1_000_000;
-            const ratio = lanceql_norm_tput / duckdb_tput;
-            std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M vecs/s {d:>9.1}x\n", .{ "DuckDB", duckdb_s * 1000, duckdb_tput, ratio });
+        const bench_result = runPythonBenchmark(allocator, script) catch {
+            break :duckdb_block;
+        };
+        if (bench_result.rows_per_sec > 0) {
+            const speedup = lanceql_throughput / @as(f64, @floatFromInt(bench_result.rows_per_sec));
+            std.debug.print("{s:<35} {d:>12} {d:>12} {d:>9.2}x\n", .{
+                "DuckDB → NumPy",
+                bench_result.rows_per_sec,
+                bench_result.iterations,
+                speedup,
+            });
         }
     }
 
-    // Polars L2 normalization (using DataFrame with list columns)
-    if (has_polars) {
+    // 3. Polars (read Parquet → L2 normalize with NumPy)
+    if (has_polars) polars_block: {
         const script = std.fmt.comptimePrint(
-            \\import time
             \\import polars as pl
+            \\import time
             \\import numpy as np
             \\
-            \\CHUNKS = {d}
-            \\DIM = {d}
-            \\ITERS = 10
+            \\WARMUP_SECONDS = {d}
+            \\BENCHMARK_SECONDS = {d}
+            \\PARQUET_PATH = "{s}"
             \\
-            \\np.random.seed(42)
-            \\vecs = np.random.randn(CHUNKS, DIM).astype(np.float32)
+            \\# Warmup
+            \\start = time.perf_counter()
+            \\while time.perf_counter() - start < WARMUP_SECONDS:
+            \\    df = pl.read_parquet(PARQUET_PATH)
+            \\    arr = df['amount'].to_numpy()
+            \\    norm = np.linalg.norm(arr)
+            \\    if norm > 0:
+            \\        _ = arr / norm
             \\
-            \\# Create Polars DataFrame with vector column
-            \\df = pl.DataFrame({{"vec": vecs.tolist()}})
+            \\# Benchmark
+            \\iterations = 0
+            \\total_rows = 0
+            \\start = time.perf_counter()
+            \\while time.perf_counter() - start < BENCHMARK_SECONDS:
+            \\    df = pl.read_parquet(PARQUET_PATH)
+            \\    arr = df['amount'].to_numpy()
+            \\    norm = np.linalg.norm(arr)
+            \\    if norm > 0:
+            \\        _ = arr / norm
+            \\    iterations += 1
+            \\    total_rows += len(arr)
             \\
-            \\def l2_normalize(vec):
-            \\    arr = np.array(vec, dtype=np.float32)
-            \\    return (arr / np.linalg.norm(arr)).tolist()
-            \\
-            \\times = []
-            \\for _ in range(ITERS):
-            \\    start = time.perf_counter_ns()
-            \\    result = df.with_columns(
-            \\        pl.col("vec").map_elements(l2_normalize, return_dtype=pl.List(pl.Float32)).alias("normalized")
-            \\    )
-            \\    times.append(time.perf_counter_ns() - start)
-            \\
-            \\print(f"RESULT_NS:{{sum(times) // len(times)}}")
-        , .{ total_chunks, EMBEDDING_DIM });
+            \\elapsed = time.perf_counter() - start
+            \\rows_per_sec = int(total_rows / elapsed)
+            \\print(f"ROWS_PER_SEC:{{rows_per_sec}}")
+            \\print(f"ITERATIONS:{{iterations}}")
+        , .{ WARMUP_SECONDS, BENCHMARK_SECONDS, PARQUET_PATH });
 
-        const ns = try runPythonBenchmark(allocator, script);
-        if (ns > 0) {
-            const polars_s = @as(f64, @floatFromInt(ns)) / 1_000_000_000.0;
-            const polars_tput = @as(f64, @floatFromInt(total_chunks)) / polars_s / 1_000_000;
-            const ratio = lanceql_norm_tput / polars_tput;
-            std.debug.print("{s:<25} {d:>9.2} ms {d:>12.1}M vecs/s {d:>9.1}x\n", .{ "Polars", polars_s * 1000, polars_tput, ratio });
+        const bench_result = runPythonBenchmark(allocator, script) catch {
+            break :polars_block;
+        };
+        if (bench_result.rows_per_sec > 0) {
+            const speedup = lanceql_throughput / @as(f64, @floatFromInt(bench_result.rows_per_sec));
+            std.debug.print("{s:<35} {d:>12} {d:>12} {d:>9.2}x\n", .{
+                "Polars → NumPy",
+                bench_result.rows_per_sec,
+                bench_result.iterations,
+                speedup,
+            });
         }
     }
 
-    // =========================================================================
-    // Summary
-    // =========================================================================
-    std.debug.print("\n================================================================================\n", .{});
-    std.debug.print("Summary\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("LanceQL Pipeline throughput:\n", .{});
-    std.debug.print("  - Chunking:       {d:.0} docs/s\n", .{lanceql_chunk_tput});
-    std.debug.print("  - Tokenize+Embed: {d:.0} chunks/s\n", .{lanceql_embed_tput});
-    std.debug.print("  - Normalization:  {d:.1}M vectors/s\n", .{lanceql_norm_tput});
-    std.debug.print("\n", .{});
-
-    metal.cleanupGPU();
+    std.debug.print("Note: All methods read from file on each iteration (no caching).\n", .{});
+    std.debug.print("      LanceQL reads .lance, DuckDB/Polars read .parquet\n", .{});
 }

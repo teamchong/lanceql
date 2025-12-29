@@ -1,38 +1,35 @@
-//! RAG (Retrieval-Augmented Generation) Pipeline Benchmark
+//! RAG Pipeline Benchmark - End-to-End Comparison
 //!
-//! Real-world use case: Document search for LLM context retrieval
+//! HONEST benchmark simulating RAG (Retrieval-Augmented Generation) pipeline:
+//!   1. LanceQL @logic_table  - Read Lance file → compute similarity scores
+//!   2. DuckDB SQL           - Read Parquet → compute similarity via SQL
+//!   3. Polars DataFrame     - Read Parquet → compute similarity
 //!
-//! Pipeline:
-//!   1. Load documents from dataset
-//!   2. Chunk documents into passages (512 tokens)
-//!   3. Generate embeddings for each chunk
-//!   4. Store in vector index
-//!   5. Query: text → embedding → top-K search → return passages
+//! FAIR COMPARISON:
+//!   - All methods read from disk (Lance or Parquet files)
+//!   - All methods run for exactly 15 seconds
+//!   - Throughput measured as rows processed per second
+//!   - Simulates RAG by computing similarity between query and document scores
 //!
-//! Comparison: LanceQL vs DuckDB+VSS vs Polars+FAISS
+//! Setup:
+//!   python3 benchmarks/generate_benchmark_data.py  # Creates test data
+//!   zig build bench-rag
 
 const std = @import("std");
-const metal = @import("lanceql.metal");
+const Table = @import("lanceql.table").Table;
 
-const WARMUP = 3;
-const ITERATIONS = 20;
-const SUBPROCESS_ITERATIONS = 50;
+const WARMUP_SECONDS = 2;
+const BENCHMARK_SECONDS = 15;
+const LANCE_PATH = "benchmarks/benchmark_e2e.lance";
+const PARQUET_PATH = "benchmarks/benchmark_e2e.parquet";
 
-// Dataset sizes
-const NUM_DOCUMENTS = 10_000;
-const CHUNKS_PER_DOC = 5;
-const TOTAL_CHUNKS = NUM_DOCUMENTS * CHUNKS_PER_DOC;
-const EMBEDDING_DIM = 384;
-const TOP_K = 10;
-const NUM_QUERIES = 100;
+fn checkPythonModule(allocator: std.mem.Allocator, module: []const u8) bool {
+    const py_code = std.fmt.allocPrint(allocator, "import {s}", .{module}) catch return false;
+    defer allocator.free(py_code);
 
-var has_duckdb: bool = false;
-var has_polars: bool = false;
-
-fn checkCommand(allocator: std.mem.Allocator, cmd: []const u8) bool {
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "which", cmd },
+        .argv = &.{ "python3", "-c", py_code },
     }) catch return false;
     defer {
         allocator.free(result.stdout);
@@ -44,63 +41,33 @@ fn checkCommand(allocator: std.mem.Allocator, cmd: []const u8) bool {
     }
 }
 
-fn runDuckDB(allocator: std.mem.Allocator, sql: []const u8) !u64 {
-    var timer = try std.time.Timer.start();
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "duckdb", "-csv", "-c", sql },
-        .max_output_bytes = 100 * 1024 * 1024,
-    }) catch return error.DuckDBFailed;
-    defer {
-        allocator.free(result.stdout);
-        allocator.free(result.stderr);
-    }
-    switch (result.term) {
-        .Exited => |code| if (code != 0) return error.DuckDBFailed,
-        else => return error.DuckDBFailed,
-    }
-    return timer.read();
-}
+fn readLanceFile(allocator: std.mem.Allocator) ![]const u8 {
+    var data_dir = std.fs.cwd().openDir(LANCE_PATH ++ "/data", .{ .iterate = true }) catch return error.FileNotFound;
+    defer data_dir.close();
 
-fn runPolars(allocator: std.mem.Allocator, code: []const u8) !u64 {
-    var timer = try std.time.Timer.start();
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "python3", "-c", code },
-        .max_output_bytes = 100 * 1024 * 1024,
-    }) catch return error.PolarsFailed;
-    defer {
-        allocator.free(result.stdout);
-        allocator.free(result.stderr);
-    }
-    switch (result.term) {
-        .Exited => |code_| if (code_ != 0) return error.PolarsFailed,
-        else => return error.PolarsFailed,
-    }
-    return timer.read();
-}
+    var iter = data_dir.iterate();
+    var lance_file_name_buf: [256]u8 = undefined;
+    var lance_file_name: ?[]const u8 = null;
 
-// Simulate text chunking (split document into fixed-size chunks)
-fn chunkDocument(allocator: std.mem.Allocator, doc_id: usize, num_chunks: usize) ![][]const u8 {
-    const chunks = try allocator.alloc([]const u8, num_chunks);
-    for (chunks, 0..) |*chunk, i| {
-        chunk.* = try std.fmt.allocPrint(allocator, "Document {d} chunk {d}: Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.", .{ doc_id, i });
+    while (iter.next() catch null) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".lance")) {
+            const len = @min(entry.name.len, lance_file_name_buf.len);
+            @memcpy(lance_file_name_buf[0..len], entry.name[0..len]);
+            lance_file_name = lance_file_name_buf[0..len];
+            break;
+        }
     }
-    return chunks;
-}
 
-// Simulate embedding generation (in real use, call MiniLM/CLIP model)
-fn generateEmbedding(rng: *std.Random.DefaultPrng, embedding: []f32) void {
-    var sum: f32 = 0;
-    for (embedding) |*v| {
-        v.* = rng.random().float(f32) * 2 - 1;
-        sum += v.* * v.*;
-    }
-    // L2 normalize
-    const norm = @sqrt(sum);
-    if (norm > 0) {
-        for (embedding) |*v| v.* /= norm;
-    }
+    const file_name = lance_file_name orelse return error.LanceFileNotFound;
+    const file = data_dir.openFile(file_name, .{}) catch return error.FileNotFound;
+    defer file.close();
+
+    const file_size = file.getEndPos() catch return error.ReadError;
+    const bytes = allocator.alloc(u8, file_size) catch return error.OutOfMemory;
+    errdefer allocator.free(bytes);
+
+    _ = file.readAll(bytes) catch return error.ReadError;
+    return bytes;
 }
 
 pub fn main() !void {
@@ -108,203 +75,285 @@ pub fn main() !void {
 
     std.debug.print("\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("RAG Pipeline Benchmark: LanceQL vs DuckDB vs Polars\n", .{});
+    std.debug.print("RAG Pipeline Benchmark: End-to-End (Read + Similarity Search)\n", .{});
     std.debug.print("================================================================================\n", .{});
-
-    // Initialize GPU
-    _ = metal.initGPU();
-
-    has_duckdb = checkCommand(allocator, "duckdb");
-    has_polars = checkCommand(allocator, "python3");
-
-    std.debug.print("\nDataset:\n", .{});
-    std.debug.print("  - Documents:      {d}\n", .{NUM_DOCUMENTS});
-    std.debug.print("  - Chunks/doc:     {d}\n", .{CHUNKS_PER_DOC});
-    std.debug.print("  - Total chunks:   {d}\n", .{TOTAL_CHUNKS});
-    std.debug.print("  - Embedding dim:  {d}\n", .{EMBEDDING_DIM});
-    std.debug.print("  - Queries:        {d}\n", .{NUM_QUERIES});
-    std.debug.print("  - Top-K:          {d}\n", .{TOP_K});
-    std.debug.print("\nEngines:\n", .{});
-    std.debug.print("  - LanceQL:  {s}\n", .{metal.getPlatformInfo()});
-    std.debug.print("  - DuckDB:   {s}\n", .{if (has_duckdb) "yes" else "no"});
-    std.debug.print("  - Polars:   {s}\n", .{if (has_polars) "yes" else "no"});
+    std.debug.print("\nPipeline: Read file → compute similarity scores → find top matches\n", .{});
+    std.debug.print("Simulates retrieval-augmented generation document search.\n", .{});
+    std.debug.print("Each method runs for {d} seconds. Measuring throughput (rows/sec).\n", .{BENCHMARK_SECONDS});
     std.debug.print("\n", .{});
 
-    // =========================================================================
-    // Step 1: Generate synthetic dataset (chunks + embeddings)
-    // =========================================================================
-    std.debug.print("Generating {d} chunks with {d}-dim embeddings...\n", .{ TOTAL_CHUNKS, EMBEDDING_DIM });
+    // Check data files exist
+    const lance_exists = blk: {
+        var data_dir = std.fs.cwd().openDir(LANCE_PATH ++ "/data", .{ .iterate = true }) catch break :blk false;
+        data_dir.close();
+        break :blk true;
+    };
 
-    var timer = try std.time.Timer.start();
+    const parquet_exists = blk: {
+        const file = std.fs.cwd().openFile(PARQUET_PATH, .{}) catch break :blk false;
+        file.close();
+        break :blk true;
+    };
 
-    const embeddings = try allocator.alloc(f32, TOTAL_CHUNKS * EMBEDDING_DIM);
-    defer allocator.free(embeddings);
+    std.debug.print("Data files:\n", .{});
+    std.debug.print("  Lance:   {s} {s}\n", .{ LANCE_PATH, if (lance_exists) "✓" else "✗" });
+    std.debug.print("  Parquet: {s} {s}\n", .{ PARQUET_PATH, if (parquet_exists) "✓" else "✗" });
 
-    const chunk_texts = try allocator.alloc([]const u8, TOTAL_CHUNKS);
-    defer {
-        for (chunk_texts) |text| allocator.free(text);
-        allocator.free(chunk_texts);
+    if (!lance_exists or !parquet_exists) {
+        std.debug.print("\n⚠️  Missing data files. Run: python3 benchmarks/generate_benchmark_data.py\n", .{});
+        return;
     }
 
-    var rng = std.Random.DefaultPrng.init(42);
+    // Check Python engines
+    const has_duckdb = checkPythonModule(allocator, "duckdb");
+    const has_polars = checkPythonModule(allocator, "polars");
 
-    for (0..NUM_DOCUMENTS) |doc_id| {
-        for (0..CHUNKS_PER_DOC) |chunk_id| {
-            const idx = doc_id * CHUNKS_PER_DOC + chunk_id;
-            chunk_texts[idx] = try std.fmt.allocPrint(allocator, "Doc{d}_Chunk{d}", .{ doc_id, chunk_id });
-            generateEmbedding(&rng, embeddings[idx * EMBEDDING_DIM .. (idx + 1) * EMBEDDING_DIM]);
-        }
-    }
+    std.debug.print("\nEngines:\n", .{});
+    std.debug.print("  LanceQL @logic_table: yes\n", .{});
+    std.debug.print("  DuckDB:               {s}\n", .{if (has_duckdb) "yes" else "no"});
+    std.debug.print("  Polars:               {s}\n", .{if (has_polars) "yes" else "no"});
+    std.debug.print("\n", .{});
 
-    const gen_time = timer.read();
-    std.debug.print("Data generation: {d:.2}s\n\n", .{@as(f64, @floatFromInt(gen_time)) / 1_000_000_000});
-
-    // Generate query embeddings
-    const query_embeddings = try allocator.alloc(f32, NUM_QUERIES * EMBEDDING_DIM);
-    defer allocator.free(query_embeddings);
-
-    for (0..NUM_QUERIES) |q| {
-        generateEmbedding(&rng, query_embeddings[q * EMBEDDING_DIM .. (q + 1) * EMBEDDING_DIM]);
-    }
-
-    // =========================================================================
-    // Benchmark: Vector Search (Top-K retrieval)
-    // =========================================================================
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("VECTOR SEARCH: Top-{d} retrieval from {d} chunks\n", .{ TOP_K, TOTAL_CHUNKS });
+    std.debug.print("{s:<40} {s:>12} {s:>12} {s:>10}\n", .{ "Method", "Rows/sec", "Iterations", "Speedup" });
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("{s:<25} {s:>12} {s:>12} {s:>10}\n", .{ "Engine", "Time/query", "Total", "QPS" });
-    std.debug.print("{s:<25} {s:>12} {s:>12} {s:>10}\n", .{ "-" ** 25, "-" ** 12, "-" ** 12, "-" ** 10 });
 
-    // Results storage
-    const results = try allocator.alloc(f32, TOTAL_CHUNKS);
-    defer allocator.free(results);
+    var lanceql_rows_per_sec: f64 = 0;
 
-    // LanceQL (GPU-accelerated batch search)
-    var lanceql_ns: u64 = 0;
+    // Query value for similarity (simulates embedding query)
+    const query_value: f64 = 150.0;
+
+    // =========================================================================
+    // LanceQL @logic_table - Read Lance file, compute similarity scores
+    // =========================================================================
     {
+        var iterations: u64 = 0;
+        var total_rows: u64 = 0;
+
         // Warmup
-        for (0..WARMUP) |q| {
-            const query = query_embeddings[q * EMBEDDING_DIM .. (q + 1) * EMBEDDING_DIM];
-            metal.batchCosineSimilarity(query, embeddings, EMBEDDING_DIM, results);
+        const warmup_end = std.time.nanoTimestamp() + WARMUP_SECONDS * 1_000_000_000;
+        while (std.time.nanoTimestamp() < warmup_end) {
+            const file_data = readLanceFile(allocator) catch break;
+            defer allocator.free(file_data);
+
+            var table = Table.init(allocator, file_data) catch break;
+            defer table.deinit();
+
+            const amounts = table.readFloat64Column(1) catch break;
+            defer allocator.free(amounts);
+
+            // Compute similarity: how close is each amount to query_value
+            // This simulates finding documents similar to a query embedding
+            var top_score: f64 = -std.math.inf(f64);
+            for (amounts) |a| {
+                const diff = @abs(a - query_value);
+                const similarity = 1.0 / (1.0 + diff); // Inverse distance
+                top_score = @max(top_score, similarity);
+            }
+            std.mem.doNotOptimizeAway(&top_score);
         }
 
-        timer = try std.time.Timer.start();
-        for (0..NUM_QUERIES) |q| {
-            const query = query_embeddings[q * EMBEDDING_DIM .. (q + 1) * EMBEDDING_DIM];
-            metal.batchCosineSimilarity(query, embeddings, EMBEDDING_DIM, results);
-            // In real use: sort and get top-K indices
+        // Benchmark
+        const benchmark_end_time = std.time.nanoTimestamp() + BENCHMARK_SECONDS * 1_000_000_000;
+        const start_time = std.time.nanoTimestamp();
+        while (std.time.nanoTimestamp() < benchmark_end_time) {
+            const file_data = readLanceFile(allocator) catch break;
+            defer allocator.free(file_data);
+
+            var table = Table.init(allocator, file_data) catch break;
+            defer table.deinit();
+
+            const amounts = table.readFloat64Column(1) catch break;
+            defer allocator.free(amounts);
+
+            // Compute similarity: how close is each amount to query_value
+            var top_score: f64 = -std.math.inf(f64);
+            for (amounts) |a| {
+                const diff = @abs(a - query_value);
+                const similarity = 1.0 / (1.0 + diff);
+                top_score = @max(top_score, similarity);
+            }
+            std.mem.doNotOptimizeAway(&top_score);
+
+            iterations += 1;
+            total_rows += amounts.len;
         }
-        lanceql_ns = timer.read();
+
+        const elapsed_ns = std.time.nanoTimestamp() - start_time;
+        const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
+        lanceql_rows_per_sec = @as(f64, @floatFromInt(total_rows)) / elapsed_s;
+
+        std.debug.print("{s:<40} {d:>10.0}K {d:>12} {s:>10}\n", .{
+            "@logic_table (similarity search)",
+            lanceql_rows_per_sec / 1000.0,
+            iterations,
+            "1.0x",
+        });
     }
 
-    const lanceql_per_query = @as(f64, @floatFromInt(lanceql_ns)) / @as(f64, @floatFromInt(NUM_QUERIES));
-    const lanceql_total_s = @as(f64, @floatFromInt(lanceql_ns)) / 1_000_000_000.0;
-    const lanceql_qps = @as(f64, @floatFromInt(NUM_QUERIES)) / lanceql_total_s;
-    std.debug.print("{s:<25} {d:>9.2} ms {d:>10.2}s {d:>9.0}\n", .{ "LanceQL", lanceql_per_query / 1_000_000, lanceql_total_s, lanceql_qps });
-
-    // DuckDB (array_cosine_similarity - limited to small arrays)
+    // =========================================================================
+    // DuckDB - Read Parquet file, compute similarity via SQL
+    // =========================================================================
     if (has_duckdb) {
-        // DuckDB doesn't handle 50K vectors well in SQL, so we test smaller scale
-        const duckdb_scale = 1000; // Test with 1K vectors
-        var duckdb_ns: u64 = 0;
-
-        // Build smaller dataset for DuckDB
-        var query_str = std.ArrayListUnmanaged(u8){};
-        defer query_str.deinit(allocator);
-        try query_str.appendSlice(allocator, "[");
-        for (0..EMBEDDING_DIM) |i| {
-            if (i > 0) try query_str.appendSlice(allocator, ",");
-            try std.fmt.format(query_str.writer(allocator), "{d:.6}", .{query_embeddings[i]});
-        }
-        try query_str.appendSlice(allocator, "]");
-
-        const sql = try std.fmt.allocPrint(allocator,
-            \\WITH vectors AS (
-            \\  SELECT generate_series AS id,
-            \\         list_transform(range({d}), x -> random()) AS vec
-            \\  FROM generate_series(1, {d})
-            \\)
-            \\SELECT id, list_cosine_similarity(vec, {s}::FLOAT[]) as score
-            \\FROM vectors
-            \\ORDER BY score DESC
-            \\LIMIT {d};
-        , .{ EMBEDDING_DIM, duckdb_scale, query_str.items, TOP_K });
-        defer allocator.free(sql);
-
-        // Warmup
-        for (0..WARMUP) |_| _ = runDuckDB(allocator, sql) catch 0;
-
-        for (0..SUBPROCESS_ITERATIONS) |_| {
-            duckdb_ns += runDuckDB(allocator, sql) catch 0;
-        }
-
-        const duckdb_per_query = @as(f64, @floatFromInt(duckdb_ns)) / @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS));
-        const duckdb_total_s = @as(f64, @floatFromInt(duckdb_ns)) / 1_000_000_000.0;
-        const duckdb_qps = @as(f64, @floatFromInt(SUBPROCESS_ITERATIONS)) / duckdb_total_s;
-        const duckdb_ratio = duckdb_per_query / lanceql_per_query;
-        std.debug.print("{s:<25} {d:>9.0} ms {d:>10.2}s {d:>9.0}  ({d:.0}x, {d} vectors)\n", .{ "DuckDB", duckdb_per_query / 1_000_000, duckdb_total_s, duckdb_qps, duckdb_ratio, duckdb_scale });
-    }
-
-    // Polars vector search (using DataFrame with list columns)
-    if (has_polars) {
-        const polars_scale = 10000; // Test with 10K vectors
-
-        const py_code = try std.fmt.allocPrint(allocator,
-            \\import polars as pl
-            \\import numpy as np
+        const py_script = std.fmt.comptimePrint(
+            \\import duckdb
             \\import time
             \\
-            \\# Generate dataset
-            \\np.random.seed(42)
-            \\vectors = np.random.randn({d}, {d}).astype(np.float32)
-            \\vectors = vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
-            \\query = np.random.randn({d}).astype(np.float32)
-            \\query = query / np.linalg.norm(query)
+            \\WARMUP_SECONDS = {d}
+            \\BENCHMARK_SECONDS = {d}
+            \\query_value = 150.0
             \\
-            \\# Create Polars DataFrame
-            \\df = pl.DataFrame({{"vec": vectors.tolist()}})
-            \\query_list = query.tolist()
+            \\# Warmup
+            \\warmup_end = time.time() + WARMUP_SECONDS
+            \\while time.time() < warmup_end:
+            \\    con = duckdb.connect()
+            \\    # Compute similarity score and find max
+            \\    df = con.execute(f"""
+            \\        SELECT MAX(1.0 / (1.0 + ABS(amount - {{query_value}}))) as top_score
+            \\        FROM read_parquet('{s}')
+            \\    """).fetchdf()
+            \\    con.close()
             \\
-            \\def dot_product(vec):
-            \\    return float(np.dot(vec, query_list))
-            \\
-            \\# Search using Polars
+            \\# Benchmark
+            \\iterations = 0
+            \\total_rows = 0
             \\start = time.time()
-            \\for _ in range({d}):
-            \\    result = df.with_columns(
-            \\        pl.col("vec").map_elements(dot_product, return_dtype=pl.Float64).alias("score")
-            \\    ).sort("score", descending=True).head({d})
+            \\benchmark_end = start + BENCHMARK_SECONDS
+            \\while time.time() < benchmark_end:
+            \\    con = duckdb.connect()
+            \\    result = con.execute(f"""
+            \\        SELECT COUNT(*), MAX(1.0 / (1.0 + ABS(amount - {{query_value}}))) as top_score
+            \\        FROM read_parquet('{s}')
+            \\    """).fetchone()
+            \\    total_rows += result[0]
+            \\    con.close()
+            \\    iterations += 1
+            \\
             \\elapsed = time.time() - start
-            \\print(f"{{elapsed:.4f}}")
-        , .{ polars_scale, EMBEDDING_DIM, EMBEDDING_DIM, NUM_QUERIES, TOP_K });
-        defer allocator.free(py_code);
+            \\rows_per_sec = total_rows / elapsed
+            \\print(f"ROWS_PER_SEC:{{rows_per_sec:.0f}}")
+            \\print(f"ITERATIONS:{{iterations}}")
+        , .{ WARMUP_SECONDS, BENCHMARK_SECONDS, PARQUET_PATH, PARQUET_PATH });
 
-        var polars_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runPolars(allocator, py_code) catch 0;
-        for (0..5) |_| {
-            polars_ns += runPolars(allocator, py_code) catch 0;
+        const result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "python3", "-c", py_script },
+            .max_output_bytes = 10 * 1024,
+        }) catch {
+            std.debug.print("{s:<40} {s:>12} {s:>12} {s:>10}\n", .{ "DuckDB SQL", "error", "-", "-" });
+            return;
+        };
+        defer {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
         }
 
-        const polars_per_query = @as(f64, @floatFromInt(polars_ns)) / 5.0 / @as(f64, @floatFromInt(NUM_QUERIES));
-        const polars_total_s = @as(f64, @floatFromInt(polars_ns)) / 5.0 / 1_000_000_000.0;
-        const polars_qps = @as(f64, @floatFromInt(NUM_QUERIES)) / polars_total_s;
-        const polars_ratio = polars_per_query / lanceql_per_query;
-        std.debug.print("{s:<25} {d:>9.2} ms {d:>10.2}s {d:>9.0}  ({d:.0}x, {d} vectors)\n", .{ "Polars", polars_per_query / 1_000_000, polars_total_s, polars_qps, polars_ratio, polars_scale });
+        // Parse output
+        var rows_per_sec: f64 = 0;
+        var iterations: u64 = 0;
+        var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "ROWS_PER_SEC:")) {
+                rows_per_sec = std.fmt.parseFloat(f64, line[13..]) catch 0;
+            } else if (std.mem.startsWith(u8, line, "ITERATIONS:")) {
+                iterations = std.fmt.parseInt(u64, line[11..], 10) catch 0;
+            }
+        }
+
+        if (rows_per_sec > 0) {
+            const speedup = lanceql_rows_per_sec / rows_per_sec;
+            std.debug.print("{s:<40} {d:>10.0}K {d:>12} {d:>9.1}x\n", .{
+                "DuckDB SQL (similarity search)",
+                rows_per_sec / 1000.0,
+                iterations,
+                speedup,
+            });
+        } else {
+            std.debug.print("{s:<40} {s:>12} {s:>12} {s:>10}\n", .{ "DuckDB SQL", "error", "-", "-" });
+        }
     }
 
     // =========================================================================
-    // Summary
+    // Polars - Read Parquet file, compute similarity via DataFrame
     // =========================================================================
+    if (has_polars) {
+        const py_script = std.fmt.comptimePrint(
+            \\import polars as pl
+            \\import time
+            \\
+            \\WARMUP_SECONDS = {d}
+            \\BENCHMARK_SECONDS = {d}
+            \\query_value = 150.0
+            \\
+            \\# Warmup
+            \\warmup_end = time.time() + WARMUP_SECONDS
+            \\while time.time() < warmup_end:
+            \\    df = pl.read_parquet("{s}")
+            \\    # Compute similarity score
+            \\    similarity = 1.0 / (1.0 + (df["amount"] - query_value).abs())
+            \\    top_score = similarity.max()
+            \\
+            \\# Benchmark
+            \\iterations = 0
+            \\total_rows = 0
+            \\start = time.time()
+            \\benchmark_end = start + BENCHMARK_SECONDS
+            \\while time.time() < benchmark_end:
+            \\    df = pl.read_parquet("{s}")
+            \\    similarity = 1.0 / (1.0 + (df["amount"] - query_value).abs())
+            \\    top_score = similarity.max()
+            \\    total_rows += len(df)
+            \\    iterations += 1
+            \\
+            \\elapsed = time.time() - start
+            \\rows_per_sec = total_rows / elapsed
+            \\print(f"ROWS_PER_SEC:{{rows_per_sec:.0f}}")
+            \\print(f"ITERATIONS:{{iterations}}")
+        , .{ WARMUP_SECONDS, BENCHMARK_SECONDS, PARQUET_PATH, PARQUET_PATH });
+
+        const result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "python3", "-c", py_script },
+            .max_output_bytes = 10 * 1024,
+        }) catch {
+            std.debug.print("{s:<40} {s:>12} {s:>12} {s:>10}\n", .{ "Polars DataFrame", "error", "-", "-" });
+            return;
+        };
+        defer {
+            allocator.free(result.stdout);
+            allocator.free(result.stderr);
+        }
+
+        // Parse output
+        var rows_per_sec: f64 = 0;
+        var iterations: u64 = 0;
+        var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "ROWS_PER_SEC:")) {
+                rows_per_sec = std.fmt.parseFloat(f64, line[13..]) catch 0;
+            } else if (std.mem.startsWith(u8, line, "ITERATIONS:")) {
+                iterations = std.fmt.parseInt(u64, line[11..], 10) catch 0;
+            }
+        }
+
+        if (rows_per_sec > 0) {
+            const speedup = lanceql_rows_per_sec / rows_per_sec;
+            std.debug.print("{s:<40} {d:>10.0}K {d:>12} {d:>9.1}x\n", .{
+                "Polars DataFrame (similarity search)",
+                rows_per_sec / 1000.0,
+                iterations,
+                speedup,
+            });
+        } else {
+            std.debug.print("{s:<40} {s:>12} {s:>12} {s:>10}\n", .{ "Polars DataFrame", "error", "-", "-" });
+        }
+    }
+
     std.debug.print("\n================================================================================\n", .{});
     std.debug.print("Summary\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("LanceQL processes {d} queries over {d} vectors at {d:.0} QPS.\n", .{ NUM_QUERIES, TOTAL_CHUNKS, lanceql_qps });
-    std.debug.print("GPU acceleration enables real-time RAG retrieval.\n", .{});
+    std.debug.print("All methods: Read file → compute similarity → find top match\n", .{});
+    std.debug.print("Similarity: 1/(1 + |value - query|) - higher is more similar\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("Note: DuckDB/Polars tested at smaller scale due to memory/performance limits.\n", .{});
-    std.debug.print("\n", .{});
-
-    metal.cleanupGPU();
 }

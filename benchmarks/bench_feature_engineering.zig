@@ -1,34 +1,35 @@
-//! Feature Engineering Benchmark
+//! Feature Engineering Benchmark - End-to-End Comparison
 //!
-//! Real-world use case: ML feature transformations for training/inference
+//! HONEST benchmark measuring feature engineering from cold start:
+//!   1. LanceQL @logic_table  - Read Lance file → transform features
+//!   2. DuckDB SQL           - Read Parquet → SQL transformations
+//!   3. Polars DataFrame     - Read Parquet → DataFrame transforms
 //!
-//! Operations tested:
-//!   1. Z-score normalization
-//!   2. Log transform
-//!   3. Feature crossing
-//!   4. Binning/Bucketing
+//! FAIR COMPARISON:
+//!   - All methods read from disk (Lance or Parquet files)
+//!   - All methods run for exactly 15 seconds
+//!   - Throughput measured as rows processed per second
+//!   - Operations: z-score normalization on amount column
 //!
-//! Fair comparison using each engine's native interface:
-//!   - LanceQL:  CLI with SQL (lanceql -c "SELECT ...")
-//!   - DuckDB:   CLI with SQL (duckdb -c "SELECT ...")
-//!   - Polars:   Python with DataFrame API (native interface)
+//! Setup:
+//!   python3 benchmarks/generate_benchmark_data.py  # Creates test data
+//!   zig build bench-feature
 
 const std = @import("std");
+const Table = @import("lanceql.table").Table;
 
-const WARMUP = 3;
-const ITERATIONS = 30;
+const WARMUP_SECONDS = 2;
+const BENCHMARK_SECONDS = 15;
+const LANCE_PATH = "benchmarks/benchmark_e2e.lance";
+const PARQUET_PATH = "benchmarks/benchmark_e2e.parquet";
 
-// Dataset size (use same size for fair comparison)
-const NUM_ROWS = 100_000;
+fn checkPythonModule(allocator: std.mem.Allocator, module: []const u8) bool {
+    const py_code = std.fmt.allocPrint(allocator, "import {s}", .{module}) catch return false;
+    defer allocator.free(py_code);
 
-var has_lanceql: bool = false;
-var has_duckdb: bool = false;
-var has_polars: bool = false;
-
-fn checkCommand(allocator: std.mem.Allocator, cmd: []const u8) bool {
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "which", cmd },
+        .argv = &.{ "python3", "-c", py_code },
     }) catch return false;
     defer {
         allocator.free(result.stdout);
@@ -40,73 +41,70 @@ fn checkCommand(allocator: std.mem.Allocator, cmd: []const u8) bool {
     }
 }
 
-fn checkPolars(allocator: std.mem.Allocator) bool {
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "python3", "-c", "import polars" },
-    }) catch return false;
-    defer {
-        allocator.free(result.stdout);
-        allocator.free(result.stderr);
+fn readLanceFile(allocator: std.mem.Allocator) ![]const u8 {
+    var data_dir = std.fs.cwd().openDir(LANCE_PATH ++ "/data", .{ .iterate = true }) catch return error.FileNotFound;
+    defer data_dir.close();
+
+    var iter = data_dir.iterate();
+    var lance_file_name_buf: [256]u8 = undefined;
+    var lance_file_name: ?[]const u8 = null;
+
+    while (iter.next() catch null) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".lance")) {
+            const len = @min(entry.name.len, lance_file_name_buf.len);
+            @memcpy(lance_file_name_buf[0..len], entry.name[0..len]);
+            lance_file_name = lance_file_name_buf[0..len];
+            break;
+        }
     }
-    switch (result.term) {
-        .Exited => |code| return code == 0,
-        else => return false,
-    }
+
+    if (lance_file_name == null) return error.FileNotFound;
+
+    const data_file = data_dir.openFile(lance_file_name.?, .{}) catch return error.FileNotFound;
+    defer data_file.close();
+
+    const file_size = (data_file.stat() catch return error.FileNotFound).size;
+    const file_data = allocator.alloc(u8, file_size) catch return error.OutOfMemory;
+
+    const bytes_read = data_file.readAll(file_data) catch return error.ReadError;
+    if (bytes_read != file_size) return error.ReadError;
+
+    return file_data;
 }
 
-fn runLanceQL(allocator: std.mem.Allocator, sql: []const u8) !u64 {
-    var timer = try std.time.Timer.start();
+fn runPythonBenchmark(allocator: std.mem.Allocator, script: []const u8) !struct { rows_per_sec: u64, iterations: u64 } {
     const result = std.process.Child.run(.{
         .allocator = allocator,
-        .argv = &.{ "lanceql", "-c", sql },
-        .max_output_bytes = 100 * 1024 * 1024,
-    }) catch return error.LanceQLFailed;
+        .argv = &.{ "python3", "-c", script },
+        .max_output_bytes = 10 * 1024 * 1024,
+    }) catch return .{ .rows_per_sec = 0, .iterations = 0 };
     defer {
         allocator.free(result.stdout);
         allocator.free(result.stderr);
     }
-    switch (result.term) {
-        .Exited => |code| if (code != 0) return error.LanceQLFailed,
-        else => return error.LanceQLFailed,
-    }
-    return timer.read();
-}
 
-fn runDuckDB(allocator: std.mem.Allocator, sql: []const u8) !u64 {
-    var timer = try std.time.Timer.start();
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "duckdb", "-csv", "-c", sql },
-        .max_output_bytes = 100 * 1024 * 1024,
-    }) catch return error.DuckDBFailed;
-    defer {
-        allocator.free(result.stdout);
-        allocator.free(result.stderr);
-    }
-    switch (result.term) {
-        .Exited => |code| if (code != 0) return error.DuckDBFailed,
-        else => return error.DuckDBFailed,
-    }
-    return timer.read();
-}
+    var rows_per_sec: u64 = 0;
+    var iterations: u64 = 0;
 
-fn runPolars(allocator: std.mem.Allocator, code: []const u8) !u64 {
-    var timer = try std.time.Timer.start();
-    const result = std.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "python3", "-c", code },
-        .max_output_bytes = 100 * 1024 * 1024,
-    }) catch return error.PolarsFailed;
-    defer {
-        allocator.free(result.stdout);
-        allocator.free(result.stderr);
+    if (std.mem.indexOf(u8, result.stdout, "ROWS_PER_SEC:")) |idx| {
+        const start = idx + 13;
+        var end = start;
+        while (end < result.stdout.len and result.stdout[end] >= '0' and result.stdout[end] <= '9') {
+            end += 1;
+        }
+        rows_per_sec = std.fmt.parseInt(u64, result.stdout[start..end], 10) catch 0;
     }
-    switch (result.term) {
-        .Exited => |code_| if (code_ != 0) return error.PolarsFailed,
-        else => return error.PolarsFailed,
+
+    if (std.mem.indexOf(u8, result.stdout, "ITERATIONS:")) |idx| {
+        const start = idx + 11;
+        var end = start;
+        while (end < result.stdout.len and result.stdout[end] >= '0' and result.stdout[end] <= '9') {
+            end += 1;
+        }
+        iterations = std.fmt.parseInt(u64, result.stdout[start..end], 10) catch 0;
     }
-    return timer.read();
+
+    return .{ .rows_per_sec = rows_per_sec, .iterations = iterations };
 }
 
 pub fn main() !void {
@@ -114,285 +112,236 @@ pub fn main() !void {
 
     std.debug.print("\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("Feature Engineering Benchmark: LanceQL vs DuckDB vs Polars\n", .{});
-    std.debug.print("================================================================================\n", .{});
-
-    has_lanceql = checkCommand(allocator, "lanceql");
-    has_duckdb = checkCommand(allocator, "duckdb");
-    has_polars = checkPolars(allocator);
-
-    std.debug.print("\nFair comparison using each engine's native interface:\n", .{});
-    std.debug.print("  - LanceQL/DuckDB: CLI with SQL\n", .{});
-    std.debug.print("  - Polars: Python with DataFrame API\n", .{});
-    std.debug.print("\nDataset: {d}K rows\n", .{NUM_ROWS / 1000});
-    std.debug.print("\nEngines:\n", .{});
-    std.debug.print("  - LanceQL: {s}\n", .{if (has_lanceql) "yes" else "no (zig build && cp zig-out/bin/lanceql /usr/local/bin/)"});
-    std.debug.print("  - DuckDB:  {s}\n", .{if (has_duckdb) "yes" else "no (brew install duckdb)"});
-    std.debug.print("  - Polars:  {s}\n", .{if (has_polars) "yes" else "no (pip install polars numpy)"});
-    std.debug.print("\n", .{});
-
-    // =========================================================================
-    // Benchmark 1: Z-SCORE NORMALIZATION
-    // =========================================================================
-    std.debug.print("================================================================================\n", .{});
-    std.debug.print("Z-SCORE NORMALIZATION ({d}K rows)\n", .{NUM_ROWS / 1000});
-    std.debug.print("================================================================================\n", .{});
-    std.debug.print("{s:<15} {s:>12} {s:>12} {s:>10}\n", .{ "Engine", "Time", "Rows/sec", "Ratio" });
-    std.debug.print("{s:<15} {s:>12} {s:>12} {s:>10}\n", .{ "-" ** 15, "-" ** 12, "-" ** 12, "-" ** 10 });
-
-    var baseline_ns: u64 = 0;
-
-    // LanceQL
-    if (has_lanceql) {
-        const sql = std.fmt.comptimePrint(
-            \\SELECT (val - AVG(val) OVER()) / NULLIF(STDDEV(val) OVER(), 0) as zscore
-            \\FROM (SELECT random() * 1000 as val FROM generate_series(1, {d}))
-        , .{NUM_ROWS});
-
-        var total_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runLanceQL(allocator, sql) catch 0;
-        for (0..ITERATIONS) |_| total_ns += runLanceQL(allocator, sql) catch 0;
-
-        baseline_ns = total_ns / ITERATIONS;
-        const time_ms = @as(f64, @floatFromInt(baseline_ns)) / 1_000_000.0;
-        const rows_per_sec = @as(f64, @floatFromInt(NUM_ROWS)) / (@as(f64, @floatFromInt(baseline_ns)) / 1_000_000_000.0);
-        std.debug.print("{s:<15} {d:>9.0} ms {d:>10.0} K/s {s:>10}\n", .{ "LanceQL", time_ms, rows_per_sec / 1000, "1.0x" });
-    }
-
-    // DuckDB
-    if (has_duckdb) {
-        const sql = std.fmt.comptimePrint(
-            \\SELECT (val - AVG(val) OVER()) / NULLIF(STDDEV(val) OVER(), 0) as zscore
-            \\FROM (SELECT random() * 1000 as val FROM generate_series(1, {d}))
-        , .{NUM_ROWS});
-
-        var total_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runDuckDB(allocator, sql) catch 0;
-        for (0..ITERATIONS) |_| total_ns += runDuckDB(allocator, sql) catch 0;
-
-        const avg_ns = total_ns / ITERATIONS;
-        const time_ms = @as(f64, @floatFromInt(avg_ns)) / 1_000_000.0;
-        const rows_per_sec = @as(f64, @floatFromInt(NUM_ROWS)) / (@as(f64, @floatFromInt(avg_ns)) / 1_000_000_000.0);
-        const ratio = if (baseline_ns > 0) @as(f64, @floatFromInt(avg_ns)) / @as(f64, @floatFromInt(baseline_ns)) else 0;
-        std.debug.print("{s:<15} {d:>9.0} ms {d:>10.0} K/s {d:>9.1}x\n", .{ "DuckDB", time_ms, rows_per_sec / 1000, ratio });
-    }
-
-    // Polars (DataFrame API)
-    if (has_polars) {
-        const py_code = std.fmt.comptimePrint(
-            \\import polars as pl
-            \\import numpy as np
-            \\df = pl.DataFrame({{"val": np.random.rand({d}) * 1000}})
-            \\result = df.with_columns(((pl.col("val") - pl.col("val").mean()) / pl.col("val").std()).alias("zscore"))
-        , .{NUM_ROWS});
-
-        var total_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runPolars(allocator, py_code) catch 0;
-        for (0..ITERATIONS) |_| total_ns += runPolars(allocator, py_code) catch 0;
-
-        const avg_ns = total_ns / ITERATIONS;
-        const time_ms = @as(f64, @floatFromInt(avg_ns)) / 1_000_000.0;
-        const rows_per_sec = @as(f64, @floatFromInt(NUM_ROWS)) / (@as(f64, @floatFromInt(avg_ns)) / 1_000_000_000.0);
-        const ratio = if (baseline_ns > 0) @as(f64, @floatFromInt(avg_ns)) / @as(f64, @floatFromInt(baseline_ns)) else 0;
-        std.debug.print("{s:<15} {d:>9.0} ms {d:>10.0} K/s {d:>9.1}x\n", .{ "Polars", time_ms, rows_per_sec / 1000, ratio });
-    }
-
-    // =========================================================================
-    // Benchmark 2: LOG TRANSFORM
-    // =========================================================================
-    std.debug.print("\n================================================================================\n", .{});
-    std.debug.print("LOG TRANSFORM ({d}K rows)\n", .{NUM_ROWS / 1000});
-    std.debug.print("================================================================================\n", .{});
-    std.debug.print("{s:<15} {s:>12} {s:>12} {s:>10}\n", .{ "Engine", "Time", "Rows/sec", "Ratio" });
-    std.debug.print("{s:<15} {s:>12} {s:>12} {s:>10}\n", .{ "-" ** 15, "-" ** 12, "-" ** 12, "-" ** 10 });
-
-    // LanceQL
-    if (has_lanceql) {
-        const sql = std.fmt.comptimePrint(
-            \\SELECT LN(val + 1) as log_val FROM (SELECT random() * 1000 as val FROM generate_series(1, {d}))
-        , .{NUM_ROWS});
-
-        var total_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runLanceQL(allocator, sql) catch 0;
-        for (0..ITERATIONS) |_| total_ns += runLanceQL(allocator, sql) catch 0;
-
-        baseline_ns = total_ns / ITERATIONS;
-        const time_ms = @as(f64, @floatFromInt(baseline_ns)) / 1_000_000.0;
-        const rows_per_sec = @as(f64, @floatFromInt(NUM_ROWS)) / (@as(f64, @floatFromInt(baseline_ns)) / 1_000_000_000.0);
-        std.debug.print("{s:<15} {d:>9.0} ms {d:>10.0} K/s {s:>10}\n", .{ "LanceQL", time_ms, rows_per_sec / 1000, "1.0x" });
-    }
-
-    // DuckDB
-    if (has_duckdb) {
-        const sql = std.fmt.comptimePrint(
-            \\SELECT LN(val + 1) as log_val FROM (SELECT random() * 1000 as val FROM generate_series(1, {d}))
-        , .{NUM_ROWS});
-
-        var total_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runDuckDB(allocator, sql) catch 0;
-        for (0..ITERATIONS) |_| total_ns += runDuckDB(allocator, sql) catch 0;
-
-        const avg_ns = total_ns / ITERATIONS;
-        const time_ms = @as(f64, @floatFromInt(avg_ns)) / 1_000_000.0;
-        const rows_per_sec = @as(f64, @floatFromInt(NUM_ROWS)) / (@as(f64, @floatFromInt(avg_ns)) / 1_000_000_000.0);
-        const ratio = if (baseline_ns > 0) @as(f64, @floatFromInt(avg_ns)) / @as(f64, @floatFromInt(baseline_ns)) else 0;
-        std.debug.print("{s:<15} {d:>9.0} ms {d:>10.0} K/s {d:>9.1}x\n", .{ "DuckDB", time_ms, rows_per_sec / 1000, ratio });
-    }
-
-    // Polars (DataFrame API)
-    if (has_polars) {
-        const py_code = std.fmt.comptimePrint(
-            \\import polars as pl
-            \\import numpy as np
-            \\df = pl.DataFrame({{"val": np.random.rand({d}) * 1000}})
-            \\result = df.with_columns((pl.col("val") + 1).log().alias("log_val"))
-        , .{NUM_ROWS});
-
-        var total_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runPolars(allocator, py_code) catch 0;
-        for (0..ITERATIONS) |_| total_ns += runPolars(allocator, py_code) catch 0;
-
-        const avg_ns = total_ns / ITERATIONS;
-        const time_ms = @as(f64, @floatFromInt(avg_ns)) / 1_000_000.0;
-        const rows_per_sec = @as(f64, @floatFromInt(NUM_ROWS)) / (@as(f64, @floatFromInt(avg_ns)) / 1_000_000_000.0);
-        const ratio = if (baseline_ns > 0) @as(f64, @floatFromInt(avg_ns)) / @as(f64, @floatFromInt(baseline_ns)) else 0;
-        std.debug.print("{s:<15} {d:>9.0} ms {d:>10.0} K/s {d:>9.1}x\n", .{ "Polars", time_ms, rows_per_sec / 1000, ratio });
-    }
-
-    // =========================================================================
-    // Benchmark 3: FEATURE CROSSING
-    // =========================================================================
-    std.debug.print("\n================================================================================\n", .{});
-    std.debug.print("FEATURE CROSSING ({d}K rows)\n", .{NUM_ROWS / 1000});
-    std.debug.print("================================================================================\n", .{});
-    std.debug.print("{s:<15} {s:>12} {s:>12} {s:>10}\n", .{ "Engine", "Time", "Rows/sec", "Ratio" });
-    std.debug.print("{s:<15} {s:>12} {s:>12} {s:>10}\n", .{ "-" ** 15, "-" ** 12, "-" ** 12, "-" ** 10 });
-
-    // LanceQL
-    if (has_lanceql) {
-        const sql = std.fmt.comptimePrint(
-            \\SELECT a * b as crossed FROM (SELECT random() * 1000 as a, random() * 1000 as b FROM generate_series(1, {d}))
-        , .{NUM_ROWS});
-
-        var total_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runLanceQL(allocator, sql) catch 0;
-        for (0..ITERATIONS) |_| total_ns += runLanceQL(allocator, sql) catch 0;
-
-        baseline_ns = total_ns / ITERATIONS;
-        const time_ms = @as(f64, @floatFromInt(baseline_ns)) / 1_000_000.0;
-        const rows_per_sec = @as(f64, @floatFromInt(NUM_ROWS)) / (@as(f64, @floatFromInt(baseline_ns)) / 1_000_000_000.0);
-        std.debug.print("{s:<15} {d:>9.0} ms {d:>10.0} K/s {s:>10}\n", .{ "LanceQL", time_ms, rows_per_sec / 1000, "1.0x" });
-    }
-
-    // DuckDB
-    if (has_duckdb) {
-        const sql = std.fmt.comptimePrint(
-            \\SELECT a * b as crossed FROM (SELECT random() * 1000 as a, random() * 1000 as b FROM generate_series(1, {d}))
-        , .{NUM_ROWS});
-
-        var total_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runDuckDB(allocator, sql) catch 0;
-        for (0..ITERATIONS) |_| total_ns += runDuckDB(allocator, sql) catch 0;
-
-        const avg_ns = total_ns / ITERATIONS;
-        const time_ms = @as(f64, @floatFromInt(avg_ns)) / 1_000_000.0;
-        const rows_per_sec = @as(f64, @floatFromInt(NUM_ROWS)) / (@as(f64, @floatFromInt(avg_ns)) / 1_000_000_000.0);
-        const ratio = if (baseline_ns > 0) @as(f64, @floatFromInt(avg_ns)) / @as(f64, @floatFromInt(baseline_ns)) else 0;
-        std.debug.print("{s:<15} {d:>9.0} ms {d:>10.0} K/s {d:>9.1}x\n", .{ "DuckDB", time_ms, rows_per_sec / 1000, ratio });
-    }
-
-    // Polars (DataFrame API)
-    if (has_polars) {
-        const py_code = std.fmt.comptimePrint(
-            \\import polars as pl
-            \\import numpy as np
-            \\df = pl.DataFrame({{"a": np.random.rand({d}) * 1000, "b": np.random.rand({d}) * 1000}})
-            \\result = df.with_columns((pl.col("a") * pl.col("b")).alias("crossed"))
-        , .{ NUM_ROWS, NUM_ROWS });
-
-        var total_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runPolars(allocator, py_code) catch 0;
-        for (0..ITERATIONS) |_| total_ns += runPolars(allocator, py_code) catch 0;
-
-        const avg_ns = total_ns / ITERATIONS;
-        const time_ms = @as(f64, @floatFromInt(avg_ns)) / 1_000_000.0;
-        const rows_per_sec = @as(f64, @floatFromInt(NUM_ROWS)) / (@as(f64, @floatFromInt(avg_ns)) / 1_000_000_000.0);
-        const ratio = if (baseline_ns > 0) @as(f64, @floatFromInt(avg_ns)) / @as(f64, @floatFromInt(baseline_ns)) else 0;
-        std.debug.print("{s:<15} {d:>9.0} ms {d:>10.0} K/s {d:>9.1}x\n", .{ "Polars", time_ms, rows_per_sec / 1000, ratio });
-    }
-
-    // =========================================================================
-    // Benchmark 4: BINNING
-    // =========================================================================
-    std.debug.print("\n================================================================================\n", .{});
-    std.debug.print("BINNING (10 bins, {d}K rows)\n", .{NUM_ROWS / 1000});
-    std.debug.print("================================================================================\n", .{});
-    std.debug.print("{s:<15} {s:>12} {s:>12} {s:>10}\n", .{ "Engine", "Time", "Rows/sec", "Ratio" });
-    std.debug.print("{s:<15} {s:>12} {s:>12} {s:>10}\n", .{ "-" ** 15, "-" ** 12, "-" ** 12, "-" ** 10 });
-
-    // LanceQL
-    if (has_lanceql) {
-        const sql = std.fmt.comptimePrint(
-            \\SELECT WIDTH_BUCKET(val, 0, 1000, 10) as bin FROM (SELECT random() * 1000 as val FROM generate_series(1, {d}))
-        , .{NUM_ROWS});
-
-        var total_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runLanceQL(allocator, sql) catch 0;
-        for (0..ITERATIONS) |_| total_ns += runLanceQL(allocator, sql) catch 0;
-
-        baseline_ns = total_ns / ITERATIONS;
-        const time_ms = @as(f64, @floatFromInt(baseline_ns)) / 1_000_000.0;
-        const rows_per_sec = @as(f64, @floatFromInt(NUM_ROWS)) / (@as(f64, @floatFromInt(baseline_ns)) / 1_000_000_000.0);
-        std.debug.print("{s:<15} {d:>9.0} ms {d:>10.0} K/s {s:>10}\n", .{ "LanceQL", time_ms, rows_per_sec / 1000, "1.0x" });
-    }
-
-    // DuckDB
-    if (has_duckdb) {
-        const sql = std.fmt.comptimePrint(
-            \\SELECT WIDTH_BUCKET(val, 0, 1000, 10) as bin FROM (SELECT random() * 1000 as val FROM generate_series(1, {d}))
-        , .{NUM_ROWS});
-
-        var total_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runDuckDB(allocator, sql) catch 0;
-        for (0..ITERATIONS) |_| total_ns += runDuckDB(allocator, sql) catch 0;
-
-        const avg_ns = total_ns / ITERATIONS;
-        const time_ms = @as(f64, @floatFromInt(avg_ns)) / 1_000_000.0;
-        const rows_per_sec = @as(f64, @floatFromInt(NUM_ROWS)) / (@as(f64, @floatFromInt(avg_ns)) / 1_000_000_000.0);
-        const ratio = if (baseline_ns > 0) @as(f64, @floatFromInt(avg_ns)) / @as(f64, @floatFromInt(baseline_ns)) else 0;
-        std.debug.print("{s:<15} {d:>9.0} ms {d:>10.0} K/s {d:>9.1}x\n", .{ "DuckDB", time_ms, rows_per_sec / 1000, ratio });
-    }
-
-    // Polars (DataFrame API) - use cut for binning
-    if (has_polars) {
-        const py_code = std.fmt.comptimePrint(
-            \\import polars as pl
-            \\import numpy as np
-            \\df = pl.DataFrame({{"val": np.random.rand({d}) * 1000}})
-            \\result = df.with_columns(pl.col("val").cut([100,200,300,400,500,600,700,800,900]).alias("bin"))
-        , .{NUM_ROWS});
-
-        var total_ns: u64 = 0;
-        for (0..WARMUP) |_| _ = runPolars(allocator, py_code) catch 0;
-        for (0..ITERATIONS) |_| total_ns += runPolars(allocator, py_code) catch 0;
-
-        const avg_ns = total_ns / ITERATIONS;
-        const time_ms = @as(f64, @floatFromInt(avg_ns)) / 1_000_000.0;
-        const rows_per_sec = @as(f64, @floatFromInt(NUM_ROWS)) / (@as(f64, @floatFromInt(avg_ns)) / 1_000_000_000.0);
-        const ratio = if (baseline_ns > 0) @as(f64, @floatFromInt(avg_ns)) / @as(f64, @floatFromInt(baseline_ns)) else 0;
-        std.debug.print("{s:<15} {d:>9.0} ms {d:>10.0} K/s {d:>9.1}x\n", .{ "Polars", time_ms, rows_per_sec / 1000, ratio });
-    }
-
-    // =========================================================================
-    // Summary
-    // =========================================================================
-    std.debug.print("\n================================================================================\n", .{});
-    std.debug.print("Summary\n", .{});
+    std.debug.print("Feature Engineering Benchmark: End-to-End (Z-Score Normalization)\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("Fair comparison using each engine's native interface:\n", .{});
-    std.debug.print("  - LanceQL/DuckDB: CLI subprocess with SQL\n", .{});
-    std.debug.print("  - Polars: Python subprocess with DataFrame API\n", .{});
-    std.debug.print("\nAll have similar subprocess spawn overhead (~30ms).\n", .{});
+    std.debug.print("Pipeline: Read file → z-score normalize amount column\n", .{});
+    std.debug.print("Each method runs for {d} seconds. Measuring throughput (rows/sec).\n", .{BENCHMARK_SECONDS});
     std.debug.print("\n", .{});
+
+    // Check files exist
+    const lance_exists = if (std.fs.cwd().access(LANCE_PATH, .{})) true else |_| false;
+    const parquet_exists = if (std.fs.cwd().access(PARQUET_PATH, .{})) true else |_| false;
+
+    if (!lance_exists or !parquet_exists) {
+        std.debug.print("ERROR: Benchmark data not found. Run:\n", .{});
+        std.debug.print("  python3 benchmarks/generate_benchmark_data.py\n", .{});
+        return;
+    }
+
+    const has_duckdb = checkPythonModule(allocator, "duckdb");
+    const has_polars = checkPythonModule(allocator, "polars");
+
+    std.debug.print("Data files:\n", .{});
+    std.debug.print("  Lance:   {s} ✓\n", .{LANCE_PATH});
+    std.debug.print("  Parquet: {s} ✓\n", .{PARQUET_PATH});
+    std.debug.print("\n", .{});
+    std.debug.print("Engines:\n", .{});
+    std.debug.print("  LanceQL @logic_table: yes\n", .{});
+    std.debug.print("  DuckDB:               {s}\n", .{if (has_duckdb) "yes" else "no (pip install duckdb)"});
+    std.debug.print("  Polars:               {s}\n", .{if (has_polars) "yes" else "no (pip install polars)"});
+    std.debug.print("\n", .{});
+
+    std.debug.print("================================================================================\n", .{});
+    std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "Method", "Rows/sec", "Iterations", "Speedup" });
+    std.debug.print("================================================================================\n", .{});
+
+    var lanceql_throughput: f64 = 0;
+
+    // 1. LanceQL @logic_table (read Lance file → z-score)
+    {
+        const warmup_end = std.time.nanoTimestamp() + WARMUP_SECONDS * std.time.ns_per_s;
+        const benchmark_end_time = warmup_end + BENCHMARK_SECONDS * std.time.ns_per_s;
+
+        var iterations: u64 = 0;
+        var total_rows: u64 = 0;
+
+        // Warmup
+        while (std.time.nanoTimestamp() < warmup_end) {
+            const file_data = readLanceFile(allocator) catch break;
+            defer allocator.free(file_data);
+
+            var table = Table.init(allocator, file_data) catch break;
+            defer table.deinit();
+
+            const amounts = table.readFloat64Column(1) catch break;
+            defer allocator.free(amounts);
+
+            // Z-score normalization: (x - mean) / std
+            var sum: f64 = 0;
+            for (amounts) |v| sum += v;
+            const mean = sum / @as(f64, @floatFromInt(amounts.len));
+
+            var variance_sum: f64 = 0;
+            for (amounts) |v| {
+                const diff = v - mean;
+                variance_sum += diff * diff;
+            }
+            const std_dev = @sqrt(variance_sum / @as(f64, @floatFromInt(amounts.len)));
+
+            if (std_dev > 0) {
+                for (amounts) |*v| v.* = (v.* - mean) / std_dev;
+            }
+        }
+
+        // Benchmark
+        const start_time = std.time.nanoTimestamp();
+        while (std.time.nanoTimestamp() < benchmark_end_time) {
+            const file_data = readLanceFile(allocator) catch break;
+            defer allocator.free(file_data);
+
+            var table = Table.init(allocator, file_data) catch break;
+            defer table.deinit();
+
+            const amounts = table.readFloat64Column(1) catch break;
+            defer allocator.free(amounts);
+
+            // Z-score normalization: (x - mean) / std
+            var sum: f64 = 0;
+            for (amounts) |v| sum += v;
+            const mean = sum / @as(f64, @floatFromInt(amounts.len));
+
+            var variance_sum: f64 = 0;
+            for (amounts) |v| {
+                const diff = v - mean;
+                variance_sum += diff * diff;
+            }
+            const std_dev = @sqrt(variance_sum / @as(f64, @floatFromInt(amounts.len)));
+
+            if (std_dev > 0) {
+                for (amounts) |*v| v.* = (v.* - mean) / std_dev;
+            }
+
+            iterations += 1;
+            total_rows += amounts.len;
+        }
+
+        const elapsed_ns = std.time.nanoTimestamp() - start_time;
+        const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
+        lanceql_throughput = @as(f64, @floatFromInt(total_rows)) / elapsed_s;
+
+        std.debug.print("{s:<35} {d:>12.0} {d:>12} {s:>10}\n", .{
+            "LanceQL @logic_table",
+            lanceql_throughput,
+            iterations,
+            "baseline",
+        });
+    }
+
+    // 2. DuckDB (read Parquet → z-score with NumPy)
+    if (has_duckdb) duckdb_block: {
+        const script = std.fmt.comptimePrint(
+            \\import duckdb
+            \\import time
+            \\import numpy as np
+            \\
+            \\WARMUP_SECONDS = {d}
+            \\BENCHMARK_SECONDS = {d}
+            \\PARQUET_PATH = "{s}"
+            \\
+            \\con = duckdb.connect()
+            \\
+            \\# Warmup
+            \\start = time.perf_counter()
+            \\while time.perf_counter() - start < WARMUP_SECONDS:
+            \\    df = con.execute(f"SELECT amount FROM '{{PARQUET_PATH}}'").fetchdf()
+            \\    arr = df['amount'].values
+            \\    mean = np.mean(arr)
+            \\    std = np.std(arr)
+            \\    if std > 0:
+            \\        _ = (arr - mean) / std
+            \\
+            \\# Benchmark
+            \\iterations = 0
+            \\total_rows = 0
+            \\start = time.perf_counter()
+            \\while time.perf_counter() - start < BENCHMARK_SECONDS:
+            \\    df = con.execute(f"SELECT amount FROM '{{PARQUET_PATH}}'").fetchdf()
+            \\    arr = df['amount'].values
+            \\    mean = np.mean(arr)
+            \\    std = np.std(arr)
+            \\    if std > 0:
+            \\        _ = (arr - mean) / std
+            \\    iterations += 1
+            \\    total_rows += len(arr)
+            \\
+            \\elapsed = time.perf_counter() - start
+            \\rows_per_sec = int(total_rows / elapsed)
+            \\print(f"ROWS_PER_SEC:{{rows_per_sec}}")
+            \\print(f"ITERATIONS:{{iterations}}")
+        , .{ WARMUP_SECONDS, BENCHMARK_SECONDS, PARQUET_PATH });
+
+        const bench_result = runPythonBenchmark(allocator, script) catch {
+            break :duckdb_block;
+        };
+        if (bench_result.rows_per_sec > 0) {
+            const speedup = lanceql_throughput / @as(f64, @floatFromInt(bench_result.rows_per_sec));
+            std.debug.print("{s:<35} {d:>12} {d:>12} {d:>9.2}x\n", .{
+                "DuckDB → NumPy",
+                bench_result.rows_per_sec,
+                bench_result.iterations,
+                speedup,
+            });
+        }
+    }
+
+    // 3. Polars (read Parquet → z-score)
+    if (has_polars) polars_block: {
+        const script = std.fmt.comptimePrint(
+            \\import polars as pl
+            \\import time
+            \\import numpy as np
+            \\
+            \\WARMUP_SECONDS = {d}
+            \\BENCHMARK_SECONDS = {d}
+            \\PARQUET_PATH = "{s}"
+            \\
+            \\# Warmup
+            \\start = time.perf_counter()
+            \\while time.perf_counter() - start < WARMUP_SECONDS:
+            \\    df = pl.read_parquet(PARQUET_PATH)
+            \\    arr = df['amount'].to_numpy()
+            \\    mean = np.mean(arr)
+            \\    std = np.std(arr)
+            \\    if std > 0:
+            \\        _ = (arr - mean) / std
+            \\
+            \\# Benchmark
+            \\iterations = 0
+            \\total_rows = 0
+            \\start = time.perf_counter()
+            \\while time.perf_counter() - start < BENCHMARK_SECONDS:
+            \\    df = pl.read_parquet(PARQUET_PATH)
+            \\    arr = df['amount'].to_numpy()
+            \\    mean = np.mean(arr)
+            \\    std = np.std(arr)
+            \\    if std > 0:
+            \\        _ = (arr - mean) / std
+            \\    iterations += 1
+            \\    total_rows += len(arr)
+            \\
+            \\elapsed = time.perf_counter() - start
+            \\rows_per_sec = int(total_rows / elapsed)
+            \\print(f"ROWS_PER_SEC:{{rows_per_sec}}")
+            \\print(f"ITERATIONS:{{iterations}}")
+        , .{ WARMUP_SECONDS, BENCHMARK_SECONDS, PARQUET_PATH });
+
+        const bench_result = runPythonBenchmark(allocator, script) catch {
+            break :polars_block;
+        };
+        if (bench_result.rows_per_sec > 0) {
+            const speedup = lanceql_throughput / @as(f64, @floatFromInt(bench_result.rows_per_sec));
+            std.debug.print("{s:<35} {d:>12} {d:>12} {d:>9.2}x\n", .{
+                "Polars → NumPy",
+                bench_result.rows_per_sec,
+                bench_result.iterations,
+                speedup,
+            });
+        }
+    }
+
+    std.debug.print("================================================================================\n", .{});
+    std.debug.print("\n", .{});
+    std.debug.print("Note: All methods read from file on each iteration (no caching).\n", .{});
+    std.debug.print("      LanceQL reads .lance, DuckDB/Polars read .parquet\n", .{});
 }

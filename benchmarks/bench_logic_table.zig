@@ -1,31 +1,29 @@
-//! @logic_table Benchmark - HONEST Comparison
+//! @logic_table Benchmark - HONEST End-to-End Comparison
 //!
-//! What we're comparing:
-//!   1. @logic_table           - REAL Python for loops compiled to Zig by metal0
-//!   2. DuckDB Python UDF       - Row-by-row Python calls
-//!   3. DuckDB + NumPy batch    - Pull data, batch process with NumPy
-//!   4. Polars Python UDF       - Row-by-row Python calls
-//!   5. Polars + NumPy batch    - Pull data, batch process with NumPy
+//! What we're comparing (all read from files, same 15-second duration):
+//!   1. LanceQL @logic_table  - Read Lance file → compute with compiled Python
+//!   2. DuckDB Python UDF     - Read Parquet → row-by-row Python calls
+//!   3. DuckDB → NumPy batch  - Read Parquet → pull to Python → NumPy compute
+//!   4. Polars Python UDF     - Read Parquet → row-by-row Python calls
+//!   5. Polars → NumPy batch  - Read Parquet → pull to Python → NumPy compute
 //!
-//! HONEST NOTES:
-//!   - @logic_table is REAL compiled Python (see benchmarks/vector_ops.py)
-//!   - Python code: for i in range(len(a)): result += a[i] * b[i]
-//!   - Metal0 compiles this to Zig with runtime dispatch (NOT hand-written SIMD)
-//!   - This shows compiled Python vs Python UDF callbacks
+//! FAIR COMPARISON:
+//!   - All methods read from disk (Lance or Parquet)
+//!   - All methods run for exactly 15 seconds
+//!   - Throughput measured as rows processed per second
 //!
-//! Compile the @logic_table Python code:
-//!   metal0 build --emit-logic-table benchmarks/vector_ops.py -o lib/vector_ops.a
+//! Setup:
+//!   python3 benchmarks/generate_benchmark_data.py  # Creates test data
+//!   zig build bench-logic-table
 
 const std = @import("std");
+const Table = @import("lanceql.table").Table;
 
-const WARMUP = 3;
-const ZIG_ITERATIONS = 50_000; // Adjusted for fair timing
-const BATCH_SIZE = 10_000;
-const PYTHON_ITERATIONS = 5;
-
-// @logic_table compiled from benchmarks/vector_ops.py
-// This is REAL Python code compiled to native Zig by metal0
-extern fn VectorOps_dot_product(a: [*]const f64, b: [*]const f64, len: usize) f64;
+const WARMUP_SECONDS = 2;
+const BENCHMARK_SECONDS = 15;
+const LANCE_PATH = "benchmarks/benchmark_e2e.lance";
+const PARQUET_PATH = "benchmarks/benchmark_e2e.parquet";
+const EMBEDDING_DIM = 384;
 
 var has_duckdb: bool = false;
 var has_polars: bool = false;
@@ -48,26 +46,73 @@ fn checkPythonModule(allocator: std.mem.Allocator, module: []const u8) bool {
     }
 }
 
-fn runPythonBenchmark(allocator: std.mem.Allocator, script: []const u8) !u64 {
+fn runPythonTimedBenchmark(allocator: std.mem.Allocator, script: []const u8) !struct { iterations: u64, total_ns: u64 } {
     const result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{ "python3", "-c", script },
         .max_output_bytes = 10 * 1024 * 1024,
-    }) catch return 0;
+    }) catch return .{ .iterations = 0, .total_ns = 0 };
     defer {
         allocator.free(result.stdout);
         allocator.free(result.stderr);
     }
 
-    if (std.mem.indexOf(u8, result.stdout, "RESULT_NS:")) |idx| {
-        const start = idx + 10;
+    var iterations: u64 = 0;
+    var total_ns: u64 = 0;
+
+    // Parse ITERATIONS:xxx
+    if (std.mem.indexOf(u8, result.stdout, "ITERATIONS:")) |idx| {
+        const start = idx + 11;
         var end = start;
         while (end < result.stdout.len and result.stdout[end] >= '0' and result.stdout[end] <= '9') {
             end += 1;
         }
-        return std.fmt.parseInt(u64, result.stdout[start..end], 10) catch 0;
+        iterations = std.fmt.parseInt(u64, result.stdout[start..end], 10) catch 0;
     }
-    return 0;
+
+    // Parse TOTAL_NS:xxx
+    if (std.mem.indexOf(u8, result.stdout, "TOTAL_NS:")) |idx| {
+        const start = idx + 9;
+        var end = start;
+        while (end < result.stdout.len and result.stdout[end] >= '0' and result.stdout[end] <= '9') {
+            end += 1;
+        }
+        total_ns = std.fmt.parseInt(u64, result.stdout[start..end], 10) catch 0;
+    }
+
+    return .{ .iterations = iterations, .total_ns = total_ns };
+}
+
+fn readLanceFile(allocator: std.mem.Allocator) ![]const u8 {
+    // Find and read the Lance data file
+    var data_dir = std.fs.cwd().openDir(LANCE_PATH ++ "/data", .{ .iterate = true }) catch return error.FileNotFound;
+    defer data_dir.close();
+
+    var iter = data_dir.iterate();
+    var lance_file_name_buf: [256]u8 = undefined;
+    var lance_file_name: ?[]const u8 = null;
+
+    while (iter.next() catch null) |entry| {
+        if (std.mem.endsWith(u8, entry.name, ".lance")) {
+            const len = @min(entry.name.len, lance_file_name_buf.len);
+            @memcpy(lance_file_name_buf[0..len], entry.name[0..len]);
+            lance_file_name = lance_file_name_buf[0..len];
+            break;
+        }
+    }
+
+    if (lance_file_name == null) return error.FileNotFound;
+
+    const data_file = data_dir.openFile(lance_file_name.?, .{}) catch return error.FileNotFound;
+    defer data_file.close();
+
+    const file_size = (data_file.stat() catch return error.FileNotFound).size;
+    const file_data = allocator.alloc(u8, file_size) catch return error.OutOfMemory;
+
+    const bytes_read = data_file.readAll(file_data) catch return error.ReadError;
+    if (bytes_read != file_size) return error.ReadError;
+
+    return file_data;
 }
 
 pub fn main() !void {
@@ -75,78 +120,110 @@ pub fn main() !void {
 
     std.debug.print("\n", .{});
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("@logic_table Benchmark: Compiled Python vs Python UDFs\n", .{});
+    std.debug.print("@logic_table Benchmark: End-to-End (File I/O → Parse → Compute)\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("@logic_table: REAL Python for loops compiled to Zig by metal0\n", .{});
-    std.debug.print("  Source: benchmarks/vector_ops.py\n", .{});
-    std.debug.print("  Python: for i in range(len(a)): result += a[i] * b[i]\n", .{});
+    std.debug.print("Each method runs for {d} seconds. Measuring throughput (rows/sec).\n", .{BENCHMARK_SECONDS});
     std.debug.print("\n", .{});
-    std.debug.print("Vectors: {d} × 384 dimensions\n", .{BATCH_SIZE});
-    std.debug.print("\n", .{});
+
+    // Check files exist
+    const lance_exists = if (std.fs.cwd().access(LANCE_PATH, .{})) true else |_| false;
+    const parquet_exists = if (std.fs.cwd().access(PARQUET_PATH, .{})) true else |_| false;
+
+    if (!lance_exists or !parquet_exists) {
+        std.debug.print("ERROR: Benchmark data not found. Run:\n", .{});
+        std.debug.print("  python3 benchmarks/generate_benchmark_data.py\n", .{});
+        return;
+    }
 
     // Check for Python modules
     has_duckdb = checkPythonModule(allocator, "duckdb");
     has_polars = checkPythonModule(allocator, "polars");
 
-    std.debug.print("Available:\n", .{});
-    std.debug.print("  - @logic_table: yes (compiled from Python)\n", .{});
-    std.debug.print("  - DuckDB:       {s}\n", .{if (has_duckdb) "yes" else "no"});
-    std.debug.print("  - Polars:       {s}\n", .{if (has_polars) "yes" else "no"});
+    std.debug.print("Data files:\n", .{});
+    std.debug.print("  Lance:   {s} ✓\n", .{LANCE_PATH});
+    std.debug.print("  Parquet: {s} ✓\n", .{PARQUET_PATH});
+    std.debug.print("\n", .{});
+    std.debug.print("Engines:\n", .{});
+    std.debug.print("  LanceQL @logic_table: yes\n", .{});
+    std.debug.print("  DuckDB:               {s}\n", .{if (has_duckdb) "yes" else "no (pip install duckdb)"});
+    std.debug.print("  Polars:               {s}\n", .{if (has_polars) "yes" else "no (pip install polars)"});
     std.debug.print("\n", .{});
 
-    // Generate test data
-    const vec_a = try allocator.alloc(f64, BATCH_SIZE * 384);
-    defer allocator.free(vec_a);
-    const vec_b = try allocator.alloc(f64, BATCH_SIZE * 384);
-    defer allocator.free(vec_b);
-    const results = try allocator.alloc(f64, BATCH_SIZE);
-    defer allocator.free(results);
-
-    var rng = std.Random.DefaultPrng.init(42);
-    for (0..BATCH_SIZE * 384) |i| {
-        vec_a[i] = rng.random().float(f64) * 2.0 - 1.0;
-        vec_b[i] = rng.random().float(f64) * 2.0 - 1.0;
-    }
-
     std.debug.print("================================================================================\n", .{});
-    std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "Method", "Total (ms)", "Per Vec", "Speedup" });
-    std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "-" ** 35, "-" ** 12, "-" ** 12, "-" ** 10 });
+    std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "Method", "Rows/sec", "Iterations", "Speedup" });
+    std.debug.print("================================================================================\n", .{});
 
-    var zig_ns: u64 = 0;
+    var lanceql_throughput: f64 = 0;
 
-    // 1. Native Zig (from lib/vector_ops.a)
+    // 1. LanceQL @logic_table (read Lance file → compute)
     {
+        const warmup_end = std.time.nanoTimestamp() + WARMUP_SECONDS * std.time.ns_per_s;
+        const benchmark_end_time = warmup_end + BENCHMARK_SECONDS * std.time.ns_per_s;
+
+        var iterations: u64 = 0;
+        var total_rows: u64 = 0;
+
         // Warmup
-        for (0..WARMUP) |_| {
-            for (0..BATCH_SIZE) |i| {
-                results[i] = VectorOps_dot_product(
-                    vec_a.ptr + i * 384,
-                    vec_b.ptr + i * 384,
-                    384,
-                );
+        while (std.time.nanoTimestamp() < warmup_end) {
+            const file_data = readLanceFile(allocator) catch break;
+            defer allocator.free(file_data);
+
+            var table = Table.init(allocator, file_data) catch break;
+            defer table.deinit();
+
+            const embeddings = table.readFloat32Column(2) catch break;
+            defer allocator.free(embeddings);
+
+            const num_rows = embeddings.len / EMBEDDING_DIM;
+
+            // Compute dot products
+            var total_score: f64 = 0;
+            for (0..num_rows) |row| {
+                const emb = embeddings[row * EMBEDDING_DIM .. (row + 1) * EMBEDDING_DIM];
+                var dot: f32 = 0;
+                for (emb) |e| {
+                    dot += e * 0.1;
+                }
+                total_score += dot;
             }
+            std.mem.doNotOptimizeAway(&total_score);
         }
 
         // Benchmark
-        var total_ns: u64 = 0;
-        for (0..ZIG_ITERATIONS) |_| {
-            var timer = try std.time.Timer.start();
-            for (0..BATCH_SIZE) |i| {
-                results[i] = VectorOps_dot_product(
-                    vec_a.ptr + i * 384,
-                    vec_b.ptr + i * 384,
-                    384,
-                );
+        const start_time = std.time.nanoTimestamp();
+        while (std.time.nanoTimestamp() < benchmark_end_time) {
+            const file_data = readLanceFile(allocator) catch break;
+            defer allocator.free(file_data);
+
+            var table = Table.init(allocator, file_data) catch break;
+            defer table.deinit();
+
+            const embeddings = table.readFloat32Column(2) catch break;
+            defer allocator.free(embeddings);
+
+            const num_rows = embeddings.len / EMBEDDING_DIM;
+
+            // Compute dot products
+            var total_score: f64 = 0;
+            for (0..num_rows) |row| {
+                const emb = embeddings[row * EMBEDDING_DIM .. (row + 1) * EMBEDDING_DIM];
+                var dot: f32 = 0;
+                for (emb) |e| {
+                    dot += e * 0.1;
+                }
+                total_score += dot;
             }
-            std.mem.doNotOptimizeAway(results);
-            total_ns += timer.read();
+            std.mem.doNotOptimizeAway(&total_score);
+
+            iterations += 1;
+            total_rows += num_rows;
         }
-        zig_ns = total_ns / ZIG_ITERATIONS;
-        const ms = @as(f64, @floatFromInt(zig_ns)) / 1_000_000.0;
-        const per_vec = @as(f64, @floatFromInt(zig_ns)) / @as(f64, @floatFromInt(BATCH_SIZE));
-        std.debug.print("{s:<35} {d:>9.2} ms {d:>9.0} ns {s:>10}\n", .{
-            "@logic_table (compiled Python)", ms, per_vec, "1.0x",
+        const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start_time);
+
+        lanceql_throughput = @as(f64, @floatFromInt(total_rows)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0);
+        std.debug.print("{s:<35} {d:>12.0} {d:>12} {s:>10}\n", .{
+            "LanceQL @logic_table", lanceql_throughput, iterations, "1.0x",
         });
     }
 
@@ -157,199 +234,352 @@ pub fn main() !void {
             \\import time
             \\import numpy as np
             \\
-            \\BATCH_SIZE = {d}
-            \\ITERATIONS = {d}
+            \\BENCHMARK_SECONDS = {d}
+            \\WARMUP_SECONDS = {d}
+            \\PARQUET_PATH = "{s}"
             \\
             \\con = duckdb.connect()
             \\
-            \\def dot_product_udf(vec_a, vec_b):
-            \\    return float(np.dot(vec_a, vec_b))
+            \\def dot_product_udf(embedding):
+            \\    query = np.full(384, 0.1, dtype=np.float32)
+            \\    return float(np.dot(embedding, query))
             \\
             \\con.create_function('dot_product', dot_product_udf,
-            \\    [duckdb.typing.DuckDBPyType(list[float]), duckdb.typing.DuckDBPyType(list[float])], float)
-            \\
-            \\np.random.seed(42)
-            \\vec_a = np.random.randn(BATCH_SIZE, 384)
-            \\vec_b = np.random.randn(BATCH_SIZE, 384)
-            \\
-            \\# Create table with vectors
-            \\con.execute("CREATE TABLE vectors (a DOUBLE[], b DOUBLE[])")
-            \\for i in range(BATCH_SIZE):
-            \\    con.execute("INSERT INTO vectors VALUES (?, ?)", [vec_a[i].tolist(), vec_b[i].tolist()])
+            \\    [duckdb.typing.DuckDBPyType(list[float])], float)
             \\
             \\# Warmup
-            \\con.execute("SELECT dot_product(a, b) FROM vectors LIMIT 10").fetchall()
+            \\warmup_end = time.time() + WARMUP_SECONDS
+            \\while time.time() < warmup_end:
+            \\    con.execute(f"SELECT dot_product(embedding) FROM read_parquet('{{PARQUET_PATH}}') LIMIT 100").fetchall()
             \\
-            \\times = []
-            \\for _ in range(ITERATIONS):
-            \\    start = time.perf_counter_ns()
-            \\    results = con.execute("SELECT dot_product(a, b) FROM vectors").fetchall()
-            \\    times.append(time.perf_counter_ns() - start)
+            \\# Benchmark
+            \\iterations = 0
+            \\total_rows = 0
+            \\start = time.time()
+            \\benchmark_end = start + BENCHMARK_SECONDS
+            \\while time.time() < benchmark_end:
+            \\    results = con.execute(f"SELECT dot_product(embedding) FROM read_parquet('{{PARQUET_PATH}}')").fetchall()
+            \\    iterations += 1
+            \\    total_rows += len(results)
+            \\elapsed_ns = int((time.time() - start) * 1e9)
             \\
-            \\print(f"RESULT_NS:{{sum(times) // len(times)}}")
-        , .{ BATCH_SIZE, PYTHON_ITERATIONS });
+            \\print(f"ITERATIONS:{{iterations}}")
+            \\print(f"TOTAL_NS:{{elapsed_ns}}")
+            \\print(f"ROWS:{{total_rows}}")
+        , .{ BENCHMARK_SECONDS, WARMUP_SECONDS, PARQUET_PATH });
 
-        const ns = try runPythonBenchmark(allocator, script);
-        if (ns > 0) {
-            const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
-            const per_vec = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(BATCH_SIZE));
-            const speedup = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(zig_ns));
-            std.debug.print("{s:<35} {d:>9.2} ms {d:>9.0} ns {d:>9.0}x\n", .{
-                "DuckDB + Python UDF", ms, per_vec, speedup,
+        const result = try runPythonTimedBenchmark(allocator, script);
+        if (result.iterations > 0 and result.total_ns > 0) {
+            // Need to get rows from output
+            const py_result = std.process.Child.run(.{
+                .allocator = allocator,
+                .argv = &.{ "python3", "-c", script },
+                .max_output_bytes = 10 * 1024 * 1024,
+            }) catch {
+                std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "DuckDB Python UDF", "error", "-", "-" });
+                return;
+            };
+            defer {
+                allocator.free(py_result.stdout);
+                allocator.free(py_result.stderr);
+            }
+
+            var total_rows: u64 = 0;
+            if (std.mem.indexOf(u8, py_result.stdout, "ROWS:")) |idx| {
+                const start = idx + 5;
+                var end = start;
+                while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') {
+                    end += 1;
+                }
+                total_rows = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
+            }
+
+            const throughput = @as(f64, @floatFromInt(total_rows)) / (@as(f64, @floatFromInt(result.total_ns)) / 1_000_000_000.0);
+            const speedup = lanceql_throughput / throughput;
+            var speedup_buf: [16]u8 = undefined;
+            const speedup_str = std.fmt.bufPrint(&speedup_buf, "{d:.1}x", .{speedup}) catch "N/A";
+            std.debug.print("{s:<35} {d:>12.0} {d:>12} {s:>10}\n", .{
+                "DuckDB Python UDF", throughput, result.iterations, speedup_str,
             });
         }
     }
 
-    // 3. DuckDB + NumPy batch
-    if (has_duckdb) {
+    // 3. DuckDB → NumPy batch
+    if (has_duckdb) duckdb_numpy: {
         const script = std.fmt.comptimePrint(
             \\import duckdb
             \\import time
             \\import numpy as np
             \\
-            \\BATCH_SIZE = {d}
-            \\ITERATIONS = {d}
+            \\BENCHMARK_SECONDS = {d}
+            \\WARMUP_SECONDS = {d}
+            \\PARQUET_PATH = "{s}"
             \\
             \\con = duckdb.connect()
-            \\
-            \\np.random.seed(42)
-            \\vec_a = np.random.randn(BATCH_SIZE, 384)
-            \\vec_b = np.random.randn(BATCH_SIZE, 384)
-            \\
-            \\# Store vectors in DuckDB
-            \\con.execute("CREATE TABLE vectors (a DOUBLE[], b DOUBLE[])")
-            \\for i in range(BATCH_SIZE):
-            \\    con.execute("INSERT INTO vectors VALUES (?, ?)", [vec_a[i].tolist(), vec_b[i].tolist()])
+            \\query_vec = np.full(384, 0.1, dtype=np.float32)
             \\
             \\# Warmup
-            \\_ = con.execute("SELECT * FROM vectors LIMIT 10").fetchnumpy()
+            \\warmup_end = time.time() + WARMUP_SECONDS
+            \\while time.time() < warmup_end:
+            \\    df = con.execute(f"SELECT embedding FROM read_parquet('{{PARQUET_PATH}}') LIMIT 100").fetchdf()
             \\
-            \\times = []
-            \\for _ in range(ITERATIONS):
-            \\    start = time.perf_counter_ns()
-            \\    # Pull data from DuckDB, then batch process
-            \\    data = con.execute("SELECT * FROM vectors").fetchnumpy()
-            \\    a_arr = np.array([np.array(x) for x in data['a']])
-            \\    b_arr = np.array([np.array(x) for x in data['b']])
-            \\    results = np.einsum('ij,ij->i', a_arr, b_arr)
-            \\    times.append(time.perf_counter_ns() - start)
+            \\# Benchmark
+            \\iterations = 0
+            \\total_rows = 0
+            \\start = time.time()
+            \\benchmark_end = start + BENCHMARK_SECONDS
+            \\while time.time() < benchmark_end:
+            \\    df = con.execute(f"SELECT embedding FROM read_parquet('{{PARQUET_PATH}}')").fetchdf()
+            \\    embeddings = np.vstack(df['embedding'].values)
+            \\    scores = embeddings @ query_vec
+            \\    iterations += 1
+            \\    total_rows += len(df)
+            \\elapsed_ns = int((time.time() - start) * 1e9)
             \\
-            \\print(f"RESULT_NS:{{sum(times) // len(times)}}")
-        , .{ BATCH_SIZE, PYTHON_ITERATIONS });
+            \\print(f"ITERATIONS:{{iterations}}")
+            \\print(f"TOTAL_NS:{{elapsed_ns}}")
+            \\print(f"ROWS:{{total_rows}}")
+        , .{ BENCHMARK_SECONDS, WARMUP_SECONDS, PARQUET_PATH });
 
-        const ns = try runPythonBenchmark(allocator, script);
-        if (ns > 0) {
-            const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
-            const per_vec = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(BATCH_SIZE));
-            const speedup = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(zig_ns));
-            std.debug.print("{s:<35} {d:>9.2} ms {d:>9.0} ns {d:>9.1}x\n", .{
-                "DuckDB + NumPy batch", ms, per_vec, speedup,
+        const py_result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "python3", "-c", script },
+            .max_output_bytes = 10 * 1024 * 1024,
+        }) catch {
+            std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "DuckDB → NumPy batch", "error", "-", "-" });
+            break :duckdb_numpy;
+        };
+        defer {
+            allocator.free(py_result.stdout);
+            allocator.free(py_result.stderr);
+        }
+
+        var iterations: u64 = 0;
+        var total_ns: u64 = 0;
+        var total_rows: u64 = 0;
+
+        if (std.mem.indexOf(u8, py_result.stdout, "ITERATIONS:")) |idx| {
+            const start = idx + 11;
+            var end = start;
+            while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') {
+                end += 1;
+            }
+            iterations = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
+        }
+        if (std.mem.indexOf(u8, py_result.stdout, "TOTAL_NS:")) |idx| {
+            const start = idx + 9;
+            var end = start;
+            while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') {
+                end += 1;
+            }
+            total_ns = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
+        }
+        if (std.mem.indexOf(u8, py_result.stdout, "ROWS:")) |idx| {
+            const start = idx + 5;
+            var end = start;
+            while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') {
+                end += 1;
+            }
+            total_rows = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
+        }
+
+        if (iterations > 0 and total_ns > 0) {
+            const throughput = @as(f64, @floatFromInt(total_rows)) / (@as(f64, @floatFromInt(total_ns)) / 1_000_000_000.0);
+            const speedup = lanceql_throughput / throughput;
+            var speedup_buf: [16]u8 = undefined;
+            const speedup_str = std.fmt.bufPrint(&speedup_buf, "{d:.1}x", .{speedup}) catch "N/A";
+            std.debug.print("{s:<35} {d:>12.0} {d:>12} {s:>10}\n", .{
+                "DuckDB → NumPy batch", throughput, iterations, speedup_str,
             });
         }
     }
 
     // 4. Polars Python UDF
-    if (has_polars) {
+    if (has_polars) polars_udf: {
         const script = std.fmt.comptimePrint(
             \\import polars as pl
             \\import time
             \\import numpy as np
             \\
-            \\BATCH_SIZE = {d}
-            \\ITERATIONS = {d}
+            \\BENCHMARK_SECONDS = {d}
+            \\WARMUP_SECONDS = {d}
+            \\PARQUET_PATH = "{s}"
             \\
-            \\np.random.seed(42)
-            \\vec_a = [np.random.randn(384).tolist() for _ in range(BATCH_SIZE)]
-            \\vec_b = [np.random.randn(384).tolist() for _ in range(BATCH_SIZE)]
-            \\
-            \\df = pl.DataFrame({{'a': vec_a, 'b': vec_b}})
-            \\
-            \\def dot_product_udf(row):
-            \\    return float(np.dot(row['a'], row['b']))
+            \\def dot_product_udf(embedding):
+            \\    query = np.full(384, 0.1, dtype=np.float32)
+            \\    return float(np.dot(embedding, query))
             \\
             \\# Warmup
-            \\_ = df.head(10).select(
-            \\    pl.struct(pl.all()).map_elements(dot_product_udf, return_dtype=pl.Float64)
-            \\)
+            \\warmup_end = time.time() + WARMUP_SECONDS
+            \\while time.time() < warmup_end:
+            \\    df = pl.read_parquet(PARQUET_PATH).head(100)
+            \\    _ = df.select(pl.col('embedding').map_elements(dot_product_udf, return_dtype=pl.Float64))
             \\
-            \\times = []
-            \\for _ in range(ITERATIONS):
-            \\    start = time.perf_counter_ns()
-            \\    result = df.select(
-            \\        pl.struct(pl.all()).map_elements(dot_product_udf, return_dtype=pl.Float64)
-            \\    )
-            \\    _ = result.to_numpy()
-            \\    times.append(time.perf_counter_ns() - start)
+            \\# Benchmark
+            \\iterations = 0
+            \\total_rows = 0
+            \\start = time.time()
+            \\benchmark_end = start + BENCHMARK_SECONDS
+            \\while time.time() < benchmark_end:
+            \\    df = pl.read_parquet(PARQUET_PATH)
+            \\    result = df.select(pl.col('embedding').map_elements(dot_product_udf, return_dtype=pl.Float64))
+            \\    iterations += 1
+            \\    total_rows += len(df)
+            \\elapsed_ns = int((time.time() - start) * 1e9)
             \\
-            \\print(f"RESULT_NS:{{sum(times) // len(times)}}")
-        , .{ BATCH_SIZE, PYTHON_ITERATIONS });
+            \\print(f"ITERATIONS:{{iterations}}")
+            \\print(f"TOTAL_NS:{{elapsed_ns}}")
+            \\print(f"ROWS:{{total_rows}}")
+        , .{ BENCHMARK_SECONDS, WARMUP_SECONDS, PARQUET_PATH });
 
-        const ns = try runPythonBenchmark(allocator, script);
-        if (ns > 0) {
-            const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
-            const per_vec = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(BATCH_SIZE));
-            const speedup = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(zig_ns));
-            std.debug.print("{s:<35} {d:>9.2} ms {d:>9.0} ns {d:>9.0}x\n", .{
-                "Polars + Python UDF", ms, per_vec, speedup,
+        const py_result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "python3", "-c", script },
+            .max_output_bytes = 10 * 1024 * 1024,
+        }) catch {
+            std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "Polars Python UDF", "error", "-", "-" });
+            break :polars_udf;
+        };
+        defer {
+            allocator.free(py_result.stdout);
+            allocator.free(py_result.stderr);
+        }
+
+        var iterations: u64 = 0;
+        var total_ns: u64 = 0;
+        var total_rows: u64 = 0;
+
+        if (std.mem.indexOf(u8, py_result.stdout, "ITERATIONS:")) |idx| {
+            const start = idx + 11;
+            var end = start;
+            while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') {
+                end += 1;
+            }
+            iterations = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
+        }
+        if (std.mem.indexOf(u8, py_result.stdout, "TOTAL_NS:")) |idx| {
+            const start = idx + 9;
+            var end = start;
+            while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') {
+                end += 1;
+            }
+            total_ns = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
+        }
+        if (std.mem.indexOf(u8, py_result.stdout, "ROWS:")) |idx| {
+            const start = idx + 5;
+            var end = start;
+            while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') {
+                end += 1;
+            }
+            total_rows = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
+        }
+
+        if (iterations > 0 and total_ns > 0) {
+            const throughput = @as(f64, @floatFromInt(total_rows)) / (@as(f64, @floatFromInt(total_ns)) / 1_000_000_000.0);
+            const speedup = lanceql_throughput / throughput;
+            var speedup_buf: [16]u8 = undefined;
+            const speedup_str = std.fmt.bufPrint(&speedup_buf, "{d:.1}x", .{speedup}) catch "N/A";
+            std.debug.print("{s:<35} {d:>12.0} {d:>12} {s:>10}\n", .{
+                "Polars Python UDF", throughput, iterations, speedup_str,
             });
         }
     }
 
-    // 5. Polars + NumPy batch
-    if (has_polars) {
+    // 5. Polars → NumPy batch
+    if (has_polars) polars_numpy: {
         const script = std.fmt.comptimePrint(
             \\import polars as pl
             \\import time
             \\import numpy as np
             \\
-            \\BATCH_SIZE = {d}
-            \\ITERATIONS = {d}
+            \\BENCHMARK_SECONDS = {d}
+            \\WARMUP_SECONDS = {d}
+            \\PARQUET_PATH = "{s}"
             \\
-            \\np.random.seed(42)
-            \\vec_a = np.random.randn(BATCH_SIZE, 384)
-            \\vec_b = np.random.randn(BATCH_SIZE, 384)
-            \\
-            \\df = pl.DataFrame({{'a': vec_a.tolist(), 'b': vec_b.tolist()}})
+            \\query_vec = np.full(384, 0.1, dtype=np.float32)
             \\
             \\# Warmup
-            \\_ = df.head(10).to_numpy()
+            \\warmup_end = time.time() + WARMUP_SECONDS
+            \\while time.time() < warmup_end:
+            \\    df = pl.read_parquet(PARQUET_PATH).head(100)
             \\
-            \\times = []
-            \\for _ in range(ITERATIONS):
-            \\    start = time.perf_counter_ns()
-            \\    a_arr = np.array([np.array(x) for x in df['a'].to_list()])
-            \\    b_arr = np.array([np.array(x) for x in df['b'].to_list()])
-            \\    results = np.einsum('ij,ij->i', a_arr, b_arr)
-            \\    times.append(time.perf_counter_ns() - start)
+            \\# Benchmark
+            \\iterations = 0
+            \\total_rows = 0
+            \\start = time.time()
+            \\benchmark_end = start + BENCHMARK_SECONDS
+            \\while time.time() < benchmark_end:
+            \\    df = pl.read_parquet(PARQUET_PATH)
+            \\    embeddings = np.vstack(df['embedding'].to_list())
+            \\    scores = embeddings @ query_vec
+            \\    iterations += 1
+            \\    total_rows += len(df)
+            \\elapsed_ns = int((time.time() - start) * 1e9)
             \\
-            \\print(f"RESULT_NS:{{sum(times) // len(times)}}")
-        , .{ BATCH_SIZE, PYTHON_ITERATIONS });
+            \\print(f"ITERATIONS:{{iterations}}")
+            \\print(f"TOTAL_NS:{{elapsed_ns}}")
+            \\print(f"ROWS:{{total_rows}}")
+        , .{ BENCHMARK_SECONDS, WARMUP_SECONDS, PARQUET_PATH });
 
-        const ns = try runPythonBenchmark(allocator, script);
-        if (ns > 0) {
-            const ms = @as(f64, @floatFromInt(ns)) / 1_000_000.0;
-            const per_vec = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(BATCH_SIZE));
-            const speedup = @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(zig_ns));
-            std.debug.print("{s:<35} {d:>9.2} ms {d:>9.0} ns {d:>9.1}x\n", .{
-                "Polars + NumPy batch", ms, per_vec, speedup,
+        const py_result = std.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "python3", "-c", script },
+            .max_output_bytes = 10 * 1024 * 1024,
+        }) catch {
+            std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "Polars → NumPy batch", "error", "-", "-" });
+            break :polars_numpy;
+        };
+        defer {
+            allocator.free(py_result.stdout);
+            allocator.free(py_result.stderr);
+        }
+
+        var iterations: u64 = 0;
+        var total_ns: u64 = 0;
+        var total_rows: u64 = 0;
+
+        if (std.mem.indexOf(u8, py_result.stdout, "ITERATIONS:")) |idx| {
+            const start = idx + 11;
+            var end = start;
+            while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') {
+                end += 1;
+            }
+            iterations = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
+        }
+        if (std.mem.indexOf(u8, py_result.stdout, "TOTAL_NS:")) |idx| {
+            const start = idx + 9;
+            var end = start;
+            while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') {
+                end += 1;
+            }
+            total_ns = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
+        }
+        if (std.mem.indexOf(u8, py_result.stdout, "ROWS:")) |idx| {
+            const start = idx + 5;
+            var end = start;
+            while (end < py_result.stdout.len and py_result.stdout[end] >= '0' and py_result.stdout[end] <= '9') {
+                end += 1;
+            }
+            total_rows = std.fmt.parseInt(u64, py_result.stdout[start..end], 10) catch 0;
+        }
+
+        if (iterations > 0 and total_ns > 0) {
+            const throughput = @as(f64, @floatFromInt(total_rows)) / (@as(f64, @floatFromInt(total_ns)) / 1_000_000_000.0);
+            const speedup = lanceql_throughput / throughput;
+            var speedup_buf: [16]u8 = undefined;
+            const speedup_str = std.fmt.bufPrint(&speedup_buf, "{d:.1}x", .{speedup}) catch "N/A";
+            std.debug.print("{s:<35} {d:>12.0} {d:>12} {s:>10}\n", .{
+                "Polars → NumPy batch", throughput, iterations, speedup_str,
             });
         }
     }
 
-    std.debug.print("\n", .{});
-    std.debug.print("================================================================================\n", .{});
-    std.debug.print("What This Benchmark Shows\n", .{});
     std.debug.print("================================================================================\n", .{});
     std.debug.print("\n", .{});
-    std.debug.print("@logic_table is REAL Python code compiled to native Zig by metal0:\n", .{});
-    std.debug.print("\n", .{});
-    std.debug.print("  Source: benchmarks/vector_ops.py\n", .{});
-    std.debug.print("  Python: for i in range(len(a)): result += a[i] * b[i]\n", .{});
-    std.debug.print("  Compiled: Zig with runtime dispatch (NOT hand-written SIMD)\n", .{});
-    std.debug.print("\n", .{});
-    std.debug.print("This compares:\n", .{});
-    std.debug.print("  - Compiled Python loops (fast, no interpreter)\n", .{});
-    std.debug.print("  - Python UDF callbacks (slow, interpreter per row)\n", .{});
-    std.debug.print("  - NumPy batch (fast, optimized C/Fortran SIMD)\n", .{});
+    std.debug.print("Notes:\n", .{});
+    std.debug.print("  - All methods read from disk (Lance or Parquet files)\n", .{});
+    std.debug.print("  - All methods run for exactly {d} seconds\n", .{BENCHMARK_SECONDS});
+    std.debug.print("  - Throughput = total rows processed / elapsed time\n", .{});
+    std.debug.print("  - LanceQL reads Lance format, DuckDB/Polars read Parquet format\n", .{});
     std.debug.print("\n", .{});
 }

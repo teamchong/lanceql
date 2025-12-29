@@ -419,26 +419,12 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseFast,
             .imports = &.{
-                .{ .name = "lanceql.metal", .module = metal_mod },
+                .{ .name = "lanceql.table", .module = table_mod },
             },
         }),
     });
-
-    // Link macOS frameworks for benchmark
-    if (use_metal) {
-        bench_vector.root_module.linkFramework("Metal", .{});
-        bench_vector.root_module.linkFramework("Foundation", .{});
-        bench_vector.root_module.addCSourceFiles(.{
-            .files = &.{"src/metal/metal_backend.m"},
-            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
-        });
-    }
-    if (use_accelerate) {
-        bench_vector.root_module.linkFramework("Accelerate", .{});
-    }
-
     const run_bench_vector = b.addRunArtifact(bench_vector);
-    const bench_vector_step = b.step("bench-vector", "Benchmark vector operations (GPU vs CPU)");
+    const bench_vector_step = b.step("bench-vector", "FAIR end-to-end: L2 norm (vector ops)");
     bench_vector_step.dependOn(&run_bench_vector.step);
 
     // SQL clause benchmark
@@ -449,25 +435,12 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseFast,
             .imports = &.{
-                .{ .name = "lanceql", .module = lanceql_mod },
-                .{ .name = "lanceql.metal", .module = metal_mod },
-                .{ .name = "lanceql.query", .module = query_mod },
+                .{ .name = "lanceql.table", .module = table_mod },
             },
         }),
     });
-    if (use_metal) {
-        bench_sql.root_module.linkFramework("Metal", .{});
-        bench_sql.root_module.linkFramework("Foundation", .{});
-        bench_sql.root_module.addCSourceFiles(.{
-            .files = &.{"src/metal/metal_backend.m"},
-            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
-        });
-    }
-    if (use_accelerate) {
-        bench_sql.root_module.linkFramework("Accelerate", .{});
-    }
     const run_bench_sql = b.addRunArtifact(bench_sql);
-    const bench_sql_step = b.step("bench-sql", "Benchmark SQL clauses (SELECT, WHERE, GROUP BY, JOIN, etc.)");
+    const bench_sql_step = b.step("bench-sql", "FAIR end-to-end: SQL clauses (FILTER, AGGREGATE)");
     bench_sql_step.dependOn(&run_bench_sql.step);
 
     // @logic_table benchmark - uses REAL metal0 compiled lib/vector_ops.a
@@ -478,6 +451,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("benchmarks/bench_logic_table.zig"),
             .target = target,
             .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lanceql.table", .module = table_mod },
+            },
         }),
     });
     // Link the REAL metal0-compiled static library
@@ -526,6 +502,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("benchmarks/bench_pushdown.zig"),
             .target = target,
             .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lanceql.table", .module = table_mod },
+            },
         }),
     });
     const run_bench_pushdown = b.addRunArtifact(bench_pushdown);
@@ -539,10 +518,13 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("benchmarks/bench_tiered_dispatch.zig"),
             .target = target,
             .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lanceql.table", .module = table_mod },
+            },
         }),
     });
     const run_bench_tiered = b.addRunArtifact(bench_tiered);
-    const bench_tiered_step = b.step("bench-tiered", "Benchmark SIMD vs GPU tiered dispatch");
+    const bench_tiered_step = b.step("bench-tiered", "FAIR end-to-end: SIMD dot product");
     bench_tiered_step.dependOn(&run_bench_tiered.step);
 
     // Parquet benchmark - LanceQL vs DuckDB vs Polars
@@ -569,15 +551,13 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("benchmarks/bench_inprocess.zig"),
             .target = target,
             .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lanceql.table", .module = table_mod },
+            },
         }),
     });
-    bench_inprocess.addObjectFile(b.path("lib/vector_ops.a"));
-    bench_inprocess.addSystemIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
-    bench_inprocess.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    bench_inprocess.linkSystemLibrary("duckdb");
-    bench_inprocess.linkLibC();
     const run_bench_inprocess = b.addRunArtifact(bench_inprocess);
-    const bench_inprocess_step = b.step("bench-inprocess", "FAIR comparison: LanceQL vs DuckDB C API (no subprocess)");
+    const bench_inprocess_step = b.step("bench-inprocess", "FAIR end-to-end: LanceQL vs DuckDB vs Polars");
     bench_inprocess_step.dependOn(&run_bench_inprocess.step);
 
     // RAG Pipeline benchmark - end-to-end document retrieval
@@ -588,23 +568,12 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseFast,
             .imports = &.{
-                .{ .name = "lanceql.metal", .module = metal_mod },
+                .{ .name = "lanceql.table", .module = table_mod },
             },
         }),
     });
-    if (use_metal) {
-        bench_rag.root_module.linkFramework("Metal", .{});
-        bench_rag.root_module.linkFramework("Foundation", .{});
-        bench_rag.root_module.addCSourceFiles(.{
-            .files = &.{"src/metal/metal_backend.m"},
-            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
-        });
-    }
-    if (use_accelerate) {
-        bench_rag.root_module.linkFramework("Accelerate", .{});
-    }
     const run_bench_rag = b.addRunArtifact(bench_rag);
-    const bench_rag_step = b.step("bench-rag", "RAG pipeline: chunking, embedding, vector search");
+    const bench_rag_step = b.step("bench-rag", "FAIR end-to-end: similarity search (RAG pipeline)");
     bench_rag_step.dependOn(&run_bench_rag.step);
 
     // Hybrid Search benchmark - vector + SQL filters
@@ -616,6 +585,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
             .imports = &.{
                 .{ .name = "lanceql.metal", .module = metal_mod },
+                .{ .name = "lanceql.table", .module = table_mod },
             },
         }),
     });
@@ -641,6 +611,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("benchmarks/bench_feature_engineering.zig"),
             .target = target,
             .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lanceql.table", .module = table_mod },
+            },
         }),
     });
     const run_bench_feature = b.addRunArtifact(bench_feature);
@@ -654,6 +627,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("benchmarks/bench_analytics.zig"),
             .target = target,
             .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lanceql.table", .module = table_mod },
+            },
         }),
     });
     const run_bench_analytics = b.addRunArtifact(bench_analytics);
@@ -668,21 +644,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseFast,
             .imports = &.{
-                .{ .name = "lanceql.metal", .module = metal_mod },
+                .{ .name = "lanceql.table", .module = table_mod },
             },
         }),
     });
-    if (use_metal) {
-        bench_embed.root_module.linkFramework("Metal", .{});
-        bench_embed.root_module.linkFramework("Foundation", .{});
-        bench_embed.root_module.addCSourceFiles(.{
-            .files = &.{"src/metal/metal_backend.m"},
-            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
-        });
-    }
-    if (use_accelerate) {
-        bench_embed.root_module.linkFramework("Accelerate", .{});
-    }
     const run_bench_embed = b.addRunArtifact(bench_embed);
     const bench_embed_step = b.step("bench-embed", "Embedding pipeline: chunking, tokenization, embedding");
     bench_embed_step.dependOn(&run_bench_embed.step);
