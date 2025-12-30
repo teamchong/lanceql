@@ -26,6 +26,9 @@ pub const AggregateType = enum {
     variance, // Sample variance
     stddev_pop, // Population standard deviation
     var_pop, // Population variance
+    // Percentile-based aggregates (require storing all values)
+    median, // 50th percentile
+    percentile, // Arbitrary percentile (0-1)
 };
 
 /// Accumulator for aggregate computations
@@ -109,6 +112,8 @@ pub const Accumulator = struct {
             .var_pop => self.computeVariance(true),
             .stddev => @sqrt(self.computeVariance(false)),
             .stddev_pop => @sqrt(self.computeVariance(true)),
+            // Percentile-based aggregates use PercentileAccumulator, not this one
+            .median, .percentile => unreachable,
         };
     }
 
@@ -120,7 +125,63 @@ pub const Accumulator = struct {
             .min => self.min_int orelse 0,
             .max => self.max_int orelse 0,
             .variance, .var_pop, .stddev, .stddev_pop => @as(i64, @intFromFloat(self.getResult())),
+            // Percentile-based aggregates use PercentileAccumulator, not this one
+            .median, .percentile => unreachable,
         };
+    }
+};
+
+/// Accumulator for percentile-based aggregates (MEDIAN, PERCENTILE)
+/// These require storing all values to compute the result
+pub const PercentileAccumulator = struct {
+    allocator: std.mem.Allocator,
+    values: std.ArrayList(f64),
+    percentile: f64, // 0.5 for median, configurable for percentile
+
+    pub fn init(allocator: std.mem.Allocator, percentile: f64) PercentileAccumulator {
+        return PercentileAccumulator{
+            .allocator = allocator,
+            .values = std.ArrayList(f64){},
+            .percentile = percentile,
+        };
+    }
+
+    pub fn deinit(self: *PercentileAccumulator) void {
+        self.values.deinit(self.allocator);
+    }
+
+    pub fn addValue(self: *PercentileAccumulator, value: f64) !void {
+        try self.values.append(self.allocator, value);
+    }
+
+    pub fn addInt(self: *PercentileAccumulator, value: i64) !void {
+        try self.addValue(@as(f64, @floatFromInt(value)));
+    }
+
+    pub fn addFloat(self: *PercentileAccumulator, value: f64) !void {
+        try self.addValue(value);
+    }
+
+    /// Compute the percentile using linear interpolation
+    pub fn getResult(self: *PercentileAccumulator) f64 {
+        if (self.values.items.len == 0) return 0;
+
+        // Sort values
+        std.mem.sort(f64, self.values.items, {}, std.sort.asc(f64));
+
+        const n = self.values.items.len;
+        if (n == 1) return self.values.items[0];
+
+        // Calculate position using linear interpolation
+        const pos = self.percentile * @as(f64, @floatFromInt(n - 1));
+        const lower_idx = @as(usize, @intFromFloat(@floor(pos)));
+        const upper_idx = @min(lower_idx + 1, n - 1);
+        const fraction = pos - @floor(pos);
+
+        // Linear interpolation between lower and upper values
+        const lower_val = self.values.items[lower_idx];
+        const upper_val = self.values.items[upper_idx];
+        return lower_val + fraction * (upper_val - lower_val);
     }
 };
 
@@ -1450,7 +1511,7 @@ pub const Executor = struct {
     /// Check if function name is an aggregate function
     fn isAggregateFunction(name: []const u8) bool {
         // Case-insensitive comparison
-        if (name.len < 3 or name.len > 11) return false;
+        if (name.len < 3 or name.len > 15) return false;
 
         var upper_buf: [16]u8 = undefined;
         const len = @min(name.len, upper_buf.len);
@@ -1466,7 +1527,11 @@ pub const Executor = struct {
             std.mem.eql(u8, upper_name, "STDDEV_POP") or
             std.mem.eql(u8, upper_name, "VARIANCE") or
             std.mem.eql(u8, upper_name, "VAR_SAMP") or
-            std.mem.eql(u8, upper_name, "VAR_POP");
+            std.mem.eql(u8, upper_name, "VAR_POP") or
+            std.mem.eql(u8, upper_name, "MEDIAN") or
+            std.mem.eql(u8, upper_name, "PERCENTILE") or
+            std.mem.eql(u8, upper_name, "PERCENTILE_CONT") or
+            std.mem.eql(u8, upper_name, "QUANTILE");
     }
 
     // ========================================================================
@@ -1906,6 +1971,13 @@ pub const Executor = struct {
             return .variance;
         } else if (std.mem.eql(u8, upper_name, "VAR_POP")) {
             return .var_pop;
+        } else if (std.mem.eql(u8, upper_name, "MEDIAN")) {
+            return .median;
+        } else if (std.mem.eql(u8, upper_name, "PERCENTILE") or
+            std.mem.eql(u8, upper_name, "PERCENTILE_CONT") or
+            std.mem.eql(u8, upper_name, "QUANTILE"))
+        {
+            return .percentile;
         }
         return .count; // Default fallback
     }
@@ -2155,11 +2227,72 @@ pub const Executor = struct {
         else
             null;
 
+        // Check if this is a percentile-based aggregate (requires storing all values)
+        const is_percentile_agg = agg_type == .median or agg_type == .percentile;
+
         // Check if this is a float-returning aggregate (stddev, variance)
         const is_float_agg = agg_type == .stddev or agg_type == .stddev_pop or
             agg_type == .variance or agg_type == .var_pop or agg_type == .avg;
 
-        if (is_float_agg) {
+        if (is_percentile_agg) {
+            // Percentile-based aggregates need to store all values
+            const results = try self.allocator.alloc(f64, num_groups);
+            errdefer self.allocator.free(results);
+
+            // Handle case of no groups
+            if (groups.count() == 0) {
+                results[0] = 0;
+                return Result.Column{
+                    .name = item.alias orelse call.name,
+                    .data = Result.ColumnData{ .float64 = results },
+                };
+            }
+
+            // Get percentile value (0.5 for median, from second arg for percentile)
+            const percentile_val: f64 = if (agg_type == .median)
+                0.5
+            else if (call.args.len >= 2 and call.args[1] == .value)
+                switch (call.args[1].value) {
+                    .float => |f| f,
+                    .integer => |i| @as(f64, @floatFromInt(i)),
+                    else => 0.5,
+                }
+            else
+                0.5;
+
+            // Compute percentile for each group
+            var group_idx: usize = 0;
+            var iter = groups.iterator();
+            while (iter.next()) |entry| {
+                const row_indices = entry.value_ptr.items;
+
+                var acc = PercentileAccumulator.init(self.allocator, percentile_val);
+                defer acc.deinit();
+
+                for (row_indices) |row_idx| {
+                    if (agg_col_name) |col_name| {
+                        const cached = self.column_cache.get(col_name) orelse return error.ColumnNotCached;
+
+                        switch (cached) {
+                            .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| try acc.addInt(data[row_idx]),
+                            .int32, .date32 => |data| try acc.addInt(data[row_idx]),
+                            .float64 => |data| try acc.addFloat(data[row_idx]),
+                            .float32 => |data| try acc.addFloat(data[row_idx]),
+                            .bool_ => |data| try acc.addInt(if (data[row_idx]) 1 else 0),
+                            .string => {}, // Skip strings for percentile
+                        }
+                    }
+                }
+
+                results[group_idx] = acc.getResult();
+                group_idx += 1;
+            }
+
+            return Result.Column{
+                .name = item.alias orelse call.name,
+                .data = Result.ColumnData{ .float64 = results },
+            };
+        } else if (is_float_agg) {
             // Allocate float64 result array
             const results = try self.allocator.alloc(f64, num_groups);
             errdefer self.allocator.free(results);

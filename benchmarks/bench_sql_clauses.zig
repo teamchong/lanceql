@@ -655,7 +655,7 @@ pub fn main() !void {
             \\warmup_end = time.time() + WARMUP_SECONDS
             \\while time.time() < warmup_end:
             \\    con = duckdb.connect()
-            \\    df = con.execute("SELECT COUNT(*) FROM read_parquet('{s}') WHERE amount > 100").fetchdf()
+            \\    _ = con.execute("SELECT COUNT(*) FROM read_parquet('{s}') WHERE amount > 100").fetchone()
             \\    con.close()
             \\
             \\iterations = 0
@@ -844,7 +844,7 @@ pub fn main() !void {
             \\warmup_end = time.time() + WARMUP_SECONDS
             \\while time.time() < warmup_end:
             \\    con = duckdb.connect()
-            \\    df = con.execute("SELECT SUM(amount) FROM read_parquet('{s}')").fetchdf()
+            \\    _ = con.execute("SELECT SUM(amount) FROM read_parquet('{s}')").fetchone()
             \\    con.close()
             \\
             \\iterations = 0
@@ -1037,7 +1037,7 @@ pub fn main() !void {
             \\warmup_end = time.time() + WARMUP_SECONDS
             \\while time.time() < warmup_end:
             \\    con = duckdb.connect()
-            \\    df = con.execute("SELECT customer_id, SUM(amount) FROM read_parquet('{s}') GROUP BY customer_id").fetchdf()
+            \\    _ = con.execute("SELECT customer_id, SUM(amount) FROM read_parquet('{s}') GROUP BY customer_id").fetchall()
             \\    con.close()
             \\
             \\iterations = 0
@@ -1047,7 +1047,7 @@ pub fn main() !void {
             \\while time.time() < benchmark_end:
             \\    con = duckdb.connect()
             \\    result = con.execute("SELECT COUNT(*) FROM read_parquet('{s}')").fetchone()
-            \\    _ = con.execute("SELECT customer_id, SUM(amount) FROM read_parquet('{s}') GROUP BY customer_id").fetchdf()
+            \\    _ = con.execute("SELECT customer_id, SUM(amount) FROM read_parquet('{s}') GROUP BY customer_id").fetchall()
             \\    total_rows += result[0]
             \\    con.close()
             \\    iterations += 1

@@ -487,6 +487,102 @@ test "execute SELECT STDDEV and VARIANCE" {
     }
 }
 
+test "execute SELECT MEDIAN and PERCENTILE" {
+    const allocator = std.testing.allocator;
+
+    // Open test Lance file - values are 1,2,3,4,5
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // For sorted values [1,2,3,4,5]:
+    // MEDIAN = 3.0 (50th percentile, middle value)
+    // PERCENTILE(0.0) = 1.0 (min)
+    // PERCENTILE(0.25) = 2.0 (25th percentile)
+    // PERCENTILE(0.75) = 4.0 (75th percentile)
+    // PERCENTILE(1.0) = 5.0 (max)
+
+    // Test MEDIAN
+    {
+        const sql = "SELECT MEDIAN(id) FROM table";
+        var stmt = try parser.parseSQL(sql, allocator);
+        defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+        var executor = Executor.init(&table, allocator);
+        defer executor.deinit();
+        var result = try executor.execute(&stmt.select, &[_]Value{});
+        defer result.deinit();
+
+        try std.testing.expect(result.columns[0].data == .float64);
+        const median = result.columns[0].data.float64[0];
+        try std.testing.expectApproxEqAbs(@as(f64, 3.0), median, 0.0001);
+    }
+
+    // Test PERCENTILE 0th (min)
+    {
+        const sql = "SELECT PERCENTILE(id, 0.0) FROM table";
+        var stmt = try parser.parseSQL(sql, allocator);
+        defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+        var executor = Executor.init(&table, allocator);
+        defer executor.deinit();
+        var result = try executor.execute(&stmt.select, &[_]Value{});
+        defer result.deinit();
+
+        try std.testing.expect(result.columns[0].data == .float64);
+        const pct = result.columns[0].data.float64[0];
+        try std.testing.expectApproxEqAbs(@as(f64, 1.0), pct, 0.0001);
+    }
+
+    // Test PERCENTILE 25th
+    {
+        const sql = "SELECT PERCENTILE(id, 0.25) FROM table";
+        var stmt = try parser.parseSQL(sql, allocator);
+        defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+        var executor = Executor.init(&table, allocator);
+        defer executor.deinit();
+        var result = try executor.execute(&stmt.select, &[_]Value{});
+        defer result.deinit();
+
+        try std.testing.expect(result.columns[0].data == .float64);
+        const pct = result.columns[0].data.float64[0];
+        try std.testing.expectApproxEqAbs(@as(f64, 2.0), pct, 0.0001);
+    }
+
+    // Test PERCENTILE 75th
+    {
+        const sql = "SELECT PERCENTILE(id, 0.75) FROM table";
+        var stmt = try parser.parseSQL(sql, allocator);
+        defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+        var executor = Executor.init(&table, allocator);
+        defer executor.deinit();
+        var result = try executor.execute(&stmt.select, &[_]Value{});
+        defer result.deinit();
+
+        try std.testing.expect(result.columns[0].data == .float64);
+        const pct = result.columns[0].data.float64[0];
+        try std.testing.expectApproxEqAbs(@as(f64, 4.0), pct, 0.0001);
+    }
+
+    // Test PERCENTILE 100th (max)
+    {
+        const sql = "SELECT PERCENTILE(id, 1.0) FROM table";
+        var stmt = try parser.parseSQL(sql, allocator);
+        defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+        var executor = Executor.init(&table, allocator);
+        defer executor.deinit();
+        var result = try executor.execute(&stmt.select, &[_]Value{});
+        defer result.deinit();
+
+        try std.testing.expect(result.columns[0].data == .float64);
+        const pct = result.columns[0].data.float64[0];
+        try std.testing.expectApproxEqAbs(@as(f64, 5.0), pct, 0.0001);
+    }
+}
+
 test "execute SELECT with GROUP BY" {
     const allocator = std.testing.allocator;
 

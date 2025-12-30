@@ -84,8 +84,8 @@ This document compares LanceQL features against DuckDB and Polars for feature pa
 | STDDEV_POP | Yes | Yes | Yes | Population standard deviation |
 | VARIANCE / VAR_SAMP | Yes | Yes | Yes | Sample variance |
 | VAR_POP | Yes | Yes | Yes | Population variance |
-| PERCENTILE | No | Yes | Yes | Future |
-| MEDIAN | No | Yes | Yes | Future |
+| PERCENTILE / QUANTILE | Yes | Yes | Yes | Arbitrary percentile (0-1) |
+| MEDIAN | Yes | Yes | Yes | 50th percentile |
 | STRING_AGG | No | Yes | Yes | Future |
 | ARRAY_AGG | No | Yes | Yes | Future |
 
@@ -164,10 +164,10 @@ This document compares LanceQL features against DuckDB and Polars for feature pa
 - IN (subquery) and IN (list) execution
 - Simple (non-correlated) only
 
-### Phase 5: Aggregations (P4) ✅ PARTIAL
+### Phase 5: Aggregations (P4) ✅ COMPLETE
 - STDDEV / STDDEV_SAMP / STDDEV_POP ✅
 - VARIANCE / VAR_SAMP / VAR_POP ✅
-- PERCENTILE / MEDIAN - Future
+- PERCENTILE / QUANTILE / MEDIAN ✅
 - STRING_AGG - Future
 
 ### Phase 6: Date/Time (P5)
