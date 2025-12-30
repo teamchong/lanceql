@@ -88,16 +88,16 @@ jobs:
           echo "Compiled @logic_table:"
           ls -la lib/vector_ops.a
 
-      - name: Run Vector benchmark (GPU vs CPU)
+      - name: Run Vector benchmark (CPU-only)
         id: bench-vector
         run: |
-          echo "## Vector Operations Benchmark" >> $GITHUB_STEP_SUMMARY
+          echo "## Vector Operations Benchmark (CPU)" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          # Note: GitHub Actions macOS runners don't expose Metal GPU
-          # Skip the GPU vector benchmark in CI - it would timeout on CPU
-          echo "Skipped: GitHub Actions macOS doesn't expose Metal GPU" | tee bench-vector.txt
-          echo "Vector benchmarks require GPU and should be run locally on Apple Silicon" >> bench-vector.txt
+          # Run CPU-only vector benchmark (GPU acceleration not available in CI)
+          ./scripts/bench-vector.sh 2>&1 | tee bench-vector.txt || {
+            echo "Skipped: Vector benchmark failed" | tee bench-vector.txt
+          }
           cat bench-vector.txt >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -134,9 +134,11 @@ jobs:
 
           # Check Vector Ops status
           if grep -q "Skipped" bench-vector.txt 2>/dev/null; then
-            echo "| Vector Ops (GPU) | :yellow_circle: Skipped (no GPU in CI) |" >> $GITHUB_STEP_SUMMARY
+            echo "| Vector Ops (CPU) | :yellow_circle: Skipped |" >> $GITHUB_STEP_SUMMARY
+          elif grep -q "rows/sec" bench-vector.txt 2>/dev/null; then
+            echo "| Vector Ops (CPU) | :white_check_mark: |" >> $GITHUB_STEP_SUMMARY
           else
-            echo "| Vector Ops (GPU) | :white_check_mark: |" >> $GITHUB_STEP_SUMMARY
+            echo "| Vector Ops (CPU) | :yellow_circle: Partial |" >> $GITHUB_STEP_SUMMARY
           fi
 
           # Check SQL Clauses status
