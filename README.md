@@ -252,34 +252,6 @@ import { LanceQL } from './lanceql.js';
 // Types are automatically picked up from lanceql.d.ts
 ```
 
-## Benchmarks
-
-### LanceQL vs PyArrow (Parquet files)
-
-*Benchmarked on Apple M2 Pro (ARM64). Results may vary on other platforms.*
-
-| Test | Dataset | PyArrow (C++) | LanceQL (Zig) | Speedup |
-|------|---------|---------------|---------------|---------|
-| Snappy Compressed | 100K rows | 75.5M rows/s | **122.6M rows/s** | **1.6x faster** |
-| Uncompressed | 100K rows | 77.7M rows/s | **370.6M rows/s** | **4.8x faster** |
-
-Pure Zig Parquet reader with zero external dependencies:
-- Thrift TCompactProtocol decoder
-- PLAIN + RLE/Dictionary encoding
-- Snappy decompression (SIMD-optimized)
-
-**Why so fast?**
-- **Zero-copy Arrow C Data Interface** - Data buffers shared directly between Zig and PyArrow
-- **No Python overhead** - Native Zig library via ctypes
-- **Minimal allocations** - Only string offsets need conversion (4 bytes per row)
-
-Run benchmarks yourself:
-```bash
-zig build test-parquet                           # Native Zig Parquet decoder benchmark
-python benchmarks/bench_parquet_vs_pyarrow.py    # vs PyArrow (Parquet files)
-python benchmarks/10_parquet_api.py              # vs pyarrow.parquet (drop-in API)
-```
-
 ## Performance Optimizations
 
 - **Zero-copy Arrow** - Direct memory sharing via Arrow C Data Interface
