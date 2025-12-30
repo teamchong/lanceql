@@ -210,23 +210,35 @@ pub const Result = struct {
         timestamp_ns: []i64, // nanoseconds since epoch
         date32: []i32, // days since epoch
         date64: []i64, // milliseconds since epoch
+
+        /// Get the length of the column data
+        pub fn len(self: ColumnData) usize {
+            return switch (self) {
+                inline else => |data| data.len,
+            };
+        }
+
+        /// Free the column data using the provided allocator
+        pub fn free(self: ColumnData, allocator: std.mem.Allocator) void {
+            switch (self) {
+                .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| allocator.free(data),
+                .int32, .date32 => |data| allocator.free(data),
+                .float64 => |data| allocator.free(data),
+                .float32 => |data| allocator.free(data),
+                .bool_ => |data| allocator.free(data),
+                .string => |data| {
+                    for (data) |str| {
+                        allocator.free(str);
+                    }
+                    allocator.free(data);
+                },
+            }
+        }
     };
 
     pub fn deinit(self: *Result) void {
         for (self.columns) |col| {
-            switch (col.data) {
-                .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| self.allocator.free(data),
-                .int32, .date32 => |data| self.allocator.free(data),
-                .float64 => |data| self.allocator.free(data),
-                .float32 => |data| self.allocator.free(data),
-                .bool_ => |data| self.allocator.free(data),
-                .string => |data| {
-                    for (data) |str| {
-                        self.allocator.free(str);
-                    }
-                    self.allocator.free(data);
-                },
-            }
+            col.data.free(self.allocator);
         }
         self.allocator.free(self.columns);
     }
@@ -247,6 +259,30 @@ pub const CachedColumn = union(enum) {
     timestamp_ns: []i64,
     date32: []i32,
     date64: []i64,
+
+    /// Get the length of the column data
+    pub fn len(self: CachedColumn) usize {
+        return switch (self) {
+            inline else => |data| data.len,
+        };
+    }
+
+    /// Free the column data using the provided allocator
+    pub fn free(self: CachedColumn, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| allocator.free(data),
+            .int32, .date32 => |data| allocator.free(data),
+            .float64 => |data| allocator.free(data),
+            .float32 => |data| allocator.free(data),
+            .bool_ => |data| allocator.free(data),
+            .string => |data| {
+                for (data) |str| {
+                    allocator.free(str);
+                }
+                allocator.free(data);
+            },
+        }
+    }
 };
 
 /// Materialized data from a JOIN operation
@@ -266,19 +302,7 @@ pub const JoinedData = struct {
         // Free column data
         var iter = self.columns.valueIterator();
         while (iter.next()) |col| {
-            switch (col.*) {
-                .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| self.allocator.free(data),
-                .int32, .date32 => |data| self.allocator.free(data),
-                .float64 => |data| self.allocator.free(data),
-                .float32 => |data| self.allocator.free(data),
-                .bool_ => |data| self.allocator.free(data),
-                .string => |data| {
-                    for (data) |str| {
-                        self.allocator.free(str);
-                    }
-                    self.allocator.free(data);
-                },
-            }
+            col.free(self.allocator);
         }
         self.columns.deinit();
         // Free column names
@@ -386,19 +410,7 @@ pub const Executor = struct {
         // Free cached columns
         var iter = self.column_cache.valueIterator();
         while (iter.next()) |col| {
-            switch (col.*) {
-                .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| self.allocator.free(data),
-                .int32, .date32 => |data| self.allocator.free(data),
-                .float64 => |data| self.allocator.free(data),
-                .float32 => |data| self.allocator.free(data),
-                .bool_ => |data| self.allocator.free(data),
-                .string => |data| {
-                    for (data) |str| {
-                        self.allocator.free(str);
-                    }
-                    self.allocator.free(data);
-                },
-            }
+            col.free(self.allocator);
         }
         self.column_cache.deinit();
 
@@ -2036,17 +2048,7 @@ pub const Executor = struct {
         var result_columns = std.ArrayListUnmanaged(Result.Column){};
         errdefer {
             for (result_columns.items) |col| {
-                switch (col.data) {
-                    .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| self.allocator.free(data),
-                    .int32, .date32 => |data| self.allocator.free(data),
-                    .float64 => |data| self.allocator.free(data),
-                    .float32 => |data| self.allocator.free(data),
-                    .bool_ => |data| self.allocator.free(data),
-                    .string => |data| {
-                        for (data) |str| self.allocator.free(str);
-                        self.allocator.free(data);
-                    },
-                }
+                col.data.free(self.allocator);
             }
             result_columns.deinit(self.allocator);
         }
@@ -4064,19 +4066,7 @@ pub const Executor = struct {
         var columns = std.ArrayList(Result.Column){};
         errdefer {
             for (columns.items) |col| {
-                switch (col.data) {
-                    .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| self.allocator.free(data),
-                    .int32, .date32 => |data| self.allocator.free(data),
-                    .float64 => |data| self.allocator.free(data),
-                    .float32 => |data| self.allocator.free(data),
-                    .bool_ => |data| self.allocator.free(data),
-                    .string => |data| {
-                        for (data) |str| {
-                            self.allocator.free(str);
-                        }
-                        self.allocator.free(data);
-                    },
-                }
+                col.data.free(self.allocator);
             }
             columns.deinit(self.allocator);
         }
@@ -4277,15 +4267,7 @@ pub const Executor = struct {
             return .{ .columns = columns, .row_count = 0 };
         }
 
-        const total_rows = switch (columns[0].data) {
-            .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |d| d.len,
-            .int32, .date32 => |d| d.len,
-            .float64 => |d| d.len,
-            .float32 => |d| d.len,
-            .bool_ => |d| d.len,
-            .string => |d| d.len,
-        };
-
+        const total_rows = columns[0].data.len();
         if (total_rows == 0) {
             return .{ .columns = columns, .row_count = 0 };
         }
@@ -4335,17 +4317,7 @@ pub const Executor = struct {
 
         // Free original column data
         for (columns) |col| {
-            switch (col.data) {
-                .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |d| self.allocator.free(d),
-                .int32, .date32 => |d| self.allocator.free(d),
-                .float64 => |d| self.allocator.free(d),
-                .float32 => |d| self.allocator.free(d),
-                .bool_ => |d| self.allocator.free(d),
-                .string => |d| {
-                    for (d) |str| self.allocator.free(str);
-                    self.allocator.free(d);
-                },
-            }
+            col.data.free(self.allocator);
         }
         self.allocator.free(columns);
 
@@ -4399,89 +4371,19 @@ pub const Executor = struct {
         return Result.Column{
             .name = col.name,
             .data = switch (col.data) {
-                .int64 => |vals| blk: {
-                    const new_vals = try self.allocator.alloc(i64, count);
-                    for (indices, 0..) |idx, i| {
-                        new_vals[i] = vals[idx];
-                    }
-                    break :blk Result.ColumnData{ .int64 = new_vals };
-                },
-                .timestamp_s => |vals| blk: {
-                    const new_vals = try self.allocator.alloc(i64, count);
-                    for (indices, 0..) |idx, i| {
-                        new_vals[i] = vals[idx];
-                    }
-                    break :blk Result.ColumnData{ .timestamp_s = new_vals };
-                },
-                .timestamp_ms => |vals| blk: {
-                    const new_vals = try self.allocator.alloc(i64, count);
-                    for (indices, 0..) |idx, i| {
-                        new_vals[i] = vals[idx];
-                    }
-                    break :blk Result.ColumnData{ .timestamp_ms = new_vals };
-                },
-                .timestamp_us => |vals| blk: {
-                    const new_vals = try self.allocator.alloc(i64, count);
-                    for (indices, 0..) |idx, i| {
-                        new_vals[i] = vals[idx];
-                    }
-                    break :blk Result.ColumnData{ .timestamp_us = new_vals };
-                },
-                .timestamp_ns => |vals| blk: {
-                    const new_vals = try self.allocator.alloc(i64, count);
-                    for (indices, 0..) |idx, i| {
-                        new_vals[i] = vals[idx];
-                    }
-                    break :blk Result.ColumnData{ .timestamp_ns = new_vals };
-                },
-                .date64 => |vals| blk: {
-                    const new_vals = try self.allocator.alloc(i64, count);
-                    for (indices, 0..) |idx, i| {
-                        new_vals[i] = vals[idx];
-                    }
-                    break :blk Result.ColumnData{ .date64 = new_vals };
-                },
-                .int32 => |vals| blk: {
-                    const new_vals = try self.allocator.alloc(i32, count);
-                    for (indices, 0..) |idx, i| {
-                        new_vals[i] = vals[idx];
-                    }
-                    break :blk Result.ColumnData{ .int32 = new_vals };
-                },
-                .date32 => |vals| blk: {
-                    const new_vals = try self.allocator.alloc(i32, count);
-                    for (indices, 0..) |idx, i| {
-                        new_vals[i] = vals[idx];
-                    }
-                    break :blk Result.ColumnData{ .date32 = new_vals };
-                },
-                .float64 => |vals| blk: {
-                    const new_vals = try self.allocator.alloc(f64, count);
-                    for (indices, 0..) |idx, i| {
-                        new_vals[i] = vals[idx];
-                    }
-                    break :blk Result.ColumnData{ .float64 = new_vals };
-                },
-                .float32 => |vals| blk: {
-                    const new_vals = try self.allocator.alloc(f32, count);
-                    for (indices, 0..) |idx, i| {
-                        new_vals[i] = vals[idx];
-                    }
-                    break :blk Result.ColumnData{ .float32 = new_vals };
-                },
-                .bool_ => |vals| blk: {
-                    const new_vals = try self.allocator.alloc(bool, count);
-                    for (indices, 0..) |idx, i| {
-                        new_vals[i] = vals[idx];
-                    }
-                    break :blk Result.ColumnData{ .bool_ = new_vals };
-                },
                 .string => |vals| blk: {
                     const new_vals = try self.allocator.alloc([]const u8, count);
                     for (indices, 0..) |idx, i| {
                         new_vals[i] = try self.allocator.dupe(u8, vals[idx]);
                     }
                     break :blk Result.ColumnData{ .string = new_vals };
+                },
+                inline else => |vals, tag| blk: {
+                    const new_vals = try self.allocator.alloc(@TypeOf(vals[0]), count);
+                    for (indices, 0..) |idx, i| {
+                        new_vals[i] = vals[idx];
+                    }
+                    break :blk @unionInit(Result.ColumnData, @tagName(tag), new_vals);
                 },
             },
         };
@@ -4498,15 +4400,7 @@ pub const Executor = struct {
     ) !void {
         if (columns.len == 0) return;
 
-        const row_count = switch (columns[0].data) {
-            .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| data.len,
-            .int32, .date32 => |data| data.len,
-            .float64 => |data| data.len,
-            .float32 => |data| data.len,
-            .bool_ => |data| data.len,
-            .string => |data| data.len,
-        };
-
+        const row_count = columns[0].data.len();
         if (row_count == 0) return;
 
         // Create array of indices [0, 1, 2, ..., n-1]
@@ -4602,94 +4496,6 @@ pub const Executor = struct {
 
     fn reorderColumn(self: *Self, col: *Result.Column, indices: []const usize) !void {
         switch (col.data) {
-            .int64 => |data| {
-                const reordered = try self.allocator.alloc(i64, data.len);
-                for (indices, 0..) |idx, i| {
-                    reordered[i] = data[idx];
-                }
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .int64 = reordered };
-            },
-            .timestamp_s => |data| {
-                const reordered = try self.allocator.alloc(i64, data.len);
-                for (indices, 0..) |idx, i| {
-                    reordered[i] = data[idx];
-                }
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .timestamp_s = reordered };
-            },
-            .timestamp_ms => |data| {
-                const reordered = try self.allocator.alloc(i64, data.len);
-                for (indices, 0..) |idx, i| {
-                    reordered[i] = data[idx];
-                }
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .timestamp_ms = reordered };
-            },
-            .timestamp_us => |data| {
-                const reordered = try self.allocator.alloc(i64, data.len);
-                for (indices, 0..) |idx, i| {
-                    reordered[i] = data[idx];
-                }
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .timestamp_us = reordered };
-            },
-            .timestamp_ns => |data| {
-                const reordered = try self.allocator.alloc(i64, data.len);
-                for (indices, 0..) |idx, i| {
-                    reordered[i] = data[idx];
-                }
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .timestamp_ns = reordered };
-            },
-            .date64 => |data| {
-                const reordered = try self.allocator.alloc(i64, data.len);
-                for (indices, 0..) |idx, i| {
-                    reordered[i] = data[idx];
-                }
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .date64 = reordered };
-            },
-            .int32 => |data| {
-                const reordered = try self.allocator.alloc(i32, data.len);
-                for (indices, 0..) |idx, i| {
-                    reordered[i] = data[idx];
-                }
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .int32 = reordered };
-            },
-            .date32 => |data| {
-                const reordered = try self.allocator.alloc(i32, data.len);
-                for (indices, 0..) |idx, i| {
-                    reordered[i] = data[idx];
-                }
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .date32 = reordered };
-            },
-            .float64 => |data| {
-                const reordered = try self.allocator.alloc(f64, data.len);
-                for (indices, 0..) |idx, i| {
-                    reordered[i] = data[idx];
-                }
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .float64 = reordered };
-            },
-            .float32 => |data| {
-                const reordered = try self.allocator.alloc(f32, data.len);
-                for (indices, 0..) |idx, i| {
-                    reordered[i] = data[idx];
-                }
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .float32 = reordered };
-            },
-            .bool_ => |data| {
-                const reordered = try self.allocator.alloc(bool, data.len);
-                for (indices, 0..) |idx, i| {
-                    reordered[i] = data[idx];
-                }
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .bool_ = reordered };
-            },
             .string => |data| {
                 const reordered = try self.allocator.alloc([]const u8, data.len);
                 for (indices, 0..) |idx, i| {
@@ -4701,6 +4507,14 @@ pub const Executor = struct {
                 }
                 self.allocator.free(data);
                 col.data = Result.ColumnData{ .string = reordered };
+            },
+            inline else => |data, tag| {
+                const reordered = try self.allocator.alloc(@TypeOf(data[0]), data.len);
+                for (indices, 0..) |idx, i| {
+                    reordered[i] = data[idx];
+                }
+                self.allocator.free(data);
+                col.data = @unionInit(Result.ColumnData, @tagName(tag), reordered);
             },
         }
     }
@@ -4717,15 +4531,7 @@ pub const Executor = struct {
     ) usize {
         if (columns.len == 0) return 0;
 
-        const row_count = switch (columns[0].data) {
-            .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| data.len,
-            .int32, .date32 => |data| data.len,
-            .float64 => |data| data.len,
-            .float32 => |data| data.len,
-            .bool_ => |data| data.len,
-            .string => |data| data.len,
-        };
-
+        const row_count = columns[0].data.len();
         const start = offset orelse 0;
         if (start >= row_count) {
             // Free all data and return 0
@@ -4766,72 +4572,6 @@ pub const Executor = struct {
         const new_len = end - start;
 
         switch (col.data) {
-            .int64 => |data| {
-                const sliced = try self.allocator.alloc(i64, new_len);
-                @memcpy(sliced, data[start..end]);
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .int64 = sliced };
-            },
-            .timestamp_s => |data| {
-                const sliced = try self.allocator.alloc(i64, new_len);
-                @memcpy(sliced, data[start..end]);
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .timestamp_s = sliced };
-            },
-            .timestamp_ms => |data| {
-                const sliced = try self.allocator.alloc(i64, new_len);
-                @memcpy(sliced, data[start..end]);
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .timestamp_ms = sliced };
-            },
-            .timestamp_us => |data| {
-                const sliced = try self.allocator.alloc(i64, new_len);
-                @memcpy(sliced, data[start..end]);
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .timestamp_us = sliced };
-            },
-            .timestamp_ns => |data| {
-                const sliced = try self.allocator.alloc(i64, new_len);
-                @memcpy(sliced, data[start..end]);
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .timestamp_ns = sliced };
-            },
-            .date64 => |data| {
-                const sliced = try self.allocator.alloc(i64, new_len);
-                @memcpy(sliced, data[start..end]);
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .date64 = sliced };
-            },
-            .int32 => |data| {
-                const sliced = try self.allocator.alloc(i32, new_len);
-                @memcpy(sliced, data[start..end]);
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .int32 = sliced };
-            },
-            .date32 => |data| {
-                const sliced = try self.allocator.alloc(i32, new_len);
-                @memcpy(sliced, data[start..end]);
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .date32 = sliced };
-            },
-            .float64 => |data| {
-                const sliced = try self.allocator.alloc(f64, new_len);
-                @memcpy(sliced, data[start..end]);
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .float64 = sliced };
-            },
-            .float32 => |data| {
-                const sliced = try self.allocator.alloc(f32, new_len);
-                @memcpy(sliced, data[start..end]);
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .float32 = sliced };
-            },
-            .bool_ => |data| {
-                const sliced = try self.allocator.alloc(bool, new_len);
-                @memcpy(sliced, data[start..end]);
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .bool_ = sliced };
-            },
             .string => |data| {
                 const sliced = try self.allocator.alloc([]const u8, new_len);
                 for (data[start..end], 0..) |str, i| {
@@ -4844,23 +4584,17 @@ pub const Executor = struct {
                 self.allocator.free(data);
                 col.data = Result.ColumnData{ .string = sliced };
             },
+            inline else => |data, tag| {
+                const sliced = try self.allocator.alloc(@TypeOf(data[0]), new_len);
+                @memcpy(sliced, data[start..end]);
+                self.allocator.free(data);
+                col.data = @unionInit(Result.ColumnData, @tagName(tag), sliced);
+            },
         }
     }
 
     fn freeColumnData(self: *Self, data: *Result.ColumnData) void {
-        switch (data.*) {
-            .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |d| self.allocator.free(d),
-            .int32, .date32 => |d| self.allocator.free(d),
-            .float64 => |d| self.allocator.free(d),
-            .float32 => |d| self.allocator.free(d),
-            .bool_ => |d| self.allocator.free(d),
-            .string => |d| {
-                for (d) |str| {
-                    self.allocator.free(str);
-                }
-                self.allocator.free(d);
-            },
-        }
+        data.free(self.allocator);
     }
 
     // ========================================================================
