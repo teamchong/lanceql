@@ -276,6 +276,14 @@ pub const OrderDirection = enum {
     desc,
 };
 
+/// Set operation types
+pub const SetOperationType = enum {
+    union_all,       // UNION ALL (keep duplicates)
+    union_distinct,  // UNION (remove duplicates)
+    intersect,       // INTERSECT
+    except,          // EXCEPT
+};
+
 /// ORDER BY clause item
 pub const OrderBy = struct {
     /// Column to sort by
@@ -292,6 +300,15 @@ pub const GroupBy = struct {
 
     /// Optional HAVING clause
     having: ?Expr,
+};
+
+/// Set operation (UNION, INTERSECT, EXCEPT) with another query
+pub const SetOperation = struct {
+    /// The type of set operation
+    op_type: SetOperationType,
+
+    /// The right-hand query
+    right: *SelectStmt,
 };
 
 /// Complete SELECT statement
@@ -320,6 +337,9 @@ pub const SelectStmt = struct {
 
     /// OFFSET clause (optional)
     offset: ?u32,
+
+    /// Set operation with another query (optional)
+    set_operation: ?SetOperation,
 };
 
 /// Top-level statement (extensible for INSERT/UPDATE/DELETE later)
@@ -416,6 +436,39 @@ pub fn deinitExpr(expr: *Expr, allocator: std.mem.Allocator) void {
     }
 }
 
+/// Recursively free all heap-allocated memory in a TableRef.
+pub fn deinitTableRef(table_ref: *TableRef, allocator: std.mem.Allocator) void {
+    switch (table_ref.*) {
+        .simple => {}, // No heap allocations
+        .function => |func| {
+            // Free function arguments
+            for (func.func.args) |*arg| {
+                deinitExpr(arg, allocator);
+            }
+            allocator.free(func.func.args);
+        },
+        .join => |join| {
+            // Free left table (recursive)
+            deinitTableRef(join.left, allocator);
+            allocator.destroy(join.left);
+
+            // Free right table in join clause
+            deinitTableRef(join.join_clause.table, allocator);
+            allocator.destroy(join.join_clause.table);
+
+            // Free ON condition expression
+            if (join.join_clause.on_condition) |*on_cond| {
+                deinitExpr(@constCast(on_cond), allocator);
+            }
+
+            // Free USING columns
+            if (join.join_clause.using_columns) |cols| {
+                allocator.free(cols);
+            }
+        },
+    }
+}
+
 /// Free all heap-allocated memory in a SelectStmt.
 /// Call this to clean up statements returned by the parser.
 pub fn deinitSelectStmt(stmt: *SelectStmt, allocator: std.mem.Allocator) void {
@@ -424,6 +477,9 @@ pub fn deinitSelectStmt(stmt: *SelectStmt, allocator: std.mem.Allocator) void {
         deinitExpr(&col.expr, allocator);
     }
     allocator.free(stmt.columns);
+
+    // Free FROM clause (TableRef)
+    deinitTableRef(&stmt.from, allocator);
 
     // Free WHERE clause
     if (stmt.where) |*where| {
@@ -441,6 +497,12 @@ pub fn deinitSelectStmt(stmt: *SelectStmt, allocator: std.mem.Allocator) void {
     // Free ORDER BY clause
     if (stmt.order_by) |order_by| {
         allocator.free(order_by);
+    }
+
+    // Free set operation (recursive)
+    if (stmt.set_operation) |set_op| {
+        deinitSelectStmt(set_op.right, allocator);
+        allocator.destroy(set_op.right);
     }
 }
 

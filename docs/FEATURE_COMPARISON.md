@@ -41,10 +41,10 @@ This document compares LanceQL features against DuckDB and Polars for feature pa
 
 | Feature | LanceQL | DuckDB | Polars | Notes |
 |---------|---------|--------|--------|-------|
-| UNION | **Parsed** | Yes | Yes | Needs execution |
-| UNION ALL | **Parsed** | Yes | Yes | Needs execution |
-| INTERSECT | **Parsed** | Yes | Yes | Needs execution |
-| EXCEPT | **Parsed** | Yes | Yes | Needs execution |
+| UNION | Yes | Yes | Yes | Full support |
+| UNION ALL | Yes | Yes | Yes | Full support |
+| INTERSECT | Yes | Yes | Yes | Full support |
+| EXCEPT | Yes | Yes | Yes | Full support |
 
 ### Subqueries
 
@@ -60,12 +60,12 @@ This document compares LanceQL features against DuckDB and Polars for feature pa
 
 | Feature | LanceQL | DuckDB | Polars | Notes |
 |---------|---------|--------|--------|-------|
-| ROW_NUMBER | **Parsed** | Yes | Yes | Needs execution |
-| RANK | **Parsed** | Yes | Yes | Needs execution |
-| DENSE_RANK | **Parsed** | Yes | Yes | Needs execution |
+| ROW_NUMBER | Yes | Yes | Yes | Full support |
+| RANK | Yes | Yes | Yes | Full support |
+| DENSE_RANK | Yes | Yes | Yes | Full support |
 | NTILE | No | Yes | Yes | Future |
-| LAG | **Parsed** | Yes | Yes | Needs execution |
-| LEAD | **Parsed** | Yes | Yes | Needs execution |
+| LAG | Yes | Yes | Yes | Full support |
+| LEAD | Yes | Yes | Yes | Full support |
 | FIRST_VALUE | No | Yes | Yes | Future |
 | LAST_VALUE | No | Yes | Yes | Future |
 | Aggregate OVER | **Parsed** | Yes | Yes | Needs execution |
@@ -140,17 +140,17 @@ This document compares LanceQL features against DuckDB and Polars for feature pa
 
 ## Implementation Roadmap
 
-### Phase 1: JOINs (P0 - High Priority)
+### Phase 1: JOINs (P0 - High Priority) ✅ COMPLETE
 - INNER JOIN with hash join algorithm
 - LEFT/RIGHT/FULL JOIN extensions
 - File: `src/sql/executor.zig:417`
 
-### Phase 2: Window Functions (P1 - High Priority)
+### Phase 2: Window Functions (P1 - High Priority) ✅ COMPLETE
 - ROW_NUMBER, RANK, DENSE_RANK
 - LAG, LEAD
-- Frame bounds (ROWS BETWEEN)
+- Frame bounds (ROWS BETWEEN) - Future
 
-### Phase 3: Set Operations (P2)
+### Phase 3: Set Operations (P2) ✅ COMPLETE
 - UNION / UNION ALL
 - INTERSECT
 - EXCEPT

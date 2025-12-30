@@ -1383,3 +1383,172 @@ test "execute INNER JOIN (self-join)" {
     // Should have 5 rows (each row matches itself)
     try std.testing.expectEqual(@as(usize, 5), result.row_count);
 }
+
+// ============================================================================
+// Window Function Tests
+// Note: Window function parsing is tested in src/sql/parser.zig
+// Window function execution is implemented in src/sql/executor.zig
+// ============================================================================
+
+// ============================================================================
+// Set Operation Tests (UNION, INTERSECT, EXCEPT)
+// ============================================================================
+
+test "parse UNION" {
+    const allocator = std.testing.allocator;
+
+    // Parse UNION SQL
+    const sql = "SELECT id FROM table1 UNION SELECT id FROM table2";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    // Verify set operation was parsed
+    try std.testing.expect(stmt.select.set_operation != null);
+    try std.testing.expectEqual(ast.SetOperationType.union_distinct, stmt.select.set_operation.?.op_type);
+}
+
+test "parse UNION ALL" {
+    const allocator = std.testing.allocator;
+
+    // Parse UNION ALL SQL
+    const sql = "SELECT id FROM table1 UNION ALL SELECT id FROM table2";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    // Verify set operation was parsed
+    try std.testing.expect(stmt.select.set_operation != null);
+    try std.testing.expectEqual(ast.SetOperationType.union_all, stmt.select.set_operation.?.op_type);
+}
+
+test "parse INTERSECT" {
+    const allocator = std.testing.allocator;
+
+    // Parse INTERSECT SQL
+    const sql = "SELECT id FROM table1 INTERSECT SELECT id FROM table2";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    // Verify set operation was parsed
+    try std.testing.expect(stmt.select.set_operation != null);
+    try std.testing.expectEqual(ast.SetOperationType.intersect, stmt.select.set_operation.?.op_type);
+}
+
+test "parse EXCEPT" {
+    const allocator = std.testing.allocator;
+
+    // Parse EXCEPT SQL
+    const sql = "SELECT id FROM table1 EXCEPT SELECT id FROM table2";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    // Verify set operation was parsed
+    try std.testing.expect(stmt.select.set_operation != null);
+    try std.testing.expectEqual(ast.SetOperationType.except, stmt.select.set_operation.?.op_type);
+}
+
+test "execute UNION ALL" {
+    const allocator = std.testing.allocator;
+
+    // Open test Lance file - use same file for both sides
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // SELECT id FROM table WHERE id <= 2 UNION ALL SELECT id FROM table WHERE id >= 4
+    // Left: [1, 2], Right: [4, 5], Union All: [1, 2, 4, 5]
+    const sql = "SELECT id FROM table WHERE id <= 2 UNION ALL SELECT id FROM table WHERE id >= 4";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    // Should have 4 rows total
+    try std.testing.expectEqual(@as(usize, 4), result.row_count);
+    try std.testing.expectEqual(@as(usize, 1), result.columns.len);
+
+    const values = result.columns[0].data.int64;
+    try std.testing.expectEqual(@as(i64, 1), values[0]);
+    try std.testing.expectEqual(@as(i64, 2), values[1]);
+    try std.testing.expectEqual(@as(i64, 4), values[2]);
+    try std.testing.expectEqual(@as(i64, 5), values[3]);
+}
+
+test "execute UNION (distinct)" {
+    const allocator = std.testing.allocator;
+
+    // Open test Lance file
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // SELECT id FROM table WHERE id <= 3 UNION SELECT id FROM table WHERE id >= 2
+    // Left: [1, 2, 3], Right: [2, 3, 4, 5], Union (distinct): [1, 2, 3, 4, 5]
+    const sql = "SELECT id FROM table WHERE id <= 3 UNION SELECT id FROM table WHERE id >= 2";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    // Should have 5 distinct rows
+    try std.testing.expectEqual(@as(usize, 5), result.row_count);
+}
+
+test "execute INTERSECT" {
+    const allocator = std.testing.allocator;
+
+    // Open test Lance file
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // SELECT id FROM table WHERE id <= 3 INTERSECT SELECT id FROM table WHERE id >= 2
+    // Left: [1, 2, 3], Right: [2, 3, 4, 5], Intersect: [2, 3]
+    const sql = "SELECT id FROM table WHERE id <= 3 INTERSECT SELECT id FROM table WHERE id >= 2";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    // Should have 2 rows (2 and 3)
+    try std.testing.expectEqual(@as(usize, 2), result.row_count);
+
+    const values = result.columns[0].data.int64;
+    try std.testing.expectEqual(@as(i64, 2), values[0]);
+    try std.testing.expectEqual(@as(i64, 3), values[1]);
+}
+
+test "execute EXCEPT" {
+    const allocator = std.testing.allocator;
+
+    // Open test Lance file
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // SELECT id FROM table EXCEPT SELECT id FROM table WHERE id >= 3
+    // Left: [1, 2, 3, 4, 5], Right: [3, 4, 5], Except: [1, 2]
+    const sql = "SELECT id FROM table EXCEPT SELECT id FROM table WHERE id >= 3";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    // Should have 2 rows (1 and 2)
+    try std.testing.expectEqual(@as(usize, 2), result.row_count);
+
+    const values = result.columns[0].data.int64;
+    try std.testing.expectEqual(@as(i64, 1), values[0]);
+    try std.testing.expectEqual(@as(i64, 2), values[1]);
+}

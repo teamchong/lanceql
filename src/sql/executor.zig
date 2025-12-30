@@ -897,7 +897,25 @@ pub const Executor = struct {
         }
 
         // 4. Read columns based on SELECT list (non-aggregate path)
-        var columns = try self.readColumns(stmt.columns, indices);
+        // Window function columns are handled separately
+        var columns_list = std.ArrayList(Result.Column){};
+        errdefer {
+            for (columns_list.items) |*col| {
+                self.freeColumnData(&col.data);
+            }
+            columns_list.deinit(self.allocator);
+        }
+
+        const base_columns = try self.readColumns(stmt.columns, indices);
+        defer self.allocator.free(base_columns);
+        try columns_list.appendSlice(self.allocator, base_columns);
+
+        // 4.5. Evaluate window functions if present
+        if (self.hasWindowFunctions(stmt.columns)) {
+            try self.evaluateWindowFunctions(&columns_list, stmt.columns, indices);
+        }
+
+        var columns = try columns_list.toOwnedSlice(self.allocator);
         var row_count = indices.len;
 
         // 5. Apply DISTINCT if specified
@@ -915,10 +933,435 @@ pub const Executor = struct {
         // 7. Apply LIMIT and OFFSET
         const final_row_count = self.applyLimitOffset(columns, stmt.limit, stmt.offset);
 
-        return Result{
+        var result = Result{
             .columns = columns,
             .row_count = final_row_count,
             .allocator = self.allocator,
+        };
+
+        // 8. Apply set operation (UNION/INTERSECT/EXCEPT) if present
+        if (stmt.set_operation) |set_op| {
+            result = try self.executeSetOperation(result, set_op, params);
+        }
+
+        return result;
+    }
+
+    // ========================================================================
+    // Set Operation Execution (UNION/INTERSECT/EXCEPT)
+    // ========================================================================
+
+    /// Execute a set operation (UNION, INTERSECT, EXCEPT) between two result sets
+    /// Note: Takes ownership of left result and frees it after use
+    fn executeSetOperation(self: *Self, left_in: Result, set_op: ast.SetOperation, params: []const Value) anyerror!Result {
+        var left = left_in;
+        defer left.deinit();
+
+        // Execute the right-hand SELECT
+        var right = try self.execute(set_op.right, params);
+        defer right.deinit();
+
+        // Verify column count matches
+        if (left.columns.len != right.columns.len) {
+            return error.SetOperationColumnMismatch;
+        }
+
+        return switch (set_op.op_type) {
+            .union_all => try self.executeUnionAll(left, right),
+            .union_distinct => try self.executeUnionDistinct(left, right),
+            .intersect => try self.executeIntersect(left, right),
+            .except => try self.executeExcept(left, right),
+        };
+    }
+
+    /// UNION ALL: Concatenate both result sets (keeping duplicates)
+    fn executeUnionAll(self: *Self, left: Result, right: Result) !Result {
+        const col_count = left.columns.len;
+        const total_rows = left.row_count + right.row_count;
+
+        var new_columns = try self.allocator.alloc(Result.Column, col_count);
+        errdefer self.allocator.free(new_columns);
+
+        for (0..col_count) |i| {
+            const left_col = left.columns[i];
+            const right_col = right.columns[i];
+
+            new_columns[i] = Result.Column{
+                .name = left_col.name,
+                .data = try self.concatenateColumnData(left_col.data, right_col.data, left.row_count, right.row_count),
+            };
+        }
+
+        // Free old left result columns (but not the data, which is now owned by new_columns)
+        // Actually, we need to be careful - left's data is NOT reused, we copied it
+        // So we should let the caller free left
+
+        return Result{
+            .columns = new_columns,
+            .row_count = total_rows,
+            .allocator = self.allocator,
+        };
+    }
+
+    /// UNION: Concatenate and remove duplicates
+    fn executeUnionDistinct(self: *Self, left: Result, right: Result) !Result {
+        // First do UNION ALL, then apply DISTINCT
+        var union_all = try self.executeUnionAll(left, right);
+        errdefer union_all.deinit();
+
+        const distinct_result = try self.applyDistinct(union_all.columns);
+        union_all.columns = distinct_result.columns;
+        union_all.row_count = distinct_result.row_count;
+
+        return union_all;
+    }
+
+    /// INTERSECT: Keep only rows that appear in both result sets
+    fn executeIntersect(self: *Self, left: Result, right: Result) !Result {
+        // Build a hash set of rows from right result
+        var right_rows = std.StringHashMap(void).init(self.allocator);
+        defer right_rows.deinit();
+
+        for (0..right.row_count) |i| {
+            const key = try self.buildRowKey(right.columns, i);
+            defer self.allocator.free(key);
+            try right_rows.put(try self.allocator.dupe(u8, key), {});
+        }
+        defer {
+            var iter = right_rows.keyIterator();
+            while (iter.next()) |key| {
+                self.allocator.free(key.*);
+            }
+        }
+
+        // Find matching rows in left result
+        var matching_indices = std.ArrayList(usize){};
+        defer matching_indices.deinit(self.allocator);
+
+        var seen = std.StringHashMap(void).init(self.allocator);
+        defer {
+            var iter = seen.keyIterator();
+            while (iter.next()) |key| {
+                self.allocator.free(key.*);
+            }
+            seen.deinit();
+        }
+
+        for (0..left.row_count) |i| {
+            const key = try self.buildRowKey(left.columns, i);
+            defer self.allocator.free(key);
+
+            // Only include if in right AND not already included (for distinct)
+            if (right_rows.contains(key) and !seen.contains(key)) {
+                try matching_indices.append(self.allocator, i);
+                try seen.put(try self.allocator.dupe(u8, key), {});
+            }
+        }
+
+        return try self.projectRows(left.columns, matching_indices.items);
+    }
+
+    /// EXCEPT: Keep rows from left that don't appear in right
+    fn executeExcept(self: *Self, left: Result, right: Result) !Result {
+        // Build a hash set of rows from right result
+        var right_rows = std.StringHashMap(void).init(self.allocator);
+        defer right_rows.deinit();
+
+        for (0..right.row_count) |i| {
+            const key = try self.buildRowKey(right.columns, i);
+            defer self.allocator.free(key);
+            try right_rows.put(try self.allocator.dupe(u8, key), {});
+        }
+        defer {
+            var iter = right_rows.keyIterator();
+            while (iter.next()) |key| {
+                self.allocator.free(key.*);
+            }
+        }
+
+        // Find rows in left that are NOT in right
+        var non_matching_indices = std.ArrayList(usize){};
+        defer non_matching_indices.deinit(self.allocator);
+
+        var seen = std.StringHashMap(void).init(self.allocator);
+        defer {
+            var iter = seen.keyIterator();
+            while (iter.next()) |key| {
+                self.allocator.free(key.*);
+            }
+            seen.deinit();
+        }
+
+        for (0..left.row_count) |i| {
+            const key = try self.buildRowKey(left.columns, i);
+            defer self.allocator.free(key);
+
+            // Include if NOT in right AND not already included (for distinct)
+            if (!right_rows.contains(key) and !seen.contains(key)) {
+                try non_matching_indices.append(self.allocator, i);
+                try seen.put(try self.allocator.dupe(u8, key), {});
+            }
+        }
+
+        return try self.projectRows(left.columns, non_matching_indices.items);
+    }
+
+    /// Build a string key representing a row for hashing
+    fn buildRowKey(self: *Self, columns: []const Result.Column, row_idx: usize) ![]u8 {
+        var key_parts = std.ArrayList(u8){};
+        errdefer key_parts.deinit(self.allocator);
+
+        for (columns, 0..) |col, col_idx| {
+            if (col_idx > 0) {
+                try key_parts.append(self.allocator, '|');
+            }
+
+            switch (col.data) {
+                .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| {
+                    var buf: [32]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch unreachable;
+                    try key_parts.appendSlice(self.allocator, s);
+                },
+                .int32, .date32 => |data| {
+                    var buf: [16]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch unreachable;
+                    try key_parts.appendSlice(self.allocator, s);
+                },
+                .float64 => |data| {
+                    var buf: [64]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch unreachable;
+                    try key_parts.appendSlice(self.allocator, s);
+                },
+                .float32 => |data| {
+                    var buf: [32]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch unreachable;
+                    try key_parts.appendSlice(self.allocator, s);
+                },
+                .bool_ => |data| {
+                    try key_parts.appendSlice(self.allocator, if (data[row_idx]) "T" else "F");
+                },
+                .string => |data| {
+                    try key_parts.appendSlice(self.allocator, data[row_idx]);
+                },
+            }
+        }
+
+        return try key_parts.toOwnedSlice(self.allocator);
+    }
+
+    /// Concatenate two column data arrays
+    fn concatenateColumnData(self: *Self, left_data: Result.ColumnData, right_data: Result.ColumnData, left_len: usize, right_len: usize) !Result.ColumnData {
+        const total_len = left_len + right_len;
+
+        return switch (left_data) {
+            .int64 => |left| {
+                const right = right_data.int64;
+                const new_data = try self.allocator.alloc(i64, total_len);
+                @memcpy(new_data[0..left_len], left[0..left_len]);
+                @memcpy(new_data[left_len..], right[0..right_len]);
+                return Result.ColumnData{ .int64 = new_data };
+            },
+            .int32 => |left| {
+                const right = right_data.int32;
+                const new_data = try self.allocator.alloc(i32, total_len);
+                @memcpy(new_data[0..left_len], left[0..left_len]);
+                @memcpy(new_data[left_len..], right[0..right_len]);
+                return Result.ColumnData{ .int32 = new_data };
+            },
+            .float64 => |left| {
+                const right = right_data.float64;
+                const new_data = try self.allocator.alloc(f64, total_len);
+                @memcpy(new_data[0..left_len], left[0..left_len]);
+                @memcpy(new_data[left_len..], right[0..right_len]);
+                return Result.ColumnData{ .float64 = new_data };
+            },
+            .float32 => |left| {
+                const right = right_data.float32;
+                const new_data = try self.allocator.alloc(f32, total_len);
+                @memcpy(new_data[0..left_len], left[0..left_len]);
+                @memcpy(new_data[left_len..], right[0..right_len]);
+                return Result.ColumnData{ .float32 = new_data };
+            },
+            .bool_ => |left| {
+                const right = right_data.bool_;
+                const new_data = try self.allocator.alloc(bool, total_len);
+                @memcpy(new_data[0..left_len], left[0..left_len]);
+                @memcpy(new_data[left_len..], right[0..right_len]);
+                return Result.ColumnData{ .bool_ = new_data };
+            },
+            .string => |left| {
+                const right = right_data.string;
+                const new_data = try self.allocator.alloc([]const u8, total_len);
+                errdefer self.allocator.free(new_data);
+
+                // Copy strings (need to duplicate)
+                for (0..left_len) |i| {
+                    new_data[i] = try self.allocator.dupe(u8, left[i]);
+                }
+                for (0..right_len) |i| {
+                    new_data[left_len + i] = try self.allocator.dupe(u8, right[i]);
+                }
+                return Result.ColumnData{ .string = new_data };
+            },
+            .timestamp_s => |left| {
+                const right = right_data.timestamp_s;
+                const new_data = try self.allocator.alloc(i64, total_len);
+                @memcpy(new_data[0..left_len], left[0..left_len]);
+                @memcpy(new_data[left_len..], right[0..right_len]);
+                return Result.ColumnData{ .timestamp_s = new_data };
+            },
+            .timestamp_ms => |left| {
+                const right = right_data.timestamp_ms;
+                const new_data = try self.allocator.alloc(i64, total_len);
+                @memcpy(new_data[0..left_len], left[0..left_len]);
+                @memcpy(new_data[left_len..], right[0..right_len]);
+                return Result.ColumnData{ .timestamp_ms = new_data };
+            },
+            .timestamp_us => |left| {
+                const right = right_data.timestamp_us;
+                const new_data = try self.allocator.alloc(i64, total_len);
+                @memcpy(new_data[0..left_len], left[0..left_len]);
+                @memcpy(new_data[left_len..], right[0..right_len]);
+                return Result.ColumnData{ .timestamp_us = new_data };
+            },
+            .timestamp_ns => |left| {
+                const right = right_data.timestamp_ns;
+                const new_data = try self.allocator.alloc(i64, total_len);
+                @memcpy(new_data[0..left_len], left[0..left_len]);
+                @memcpy(new_data[left_len..], right[0..right_len]);
+                return Result.ColumnData{ .timestamp_ns = new_data };
+            },
+            .date32 => |left| {
+                const right = right_data.date32;
+                const new_data = try self.allocator.alloc(i32, total_len);
+                @memcpy(new_data[0..left_len], left[0..left_len]);
+                @memcpy(new_data[left_len..], right[0..right_len]);
+                return Result.ColumnData{ .date32 = new_data };
+            },
+            .date64 => |left| {
+                const right = right_data.date64;
+                const new_data = try self.allocator.alloc(i64, total_len);
+                @memcpy(new_data[0..left_len], left[0..left_len]);
+                @memcpy(new_data[left_len..], right[0..right_len]);
+                return Result.ColumnData{ .date64 = new_data };
+            },
+        };
+    }
+
+    /// Project specific rows from a result set
+    fn projectRows(self: *Self, columns: []const Result.Column, indices: []const usize) !Result {
+        const new_row_count = indices.len;
+        const col_count = columns.len;
+
+        var new_columns = try self.allocator.alloc(Result.Column, col_count);
+        errdefer self.allocator.free(new_columns);
+
+        for (0..col_count) |col_idx| {
+            const col = columns[col_idx];
+
+            new_columns[col_idx] = Result.Column{
+                .name = col.name,
+                .data = try self.projectColumnData(col.data, indices),
+            };
+        }
+
+        return Result{
+            .columns = new_columns,
+            .row_count = new_row_count,
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Project specific rows from column data
+    fn projectColumnData(self: *Self, data: Result.ColumnData, indices: []const usize) !Result.ColumnData {
+        const len = indices.len;
+
+        return switch (data) {
+            .int64 => |d| {
+                const new_data = try self.allocator.alloc(i64, len);
+                for (indices, 0..) |src_idx, dst_idx| {
+                    new_data[dst_idx] = d[src_idx];
+                }
+                return Result.ColumnData{ .int64 = new_data };
+            },
+            .int32 => |d| {
+                const new_data = try self.allocator.alloc(i32, len);
+                for (indices, 0..) |src_idx, dst_idx| {
+                    new_data[dst_idx] = d[src_idx];
+                }
+                return Result.ColumnData{ .int32 = new_data };
+            },
+            .float64 => |d| {
+                const new_data = try self.allocator.alloc(f64, len);
+                for (indices, 0..) |src_idx, dst_idx| {
+                    new_data[dst_idx] = d[src_idx];
+                }
+                return Result.ColumnData{ .float64 = new_data };
+            },
+            .float32 => |d| {
+                const new_data = try self.allocator.alloc(f32, len);
+                for (indices, 0..) |src_idx, dst_idx| {
+                    new_data[dst_idx] = d[src_idx];
+                }
+                return Result.ColumnData{ .float32 = new_data };
+            },
+            .bool_ => |d| {
+                const new_data = try self.allocator.alloc(bool, len);
+                for (indices, 0..) |src_idx, dst_idx| {
+                    new_data[dst_idx] = d[src_idx];
+                }
+                return Result.ColumnData{ .bool_ = new_data };
+            },
+            .string => |d| {
+                const new_data = try self.allocator.alloc([]const u8, len);
+                errdefer self.allocator.free(new_data);
+                for (indices, 0..) |src_idx, dst_idx| {
+                    new_data[dst_idx] = try self.allocator.dupe(u8, d[src_idx]);
+                }
+                return Result.ColumnData{ .string = new_data };
+            },
+            .timestamp_s => |d| {
+                const new_data = try self.allocator.alloc(i64, len);
+                for (indices, 0..) |src_idx, dst_idx| {
+                    new_data[dst_idx] = d[src_idx];
+                }
+                return Result.ColumnData{ .timestamp_s = new_data };
+            },
+            .timestamp_ms => |d| {
+                const new_data = try self.allocator.alloc(i64, len);
+                for (indices, 0..) |src_idx, dst_idx| {
+                    new_data[dst_idx] = d[src_idx];
+                }
+                return Result.ColumnData{ .timestamp_ms = new_data };
+            },
+            .timestamp_us => |d| {
+                const new_data = try self.allocator.alloc(i64, len);
+                for (indices, 0..) |src_idx, dst_idx| {
+                    new_data[dst_idx] = d[src_idx];
+                }
+                return Result.ColumnData{ .timestamp_us = new_data };
+            },
+            .timestamp_ns => |d| {
+                const new_data = try self.allocator.alloc(i64, len);
+                for (indices, 0..) |src_idx, dst_idx| {
+                    new_data[dst_idx] = d[src_idx];
+                }
+                return Result.ColumnData{ .timestamp_ns = new_data };
+            },
+            .date32 => |d| {
+                const new_data = try self.allocator.alloc(i32, len);
+                for (indices, 0..) |src_idx, dst_idx| {
+                    new_data[dst_idx] = d[src_idx];
+                }
+                return Result.ColumnData{ .date32 = new_data };
+            },
+            .date64 => |d| {
+                const new_data = try self.allocator.alloc(i64, len);
+                for (indices, 0..) |src_idx, dst_idx| {
+                    new_data[dst_idx] = d[src_idx];
+                }
+                return Result.ColumnData{ .date64 = new_data };
+            },
         };
     }
 
@@ -1015,6 +1458,368 @@ pub const Executor = struct {
         if (std.mem.eql(u8, upper_name, "LAG")) return .lag;
         if (std.mem.eql(u8, upper_name, "LEAD")) return .lead;
         return null;
+    }
+
+    /// Evaluate window functions and add result columns
+    /// Window functions are evaluated after all base columns are computed
+    fn evaluateWindowFunctions(
+        self: *Self,
+        columns: *std.ArrayList(Result.Column),
+        select_list: []const ast.SelectItem,
+        indices: []const u32,
+    ) !void {
+        for (select_list) |item| {
+            if (!isWindowFunction(&item.expr)) continue;
+
+            const call = item.expr.call;
+            const window_spec = call.window.?;
+            const func_type = parseWindowFunctionType(call.name) orelse continue;
+
+            // Build partition groups
+            var partitions = try self.buildWindowPartitions(window_spec, indices);
+            defer {
+                var iter = partitions.valueIterator();
+                while (iter.next()) |list| {
+                    list.deinit(self.allocator);
+                }
+                partitions.deinit();
+            }
+
+            // Allocate result array
+            const results = try self.allocator.alloc(i64, indices.len);
+            errdefer self.allocator.free(results);
+
+            // Process each partition
+            var partition_iter = partitions.iterator();
+            while (partition_iter.next()) |entry| {
+                var partition_indices = entry.value_ptr.*;
+
+                // Sort partition by ORDER BY if specified
+                if (window_spec.order_by) |order_by| {
+                    try self.sortWindowPartition(&partition_indices, order_by);
+                }
+
+                // Compute window function for this partition
+                switch (func_type) {
+                    .row_number => {
+                        // ROW_NUMBER: sequential number within partition
+                        for (partition_indices.items, 0..) |original_idx, rank| {
+                            // Find position in indices array
+                            const result_idx = self.findIndexPosition(indices, original_idx);
+                            if (result_idx) |idx| {
+                                results[idx] = @intCast(rank + 1);
+                            }
+                        }
+                    },
+                    .rank => {
+                        // RANK: same rank for ties, skip ranks after ties
+                        try self.computeRank(results, partition_indices.items, indices, window_spec.order_by, false);
+                    },
+                    .dense_rank => {
+                        // DENSE_RANK: same rank for ties, no gaps
+                        try self.computeRank(results, partition_indices.items, indices, window_spec.order_by, true);
+                    },
+                    .lag => {
+                        // LAG: value from N rows before
+                        const offset: usize = if (call.args.len > 1) blk: {
+                            const arg = call.args[1];
+                            if (arg == .value and arg.value == .integer) {
+                                break :blk @intCast(arg.value.integer);
+                            }
+                            break :blk 1;
+                        } else 1;
+
+                        const default_val: i64 = if (call.args.len > 2) blk: {
+                            const arg = call.args[2];
+                            if (arg == .value and arg.value == .integer) {
+                                break :blk arg.value.integer;
+                            }
+                            break :blk 0;
+                        } else 0;
+
+                        try self.computeLagLead(results, partition_indices.items, indices, call.args, offset, default_val, true);
+                    },
+                    .lead => {
+                        // LEAD: value from N rows after
+                        const offset: usize = if (call.args.len > 1) blk: {
+                            const arg = call.args[1];
+                            if (arg == .value and arg.value == .integer) {
+                                break :blk @intCast(arg.value.integer);
+                            }
+                            break :blk 1;
+                        } else 1;
+
+                        const default_val: i64 = if (call.args.len > 2) blk: {
+                            const arg = call.args[2];
+                            if (arg == .value and arg.value == .integer) {
+                                break :blk arg.value.integer;
+                            }
+                            break :blk 0;
+                        } else 0;
+
+                        try self.computeLagLead(results, partition_indices.items, indices, call.args, offset, default_val, false);
+                    },
+                }
+            }
+
+            // Add result column
+            const col_name = item.alias orelse call.name;
+            try columns.append(self.allocator, Result.Column{
+                .name = col_name,
+                .data = Result.ColumnData{ .int64 = results },
+            });
+        }
+    }
+
+    /// Build partition groups based on PARTITION BY columns
+    fn buildWindowPartitions(
+        self: *Self,
+        window_spec: *const ast.WindowSpec,
+        indices: []const u32,
+    ) !std.StringHashMap(std.ArrayListUnmanaged(u32)) {
+        var partitions = std.StringHashMap(std.ArrayListUnmanaged(u32)).init(self.allocator);
+        errdefer {
+            var iter = partitions.valueIterator();
+            while (iter.next()) |list| {
+                list.deinit(self.allocator);
+            }
+            partitions.deinit();
+        }
+
+        if (window_spec.partition_by) |partition_cols| {
+            // Preload partition columns
+            try self.preloadColumns(partition_cols);
+
+            // Group rows by partition key
+            for (indices) |row_idx| {
+                const key = try self.buildPartitionKey(partition_cols, row_idx);
+                const result = try partitions.getOrPut(key);
+                if (!result.found_existing) {
+                    result.value_ptr.* = .{};
+                }
+                try result.value_ptr.append(self.allocator, row_idx);
+            }
+        } else {
+            // No PARTITION BY - all rows in one partition
+            var single_partition: std.ArrayListUnmanaged(u32) = .{};
+            for (indices) |row_idx| {
+                try single_partition.append(self.allocator, row_idx);
+            }
+            try partitions.put("", single_partition);
+        }
+
+        return partitions;
+    }
+
+    /// Build partition key from row values
+    fn buildPartitionKey(self: *Self, partition_cols: [][]const u8, row_idx: u32) ![]const u8 {
+        var key_parts = std.ArrayList(u8){};
+        errdefer key_parts.deinit(self.allocator);
+
+        for (partition_cols, 0..) |col_name, i| {
+            if (i > 0) try key_parts.append(self.allocator, '|');
+
+            const col = self.column_cache.get(col_name) orelse return error.ColumnNotFound;
+            const value_str = try self.columnValueToString(col, row_idx);
+            try key_parts.appendSlice(self.allocator, value_str);
+        }
+
+        return key_parts.toOwnedSlice(self.allocator);
+    }
+
+    /// Convert column value at index to string for key building
+    fn columnValueToString(self: *Self, col: CachedColumn, row_idx: u32) ![]const u8 {
+        return switch (col) {
+            .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| blk: {
+                const val = data[row_idx];
+                const buf = try self.allocator.alloc(u8, 32);
+                const written = std.fmt.bufPrint(buf, "{d}", .{val}) catch "";
+                break :blk written;
+            },
+            .int32, .date32 => |data| blk: {
+                const val = data[row_idx];
+                const buf = try self.allocator.alloc(u8, 16);
+                const written = std.fmt.bufPrint(buf, "{d}", .{val}) catch "";
+                break :blk written;
+            },
+            .float64 => |data| blk: {
+                const val = data[row_idx];
+                const buf = try self.allocator.alloc(u8, 32);
+                const written = std.fmt.bufPrint(buf, "{d}", .{val}) catch "";
+                break :blk written;
+            },
+            .float32 => |data| blk: {
+                const val = data[row_idx];
+                const buf = try self.allocator.alloc(u8, 32);
+                const written = std.fmt.bufPrint(buf, "{d}", .{val}) catch "";
+                break :blk written;
+            },
+            .bool_ => |data| if (data[row_idx]) "true" else "false",
+            .string => |data| data[row_idx],
+        };
+    }
+
+    /// Sort partition indices by ORDER BY columns
+    fn sortWindowPartition(
+        self: *Self,
+        partition: *std.ArrayListUnmanaged(u32),
+        order_by: []const ast.OrderBy,
+    ) !void {
+        // Preload ORDER BY columns
+        var col_names = std.ArrayList([]const u8){};
+        defer col_names.deinit(self.allocator);
+        for (order_by) |ob| {
+            try col_names.append(self.allocator, ob.column);
+        }
+        try self.preloadColumns(col_names.items);
+
+        // Sort using first ORDER BY column (simplified - full impl would use all)
+        if (order_by.len == 0) return;
+
+        const first_ob = order_by[0];
+        const col_name = first_ob.column;
+
+        const cached_col = self.column_cache.get(col_name) orelse return;
+        const ascending = first_ob.direction == .asc;
+
+        // Sort partition indices based on column values
+        const WindowSortCtx = struct {
+            col: CachedColumn,
+            asc: bool,
+
+            fn lessThan(c: @This(), a: u32, b: u32) bool {
+                const result = switch (c.col) {
+                    .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| data[a] < data[b],
+                    .int32, .date32 => |data| data[a] < data[b],
+                    .float64 => |data| data[a] < data[b],
+                    .float32 => |data| data[a] < data[b],
+                    .string => |data| std.mem.lessThan(u8, data[a], data[b]),
+                    .bool_ => |data| @intFromBool(data[a]) < @intFromBool(data[b]),
+                };
+                return if (c.asc) result else !result;
+            }
+        };
+
+        const sort_ctx = WindowSortCtx{ .col = cached_col, .asc = ascending };
+        std.mem.sort(u32, partition.items, sort_ctx, WindowSortCtx.lessThan);
+    }
+
+    /// Find position of original row index in indices array
+    fn findIndexPosition(self: *Self, indices: []const u32, original_idx: u32) ?usize {
+        _ = self;
+        for (indices, 0..) |idx, pos| {
+            if (idx == original_idx) return pos;
+        }
+        return null;
+    }
+
+    /// Compute RANK or DENSE_RANK for partition
+    fn computeRank(
+        self: *Self,
+        results: []i64,
+        partition: []const u32,
+        indices: []const u32,
+        order_by: ?[]const ast.OrderBy,
+        dense: bool,
+    ) !void {
+        if (partition.len == 0) return;
+
+        var current_rank: i64 = 1;
+        var prev_value: ?i64 = null;
+        var rows_at_rank: i64 = 0;
+
+        // Get ORDER BY column for comparison
+        const order_col: ?CachedColumn = if (order_by) |ob| blk: {
+            if (ob.len == 0) break :blk null;
+            const col_name = ob[0].column;
+            break :blk self.column_cache.get(col_name);
+        } else null;
+
+        for (partition, 0..) |original_idx, i| {
+            const result_idx = self.findIndexPosition(indices, original_idx) orelse continue;
+
+            if (order_col) |col| {
+                const current_value: i64 = switch (col) {
+                    .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| data[original_idx],
+                    .int32, .date32 => |data| data[original_idx],
+                    .float64 => |data| @intFromFloat(data[original_idx]),
+                    .float32 => |data| @intFromFloat(data[original_idx]),
+                    .string => |data| @intCast(std.hash.Wyhash.hash(0, data[original_idx])),
+                    .bool_ => |data| if (data[original_idx]) 1 else 0,
+                };
+
+                if (prev_value) |pv| {
+                    if (current_value != pv) {
+                        // Value changed - update rank
+                        if (dense) {
+                            current_rank += 1;
+                        } else {
+                            current_rank += rows_at_rank;
+                        }
+                        rows_at_rank = 1;
+                    } else {
+                        rows_at_rank += 1;
+                    }
+                } else {
+                    rows_at_rank = 1;
+                }
+                prev_value = current_value;
+            } else {
+                // No ORDER BY - all get rank 1
+                _ = i;
+            }
+
+            results[result_idx] = current_rank;
+        }
+    }
+
+    /// Compute LAG or LEAD for partition
+    fn computeLagLead(
+        self: *Self,
+        results: []i64,
+        partition: []const u32,
+        indices: []const u32,
+        args: []const Expr,
+        offset: usize,
+        default_val: i64,
+        is_lag: bool,
+    ) !void {
+        if (args.len == 0) return;
+
+        // Get the column to look up
+        const col_name = switch (args[0]) {
+            .column => |col| col.name,
+            else => return,
+        };
+
+        const cached_col = self.column_cache.get(col_name) orelse return;
+
+        for (partition, 0..) |original_idx, i| {
+            const result_idx = self.findIndexPosition(indices, original_idx) orelse continue;
+
+            // Calculate source index
+            const source_partition_idx: ?usize = if (is_lag) blk: {
+                if (i < offset) break :blk null;
+                break :blk i - offset;
+            } else blk: {
+                if (i + offset >= partition.len) break :blk null;
+                break :blk i + offset;
+            };
+
+            if (source_partition_idx) |src_idx| {
+                const src_original_idx = partition[src_idx];
+                results[result_idx] = switch (cached_col) {
+                    .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| data[src_original_idx],
+                    .int32, .date32 => |data| data[src_original_idx],
+                    .float64 => |data| @intFromFloat(data[src_original_idx]),
+                    .float32 => |data| @intFromFloat(data[src_original_idx]),
+                    .string => 0, // LAG/LEAD on strings returns 0 for now
+                    .bool_ => |data| if (data[src_original_idx]) 1 else 0,
+                };
+            } else {
+                results[result_idx] = default_val;
+            }
+        }
     }
 
     /// Parse aggregate function name to AggregateType
@@ -2546,6 +3351,9 @@ pub const Executor = struct {
         }
 
         for (select_list) |item| {
+            // Skip window function expressions - they're handled separately
+            if (isWindowFunction(&item.expr)) continue;
+
             // Handle SELECT *
             if (item.expr == .column and std.mem.eql(u8, item.expr.column.name, "*")) {
                 const col_names = try self.tbl().columnNames();

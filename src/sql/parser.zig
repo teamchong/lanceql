@@ -172,6 +172,9 @@ pub const Parser = struct {
         else
             null;
 
+        // Set operation (UNION/INTERSECT/EXCEPT) - optional
+        const set_operation = try self.parseSetOperation();
+
         return SelectStmt{
             .with_data = null,
             .distinct = distinct,
@@ -182,7 +185,40 @@ pub const Parser = struct {
             .order_by = order_by,
             .limit = limit,
             .offset = offset,
+            .set_operation = set_operation,
         };
+    }
+
+    /// Parse set operation (UNION/INTERSECT/EXCEPT) if present
+    fn parseSetOperation(self: *Self) anyerror!?ast.SetOperation {
+        // Check for set operation keywords
+        var op_type: ?ast.SetOperationType = null;
+
+        if (self.match(&[_]TokenType{.UNION})) {
+            // Check for ALL keyword
+            if (self.match(&[_]TokenType{.ALL})) {
+                op_type = .union_all;
+            } else {
+                op_type = .union_distinct;
+            }
+        } else if (self.match(&[_]TokenType{.INTERSECT})) {
+            op_type = .intersect;
+        } else if (self.match(&[_]TokenType{.EXCEPT})) {
+            op_type = .except;
+        }
+
+        if (op_type) |ot| {
+            // Parse the right-hand SELECT statement
+            const right = try self.allocator.create(SelectStmt);
+            right.* = try self.parseSelect();
+
+            return ast.SetOperation{
+                .op_type = ot,
+                .right = right,
+            };
+        }
+
+        return null;
     }
 
     // ========================================================================
@@ -1285,4 +1321,77 @@ test "parse method call without OVER clause" {
 
     try std.testing.expect(expr == .method_call);
     try std.testing.expect(expr.method_call.over == null);
+}
+
+test "parse UNION" {
+    const allocator = std.testing.allocator;
+
+    const sql = "SELECT id FROM users UNION SELECT id FROM admins";
+    var stmt = try parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    // First SELECT
+    try std.testing.expectEqual(@as(usize, 1), stmt.select.columns.len);
+
+    // Verify set operation
+    try std.testing.expect(stmt.select.set_operation != null);
+    const set_op = stmt.select.set_operation.?;
+    try std.testing.expectEqual(ast.SetOperationType.union_distinct, set_op.op_type);
+
+    // Verify second SELECT
+    try std.testing.expectEqual(@as(usize, 1), set_op.right.columns.len);
+}
+
+test "parse UNION ALL" {
+    const allocator = std.testing.allocator;
+
+    const sql = "SELECT name FROM employees UNION ALL SELECT name FROM contractors";
+    var stmt = try parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    try std.testing.expect(stmt.select.set_operation != null);
+    const set_op = stmt.select.set_operation.?;
+    try std.testing.expectEqual(ast.SetOperationType.union_all, set_op.op_type);
+}
+
+test "parse INTERSECT" {
+    const allocator = std.testing.allocator;
+
+    const sql = "SELECT id FROM active_users INTERSECT SELECT id FROM premium_users";
+    var stmt = try parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    try std.testing.expect(stmt.select.set_operation != null);
+    const set_op = stmt.select.set_operation.?;
+    try std.testing.expectEqual(ast.SetOperationType.intersect, set_op.op_type);
+}
+
+test "parse EXCEPT" {
+    const allocator = std.testing.allocator;
+
+    const sql = "SELECT id FROM all_users EXCEPT SELECT id FROM banned_users";
+    var stmt = try parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    try std.testing.expect(stmt.select.set_operation != null);
+    const set_op = stmt.select.set_operation.?;
+    try std.testing.expectEqual(ast.SetOperationType.except, set_op.op_type);
+}
+
+test "parse chained UNION" {
+    const allocator = std.testing.allocator;
+
+    const sql = "SELECT a FROM t1 UNION SELECT b FROM t2 UNION SELECT c FROM t3";
+    var stmt = try parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    // First UNION
+    try std.testing.expect(stmt.select.set_operation != null);
+    const set_op1 = stmt.select.set_operation.?;
+    try std.testing.expectEqual(ast.SetOperationType.union_distinct, set_op1.op_type);
+
+    // Second UNION (chained)
+    try std.testing.expect(set_op1.right.set_operation != null);
+    const set_op2 = set_op1.right.set_operation.?;
+    try std.testing.expectEqual(ast.SetOperationType.union_distinct, set_op2.op_type);
 }
