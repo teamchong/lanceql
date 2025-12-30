@@ -138,6 +138,8 @@ pub const Expr = union(enum) {
         method: []const u8,
         /// Method arguments
         args: []Expr,
+        /// Optional window specification (OVER clause)
+        over: ?*WindowSpec,
     },
 };
 
@@ -404,6 +406,11 @@ pub fn deinitExpr(expr: *Expr, allocator: std.mem.Allocator) void {
                 deinitExpr(arg, allocator);
             }
             allocator.free(mc.args);
+            if (mc.over) |over| {
+                if (over.partition_by) |pb| allocator.free(pb);
+                if (over.order_by) |ob| allocator.free(ob);
+                allocator.destroy(over);
+            }
         },
         .value, .column => {}, // No heap allocations to free
     }
@@ -594,7 +601,27 @@ pub fn printExpr(expr: *const Expr, writer: anytype, indent: usize) !void {
             for (mc.args) |*arg| {
                 try printExpr(arg, writer, indent + 2);
             }
-            try writer.print("{s})\n", .{prefix});
+            try writer.print("{s})", .{prefix});
+            if (mc.over) |over| {
+                try writer.writeAll(" OVER(");
+                if (over.partition_by) |pb| {
+                    try writer.writeAll("PARTITION BY ");
+                    for (pb, 0..) |col, i| {
+                        if (i > 0) try writer.writeAll(", ");
+                        try writer.writeAll(col);
+                    }
+                }
+                if (over.order_by) |ob| {
+                    if (over.partition_by != null) try writer.writeAll(" ");
+                    try writer.writeAll("ORDER BY ");
+                    for (ob, 0..) |o, i| {
+                        if (i > 0) try writer.writeAll(", ");
+                        try writer.print("{s} {s}", .{ o.column, if (o.direction == .desc) "DESC" else "ASC" });
+                    }
+                }
+                try writer.writeAll(")");
+            }
+            try writer.writeAll("\n");
         },
     }
 }

@@ -629,6 +629,7 @@ pub const Parser = struct {
 
     /// Parse method call on a table alias (e.g., t.risk_score())
     /// Used for @logic_table computed columns
+    /// Supports optional OVER clause for window functions: t.risk_score() OVER (PARTITION BY x)
     fn parseMethodCall(self: *Self, object: []const u8, method: []const u8) anyerror!Expr {
         _ = try self.expect(.LPAREN);
 
@@ -646,11 +647,18 @@ pub const Parser = struct {
 
         _ = try self.expect(.RPAREN);
 
+        // Check for OVER clause (window function)
+        var window: ?*ast.WindowSpec = null;
+        if (self.match(&[_]TokenType{.OVER})) {
+            window = try self.parseWindowSpec();
+        }
+
         return Expr{
             .method_call = .{
                 .object = object,
                 .method = method,
                 .args = try args.toOwnedSlice(self.allocator),
+                .over = window,
             },
         };
     }
@@ -1232,4 +1240,49 @@ test "parse qualified column vs method call" {
     try std.testing.expect(expr2 == .method_call);
     try std.testing.expectEqualStrings("t", expr2.method_call.object);
     try std.testing.expectEqualStrings("name", expr2.method_call.method);
+}
+
+test "parse method call with OVER clause" {
+    const allocator = std.testing.allocator;
+
+    // Method call with window specification
+    const sql = "SELECT t.risk_score() OVER (PARTITION BY customer_id ORDER BY created_at DESC) FROM orders AS t";
+    var stmt = try parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    const expr = stmt.select.columns[0].expr;
+
+    try std.testing.expect(expr == .method_call);
+    try std.testing.expectEqualStrings("t", expr.method_call.object);
+    try std.testing.expectEqualStrings("risk_score", expr.method_call.method);
+    try std.testing.expectEqual(@as(usize, 0), expr.method_call.args.len);
+
+    // Verify OVER clause
+    try std.testing.expect(expr.method_call.over != null);
+    const over = expr.method_call.over.?;
+
+    // Check PARTITION BY
+    try std.testing.expect(over.partition_by != null);
+    try std.testing.expectEqual(@as(usize, 1), over.partition_by.?.len);
+    try std.testing.expectEqualStrings("customer_id", over.partition_by.?[0]);
+
+    // Check ORDER BY
+    try std.testing.expect(over.order_by != null);
+    try std.testing.expectEqual(@as(usize, 1), over.order_by.?.len);
+    try std.testing.expectEqualStrings("created_at", over.order_by.?[0].column);
+    try std.testing.expectEqual(ast.OrderDirection.desc, over.order_by.?[0].direction);
+}
+
+test "parse method call without OVER clause" {
+    const allocator = std.testing.allocator;
+
+    // Method call without window specification
+    const sql = "SELECT t.compute() FROM table1 AS t";
+    var stmt = try parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    const expr = stmt.select.columns[0].expr;
+
+    try std.testing.expect(expr == .method_call);
+    try std.testing.expect(expr.method_call.over == null);
 }

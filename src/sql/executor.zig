@@ -6,7 +6,7 @@
 const std = @import("std");
 const ast = @import("ast");
 const Table = @import("lanceql.table").Table;
-const logic_table_dispatch = @import("logic_table_dispatch.zig");
+pub const logic_table_dispatch = @import("logic_table_dispatch.zig");
 
 const Expr = ast.Expr;
 const SelectStmt = ast.SelectStmt;
@@ -156,26 +156,61 @@ pub const CachedColumn = union(enum) {
     date64: []i64,
 };
 
+/// Active table source for query execution
+/// Tracks whether we're using a direct table or a logic_table
+pub const TableSource = union(enum) {
+    /// Direct table (existing behavior - table injected at init)
+    direct: *Table,
+    /// Logic table with loaded data from Python file
+    logic_table: struct {
+        executor: *logic_table_dispatch.LogicTableExecutor,
+        primary_table: *Table,
+        alias: ?[]const u8,
+    },
+
+    pub fn getTable(self: TableSource) *Table {
+        return switch (self) {
+            .direct => |t| t,
+            .logic_table => |lt| lt.primary_table,
+        };
+    }
+};
+
 /// SQL Query Executor
 pub const Executor = struct {
-    table: *Table,
+    /// Default table (used when FROM is a simple table name or not specified)
+    table: ?*Table,
     allocator: std.mem.Allocator,
     column_cache: std.StringHashMap(CachedColumn),
     /// Optional dispatcher for @logic_table method calls
     dispatcher: ?*logic_table_dispatch.Dispatcher = null,
     /// Maps table alias to class name for @logic_table instances
     logic_table_aliases: std.StringHashMap([]const u8),
+    /// Currently active table source (set during execute)
+    active_source: ?TableSource = null,
 
     const Self = @This();
 
-    pub fn init(table: *Table, allocator: std.mem.Allocator) Self {
+    pub fn init(table: ?*Table, allocator: std.mem.Allocator) Self {
         return .{
             .table = table,
             .allocator = allocator,
             .column_cache = std.StringHashMap(CachedColumn).init(allocator),
             .dispatcher = null,
             .logic_table_aliases = std.StringHashMap([]const u8).init(allocator),
+            .active_source = null,
         };
+    }
+
+    /// Initialize with a table (convenience for existing code)
+    pub fn initWithTable(table: *Table, allocator: std.mem.Allocator) Self {
+        return init(table, allocator);
+    }
+
+    /// Get the table (must be set before calling this)
+    /// This is used by internal methods that expect a table to be configured.
+    inline fn tbl(self: *Self) *Table {
+        return self.table orelse unreachable;
     }
 
     /// Set the dispatcher for @logic_table method calls
@@ -255,8 +290,8 @@ pub const Executor = struct {
             if (self.column_cache.contains(name)) continue;
 
             // Use physical column ID (not array index) for column metadata access
-            const physical_col_id = self.table.physicalColumnId(name) orelse return error.ColumnNotFound;
-            const field = self.table.getFieldById(physical_col_id) orelse return error.InvalidColumn;
+            const physical_col_id = self.tbl().physicalColumnId(name) orelse return error.ColumnNotFound;
+            const field = self.tbl().getFieldById(physical_col_id) orelse return error.InvalidColumn;
 
             // Read and cache column based on type
             // Precise type detection (order matters - check specific before general)
@@ -264,51 +299,51 @@ pub const Executor = struct {
 
             // Timestamp types (check before generic "int" matches)
             if (std.mem.indexOf(u8, logical_type, "timestamp[ns") != null) {
-                const data = try self.table.readInt64Column(physical_col_id);
+                const data = try self.tbl().readInt64Column(physical_col_id);
                 try self.column_cache.put(name, CachedColumn{ .timestamp_ns = data });
             } else if (std.mem.indexOf(u8, logical_type, "timestamp[us") != null) {
-                const data = try self.table.readInt64Column(physical_col_id);
+                const data = try self.tbl().readInt64Column(physical_col_id);
                 try self.column_cache.put(name, CachedColumn{ .timestamp_us = data });
             } else if (std.mem.indexOf(u8, logical_type, "timestamp[ms") != null) {
-                const data = try self.table.readInt64Column(physical_col_id);
+                const data = try self.tbl().readInt64Column(physical_col_id);
                 try self.column_cache.put(name, CachedColumn{ .timestamp_ms = data });
             } else if (std.mem.indexOf(u8, logical_type, "timestamp[s") != null) {
-                const data = try self.table.readInt64Column(physical_col_id);
+                const data = try self.tbl().readInt64Column(physical_col_id);
                 try self.column_cache.put(name, CachedColumn{ .timestamp_s = data });
             } else if (std.mem.indexOf(u8, logical_type, "date32") != null) {
-                const data = try self.table.readInt32Column(physical_col_id);
+                const data = try self.tbl().readInt32Column(physical_col_id);
                 try self.column_cache.put(name, CachedColumn{ .date32 = data });
             } else if (std.mem.indexOf(u8, logical_type, "date64") != null) {
-                const data = try self.table.readInt64Column(physical_col_id);
+                const data = try self.tbl().readInt64Column(physical_col_id);
                 try self.column_cache.put(name, CachedColumn{ .date64 = data });
             } else if (std.mem.eql(u8, logical_type, "int32")) {
                 // Explicit int32 type
-                const data = try self.table.readInt32Column(physical_col_id);
+                const data = try self.tbl().readInt32Column(physical_col_id);
                 try self.column_cache.put(name, CachedColumn{ .int32 = data });
             } else if (std.mem.eql(u8, logical_type, "float") or
                 std.mem.indexOf(u8, logical_type, "float32") != null)
             {
                 // float or float32 → f32
-                const data = try self.table.readFloat32Column(physical_col_id);
+                const data = try self.tbl().readFloat32Column(physical_col_id);
                 try self.column_cache.put(name, CachedColumn{ .float32 = data });
             } else if (std.mem.eql(u8, logical_type, "bool") or
                 std.mem.indexOf(u8, logical_type, "boolean") != null)
             {
                 // bool or boolean → bool
-                const data = try self.table.readBoolColumn(physical_col_id);
+                const data = try self.tbl().readBoolColumn(physical_col_id);
                 try self.column_cache.put(name, CachedColumn{ .bool_ = data });
             } else if (std.mem.indexOf(u8, logical_type, "int") != null) {
                 // Default integers (int, int64, integer) to int64
-                const data = try self.table.readInt64Column(physical_col_id);
+                const data = try self.tbl().readInt64Column(physical_col_id);
                 try self.column_cache.put(name, CachedColumn{ .int64 = data });
             } else if (std.mem.indexOf(u8, logical_type, "double") != null) {
                 // double → float64
-                const data = try self.table.readFloat64Column(physical_col_id);
+                const data = try self.tbl().readFloat64Column(physical_col_id);
                 try self.column_cache.put(name, CachedColumn{ .float64 = data });
             } else if (std.mem.indexOf(u8, logical_type, "utf8") != null or
                 std.mem.indexOf(u8, logical_type, "string") != null)
             {
-                const data = try self.table.readStringColumn(physical_col_id);
+                const data = try self.tbl().readStringColumn(physical_col_id);
                 try self.column_cache.put(name, CachedColumn{ .string = data });
             } else {
                 return error.UnsupportedColumnType;
@@ -316,8 +351,104 @@ pub const Executor = struct {
         }
     }
 
+    /// Get the currently active table for query execution
+    fn getActiveTable(self: *Self) !*Table {
+        if (self.active_source) |source| {
+            return source.getTable();
+        }
+        return self.table orelse error.NoTableConfigured;
+    }
+
+    /// Resolve FROM clause to get the table source
+    fn resolveTableSource(self: *Self, from: *const ast.TableRef) !TableSource {
+        switch (from.*) {
+            .simple => {
+                // Simple table reference - use the default table
+                const direct_table = self.table orelse return error.NoTableConfigured;
+                return .{ .direct = direct_table };
+            },
+            .function => |func| {
+                // Table-valued function (e.g., logic_table('fraud.py'))
+                if (std.mem.eql(u8, func.func.name, "logic_table")) {
+                    // Extract file path from first argument
+                    if (func.func.args.len == 0) {
+                        return error.LogicTableRequiresPath;
+                    }
+
+                    const path_arg = func.func.args[0];
+                    const path = switch (path_arg) {
+                        .value => |val| switch (val) {
+                            .string => |s| s,
+                            else => return error.LogicTablePathMustBeString,
+                        },
+                        else => return error.LogicTablePathMustBeString,
+                    };
+
+                    // Create LogicTableExecutor from file path (heap allocated)
+                    const executor = try self.allocator.create(logic_table_dispatch.LogicTableExecutor);
+                    errdefer self.allocator.destroy(executor);
+                    executor.* = try logic_table_dispatch.LogicTableExecutor.init(self.allocator, path);
+                    errdefer executor.deinit();
+
+                    // Load tables referenced in the Python file
+                    try executor.loadTables();
+
+                    // Get primary table (first loaded table)
+                    const primary_table = executor.getPrimaryTable() orelse {
+                        executor.deinit();
+                        self.allocator.destroy(executor);
+                        return error.NoTablesInLogicTable;
+                    };
+
+                    // Register alias for method dispatch
+                    if (func.alias) |alias| {
+                        try self.registerLogicTableAlias(alias, executor.class_name);
+                    }
+
+                    return .{ .logic_table = .{
+                        .executor = executor,
+                        .primary_table = primary_table,
+                        .alias = func.alias,
+                    } };
+                }
+                return error.UnsupportedTableFunction;
+            },
+            .join => {
+                // TODO: Support JOIN expressions
+                return error.JoinsNotYetSupported;
+            },
+        }
+    }
+
+    /// Release resources associated with a table source
+    fn releaseTableSource(self: *Self, source: *TableSource) void {
+        switch (source.*) {
+            .direct => {
+                // Nothing to release - table is managed externally
+            },
+            .logic_table => |*lt| {
+                // Clean up executor and free heap allocation
+                lt.executor.deinit();
+                self.allocator.destroy(lt.executor);
+            },
+        }
+    }
+
     /// Execute a SELECT statement
     pub fn execute(self: *Self, stmt: *const SelectStmt, params: []const Value) !Result {
+        // 0. Resolve FROM clause to get table source
+        var source = try self.resolveTableSource(&stmt.from);
+        defer self.releaseTableSource(&source);
+
+        // Set active source and temporarily swap table pointer for internal methods
+        self.active_source = source;
+        const original_table = self.table;
+        self.table = source.getTable();
+        defer {
+            self.active_source = null;
+            self.table = original_table;
+        }
+
         // 1. Bind parameters to WHERE clause (replace ? with actual values)
         if (stmt.where) |where_expr| {
             _ = where_expr; // TODO: Implement parameter binding
@@ -1000,7 +1131,7 @@ pub const Executor = struct {
         defer self.freeExpr(&bound_expr);
 
         // Get total row count
-        const row_count = try self.table.rowCount(0);
+        const row_count = try self.tbl().rowCount(0);
 
         // Evaluate expression for each row
         var matching_indices = std.ArrayList(u32){};
@@ -1139,6 +1270,7 @@ pub const Executor = struct {
                         .object = mc.object,
                         .method = mc.method,
                         .args = new_args,
+                        .over = mc.over, // Window spec passes through (no parameter placeholders)
                     },
                 };
             },
@@ -1732,8 +1864,8 @@ pub const Executor = struct {
             .column => |col| blk: {
                 const cached = self.column_cache.get(col.name) orelse {
                     // Not cached yet, look up from table
-                    const physical_col_id = self.table.physicalColumnId(col.name) orelse return error.ColumnNotFound;
-                    const field = self.table.getFieldById(physical_col_id) orelse return error.InvalidColumn;
+                    const physical_col_id = self.tbl().physicalColumnId(col.name) orelse return error.ColumnNotFound;
+                    const field = self.tbl().getFieldById(physical_col_id) orelse return error.InvalidColumn;
 
                     if (std.mem.indexOf(u8, field.logical_type, "int") != null) {
                         break :blk .int64;
@@ -1912,7 +2044,7 @@ pub const Executor = struct {
     /// Get all row indices (0, 1, 2, ..., n-1)
     fn getAllIndices(self: *Self) ![]u32 {
         // Get row count from first column
-        const row_count = try self.table.rowCount(0);
+        const row_count = try self.tbl().rowCount(0);
         const indices = try self.allocator.alloc(u32, @intCast(row_count));
 
         for (indices, 0..) |*idx, i| {
@@ -1955,13 +2087,13 @@ pub const Executor = struct {
         for (select_list) |item| {
             // Handle SELECT *
             if (item.expr == .column and std.mem.eql(u8, item.expr.column.name, "*")) {
-                const col_names = try self.table.columnNames();
+                const col_names = try self.tbl().columnNames();
                 defer self.allocator.free(col_names);
 
                 for (col_names) |col_name| {
                     // Look up the physical column ID from the name
                     // The physical column ID maps to the column metadata index
-                    const physical_col_id = self.table.physicalColumnId(col_name) orelse return error.ColumnNotFound;
+                    const physical_col_id = self.tbl().physicalColumnId(col_name) orelse return error.ColumnNotFound;
                     const data = try self.readColumnAtIndices(physical_col_id, indices);
 
                     try columns.append(self.allocator, Result.Column{
@@ -1975,7 +2107,7 @@ pub const Executor = struct {
             // Handle regular column
             if (item.expr == .column) {
                 const col_name = item.expr.column.name;
-                const col_idx = self.table.physicalColumnId(col_name) orelse return error.ColumnNotFound;
+                const col_idx = self.tbl().physicalColumnId(col_name) orelse return error.ColumnNotFound;
                 const data = try self.readColumnAtIndices(col_idx, indices);
 
                 try columns.append(self.allocator, Result.Column{
@@ -1998,7 +2130,7 @@ pub const Executor = struct {
         col_idx: u32,
         indices: []const u32,
     ) !Result.ColumnData {
-        const field = self.table.getFieldById(col_idx) orelse return error.InvalidColumn;
+        const field = self.tbl().getFieldById(col_idx) orelse return error.InvalidColumn;
 
         // Phase 2: Table API now has readAtIndices() methods
         // Current implementation still uses inline filtering for type-specific handling
@@ -2009,7 +2141,7 @@ pub const Executor = struct {
         // Precise type detection (order matters - check specific before general)
         // Timestamp types (check before generic "int" matches)
         if (std.mem.indexOf(u8, logical_type, "timestamp[ns") != null) {
-            const all_data = try self.table.readInt64Column(col_idx);
+            const all_data = try self.tbl().readInt64Column(col_idx);
             defer self.allocator.free(all_data);
 
             const filtered = try self.allocator.alloc(i64, indices.len);
@@ -2018,7 +2150,7 @@ pub const Executor = struct {
             }
             return Result.ColumnData{ .timestamp_ns = filtered };
         } else if (std.mem.indexOf(u8, logical_type, "timestamp[us") != null) {
-            const all_data = try self.table.readInt64Column(col_idx);
+            const all_data = try self.tbl().readInt64Column(col_idx);
             defer self.allocator.free(all_data);
 
             const filtered = try self.allocator.alloc(i64, indices.len);
@@ -2027,7 +2159,7 @@ pub const Executor = struct {
             }
             return Result.ColumnData{ .timestamp_us = filtered };
         } else if (std.mem.indexOf(u8, logical_type, "timestamp[ms") != null) {
-            const all_data = try self.table.readInt64Column(col_idx);
+            const all_data = try self.tbl().readInt64Column(col_idx);
             defer self.allocator.free(all_data);
 
             const filtered = try self.allocator.alloc(i64, indices.len);
@@ -2036,7 +2168,7 @@ pub const Executor = struct {
             }
             return Result.ColumnData{ .timestamp_ms = filtered };
         } else if (std.mem.indexOf(u8, logical_type, "timestamp[s") != null) {
-            const all_data = try self.table.readInt64Column(col_idx);
+            const all_data = try self.tbl().readInt64Column(col_idx);
             defer self.allocator.free(all_data);
 
             const filtered = try self.allocator.alloc(i64, indices.len);
@@ -2045,7 +2177,7 @@ pub const Executor = struct {
             }
             return Result.ColumnData{ .timestamp_s = filtered };
         } else if (std.mem.indexOf(u8, logical_type, "date32") != null) {
-            const all_data = try self.table.readInt32Column(col_idx);
+            const all_data = try self.tbl().readInt32Column(col_idx);
             defer self.allocator.free(all_data);
 
             const filtered = try self.allocator.alloc(i32, indices.len);
@@ -2054,7 +2186,7 @@ pub const Executor = struct {
             }
             return Result.ColumnData{ .date32 = filtered };
         } else if (std.mem.indexOf(u8, logical_type, "date64") != null) {
-            const all_data = try self.table.readInt64Column(col_idx);
+            const all_data = try self.tbl().readInt64Column(col_idx);
             defer self.allocator.free(all_data);
 
             const filtered = try self.allocator.alloc(i64, indices.len);
@@ -2063,7 +2195,7 @@ pub const Executor = struct {
             }
             return Result.ColumnData{ .date64 = filtered };
         } else if (std.mem.eql(u8, logical_type, "int32")) {
-            const all_data = try self.table.readInt32Column(col_idx);
+            const all_data = try self.tbl().readInt32Column(col_idx);
             defer self.allocator.free(all_data);
 
             const filtered = try self.allocator.alloc(i32, indices.len);
@@ -2073,7 +2205,7 @@ pub const Executor = struct {
             return Result.ColumnData{ .int32 = filtered };
         } else if (std.mem.eql(u8, logical_type, "float") or
             std.mem.indexOf(u8, logical_type, "float32") != null) {
-            const all_data = try self.table.readFloat32Column(col_idx);
+            const all_data = try self.tbl().readFloat32Column(col_idx);
             defer self.allocator.free(all_data);
 
             const filtered = try self.allocator.alloc(f32, indices.len);
@@ -2083,7 +2215,7 @@ pub const Executor = struct {
             return Result.ColumnData{ .float32 = filtered };
         } else if (std.mem.eql(u8, logical_type, "bool") or
             std.mem.indexOf(u8, logical_type, "boolean") != null) {
-            const all_data = try self.table.readBoolColumn(col_idx);
+            const all_data = try self.tbl().readBoolColumn(col_idx);
             defer self.allocator.free(all_data);
 
             const filtered = try self.allocator.alloc(bool, indices.len);
@@ -2093,7 +2225,7 @@ pub const Executor = struct {
             return Result.ColumnData{ .bool_ = filtered };
         } else if (std.mem.indexOf(u8, logical_type, "int") != null) {
             // Default integers to int64
-            const all_data = try self.table.readInt64Column(col_idx);
+            const all_data = try self.tbl().readInt64Column(col_idx);
             defer self.allocator.free(all_data);
 
             const filtered = try self.allocator.alloc(i64, indices.len);
@@ -2102,7 +2234,7 @@ pub const Executor = struct {
             }
             return Result.ColumnData{ .int64 = filtered };
         } else if (std.mem.indexOf(u8, logical_type, "double") != null) {
-            const all_data = try self.table.readFloat64Column(col_idx);
+            const all_data = try self.tbl().readFloat64Column(col_idx);
             defer self.allocator.free(all_data);
 
             const filtered = try self.allocator.alloc(f64, indices.len);
@@ -2112,7 +2244,7 @@ pub const Executor = struct {
             return Result.ColumnData{ .float64 = filtered };
         } else if (std.mem.indexOf(u8, logical_type, "utf8") != null or
             std.mem.indexOf(u8, logical_type, "string") != null) {
-            const all_data = try self.table.readStringColumn(col_idx);
+            const all_data = try self.tbl().readStringColumn(col_idx);
             // all_data contains owned strings - must free both array and individual strings
             defer {
                 for (all_data) |str| {

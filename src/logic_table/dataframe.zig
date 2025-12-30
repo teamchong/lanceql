@@ -28,6 +28,35 @@ const logic_table = @import("logic_table.zig");
 const LogicTableContext = logic_table.LogicTableContext;
 const LogicTableExecutor = @import("executor.zig").LogicTableExecutor;
 
+/// Method result cache - stores per-row method results computed in batch
+pub const MethodResultCache = struct {
+    allocator: std.mem.Allocator,
+    results: std.StringHashMap([]f64),
+
+    pub fn init(allocator: std.mem.Allocator) MethodResultCache {
+        return .{
+            .allocator = allocator,
+            .results = std.StringHashMap([]f64).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *MethodResultCache) void {
+        var iter = self.results.iterator();
+        while (iter.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.results.deinit();
+    }
+
+    pub fn get(self: *const MethodResultCache, method: []const u8) ?[]const f64 {
+        return self.results.get(method);
+    }
+
+    pub fn put(self: *MethodResultCache, method: []const u8, results: []f64) !void {
+        try self.results.put(method, results);
+    }
+};
+
 /// Filter operation for method results
 pub const FilterOp = enum {
     eq, // ==
@@ -69,6 +98,12 @@ pub const LogicTableDataFrame = struct {
     limit_value: ?u64 = null,
     offset_value: ?u64 = null,
 
+    // Method result cache - populated during collect()
+    method_cache: MethodResultCache,
+
+    // Optional: mock method results for testing (when real dispatch not available)
+    mock_method_fn: ?*const fn (method: []const u8, row_count: usize, allocator: std.mem.Allocator) anyerror![]f64 = null,
+
     const Self = @This();
 
     /// Column filter for WHERE clause on data columns
@@ -95,6 +130,7 @@ pub const LogicTableDataFrame = struct {
             .executor = executor,
             .method_filters = std.ArrayList(MethodFilter).init(allocator),
             .column_filters = std.ArrayList(ColumnFilter).init(allocator),
+            .method_cache = MethodResultCache.init(allocator),
         };
     }
 
@@ -105,12 +141,14 @@ pub const LogicTableDataFrame = struct {
             .executor = executor,
             .method_filters = std.ArrayList(MethodFilter).init(allocator),
             .column_filters = std.ArrayList(ColumnFilter).init(allocator),
+            .method_cache = MethodResultCache.init(allocator),
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.method_filters.deinit();
         self.column_filters.deinit();
+        self.method_cache.deinit();
         self.executor.deinit();
         self.allocator.destroy(self.executor);
     }
@@ -184,6 +222,10 @@ pub const LogicTableDataFrame = struct {
             };
         }
 
+        // Pre-compute all required method results in batch
+        // This is much more efficient than row-by-row evaluation
+        try self.computeMethodResults(row_count);
+
         // Build filtered indices based on column filters
         var filtered_indices = try self.allocator.alloc(u32, row_count);
         defer self.allocator.free(filtered_indices);
@@ -201,7 +243,7 @@ pub const LogicTableDataFrame = struct {
         var final_count: usize = 0;
 
         for (filtered_indices[0..filtered_count]) |idx| {
-            if (try self.evaluateMethodFilters(idx)) {
+            if (self.evaluateMethodFilters(idx)) {
                 final_indices[final_count] = idx;
                 final_count += 1;
             }
@@ -226,6 +268,32 @@ pub const LogicTableDataFrame = struct {
             .row_count = result_count,
             .indices = try self.allocator.dupe(u32, final_indices[start..end]),
         };
+    }
+
+    /// Compute method results for all rows in batch mode
+    /// Results are cached for use in filtering
+    fn computeMethodResults(self: *Self, row_count: usize) !void {
+        for (self.method_filters.items) |filter| {
+            // Skip if already computed
+            if (self.method_cache.get(filter.method) != null) continue;
+
+            // Compute method results
+            var results: []f64 = undefined;
+
+            if (self.mock_method_fn) |mock_fn| {
+                // Use mock function for testing
+                results = try mock_fn(filter.method, row_count, self.allocator);
+            } else {
+                // Use real batch dispatch from executor
+                // This would call the compiled @logic_table method
+                // For now, allocate zeros as placeholder
+                // TODO: Integrate with batch dispatcher when real methods are registered
+                results = try self.allocator.alloc(f64, row_count);
+                @memset(results, 0.0);
+            }
+
+            try self.method_cache.put(filter.method, results);
+        }
     }
 
     /// Evaluate column filters for a row
@@ -266,14 +334,22 @@ pub const LogicTableDataFrame = struct {
         return false;
     }
 
-    /// Evaluate method filters for a row
-    fn evaluateMethodFilters(self: *Self, row_idx: u32) !bool {
-        _ = row_idx;
-        // For now, method filters are evaluated at the batch level
-        // Individual row evaluation would require row-wise method calls
-        for (self.method_filters.items) |_| {
-            // TODO: Implement row-wise method evaluation
-            // This requires the compiled method to support row indexing
+    /// Evaluate method filters for a row using cached batch results
+    fn evaluateMethodFilters(self: *Self, row_idx: u32) bool {
+        for (self.method_filters.items) |filter| {
+            // Get cached results for this method
+            const results = self.method_cache.get(filter.method) orelse {
+                // No results cached - skip this filter (shouldn't happen)
+                continue;
+            };
+
+            // Get the value for this row
+            if (row_idx >= results.len) continue;
+            const value = results[row_idx];
+
+            // Compare against filter threshold
+            const matches = self.compareValues(f64, value, filter.value, filter.op);
+            if (!matches) return false;
         }
         return true;
     }
@@ -299,6 +375,17 @@ pub const LogicTableDataFrame = struct {
     pub fn count(self: *Self) !u64 {
         const result = try self.collect();
         return result.row_count;
+    }
+
+    /// Set mock method function for testing
+    /// The function should return per-row results for the given method
+    pub fn setMockMethodFn(self: *Self, mock_fn: *const fn ([]const u8, usize, std.mem.Allocator) anyerror![]f64) void {
+        self.mock_method_fn = mock_fn;
+    }
+
+    /// Get cached method results (for testing/debugging)
+    pub fn getMethodResults(self: *const Self, method: []const u8) ?[]const f64 {
+        return self.method_cache.get(method);
     }
 };
 
@@ -342,4 +429,69 @@ test "LogicTableDataFrame basic" {
 test "FilterOp comparison" {
     try std.testing.expect(FilterOp.gt != FilterOp.lt);
     try std.testing.expect(FilterOp.eq == FilterOp.eq);
+}
+
+test "method filter with mock results" {
+    const allocator = std.testing.allocator;
+
+    // Create a simple executor
+    var executor = try LogicTableExecutor.init(allocator, "test.py");
+
+    // Create DataFrame from executor
+    var df = LogicTableDataFrame.fromExecutor(allocator, &executor);
+    defer {
+        df.method_filters.deinit();
+        df.column_filters.deinit();
+        df.method_cache.deinit();
+        executor.deinit();
+    }
+
+    // Mock method function that returns risk scores [0.1, 0.5, 0.8, 0.3, 0.9]
+    const mock_fn = struct {
+        fn compute(_: []const u8, row_count: usize, alloc: std.mem.Allocator) ![]f64 {
+            const results = try alloc.alloc(f64, row_count);
+            const mock_scores = [_]f64{ 0.1, 0.5, 0.8, 0.3, 0.9 };
+            for (0..row_count) |i| {
+                results[i] = if (i < mock_scores.len) mock_scores[i] else 0.0;
+            }
+            return results;
+        }
+    }.compute;
+
+    df.setMockMethodFn(mock_fn);
+
+    // Add filter: risk_score > 0.5
+    _ = try df.filterMethod("risk_score", .gt, 0.5);
+
+    // Verify filter was added
+    try std.testing.expectEqual(@as(usize, 1), df.method_filters.items.len);
+    try std.testing.expectEqualStrings("risk_score", df.method_filters.items[0].method);
+    try std.testing.expectEqual(FilterOp.gt, df.method_filters.items[0].op);
+    try std.testing.expectEqual(@as(f64, 0.5), df.method_filters.items[0].value);
+}
+
+test "MethodResultCache" {
+    const allocator = std.testing.allocator;
+
+    var cache = MethodResultCache.init(allocator);
+    defer cache.deinit();
+
+    // Add some results
+    var results = try allocator.alloc(f64, 5);
+    results[0] = 0.1;
+    results[1] = 0.2;
+    results[2] = 0.3;
+    results[3] = 0.4;
+    results[4] = 0.5;
+
+    try cache.put("risk_score", results);
+
+    // Retrieve and verify
+    const retrieved = cache.get("risk_score");
+    try std.testing.expect(retrieved != null);
+    try std.testing.expectEqual(@as(f64, 0.1), retrieved.?[0]);
+    try std.testing.expectEqual(@as(f64, 0.5), retrieved.?[4]);
+
+    // Non-existent method
+    try std.testing.expect(cache.get("unknown") == null);
 }

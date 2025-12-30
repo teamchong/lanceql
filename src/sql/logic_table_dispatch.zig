@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const ast = @import("ast");
-const logic_table = @import("lanceql.logic_table");
+pub const logic_table = @import("lanceql.logic_table");
 
 pub const LogicTableContext = logic_table.LogicTableContext;
 pub const LogicTableExecutor = logic_table.LogicTableExecutor;
@@ -27,7 +27,110 @@ pub const DispatchError = error{
     ArgumentCountMismatch,
     InvalidArgumentType,
     ExecutionFailed,
+    OutputBufferNotInitialized,
+    OutOfMemory,
 };
+
+// =============================================================================
+// Batch-Vectorized Method Dispatch ABI
+// =============================================================================
+
+/// Column binding for batch method input
+/// Provides named access to column data with type information
+pub const ColumnBinding = struct {
+    /// Column name (e.g., "amount", "customer_id")
+    name: []const u8,
+    /// Table alias (e.g., "orders", "t")
+    table_alias: ?[]const u8,
+    /// Actual column data
+    data: ColumnData,
+
+    pub const ColumnData = union(enum) {
+        f64: []const f64,
+        f32: []const f32,
+        i64: []const i64,
+        i32: []const i32,
+        bool_: []const bool,
+        string: []const []const u8,
+    };
+
+    /// Get row count from data
+    pub fn len(self: ColumnBinding) usize {
+        return switch (self.data) {
+            .f64 => |d| d.len,
+            .f32 => |d| d.len,
+            .i64 => |d| d.len,
+            .i32 => |d| d.len,
+            .bool_ => |d| d.len,
+            .string => |d| d.len,
+        };
+    }
+};
+
+/// Output buffer for batch method results
+/// Pre-allocated by caller, filled by method
+pub const ColumnBuffer = struct {
+    f64: ?[]f64 = null,
+    f32: ?[]f32 = null,
+    i64: ?[]i64 = null,
+    i32: ?[]i32 = null,
+    bool_: ?[]bool = null,
+
+    /// Initialize for f64 output
+    pub fn initFloat64(allocator: std.mem.Allocator, len_val: usize) !ColumnBuffer {
+        return .{ .f64 = try allocator.alloc(f64, len_val) };
+    }
+
+    /// Initialize for f32 output
+    pub fn initFloat32(allocator: std.mem.Allocator, len_val: usize) !ColumnBuffer {
+        return .{ .f32 = try allocator.alloc(f32, len_val) };
+    }
+
+    /// Initialize for i64 output
+    pub fn initInt64(allocator: std.mem.Allocator, len_val: usize) !ColumnBuffer {
+        return .{ .i64 = try allocator.alloc(i64, len_val) };
+    }
+
+    /// Initialize for bool output
+    pub fn initBool(allocator: std.mem.Allocator, len_val: usize) !ColumnBuffer {
+        return .{ .bool_ = try allocator.alloc(bool, len_val) };
+    }
+
+    /// Free allocated memory
+    pub fn deinit(self: *ColumnBuffer, allocator: std.mem.Allocator) void {
+        if (self.f64) |buf| allocator.free(buf);
+        if (self.f32) |buf| allocator.free(buf);
+        if (self.i64) |buf| allocator.free(buf);
+        if (self.i32) |buf| allocator.free(buf);
+        if (self.bool_) |buf| allocator.free(buf);
+        self.* = .{};
+    }
+
+    /// Get output length
+    pub fn len(self: ColumnBuffer) usize {
+        if (self.f64) |buf| return buf.len;
+        if (self.f32) |buf| return buf.len;
+        if (self.i64) |buf| return buf.len;
+        if (self.i32) |buf| return buf.len;
+        if (self.bool_) |buf| return buf.len;
+        return 0;
+    }
+};
+
+/// Batch method function signature (C ABI)
+/// This is the standard signature for all batch @logic_table methods
+pub const BatchMethodFn = *const fn (
+    /// Input column bindings
+    inputs: [*]const ColumnBinding,
+    num_inputs: usize,
+    /// Row selection (null = all rows)
+    selection: ?[*]const u32,
+    selection_len: usize,
+    /// Output buffer (pre-allocated)
+    output: *ColumnBuffer,
+    /// Query context for pushdown optimization
+    ctx: ?*logic_table.QueryContext,
+) callconv(.c) void;
 
 /// Method function pointer types for C ABI
 pub const MethodFnF64_2Args = *const fn ([*]const f64, [*]const f64, usize) callconv(.c) f64;
@@ -41,11 +144,24 @@ pub const RegisteredMethod = struct {
     fn_ptr: *const anyopaque,
     arg_count: u8,
     return_type: ReturnType,
+    /// Method dispatch mode
+    dispatch_mode: DispatchMode = .scalar,
+    /// Input column names for batch methods
+    input_columns: []const []const u8 = &.{},
 
     pub const ReturnType = enum {
         f64,
+        f32,
         i64,
         bool_,
+        void_, // For methods that write directly to output buffer
+    };
+
+    pub const DispatchMode = enum {
+        /// Legacy scalar dispatch (callMethod0/1/2)
+        scalar,
+        /// Batch-vectorized dispatch (callMethodBatch)
+        batch,
     };
 };
 
@@ -86,7 +202,7 @@ pub const Dispatcher = struct {
         self.executors.deinit();
     }
 
-    /// Register a compiled method function pointer
+    /// Register a compiled method function pointer (scalar dispatch)
     pub fn registerMethod(
         self: *Self,
         class_name: []const u8,
@@ -103,6 +219,29 @@ pub const Dispatcher = struct {
             .fn_ptr = fn_ptr,
             .arg_count = arg_count,
             .return_type = .f64,
+        });
+    }
+
+    /// Register a batch-vectorized method function pointer
+    pub fn registerBatchMethod(
+        self: *Self,
+        class_name: []const u8,
+        method_name: []const u8,
+        fn_ptr: BatchMethodFn,
+        input_columns: []const []const u8,
+        return_type: RegisteredMethod.ReturnType,
+    ) !void {
+        const key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ class_name, method_name });
+        errdefer self.allocator.free(key);
+
+        try self.methods.put(key, .{
+            .class_name = class_name,
+            .method_name = method_name,
+            .fn_ptr = @ptrCast(fn_ptr),
+            .arg_count = @intCast(input_columns.len),
+            .return_type = return_type,
+            .dispatch_mode = .batch,
+            .input_columns = input_columns,
         });
     }
 
@@ -194,6 +333,43 @@ pub const Dispatcher = struct {
         return fn_ptr(a, b, len);
     }
 
+    /// Call a batch-vectorized method
+    /// This is the primary dispatch method for @logic_table batch execution
+    pub fn callMethodBatch(
+        self: *Self,
+        class_name: []const u8,
+        method_name: []const u8,
+        inputs: []const ColumnBinding,
+        selection: ?[]const u32,
+        output: *ColumnBuffer,
+        ctx: ?*logic_table.QueryContext,
+    ) DispatchError!void {
+        var key_buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ class_name, method_name }) catch
+            return DispatchError.MethodNotFound;
+
+        const method = self.methods.get(key) orelse return DispatchError.MethodNotFound;
+
+        // Verify this is a batch method
+        if (method.dispatch_mode != .batch) {
+            return DispatchError.ArgumentCountMismatch;
+        }
+
+        // Call the batch function
+        const batch_fn: BatchMethodFn = @ptrCast(@alignCast(method.fn_ptr));
+        const selection_ptr = if (selection) |s| s.ptr else null;
+        const selection_len = if (selection) |s| s.len else 0;
+        batch_fn(inputs.ptr, inputs.len, selection_ptr, selection_len, output, ctx);
+    }
+
+    /// Check if a method is registered as batch mode
+    pub fn isBatchMethod(self: *Self, class_name: []const u8, method_name: []const u8) bool {
+        var key_buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ class_name, method_name }) catch return false;
+        const method = self.methods.get(key) orelse return false;
+        return method.dispatch_mode == .batch;
+    }
+
     /// Get registered method info (for argument count checking)
     pub fn getMethodInfo(self: *Self, class_name: []const u8, method_name: []const u8) ?RegisteredMethod {
         var key_buf: [256]u8 = undefined;
@@ -278,4 +454,116 @@ test "Dispatcher method not found" {
 
     const result = dispatcher.callMethod0("Unknown", "method");
     try std.testing.expectError(DispatchError.MethodNotFound, result);
+}
+
+test "Dispatcher batch method" {
+    const allocator = std.testing.allocator;
+
+    var dispatcher = Dispatcher.init(allocator);
+    defer dispatcher.deinit();
+
+    // Create a batch test function that multiplies each value by 2
+    const TestBatchFn = struct {
+        fn batchDoubleValues(
+            inputs: [*]const ColumnBinding,
+            num_inputs: usize,
+            selection: ?[*]const u32,
+            selection_len: usize,
+            output: *ColumnBuffer,
+            ctx: ?*logic_table.QueryContext,
+        ) callconv(.c) void {
+            _ = ctx;
+
+            // Get the first input column (should be f64)
+            if (num_inputs == 0) return;
+            const input_data = switch (inputs[0].data) {
+                .f64 => |d| d,
+                else => return,
+            };
+
+            const out_buf = output.f64 orelse return;
+
+            // Process with or without selection
+            if (selection) |sel| {
+                for (0..selection_len) |i| {
+                    const idx = sel[i];
+                    out_buf[i] = input_data[idx] * 2.0;
+                }
+            } else {
+                for (input_data, 0..) |val, i| {
+                    out_buf[i] = val * 2.0;
+                }
+            }
+        }
+    };
+
+    const input_cols = [_][]const u8{"value"};
+    try dispatcher.registerBatchMethod(
+        "TestBatch",
+        "doubleValues",
+        &TestBatchFn.batchDoubleValues,
+        &input_cols,
+        .f64,
+    );
+
+    // Create input data
+    const values = [_]f64{ 1.0, 2.0, 3.0, 4.0, 5.0 };
+    const inputs = [_]ColumnBinding{
+        .{
+            .name = "value",
+            .table_alias = null,
+            .data = .{ .f64 = &values },
+        },
+    };
+
+    // Test without selection (all rows)
+    {
+        var output = try ColumnBuffer.initFloat64(allocator, 5);
+        defer output.deinit(allocator);
+
+        try dispatcher.callMethodBatch("TestBatch", "doubleValues", &inputs, null, &output, null);
+
+        const out_buf = output.f64.?;
+        try std.testing.expectEqual(@as(f64, 2.0), out_buf[0]);
+        try std.testing.expectEqual(@as(f64, 4.0), out_buf[1]);
+        try std.testing.expectEqual(@as(f64, 10.0), out_buf[4]);
+    }
+
+    // Test with selection (only rows 1, 3)
+    {
+        const selection = [_]u32{ 1, 3 };
+        var output = try ColumnBuffer.initFloat64(allocator, 2);
+        defer output.deinit(allocator);
+
+        try dispatcher.callMethodBatch("TestBatch", "doubleValues", &inputs, &selection, &output, null);
+
+        const out_buf = output.f64.?;
+        try std.testing.expectEqual(@as(f64, 4.0), out_buf[0]); // 2.0 * 2
+        try std.testing.expectEqual(@as(f64, 8.0), out_buf[1]); // 4.0 * 2
+    }
+}
+
+test "ColumnBuffer initialization" {
+    const allocator = std.testing.allocator;
+
+    // Test f64 buffer
+    {
+        var buf = try ColumnBuffer.initFloat64(allocator, 10);
+        defer buf.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 10), buf.len());
+    }
+
+    // Test f32 buffer
+    {
+        var buf = try ColumnBuffer.initFloat32(allocator, 5);
+        defer buf.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 5), buf.len());
+    }
+
+    // Test i64 buffer
+    {
+        var buf = try ColumnBuffer.initInt64(allocator, 3);
+        defer buf.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 3), buf.len());
+    }
 }

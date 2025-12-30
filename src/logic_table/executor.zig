@@ -114,9 +114,9 @@ pub const LogicTableExecutor = struct {
             .python_file = try allocator.dupe(u8, python_file),
             .base_dir = try allocator.dupe(u8, base_dir),
             .class_name = "",
-            .table_decls = std.ArrayList(TableDecl).init(allocator),
+            .table_decls = .{},
             .loaded_tables = std.StringHashMap(LoadedTable).init(allocator),
-            .methods = std.ArrayList(MethodMeta).init(allocator),
+            .methods = .{},
             .registered_methods = std.StringHashMap(RegisteredMethod).init(allocator),
             .ctx = LogicTableContext.init(allocator),
             .query_ctx = null,
@@ -127,12 +127,17 @@ pub const LogicTableExecutor = struct {
         self.allocator.free(self.python_file);
         self.allocator.free(self.base_dir);
 
+        // Free class name if parsed
+        if (self.class_name.len > 0) {
+            self.allocator.free(self.class_name);
+        }
+
         // Free table declarations
         for (self.table_decls.items) |decl| {
             self.allocator.free(decl.name);
             self.allocator.free(decl.path);
         }
-        self.table_decls.deinit();
+        self.table_decls.deinit(self.allocator);
 
         // Free loaded tables
         var iter = self.loaded_tables.iterator();
@@ -146,7 +151,7 @@ pub const LogicTableExecutor = struct {
         for (self.methods.items) |method| {
             self.allocator.free(method.name);
         }
-        self.methods.deinit();
+        self.methods.deinit(self.allocator);
 
         self.registered_methods.deinit();
         self.ctx.deinit();
@@ -158,9 +163,186 @@ pub const LogicTableExecutor = struct {
         self.ctx.query_context = query_ctx;
     }
 
+    /// Parse Python file to extract @logic_table metadata
+    /// Extracts: class name, Table() declarations, method names
+    pub fn parsePythonFile(self: *Self) !void {
+        // Read the Python file
+        const file = std.fs.cwd().openFile(self.python_file, .{}) catch |err| {
+            std.debug.print("Failed to open Python file: {s} (error: {})\n", .{ self.python_file, err });
+            return LogicTableError.InvalidLogicTable;
+        };
+        defer file.close();
+
+        const content = file.readToEndAlloc(self.allocator, 1024 * 1024) catch |err| {
+            std.debug.print("Failed to read Python file: {s} (error: {})\n", .{ self.python_file, err });
+            return LogicTableError.InvalidLogicTable;
+        };
+        defer self.allocator.free(content);
+
+        // Extract class name
+        self.class_name = try self.extractClassName(content);
+
+        // Extract Table() declarations
+        try self.extractTableDecls(content);
+
+        // Extract method names
+        try self.extractMethods(content);
+    }
+
+    /// Extract class name from Python content
+    /// Looks for: @logic_table\n... class ClassName:
+    pub fn extractClassName(self: *Self, content: []const u8) ![]const u8 {
+        // Find @logic_table decorator
+        const logic_table_pos = std.mem.indexOf(u8, content, "@logic_table") orelse
+            return LogicTableError.InvalidLogicTable;
+
+        // Find "class " after the decorator
+        const after_decorator = content[logic_table_pos..];
+        const class_pos = std.mem.indexOf(u8, after_decorator, "class ") orelse
+            return LogicTableError.InvalidLogicTable;
+
+        const name_start = class_pos + 6; // "class " length
+        const after_class = after_decorator[name_start..];
+
+        // Find end of class name (: or ( for inheritance)
+        var name_end: usize = 0;
+        for (after_class, 0..) |c, i| {
+            if (c == ':' or c == '(' or c == ' ' or c == '\n') {
+                name_end = i;
+                break;
+            }
+        }
+        if (name_end == 0) return LogicTableError.InvalidLogicTable;
+
+        const class_name = std.mem.trim(u8, after_class[0..name_end], " \t\n\r");
+        return try self.allocator.dupe(u8, class_name);
+    }
+
+    /// Extract Table() declarations from Python content
+    /// Looks for: variable_name = Table("path.lance")
+    pub fn extractTableDecls(self: *Self, content: []const u8) !void {
+        var pos: usize = 0;
+        while (pos < content.len) {
+            // Find "Table(" pattern
+            const table_start = std.mem.indexOfPos(u8, content, pos, "Table(") orelse break;
+
+            // Look backwards to find variable name
+            var var_start = table_start;
+            while (var_start > 0 and content[var_start - 1] != '\n') {
+                var_start -= 1;
+            }
+
+            // Extract the line before Table(
+            const line_before = content[var_start..table_start];
+
+            // Look for pattern: "name = " or "name=" with optional spaces
+            const eq_pos = std.mem.indexOf(u8, line_before, "=") orelse {
+                pos = table_start + 6;
+                continue;
+            };
+
+            const var_name = std.mem.trim(u8, line_before[0..eq_pos], " \t");
+
+            // Skip if variable name is empty or has invalid chars
+            if (var_name.len == 0 or !isValidPythonIdent(var_name)) {
+                pos = table_start + 6;
+                continue;
+            }
+
+            // Extract path from Table("...") or Table('...')
+            const after_table = content[table_start + 6..];
+            const quote = if (after_table.len > 0 and (after_table[0] == '"' or after_table[0] == '\''))
+                after_table[0]
+            else {
+                pos = table_start + 6;
+                continue;
+            };
+
+            const path_start: usize = 1;
+            const path_end = std.mem.indexOfPos(u8, after_table, path_start, &[_]u8{quote}) orelse {
+                pos = table_start + 6;
+                continue;
+            };
+
+            const path = after_table[path_start..path_end];
+
+            // Add table declaration
+            try self.table_decls.append(self.allocator, .{
+                .name = try self.allocator.dupe(u8, var_name),
+                .path = try self.allocator.dupe(u8, path),
+            });
+
+            pos = table_start + 6 + path_end;
+        }
+    }
+
+    /// Extract method names from Python content
+    /// Looks for: def method_name(self, ...):
+    pub fn extractMethods(self: *Self, content: []const u8) !void {
+        var pos: usize = 0;
+        while (pos < content.len) {
+            // Find "def " pattern
+            const def_start = std.mem.indexOfPos(u8, content, pos, "def ") orelse break;
+
+            // Skip methods starting with underscore (private/magic)
+            const name_start = def_start + 4;
+            if (name_start >= content.len) break;
+
+            // Find end of method name (
+            const after_def = content[name_start..];
+            const paren_pos = std.mem.indexOf(u8, after_def, "(") orelse {
+                pos = name_start;
+                continue;
+            };
+
+            const method_name = std.mem.trim(u8, after_def[0..paren_pos], " \t");
+
+            // Skip private methods and __init__
+            if (method_name.len == 0 or method_name[0] == '_') {
+                pos = name_start + paren_pos;
+                continue;
+            }
+
+            // Check if method has 'self' parameter (instance method)
+            const params_start = name_start + paren_pos + 1;
+            const after_paren = content[params_start..];
+            const close_paren = std.mem.indexOf(u8, after_paren, ")") orelse {
+                pos = params_start;
+                continue;
+            };
+
+            const params = after_paren[0..close_paren];
+            const has_self = std.mem.indexOf(u8, params, "self") != null;
+
+            if (has_self) {
+                try self.methods.append(self.allocator, .{
+                    .name = try self.allocator.dupe(u8, method_name),
+                    .deps = &.{}, // Dependencies extracted later
+                });
+            }
+
+            pos = params_start + close_paren;
+        }
+    }
+
+    /// Check if string is a valid Python identifier
+    fn isValidPythonIdent(s: []const u8) bool {
+        if (s.len == 0) return false;
+
+        // First char must be letter or underscore
+        const first = s[0];
+        if (!std.ascii.isAlphabetic(first) and first != '_') return false;
+
+        // Rest must be alphanumeric or underscore
+        for (s[1..]) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+        }
+        return true;
+    }
+
     /// Add a table declaration manually (alternative to parsing Python)
     pub fn addTableDecl(self: *Self, name: []const u8, path: []const u8) !void {
-        try self.table_decls.append(.{
+        try self.table_decls.append(self.allocator, .{
             .name = try self.allocator.dupe(u8, name),
             .path = try self.allocator.dupe(u8, path),
         });
@@ -168,7 +350,7 @@ pub const LogicTableExecutor = struct {
 
     /// Add a method declaration manually
     pub fn addMethod(self: *Self, name: []const u8, deps: []const []const u8) !void {
-        try self.methods.append(.{
+        try self.methods.append(self.allocator, .{
             .name = try self.allocator.dupe(u8, name),
             .deps = deps,
         });
@@ -198,6 +380,17 @@ pub const LogicTableExecutor = struct {
         for (self.table_decls.items) |decl| {
             try self.loadTable(decl);
         }
+    }
+
+    /// Get the primary (first) loaded table for SQL execution
+    /// Returns null if no tables are loaded
+    pub fn getPrimaryTable(self: *Self) ?*Table {
+        // Return the first loaded table
+        var iter = self.loaded_tables.valueIterator();
+        if (iter.next()) |loaded| {
+            return loaded.table;
+        }
+        return null;
     }
 
     /// Load a single table
@@ -399,4 +592,91 @@ test "LogicTableExecutor path resolution" {
     defer executor.deinit();
 
     try std.testing.expectEqualStrings("examples", executor.base_dir);
+}
+
+test "Python parsing - extractClassName" {
+    const allocator = std.testing.allocator;
+
+    var executor = try LogicTableExecutor.init(allocator, "test.py");
+    defer executor.deinit();
+
+    // Test extractClassName with valid content
+    const content =
+        \\from lanceql import logic_table, Table
+        \\
+        \\@logic_table
+        \\class FraudDetector:
+        \\    orders = Table("orders.lance")
+    ;
+
+    const class_name = try executor.extractClassName(content);
+    defer allocator.free(class_name);
+
+    try std.testing.expectEqualStrings("FraudDetector", class_name);
+}
+
+test "Python parsing - extractTableDecls" {
+    const allocator = std.testing.allocator;
+
+    var executor = try LogicTableExecutor.init(allocator, "test.py");
+    defer executor.deinit();
+
+    const content =
+        \\@logic_table
+        \\class FraudDetector:
+        \\    orders = Table("orders.lance")
+        \\    customers = Table('customers.lance')
+        \\
+        \\    def risk_score(self):
+        \\        return 0.5
+    ;
+
+    try executor.extractTableDecls(content);
+
+    try std.testing.expectEqual(@as(usize, 2), executor.table_decls.items.len);
+    try std.testing.expectEqualStrings("orders", executor.table_decls.items[0].name);
+    try std.testing.expectEqualStrings("orders.lance", executor.table_decls.items[0].path);
+    try std.testing.expectEqualStrings("customers", executor.table_decls.items[1].name);
+    try std.testing.expectEqualStrings("customers.lance", executor.table_decls.items[1].path);
+}
+
+test "Python parsing - extractMethods" {
+    const allocator = std.testing.allocator;
+
+    var executor = try LogicTableExecutor.init(allocator, "test.py");
+    defer executor.deinit();
+
+    const content =
+        \\@logic_table
+        \\class FraudDetector:
+        \\    def __init__(self):
+        \\        pass
+        \\
+        \\    def risk_score(self):
+        \\        return 0.5
+        \\
+        \\    def _private_method(self):
+        \\        pass
+        \\
+        \\    def calculate_velocity(self, window_days=30):
+        \\        return 0.1
+    ;
+
+    try executor.extractMethods(content);
+
+    // Should only extract risk_score and calculate_velocity (not __init__ or _private_method)
+    try std.testing.expectEqual(@as(usize, 2), executor.methods.items.len);
+    try std.testing.expectEqualStrings("risk_score", executor.methods.items[0].name);
+    try std.testing.expectEqualStrings("calculate_velocity", executor.methods.items[1].name);
+}
+
+test "isValidPythonIdent" {
+    try std.testing.expect(LogicTableExecutor.isValidPythonIdent("valid_name"));
+    try std.testing.expect(LogicTableExecutor.isValidPythonIdent("_private"));
+    try std.testing.expect(LogicTableExecutor.isValidPythonIdent("CamelCase"));
+    try std.testing.expect(LogicTableExecutor.isValidPythonIdent("name123"));
+    try std.testing.expect(!LogicTableExecutor.isValidPythonIdent(""));
+    try std.testing.expect(!LogicTableExecutor.isValidPythonIdent("123name"));
+    try std.testing.expect(!LogicTableExecutor.isValidPythonIdent("name-with-dash"));
+    try std.testing.expect(!LogicTableExecutor.isValidPythonIdent("name with space"));
 }

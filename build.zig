@@ -707,6 +707,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "lanceql.sql.parser", .module = sql_parser_mod },
                 .{ .name = "lanceql.sql.executor", .module = sql_executor_mod },
                 .{ .name = "lanceql.sql.column_deps", .module = sql_column_deps_mod },
+                .{ .name = "lanceql.logic_table", .module = logic_table_mod },
             },
         }),
     });
