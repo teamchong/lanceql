@@ -6,36 +6,77 @@ const std = @import("std");
 const Table = @import("lanceql.table").Table;
 const ast = @import("lanceql.sql.ast");
 const parser = @import("lanceql.sql.parser");
-const Executor = @import("lanceql.sql.executor").Executor;
+const executor_mod = @import("lanceql.sql.executor");
+const Executor = executor_mod.Executor;
+const Result = executor_mod.Result;
 const Value = ast.Value;
 
+// ============================================================================
+// Test Fixtures
+// ============================================================================
+
+const int64_fixture = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+const float64_fixture = @embedFile("fixtures/simple_float64.lance/data/101000000010001000111010eda0664313bd731181abf5bde4.lance");
+const mixed_fixture = @embedFile("fixtures/mixed_types.lance/data/11100100001000010010010060d60b4085bd08dcf790581192.lance");
+const sqlite_fixture = @embedFile("fixtures/better-sqlite3/simple.lance/data/1010001110011001100010108ba1604433ac0cda4c27f6809f.lance");
+
+// ============================================================================
+// Test Context Helper
+// ============================================================================
+
+/// Test context that manages table, executor, and result lifecycle.
+/// Use init() to set up, exec() to run queries, and deinit() to clean up.
+const TestContext = struct {
+    table: Table,
+    executor: Executor,
+    allocator: std.mem.Allocator,
+    result: ?Result,
+    stmt: ?ast.Statement,
+
+    /// Initialize in-place to avoid pointer invalidation
+    pub fn init(self: *TestContext, allocator: std.mem.Allocator, data: []const u8) !void {
+        self.allocator = allocator;
+        self.result = null;
+        self.stmt = null;
+        self.table = try Table.init(allocator, data);
+        self.executor = Executor.init(&self.table, allocator);
+    }
+
+    /// Execute a SQL query and return the result
+    pub fn exec(self: *TestContext, sql: []const u8) !*Result {
+        // Clean up previous result/stmt if any
+        if (self.result) |*r| r.deinit();
+        if (self.stmt) |*s| ast.deinitSelectStmt(&s.select, self.allocator);
+
+        self.stmt = try parser.parseSQL(sql, self.allocator);
+        self.result = try self.executor.execute(&self.stmt.?.select, &[_]Value{});
+        return &self.result.?;
+    }
+
+    /// Clean up all resources
+    pub fn deinit(self: *TestContext) void {
+        if (self.result) |*r| r.deinit();
+        if (self.stmt) |*s| ast.deinitSelectStmt(&s.select, self.allocator);
+        self.executor.deinit();
+        self.table.deinit();
+    }
+};
+
+// ============================================================================
+// Tests
+// ============================================================================
+
 test "execute simple SELECT *" {
-    const allocator = std.testing.allocator;
+    var ctx: TestContext = undefined;
+    try ctx.init(std.testing.allocator, int64_fixture);
+    defer ctx.deinit();
 
-    // Open test Lance file
-    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
-    var table = try Table.init(allocator, lance_data);
-    defer table.deinit();
+    const result = try ctx.exec("SELECT * FROM table");
 
-    // Parse SQL
-    const sql = "SELECT * FROM table";
-    var stmt = try parser.parseSQL(sql, allocator);
-    defer ast.deinitSelectStmt(&stmt.select, allocator);
-
-    // Execute
-    var executor = Executor.init(&table, allocator);
-    defer executor.deinit();
-    var result = try executor.execute(&stmt.select, &[_]Value{});
-    defer result.deinit();
-
-    // Verify results
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 5), result.row_count);
 
-    // Check column data
-    const col = result.columns[0];
-    try std.testing.expect(col.data == .int64);
-    const values = col.data.int64;
+    const values = result.columns[0].data.int64;
     try std.testing.expectEqual(@as(i64, 1), values[0]);
     try std.testing.expectEqual(@as(i64, 2), values[1]);
     try std.testing.expectEqual(@as(i64, 3), values[2]);
@@ -44,25 +85,12 @@ test "execute simple SELECT *" {
 }
 
 test "execute SELECT with WHERE clause" {
-    const allocator = std.testing.allocator;
+    var ctx: TestContext = undefined;
+    try ctx.init(std.testing.allocator, int64_fixture);
+    defer ctx.deinit();
 
-    // Open test Lance file
-    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
-    var table = try Table.init(allocator, lance_data);
-    defer table.deinit();
+    const result = try ctx.exec("SELECT * FROM table WHERE id > 2");
 
-    // Parse SQL: SELECT * FROM table WHERE id > 2
-    const sql = "SELECT * FROM table WHERE id > 2";
-    var stmt = try parser.parseSQL(sql, allocator);
-    defer ast.deinitSelectStmt(&stmt.select, allocator);
-
-    // Execute
-    var executor = Executor.init(&table, allocator);
-    defer executor.deinit();
-    var result = try executor.execute(&stmt.select, &[_]Value{});
-    defer result.deinit();
-
-    // Verify results - should have 3 rows (3, 4, 5)
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 3), result.row_count);
 
@@ -73,25 +101,12 @@ test "execute SELECT with WHERE clause" {
 }
 
 test "execute SELECT with ORDER BY DESC" {
-    const allocator = std.testing.allocator;
+    var ctx: TestContext = undefined;
+    try ctx.init(std.testing.allocator, int64_fixture);
+    defer ctx.deinit();
 
-    // Open test Lance file
-    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
-    var table = try Table.init(allocator, lance_data);
-    defer table.deinit();
+    const result = try ctx.exec("SELECT * FROM table ORDER BY id DESC");
 
-    // Parse SQL: SELECT * FROM table ORDER BY id DESC
-    const sql = "SELECT * FROM table ORDER BY id DESC";
-    var stmt = try parser.parseSQL(sql, allocator);
-    defer ast.deinitSelectStmt(&stmt.select, allocator);
-
-    // Execute
-    var executor = Executor.init(&table, allocator);
-    defer executor.deinit();
-    var result = try executor.execute(&stmt.select, &[_]Value{});
-    defer result.deinit();
-
-    // Verify results - should be reversed (5, 4, 3, 2, 1)
     try std.testing.expectEqual(@as(usize, 5), result.row_count);
 
     const values = result.columns[0].data.int64;
@@ -103,25 +118,12 @@ test "execute SELECT with ORDER BY DESC" {
 }
 
 test "execute SELECT with LIMIT" {
-    const allocator = std.testing.allocator;
+    var ctx: TestContext = undefined;
+    try ctx.init(std.testing.allocator, int64_fixture);
+    defer ctx.deinit();
 
-    // Open test Lance file
-    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
-    var table = try Table.init(allocator, lance_data);
-    defer table.deinit();
+    const result = try ctx.exec("SELECT * FROM table LIMIT 3");
 
-    // Parse SQL: SELECT * FROM table LIMIT 3
-    const sql = "SELECT * FROM table LIMIT 3";
-    var stmt = try parser.parseSQL(sql, allocator);
-    defer ast.deinitSelectStmt(&stmt.select, allocator);
-
-    // Execute
-    var executor = Executor.init(&table, allocator);
-    defer executor.deinit();
-    var result = try executor.execute(&stmt.select, &[_]Value{});
-    defer result.deinit();
-
-    // Verify results - should have 3 rows (1, 2, 3)
     try std.testing.expectEqual(@as(usize, 3), result.row_count);
 
     const values = result.columns[0].data.int64;
@@ -131,25 +133,12 @@ test "execute SELECT with LIMIT" {
 }
 
 test "execute SELECT with OFFSET" {
-    const allocator = std.testing.allocator;
+    var ctx: TestContext = undefined;
+    try ctx.init(std.testing.allocator, int64_fixture);
+    defer ctx.deinit();
 
-    // Open test Lance file
-    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
-    var table = try Table.init(allocator, lance_data);
-    defer table.deinit();
+    const result = try ctx.exec("SELECT * FROM table LIMIT 2 OFFSET 2");
 
-    // Parse SQL: SELECT * FROM table LIMIT 2 OFFSET 2
-    const sql = "SELECT * FROM table LIMIT 2 OFFSET 2";
-    var stmt = try parser.parseSQL(sql, allocator);
-    defer ast.deinitSelectStmt(&stmt.select, allocator);
-
-    // Execute
-    var executor = Executor.init(&table, allocator);
-    defer executor.deinit();
-    var result = try executor.execute(&stmt.select, &[_]Value{});
-    defer result.deinit();
-
-    // Verify results - should have 2 rows (3, 4)
     try std.testing.expectEqual(@as(usize, 2), result.row_count);
 
     const values = result.columns[0].data.int64;
@@ -158,25 +147,12 @@ test "execute SELECT with OFFSET" {
 }
 
 test "execute SELECT with float64 column" {
-    const allocator = std.testing.allocator;
+    var ctx: TestContext = undefined;
+    try ctx.init(std.testing.allocator, float64_fixture);
+    defer ctx.deinit();
 
-    // Open test Lance file with float64
-    const lance_data = @embedFile("fixtures/simple_float64.lance/data/101000000010001000111010eda0664313bd731181abf5bde4.lance");
-    var table = try Table.init(allocator, lance_data);
-    defer table.deinit();
+    const result = try ctx.exec("SELECT * FROM table WHERE value > 3.0");
 
-    // Parse SQL
-    const sql = "SELECT * FROM table WHERE value > 3.0";
-    var stmt = try parser.parseSQL(sql, allocator);
-    defer ast.deinitSelectStmt(&stmt.select, allocator);
-
-    // Execute
-    var executor = Executor.init(&table, allocator);
-    defer executor.deinit();
-    var result = try executor.execute(&stmt.select, &[_]Value{});
-    defer result.deinit();
-
-    // Verify results - should have 3 rows (3.5, 4.5, 5.5)
     try std.testing.expectEqual(@as(usize, 3), result.row_count);
 
     const values = result.columns[0].data.float64;
@@ -186,29 +162,15 @@ test "execute SELECT with float64 column" {
 }
 
 test "execute SELECT with mixed types" {
-    const allocator = std.testing.allocator;
+    var ctx: TestContext = undefined;
+    try ctx.init(std.testing.allocator, mixed_fixture);
+    defer ctx.deinit();
 
-    // Open test Lance file with mixed types
-    const lance_data = @embedFile("fixtures/mixed_types.lance/data/11100100001000010010010060d60b4085bd08dcf790581192.lance");
-    var table = try Table.init(allocator, lance_data);
-    defer table.deinit();
+    const result = try ctx.exec("SELECT * FROM table");
 
-    // Parse SQL
-    const sql = "SELECT * FROM table";
-    var stmt = try parser.parseSQL(sql, allocator);
-    defer ast.deinitSelectStmt(&stmt.select, allocator);
-
-    // Execute
-    var executor = Executor.init(&table, allocator);
-    defer executor.deinit();
-    var result = try executor.execute(&stmt.select, &[_]Value{});
-    defer result.deinit();
-
-    // Verify results
     try std.testing.expectEqual(@as(usize, 3), result.columns.len);
     try std.testing.expectEqual(@as(usize, 3), result.row_count);
 
-    // Check column types
     try std.testing.expect(result.columns[0].data == .int64);
     try std.testing.expect(result.columns[1].data == .float64);
     try std.testing.expect(result.columns[2].data == .string);
@@ -287,204 +249,81 @@ test "execute SELECT * on better-sqlite3 fixture" {
 // ============================================================================
 
 test "execute SELECT COUNT(*)" {
-    const allocator = std.testing.allocator;
+    var ctx: TestContext = undefined;
+    try ctx.init(std.testing.allocator, int64_fixture);
+    defer ctx.deinit();
 
-    // Open test Lance file
-    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
-    var table = try Table.init(allocator, lance_data);
-    defer table.deinit();
+    const result = try ctx.exec("SELECT COUNT(*) FROM table");
 
-    // Parse SQL: SELECT COUNT(*) FROM table
-    const sql = "SELECT COUNT(*) FROM table";
-    var stmt = try parser.parseSQL(sql, allocator);
-    defer ast.deinitSelectStmt(&stmt.select, allocator);
-
-    // Execute
-    var executor = Executor.init(&table, allocator);
-    defer executor.deinit();
-    var result = try executor.execute(&stmt.select, &[_]Value{});
-    defer result.deinit();
-
-    // Verify results - should have 1 row with count 5
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 1), result.row_count);
-
     try std.testing.expect(result.columns[0].data == .int64);
-    const values = result.columns[0].data.int64;
-    try std.testing.expectEqual(@as(i64, 5), values[0]);
+    try std.testing.expectEqual(@as(i64, 5), result.columns[0].data.int64[0]);
 }
 
 test "execute SELECT SUM(id)" {
-    const allocator = std.testing.allocator;
+    var ctx: TestContext = undefined;
+    try ctx.init(std.testing.allocator, int64_fixture);
+    defer ctx.deinit();
 
-    // Open test Lance file
-    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
-    var table = try Table.init(allocator, lance_data);
-    defer table.deinit();
+    const result = try ctx.exec("SELECT SUM(id) FROM table");
 
-    // Parse SQL: SELECT SUM(id) FROM table
-    const sql = "SELECT SUM(id) FROM table";
-    var stmt = try parser.parseSQL(sql, allocator);
-    defer ast.deinitSelectStmt(&stmt.select, allocator);
-
-    // Execute
-    var executor = Executor.init(&table, allocator);
-    defer executor.deinit();
-    var result = try executor.execute(&stmt.select, &[_]Value{});
-    defer result.deinit();
-
-    // Verify results - should have 1 row with sum 15 (1+2+3+4+5)
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 1), result.row_count);
-
     try std.testing.expect(result.columns[0].data == .int64);
-    const values = result.columns[0].data.int64;
-    try std.testing.expectEqual(@as(i64, 15), values[0]);
+    try std.testing.expectEqual(@as(i64, 15), result.columns[0].data.int64[0]);
 }
 
 test "execute SELECT AVG(id)" {
-    const allocator = std.testing.allocator;
+    var ctx: TestContext = undefined;
+    try ctx.init(std.testing.allocator, int64_fixture);
+    defer ctx.deinit();
 
-    // Open test Lance file
-    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
-    var table = try Table.init(allocator, lance_data);
-    defer table.deinit();
+    const result = try ctx.exec("SELECT AVG(id) FROM table");
 
-    // Parse SQL: SELECT AVG(id) FROM table
-    const sql = "SELECT AVG(id) FROM table";
-    var stmt = try parser.parseSQL(sql, allocator);
-    defer ast.deinitSelectStmt(&stmt.select, allocator);
-
-    // Execute
-    var executor = Executor.init(&table, allocator);
-    defer executor.deinit();
-    var result = try executor.execute(&stmt.select, &[_]Value{});
-    defer result.deinit();
-
-    // Verify results - should have 1 row with avg 3.0 (15/5)
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 1), result.row_count);
-
     try std.testing.expect(result.columns[0].data == .float64);
-    const values = result.columns[0].data.float64;
-    try std.testing.expectEqual(@as(f64, 3.0), values[0]);
+    try std.testing.expectEqual(@as(f64, 3.0), result.columns[0].data.float64[0]);
 }
 
 test "execute SELECT MIN/MAX(id)" {
-    const allocator = std.testing.allocator;
-
-    // Open test Lance file
-    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
-    var table = try Table.init(allocator, lance_data);
-    defer table.deinit();
+    var ctx: TestContext = undefined;
+    try ctx.init(std.testing.allocator, int64_fixture);
+    defer ctx.deinit();
 
     // Test MIN
-    {
-        const sql = "SELECT MIN(id) FROM table";
-        var stmt = try parser.parseSQL(sql, allocator);
-        defer ast.deinitSelectStmt(&stmt.select, allocator);
-
-        var executor = Executor.init(&table, allocator);
-        defer executor.deinit();
-        var result = try executor.execute(&stmt.select, &[_]Value{});
-        defer result.deinit();
-
-        try std.testing.expectEqual(@as(i64, 1), result.columns[0].data.int64[0]);
-    }
+    var result = try ctx.exec("SELECT MIN(id) FROM table");
+    try std.testing.expectEqual(@as(i64, 1), result.columns[0].data.int64[0]);
 
     // Test MAX
-    {
-        const sql = "SELECT MAX(id) FROM table";
-        var stmt = try parser.parseSQL(sql, allocator);
-        defer ast.deinitSelectStmt(&stmt.select, allocator);
-
-        var executor = Executor.init(&table, allocator);
-        defer executor.deinit();
-        var result = try executor.execute(&stmt.select, &[_]Value{});
-        defer result.deinit();
-
-        try std.testing.expectEqual(@as(i64, 5), result.columns[0].data.int64[0]);
-    }
+    result = try ctx.exec("SELECT MAX(id) FROM table");
+    try std.testing.expectEqual(@as(i64, 5), result.columns[0].data.int64[0]);
 }
 
 test "execute SELECT STDDEV and VARIANCE" {
-    const allocator = std.testing.allocator;
+    var ctx: TestContext = undefined;
+    try ctx.init(std.testing.allocator, int64_fixture);
+    defer ctx.deinit();
 
-    // Open test Lance file - values are 1,2,3,4,5
-    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
-    var table = try Table.init(allocator, lance_data);
-    defer table.deinit();
-
-    // For values 1,2,3,4,5:
-    // Mean = 3
-    // Population variance = ((1-3)² + (2-3)² + (3-3)² + (4-3)² + (5-3)²) / 5 = 10/5 = 2.0
-    // Sample variance = 10/4 = 2.5
-    // Population stddev = sqrt(2) ≈ 1.4142
-    // Sample stddev = sqrt(2.5) ≈ 1.5811
+    // For values 1,2,3,4,5: Mean=3, PopVar=2.0, SampleVar=2.5
 
     // Test VARIANCE (sample)
-    {
-        const sql = "SELECT VARIANCE(id) FROM table";
-        var stmt = try parser.parseSQL(sql, allocator);
-        defer ast.deinitSelectStmt(&stmt.select, allocator);
-
-        var executor = Executor.init(&table, allocator);
-        defer executor.deinit();
-        var result = try executor.execute(&stmt.select, &[_]Value{});
-        defer result.deinit();
-
-        try std.testing.expect(result.columns[0].data == .float64);
-        const variance = result.columns[0].data.float64[0];
-        try std.testing.expectApproxEqAbs(@as(f64, 2.5), variance, 0.0001);
-    }
+    var result = try ctx.exec("SELECT VARIANCE(id) FROM table");
+    try std.testing.expect(result.columns[0].data == .float64);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.5), result.columns[0].data.float64[0], 0.0001);
 
     // Test VAR_POP (population)
-    {
-        const sql = "SELECT VAR_POP(id) FROM table";
-        var stmt = try parser.parseSQL(sql, allocator);
-        defer ast.deinitSelectStmt(&stmt.select, allocator);
-
-        var executor = Executor.init(&table, allocator);
-        defer executor.deinit();
-        var result = try executor.execute(&stmt.select, &[_]Value{});
-        defer result.deinit();
-
-        try std.testing.expect(result.columns[0].data == .float64);
-        const var_pop = result.columns[0].data.float64[0];
-        try std.testing.expectApproxEqAbs(@as(f64, 2.0), var_pop, 0.0001);
-    }
+    result = try ctx.exec("SELECT VAR_POP(id) FROM table");
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), result.columns[0].data.float64[0], 0.0001);
 
     // Test STDDEV (sample)
-    {
-        const sql = "SELECT STDDEV(id) FROM table";
-        var stmt = try parser.parseSQL(sql, allocator);
-        defer ast.deinitSelectStmt(&stmt.select, allocator);
-
-        var executor = Executor.init(&table, allocator);
-        defer executor.deinit();
-        var result = try executor.execute(&stmt.select, &[_]Value{});
-        defer result.deinit();
-
-        try std.testing.expect(result.columns[0].data == .float64);
-        const stddev = result.columns[0].data.float64[0];
-        try std.testing.expectApproxEqAbs(@as(f64, 1.5811388300841898), stddev, 0.0001);
-    }
+    result = try ctx.exec("SELECT STDDEV(id) FROM table");
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5811388300841898), result.columns[0].data.float64[0], 0.0001);
 
     // Test STDDEV_POP (population)
-    {
-        const sql = "SELECT STDDEV_POP(id) FROM table";
-        var stmt = try parser.parseSQL(sql, allocator);
-        defer ast.deinitSelectStmt(&stmt.select, allocator);
-
-        var executor = Executor.init(&table, allocator);
-        defer executor.deinit();
-        var result = try executor.execute(&stmt.select, &[_]Value{});
-        defer result.deinit();
-
-        try std.testing.expect(result.columns[0].data == .float64);
-        const stddev_pop = result.columns[0].data.float64[0];
-        try std.testing.expectApproxEqAbs(@as(f64, 1.4142135623730951), stddev_pop, 0.0001);
-    }
+    result = try ctx.exec("SELECT STDDEV_POP(id) FROM table");
+    try std.testing.expectApproxEqAbs(@as(f64, 1.4142135623730951), result.columns[0].data.float64[0], 0.0001);
 }
 
 test "execute SELECT MEDIAN and PERCENTILE" {
