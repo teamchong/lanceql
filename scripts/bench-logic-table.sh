@@ -28,10 +28,10 @@ echo ""
 echo "Engines:"
 echo "  - LanceQL: native Zig + Metal GPU (compiled @logic_table)"
 
-if command -v duckdb &> /dev/null; then
-    echo "  - DuckDB: $(duckdb --version 2>/dev/null | head -1 || echo 'available')"
+if python3 -c "import duckdb" 2>/dev/null; then
+    echo "  - DuckDB: $(python3 -c 'import duckdb; print(duckdb.__version__)')"
 else
-    echo "  - DuckDB: not installed (brew install duckdb)"
+    echo "  - DuckDB: not installed (pip install duckdb)"
 fi
 
 if python3 -c "import polars" 2>/dev/null; then
