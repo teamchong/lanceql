@@ -300,6 +300,243 @@ pub const LazyLanceFile = struct {
         // For now, return metadata + offset table
         return total;
     }
+
+    /// Get schema bytes from global buffer 0 (lazy read)
+    pub fn getSchemaBytes(self: *Self) LazyLanceFileError!?[]const u8 {
+        if (self.footer.num_global_buffers == 0) return null;
+
+        // Read global buffer offset table (16 bytes per entry)
+        const gbo_start = self.footer.global_buff_offsets_start;
+        var entry_buf: [16]u8 = undefined;
+        self.reader.readExact(gbo_start, &entry_buf) catch {
+            return LazyLanceFileError.IoError;
+        };
+
+        const position = std.mem.readInt(u64, entry_buf[0..8], .little);
+        const length = std.mem.readInt(u64, entry_buf[8..16], .little);
+
+        // Read schema bytes
+        const schema_bytes = self.allocator.alloc(u8, length) catch {
+            return LazyLanceFileError.OutOfMemory;
+        };
+        self.reader.readExact(position, schema_bytes) catch {
+            self.allocator.free(schema_bytes);
+            return LazyLanceFileError.IoError;
+        };
+
+        return schema_bytes;
+    }
+
+    /// Read all int32 values from a column (column-first I/O)
+    pub fn readInt32Column(self: *Self, col_idx: u32) LazyLanceFileError![]i32 {
+        var col_meta = try self.readColumnMetadata(col_idx);
+        defer col_meta.deinit(self.allocator);
+
+        if (col_meta.pages.len == 0) return LazyLanceFileError.NoPages;
+
+        // Calculate total values across all pages
+        var total_values: usize = 0;
+        for (col_meta.pages) |page| {
+            if (page.buffer_sizes.len > 0) {
+                total_values += page.buffer_sizes[0] / @sizeOf(i32);
+            }
+        }
+
+        var result = self.allocator.alloc(i32, total_values) catch {
+            return LazyLanceFileError.OutOfMemory;
+        };
+        errdefer self.allocator.free(result);
+
+        var offset: usize = 0;
+        for (col_meta.pages) |page| {
+            if (page.buffer_offsets.len == 0 or page.buffer_sizes.len == 0) continue;
+
+            const buffer_offset = page.buffer_offsets[0];
+            const buffer_size = page.buffer_sizes[0];
+
+            const buffer_data = self.allocator.alloc(u8, buffer_size) catch {
+                return LazyLanceFileError.OutOfMemory;
+            };
+            defer self.allocator.free(buffer_data);
+
+            self.reader.readExact(buffer_offset, buffer_data) catch {
+                return LazyLanceFileError.IoError;
+            };
+
+            const decoder = PlainDecoder.init(buffer_data);
+            const page_values = decoder.readAllInt32(self.allocator) catch {
+                return LazyLanceFileError.OutOfMemory;
+            };
+            defer self.allocator.free(page_values);
+
+            @memcpy(result[offset .. offset + page_values.len], page_values);
+            offset += page_values.len;
+        }
+
+        return result;
+    }
+
+    /// Read all float32 values from a column (column-first I/O)
+    pub fn readFloat32Column(self: *Self, col_idx: u32) LazyLanceFileError![]f32 {
+        var col_meta = try self.readColumnMetadata(col_idx);
+        defer col_meta.deinit(self.allocator);
+
+        if (col_meta.pages.len == 0) return LazyLanceFileError.NoPages;
+
+        var total_values: usize = 0;
+        for (col_meta.pages) |page| {
+            if (page.buffer_sizes.len > 0) {
+                total_values += page.buffer_sizes[0] / @sizeOf(f32);
+            }
+        }
+
+        var result = self.allocator.alloc(f32, total_values) catch {
+            return LazyLanceFileError.OutOfMemory;
+        };
+        errdefer self.allocator.free(result);
+
+        var offset: usize = 0;
+        for (col_meta.pages) |page| {
+            if (page.buffer_offsets.len == 0 or page.buffer_sizes.len == 0) continue;
+
+            const buffer_offset = page.buffer_offsets[0];
+            const buffer_size = page.buffer_sizes[0];
+
+            const buffer_data = self.allocator.alloc(u8, buffer_size) catch {
+                return LazyLanceFileError.OutOfMemory;
+            };
+            defer self.allocator.free(buffer_data);
+
+            self.reader.readExact(buffer_offset, buffer_data) catch {
+                return LazyLanceFileError.IoError;
+            };
+
+            const decoder = PlainDecoder.init(buffer_data);
+            const page_values = decoder.readAllFloat32(self.allocator) catch {
+                return LazyLanceFileError.OutOfMemory;
+            };
+            defer self.allocator.free(page_values);
+
+            @memcpy(result[offset .. offset + page_values.len], page_values);
+            offset += page_values.len;
+        }
+
+        return result;
+    }
+
+    /// Read all bool values from a column (column-first I/O)
+    pub fn readBoolColumn(self: *Self, col_idx: u32) LazyLanceFileError![]bool {
+        var col_meta = try self.readColumnMetadata(col_idx);
+        defer col_meta.deinit(self.allocator);
+
+        if (col_meta.pages.len == 0) return LazyLanceFileError.NoPages;
+
+        var total_values: usize = 0;
+        for (col_meta.pages) |page| {
+            if (page.buffer_sizes.len > 0) {
+                // Bool stored as 1 byte each
+                total_values += page.buffer_sizes[0];
+            }
+        }
+
+        var result = self.allocator.alloc(bool, total_values) catch {
+            return LazyLanceFileError.OutOfMemory;
+        };
+        errdefer self.allocator.free(result);
+
+        var offset: usize = 0;
+        for (col_meta.pages) |page| {
+            if (page.buffer_offsets.len == 0 or page.buffer_sizes.len == 0) continue;
+
+            const buffer_offset = page.buffer_offsets[0];
+            const buffer_size = page.buffer_sizes[0];
+
+            const buffer_data = self.allocator.alloc(u8, buffer_size) catch {
+                return LazyLanceFileError.OutOfMemory;
+            };
+            defer self.allocator.free(buffer_data);
+
+            self.reader.readExact(buffer_offset, buffer_data) catch {
+                return LazyLanceFileError.IoError;
+            };
+
+            const decoder = PlainDecoder.init(buffer_data);
+            const page_values = decoder.readAllBool(self.allocator) catch {
+                return LazyLanceFileError.OutOfMemory;
+            };
+            defer self.allocator.free(page_values);
+
+            @memcpy(result[offset .. offset + page_values.len], page_values);
+            offset += page_values.len;
+        }
+
+        return result;
+    }
+
+    /// Read all string values from a column (column-first I/O)
+    pub fn readStringColumn(self: *Self, col_idx: u32) LazyLanceFileError![][]const u8 {
+        var col_meta = try self.readColumnMetadata(col_idx);
+        defer col_meta.deinit(self.allocator);
+
+        if (col_meta.pages.len == 0) return LazyLanceFileError.NoPages;
+
+        // Strings use buffers 0 (offsets) and 1 (data)
+        var all_strings = std.ArrayList([]const u8).init(self.allocator);
+        errdefer {
+            for (all_strings.items) |s| self.allocator.free(s);
+            all_strings.deinit();
+        }
+
+        for (col_meta.pages) |page| {
+            if (page.buffer_offsets.len < 2 or page.buffer_sizes.len < 2) continue;
+
+            const offsets_pos = page.buffer_offsets[0];
+            const offsets_size = page.buffer_sizes[0];
+            const data_pos = page.buffer_offsets[1];
+            const data_size = page.buffer_sizes[1];
+
+            // Read offsets buffer
+            const offsets_buf = self.allocator.alloc(u8, offsets_size) catch {
+                return LazyLanceFileError.OutOfMemory;
+            };
+            defer self.allocator.free(offsets_buf);
+
+            self.reader.readExact(offsets_pos, offsets_buf) catch {
+                return LazyLanceFileError.IoError;
+            };
+
+            // Read data buffer
+            const data_buf = self.allocator.alloc(u8, data_size) catch {
+                return LazyLanceFileError.OutOfMemory;
+            };
+            defer self.allocator.free(data_buf);
+
+            self.reader.readExact(data_pos, data_buf) catch {
+                return LazyLanceFileError.IoError;
+            };
+
+            // Decode strings
+            const decoder = PlainDecoder.init(offsets_buf);
+            const strings = decoder.readAllStrings(self.allocator, data_buf) catch {
+                return LazyLanceFileError.OutOfMemory;
+            };
+            defer self.allocator.free(strings);
+
+            for (strings) |s| {
+                const copy = self.allocator.dupe(u8, s) catch {
+                    return LazyLanceFileError.OutOfMemory;
+                };
+                all_strings.append(copy) catch {
+                    self.allocator.free(copy);
+                    return LazyLanceFileError.OutOfMemory;
+                };
+            }
+        }
+
+        return all_strings.toOwnedSlice() catch {
+            return LazyLanceFileError.OutOfMemory;
+        };
+    }
 };
 
 // ============================================================================

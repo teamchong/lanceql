@@ -8,8 +8,11 @@ const format = @import("lanceql.format");
 const proto = @import("lanceql.proto");
 const encoding = @import("lanceql.encoding");
 const simd = @import("simd");
+const io = @import("lanceql.io");
 
 const LanceFile = format.LanceFile;
+const LazyLanceFile = format.LazyLanceFile;
+const FileReader = io.FileReader;
 const Schema = proto.Schema;
 const Field = proto.Field;
 const ColumnMetadata = proto.ColumnMetadata;
@@ -840,6 +843,194 @@ pub const Table = struct {
 
         simd.batchDotProductF32(embeddings, query, dim, out);
         return out;
+    }
+};
+
+// ============================================================================
+// LazyTable - File-path based API using column-first I/O
+// ============================================================================
+
+/// Lazy table reader - only reads columns on demand, directly from file
+///
+/// Benefits over Table:
+/// - No need to load entire file into memory first
+/// - Column-first I/O - only reads the bytes for requested columns
+/// - 10-100x I/O reduction for queries that only need 1-2 columns
+pub const LazyTable = struct {
+    allocator: std.mem.Allocator,
+    file_reader: *FileReader, // Heap-allocated to ensure stable address
+    lazy_file: LazyLanceFile,
+    schema: ?Schema,
+    schema_bytes: ?[]const u8,
+
+    const Self = @This();
+
+    /// Open a lazy table from a file path
+    pub fn initFromPath(allocator: std.mem.Allocator, path: []const u8) TableError!Self {
+        // Allocate FileReader on heap so its address stays stable
+        const file_reader = allocator.create(FileReader) catch {
+            return TableError.OutOfMemory;
+        };
+        errdefer allocator.destroy(file_reader);
+
+        file_reader.* = FileReader.open(path) catch {
+            return TableError.ReadError;
+        };
+        errdefer file_reader.close();
+
+        var lazy_file = LazyLanceFile.init(allocator, file_reader.reader()) catch |err| {
+            return switch (err) {
+                error.FileTooSmall => TableError.FileTooSmall,
+                error.InvalidMagic => TableError.InvalidMagic,
+                error.UnsupportedVersion => TableError.UnsupportedVersion,
+                error.InvalidMetadata => TableError.InvalidMetadata,
+                error.OutOfMemory => TableError.OutOfMemory,
+                else => TableError.ReadError,
+            };
+        };
+        errdefer lazy_file.deinit();
+
+        // Parse schema from global buffer 0 (lazy read)
+        var schema: ?Schema = null;
+        var schema_bytes: ?[]const u8 = null;
+        if (lazy_file.getSchemaBytes() catch null) |bytes| {
+            schema_bytes = bytes;
+            schema = Schema.parse(allocator, bytes) catch null;
+        }
+
+        return Self{
+            .allocator = allocator,
+            .file_reader = file_reader,
+            .lazy_file = lazy_file,
+            .schema = schema,
+            .schema_bytes = schema_bytes,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self.schema) |*s| s.deinit();
+        if (self.schema_bytes) |bytes| self.allocator.free(bytes);
+        self.lazy_file.deinit();
+        self.file_reader.close();
+        self.allocator.destroy(self.file_reader);
+    }
+
+    /// Get the number of columns
+    pub fn numColumns(self: Self) u32 {
+        return self.lazy_file.numColumns();
+    }
+
+    /// Get the schema
+    pub fn getSchema(self: Self) ?Schema {
+        return self.schema;
+    }
+
+    /// Get column index by name
+    pub fn columnIndex(self: Self, name: []const u8) ?usize {
+        const schema = self.schema orelse return null;
+        return schema.fieldIndex(name);
+    }
+
+    /// Get physical column ID by name
+    pub fn physicalColumnId(self: Self, name: []const u8) ?u32 {
+        const schema = self.schema orelse return null;
+        return schema.physicalColumnId(name);
+    }
+
+    /// Get field by physical ID
+    pub fn getFieldById(self: Self, id: u32) ?Field {
+        const schema = self.schema orelse return null;
+        for (schema.fields) |field| {
+            if (field.id == id) return field;
+        }
+        return null;
+    }
+
+    /// Get column names from schema
+    pub fn columnNames(self: Self) TableError![][]const u8 {
+        const schema = self.schema orelse return TableError.NoSchema;
+        return schema.columnNames(self.allocator) catch return TableError.OutOfMemory;
+    }
+
+    /// Get row count by reading a column's metadata
+    pub fn rowCount(self: *Self, col_idx: u32) TableError!u32 {
+        // Read int64 column and return its length
+        // This is a bit wasteful but ensures consistency
+        const data = try self.readInt64Column(col_idx);
+        defer self.allocator.free(data);
+        return @intCast(data.len);
+    }
+
+    /// Read int64 column by physical ID
+    pub fn readInt64Column(self: *Self, col_idx: u32) TableError![]i64 {
+        return self.lazy_file.readInt64Column(col_idx) catch |err| {
+            return switch (err) {
+                error.ColumnOutOfBounds => TableError.ColumnOutOfBounds,
+                error.NoPages => TableError.NoPages,
+                error.OutOfMemory => TableError.OutOfMemory,
+                else => TableError.ReadError,
+            };
+        };
+    }
+
+    /// Read int32 column by physical ID
+    pub fn readInt32Column(self: *Self, col_idx: u32) TableError![]i32 {
+        return self.lazy_file.readInt32Column(col_idx) catch |err| {
+            return switch (err) {
+                error.ColumnOutOfBounds => TableError.ColumnOutOfBounds,
+                error.NoPages => TableError.NoPages,
+                error.OutOfMemory => TableError.OutOfMemory,
+                else => TableError.ReadError,
+            };
+        };
+    }
+
+    /// Read float64 column by physical ID
+    pub fn readFloat64Column(self: *Self, col_idx: u32) TableError![]f64 {
+        return self.lazy_file.readFloat64Column(col_idx) catch |err| {
+            return switch (err) {
+                error.ColumnOutOfBounds => TableError.ColumnOutOfBounds,
+                error.NoPages => TableError.NoPages,
+                error.OutOfMemory => TableError.OutOfMemory,
+                else => TableError.ReadError,
+            };
+        };
+    }
+
+    /// Read float32 column by physical ID
+    pub fn readFloat32Column(self: *Self, col_idx: u32) TableError![]f32 {
+        return self.lazy_file.readFloat32Column(col_idx) catch |err| {
+            return switch (err) {
+                error.ColumnOutOfBounds => TableError.ColumnOutOfBounds,
+                error.NoPages => TableError.NoPages,
+                error.OutOfMemory => TableError.OutOfMemory,
+                else => TableError.ReadError,
+            };
+        };
+    }
+
+    /// Read bool column by physical ID
+    pub fn readBoolColumn(self: *Self, col_idx: u32) TableError![]bool {
+        return self.lazy_file.readBoolColumn(col_idx) catch |err| {
+            return switch (err) {
+                error.ColumnOutOfBounds => TableError.ColumnOutOfBounds,
+                error.NoPages => TableError.NoPages,
+                error.OutOfMemory => TableError.OutOfMemory,
+                else => TableError.ReadError,
+            };
+        };
+    }
+
+    /// Read string column by physical ID
+    pub fn readStringColumn(self: *Self, col_idx: u32) TableError![][]const u8 {
+        return self.lazy_file.readStringColumn(col_idx) catch |err| {
+            return switch (err) {
+                error.ColumnOutOfBounds => TableError.ColumnOutOfBounds,
+                error.NoPages => TableError.NoPages,
+                error.OutOfMemory => TableError.OutOfMemory,
+                else => TableError.ReadError,
+            };
+        };
     }
 };
 

@@ -106,6 +106,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lanceql.format", .module = format_mod },
             .{ .name = "lanceql.proto", .module = proto_mod },
             .{ .name = "lanceql.encoding", .module = encoding_mod },
+            .{ .name = "lanceql.io", .module = io_mod },
             .{ .name = "simd", .module = simd_mod },
         },
     });

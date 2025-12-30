@@ -52,9 +52,13 @@ pub const Reader = struct {
     ///
     /// Returns an error if fewer bytes are available.
     pub fn readExact(self: Reader, offset: u64, buffer: []u8) ReadError!void {
-        const bytes_read = try self.read(offset, buffer);
-        if (bytes_read < buffer.len) {
-            return ReadError.OffsetOutOfBounds;
+        var total_read: usize = 0;
+        while (total_read < buffer.len) {
+            const bytes_read = try self.read(offset + total_read, buffer[total_read..]);
+            if (bytes_read == 0) {
+                return ReadError.OffsetOutOfBounds;
+            }
+            total_read += bytes_read;
         }
     }
 
