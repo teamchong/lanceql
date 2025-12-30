@@ -50,7 +50,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install polars numpy pyarrow pylance duckdb
+          pip install polars numpy pyarrow pylance duckdb pandas
 
       - name: Generate benchmark data
         run: |
@@ -183,7 +183,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install polars numpy pyarrow pylance duckdb
+          pip install polars numpy pyarrow pylance duckdb pandas
 
       - name: Generate benchmark data
         run: |
