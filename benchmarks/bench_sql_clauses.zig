@@ -706,6 +706,12 @@ pub fn main() !void {
                 iterations,
                 speedup,
             });
+        } else {
+            // Debug: print stderr if benchmark failed
+            if (result.stderr.len > 0) {
+                std.debug.print("DuckDB FILTER stderr: {s}\n", .{result.stderr[0..@min(result.stderr.len, 200)]});
+            }
+            std.debug.print("{s:<40} {s:>12} {s:>12} {s:>10}\n", .{ "DuckDB SQL (FILTER)", "0", "0", "-" });
         }
     }
 
