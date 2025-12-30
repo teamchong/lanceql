@@ -41,20 +41,25 @@ else
 fi
 echo ""
 
-# Check if vector_ops.a exists (required for @logic_table benchmarks)
+# Build vector_ops.a if not present (required for @logic_table benchmarks)
 if [ ! -f "$PROJECT_DIR/lib/vector_ops.a" ]; then
-    echo "================================================================================"
-    echo "SKIPPED: lib/vector_ops.a not found"
-    echo ""
-    echo "The @logic_table benchmark requires a compiled Python logic_table library."
-    echo "To generate it, run:"
-    echo ""
-    echo "  cd deps/metal0 && zig build"
-    echo "  ./zig-out/bin/metal0 build --emit-logic-table benchmarks/vector_ops.py -o lib/vector_ops.a"
-    echo ""
-    echo "Or run benchmarks locally on a machine with metal0 installed."
-    echo "================================================================================"
-    exit 0
+    echo "Building @logic_table library..."
+
+    # Check if metal0 is built
+    if [ ! -f "$PROJECT_DIR/deps/metal0/zig-out/bin/metal0" ]; then
+        echo "  Building metal0 AOT Python compiler..."
+        (cd "$PROJECT_DIR/deps/metal0" && zig build)
+    fi
+
+    # Compile Python @logic_table to native static library
+    mkdir -p "$PROJECT_DIR/lib"
+    "$PROJECT_DIR/deps/metal0/zig-out/bin/metal0" build --emit-logic-table "$PROJECT_DIR/benchmarks/vector_ops.py" -o "$PROJECT_DIR/lib/vector_ops.a"
+
+    if [ ! -f "$PROJECT_DIR/lib/vector_ops.a" ]; then
+        echo "ERROR: Failed to compile @logic_table library"
+        exit 1
+    fi
+    echo "  ✓ Compiled lib/vector_ops.a"
 fi
 
 # Build and run

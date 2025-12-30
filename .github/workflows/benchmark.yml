@@ -68,6 +68,19 @@ jobs:
           sudo cp zig-out/bin/lanceql /usr/local/bin/
           lanceql --version || echo "LanceQL CLI installed"
 
+      - name: Build metal0 and compile @logic_table
+        run: |
+          # Build metal0 AOT Python compiler
+          cd deps/metal0
+          zig build
+          cd ../..
+
+          # Compile Python @logic_table to native static library
+          mkdir -p lib
+          deps/metal0/zig-out/bin/metal0 build --emit-logic-table benchmarks/vector_ops.py -o lib/vector_ops.a
+          echo "Compiled @logic_table:"
+          ls -la lib/vector_ops.a
+
       - name: Run Vector benchmark (GPU vs CPU)
         id: bench-vector
         run: |
@@ -197,6 +210,19 @@ jobs:
           zig build cli
           sudo cp zig-out/bin/lanceql /usr/local/bin/
           lanceql --version || echo "LanceQL CLI installed"
+
+      - name: Build metal0 and compile @logic_table
+        run: |
+          # Build metal0 AOT Python compiler
+          cd deps/metal0
+          zig build
+          cd ../..
+
+          # Compile Python @logic_table to native static library
+          mkdir -p lib
+          deps/metal0/zig-out/bin/metal0 build --emit-logic-table benchmarks/vector_ops.py -o lib/vector_ops.a
+          echo "Compiled @logic_table:"
+          ls -la lib/vector_ops.a
 
       - name: Run SQL clause benchmark (LanceQL vs DuckDB vs Polars)
         run: |
