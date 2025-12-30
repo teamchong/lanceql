@@ -6,6 +6,7 @@
 const std = @import("std");
 const ast = @import("ast");
 const Table = @import("lanceql.table").Table;
+const hash = @import("lanceql.hash");
 pub const logic_table_dispatch = @import("logic_table_dispatch.zig");
 
 const Expr = ast.Expr;
@@ -2002,8 +2003,9 @@ pub const Executor = struct {
         // Get group by column names (empty if no GROUP BY but has aggregates)
         const group_cols = if (stmt.group_by) |gb| gb.columns else &[_][]const u8{};
 
-        // Build groups: maps group key to list of row indices
-        var groups = std.StringHashMap(std.ArrayListUnmanaged(u32)).init(self.allocator);
+        // Build groups: maps hash key to list of row indices
+        // Using integer hashing for O(1) lookups (vs O(n) string comparison)
+        var groups = std.AutoHashMap(u64, std.ArrayListUnmanaged(u32)).init(self.allocator);
         defer {
             var iter = groups.valueIterator();
             while (iter.next()) |list| {
@@ -2012,30 +2014,15 @@ pub const Executor = struct {
             groups.deinit();
         }
 
-        // Also need to track key strings for proper cleanup
-        var key_strings = std.ArrayListUnmanaged([]const u8){};
-        defer {
-            for (key_strings.items) |key| {
-                self.allocator.free(key);
-            }
-            key_strings.deinit(self.allocator);
-        }
-
-        // Group rows by their group key
+        // Group rows by their hash key (efficient integer hashing)
         for (filtered_indices) |row_idx| {
-            const key = try self.buildGroupKey(group_cols, row_idx);
+            const key = self.hashGroupKey(group_cols, row_idx);
 
-            if (groups.getPtr(key)) |list| {
-                // Existing group - add row index and free the duplicate key
-                try list.append(self.allocator, row_idx);
-                self.allocator.free(key);
-            } else {
-                // New group
-                var list = std.ArrayListUnmanaged(u32){};
-                try list.append(self.allocator, row_idx);
-                try groups.put(key, list);
-                try key_strings.append(self.allocator, key);
+            const entry = try groups.getOrPut(key);
+            if (!entry.found_existing) {
+                entry.value_ptr.* = .{};
             }
+            try entry.value_ptr.append(self.allocator, row_idx);
         }
 
         // If no GROUP BY and no matching rows, return single row with 0/null for aggregates
@@ -2176,11 +2163,43 @@ pub const Executor = struct {
         return key.toOwnedSlice(self.allocator);
     }
 
+    /// Hash a group key from GROUP BY column values (efficient integer hashing)
+    ///
+    /// This is much faster than buildGroupKey() because:
+    /// 1. No string allocation per row
+    /// 2. O(1) hash comparison instead of O(n) string comparison
+    /// 3. No type conversion overhead
+    fn hashGroupKey(self: *Self, group_cols: []const []const u8, row_idx: u32) u64 {
+        if (group_cols.len == 0) {
+            // No GROUP BY - all rows in one group
+            return 0;
+        }
+
+        var key_hash: u64 = hash.FNV_OFFSET_BASIS;
+
+        for (group_cols) |col_name| {
+            const cached = self.column_cache.get(col_name) orelse continue;
+
+            const col_hash = switch (cached) {
+                .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| hash.hashI64(data[row_idx]),
+                .int32, .date32 => |data| hash.hashI32(data[row_idx]),
+                .float64 => |data| hash.hashF64(data[row_idx]),
+                .float32 => |data| hash.hashF32(data[row_idx]),
+                .bool_ => |data| hash.hashBool(data[row_idx]),
+                .string => |data| hash.stringHash(data[row_idx]),
+            };
+
+            key_hash = hash.combineHash(key_hash, col_hash);
+        }
+
+        return key_hash;
+    }
+
     /// Evaluate a SELECT item for all groups
     fn evaluateSelectItemForGroups(
         self: *Self,
         item: ast.SelectItem,
-        groups: *std.StringHashMap(std.ArrayList(u32)),
+        groups: *std.AutoHashMap(u64, std.ArrayListUnmanaged(u32)),
         group_cols: []const []const u8,
         num_groups: usize,
     ) !Result.Column {
@@ -2217,7 +2236,7 @@ pub const Executor = struct {
     fn evaluateAggregateForGroups(
         self: *Self,
         item: ast.SelectItem,
-        groups: *std.StringHashMap(std.ArrayList(u32)),
+        groups: *std.AutoHashMap(u64, std.ArrayListUnmanaged(u32)),
         num_groups: usize,
     ) !Result.Column {
         const call = item.expr.call;
@@ -2398,7 +2417,7 @@ pub const Executor = struct {
     fn evaluateGroupByColumnForGroups(
         self: *Self,
         item: ast.SelectItem,
-        groups: *std.StringHashMap(std.ArrayList(u32)),
+        groups: *std.AutoHashMap(u64, std.ArrayListUnmanaged(u32)),
         num_groups: usize,
     ) !Result.Column {
         const col_name = item.expr.column.name;

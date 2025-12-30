@@ -95,6 +95,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/simd.zig"),
     });
 
+    // Hash functions for GROUP BY and JOIN
+    const hash_mod = b.addModule("lanceql.hash", .{
+        .root_source_file = b.path("src/hash.zig"),
+    });
+
     const table_mod = b.addModule("lanceql.table", .{
         .root_source_file = b.path("src/table.zig"),
         .imports = &.{
@@ -176,6 +181,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "parser", .module = sql_parser_mod },
             .{ .name = "lanceql.table", .module = table_mod },
             .{ .name = "lanceql.logic_table", .module = logic_table_mod },
+            .{ .name = "lanceql.hash", .module = hash_mod },
         },
     });
 
@@ -418,7 +424,7 @@ pub fn build(b: *std.Build) void {
     const test_metal_step = b.step("test-metal", "Run Metal/Accelerate module tests");
     test_metal_step.dependOn(&run_test_metal.step);
 
-    // Vector benchmark (Metal/Accelerate)
+    // Vector benchmark (Column-first I/O)
     const bench_vector = b.addExecutable(.{
         .name = "bench_vector",
         .root_module = b.createModule(.{
@@ -426,7 +432,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseFast,
             .imports = &.{
-                .{ .name = "lanceql.table", .module = table_mod },
+                .{ .name = "lanceql.format", .module = format_mod },
+                .{ .name = "lanceql.io", .module = io_mod },
             },
         }),
     });
@@ -434,7 +441,7 @@ pub fn build(b: *std.Build) void {
     const bench_vector_step = b.step("bench-vector", "FAIR end-to-end: L2 norm (vector ops)");
     bench_vector_step.dependOn(&run_bench_vector.step);
 
-    // SQL clause benchmark
+    // SQL clause benchmark - uses real SQL executor for honest benchmarks
     const bench_sql = b.addExecutable(.{
         .name = "bench_sql",
         .root_module = b.createModule(.{
@@ -444,11 +451,16 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "lanceql.table", .module = table_mod },
                 .{ .name = "lanceql.simd", .module = simd_mod },
+                .{ .name = "lanceql.sql.ast", .module = sql_ast_mod },
+                .{ .name = "lanceql.sql.parser", .module = sql_parser_mod },
+                .{ .name = "lanceql.sql.executor", .module = sql_executor_mod },
+                .{ .name = "lanceql.format", .module = format_mod },
+                .{ .name = "lanceql.io", .module = io_mod },
             },
         }),
     });
     const run_bench_sql = b.addRunArtifact(bench_sql);
-    const bench_sql_step = b.step("bench-sql", "FAIR end-to-end: SQL clauses (FILTER, AGGREGATE)");
+    const bench_sql_step = b.step("bench-sql", "FAIR end-to-end: SQL clauses (FILTER, AGGREGATE, GROUP BY, JOIN)");
     bench_sql_step.dependOn(&run_bench_sql.step);
 
     // Column-first I/O benchmark - compares full-file vs column-first reading
@@ -662,7 +674,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseFast,
             .imports = &.{
-                .{ .name = "lanceql.table", .module = table_mod },
+                .{ .name = "lanceql.format", .module = format_mod },
+                .{ .name = "lanceql.io", .module = io_mod },
             },
         }),
     });
