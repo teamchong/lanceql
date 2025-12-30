@@ -1899,3 +1899,188 @@ test "execute IN subquery" {
     try std.testing.expectEqual(@as(i64, 4), values[0]);
     try std.testing.expectEqual(@as(i64, 5), values[1]);
 }
+
+// ============================================================================
+// Date/Time Function Tests
+// ============================================================================
+
+// Note: Date/time functions use column values (id) as epoch timestamps
+// id values [1, 2, 3, 4, 5] represent epoch seconds from 1970
+// For more meaningful date tests, we use computed expressions
+
+test "execute YEAR function on column" {
+    const allocator = std.testing.allocator;
+
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // YEAR(id) where id = [1,2,3,4,5] (all 1970 since they're tiny epoch values)
+    const sql = "SELECT YEAR(id) FROM table LIMIT 1";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.row_count);
+    try std.testing.expectEqual(@as(usize, 1), result.columns.len);
+    // id=1 is epoch second 1, which is Jan 1, 1970
+    try std.testing.expectEqual(@as(i64, 1970), result.columns[0].data.int64[0]);
+}
+
+test "execute MONTH and DAY functions on column" {
+    const allocator = std.testing.allocator;
+
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // MONTH(id), DAY(id) where id = [1,2,3,4,5] (all Jan 1, 1970)
+    const sql = "SELECT MONTH(id), DAY(id) FROM table LIMIT 1";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.row_count);
+    try std.testing.expectEqual(@as(usize, 2), result.columns.len);
+    try std.testing.expectEqual(@as(i64, 1), result.columns[0].data.int64[0]); // Month 1
+    try std.testing.expectEqual(@as(i64, 1), result.columns[1].data.int64[0]); // Day 1
+}
+
+test "execute HOUR/MINUTE/SECOND functions on column" {
+    const allocator = std.testing.allocator;
+
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // id=1 is epoch second 1 = 00:00:01 on Jan 1, 1970
+    const sql = "SELECT HOUR(id), MINUTE(id), SECOND(id) FROM table LIMIT 1";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.row_count);
+    try std.testing.expectEqual(@as(usize, 3), result.columns.len);
+    try std.testing.expectEqual(@as(i64, 0), result.columns[0].data.int64[0]); // Hour 0
+    try std.testing.expectEqual(@as(i64, 0), result.columns[1].data.int64[0]); // Minute 0
+    try std.testing.expectEqual(@as(i64, 1), result.columns[2].data.int64[0]); // Second 1
+}
+
+test "execute DAYOFWEEK function on column" {
+    const allocator = std.testing.allocator;
+
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // id=1 is epoch second 1 = Jan 1, 1970 = Thursday (day 4)
+    const sql = "SELECT DAYOFWEEK(id) FROM table LIMIT 1";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.row_count);
+    // Jan 1, 1970 was a Thursday (day 4, 0-indexed from Sunday)
+    try std.testing.expectEqual(@as(i64, 4), result.columns[0].data.int64[0]);
+}
+
+test "execute QUARTER function on column" {
+    const allocator = std.testing.allocator;
+
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // id=1 is Jan 1970 = Q1
+    const sql = "SELECT QUARTER(id) FROM table LIMIT 1";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.row_count);
+    try std.testing.expectEqual(@as(i64, 1), result.columns[0].data.int64[0]); // Q1
+}
+
+test "execute DATE_TRUNC on column" {
+    const allocator = std.testing.allocator;
+
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // DATE_TRUNC('day', id) where id = [1,2,3,4,5] should all truncate to 0 (start of Jan 1, 1970)
+    const sql = "SELECT DATE_TRUNC('day', id) FROM table LIMIT 1";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.row_count);
+    try std.testing.expectEqual(@as(i64, 0), result.columns[0].data.int64[0]); // Truncated to day start
+}
+
+test "execute DATE_ADD on column" {
+    const allocator = std.testing.allocator;
+
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // DATE_ADD(id, 1, 'day') adds 86400 seconds
+    const sql = "SELECT DATE_ADD(id, 1, 'day') FROM table LIMIT 1";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.row_count);
+    // id=1 + 86400 = 86401
+    try std.testing.expectEqual(@as(i64, 86401), result.columns[0].data.int64[0]);
+}
+
+test "execute EPOCH function on column" {
+    const allocator = std.testing.allocator;
+
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // EPOCH(id) should return the same value
+    const sql = "SELECT EPOCH(id) FROM table LIMIT 1";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.row_count);
+    try std.testing.expectEqual(@as(i64, 1), result.columns[0].data.int64[0]);
+}

@@ -6,10 +6,10 @@ This document compares LanceQL features against DuckDB and Polars for feature pa
 
 | Category | LanceQL | DuckDB | Polars |
 |----------|---------|--------|--------|
-| Query Language | 85% | 100% | 95% |
-| JOINs | Parsed only | Full | Full |
-| Window Functions | Parsed only | Full | Full |
-| Data Types | 80% | 100% | 95% |
+| Query Language | 95% | 100% | 95% |
+| JOINs | Full | Full | Full |
+| Window Functions | Full | Full | Full |
+| Data Types | 90% | 100% | 95% |
 | File Formats | Lance native | Many | Many |
 | **Unique Features** | @logic_table | Extensions | LazyFrame |
 
@@ -29,11 +29,11 @@ This document compares LanceQL features against DuckDB and Polars for feature pa
 
 | Feature | LanceQL | DuckDB | Polars | Notes |
 |---------|---------|--------|--------|-------|
-| INNER JOIN | **Parsed** | Yes | Yes | Needs execution |
-| LEFT JOIN | **Parsed** | Yes | Yes | Needs execution |
-| RIGHT JOIN | **Parsed** | Yes | Yes | Needs execution |
-| FULL OUTER JOIN | **Parsed** | Yes | Yes | Needs execution |
-| CROSS JOIN | **Parsed** | Yes | Yes | Needs execution |
+| INNER JOIN | Yes | Yes | Yes | Hash join |
+| LEFT JOIN | Yes | Yes | Yes | Hash join |
+| RIGHT JOIN | Yes | Yes | Yes | Hash join |
+| FULL OUTER JOIN | Yes | Yes | Yes | Hash join |
+| CROSS JOIN | Yes | Yes | Yes | Nested loop |
 | NATURAL JOIN | No | Yes | No | Future |
 | LATERAL JOIN | No | Yes | No | Future |
 
@@ -69,7 +69,7 @@ This document compares LanceQL features against DuckDB and Polars for feature pa
 | LEAD | Yes | Yes | Yes | Full support |
 | FIRST_VALUE | No | Yes | Yes | Future |
 | LAST_VALUE | No | Yes | Yes | Future |
-| Aggregate OVER | **Parsed** | Yes | Yes | Needs execution |
+| Aggregate OVER | Yes | Yes | Yes | Full support |
 | Frame bounds | No | Yes | Yes | Future |
 
 ### Aggregate Functions
@@ -97,9 +97,9 @@ This document compares LanceQL features against DuckDB and Polars for feature pa
 | Float (f64) | Yes | Yes | Yes | Full support |
 | String | Yes | Yes | Yes | Full support |
 | Boolean | Yes | Yes | Yes | Full support |
-| Date | Partial | Yes | Yes | Needs work |
-| Time | Partial | Yes | Yes | Needs work |
-| Timestamp | Partial | Yes | Yes | Needs work |
+| Date | Yes | Yes | Yes | Via epoch functions |
+| Time | Yes | Yes | Yes | Via epoch functions |
+| Timestamp | Yes | Yes | Yes | YEAR/MONTH/DAY/HOUR etc. |
 | Interval | No | Yes | Yes | Future |
 | Decimal | No | Yes | Yes | Future |
 | UUID | No | Yes | No | Future |
@@ -170,10 +170,14 @@ This document compares LanceQL features against DuckDB and Polars for feature pa
 - PERCENTILE / QUANTILE / MEDIAN ✅
 - STRING_AGG - Future
 
-### Phase 6: Date/Time (P5)
-- Full timestamp support
-- Date arithmetic
-- EXTRACT function
+### Phase 6: Date/Time (P5) ✅ COMPLETE
+- YEAR/MONTH/DAY/HOUR/MINUTE/SECOND extractors ✅
+- DAYOFWEEK/DOW, DAYOFYEAR/DOY, WEEK, QUARTER ✅
+- DATE_PART/EXTRACT(part, timestamp) ✅
+- DATE_TRUNC(part, timestamp) ✅
+- DATE_ADD/DATEADD(timestamp, interval, part) ✅
+- DATE_DIFF/DATEDIFF(timestamp1, timestamp2, part) ✅
+- EPOCH/UNIX_TIMESTAMP and FROM_UNIXTIME/TO_TIMESTAMP ✅
 
 ### Phase 7: File Formats (P6 - Optional)
 - CSV reader
