@@ -972,6 +972,51 @@ pub const Executor = struct {
             std.mem.eql(u8, upper_name, "MAX");
     }
 
+    // ========================================================================
+    // Window Function Support
+    // ========================================================================
+
+    /// Window function types
+    const WindowFunctionType = enum {
+        row_number,
+        rank,
+        dense_rank,
+        lag,
+        lead,
+    };
+
+    /// Check if expression is a window function (has OVER clause)
+    fn isWindowFunction(expr: *const Expr) bool {
+        return switch (expr.*) {
+            .call => |call| call.window != null,
+            else => false,
+        };
+    }
+
+    /// Check if SELECT list contains any window functions
+    fn hasWindowFunctions(self: *Self, select_list: []const ast.SelectItem) bool {
+        _ = self;
+        for (select_list) |item| {
+            if (isWindowFunction(&item.expr)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Parse window function name
+    fn parseWindowFunctionType(name: []const u8) ?WindowFunctionType {
+        var upper_buf: [16]u8 = undefined;
+        const upper_name = std.ascii.upperString(&upper_buf, name);
+
+        if (std.mem.eql(u8, upper_name, "ROW_NUMBER")) return .row_number;
+        if (std.mem.eql(u8, upper_name, "RANK")) return .rank;
+        if (std.mem.eql(u8, upper_name, "DENSE_RANK")) return .dense_rank;
+        if (std.mem.eql(u8, upper_name, "LAG")) return .lag;
+        if (std.mem.eql(u8, upper_name, "LEAD")) return .lead;
+        return null;
+    }
+
     /// Parse aggregate function name to AggregateType
     fn parseAggregateType(name: []const u8, args: []const Expr) AggregateType {
         var upper_buf: [8]u8 = undefined;

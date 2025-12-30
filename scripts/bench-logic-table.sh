@@ -41,5 +41,21 @@ else
 fi
 echo ""
 
+# Check if vector_ops.a exists (required for @logic_table benchmarks)
+if [ ! -f "$PROJECT_DIR/lib/vector_ops.a" ]; then
+    echo "================================================================================"
+    echo "SKIPPED: lib/vector_ops.a not found"
+    echo ""
+    echo "The @logic_table benchmark requires a compiled Python logic_table library."
+    echo "To generate it, run:"
+    echo ""
+    echo "  cd deps/metal0 && zig build"
+    echo "  ./zig-out/bin/metal0 build --emit-logic-table benchmarks/vector_ops.py -o lib/vector_ops.a"
+    echo ""
+    echo "Or run benchmarks locally on a machine with metal0 installed."
+    echo "================================================================================"
+    exit 0
+fi
+
 # Build and run
 zig build bench-logic-table 2>&1

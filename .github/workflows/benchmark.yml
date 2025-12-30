@@ -51,7 +51,13 @@ jobs:
       - name: Install dependencies
         run: |
           brew install duckdb
-          pip install polars numpy
+          pip install polars numpy pyarrow pylance
+
+      - name: Generate benchmark data
+        run: |
+          python3 benchmarks/generate_benchmark_data.py
+          echo "Benchmark data files:"
+          ls -la benchmarks/*.lance benchmarks/*.parquet 2>/dev/null || echo "Some files missing"
 
       - name: Build Metal shaders
         run: zig build metal-shaders
@@ -106,9 +112,32 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Benchmark | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Vector Ops (GPU vs CPU) | :white_check_mark: |" >> $GITHUB_STEP_SUMMARY
-          echo "| SQL Clauses (200M rows) | :white_check_mark: |" >> $GITHUB_STEP_SUMMARY
-          echo "| ML Workflows | :white_check_mark: |" >> $GITHUB_STEP_SUMMARY
+
+          # Check Vector Ops status
+          if grep -q "Skipped" bench-vector.txt 2>/dev/null; then
+            echo "| Vector Ops (GPU) | :yellow_circle: Skipped (no GPU in CI) |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Vector Ops (GPU) | :white_check_mark: |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Check SQL Clauses status
+          if grep -q "Missing data files" bench-sql.txt 2>/dev/null; then
+            echo "| SQL Clauses | :red_circle: Missing data |" >> $GITHUB_STEP_SUMMARY
+          elif grep -q "rows/sec" bench-sql.txt 2>/dev/null; then
+            echo "| SQL Clauses | :white_check_mark: |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| SQL Clauses | :yellow_circle: Partial |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Check @logic_table status
+          if grep -q "SKIPPED" bench-logic-table.txt 2>/dev/null; then
+            echo "| @logic_table | :yellow_circle: Skipped (no vector_ops.a) |" >> $GITHUB_STEP_SUMMARY
+          elif grep -q "rows/sec" bench-logic-table.txt 2>/dev/null; then
+            echo "| @logic_table | :white_check_mark: |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| @logic_table | :yellow_circle: Partial |" >> $GITHUB_STEP_SUMMARY
+          fi
+
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Platform:** macOS Apple Silicon (M1)" >> $GITHUB_STEP_SUMMARY
           echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
@@ -159,7 +188,13 @@ jobs:
           curl -LO https://github.com/duckdb/duckdb/releases/download/v1.1.3/duckdb_cli-linux-amd64.zip
           unzip duckdb_cli-linux-amd64.zip
           sudo mv duckdb /usr/local/bin/
-          pip install polars numpy
+          pip install polars numpy pyarrow pylance
+
+      - name: Generate benchmark data
+        run: |
+          python3 benchmarks/generate_benchmark_data.py
+          echo "Benchmark data files:"
+          ls -la benchmarks/*.lance benchmarks/*.parquet 2>/dev/null || echo "Some files missing"
 
       - name: Build library and CLI
         run: |
@@ -194,8 +229,25 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Benchmark | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| SQL Clauses (200M rows) | :white_check_mark: |" >> $GITHUB_STEP_SUMMARY
-          echo "| ML Workflows | :white_check_mark: |" >> $GITHUB_STEP_SUMMARY
+
+          # Check SQL Clauses status
+          if grep -q "Missing data files" bench-sql.txt 2>/dev/null; then
+            echo "| SQL Clauses | :red_circle: Missing data |" >> $GITHUB_STEP_SUMMARY
+          elif grep -q "rows/sec" bench-sql.txt 2>/dev/null; then
+            echo "| SQL Clauses | :white_check_mark: |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| SQL Clauses | :yellow_circle: Partial |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Check @logic_table status
+          if grep -q "SKIPPED" bench-logic-table.txt 2>/dev/null; then
+            echo "| @logic_table | :yellow_circle: Skipped (no vector_ops.a) |" >> $GITHUB_STEP_SUMMARY
+          elif grep -q "rows/sec" bench-logic-table.txt 2>/dev/null; then
+            echo "| @logic_table | :white_check_mark: |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| @logic_table | :yellow_circle: Partial |" >> $GITHUB_STEP_SUMMARY
+          fi
+
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Platform:** Linux x86_64 (CPU only)" >> $GITHUB_STEP_SUMMARY
           echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY

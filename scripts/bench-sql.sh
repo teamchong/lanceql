@@ -36,5 +36,37 @@ else
 fi
 echo ""
 
+echo "================================================================================"
+echo "SQL Clauses Benchmark: End-to-End (Read + SQL Operations)"
+echo "================================================================================"
+echo ""
+echo "Pipeline: Read file → execute SQL clause → return result"
+echo "Each method runs for 15 seconds. Measuring throughput (rows/sec)."
+echo ""
+
+# Check for benchmark data files
+LANCE_FILE="$PROJECT_DIR/benchmarks/benchmark_e2e.lance"
+PARQUET_FILE="$PROJECT_DIR/benchmarks/benchmark_e2e.parquet"
+
+echo "Data files:"
+if [ -d "$LANCE_FILE" ]; then
+    echo "  Lance:   benchmarks/benchmark_e2e.lance ✓"
+else
+    echo "  Lance:   benchmarks/benchmark_e2e.lance ✗"
+fi
+
+if [ -f "$PARQUET_FILE" ]; then
+    echo "  Parquet: benchmarks/benchmark_e2e.parquet ✓"
+else
+    echo "  Parquet: benchmarks/benchmark_e2e.parquet ✗"
+fi
+echo ""
+
+# Check if data files exist
+if [ ! -d "$LANCE_FILE" ] || [ ! -f "$PARQUET_FILE" ]; then
+    echo "⚠️  Missing data files. Run: python3 benchmarks/generate_benchmark_data.py"
+    exit 0
+fi
+
 # Build and run
 zig build bench-sql 2>&1
