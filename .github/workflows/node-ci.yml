@@ -46,7 +46,7 @@ jobs:
       - name: Build metal0 compiler
         run: |
           cd deps/metal0
-          zig build metal0
+          zig build
           echo "$PWD/zig-out/bin" >> $GITHUB_PATH
 
       - name: Build Zig shared library
