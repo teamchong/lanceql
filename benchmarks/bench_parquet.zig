@@ -1,5 +1,8 @@
 //! Parquet Reader Benchmark: LanceQL vs DuckDB vs Polars
 //!
+//! HONEST benchmark - all methods read file from disk each iteration.
+//! No pre-loading, no mmap caching advantage.
+//!
 //! Usage: zig build bench-parquet && ./zig-out/bin/bench_parquet <parquet_file>
 
 const std = @import("std");
@@ -59,6 +62,19 @@ fn runPolars(alloc: std.mem.Allocator, code: []const u8) !u64 {
     return timer.read();
 }
 
+/// Read file from disk (fair comparison - reads each time like DuckDB/Polars)
+fn readFileFromDisk(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+
+    const file_size = try file.getEndPos();
+    const data = try allocator.alloc(u8, file_size);
+    errdefer allocator.free(data);
+
+    _ = try file.readAll(data);
+    return data;
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -78,19 +94,21 @@ pub fn main() !void {
     has_duckdb = checkCommand(allocator, "duckdb");
     has_polars = checkCommand(allocator, "python3");
 
-    // Read file into memory
-    const file = try std.fs.cwd().openFile(file_path, .{});
-    defer file.close();
-
-    const file_size = try file.getEndPos();
-    const data = try allocator.alloc(u8, file_size);
-    defer allocator.free(data);
-
-    _ = try file.readAll(data);
+    // Get file size for display (don't keep data loaded)
+    const file_size = blk: {
+        const file = std.fs.cwd().openFile(file_path, .{}) catch {
+            std.debug.print("Error: Cannot open file: {s}\n", .{file_path});
+            return;
+        };
+        defer file.close();
+        break :blk file.getEndPos() catch 0;
+    };
 
     std.debug.print("================================================================================\n", .{});
     std.debug.print("Parquet Reader Benchmark: LanceQL vs DuckDB vs Polars\n", .{});
     std.debug.print("================================================================================\n", .{});
+    std.debug.print("\nHONEST benchmark: All methods read file from disk EACH iteration.\n", .{});
+    std.debug.print("No pre-loading, no mmap caching advantage.\n\n", .{});
     std.debug.print("File: {s}\n", .{file_path});
     std.debug.print("Size: {d:.2} MB\n", .{@as(f64, @floatFromInt(file_size)) / 1024 / 1024});
     std.debug.print("\nEngines:\n", .{});
@@ -111,7 +129,11 @@ pub fn main() !void {
 
     std.debug.print("Warming up ({d} iterations)...\n", .{warmup_iterations});
     for (0..warmup_iterations) |_| {
-        var pf = try ParquetFile.init(allocator, data);
+        // Read file from disk each iteration (fair comparison)
+        const data = readFileFromDisk(allocator, file_path) catch continue;
+        defer allocator.free(data);
+
+        var pf = ParquetFile.init(allocator, data) catch continue;
         defer pf.deinit();
 
         const rg = pf.getRowGroup(0) orelse continue;
@@ -139,7 +161,11 @@ pub fn main() !void {
     for (0..bench_iterations) |_| {
         var timer = try std.time.Timer.start();
 
-        var pf = try ParquetFile.init(allocator, data);
+        // Read file from disk each iteration (fair comparison)
+        const data = readFileFromDisk(allocator, file_path) catch continue;
+        defer allocator.free(data);
+
+        var pf = ParquetFile.init(allocator, data) catch continue;
         defer pf.deinit();
 
         const rg = pf.getRowGroup(0) orelse continue;
@@ -218,7 +244,13 @@ pub fn main() !void {
         std.debug.print("  Avg:  {d:.2} ms\n", .{duckdb_avg_ms});
         std.debug.print("  Max:  {d:.2} ms\n", .{duckdb_max_ms});
         std.debug.print("  Throughput: {d:.2}M rows/sec\n", .{duckdb_throughput});
-        std.debug.print("  vs LanceQL: {d:.1}x\n", .{duckdb_avg_ms / avg_ms});
+
+        const speedup = avg_ms / duckdb_avg_ms;
+        if (speedup > 1) {
+            std.debug.print("  LanceQL is {d:.1}x SLOWER\n", .{speedup});
+        } else {
+            std.debug.print("  LanceQL is {d:.1}x faster\n", .{1.0 / speedup});
+        }
     }
 
     // =========================================================================
@@ -261,7 +293,13 @@ pub fn main() !void {
         std.debug.print("  Avg:  {d:.2} ms\n", .{polars_avg_ms});
         std.debug.print("  Max:  {d:.2} ms\n", .{polars_max_ms});
         std.debug.print("  Throughput: {d:.2}M rows/sec\n", .{polars_throughput});
-        std.debug.print("  vs LanceQL: {d:.1}x\n", .{polars_avg_ms / avg_ms});
+
+        const speedup = avg_ms / polars_avg_ms;
+        if (speedup > 1) {
+            std.debug.print("  LanceQL is {d:.1}x SLOWER\n", .{speedup});
+        } else {
+            std.debug.print("  LanceQL is {d:.1}x faster\n", .{1.0 / speedup});
+        }
     }
 
     // =========================================================================
@@ -273,5 +311,6 @@ pub fn main() !void {
     std.debug.print("{s:<20} {s:>15}\n", .{ "Engine", "Throughput" });
     std.debug.print("{s:<20} {s:>15}\n", .{ "-" ** 20, "-" ** 15 });
     std.debug.print("{s:<20} {d:>12.2}M/s\n", .{ "LanceQL", throughput });
-    std.debug.print("\nNote: DuckDB/Polars times include subprocess overhead.\n", .{});
+    std.debug.print("\nNote: All methods read file from disk each iteration.\n", .{});
+    std.debug.print("DuckDB/Polars times include subprocess overhead.\n", .{});
 }
