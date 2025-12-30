@@ -211,6 +211,11 @@ jobs:
           sudo cp zig-out/bin/lanceql /usr/local/bin/
           lanceql --version || echo "LanceQL CLI installed"
 
+      - name: Install metal0 dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libbz2-dev liblzma-dev
+
       - name: Build metal0 and compile @logic_table
         run: |
           # Build metal0 AOT Python compiler
