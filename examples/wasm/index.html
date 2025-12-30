@@ -1147,6 +1147,254 @@
             from { transform: rotate(0deg); }
             to { transform: rotate(360deg); }
         }
+        .animate-spin {
+            animation: spin 1s linear infinite;
+        }
+
+        /* Storage Management Panel */
+        .storage-panel {
+            background: #1e293b;
+            border-radius: 12px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+        .storage-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+            cursor: pointer;
+        }
+        .storage-title {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 600;
+            color: #e2e8f0;
+        }
+        .storage-title svg {
+            color: #10b981;
+        }
+        .storage-toggle {
+            color: #64748b;
+            transition: transform 0.2s;
+        }
+        .storage-panel.collapsed .storage-toggle {
+            transform: rotate(-90deg);
+        }
+        .storage-panel.collapsed .storage-content {
+            display: none;
+        }
+        .storage-stats {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+            margin-bottom: 15px;
+        }
+        .storage-stat {
+            background: #0f172a;
+            border-radius: 8px;
+            padding: 12px;
+            text-align: center;
+        }
+        .storage-stat-value {
+            font-size: 20px;
+            font-weight: 700;
+            color: #e2e8f0;
+        }
+        .storage-stat-label {
+            font-size: 11px;
+            color: #64748b;
+            margin-top: 4px;
+        }
+        .storage-files {
+            max-height: 200px;
+            overflow-y: auto;
+            margin-bottom: 12px;
+        }
+        .storage-file-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 12px;
+            background: #0f172a;
+            border-radius: 6px;
+            margin-bottom: 6px;
+        }
+        .storage-file-info {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .storage-file-icon {
+            color: #10b981;
+        }
+        .storage-file-name {
+            font-size: 13px;
+            color: #e2e8f0;
+            font-family: 'SF Mono', Monaco, monospace;
+        }
+        .storage-file-size {
+            font-size: 11px;
+            color: #64748b;
+        }
+        .storage-file-delete {
+            padding: 4px 8px;
+            background: transparent;
+            border: none;
+            color: #64748b;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+        .storage-file-delete:hover {
+            background: #ef4444;
+            color: white;
+        }
+        .storage-actions {
+            display: flex;
+            gap: 8px;
+        }
+        .storage-btn {
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .storage-btn-clear {
+            background: #dc2626;
+            color: white;
+            border: none;
+        }
+        .storage-btn-clear:hover {
+            background: #b91c1c;
+        }
+        .storage-btn-refresh {
+            background: #334155;
+            color: #e2e8f0;
+            border: none;
+        }
+        .storage-btn-refresh:hover {
+            background: #475569;
+        }
+        .storage-empty {
+            color: #64748b;
+            font-size: 13px;
+            text-align: center;
+            padding: 20px;
+        }
+        .online-indicator {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            padding: 4px 10px;
+            border-radius: 20px;
+            background: rgba(16, 185, 129, 0.1);
+            color: #10b981;
+        }
+        .online-indicator.offline {
+            background: rgba(245, 158, 11, 0.1);
+            color: #f59e0b;
+        }
+        .online-indicator-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+        .cache-badge {
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: rgba(16, 185, 129, 0.2);
+            color: #10b981;
+            margin-left: 6px;
+        }
+        .save-local-btn {
+            padding: 4px 10px;
+            background: #065f46;
+            border: none;
+            border-radius: 4px;
+            color: #10b981;
+            font-size: 11px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            transition: all 0.2s;
+        }
+        .save-local-btn:hover {
+            background: #047857;
+            color: #6ee7b7;
+        }
+        .save-local-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .opfs-unsupported {
+            font-size: 10px;
+            padding: 2px 8px;
+            border-radius: 10px;
+            background: rgba(239, 68, 68, 0.2);
+            color: #ef4444;
+            margin-left: 8px;
+        }
+        .storage-panel.unsupported .storage-btn-clear,
+        .storage-panel.unsupported .storage-btn-refresh {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .storage-btn-session {
+            background: #7c3aed;
+            color: white;
+            border: none;
+        }
+        .storage-btn-session:hover {
+            background: #6d28d9;
+        }
+        /* Memory display */
+        .memory-display {
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid #334155;
+        }
+        .memory-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+            font-size: 12px;
+        }
+        .memory-label {
+            color: #94a3b8;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .memory-values {
+            color: #e2e8f0;
+            font-family: 'SF Mono', Monaco, monospace;
+        }
+        .memory-bar {
+            height: 6px;
+            background: #1e293b;
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        .memory-bar-fill {
+            height: 100%;
+            background: #10b981;
+            border-radius: 3px;
+            transition: width 0.3s, background 0.3s;
+        }
+        .status-warning {
+            background: rgba(245, 158, 11, 0.1);
+            color: #f59e0b;
+        }
 
         /* Mobile responsive */
         @media (max-width: 768px) {
@@ -1265,6 +1513,87 @@
                 <div class="progress-text">
                     <span id="progress-label">Loading...</span>
                     <span id="progress-percent">0%</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- Storage Management Panel -->
+        <section class="storage-panel collapsed" id="storage-panel">
+            <div class="storage-header" onclick="toggleStoragePanel()">
+                <span class="storage-title">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+                        <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
+                        <line x1="12" y1="22.08" x2="12" y2="12"/>
+                    </svg>
+                    Local Storage (OPFS)
+                    <span id="opfs-support-indicator"></span>
+                    <span class="online-indicator" id="online-indicator">
+                        <span class="online-indicator-dot"></span>
+                        <span id="online-status">Online</span>
+                    </span>
+                </span>
+                <svg class="storage-toggle" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="6 9 12 15 18 9"/>
+                </svg>
+            </div>
+            <div class="storage-content">
+                <div class="storage-stats">
+                    <div class="storage-stat">
+                        <div class="storage-stat-value" id="storage-used">0 KB</div>
+                        <div class="storage-stat-label">Storage Used</div>
+                    </div>
+                    <div class="storage-stat">
+                        <div class="storage-stat-value" id="storage-files-count">0</div>
+                        <div class="storage-stat-label">Cached Files</div>
+                    </div>
+                    <div class="storage-stat">
+                        <div class="storage-stat-value" id="storage-quota">--</div>
+                        <div class="storage-stat-label">Available</div>
+                    </div>
+                </div>
+                <div class="storage-files" id="storage-files-list">
+                    <div class="storage-empty">No files cached locally</div>
+                </div>
+                <div class="storage-actions">
+                    <button class="storage-btn storage-btn-refresh" onclick="refreshStorageStats()">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M23 4v6h-6"/><path d="M1 20v-6h6"/>
+                            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                        </svg>
+                        Refresh
+                    </button>
+                    <button class="storage-btn storage-btn-clear" onclick="clearAllStorage()">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                        </svg>
+                        Clear Cache
+                    </button>
+                    <button class="storage-btn storage-btn-session" onclick="clearSession()" title="Clear all tables, cached files, and reset the demo">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+                            <polyline points="16 17 21 12 16 7"/>
+                            <line x1="21" y1="12" x2="9" y2="12"/>
+                        </svg>
+                        Logout
+                    </button>
+                </div>
+                <div class="memory-display">
+                    <div class="memory-header">
+                        <span class="memory-label">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="2" y="6" width="20" height="12" rx="2"/>
+                                <path d="M6 12h.01M10 12h.01M14 12h.01M18 12h.01"/>
+                            </svg>
+                            JS Heap Memory
+                        </span>
+                        <span class="memory-values">
+                            <span id="memory-used">--</span> / <span id="memory-limit">--</span>
+                        </span>
+                    </div>
+                    <div class="memory-bar">
+                        <div class="memory-bar-fill" id="memory-bar-fill" style="width: 0%"></div>
+                    </div>
                 </div>
             </div>
         </section>
@@ -1542,7 +1871,17 @@
         import { atom, computed } from 'https://esm.sh/nanostores@0.10.3';
         // Import from local lanceql.js (synced from packages/browser/src/lanceql.js)
         // Run: cp packages/browser/src/lanceql.js examples/wasm/lanceql.js
-        import LanceQL, { SQLExecutor, SQLLexer, SQLParser, initSqlJs } from './lanceql.js';
+        import LanceQL, {
+            SQLExecutor, SQLLexer, SQLParser, initSqlJs,
+            // OPFS and storage APIs
+            opfsStorage, OPFSStorage, ChunkedLanceReader, LRUCache,
+            // Memory management
+            memoryManager, MemoryManager, StreamUtils,
+            // Unified data access
+            openLance, LanceDataBase, OPFSLanceData, RemoteLanceData,
+            // Local database
+            LocalDatabase
+        } from './lanceql.js';
 
         let lanceql;
 
@@ -1638,12 +1977,14 @@
                     }
                     this.statusType = type;
                     if (this.statusTimeout) clearTimeout(this.statusTimeout);
-                    if (type === 'success') {
+                    // Auto-clear success and warning messages
+                    if (type === 'success' || type === 'warning') {
+                        const delay = type === 'warning' ? 5000 : 8000;
                         this.statusTimeout = setTimeout(() => {
                             this.statusMessage = '';
                             this.statusType = '';
                             this.showResetLink = false;
-                        }, 8000);
+                        }, delay);
                     }
                 }
             });
@@ -1659,6 +2000,366 @@
         Alpine.start();
 
         const PAGE_SIZE = 50;
+
+        // === Memory Management ===
+
+        // Memory limits and tracking
+        const MEMORY_CONFIG = {
+            // Warn when heap usage exceeds this percentage
+            warnThreshold: 0.7,  // 70%
+            // Fail operations when exceeds this
+            failThreshold: 0.85, // 85%
+            // Maximum file size to load into memory (100MB default, can be lower on mobile)
+            maxFileSize: 100 * 1024 * 1024,
+            // Minimum free memory required for operations (50MB)
+            minFreeMemory: 50 * 1024 * 1024,
+        };
+
+        // Get current memory usage (Chrome-only, estimate for others)
+        function getMemoryInfo() {
+            // Chrome exposes detailed memory info
+            if (performance.memory) {
+                return {
+                    used: performance.memory.usedJSHeapSize,
+                    total: performance.memory.totalJSHeapSize,
+                    limit: performance.memory.jsHeapSizeLimit,
+                    available: performance.memory.jsHeapSizeLimit - performance.memory.usedJSHeapSize,
+                    supported: true
+                };
+            }
+            // Fallback: estimate based on typical browser limits
+            // Most browsers have ~2GB heap limit, mobile ~512MB
+            const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+            const estimatedLimit = isMobile ? 512 * 1024 * 1024 : 2 * 1024 * 1024 * 1024;
+            return {
+                used: 0,
+                total: 0,
+                limit: estimatedLimit,
+                available: estimatedLimit,
+                supported: false
+            };
+        }
+
+        // Check if we have enough memory for an operation
+        function checkMemoryForOperation(requiredBytes, operationName) {
+            const mem = getMemoryInfo();
+
+            // Check file size limit
+            if (requiredBytes > MEMORY_CONFIG.maxFileSize) {
+                const maxMB = (MEMORY_CONFIG.maxFileSize / 1024 / 1024).toFixed(0);
+                const reqMB = (requiredBytes / 1024 / 1024).toFixed(1);
+                throw new Error(
+                    `File too large: ${reqMB}MB exceeds ${maxMB}MB limit. ` +
+                    `Use smaller files or chunked loading.`
+                );
+            }
+
+            if (mem.supported) {
+                // Check heap usage percentage
+                const usagePercent = mem.used / mem.limit;
+                if (usagePercent > MEMORY_CONFIG.failThreshold) {
+                    throw new Error(
+                        `Memory limit reached (${(usagePercent * 100).toFixed(0)}% used). ` +
+                        `Clear some tables or refresh the page.`
+                    );
+                }
+
+                // Check if enough free memory
+                if (mem.available < requiredBytes + MEMORY_CONFIG.minFreeMemory) {
+                    const availMB = (mem.available / 1024 / 1024).toFixed(0);
+                    const reqMB = (requiredBytes / 1024 / 1024).toFixed(1);
+                    throw new Error(
+                        `Not enough memory for ${operationName}: need ${reqMB}MB, only ${availMB}MB available. ` +
+                        `Clear some tables first.`
+                    );
+                }
+
+                // Warn if approaching limit
+                if (usagePercent > MEMORY_CONFIG.warnThreshold) {
+                    console.warn(`Memory warning: ${(usagePercent * 100).toFixed(0)}% heap used`);
+                    showStatus(`⚠️ Memory usage high (${(usagePercent * 100).toFixed(0)}%)`, 'warning');
+                }
+            }
+
+            return true;
+        }
+
+        // Update memory display in UI
+        function updateMemoryDisplay() {
+            const mem = getMemoryInfo();
+            const memUsedEl = document.getElementById('memory-used');
+            const memLimitEl = document.getElementById('memory-limit');
+            const memBarEl = document.getElementById('memory-bar-fill');
+
+            if (memUsedEl && mem.supported) {
+                memUsedEl.textContent = formatBytes(mem.used);
+                memLimitEl.textContent = formatBytes(mem.limit);
+
+                const percent = (mem.used / mem.limit) * 100;
+                memBarEl.style.width = `${Math.min(percent, 100)}%`;
+
+                // Color based on usage
+                if (percent > MEMORY_CONFIG.failThreshold * 100) {
+                    memBarEl.style.background = '#ef4444'; // red
+                } else if (percent > MEMORY_CONFIG.warnThreshold * 100) {
+                    memBarEl.style.background = '#f59e0b'; // yellow
+                } else {
+                    memBarEl.style.background = '#10b981'; // green
+                }
+            } else if (memUsedEl) {
+                memUsedEl.textContent = 'N/A';
+                memLimitEl.textContent = '(Chrome only)';
+                memBarEl.style.width = '0%';
+            }
+        }
+
+        // Periodically update memory display
+        setInterval(updateMemoryDisplay, 2000);
+
+        // === Storage Management Functions ===
+
+        // OPFS support detection - use package's opfsStorage
+        let opfsSupported = false;
+        async function checkOPFSSupport() {
+            // Use the package's OPFSStorage which has proper detection
+            opfsSupported = await opfsStorage.isSupported();
+            return opfsSupported;
+        }
+
+        // Track if user has unsaved data (for exit prompt)
+        let hasUnsavedData = false;
+
+        // Warn user before leaving if they have local data
+        window.addEventListener('beforeunload', (e) => {
+            if (hasUnsavedData && tablesRegistry.size > 0) {
+                e.preventDefault();
+                e.returnValue = 'You have locally cached data. Are you sure you want to leave?';
+                return e.returnValue;
+            }
+        });
+
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+        }
+
+        function toggleStoragePanel() {
+            const panel = document.getElementById('storage-panel');
+            panel.classList.toggle('collapsed');
+            if (!panel.classList.contains('collapsed')) {
+                refreshStorageStats();
+            }
+        }
+
+        function updateStoragePanelSupport() {
+            const panel = document.getElementById('storage-panel');
+            const indicator = document.getElementById('opfs-support-indicator');
+            if (!opfsSupported) {
+                panel.classList.add('unsupported');
+                if (indicator) {
+                    indicator.innerHTML = '<span class="opfs-unsupported">OPFS not supported</span>';
+                }
+            }
+        }
+
+        async function refreshStorageStats() {
+            if (!opfsSupported) {
+                document.getElementById('storage-used').textContent = 'N/A';
+                document.getElementById('storage-files-count').textContent = '-';
+                document.getElementById('storage-quota').textContent = 'N/A';
+                document.getElementById('storage-files-list').innerHTML =
+                    '<div class="storage-empty">OPFS not supported in this browser. Files will work in memory only.</div>';
+                return;
+            }
+
+            try {
+                // Use package's opfsStorage for stats
+                const stats = await opfsStorage.getStats();
+                document.getElementById('storage-used').textContent = formatBytes(stats.totalSize);
+                document.getElementById('storage-files-count').textContent = stats.fileCount;
+
+                // Get storage quota
+                if (navigator.storage && navigator.storage.estimate) {
+                    const estimate = await navigator.storage.estimate();
+                    const quota = estimate.quota || 0;
+                    document.getElementById('storage-quota').textContent = formatBytes(quota - stats.totalSize);
+                }
+
+                // Get file list using package API
+                const files = await opfsStorage.listFiles();
+
+                // Update hasUnsavedData flag
+                hasUnsavedData = files.length > 0;
+
+                // Render file list
+                const listEl = document.getElementById('storage-files-list');
+                if (files.length === 0) {
+                    listEl.innerHTML = '<div class="storage-empty">No files cached locally</div>';
+                } else {
+                    listEl.innerHTML = files.map(f => `
+                        <div class="storage-file-item" data-file="${f.name}">
+                            <div class="storage-file-info">
+                                <svg class="storage-file-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                                    <polyline points="14,2 14,8 20,8"/>
+                                </svg>
+                                <span class="storage-file-name">${f.name}</span>
+                                <span class="storage-file-size">${formatBytes(f.size)}</span>
+                            </div>
+                            <button class="storage-file-delete" onclick="deleteStorageFile('${f.name}')" title="Delete">×</button>
+                        </div>
+                    `).join('');
+                }
+            } catch (e) {
+                console.warn('Failed to refresh storage stats:', e);
+            }
+        }
+
+        async function deleteStorageFile(fileName) {
+            if (!opfsSupported) return;
+            if (!confirm(`Delete "${fileName}" from local storage?`)) return;
+            try {
+                // Use package's opfsStorage
+                await opfsStorage.delete(fileName);
+
+                // Also remove from tables registry if it exists
+                const tableName = fileName.replace(/\.lance$/, '');
+                if (tablesRegistry.has(tableName)) {
+                    unregisterTable(tableName);
+                }
+
+                refreshStorageStats();
+                showStatus(`Deleted "${fileName}"`, 'success');
+            } catch (e) {
+                showStatus(`Failed to delete: ${e.message}`, 'error');
+            }
+        }
+
+        async function clearAllStorage() {
+            if (!opfsSupported) {
+                showStatus('OPFS not supported', 'error');
+                return;
+            }
+            if (!confirm('Clear all locally cached files? This cannot be undone.')) return;
+            try {
+                // Use package's opfsStorage
+                const count = await opfsStorage.clearAll();
+
+                // Clear tables registry for local tables
+                for (const [name, info] of tablesRegistry) {
+                    if (info.type === 'local') {
+                        tablesRegistry.delete(name);
+                    }
+                }
+
+                renderTablesUI();
+                refreshStorageStats();
+                hasUnsavedData = false;
+                showStatus(`Cleared ${count} files from local storage`, 'success');
+            } catch (e) {
+                showStatus(`Failed to clear storage: ${e.message}`, 'error');
+            }
+        }
+
+        // Clear entire session - OPFS + in-memory tables + reset UI
+        async function clearSession() {
+            if (!confirm('Clear your session? This will remove all loaded tables and cached files.')) return;
+
+            try {
+                // Clear OPFS if supported using package API
+                if (opfsSupported) {
+                    await opfsStorage.clearAll();
+                }
+
+                // Clear in-memory tables
+                for (const [name, info] of tablesRegistry) {
+                    if (info?.dataset?.close) {
+                        try { info.dataset.close(); } catch (e) {}
+                    }
+                }
+                tablesRegistry.clear();
+
+                // Reset UI state
+                $currentFile.set(null);
+                $columnTypes.set([]);
+                $totalBytesDownloaded.set(0);
+                $totalRequests.set(0);
+                Alpine.store('app').opfsWritten = 0;
+                hasUnsavedData = false;
+
+                // Clear results
+                document.getElementById('results-table-body').innerHTML = '';
+                document.getElementById('results-table-header').innerHTML = '';
+
+                renderTablesUI();
+                refreshStorageStats();
+                showStatus('Session cleared', 'success');
+            } catch (e) {
+                showStatus(`Failed to clear session: ${e.message}`, 'error');
+            }
+        }
+
+        // Save remote dataset to OPFS for offline use
+        async function saveRemoteToLocal(url, name) {
+            if (!opfsSupported) {
+                showStatus('OPFS not supported - cannot save locally', 'error');
+                return false;
+            }
+
+            try {
+                // First, check file size with HEAD request
+                showStatus(`Checking file size...`, 'info');
+                const headResponse = await fetch(url, { method: 'HEAD' });
+                if (!headResponse.ok) throw new Error(`HTTP ${headResponse.status}`);
+
+                const contentLength = headResponse.headers.get('content-length');
+                if (contentLength) {
+                    const fileSize = parseInt(contentLength, 10);
+                    // Check memory before downloading
+                    checkMemoryForOperation(fileSize, `save "${name}" locally`);
+                }
+
+                showStatus(`Downloading "${name}"...`, 'info');
+
+                // Fetch the entire file
+                const response = await fetch(url);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+                const buffer = await response.arrayBuffer();
+
+                // Store in OPFS using package API
+                await opfsStorage.save(`${name}.lance`, new Uint8Array(buffer));
+
+                // Update state and refresh
+                hasUnsavedData = true;
+                refreshStorageStats();
+
+                showStatus(`Saved "${name}" locally (${formatBytes(buffer.byteLength)})`, 'success');
+                return true;
+            } catch (e) {
+                showStatus(`Failed to save: ${e.message}`, 'error');
+                return false;
+            }
+        }
+
+        // Online/offline detection
+        function updateOnlineStatus() {
+            const indicator = document.getElementById('online-indicator');
+            const statusText = document.getElementById('online-status');
+            if (navigator.onLine) {
+                indicator.classList.remove('offline');
+                statusText.textContent = 'Online';
+            } else {
+                indicator.classList.add('offline');
+                statusText.textContent = 'Offline';
+            }
+        }
+
+        window.addEventListener('online', updateOnlineStatus);
+        window.addEventListener('offline', updateOnlineStatus);
 
         // Default demo dataset URL - LAION 1M images dataset
         const DEFAULT_DATASET_URL = 'https://data.metal0.dev/laion-1m/images.lance';
@@ -1696,8 +2397,19 @@
                 }
                 setTimeout(runSqlQuery, 100);
 
-                // Load previously uploaded files from OPFS
-                loadOPFSTables();
+                // Check OPFS support and load tables
+                opfsSupported = await checkOPFSSupport();
+                console.log('OPFS supported:', opfsSupported);
+                updateStoragePanelSupport();
+
+                if (opfsSupported) {
+                    loadOPFSTables();
+                }
+
+                // Initialize storage stats, online status, and memory display
+                updateOnlineStatus();
+                refreshStorageStats();
+                updateMemoryDisplay();
 
                 // Initialize CLIP and MiniLM after lanceql is loaded
                 initClipWasm();
@@ -3915,12 +4627,21 @@
                             <div class="table-name">${name}</div>
                             <div class="table-meta">${meta.join(' · ')}</div>
                         </div>
-                        ${isLocal ? `
                         <div class="table-actions">
-                            <button class="table-action-btn rename" data-name="${name}" title="Rename">✏️</button>
-                            <button class="table-action-btn delete" data-name="${name}" title="Remove">×</button>
+                            ${isLocal ? `
+                                <button class="table-action-btn rename" data-name="${name}" title="Rename">✏️</button>
+                                <button class="table-action-btn delete" data-name="${name}" title="Remove">×</button>
+                            ` : `
+                                <button class="save-local-btn" data-name="${name}" data-url="${info.url || ''}" title="Save locally for offline use">
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                        <polyline points="7 10 12 15 17 10"/>
+                                        <line x1="12" y1="15" x2="12" y2="3"/>
+                                    </svg>
+                                    Save Local
+                                </button>
+                            `}
                         </div>
-                        ` : ''}
                     </div>
                 `;
             }
@@ -3948,7 +4669,30 @@
         }
 
         // Handle table actions (event delegation)
-        document.getElementById('tables-list').addEventListener('click', (e) => {
+        document.getElementById('tables-list').addEventListener('click', async (e) => {
+            // Handle save-local-btn for remote tables
+            const saveBtn = e.target.closest('.save-local-btn');
+            if (saveBtn) {
+                const name = saveBtn.dataset.name;
+                const url = saveBtn.dataset.url;
+                if (url) {
+                    saveBtn.disabled = true;
+                    saveBtn.innerHTML = '<svg class="animate-spin" width="12" height="12" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" fill="none" opacity="0.25"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="4" fill="none"/></svg> Saving...';
+                    const success = await saveRemoteToLocal(url, name);
+                    if (success) {
+                        // Re-render to show as local
+                        const info = tablesRegistry.get(name);
+                        if (info) {
+                            info.type = 'local';
+                            renderTablesUI();
+                        }
+                    } else {
+                        renderTablesUI(); // Restore button
+                    }
+                }
+                return;
+            }
+
             const btn = e.target.closest('.table-action-btn');
             if (!btn) return;
 
@@ -4010,23 +4754,31 @@
             }
         });
 
-        // Upload file to OPFS and register
+        // Upload file to OPFS and register (falls back to memory-only if OPFS not supported)
         async function uploadFileToOPFS(file) {
             const name = file.name.replace(/\.lance$/, '');
-            showStatus(`Uploading ${name}...`, 'info');
 
             try {
+                // Check memory BEFORE reading file
+                checkMemoryForOperation(file.size, `upload "${name}"`);
+
+                showStatus(`Uploading ${name}...`, 'info');
+
                 // Read file content
                 const buffer = await file.arrayBuffer();
 
-                // Store in OPFS
-                const root = await navigator.storage.getDirectory();
-                const fileHandle = await root.getFileHandle(`${name}.lance`, { create: true });
-                const writable = await fileHandle.createWritable();
-                await writable.write(buffer);
-                await writable.close();
+                // Store in OPFS if supported using package API
+                if (opfsSupported) {
+                    try {
+                        await opfsStorage.save(`${name}.lance`, new Uint8Array(buffer));
+                        hasUnsavedData = true;
+                        refreshStorageStats();
+                    } catch (opfsErr) {
+                        console.warn('Failed to save to OPFS, using memory only:', opfsErr);
+                    }
+                }
 
-                // Open as Lance file
+                // Open as Lance file (always works - in memory)
                 const dataset = await lanceql.openMemory(new Uint8Array(buffer));
 
                 // Detect column types
@@ -4050,7 +4802,11 @@
                 $columnTypes.set(dataset._columnTypes || []);
                 showColumnChips();
 
-                showStatus(`Uploaded "${name}" (${(buffer.byteLength / 1024 / 1024).toFixed(2)} MB)`, 'success');
+                // Update memory display after load
+                updateMemoryDisplay();
+
+                const persistNote = opfsSupported ? ' (saved locally)' : ' (memory only - will be lost on refresh)';
+                showStatus(`Uploaded "${name}" (${(buffer.byteLength / 1024 / 1024).toFixed(2)} MB)${persistNote}`, 'success');
             } catch (err) {
                 showStatus(`Failed to upload: ${err.message}`, 'error');
                 console.error(err);
@@ -4059,15 +4815,32 @@
 
         // Load OPFS tables on init
         async function loadOPFSTables() {
-            try {
-                const root = await navigator.storage.getDirectory();
-                for await (const [name, handle] of root.entries()) {
-                    if (handle.kind === 'file' && name.endsWith('.lance')) {
-                        const file = await handle.getFile();
-                        const buffer = await file.arrayBuffer();
-                        const tableName = name.replace(/\.lance$/, '');
+            if (!opfsSupported) return;
 
-                        const dataset = await lanceql.openMemory(new Uint8Array(buffer));
+            try {
+                // Use package's opfsStorage to list files
+                const files = await opfsStorage.listFiles();
+                let loadedCount = 0;
+                let skippedCount = 0;
+
+                for (const fileInfo of files) {
+                    if (fileInfo.name.endsWith('.lance')) {
+                        const tableName = fileInfo.name.replace(/\.lance$/, '');
+
+                        // Check memory before loading
+                        try {
+                            checkMemoryForOperation(fileInfo.size, `load "${tableName}"`);
+                        } catch (memErr) {
+                            console.warn(`Skipping ${tableName}: ${memErr.message}`);
+                            skippedCount++;
+                            continue; // Skip this file but continue loading others
+                        }
+
+                        // Load file using package API
+                        const buffer = await opfsStorage.load(fileInfo.name);
+                        if (!buffer) continue;
+
+                        const dataset = await lanceql.openMemory(buffer);
                         let cols = dataset.numColumns;
                         try {
                             const types = await dataset.detectColumnTypes();
@@ -4081,9 +4854,19 @@
                             rows: dataset.rowCount || 0,
                             cols
                         });
+                        loadedCount++;
                     }
                 }
+
+                // Update hasUnsavedData if we loaded any files
+                hasUnsavedData = loadedCount > 0;
+
                 renderTablesUI();
+                updateMemoryDisplay();
+
+                if (skippedCount > 0) {
+                    showStatus(`Loaded ${loadedCount} tables, skipped ${skippedCount} (memory limit)`, 'warning');
+                }
             } catch (e) {
                 console.warn('Could not load OPFS tables:', e);
             }

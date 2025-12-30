@@ -1128,6 +1128,1202 @@ class OPFSStorage {
             return false;
         }
     }
+
+    /**
+     * Read a byte range from a file without loading the entire file
+     * @param {string} path - File path
+     * @param {number} offset - Start byte offset
+     * @param {number} length - Number of bytes to read
+     * @returns {Promise<Uint8Array|null>}
+     */
+    async readRange(path, offset, length) {
+        try {
+            const parts = path.split('/');
+            const fileName = parts.pop();
+            const dirPath = parts.join('/');
+
+            const dir = dirPath ? await this.getDir(dirPath) : await this.getRoot();
+            const fileHandle = await dir.getFileHandle(fileName);
+            const file = await fileHandle.getFile();
+
+            // Use slice to read only the requested range
+            const blob = file.slice(offset, offset + length);
+            const buffer = await blob.arrayBuffer();
+            return new Uint8Array(buffer);
+        } catch (e) {
+            if (e.name === 'NotFoundError') {
+                return null;
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Get file size without loading the file
+     * @param {string} path - File path
+     * @returns {Promise<number|null>}
+     */
+    async getFileSize(path) {
+        try {
+            const parts = path.split('/');
+            const fileName = parts.pop();
+            const dirPath = parts.join('/');
+
+            const dir = dirPath ? await this.getDir(dirPath) : await this.getRoot();
+            const fileHandle = await dir.getFileHandle(fileName);
+            const file = await fileHandle.getFile();
+            return file.size;
+        } catch (e) {
+            if (e.name === 'NotFoundError') {
+                return null;
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Open a file for chunked reading
+     * @param {string} path - File path
+     * @returns {Promise<OPFSFileReader|null>}
+     */
+    async openFile(path) {
+        try {
+            const parts = path.split('/');
+            const fileName = parts.pop();
+            const dirPath = parts.join('/');
+
+            const dir = dirPath ? await this.getDir(dirPath) : await this.getRoot();
+            const fileHandle = await dir.getFileHandle(fileName);
+            return new OPFSFileReader(fileHandle);
+        } catch (e) {
+            if (e.name === 'NotFoundError') {
+                return null;
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Check if OPFS is supported in this browser
+     * @returns {Promise<boolean>}
+     */
+    async isSupported() {
+        try {
+            if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) {
+                return false;
+            }
+            // Actually try to access OPFS
+            await navigator.storage.getDirectory();
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    /**
+     * Get storage statistics
+     * @returns {Promise<{fileCount: number, totalSize: number}>}
+     */
+    async getStats() {
+        try {
+            const root = await this.getRoot();
+            let fileCount = 0;
+            let totalSize = 0;
+
+            async function countDir(dir) {
+                for await (const [name, handle] of dir.entries()) {
+                    if (handle.kind === 'file') {
+                        const file = await handle.getFile();
+                        fileCount++;
+                        totalSize += file.size;
+                    } else if (handle.kind === 'directory') {
+                        await countDir(handle);
+                    }
+                }
+            }
+
+            await countDir(root);
+            return { fileCount, totalSize };
+        } catch (e) {
+            return { fileCount: 0, totalSize: 0 };
+        }
+    }
+
+    /**
+     * List all files in storage with their sizes
+     * @returns {Promise<Array<{name: string, size: number, lastModified: number}>>}
+     */
+    async listFiles() {
+        try {
+            const root = await this.getRoot();
+            const files = [];
+
+            async function listDir(dir, prefix = '') {
+                for await (const [name, handle] of dir.entries()) {
+                    if (handle.kind === 'file') {
+                        const file = await handle.getFile();
+                        files.push({
+                            name: prefix ? `${prefix}/${name}` : name,
+                            size: file.size,
+                            lastModified: file.lastModified
+                        });
+                    } else if (handle.kind === 'directory') {
+                        await listDir(handle, prefix ? `${prefix}/${name}` : name);
+                    }
+                }
+            }
+
+            await listDir(root);
+            return files;
+        } catch (e) {
+            return [];
+        }
+    }
+
+    /**
+     * Clear all files in storage
+     * @returns {Promise<number>} Number of files deleted
+     */
+    async clearAll() {
+        try {
+            const root = await this.getRoot();
+            let count = 0;
+
+            const entries = [];
+            for await (const [name, handle] of root.entries()) {
+                entries.push({ name, kind: handle.kind });
+            }
+
+            for (const entry of entries) {
+                await root.removeEntry(entry.name, { recursive: entry.kind === 'directory' });
+                count++;
+            }
+
+            return count;
+        } catch (e) {
+            console.warn('Failed to clear OPFS:', e);
+            return 0;
+        }
+    }
+}
+
+/**
+ * OPFS File Reader for chunked/streaming reads
+ * Wraps a FileSystemFileHandle for efficient byte-range access
+ */
+class OPFSFileReader {
+    constructor(fileHandle) {
+        this.fileHandle = fileHandle;
+        this._file = null;
+        this._size = null;
+    }
+
+    /**
+     * Get the File object (cached)
+     */
+    async getFile() {
+        if (!this._file) {
+            this._file = await this.fileHandle.getFile();
+            this._size = this._file.size;
+        }
+        return this._file;
+    }
+
+    /**
+     * Get file size
+     * @returns {Promise<number>}
+     */
+    async getSize() {
+        if (this._size === null) {
+            await this.getFile();
+        }
+        return this._size;
+    }
+
+    /**
+     * Read a byte range
+     * @param {number} offset - Start byte offset
+     * @param {number} length - Number of bytes to read
+     * @returns {Promise<Uint8Array>}
+     */
+    async readRange(offset, length) {
+        const file = await this.getFile();
+        const blob = file.slice(offset, offset + length);
+        const buffer = await blob.arrayBuffer();
+        return new Uint8Array(buffer);
+    }
+
+    /**
+     * Read from end of file (useful for footer)
+     * @param {number} length - Number of bytes to read from end
+     * @returns {Promise<Uint8Array>}
+     */
+    async readFromEnd(length) {
+        const size = await this.getSize();
+        return this.readRange(size - length, length);
+    }
+
+    /**
+     * Invalidate cache (call after file is modified)
+     */
+    invalidate() {
+        this._file = null;
+        this._size = null;
+    }
+}
+
+/**
+ * LRU Cache for page data
+ * Keeps recently accessed pages in memory to avoid repeated OPFS reads
+ */
+class LRUCache {
+    constructor(maxSize = 50 * 1024 * 1024) { // 50MB default
+        this.maxSize = maxSize;
+        this.currentSize = 0;
+        this.cache = new Map(); // key -> { data, size, lastAccess }
+    }
+
+    /**
+     * Get item from cache
+     * @param {string} key - Cache key
+     * @returns {Uint8Array|null}
+     */
+    get(key) {
+        const entry = this.cache.get(key);
+        if (entry) {
+            entry.lastAccess = Date.now();
+            return entry.data;
+        }
+        return null;
+    }
+
+    /**
+     * Put item in cache
+     * @param {string} key - Cache key
+     * @param {Uint8Array} data - Data to cache
+     */
+    put(key, data) {
+        // Remove existing entry if present
+        if (this.cache.has(key)) {
+            this.currentSize -= this.cache.get(key).size;
+            this.cache.delete(key);
+        }
+
+        const size = data.byteLength;
+
+        // Evict if needed
+        while (this.currentSize + size > this.maxSize && this.cache.size > 0) {
+            this._evictOldest();
+        }
+
+        // Don't cache if single item is too large
+        if (size > this.maxSize) {
+            return;
+        }
+
+        this.cache.set(key, {
+            data,
+            size,
+            lastAccess: Date.now()
+        });
+        this.currentSize += size;
+    }
+
+    /**
+     * Evict oldest entry
+     */
+    _evictOldest() {
+        let oldestKey = null;
+        let oldestTime = Infinity;
+
+        for (const [key, entry] of this.cache) {
+            if (entry.lastAccess < oldestTime) {
+                oldestTime = entry.lastAccess;
+                oldestKey = key;
+            }
+        }
+
+        if (oldestKey) {
+            this.currentSize -= this.cache.get(oldestKey).size;
+            this.cache.delete(oldestKey);
+        }
+    }
+
+    /**
+     * Clear entire cache
+     */
+    clear() {
+        this.cache.clear();
+        this.currentSize = 0;
+    }
+
+    /**
+     * Get cache stats
+     */
+    stats() {
+        return {
+            entries: this.cache.size,
+            currentSize: this.currentSize,
+            maxSize: this.maxSize,
+            utilization: (this.currentSize / this.maxSize * 100).toFixed(1) + '%'
+        };
+    }
+}
+
+// Lance file format constants
+const LANCE_FOOTER_SIZE = 40;
+const LANCE_MAGIC = new Uint8Array([0x4C, 0x41, 0x4E, 0x43]); // "LANC"
+
+/**
+ * Chunked Lance File Reader
+ * Reads Lance files from OPFS without loading entire file into memory
+ */
+class ChunkedLanceReader {
+    /**
+     * @param {OPFSFileReader} fileReader - OPFS file reader
+     * @param {LRUCache} [pageCache] - Optional page cache (shared across readers)
+     */
+    constructor(fileReader, pageCache = null) {
+        this.fileReader = fileReader;
+        this.pageCache = pageCache || new LRUCache();
+        this.footer = null;
+        this.columnMetaCache = new Map(); // colIdx -> metadata
+        this._cacheKey = null; // For cache key generation
+    }
+
+    /**
+     * Open a Lance file from OPFS
+     * @param {OPFSStorage} storage - OPFS storage instance
+     * @param {string} path - File path in OPFS
+     * @param {LRUCache} [pageCache] - Optional shared page cache
+     * @returns {Promise<ChunkedLanceReader>}
+     */
+    static async open(storage, path, pageCache = null) {
+        const fileReader = await storage.openFile(path);
+        if (!fileReader) {
+            throw new Error(`File not found: ${path}`);
+        }
+        const reader = new ChunkedLanceReader(fileReader, pageCache);
+        reader._cacheKey = path;
+        await reader._readFooter();
+        return reader;
+    }
+
+    /**
+     * Read and parse the Lance footer
+     */
+    async _readFooter() {
+        const footerData = await this.fileReader.readFromEnd(LANCE_FOOTER_SIZE);
+
+        // Verify magic bytes
+        const magic = footerData.slice(36, 40);
+        if (!this._arraysEqual(magic, LANCE_MAGIC)) {
+            throw new Error('Invalid Lance file: magic bytes mismatch');
+        }
+
+        // Parse footer (little-endian)
+        const view = new DataView(footerData.buffer, footerData.byteOffset);
+        this.footer = {
+            columnMetaStart: view.getBigUint64(0, true),
+            columnMetaOffsetsStart: view.getBigUint64(8, true),
+            globalBuffOffsetsStart: view.getBigUint64(16, true),
+            numGlobalBuffers: view.getUint32(24, true),
+            numColumns: view.getUint32(28, true),
+            majorVersion: view.getUint16(32, true),
+            minorVersion: view.getUint16(34, true),
+        };
+
+        return this.footer;
+    }
+
+    /**
+     * Compare two Uint8Arrays
+     */
+    _arraysEqual(a, b) {
+        if (a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) {
+            if (a[i] !== b[i]) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Get file size
+     * @returns {Promise<number>}
+     */
+    async getSize() {
+        return this.fileReader.getSize();
+    }
+
+    /**
+     * Get number of columns
+     * @returns {number}
+     */
+    getNumColumns() {
+        if (!this.footer) throw new Error('Footer not loaded');
+        return this.footer.numColumns;
+    }
+
+    /**
+     * Get Lance format version
+     * @returns {{major: number, minor: number}}
+     */
+    getVersion() {
+        if (!this.footer) throw new Error('Footer not loaded');
+        return {
+            major: this.footer.majorVersion,
+            minor: this.footer.minorVersion
+        };
+    }
+
+    /**
+     * Read column metadata offset table
+     * @returns {Promise<BigUint64Array>}
+     */
+    async _readColumnMetaOffsets() {
+        const numCols = this.footer.numColumns;
+        const offsetTableSize = numCols * 8; // 8 bytes per offset
+        const data = await this.fileReader.readRange(
+            Number(this.footer.columnMetaOffsetsStart),
+            offsetTableSize
+        );
+        return new BigUint64Array(data.buffer, data.byteOffset, numCols);
+    }
+
+    /**
+     * Read raw column metadata bytes
+     * @param {number} colIdx - Column index
+     * @returns {Promise<Uint8Array>}
+     */
+    async readColumnMetaRaw(colIdx) {
+        if (colIdx >= this.footer.numColumns) {
+            throw new Error(`Column index ${colIdx} out of range (${this.footer.numColumns} columns)`);
+        }
+
+        // Check cache
+        const cacheKey = `${this._cacheKey}:colmeta:${colIdx}`;
+        const cached = this.pageCache.get(cacheKey);
+        if (cached) return cached;
+
+        // Read offset table
+        const offsets = await this._readColumnMetaOffsets();
+
+        // Calculate start and end
+        const start = Number(this.footer.columnMetaStart) + Number(offsets[colIdx]);
+        const end = colIdx < this.footer.numColumns - 1
+            ? Number(this.footer.columnMetaStart) + Number(offsets[colIdx + 1])
+            : Number(this.footer.columnMetaOffsetsStart);
+
+        const data = await this.fileReader.readRange(start, end - start);
+
+        // Cache it
+        this.pageCache.put(cacheKey, data);
+        return data;
+    }
+
+    /**
+     * Read a specific byte range from the file
+     * @param {number} offset - Start offset
+     * @param {number} length - Number of bytes
+     * @returns {Promise<Uint8Array>}
+     */
+    async readRange(offset, length) {
+        // Check cache
+        const cacheKey = `${this._cacheKey}:range:${offset}:${length}`;
+        const cached = this.pageCache.get(cacheKey);
+        if (cached) return cached;
+
+        const data = await this.fileReader.readRange(offset, length);
+
+        // Cache if reasonably sized
+        if (length < 10 * 1024 * 1024) { // < 10MB
+            this.pageCache.put(cacheKey, data);
+        }
+        return data;
+    }
+
+    /**
+     * Get cache statistics
+     * @returns {object}
+     */
+    getCacheStats() {
+        return this.pageCache.stats();
+    }
+
+    /**
+     * Close the reader and release resources
+     */
+    close() {
+        this.fileReader.invalidate();
+        this.columnMetaCache.clear();
+    }
+}
+
+// =============================================================================
+// Memory Manager - Global memory monitoring and management
+// =============================================================================
+
+/**
+ * Global memory manager for browser environment.
+ * Monitors memory usage and triggers cleanup when needed.
+ */
+class MemoryManager {
+    constructor(options = {}) {
+        this.maxHeapMB = options.maxHeapMB || 100; // Target max heap usage
+        this.warningThreshold = options.warningThreshold || 0.8; // 80% warning
+        this.caches = new Set(); // Registered LRU caches
+        this.lastCheck = 0;
+        this.checkInterval = 5000; // Check every 5 seconds
+    }
+
+    /**
+     * Register a cache for memory management
+     * @param {LRUCache} cache - Cache to manage
+     */
+    registerCache(cache) {
+        this.caches.add(cache);
+    }
+
+    /**
+     * Unregister a cache
+     * @param {LRUCache} cache - Cache to remove
+     */
+    unregisterCache(cache) {
+        this.caches.delete(cache);
+    }
+
+    /**
+     * Get current memory usage (if available)
+     * @returns {Object|null} Memory info or null if not available
+     */
+    getMemoryUsage() {
+        if (typeof performance !== 'undefined' && performance.memory) {
+            // Chrome/Chromium only
+            return {
+                usedHeapMB: performance.memory.usedJSHeapSize / (1024 * 1024),
+                totalHeapMB: performance.memory.totalJSHeapSize / (1024 * 1024),
+                limitMB: performance.memory.jsHeapSizeLimit / (1024 * 1024),
+            };
+        }
+        return null;
+    }
+
+    /**
+     * Check memory and trigger cleanup if needed
+     * @returns {boolean} True if cleanup was triggered
+     */
+    checkAndCleanup() {
+        const now = Date.now();
+        if (now - this.lastCheck < this.checkInterval) {
+            return false;
+        }
+        this.lastCheck = now;
+
+        const memory = this.getMemoryUsage();
+        if (!memory) return false;
+
+        const usageRatio = memory.usedHeapMB / this.maxHeapMB;
+
+        if (usageRatio > this.warningThreshold) {
+            console.warn(`[MemoryManager] High memory usage: ${memory.usedHeapMB.toFixed(1)}MB / ${this.maxHeapMB}MB`);
+            this.cleanup();
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Force cleanup of all registered caches
+     */
+    cleanup() {
+        for (const cache of this.caches) {
+            // Evict 50% of entries
+            const stats = cache.stats();
+            const targetSize = stats.currentSize / 2;
+
+            while (cache.currentSize > targetSize && cache.cache.size > 0) {
+                cache._evictOldest();
+            }
+        }
+    }
+
+    /**
+     * Get aggregate cache stats
+     * @returns {Object} Combined stats from all caches
+     */
+    getCacheStats() {
+        let totalEntries = 0;
+        let totalSize = 0;
+        let totalMaxSize = 0;
+
+        for (const cache of this.caches) {
+            const stats = cache.stats();
+            totalEntries += stats.entries;
+            totalSize += stats.currentSize;
+            totalMaxSize += stats.maxSize;
+        }
+
+        return {
+            caches: this.caches.size,
+            totalEntries,
+            totalSizeMB: (totalSize / (1024 * 1024)).toFixed(2),
+            totalMaxSizeMB: (totalMaxSize / (1024 * 1024)).toFixed(2),
+            memory: this.getMemoryUsage(),
+        };
+    }
+}
+
+// Global memory manager instance
+const memoryManager = new MemoryManager();
+
+/**
+ * Streaming utilities for large file processing
+ */
+const StreamUtils = {
+    /**
+     * Process items in batches with memory-aware pacing
+     * @param {AsyncIterable} source - Source of items
+     * @param {Function} processor - Async function to process each batch
+     * @param {Object} options - Options
+     * @yields {any} Results from processor
+     */
+    async *processBatches(source, processor, options = {}) {
+        const batchSize = options.batchSize || 10000;
+        const pauseAfter = options.pauseAfter || 5; // Pause every N batches for GC
+        let batchCount = 0;
+
+        for await (const batch of source) {
+            yield await processor(batch);
+            batchCount++;
+
+            // Periodic memory check
+            if (batchCount % pauseAfter === 0) {
+                memoryManager.checkAndCleanup();
+                // Small delay to allow GC
+                await new Promise(r => setTimeout(r, 0));
+            }
+        }
+    },
+
+    /**
+     * Create a progress-reporting wrapper for async iterables
+     * @param {AsyncIterable} source - Source iterable
+     * @param {Function} onProgress - Progress callback (processed, total?)
+     */
+    async *withProgress(source, onProgress) {
+        let processed = 0;
+        for await (const item of source) {
+            processed += Array.isArray(item) ? item.length : 1;
+            onProgress(processed);
+            yield item;
+        }
+    },
+
+    /**
+     * Limit memory usage by processing in chunks with explicit cleanup
+     * @param {AsyncIterable} source - Source of data chunks
+     * @param {number} maxChunksInFlight - Max chunks to keep in memory
+     */
+    async *throttle(source, maxChunksInFlight = 3) {
+        const queue = [];
+
+        for await (const chunk of source) {
+            queue.push(chunk);
+
+            if (queue.length >= maxChunksInFlight) {
+                yield queue.shift();
+            }
+        }
+
+        // Drain remaining
+        while (queue.length > 0) {
+            yield queue.shift();
+        }
+    },
+};
+
+// Export memory utilities
+export { memoryManager, MemoryManager, StreamUtils };
+
+// =============================================================================
+// Protobuf Encoder - Minimal encoder for Lance column metadata
+// =============================================================================
+
+/**
+ * Simple Protobuf encoder for Lance metadata.
+ * Only implements what's needed for Lance file writing.
+ */
+class ProtobufEncoder {
+    constructor() {
+        this.chunks = [];
+    }
+
+    /**
+     * Encode a varint (variable-length integer)
+     * @param {number|bigint} value
+     * @returns {Uint8Array}
+     */
+    static encodeVarint(value) {
+        const bytes = [];
+        let v = typeof value === 'bigint' ? value : BigInt(value);
+        while (v > 0x7fn) {
+            bytes.push(Number(v & 0x7fn) | 0x80);
+            v >>= 7n;
+        }
+        bytes.push(Number(v));
+        return new Uint8Array(bytes);
+    }
+
+    /**
+     * Encode a field header (tag)
+     * @param {number} fieldNum - Field number
+     * @param {number} wireType - Wire type (0=varint, 2=length-delimited)
+     * @returns {Uint8Array}
+     */
+    static encodeFieldHeader(fieldNum, wireType) {
+        const tag = (fieldNum << 3) | wireType;
+        return ProtobufEncoder.encodeVarint(tag);
+    }
+
+    /**
+     * Encode a varint field
+     * @param {number} fieldNum
+     * @param {number|bigint} value
+     */
+    writeVarint(fieldNum, value) {
+        this.chunks.push(ProtobufEncoder.encodeFieldHeader(fieldNum, 0));
+        this.chunks.push(ProtobufEncoder.encodeVarint(value));
+    }
+
+    /**
+     * Encode a length-delimited field (bytes or nested message)
+     * @param {number} fieldNum
+     * @param {Uint8Array} data
+     */
+    writeBytes(fieldNum, data) {
+        this.chunks.push(ProtobufEncoder.encodeFieldHeader(fieldNum, 2));
+        this.chunks.push(ProtobufEncoder.encodeVarint(data.length));
+        this.chunks.push(data);
+    }
+
+    /**
+     * Encode packed repeated uint64 as varints
+     * @param {number} fieldNum
+     * @param {BigUint64Array|number[]} values
+     */
+    writePackedUint64(fieldNum, values) {
+        // First encode all varints
+        const varintChunks = [];
+        for (const v of values) {
+            varintChunks.push(ProtobufEncoder.encodeVarint(v));
+        }
+        // Calculate total length
+        const totalLen = varintChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+        // Write field header + length + data
+        this.chunks.push(ProtobufEncoder.encodeFieldHeader(fieldNum, 2));
+        this.chunks.push(ProtobufEncoder.encodeVarint(totalLen));
+        for (const chunk of varintChunks) {
+            this.chunks.push(chunk);
+        }
+    }
+
+    /**
+     * Get the encoded bytes
+     * @returns {Uint8Array}
+     */
+    toBytes() {
+        const totalLen = this.chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+        const result = new Uint8Array(totalLen);
+        let offset = 0;
+        for (const chunk of this.chunks) {
+            result.set(chunk, offset);
+            offset += chunk.length;
+        }
+        return result;
+    }
+
+    /**
+     * Clear the encoder for reuse
+     */
+    clear() {
+        this.chunks = [];
+    }
+}
+
+// =============================================================================
+// LanceFileWriter - Create Lance files in pure JavaScript
+// =============================================================================
+
+/**
+ * Lance column types
+ */
+const LanceColumnType = {
+    INT64: 'int64',
+    FLOAT64: 'float64',
+    STRING: 'string',
+    BOOL: 'bool',
+    INT32: 'int32',
+    FLOAT32: 'float32',
+};
+
+/**
+ * Pure JavaScript Lance File Writer - Creates Lance files without WASM.
+ * Use this when WASM is not available or for simple file creation.
+ * Supports basic column types: int64, float64, string, bool.
+ *
+ * @example
+ * const writer = new PureLanceWriter();
+ * writer.addInt64Column('id', BigInt64Array.from([1n, 2n, 3n]));
+ * writer.addFloat64Column('score', new Float64Array([0.5, 0.8, 0.3]));
+ * writer.addStringColumn('name', ['Alice', 'Bob', 'Charlie']);
+ * const lanceData = writer.finalize();
+ * await opfsStorage.save('mydata.lance', lanceData);
+ */
+class PureLanceWriter {
+    /**
+     * @param {Object} options
+     * @param {number} [options.majorVersion=0] - Lance format major version
+     * @param {number} [options.minorVersion=3] - Lance format minor version (3 = v2.0)
+     */
+    constructor(options = {}) {
+        this.majorVersion = options.majorVersion ?? 0;
+        this.minorVersion = options.minorVersion ?? 3; // v2.0
+        this.columns = []; // { name, type, data, metadata }
+        this.rowCount = null;
+    }
+
+    /**
+     * Validate row count consistency
+     * @param {number} count
+     */
+    _validateRowCount(count) {
+        if (this.rowCount === null) {
+            this.rowCount = count;
+        } else if (this.rowCount !== count) {
+            throw new Error(`Row count mismatch: expected ${this.rowCount}, got ${count}`);
+        }
+    }
+
+    /**
+     * Add an int64 column
+     * @param {string} name - Column name
+     * @param {BigInt64Array} values - Column values
+     */
+    addInt64Column(name, values) {
+        this._validateRowCount(values.length);
+        this.columns.push({
+            name,
+            type: LanceColumnType.INT64,
+            data: new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
+            length: values.length,
+        });
+    }
+
+    /**
+     * Add an int32 column
+     * @param {string} name - Column name
+     * @param {Int32Array} values - Column values
+     */
+    addInt32Column(name, values) {
+        this._validateRowCount(values.length);
+        this.columns.push({
+            name,
+            type: LanceColumnType.INT32,
+            data: new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
+            length: values.length,
+        });
+    }
+
+    /**
+     * Add a float64 column
+     * @param {string} name - Column name
+     * @param {Float64Array} values - Column values
+     */
+    addFloat64Column(name, values) {
+        this._validateRowCount(values.length);
+        this.columns.push({
+            name,
+            type: LanceColumnType.FLOAT64,
+            data: new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
+            length: values.length,
+        });
+    }
+
+    /**
+     * Add a float32 column
+     * @param {string} name - Column name
+     * @param {Float32Array} values - Column values
+     */
+    addFloat32Column(name, values) {
+        this._validateRowCount(values.length);
+        this.columns.push({
+            name,
+            type: LanceColumnType.FLOAT32,
+            data: new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
+            length: values.length,
+        });
+    }
+
+    /**
+     * Add a boolean column
+     * @param {string} name - Column name
+     * @param {boolean[]} values - Column values
+     */
+    addBoolColumn(name, values) {
+        this._validateRowCount(values.length);
+        // Pack booleans as bytes (1 byte per bool for simplicity)
+        const data = new Uint8Array(values.length);
+        for (let i = 0; i < values.length; i++) {
+            data[i] = values[i] ? 1 : 0;
+        }
+        this.columns.push({
+            name,
+            type: LanceColumnType.BOOL,
+            data,
+            length: values.length,
+        });
+    }
+
+    /**
+     * Add a string column
+     * @param {string} name - Column name
+     * @param {string[]} values - Column values
+     */
+    addStringColumn(name, values) {
+        this._validateRowCount(values.length);
+
+        const encoder = new TextEncoder();
+
+        // Build offsets and data
+        // Lance strings use i32 offsets followed by UTF-8 data
+        const offsets = new Int32Array(values.length + 1);
+        const dataChunks = [];
+        let currentOffset = 0;
+
+        for (let i = 0; i < values.length; i++) {
+            offsets[i] = currentOffset;
+            const encoded = encoder.encode(values[i]);
+            dataChunks.push(encoded);
+            currentOffset += encoded.length;
+        }
+        offsets[values.length] = currentOffset;
+
+        // Combine offsets and data
+        const offsetsBytes = new Uint8Array(offsets.buffer);
+        const totalDataLen = dataChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+        const stringData = new Uint8Array(totalDataLen);
+        let writePos = 0;
+        for (const chunk of dataChunks) {
+            stringData.set(chunk, writePos);
+            writePos += chunk.length;
+        }
+
+        // Store both parts
+        this.columns.push({
+            name,
+            type: LanceColumnType.STRING,
+            offsetsData: offsetsBytes,
+            stringData,
+            data: null, // Will be combined in finalize
+            length: values.length,
+        });
+    }
+
+    /**
+     * Build column metadata protobuf for a column
+     * @param {number} bufferOffset - Offset to column data
+     * @param {number} bufferSize - Size of column data
+     * @param {number} length - Number of rows
+     * @param {string} type - Column type
+     * @returns {Uint8Array}
+     */
+    _buildColumnMeta(bufferOffset, bufferSize, length, type) {
+        // Build Page message
+        const pageEncoder = new ProtobufEncoder();
+        pageEncoder.writePackedUint64(1, [BigInt(bufferOffset)]); // buffer_offsets
+        pageEncoder.writePackedUint64(2, [BigInt(bufferSize)]); // buffer_sizes
+        pageEncoder.writeVarint(3, length); // length
+        // Skip encoding (field 4) - use default
+        pageEncoder.writeVarint(5, 0); // priority
+        const pageBytes = pageEncoder.toBytes();
+
+        // Build ColumnMetadata message
+        const metaEncoder = new ProtobufEncoder();
+        // Skip encoding (field 1) - use default plain encoding
+        metaEncoder.writeBytes(2, pageBytes); // pages (repeated)
+        // Skip buffer_offsets and buffer_sizes at column level
+
+        return metaEncoder.toBytes();
+    }
+
+    /**
+     * Build column metadata for string column (2 buffers: offsets + data)
+     * @param {number} offsetsBufOffset - Offset to offsets buffer
+     * @param {number} offsetsBufSize - Size of offsets buffer
+     * @param {number} dataBufOffset - Offset to string data buffer
+     * @param {number} dataBufSize - Size of string data buffer
+     * @param {number} length - Number of rows
+     * @returns {Uint8Array}
+     */
+    _buildStringColumnMeta(offsetsBufOffset, offsetsBufSize, dataBufOffset, dataBufSize, length) {
+        // Build Page message with 2 buffers
+        const pageEncoder = new ProtobufEncoder();
+        pageEncoder.writePackedUint64(1, [BigInt(offsetsBufOffset), BigInt(dataBufOffset)]); // buffer_offsets
+        pageEncoder.writePackedUint64(2, [BigInt(offsetsBufSize), BigInt(dataBufSize)]); // buffer_sizes
+        pageEncoder.writeVarint(3, length); // length
+        pageEncoder.writeVarint(5, 0); // priority
+        const pageBytes = pageEncoder.toBytes();
+
+        // Build ColumnMetadata message
+        const metaEncoder = new ProtobufEncoder();
+        metaEncoder.writeBytes(2, pageBytes); // pages (repeated)
+
+        return metaEncoder.toBytes();
+    }
+
+    /**
+     * Finalize and create the Lance file
+     * @returns {Uint8Array} Complete Lance file data
+     */
+    finalize() {
+        if (this.columns.length === 0) {
+            throw new Error('No columns added');
+        }
+
+        const chunks = [];
+        let currentOffset = 0;
+
+        // 1. Write column data buffers
+        const columnBufferInfos = []; // { offset, size } for each column
+
+        for (const col of this.columns) {
+            if (col.type === LanceColumnType.STRING) {
+                // String columns have 2 buffers: offsets + data
+                const offsetsOffset = currentOffset;
+                chunks.push(col.offsetsData);
+                currentOffset += col.offsetsData.length;
+
+                const dataOffset = currentOffset;
+                chunks.push(col.stringData);
+                currentOffset += col.stringData.length;
+
+                columnBufferInfos.push({
+                    type: 'string',
+                    offsetsOffset,
+                    offsetsSize: col.offsetsData.length,
+                    dataOffset,
+                    dataSize: col.stringData.length,
+                    length: col.length,
+                });
+            } else {
+                // Simple column with single buffer
+                const bufferOffset = currentOffset;
+                chunks.push(col.data);
+                currentOffset += col.data.length;
+
+                columnBufferInfos.push({
+                    type: col.type,
+                    offset: bufferOffset,
+                    size: col.data.length,
+                    length: col.length,
+                });
+            }
+        }
+
+        // 2. Build column metadata
+        const columnMetadatas = [];
+        for (let i = 0; i < this.columns.length; i++) {
+            const info = columnBufferInfos[i];
+            let meta;
+            if (info.type === 'string') {
+                meta = this._buildStringColumnMeta(
+                    info.offsetsOffset, info.offsetsSize,
+                    info.dataOffset, info.dataSize,
+                    info.length
+                );
+            } else {
+                meta = this._buildColumnMeta(info.offset, info.size, info.length, info.type);
+            }
+            columnMetadatas.push(meta);
+        }
+
+        // 3. Write column metadata section
+        const columnMetaStart = currentOffset;
+        const columnMetaOffsets = [];
+        let metaOffset = 0;
+        for (const meta of columnMetadatas) {
+            columnMetaOffsets.push(metaOffset);
+            chunks.push(meta);
+            currentOffset += meta.length;
+            metaOffset += meta.length;
+        }
+
+        // 4. Write column metadata offset table
+        const columnMetaOffsetsStart = currentOffset;
+        const offsetTable = new BigUint64Array(columnMetaOffsets.length);
+        for (let i = 0; i < columnMetaOffsets.length; i++) {
+            offsetTable[i] = BigInt(columnMetaOffsets[i]);
+        }
+        const offsetTableBytes = new Uint8Array(offsetTable.buffer);
+        chunks.push(offsetTableBytes);
+        currentOffset += offsetTableBytes.length;
+
+        // 5. Write global buffer offsets (empty for now)
+        const globalBuffOffsetsStart = currentOffset;
+        const numGlobalBuffers = 0;
+
+        // 6. Write footer (40 bytes)
+        const footer = new ArrayBuffer(LANCE_FOOTER_SIZE);
+        const footerView = new DataView(footer);
+
+        footerView.setBigUint64(0, BigInt(columnMetaStart), true);           // column_meta_start
+        footerView.setBigUint64(8, BigInt(columnMetaOffsetsStart), true);    // column_meta_offsets_start
+        footerView.setBigUint64(16, BigInt(globalBuffOffsetsStart), true);   // global_buff_offsets_start
+        footerView.setUint32(24, numGlobalBuffers, true);                    // num_global_buffers
+        footerView.setUint32(28, this.columns.length, true);                 // num_columns
+        footerView.setUint16(32, this.majorVersion, true);                   // major_version
+        footerView.setUint16(34, this.minorVersion, true);                   // minor_version
+        // Magic "LANC"
+        new Uint8Array(footer, 36, 4).set(LANCE_MAGIC);
+
+        chunks.push(new Uint8Array(footer));
+
+        // 7. Combine all chunks
+        const totalSize = currentOffset + LANCE_FOOTER_SIZE;
+        const result = new Uint8Array(totalSize);
+        let writeOffset = 0;
+        for (const chunk of chunks) {
+            result.set(chunk, writeOffset);
+            writeOffset += chunk.length;
+        }
+
+        return result;
+    }
+
+    /**
+     * Get the number of columns
+     * @returns {number}
+     */
+    getNumColumns() {
+        return this.columns.length;
+    }
+
+    /**
+     * Get the row count
+     * @returns {number|null}
+     */
+    getRowCount() {
+        return this.rowCount;
+    }
+
+    /**
+     * Get column names
+     * @returns {string[]}
+     */
+    getColumnNames() {
+        return this.columns.map(c => c.name);
+    }
 }
 
 // Legacy IndexedDB + OPFS storage (deprecated, use OPFSStorage instead)
@@ -1724,7 +2920,7 @@ class HotTierCache {
 const hotTierCache = new HotTierCache();
 
 // Export storage and statistics for external use
-export { opfsStorage, OPFSStorage, datasetStorage, DatasetStorage, statisticsManager, StatisticsManager, hotTierCache, HotTierCache };
+export { opfsStorage, OPFSStorage, OPFSFileReader, LRUCache, ChunkedLanceReader, ProtobufEncoder, PureLanceWriter, LanceColumnType, datasetStorage, DatasetStorage, statisticsManager, StatisticsManager, hotTierCache, HotTierCache };
 
 // =============================================================================
 // OPFSJoinExecutor - OPFS-backed join execution for TB-scale joins
@@ -2895,12 +4091,401 @@ export class LocalDatabase {
     }
 
     /**
+     * Streaming scan - yields batches of rows for memory-efficient processing
+     * @param {string} tableName - Table name
+     * @param {Object} options - Scan options {batchSize, where, columns}
+     * @yields {Object[]} Batch of rows
+     *
+     * @example
+     * for await (const batch of db.scan('users', { batchSize: 1000, where: r => r.age > 18 })) {
+     *   processBatch(batch);
+     * }
+     */
+    async *scan(tableName, options = {}) {
+        if (!this.tables.has(tableName)) {
+            throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        const table = this.tables.get(tableName);
+        const deletedSet = new Set(table.deletionVector);
+        const batchSize = options.batchSize || 10000;
+        const whereFn = options.where || (() => true);
+        const columns = options.columns;
+
+        let batch = [];
+
+        for (const fragKey of table.fragments) {
+            const fragData = await this.storage.load(fragKey);
+            if (!fragData) continue;
+
+            const rows = this._parseFragment(fragData, table.schema);
+
+            for (const row of rows) {
+                if (deletedSet.has(row.__rowId)) continue;
+                if (!whereFn(row)) continue;
+
+                // Project columns if specified
+                let projectedRow;
+                if (columns && columns.length > 0 && columns[0] !== '*') {
+                    projectedRow = {};
+                    for (const col of columns) {
+                        projectedRow[col] = row[col];
+                    }
+                } else {
+                    const { __rowId, ...rest } = row;
+                    projectedRow = rest;
+                }
+
+                batch.push(projectedRow);
+
+                if (batch.length >= batchSize) {
+                    yield batch;
+                    batch = [];
+                }
+            }
+        }
+
+        // Yield remaining rows
+        if (batch.length > 0) {
+            yield batch;
+        }
+    }
+
+    /**
+     * Count rows in a table (efficient - doesn't load data)
+     * @param {string} tableName - Table name
+     * @param {Function} [where] - Optional filter function
+     * @returns {Promise<number>}
+     */
+    async count(tableName, where = null) {
+        if (!this.tables.has(tableName)) {
+            throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        const table = this.tables.get(tableName);
+
+        // Fast path: if no filter and no deletions, return cached count
+        if (!where && table.deletionVector.length === 0) {
+            return table.rowCount;
+        }
+
+        // Otherwise count with filter/deletions
+        let count = 0;
+        for await (const batch of this.scan(tableName, { where })) {
+            count += batch.length;
+        }
+        return count;
+    }
+
+    /**
+     * Get table schema
+     * @param {string} tableName - Table name
+     * @returns {Array} Column schema
+     */
+    getSchema(tableName) {
+        const table = this.tables.get(tableName);
+        if (!table) {
+            throw new Error(`Table '${tableName}' does not exist`);
+        }
+        return table.schema;
+    }
+
+    /**
      * Close the database
      */
     async close() {
         await this._saveManifest();
     }
 }
+
+// =============================================================================
+// Unified LanceData API - Single interface for local and remote Lance files
+// =============================================================================
+
+/**
+ * Base class for unified Lance data access.
+ * Provides common interface for both local (OPFS) and remote (HTTP) Lance files.
+ */
+class LanceDataBase {
+    constructor(type) {
+        this.type = type; // 'local' | 'remote' | 'cached'
+    }
+
+    // Abstract methods - must be implemented by subclasses
+    async getSchema() { throw new Error('Not implemented'); }
+    async getRowCount() { throw new Error('Not implemented'); }
+    async readColumn(colIdx, start = 0, count = null) { throw new Error('Not implemented'); }
+    async *scan(options = {}) { throw new Error('Not implemented'); }
+
+    // Optional methods
+    async insert(rows) { throw new Error('Write not supported for this source'); }
+    isCached() { return false; }
+    async prefetch() { }
+    async evict() { }
+    async close() { }
+}
+
+/**
+ * OPFS-backed Lance data for local files.
+ * Uses ChunkedLanceReader for efficient memory usage.
+ */
+class OPFSLanceData extends LanceDataBase {
+    constructor(path, storage = opfsStorage) {
+        super('local');
+        this.path = path;
+        this.storage = storage;
+        this.reader = null;
+        this.database = null;
+        this._isDatabase = false;
+    }
+
+    /**
+     * Open OPFS Lance file or database
+     */
+    async open() {
+        // Check if it's a database (directory with manifest)
+        const manifestPath = `${this.path}/__manifest__`;
+        if (await this.storage.exists(manifestPath)) {
+            this._isDatabase = true;
+            this.database = new LocalDatabase(this.path, this.storage);
+            await this.database.open();
+        } else {
+            // Single Lance file
+            this.reader = await ChunkedLanceReader.open(this.storage, this.path);
+        }
+        return this;
+    }
+
+    async getSchema() {
+        if (this._isDatabase) {
+            const tables = this.database.listTables();
+            if (tables.length === 0) return [];
+            return this.database.getSchema(tables[0]);
+        }
+        // For single file, return column count (no schema info in simple Lance files)
+        return Array.from({ length: this.reader.getNumColumns() }, (_, i) => ({
+            name: `col_${i}`,
+            type: 'unknown'
+        }));
+    }
+
+    async getRowCount() {
+        if (this._isDatabase) {
+            const tables = this.database.listTables();
+            if (tables.length === 0) return 0;
+            return this.database.count(tables[0]);
+        }
+        // Read first column metadata for row count
+        const meta = await this.reader.readColumnMetaRaw(0);
+        // Parse row count from protobuf (simplified)
+        return 0; // Would need protobuf decoder
+    }
+
+    async readColumn(colIdx, start = 0, count = null) {
+        if (this._isDatabase) {
+            throw new Error('Use select() for database queries');
+        }
+        return this.reader.readColumnMetaRaw(colIdx);
+    }
+
+    async *scan(options = {}) {
+        if (this._isDatabase) {
+            const tables = this.database.listTables();
+            if (tables.length === 0) return;
+            yield* this.database.scan(tables[0], options);
+        } else {
+            throw new Error('scan() requires database, use readColumn() for single files');
+        }
+    }
+
+    async insert(rows) {
+        if (!this._isDatabase) {
+            throw new Error('insert() requires database');
+        }
+        const tables = this.database.listTables();
+        if (tables.length === 0) {
+            throw new Error('No tables in database');
+        }
+        return this.database.insert(tables[0], rows);
+    }
+
+    isCached() {
+        return true; // OPFS is always local
+    }
+
+    async close() {
+        if (this.reader) {
+            this.reader.close();
+        }
+        if (this.database) {
+            await this.database.close();
+        }
+    }
+}
+
+/**
+ * HTTP-backed Lance data for remote files.
+ * Uses HotTierCache for OPFS caching.
+ */
+class RemoteLanceData extends LanceDataBase {
+    constructor(url) {
+        super('remote');
+        this.url = url;
+        this.remoteFile = null;
+        this.cachedPath = null;
+    }
+
+    async open() {
+        // Check if already cached
+        const cacheInfo = await hotTierCache.getCacheInfo(this.url);
+        if (cacheInfo && cacheInfo.complete) {
+            this.type = 'cached';
+            this.cachedPath = cacheInfo.path;
+        }
+
+        // Open remote file (will use HTTP Range requests)
+        // This assumes RemoteLanceFile exists in the codebase
+        if (typeof RemoteLanceFile !== 'undefined') {
+            this.remoteFile = await RemoteLanceFile.open(null, this.url);
+        }
+
+        return this;
+    }
+
+    async getSchema() {
+        if (!this.remoteFile) {
+            return [];
+        }
+        // Get column types
+        const numCols = this.remoteFile.numColumns;
+        const schema = [];
+        for (let i = 0; i < numCols; i++) {
+            const type = await this.remoteFile.getColumnType(i);
+            schema.push({ name: `col_${i}`, type });
+        }
+        return schema;
+    }
+
+    async getRowCount() {
+        if (!this.remoteFile) return 0;
+        return this.remoteFile.getRowCount();
+    }
+
+    async readColumn(colIdx, start = 0, count = null) {
+        if (!this.remoteFile) {
+            throw new Error('Remote file not opened');
+        }
+        // Use remote file's column reading
+        const type = await this.remoteFile.getColumnType(colIdx);
+        if (type.includes('int64')) {
+            return this.remoteFile.readInt64Column(colIdx, count);
+        } else if (type.includes('float64')) {
+            return this.remoteFile.readFloat64Column(colIdx, count);
+        } else if (type.includes('string')) {
+            return this.remoteFile.readStrings(colIdx, count);
+        }
+        throw new Error(`Unsupported column type: ${type}`);
+    }
+
+    async *scan(options = {}) {
+        // For remote files, read in batches
+        const batchSize = options.batchSize || 10000;
+        const rowCount = await this.getRowCount();
+        const schema = await this.getSchema();
+
+        for (let offset = 0; offset < rowCount; offset += batchSize) {
+            const count = Math.min(batchSize, rowCount - offset);
+            const batch = [];
+
+            // Read each column for this batch
+            const columns = {};
+            for (let i = 0; i < schema.length; i++) {
+                columns[schema[i].name] = await this.readColumn(i, offset, count);
+            }
+
+            // Build rows
+            for (let r = 0; r < count; r++) {
+                const row = {};
+                for (const name of Object.keys(columns)) {
+                    row[name] = columns[name][r];
+                }
+                if (!options.where || options.where(row)) {
+                    batch.push(row);
+                }
+            }
+
+            yield batch;
+        }
+    }
+
+    isCached() {
+        return this.type === 'cached';
+    }
+
+    async prefetch() {
+        // Cache entire file to OPFS
+        await hotTierCache.cache(this.url);
+        const cacheInfo = await hotTierCache.getCacheInfo(this.url);
+        if (cacheInfo && cacheInfo.complete) {
+            this.type = 'cached';
+            this.cachedPath = cacheInfo.path;
+        }
+    }
+
+    async evict() {
+        await hotTierCache.evict(this.url);
+        this.type = 'remote';
+        this.cachedPath = null;
+    }
+
+    async close() {
+        if (this.remoteFile) {
+            this.remoteFile.close();
+        }
+    }
+}
+
+/**
+ * Factory function to open Lance data from any source.
+ * Supports:
+ * - opfs://path - Local OPFS file or database
+ * - https://url - Remote HTTP file (with optional caching)
+ *
+ * @param {string} source - Data source URI
+ * @returns {Promise<LanceDataBase>}
+ *
+ * @example
+ * // Local OPFS database
+ * const local = await openLance('opfs://mydb');
+ * for await (const batch of local.scan()) {
+ *   processBatch(batch);
+ * }
+ *
+ * // Remote file with caching
+ * const remote = await openLance('https://example.com/data.lance');
+ * await remote.prefetch(); // Cache to OPFS
+ * const data = await remote.readColumn(0);
+ */
+async function openLance(source) {
+    if (source.startsWith('opfs://')) {
+        const path = source.slice(7);
+        const data = new OPFSLanceData(path);
+        await data.open();
+        return data;
+    } else if (source.startsWith('http://') || source.startsWith('https://')) {
+        const data = new RemoteLanceData(source);
+        await data.open();
+        return data;
+    } else {
+        // Assume OPFS path without prefix
+        const data = new OPFSLanceData(source);
+        await data.open();
+        return data;
+    }
+}
+
+// Export unified API
+export { openLance, LanceDataBase, OPFSLanceData, RemoteLanceData };
 
 /**
  * SQL Parser for LocalDatabase (supports CREATE, INSERT, UPDATE, DELETE, SELECT)

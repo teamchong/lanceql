@@ -1,14 +1,7 @@
 name: Deploy to GitHub Pages
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'src/wasm.zig'
-      - 'examples/wasm/**'
-      - 'packages/browser/src/**'  # lanceql.js source (symlinked from examples/wasm)
-      - '.github/workflows/pages.yml'
-  workflow_dispatch:
+  workflow_dispatch:  # Manual trigger only
 
 permissions:
   contents: read

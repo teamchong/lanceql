@@ -312,6 +312,818 @@ export const DatasetStorage: {
 };
 
 // =============================================================================
+// OPFS Storage (Origin Private File System)
+// =============================================================================
+
+/**
+ * OPFS-only storage for Lance database files.
+ * Uses Origin Private File System exclusively for high-performance file access.
+ */
+export interface OPFSStorage {
+  /**
+   * Open the storage (ensure root directory exists)
+   */
+  open(): Promise<OPFSStorage>;
+
+  /**
+   * Save data to a file
+   * @param path File path (e.g., 'mydb/users/frag_001.lance')
+   * @param data File data
+   */
+  save(path: string, data: Uint8Array): Promise<{ path: string; size: number }>;
+
+  /**
+   * Load data from a file
+   * @param path File path
+   * @returns File data or null if not found
+   */
+  load(path: string): Promise<Uint8Array | null>;
+
+  /**
+   * Delete a file
+   * @param path File path
+   */
+  delete(path: string): Promise<boolean>;
+
+  /**
+   * List files in a directory
+   * @param dirPath Directory path
+   */
+  list(dirPath?: string): Promise<Array<{ name: string; type: 'file' | 'directory' }>>;
+
+  /**
+   * Check if a file exists
+   * @param path File path
+   */
+  exists(path: string): Promise<boolean>;
+
+  /**
+   * Delete a directory and all contents
+   * @param dirPath Directory path
+   */
+  deleteDir(dirPath: string): Promise<boolean>;
+
+  /**
+   * Read a byte range from a file without loading the entire file
+   * @param path File path
+   * @param offset Start byte offset
+   * @param length Number of bytes to read
+   */
+  readRange(path: string, offset: number, length: number): Promise<Uint8Array | null>;
+
+  /**
+   * Get file size without loading the file
+   * @param path File path
+   */
+  getFileSize(path: string): Promise<number | null>;
+
+  /**
+   * Open a file for chunked reading
+   * @param path File path
+   */
+  openFile(path: string): Promise<OPFSFileReader | null>;
+}
+
+/** Global OPFS storage instance */
+export const opfsStorage: OPFSStorage;
+
+/** OPFSStorage class for creating custom instances */
+export const OPFSStorage: {
+  new(rootDir?: string): OPFSStorage;
+};
+
+/**
+ * OPFS File Reader for chunked/streaming reads.
+ * Wraps a FileSystemFileHandle for efficient byte-range access.
+ */
+export interface OPFSFileReader {
+  /**
+   * Get file size
+   */
+  getSize(): Promise<number>;
+
+  /**
+   * Read a byte range
+   * @param offset Start byte offset
+   * @param length Number of bytes to read
+   */
+  readRange(offset: number, length: number): Promise<Uint8Array>;
+
+  /**
+   * Read from end of file (useful for footer)
+   * @param length Number of bytes to read from end
+   */
+  readFromEnd(length: number): Promise<Uint8Array>;
+
+  /**
+   * Invalidate cache (call after file is modified)
+   */
+  invalidate(): void;
+}
+
+/** OPFSFileReader class */
+export const OPFSFileReader: {
+  new(fileHandle: FileSystemFileHandle): OPFSFileReader;
+};
+
+/**
+ * LRU Cache statistics
+ */
+export interface LRUCacheStats {
+  entries: number;
+  currentSize: number;
+  maxSize: number;
+  utilization: string;
+}
+
+/**
+ * LRU Cache for page data.
+ * Keeps recently accessed pages in memory to avoid repeated OPFS reads.
+ */
+export interface LRUCache {
+  /**
+   * Get item from cache
+   * @param key Cache key
+   */
+  get(key: string): Uint8Array | null;
+
+  /**
+   * Put item in cache
+   * @param key Cache key
+   * @param data Data to cache
+   */
+  put(key: string, data: Uint8Array): void;
+
+  /**
+   * Clear entire cache
+   */
+  clear(): void;
+
+  /**
+   * Get cache statistics
+   */
+  stats(): LRUCacheStats;
+}
+
+/** LRUCache class */
+export const LRUCache: {
+  new(maxSize?: number): LRUCache;
+};
+
+/**
+ * Lance file footer information
+ */
+export interface LanceFooter {
+  columnMetaStart: bigint;
+  columnMetaOffsetsStart: bigint;
+  globalBuffOffsetsStart: bigint;
+  numGlobalBuffers: number;
+  numColumns: number;
+  majorVersion: number;
+  minorVersion: number;
+}
+
+/**
+ * Chunked Lance File Reader.
+ * Reads Lance files from OPFS without loading entire file into memory.
+ */
+export interface ChunkedLanceReader {
+  /** Parsed footer information */
+  readonly footer: LanceFooter | null;
+
+  /**
+   * Get file size
+   */
+  getSize(): Promise<number>;
+
+  /**
+   * Get number of columns
+   */
+  getNumColumns(): number;
+
+  /**
+   * Get Lance format version
+   */
+  getVersion(): { major: number; minor: number };
+
+  /**
+   * Read raw column metadata bytes
+   * @param colIdx Column index
+   */
+  readColumnMetaRaw(colIdx: number): Promise<Uint8Array>;
+
+  /**
+   * Read a specific byte range from the file
+   * @param offset Start offset
+   * @param length Number of bytes
+   */
+  readRange(offset: number, length: number): Promise<Uint8Array>;
+
+  /**
+   * Get cache statistics
+   */
+  getCacheStats(): LRUCacheStats;
+
+  /**
+   * Close the reader and release resources
+   */
+  close(): void;
+}
+
+/** ChunkedLanceReader class */
+export const ChunkedLanceReader: {
+  /**
+   * Open a Lance file from OPFS
+   * @param storage OPFS storage instance
+   * @param path File path in OPFS
+   * @param pageCache Optional shared page cache
+   */
+  open(storage: OPFSStorage, path: string, pageCache?: LRUCache): Promise<ChunkedLanceReader>;
+};
+
+// =============================================================================
+// Protobuf Encoder
+// =============================================================================
+
+/**
+ * Simple Protobuf encoder for Lance metadata.
+ * Only implements what's needed for Lance file writing.
+ */
+export interface ProtobufEncoder {
+  /**
+   * Encode a varint field
+   * @param fieldNum Field number
+   * @param value Value to encode
+   */
+  writeVarint(fieldNum: number, value: number | bigint): void;
+
+  /**
+   * Encode a length-delimited field (bytes or nested message)
+   * @param fieldNum Field number
+   * @param data Data to encode
+   */
+  writeBytes(fieldNum: number, data: Uint8Array): void;
+
+  /**
+   * Encode packed repeated uint64 as varints
+   * @param fieldNum Field number
+   * @param values Values to encode
+   */
+  writePackedUint64(fieldNum: number, values: bigint[] | number[]): void;
+
+  /**
+   * Get the encoded bytes
+   */
+  toBytes(): Uint8Array;
+
+  /**
+   * Clear the encoder for reuse
+   */
+  clear(): void;
+}
+
+/** ProtobufEncoder class */
+export const ProtobufEncoder: {
+  new(): ProtobufEncoder;
+
+  /**
+   * Encode a varint (variable-length integer)
+   */
+  encodeVarint(value: number | bigint): Uint8Array;
+
+  /**
+   * Encode a field header (tag)
+   */
+  encodeFieldHeader(fieldNum: number, wireType: number): Uint8Array;
+};
+
+// =============================================================================
+// Pure Lance Writer (No WASM)
+// =============================================================================
+
+/**
+ * Lance column types
+ */
+export const LanceColumnType: {
+  INT64: 'int64';
+  FLOAT64: 'float64';
+  STRING: 'string';
+  BOOL: 'bool';
+  INT32: 'int32';
+  FLOAT32: 'float32';
+};
+
+/**
+ * Pure Lance Writer options
+ */
+export interface PureLanceWriterOptions {
+  /** Lance format major version (default: 0) */
+  majorVersion?: number;
+  /** Lance format minor version (default: 3 for v2.0) */
+  minorVersion?: number;
+}
+
+/**
+ * Pure JavaScript Lance File Writer - Creates Lance files without WASM.
+ * Use this when WASM is not available or for simple file creation.
+ * Supports basic column types: int64, float64, string, bool.
+ *
+ * @example
+ * ```javascript
+ * const writer = new PureLanceWriter();
+ * writer.addInt64Column('id', BigInt64Array.from([1n, 2n, 3n]));
+ * writer.addFloat64Column('score', new Float64Array([0.5, 0.8, 0.3]));
+ * writer.addStringColumn('name', ['Alice', 'Bob', 'Charlie']);
+ * const lanceData = writer.finalize();
+ * await opfsStorage.save('mydata.lance', lanceData);
+ * ```
+ */
+export interface PureLanceWriter {
+  /**
+   * Add an int64 column
+   * @param name Column name
+   * @param values Column values
+   */
+  addInt64Column(name: string, values: BigInt64Array): void;
+
+  /**
+   * Add an int32 column
+   * @param name Column name
+   * @param values Column values
+   */
+  addInt32Column(name: string, values: Int32Array): void;
+
+  /**
+   * Add a float64 column
+   * @param name Column name
+   * @param values Column values
+   */
+  addFloat64Column(name: string, values: Float64Array): void;
+
+  /**
+   * Add a float32 column
+   * @param name Column name
+   * @param values Column values
+   */
+  addFloat32Column(name: string, values: Float32Array): void;
+
+  /**
+   * Add a boolean column
+   * @param name Column name
+   * @param values Column values
+   */
+  addBoolColumn(name: string, values: boolean[]): void;
+
+  /**
+   * Add a string column
+   * @param name Column name
+   * @param values Column values
+   */
+  addStringColumn(name: string, values: string[]): void;
+
+  /**
+   * Finalize and create the Lance file
+   * @returns Complete Lance file data
+   */
+  finalize(): Uint8Array;
+
+  /**
+   * Get the number of columns
+   */
+  getNumColumns(): number;
+
+  /**
+   * Get the row count
+   */
+  getRowCount(): number | null;
+
+  /**
+   * Get column names
+   */
+  getColumnNames(): string[];
+}
+
+/** PureLanceWriter class */
+export const PureLanceWriter: {
+  new(options?: PureLanceWriterOptions): PureLanceWriter;
+};
+
+// =============================================================================
+// Local Database (OPFS-backed)
+// =============================================================================
+
+/**
+ * Column definition for table creation
+ */
+export interface ColumnDefinition {
+  name: string;
+  type: 'int64' | 'int32' | 'float64' | 'float32' | 'string' | 'bool' | 'vector';
+  primaryKey?: boolean;
+  vectorDim?: number;
+}
+
+/**
+ * Scan options for streaming reads
+ */
+export interface ScanOptions {
+  /** Number of rows per batch (default: 10000) */
+  batchSize?: number;
+  /** Filter function */
+  where?: (row: Record<string, any>) => boolean;
+  /** Columns to include */
+  columns?: string[];
+}
+
+/**
+ * Select query options
+ */
+export interface SelectOptions {
+  /** Columns to select (use ['*'] for all) */
+  columns?: string[];
+  /** Filter function */
+  where?: (row: Record<string, any>) => boolean;
+  /** Maximum rows to return */
+  limit?: number;
+  /** Rows to skip */
+  offset?: number;
+  /** Order by */
+  orderBy?: { column: string; desc?: boolean };
+}
+
+/**
+ * Local database backed by OPFS storage.
+ * Supports full CRUD operations with SQL interface.
+ *
+ * @example
+ * ```javascript
+ * const db = new LocalDatabase('mydb');
+ * await db.open();
+ *
+ * await db.createTable('users', [
+ *   { name: 'id', type: 'int64', primaryKey: true },
+ *   { name: 'name', type: 'string' },
+ *   { name: 'score', type: 'float64' }
+ * ]);
+ *
+ * await db.insert('users', [
+ *   { id: 1, name: 'Alice', score: 95.5 },
+ *   { id: 2, name: 'Bob', score: 87.3 }
+ * ]);
+ *
+ * const users = await db.select('users', { where: r => r.score > 90 });
+ * ```
+ */
+export class LocalDatabase {
+  constructor(name: string, storage?: OPFSStorage);
+
+  /** Database name */
+  readonly name: string;
+
+  /** Current version number */
+  readonly version: number;
+
+  /**
+   * Open or create the database
+   */
+  open(): Promise<LocalDatabase>;
+
+  /**
+   * Create a new table
+   * @param tableName Table name
+   * @param columns Column definitions
+   */
+  createTable(tableName: string, columns: ColumnDefinition[]): Promise<{ success: boolean; table: string }>;
+
+  /**
+   * Drop a table
+   * @param tableName Table name
+   */
+  dropTable(tableName: string): Promise<{ success: boolean; table: string }>;
+
+  /**
+   * Insert rows into a table
+   * @param tableName Table name
+   * @param rows Array of row objects
+   */
+  insert(tableName: string, rows: Record<string, any>[]): Promise<{ success: boolean; inserted: number }>;
+
+  /**
+   * Delete rows from a table
+   * @param tableName Table name
+   * @param predicate Filter function to select rows to delete
+   */
+  delete(tableName: string, predicate: (row: Record<string, any>) => boolean): Promise<{ success: boolean; deleted: number }>;
+
+  /**
+   * Update rows in a table
+   * @param tableName Table name
+   * @param updates Column updates
+   * @param predicate Filter function to select rows to update
+   */
+  update(tableName: string, updates: Record<string, any>, predicate: (row: Record<string, any>) => boolean): Promise<{ success: boolean; updated: number }>;
+
+  /**
+   * Select rows from a table
+   * @param tableName Table name
+   * @param options Query options
+   */
+  select(tableName: string, options?: SelectOptions): Promise<Record<string, any>[]>;
+
+  /**
+   * Streaming scan - yields batches of rows for memory-efficient processing
+   * @param tableName Table name
+   * @param options Scan options
+   */
+  scan(tableName: string, options?: ScanOptions): AsyncGenerator<Record<string, any>[], void, unknown>;
+
+  /**
+   * Count rows in a table
+   * @param tableName Table name
+   * @param where Optional filter function
+   */
+  count(tableName: string, where?: (row: Record<string, any>) => boolean): Promise<number>;
+
+  /**
+   * Get table schema
+   * @param tableName Table name
+   */
+  getSchema(tableName: string): ColumnDefinition[];
+
+  /**
+   * Get table info
+   * @param tableName Table name
+   */
+  getTable(tableName: string): { name: string; schema: ColumnDefinition[]; rowCount: number; fragments: string[] } | undefined;
+
+  /**
+   * List all tables
+   */
+  listTables(): string[];
+
+  /**
+   * Execute SQL statement
+   * @param sql SQL statement
+   */
+  exec(sql: string): Promise<any>;
+
+  /**
+   * Compact the database (merge fragments, remove deleted rows)
+   */
+  compact(): Promise<{ success: boolean; compacted: number }>;
+
+  /**
+   * Close the database
+   */
+  close(): Promise<void>;
+}
+
+// =============================================================================
+// Unified LanceData API
+// =============================================================================
+
+/**
+ * Data source type
+ */
+export type LanceDataType = 'local' | 'remote' | 'cached';
+
+/**
+ * Base interface for unified Lance data access.
+ * Provides common interface for both local (OPFS) and remote (HTTP) Lance files.
+ */
+export interface LanceDataBase {
+  /** Data source type */
+  readonly type: LanceDataType;
+
+  /**
+   * Get schema information
+   */
+  getSchema(): Promise<Array<{ name: string; type: string }>>;
+
+  /**
+   * Get total row count
+   */
+  getRowCount(): Promise<number>;
+
+  /**
+   * Read column data
+   * @param colIdx Column index
+   * @param start Start row (default: 0)
+   * @param count Number of rows (default: all)
+   */
+  readColumn(colIdx: number, start?: number, count?: number): Promise<any>;
+
+  /**
+   * Streaming scan - yields batches of rows
+   * @param options Scan options
+   */
+  scan(options?: ScanOptions): AsyncGenerator<Record<string, any>[], void, unknown>;
+
+  /**
+   * Insert rows (local sources only)
+   * @param rows Rows to insert
+   */
+  insert?(rows: Record<string, any>[]): Promise<any>;
+
+  /**
+   * Check if data is cached locally
+   */
+  isCached(): boolean;
+
+  /**
+   * Prefetch data to local cache
+   */
+  prefetch(): Promise<void>;
+
+  /**
+   * Evict data from local cache
+   */
+  evict(): Promise<void>;
+
+  /**
+   * Close the data source
+   */
+  close(): Promise<void>;
+}
+
+/**
+ * OPFS-backed Lance data for local files.
+ * Uses ChunkedLanceReader for efficient memory usage.
+ */
+export class OPFSLanceData implements LanceDataBase {
+  constructor(path: string, storage?: OPFSStorage);
+
+  readonly type: LanceDataType;
+  readonly path: string;
+
+  /**
+   * Open OPFS Lance file or database
+   */
+  open(): Promise<OPFSLanceData>;
+
+  getSchema(): Promise<Array<{ name: string; type: string }>>;
+  getRowCount(): Promise<number>;
+  readColumn(colIdx: number, start?: number, count?: number): Promise<any>;
+  scan(options?: ScanOptions): AsyncGenerator<Record<string, any>[], void, unknown>;
+  insert(rows: Record<string, any>[]): Promise<any>;
+  isCached(): boolean;
+  prefetch(): Promise<void>;
+  evict(): Promise<void>;
+  close(): Promise<void>;
+}
+
+/**
+ * HTTP-backed Lance data for remote files.
+ * Uses HotTierCache for OPFS caching.
+ */
+export class RemoteLanceData implements LanceDataBase {
+  constructor(url: string);
+
+  readonly type: LanceDataType;
+  readonly url: string;
+
+  /**
+   * Open remote Lance file
+   */
+  open(): Promise<RemoteLanceData>;
+
+  getSchema(): Promise<Array<{ name: string; type: string }>>;
+  getRowCount(): Promise<number>;
+  readColumn(colIdx: number, start?: number, count?: number): Promise<any>;
+  scan(options?: ScanOptions): AsyncGenerator<Record<string, any>[], void, unknown>;
+  isCached(): boolean;
+  prefetch(): Promise<void>;
+  evict(): Promise<void>;
+  close(): Promise<void>;
+}
+
+/**
+ * Factory function to open Lance data from any source.
+ * Supports:
+ * - opfs://path - Local OPFS file or database
+ * - https://url - Remote HTTP file (with optional caching)
+ *
+ * @param source Data source URI
+ *
+ * @example
+ * ```javascript
+ * // Local OPFS database
+ * const local = await openLance('opfs://mydb');
+ * for await (const batch of local.scan()) {
+ *   processBatch(batch);
+ * }
+ *
+ * // Remote file with caching
+ * const remote = await openLance('https://example.com/data.lance');
+ * await remote.prefetch(); // Cache to OPFS
+ * const data = await remote.readColumn(0);
+ * ```
+ */
+export function openLance(source: string): Promise<LanceDataBase>;
+
+// =============================================================================
+// Memory Management
+// =============================================================================
+
+/**
+ * Memory usage information
+ */
+export interface MemoryUsage {
+  usedHeapMB: number;
+  totalHeapMB: number;
+  limitMB: number;
+}
+
+/**
+ * Memory manager options
+ */
+export interface MemoryManagerOptions {
+  /** Target max heap usage in MB (default: 100) */
+  maxHeapMB?: number;
+  /** Warning threshold ratio (default: 0.8) */
+  warningThreshold?: number;
+}
+
+/**
+ * Global memory manager for browser environment.
+ * Monitors memory usage and triggers cleanup when needed.
+ */
+export interface MemoryManager {
+  /**
+   * Register a cache for memory management
+   */
+  registerCache(cache: LRUCache): void;
+
+  /**
+   * Unregister a cache
+   */
+  unregisterCache(cache: LRUCache): void;
+
+  /**
+   * Get current memory usage (Chrome/Chromium only)
+   */
+  getMemoryUsage(): MemoryUsage | null;
+
+  /**
+   * Check memory and trigger cleanup if needed
+   */
+  checkAndCleanup(): boolean;
+
+  /**
+   * Force cleanup of all registered caches
+   */
+  cleanup(): void;
+
+  /**
+   * Get aggregate cache stats
+   */
+  getCacheStats(): {
+    caches: number;
+    totalEntries: number;
+    totalSizeMB: string;
+    totalMaxSizeMB: string;
+    memory: MemoryUsage | null;
+  };
+}
+
+/** MemoryManager class */
+export const MemoryManager: {
+  new(options?: MemoryManagerOptions): MemoryManager;
+};
+
+/** Global memory manager instance */
+export const memoryManager: MemoryManager;
+
+/**
+ * Streaming utilities for large file processing
+ */
+export const StreamUtils: {
+  /**
+   * Process items in batches with memory-aware pacing
+   */
+  processBatches<T, R>(
+    source: AsyncIterable<T>,
+    processor: (batch: T) => Promise<R>,
+    options?: { batchSize?: number; pauseAfter?: number }
+  ): AsyncGenerator<R, void, unknown>;
+
+  /**
+   * Create a progress-reporting wrapper for async iterables
+   */
+  withProgress<T>(
+    source: AsyncIterable<T>,
+    onProgress: (processed: number) => void
+  ): AsyncGenerator<T, void, unknown>;
+
+  /**
+   * Limit memory usage by processing in chunks with explicit cleanup
+   */
+  throttle<T>(
+    source: AsyncIterable<T>,
+    maxChunksInFlight?: number
+  ): AsyncGenerator<T, void, unknown>;
+};
+
+// =============================================================================
 // CSS-Driven Data Engine (LanceData)
 // =============================================================================
 
