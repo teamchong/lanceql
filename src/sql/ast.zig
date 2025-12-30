@@ -98,6 +98,14 @@ pub const Expr = union(enum) {
     in_list: struct {
         expr: *Expr,
         values: []Expr,
+        negated: bool, // NOT IN
+    },
+
+    /// IN subquery: col IN (SELECT ...)
+    in_subquery: struct {
+        expr: *Expr,
+        subquery: *SelectStmt,
+        negated: bool, // NOT IN
     },
 
     /// BETWEEN expression: col BETWEEN low AND high
@@ -389,6 +397,12 @@ pub fn deinitExpr(expr: *Expr, allocator: std.mem.Allocator) void {
                 deinitExpr(val, allocator);
             }
             allocator.free(in.values);
+        },
+        .in_subquery => |in| {
+            deinitExpr(in.expr, allocator);
+            allocator.destroy(in.expr);
+            deinitSelectStmt(in.subquery, allocator);
+            allocator.destroy(in.subquery);
         },
         .between => |between| {
             deinitExpr(between.expr, allocator);

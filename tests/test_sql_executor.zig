@@ -1552,3 +1552,174 @@ test "execute EXCEPT" {
     try std.testing.expectEqual(@as(i64, 1), values[0]);
     try std.testing.expectEqual(@as(i64, 2), values[1]);
 }
+
+// ============================================================================
+// Subquery Tests (EXISTS, IN)
+// ============================================================================
+
+test "parse IN list" {
+    const allocator = std.testing.allocator;
+
+    const sql = "SELECT id FROM table WHERE id IN (1, 2, 3)";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    try std.testing.expect(stmt.select.where != null);
+    try std.testing.expect(stmt.select.where.? == .in_list);
+}
+
+test "parse NOT IN list" {
+    const allocator = std.testing.allocator;
+
+    const sql = "SELECT id FROM table WHERE id NOT IN (4, 5)";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    try std.testing.expect(stmt.select.where != null);
+    try std.testing.expect(stmt.select.where.? == .in_list);
+    try std.testing.expect(stmt.select.where.?.in_list.negated);
+}
+
+test "parse IN subquery" {
+    const allocator = std.testing.allocator;
+
+    const sql = "SELECT id FROM t1 WHERE id IN (SELECT id FROM t2)";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    try std.testing.expect(stmt.select.where != null);
+    try std.testing.expect(stmt.select.where.? == .in_subquery);
+}
+
+test "parse EXISTS" {
+    const allocator = std.testing.allocator;
+
+    const sql = "SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM t2)";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    try std.testing.expect(stmt.select.where != null);
+    try std.testing.expect(stmt.select.where.? == .exists);
+    try std.testing.expect(!stmt.select.where.?.exists.negated);
+}
+
+test "execute IN list" {
+    const allocator = std.testing.allocator;
+
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // SELECT id FROM table WHERE id IN (2, 4)
+    const sql = "SELECT id FROM table WHERE id IN (2, 4)";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    // Should have 2 rows (2 and 4)
+    try std.testing.expectEqual(@as(usize, 2), result.row_count);
+
+    const values = result.columns[0].data.int64;
+    try std.testing.expectEqual(@as(i64, 2), values[0]);
+    try std.testing.expectEqual(@as(i64, 4), values[1]);
+}
+
+test "execute NOT IN list" {
+    const allocator = std.testing.allocator;
+
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // SELECT id FROM table WHERE id NOT IN (2, 4)
+    const sql = "SELECT id FROM table WHERE id NOT IN (2, 4)";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    // Should have 3 rows (1, 3, 5)
+    try std.testing.expectEqual(@as(usize, 3), result.row_count);
+
+    const values = result.columns[0].data.int64;
+    try std.testing.expectEqual(@as(i64, 1), values[0]);
+    try std.testing.expectEqual(@as(i64, 3), values[1]);
+    try std.testing.expectEqual(@as(i64, 5), values[2]);
+}
+
+test "execute EXISTS subquery" {
+    const allocator = std.testing.allocator;
+
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // SELECT id FROM table WHERE EXISTS (SELECT id FROM table WHERE id > 3)
+    // EXISTS subquery returns true (there are rows with id > 3), so all rows are returned
+    const sql = "SELECT id FROM table WHERE EXISTS (SELECT id FROM table WHERE id > 3)";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    // EXISTS is true, so all 5 rows should be returned
+    try std.testing.expectEqual(@as(usize, 5), result.row_count);
+}
+
+test "execute NOT EXISTS subquery" {
+    const allocator = std.testing.allocator;
+
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // SELECT id FROM table WHERE NOT EXISTS (SELECT id FROM table WHERE id > 10)
+    // NOT EXISTS subquery returns true (no rows with id > 10), so all rows are returned
+    const sql = "SELECT id FROM table WHERE NOT EXISTS (SELECT id FROM table WHERE id > 10)";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    // NOT EXISTS is true (no rows > 10), so all 5 rows should be returned
+    try std.testing.expectEqual(@as(usize, 5), result.row_count);
+}
+
+test "execute IN subquery" {
+    const allocator = std.testing.allocator;
+
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // SELECT id FROM table WHERE id IN (SELECT id FROM table WHERE id > 3)
+    // Subquery returns [4, 5], so we get rows where id IN (4, 5)
+    const sql = "SELECT id FROM table WHERE id IN (SELECT id FROM table WHERE id > 3)";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    var executor = Executor.init(&table, allocator);
+    defer executor.deinit();
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    // Should have 2 rows (4 and 5)
+    try std.testing.expectEqual(@as(usize, 2), result.row_count);
+
+    const values = result.columns[0].data.int64;
+    try std.testing.expectEqual(@as(i64, 4), values[0]);
+    try std.testing.expectEqual(@as(i64, 5), values[1]);
+}

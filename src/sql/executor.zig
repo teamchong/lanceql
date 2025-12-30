@@ -338,6 +338,21 @@ pub const Executor = struct {
             .unary => |un| {
                 try self.extractColumnNames(un.operand, list);
             },
+            .in_list => |in| {
+                try self.extractColumnNames(in.expr, list);
+                for (in.values) |*val| {
+                    try self.extractColumnNames(val, list);
+                }
+            },
+            .in_subquery => |in| {
+                try self.extractColumnNames(in.expr, list);
+                // Don't extract from subquery - it has its own scope
+            },
+            .call => |call| {
+                for (call.args) |*arg| {
+                    try self.extractColumnNames(arg, list);
+                }
+            },
             else => {},
         }
     }
@@ -2492,6 +2507,7 @@ pub const Executor = struct {
                     .in_list = .{
                         .expr = new_expr,
                         .values = new_values,
+                        .negated = in.negated,
                     },
                 };
             },
@@ -2521,6 +2537,21 @@ pub const Executor = struct {
             // New expression types - pass through for now (execution support TODO)
             .case_expr => expr.*,
             .exists => expr.*,
+            .in_subquery => |in| blk: {
+                // Bind parameters in IN subquery expression
+                const new_expr = try self.allocator.create(Expr);
+                errdefer self.allocator.destroy(new_expr);
+                new_expr.* = try self.bindParameters(in.expr, params);
+
+                // Subquery uses its own execution context, no need to bind here
+                break :blk Expr{
+                    .in_subquery = .{
+                        .expr = new_expr,
+                        .subquery = in.subquery,
+                        .negated = in.negated,
+                    },
+                };
+            },
             .cast => expr.*,
             .method_call => |mc| blk: {
                 // Bind parameters in method call arguments
@@ -2570,6 +2601,11 @@ pub const Executor = struct {
                 }
                 self.allocator.free(in.values);
             },
+            .in_subquery => |in| {
+                self.freeExpr(in.expr);
+                self.allocator.destroy(in.expr);
+                // Don't free subquery - it's owned by the AST
+            },
             .between => |bet| {
                 self.freeExpr(bet.expr);
                 self.allocator.destroy(bet.expr);
@@ -2597,8 +2633,116 @@ pub const Executor = struct {
             .column => error.ColumnRequiresComparison,
             .binary => |bin| try self.evaluateBinaryOp(bin.op, bin.left, bin.right, row_idx),
             .unary => |un| try self.evaluateUnaryOp(un.op, un.operand, row_idx),
+            .exists => |ex| try self.evaluateExists(ex.subquery, ex.negated),
+            .in_list => |in| blk: {
+                const result = try self.evaluateInList(in.expr, in.values, row_idx);
+                break :blk if (in.negated) !result else result;
+            },
+            .in_subquery => |in| try self.evaluateInSubquery(in.expr, in.subquery, in.negated, row_idx),
             else => error.UnsupportedExpression,
         };
+    }
+
+    /// Evaluate EXISTS subquery
+    fn evaluateExists(self: *Self, subquery: *ast.SelectStmt, negated: bool) anyerror!bool {
+        // Execute the subquery
+        var result = try self.execute(subquery, &[_]Value{});
+        defer result.deinit();
+
+        // EXISTS is true if the subquery returns at least one row
+        const exists = result.row_count > 0;
+
+        // Apply negation if NOT EXISTS
+        return if (negated) !exists else exists;
+    }
+
+    /// Evaluate IN list expression
+    fn evaluateInList(self: *Self, expr: *const Expr, values: []const Expr, row_idx: u32) anyerror!bool {
+        // Get the value of the left expression
+        const left_val = try self.evaluateToValue(expr, row_idx);
+
+        // Check if the value is in the list
+        for (values) |*val_expr| {
+            const list_val = try self.evaluateToValue(val_expr, row_idx);
+
+            // Compare based on type
+            const matches = switch (left_val) {
+                .integer => |left_int| switch (list_val) {
+                    .integer => |right_int| left_int == right_int,
+                    .float => |right_float| @as(f64, @floatFromInt(left_int)) == right_float,
+                    else => false,
+                },
+                .float => |left_float| switch (list_val) {
+                    .integer => |right_int| left_float == @as(f64, @floatFromInt(right_int)),
+                    .float => |right_float| left_float == right_float,
+                    else => false,
+                },
+                .string => |left_str| switch (list_val) {
+                    .string => |right_str| std.mem.eql(u8, left_str, right_str),
+                    else => false,
+                },
+                .null => false, // NULL is not equal to anything including itself in IN
+                else => false,
+            };
+
+            if (matches) return true;
+        }
+
+        return false;
+    }
+
+    /// Evaluate IN subquery expression
+    fn evaluateInSubquery(self: *Self, expr: *const Expr, subquery: *ast.SelectStmt, negated: bool, row_idx: u32) anyerror!bool {
+        // Get the value of the left expression
+        const left_val = try self.evaluateToValue(expr, row_idx);
+
+        // Execute the subquery
+        var result = try self.execute(subquery, &[_]Value{});
+        defer result.deinit();
+
+        // Subquery must return exactly one column
+        if (result.columns.len != 1) {
+            return error.SubqueryMustReturnOneColumn;
+        }
+
+        // Check if the value is in the subquery results
+        const col = result.columns[0];
+        for (0..result.row_count) |i| {
+            const subquery_val: Value = switch (col.data) {
+                .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| .{ .integer = data[i] },
+                .int32, .date32 => |data| .{ .integer = data[i] },
+                .float64 => |data| .{ .float = data[i] },
+                .float32 => |data| .{ .float = data[i] },
+                .bool_ => |data| .{ .integer = if (data[i]) 1 else 0 },
+                .string => |data| .{ .string = data[i] },
+            };
+
+            // Compare based on type
+            const matches = switch (left_val) {
+                .integer => |left_int| switch (subquery_val) {
+                    .integer => |right_int| left_int == right_int,
+                    .float => |right_float| @as(f64, @floatFromInt(left_int)) == right_float,
+                    else => false,
+                },
+                .float => |left_float| switch (subquery_val) {
+                    .integer => |right_int| left_float == @as(f64, @floatFromInt(right_int)),
+                    .float => |right_float| left_float == right_float,
+                    else => false,
+                },
+                .string => |left_str| switch (subquery_val) {
+                    .string => |right_str| std.mem.eql(u8, left_str, right_str),
+                    else => false,
+                },
+                .null => false,
+                else => false,
+            };
+
+            if (matches) {
+                return if (negated) false else true;
+            }
+        }
+
+        return if (negated) true else false;
     }
 
     /// Evaluate binary operation

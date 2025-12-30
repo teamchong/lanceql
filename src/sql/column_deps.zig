@@ -142,6 +142,10 @@ pub const ColumnDeps = struct {
                 }
             },
             .exists => {}, // Subquery handled separately
+            .in_subquery => |in| {
+                try self.extractFromExpr(in.expr);
+                // Subquery handled separately
+            },
             .cast => |c| {
                 try self.extractFromExpr(c.expr);
             },

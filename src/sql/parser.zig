@@ -361,6 +361,69 @@ pub const Parser = struct {
             return Expr{ .binary = .{ .op = .ge, .left = left_ptr, .right = right_ptr } };
         }
 
+        // Check for [NOT] IN or [NOT] EXISTS
+        const negated = self.match(&[_]TokenType{.NOT});
+        if (self.match(&[_]TokenType{.IN})) {
+            // Expect opening parenthesis
+            if (!self.match(&[_]TokenType{.LPAREN})) {
+                return error.ExpectedOpenParen;
+            }
+
+            // Create left expression pointer
+            const left_ptr = try self.allocator.create(Expr);
+            errdefer self.allocator.destroy(left_ptr);
+            left_ptr.* = left;
+
+            // Check if it's a subquery (SELECT) or a value list
+            if (self.check(.SELECT)) {
+                // IN (SELECT ...) - subquery
+                const subquery = try self.allocator.create(ast.SelectStmt);
+                errdefer self.allocator.destroy(subquery);
+                subquery.* = try self.parseSelect();
+
+                // Expect closing parenthesis
+                if (!self.match(&[_]TokenType{.RPAREN})) {
+                    return error.ExpectedCloseParen;
+                }
+
+                return Expr{
+                    .in_subquery = .{
+                        .expr = left_ptr,
+                        .subquery = subquery,
+                        .negated = negated,
+                    },
+                };
+            } else {
+                // IN (val1, val2, ...) - value list
+                var values = std.ArrayList(Expr){};
+                errdefer values.deinit(self.allocator);
+
+                // Parse first value
+                try values.append(self.allocator, try self.parseExpr());
+
+                // Parse additional values
+                while (self.match(&[_]TokenType{.COMMA})) {
+                    try values.append(self.allocator, try self.parseExpr());
+                }
+
+                // Expect closing parenthesis
+                if (!self.match(&[_]TokenType{.RPAREN})) {
+                    return error.ExpectedCloseParen;
+                }
+
+                return Expr{
+                    .in_list = .{
+                        .expr = left_ptr,
+                        .values = try values.toOwnedSlice(self.allocator),
+                        .negated = negated,
+                    },
+                };
+            }
+        } else if (negated) {
+            // Had NOT but no IN - this is an error (NOT EXISTS is handled in parsePrimary)
+            return error.ExpectedIN;
+        }
+
         return left;
     }
 
@@ -529,6 +592,33 @@ pub const Parser = struct {
                     .exists = .{
                         .subquery = subquery,
                         .negated = false,
+                    },
+                };
+            },
+
+            // NOT expression (NOT EXISTS, NOT <boolean_expr>)
+            .NOT => {
+                self.advance();
+                // Check for NOT EXISTS
+                if (self.match(&[_]TokenType{.EXISTS})) {
+                    _ = try self.expect(.LPAREN);
+                    const subquery = try self.allocator.create(ast.SelectStmt);
+                    subquery.* = try self.parseSelect();
+                    _ = try self.expect(.RPAREN);
+                    return Expr{
+                        .exists = .{
+                            .subquery = subquery,
+                            .negated = true,
+                        },
+                    };
+                }
+                // NOT <expr> - parse as unary NOT with comparison as operand
+                const operand = try self.allocator.create(Expr);
+                operand.* = try self.parseComparisonExpr();
+                return Expr{
+                    .unary = .{
+                        .op = .not,
+                        .operand = operand,
                     },
                 };
             },

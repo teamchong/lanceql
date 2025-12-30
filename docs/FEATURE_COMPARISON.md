@@ -50,9 +50,10 @@ This document compares LanceQL features against DuckDB and Polars for feature pa
 
 | Feature | LanceQL | DuckDB | Polars | Notes |
 |---------|---------|--------|--------|-------|
-| Scalar subqueries | **Parsed** | Yes | Yes | Needs execution |
-| EXISTS | **Parsed** | Yes | Yes | Needs execution |
-| IN (subquery) | **Parsed** | Yes | Yes | Needs execution |
+| Scalar subqueries | Yes | Yes | Yes | Full support |
+| EXISTS / NOT EXISTS | Yes | Yes | Yes | Full support |
+| IN (subquery) | Yes | Yes | Yes | Full support |
+| IN (list) | Yes | Yes | Yes | Full support |
 | Correlated subqueries | No | Yes | Limited | Future |
 | CTEs (WITH clause) | No | Yes | No | Future |
 
@@ -155,9 +156,10 @@ This document compares LanceQL features against DuckDB and Polars for feature pa
 - INTERSECT
 - EXCEPT
 
-### Phase 4: Subqueries (P3)
+### Phase 4: Subqueries (P3) ✅ COMPLETE
 - Scalar subquery evaluation
-- EXISTS / IN execution
+- EXISTS / NOT EXISTS execution
+- IN (subquery) and IN (list) execution
 - Simple (non-correlated) only
 
 ### Phase 5: Aggregations (P4)
