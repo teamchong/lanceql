@@ -57,9 +57,46 @@ pub const LoadedTable = struct {
     };
 };
 
-/// Method function pointer types
+/// Method function pointer types (scalar - returns single value)
 pub const MethodFnF64 = *const fn (a: [*]const f64, b: [*]const f64, len: usize) callconv(.c) f64;
 pub const MethodFnF64Single = *const fn (a: [*]const f64, len: usize) callconv(.c) f64;
+
+/// Batch method function pointer types (N inputs → N outputs)
+/// Used for vectorized operations that process all rows at once
+/// Returns i64 (dummy 0 value, results are in out array)
+pub const BatchMethodFn = *const fn (
+    matrix: [*]const f64, // Input: [num_rows × dim]
+    vec: [*]const f64, // Query vector [dim]
+    num_rows: i64,
+    dim: i64,
+    out: [*]f64, // Output: [num_rows]
+) callconv(.c) i64;
+
+/// Batch method with f32 matrix input (common for embeddings)
+pub const BatchMethodFnF32 = *const fn (
+    matrix: [*]const f32, // Input: [num_rows × dim] as f32
+    vec: [*]const f64, // Query vector [dim] as f64
+    num_rows: i64,
+    dim: i64,
+    out: [*]f64, // Output: [num_rows] as f64
+) callconv(.c) i64;
+
+/// Default batch size for cache-friendly processing
+pub const DEFAULT_BATCH_SIZE: usize = 1024;
+
+/// Auto-determine batch size based on data characteristics
+pub fn getOptimalBatchSize(num_rows: usize, dim: usize) usize {
+    // L2 cache typically ~256KB on modern CPUs
+    const L2_CACHE_SIZE: usize = 256 * 1024;
+    const element_size: usize = @sizeOf(f64);
+
+    // Calculate rows that fit in L2 cache
+    const bytes_per_row = dim * element_size;
+    const rows_per_cache = if (bytes_per_row > 0) L2_CACHE_SIZE / bytes_per_row else DEFAULT_BATCH_SIZE;
+
+    // Use smaller of: cache-optimal, all rows, or default
+    return @min(rows_per_cache, @min(num_rows, DEFAULT_BATCH_SIZE));
+}
 
 /// Registered method with function pointer
 pub const RegisteredMethod = struct {
@@ -69,6 +106,12 @@ pub const RegisteredMethod = struct {
     fn_ptr: *const anyopaque,
     /// Number of array parameters
     num_array_params: u8,
+    /// Optional batch processing function pointer
+    batch_fn_ptr: ?*const anyopaque = null,
+    /// Whether batch processing is supported
+    supports_batch: bool = false,
+    /// Whether batch function uses f32 input matrix
+    batch_uses_f32: bool = false,
 };
 
 /// LogicTable Executor - manages @logic_table execution
@@ -375,6 +418,92 @@ pub const LogicTableExecutor = struct {
         });
     }
 
+    /// Register a method with batch processing support
+    pub fn registerMethodWithBatch(
+        self: *Self,
+        class_name: []const u8,
+        method_name: []const u8,
+        fn_ptr: *const anyopaque,
+        num_array_params: u8,
+        batch_fn_ptr: *const anyopaque,
+        batch_uses_f32: bool,
+    ) !void {
+        const key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ class_name, method_name });
+        errdefer self.allocator.free(key);
+
+        try self.registered_methods.put(key, .{
+            .name = method_name,
+            .class_name = class_name,
+            .fn_ptr = fn_ptr,
+            .num_array_params = num_array_params,
+            .batch_fn_ptr = batch_fn_ptr,
+            .supports_batch = true,
+            .batch_uses_f32 = batch_uses_f32,
+        });
+    }
+
+    /// Call method returning batch output (N inputs → N outputs)
+    /// Automatically uses batch function if available, otherwise falls back to per-row
+    pub fn callMethodBatchOutput(
+        self: *Self,
+        class_name: []const u8,
+        method_name: []const u8,
+        input_data_f64: ?[]const f64, // Flattened [N × dim] as f64
+        input_data_f32: ?[]const f32, // Flattened [N × dim] as f32
+        query_vec: []const f64, // Query vector [dim]
+        num_rows: usize,
+        dim: usize,
+    ) ![]f64 {
+        const key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ class_name, method_name });
+        defer self.allocator.free(key);
+
+        const method = self.registered_methods.get(key) orelse
+            return LogicTableError.MethodNotFound;
+
+        // Allocate output
+        var results = try self.allocator.alloc(f64, num_rows);
+        errdefer self.allocator.free(results);
+
+        // Use batch function if available
+        if (method.batch_fn_ptr) |batch_fn| {
+            if (method.batch_uses_f32) {
+                // Batch with f32 input matrix
+                const fn_ptr: BatchMethodFnF32 = @ptrCast(@alignCast(batch_fn));
+                const input = input_data_f32 orelse return LogicTableError.TypeMismatch;
+                _ = fn_ptr(input.ptr, query_vec.ptr, @intCast(num_rows), @intCast(dim), results.ptr);
+            } else {
+                // Batch with f64 input matrix
+                const fn_ptr: BatchMethodFn = @ptrCast(@alignCast(batch_fn));
+                const input = input_data_f64 orelse return LogicTableError.TypeMismatch;
+                _ = fn_ptr(input.ptr, query_vec.ptr, @intCast(num_rows), @intCast(dim), results.ptr);
+            }
+        } else {
+            // Fallback: call scalar method per-row (slow but compatible)
+            const input = input_data_f64 orelse return LogicTableError.TypeMismatch;
+            const scalar_fn: MethodFnF64 = @ptrCast(@alignCast(method.fn_ptr));
+            for (0..num_rows) |i| {
+                const row_start = i * dim;
+                const row_end = row_start + dim;
+                results[i] = scalar_fn(
+                    input[row_start..row_end].ptr,
+                    query_vec.ptr,
+                    dim,
+                );
+            }
+        }
+
+        return results;
+    }
+
+    /// Check if a method supports batch processing
+    pub fn methodSupportsBatch(self: *Self, class_name: []const u8, method_name: []const u8) bool {
+        const key = std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ class_name, method_name }) catch return false;
+        defer self.allocator.free(key);
+
+        const method = self.registered_methods.get(key) orelse return false;
+        return method.supports_batch;
+    }
+
     /// Load all declared tables from Lance files
     pub fn loadTables(self: *Self) !void {
         for (self.table_decls.items) |decl| {
@@ -545,9 +674,27 @@ pub const LogicTableExecutor = struct {
 // These come from lib/vector_ops.a (linked at build time)
 // =============================================================================
 
-// VectorOps class methods
+// VectorOps class methods (scalar - single result)
 pub extern fn VectorOps_dot_product(a: [*]const f64, b: [*]const f64, len: usize) callconv(.c) f64;
 pub extern fn VectorOps_sum_squares(a: [*]const f64, len: usize) callconv(.c) f64;
+
+// VectorOps batch methods (N inputs → N outputs)
+// Returns i64 (dummy 0 value, results are in out array)
+pub extern fn VectorOps_batch_dot_product(
+    matrix: [*]const f64,
+    vec: [*]const f64,
+    num_rows: i64,
+    dim: i64,
+    out: [*]f64,
+) callconv(.c) i64;
+
+pub extern fn VectorOps_batch_dot_product_f32(
+    matrix: [*]const f32,
+    vec: [*]const f64,
+    num_rows: i64,
+    dim: i64,
+    out: [*]f64,
+) callconv(.c) i64;
 
 // =============================================================================
 // Convenience functions for common patterns
@@ -557,12 +704,32 @@ pub extern fn VectorOps_sum_squares(a: [*]const f64, len: usize) callconv(.c) f6
 pub fn createVectorOpsExecutor(allocator: std.mem.Allocator) !LogicTableExecutor {
     var exec = try LogicTableExecutor.init(allocator, "vector_ops.py");
 
-    // Register compiled extern functions
+    // Register scalar methods
     try exec.registerMethod("VectorOps", "dot_product", @ptrCast(&VectorOps_dot_product), 2);
     try exec.registerMethod("VectorOps", "sum_squares", @ptrCast(&VectorOps_sum_squares), 1);
 
+    // Register batch methods with batch function pointers
+    try exec.registerMethodWithBatch(
+        "VectorOps",
+        "batch_dot_product",
+        @ptrCast(&VectorOps_dot_product), // fallback scalar
+        2,
+        @ptrCast(&VectorOps_batch_dot_product), // batch function
+        false, // uses f64
+    );
+    try exec.registerMethodWithBatch(
+        "VectorOps",
+        "batch_dot_product_f32",
+        @ptrCast(&VectorOps_dot_product), // fallback scalar
+        2,
+        @ptrCast(&VectorOps_batch_dot_product_f32), // batch function (f32 input)
+        true, // uses f32
+    );
+
     try exec.addMethod("dot_product", &.{ "a", "b" });
     try exec.addMethod("sum_squares", &.{"a"});
+    try exec.addMethod("batch_dot_product", &.{ "matrix", "vec", "num_rows", "dim", "out" });
+    try exec.addMethod("batch_dot_product_f32", &.{ "matrix", "vec", "num_rows", "dim", "out" });
 
     return exec;
 }

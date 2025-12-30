@@ -33,3 +33,4 @@ class VectorOps:
         for i in range(len(a)):
             result = result + a[i] * a[i]
         return result
+

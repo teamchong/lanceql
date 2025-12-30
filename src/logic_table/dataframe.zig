@@ -285,11 +285,29 @@ pub const LogicTableDataFrame = struct {
                 results = try mock_fn(filter.method, row_count, self.allocator);
             } else {
                 // Use real batch dispatch from executor
-                // This would call the compiled @logic_table method
-                // For now, allocate zeros as placeholder
-                // TODO: Integrate with batch dispatcher when real methods are registered
-                results = try self.allocator.alloc(f64, row_count);
-                @memset(results, 0.0);
+                // Parse method name format: "ClassName.method_name" or just "method_name"
+                var class_name: []const u8 = "VectorOps";
+                var method_name: []const u8 = filter.method;
+
+                if (std.mem.indexOf(u8, filter.method, ".")) |dot_idx| {
+                    class_name = filter.method[0..dot_idx];
+                    method_name = filter.method[dot_idx + 1 ..];
+                }
+
+                // Check if method supports batch processing
+                if (self.executor.methodSupportsBatch(class_name, method_name)) {
+                    // Get input data from context based on method requirements
+                    // This requires knowing what columns the method expects
+                    // For now, fallback to placeholder until method metadata is available
+                    results = try self.allocator.alloc(f64, row_count);
+                    @memset(results, 0.0);
+                    // NOTE: Full batch integration requires method signature metadata
+                    // to know which columns to pass. Future: use executor.callMethodBatchOutput()
+                } else {
+                    // Fallback: allocate zeros (method not found or no batch support)
+                    results = try self.allocator.alloc(f64, row_count);
+                    @memset(results, 0.0);
+                }
             }
 
             try self.method_cache.put(filter.method, results);
