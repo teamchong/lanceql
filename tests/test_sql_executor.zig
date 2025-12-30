@@ -1286,3 +1286,100 @@ test "Dispatcher batch method registration and dispatch" {
         try std.testing.expectEqual(@as(f64, 4.0), out_buf[1]); // 400 * 0.01
     }
 }
+
+// ============================================================================
+// JOIN Tests
+// ============================================================================
+
+test "parse INNER JOIN syntax" {
+    const allocator = std.testing.allocator;
+
+    // Test parsing of INNER JOIN (just verify it parses without error)
+    const sql = "SELECT a.id, b.id FROM orders AS a INNER JOIN items AS b ON a.id = b.order_id";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    // Verify the FROM clause is a JOIN
+    try std.testing.expect(stmt.select.from == .join);
+    const join = stmt.select.from.join;
+
+    // Verify left side is a simple table
+    try std.testing.expect(join.left.* == .simple);
+
+    // Verify join clause
+    try std.testing.expectEqual(ast.JoinType.inner, join.join_clause.join_type);
+    try std.testing.expect(join.join_clause.on_condition != null);
+}
+
+test "parse LEFT JOIN syntax" {
+    const allocator = std.testing.allocator;
+
+    const sql = "SELECT * FROM orders LEFT JOIN items ON orders.id = items.order_id";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    try std.testing.expect(stmt.select.from == .join);
+    const join = stmt.select.from.join;
+    try std.testing.expectEqual(ast.JoinType.left, join.join_clause.join_type);
+}
+
+test "parse RIGHT JOIN syntax" {
+    const allocator = std.testing.allocator;
+
+    const sql = "SELECT * FROM orders RIGHT JOIN items ON orders.id = items.order_id";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    try std.testing.expect(stmt.select.from == .join);
+    const join = stmt.select.from.join;
+    try std.testing.expectEqual(ast.JoinType.right, join.join_clause.join_type);
+}
+
+test "parse FULL OUTER JOIN syntax" {
+    const allocator = std.testing.allocator;
+
+    const sql = "SELECT * FROM orders FULL OUTER JOIN items ON orders.id = items.order_id";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    try std.testing.expect(stmt.select.from == .join);
+    const join = stmt.select.from.join;
+    try std.testing.expectEqual(ast.JoinType.full, join.join_clause.join_type);
+}
+
+test "execute INNER JOIN (self-join)" {
+    const allocator = std.testing.allocator;
+
+    // Use the same Lance file twice (self-join)
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table1 = try Table.init(allocator, lance_data);
+    defer table1.deinit();
+    var table2 = try Table.init(allocator, lance_data);
+    defer table2.deinit();
+
+    // Create executor and register both tables
+    var executor = Executor.init(null, allocator);
+    defer executor.deinit();
+
+    try executor.registerTable("a", &table1);
+    try executor.registerTable("b", &table2);
+
+    // For self-join, we need both tables to have the same data
+    // Parse SQL: SELECT a.id, b.id FROM a INNER JOIN b ON a.id = b.id
+    const sql = "SELECT a.id, b.id FROM a INNER JOIN b ON a.id = b.id";
+    var stmt = try parser.parseSQL(sql, allocator);
+    defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+    // Execute - this tests the hash join algorithm
+    var result = try executor.execute(&stmt.select, &[_]Value{});
+    defer result.deinit();
+
+    // Self-join on same data with equality should produce same row count as original
+    // Each row matches exactly one row in the other table
+    std.debug.print("\nINNER JOIN (self-join) result:\n", .{});
+    std.debug.print("  columns: {d}\n", .{result.columns.len});
+    std.debug.print("  row_count: {d}\n", .{result.row_count});
+
+    // Should have 5 rows (each row matches itself)
+    try std.testing.expectEqual(@as(usize, 5), result.row_count);
+}

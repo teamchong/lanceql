@@ -156,6 +156,46 @@ pub const CachedColumn = union(enum) {
     date64: []i64,
 };
 
+/// Materialized data from a JOIN operation
+pub const JoinedData = struct {
+    /// Column data by name (qualified with table alias if present)
+    columns: std.StringHashMap(CachedColumn),
+    /// Column names in order
+    column_names: [][]const u8,
+    /// Number of rows in the joined result
+    row_count: usize,
+    /// Allocator for cleanup
+    allocator: std.mem.Allocator,
+    /// Left table pointer (for schema access)
+    left_table: *Table,
+
+    pub fn deinit(self: *JoinedData) void {
+        // Free column data
+        var iter = self.columns.valueIterator();
+        while (iter.next()) |col| {
+            switch (col.*) {
+                .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| self.allocator.free(data),
+                .int32, .date32 => |data| self.allocator.free(data),
+                .float64 => |data| self.allocator.free(data),
+                .float32 => |data| self.allocator.free(data),
+                .bool_ => |data| self.allocator.free(data),
+                .string => |data| {
+                    for (data) |str| {
+                        self.allocator.free(str);
+                    }
+                    self.allocator.free(data);
+                },
+            }
+        }
+        self.columns.deinit();
+        // Free column names
+        for (self.column_names) |name| {
+            self.allocator.free(name);
+        }
+        self.allocator.free(self.column_names);
+    }
+};
+
 /// Active table source for query execution
 /// Tracks whether we're using a direct table or a logic_table
 pub const TableSource = union(enum) {
@@ -167,11 +207,14 @@ pub const TableSource = union(enum) {
         primary_table: *Table,
         alias: ?[]const u8,
     },
+    /// Joined table with materialized data
+    joined: *JoinedData,
 
     pub fn getTable(self: TableSource) *Table {
         return switch (self) {
             .direct => |t| t,
             .logic_table => |lt| lt.primary_table,
+            .joined => |jd| jd.left_table,
         };
     }
 };
@@ -188,6 +231,8 @@ pub const Executor = struct {
     logic_table_aliases: std.StringHashMap([]const u8),
     /// Currently active table source (set during execute)
     active_source: ?TableSource = null,
+    /// Registered tables by name (for JOINs and multi-table queries)
+    tables: std.StringHashMap(*Table),
 
     const Self = @This();
 
@@ -199,7 +244,18 @@ pub const Executor = struct {
             .dispatcher = null,
             .logic_table_aliases = std.StringHashMap([]const u8).init(allocator),
             .active_source = null,
+            .tables = std.StringHashMap(*Table).init(allocator),
         };
+    }
+
+    /// Register a table by name for use in JOINs and multi-table queries
+    pub fn registerTable(self: *Self, name: []const u8, table: *Table) !void {
+        try self.tables.put(name, table);
+    }
+
+    /// Get a registered table by name
+    pub fn getRegisteredTable(self: *Self, name: []const u8) ?*Table {
+        return self.tables.get(name);
     }
 
     /// Initialize with a table (convenience for existing code)
@@ -260,6 +316,9 @@ pub const Executor = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.logic_table_aliases.deinit();
+
+        // Clean up registered tables map (tables are owned by caller, just deinit the map)
+        self.tables.deinit();
     }
 
     // ========================================================================
@@ -360,10 +419,14 @@ pub const Executor = struct {
     }
 
     /// Resolve FROM clause to get the table source
-    fn resolveTableSource(self: *Self, from: *const ast.TableRef) !TableSource {
+    fn resolveTableSource(self: *Self, from: *const ast.TableRef) anyerror!TableSource {
         switch (from.*) {
-            .simple => {
-                // Simple table reference - use the default table
+            .simple => |simple| {
+                // First check if table is registered by name
+                if (self.tables.get(simple.name)) |registered_table| {
+                    return .{ .direct = registered_table };
+                }
+                // Otherwise use the default table
                 const direct_table = self.table orelse return error.NoTableConfigured;
                 return .{ .direct = direct_table };
             },
@@ -413,11 +476,359 @@ pub const Executor = struct {
                 }
                 return error.UnsupportedTableFunction;
             },
-            .join => {
-                // TODO: Support JOIN expressions
-                return error.JoinsNotYetSupported;
+            .join => |join| {
+                // Execute JOIN by resolving both sides and performing hash join
+                return try self.executeJoin(join.left, &join.join_clause);
             },
         }
+    }
+
+    /// Execute a JOIN operation using hash join algorithm
+    fn executeJoin(self: *Self, left_ref: *const ast.TableRef, join_clause: *const ast.JoinClause) !TableSource {
+        // 1. Resolve left table
+        var left_source = try self.resolveTableSource(left_ref);
+        errdefer self.releaseTableSource(&left_source);
+        const left_table = left_source.getTable();
+
+        // 2. Resolve right table
+        var right_source = try self.resolveTableSource(join_clause.table);
+        defer self.releaseTableSource(&right_source);
+        const right_table = right_source.getTable();
+
+        // 3. Extract join key column names from ON condition
+        const join_keys = try self.extractJoinKeys(join_clause.on_condition orelse return error.JoinRequiresOnCondition);
+
+        // 4. Get join key columns from both tables
+        const left_key_col_idx = left_table.physicalColumnId(join_keys.left_col) orelse return error.JoinColumnNotFound;
+        const right_key_col_idx = right_table.physicalColumnId(join_keys.right_col) orelse return error.JoinColumnNotFound;
+
+        // 5. Read join key data
+        const left_key_data = try self.readJoinKeyColumn(left_table, left_key_col_idx);
+        defer self.freeJoinKeyData(left_key_data);
+
+        const right_key_data = try self.readJoinKeyColumn(right_table, right_key_col_idx);
+        defer self.freeJoinKeyData(right_key_data);
+
+        // 6. Build hash table from right table (build phase)
+        var hash_table = std.StringHashMap(std.ArrayListUnmanaged(usize)).init(self.allocator);
+        defer {
+            var iter = hash_table.iterator();
+            while (iter.next()) |entry| {
+                // Free the key (we allocated it during insertion)
+                self.allocator.free(entry.key_ptr.*);
+                // Deinit the ArrayList value
+                entry.value_ptr.deinit(self.allocator);
+            }
+            hash_table.deinit();
+        }
+
+        for (0..right_key_data.len()) |idx| {
+            const key = try self.joinKeyToString(right_key_data, idx);
+            defer self.allocator.free(key);
+
+            const result = try hash_table.getOrPut(key);
+            if (!result.found_existing) {
+                const key_copy = try self.allocator.dupe(u8, key);
+                result.key_ptr.* = key_copy;
+                result.value_ptr.* = .{};
+            }
+            try result.value_ptr.append(self.allocator, idx);
+        }
+
+        // 7. Probe phase - find matching rows
+        var left_indices = std.ArrayListUnmanaged(usize){};
+        defer left_indices.deinit(self.allocator);
+        var right_indices = std.ArrayListUnmanaged(usize){};
+        defer right_indices.deinit(self.allocator);
+
+        // Track matched rows for outer joins
+        var matched_right = std.AutoHashMap(usize, void).init(self.allocator);
+        defer matched_right.deinit();
+
+        for (0..left_key_data.len()) |left_idx| {
+            const key = try self.joinKeyToString(left_key_data, left_idx);
+            defer self.allocator.free(key);
+
+            if (hash_table.get(key)) |right_list| {
+                for (right_list.items) |right_idx| {
+                    try left_indices.append(self.allocator, left_idx);
+                    try right_indices.append(self.allocator, right_idx);
+                    try matched_right.put(right_idx, {});
+                }
+            } else if (join_clause.join_type == .left or join_clause.join_type == .full) {
+                // LEFT/FULL JOIN: include left row with NULL for right
+                try left_indices.append(self.allocator, left_idx);
+                try right_indices.append(self.allocator, std.math.maxInt(usize)); // Sentinel for NULL
+            }
+        }
+
+        // For RIGHT/FULL JOIN: add unmatched right rows
+        if (join_clause.join_type == .right or join_clause.join_type == .full) {
+            for (0..right_key_data.len()) |right_idx| {
+                if (!matched_right.contains(right_idx)) {
+                    try left_indices.append(self.allocator, std.math.maxInt(usize)); // Sentinel for NULL
+                    try right_indices.append(self.allocator, right_idx);
+                }
+            }
+        }
+
+        // 8. Build joined result with all columns from both tables
+        const joined_data = try self.allocator.create(JoinedData);
+        errdefer self.allocator.destroy(joined_data);
+
+        joined_data.* = JoinedData{
+            .columns = std.StringHashMap(CachedColumn).init(self.allocator),
+            .column_names = &[_][]const u8{},
+            .row_count = left_indices.items.len,
+            .allocator = self.allocator,
+            .left_table = left_table,
+        };
+        errdefer joined_data.deinit();
+
+        // Build column names list and copy data
+        var col_names = std.ArrayListUnmanaged([]const u8){};
+        errdefer {
+            for (col_names.items) |name| {
+                self.allocator.free(name);
+            }
+            col_names.deinit(self.allocator);
+        }
+
+        // Add left table columns (with table alias prefix if available)
+        const left_alias = switch (left_ref.*) {
+            .simple => |s| s.alias orelse s.name,
+            else => "left",
+        };
+
+        try self.addJoinedColumns(
+            left_table,
+            left_alias,
+            left_indices.items,
+            joined_data,
+            &col_names,
+            false, // isRightSide
+        );
+
+        // Add right table columns
+        const right_alias = switch (join_clause.table.*) {
+            .simple => |s| s.alias orelse s.name,
+            else => "right",
+        };
+
+        try self.addJoinedColumns(
+            right_table,
+            right_alias,
+            right_indices.items,
+            joined_data,
+            &col_names,
+            true, // isRightSide
+        );
+
+        joined_data.column_names = try col_names.toOwnedSlice(self.allocator);
+
+        // Release left_source ownership since it's now managed by joined_data
+        // (we keep left_table pointer in joined_data.left_table)
+        switch (left_source) {
+            .direct => {}, // Nothing to release
+            .logic_table => |*lt| {
+                lt.executor.deinit();
+                self.allocator.destroy(lt.executor);
+            },
+            .joined => |jd| {
+                jd.deinit();
+                self.allocator.destroy(jd);
+            },
+        }
+
+        return .{ .joined = joined_data };
+    }
+
+    /// Extract left and right column names from JOIN ON condition
+    fn extractJoinKeys(self: *Self, condition: ast.Expr) !struct { left_col: []const u8, right_col: []const u8 } {
+        _ = self;
+        // ON condition should be: left.col = right.col
+        switch (condition) {
+            .binary => |bin| {
+                if (bin.op != .eq) return error.JoinConditionMustBeEquality;
+
+                const left_col = switch (bin.left.*) {
+                    .column => |col| col.name, // column.table is optional qualifier
+                    else => return error.JoinConditionMustBeColumn,
+                };
+
+                const right_col = switch (bin.right.*) {
+                    .column => |col| col.name,
+                    else => return error.JoinConditionMustBeColumn,
+                };
+
+                return .{ .left_col = left_col, .right_col = right_col };
+            },
+            else => return error.JoinConditionMustBeBinary,
+        }
+    }
+
+    /// Join key data union for different column types
+    const JoinKeyData = union(enum) {
+        int64: []i64,
+        int32: []i32,
+        float64: []f64,
+        string: [][]const u8,
+
+        fn len(self: JoinKeyData) usize {
+            return switch (self) {
+                .int64 => |d| d.len,
+                .int32 => |d| d.len,
+                .float64 => |d| d.len,
+                .string => |d| d.len,
+            };
+        }
+    };
+
+    /// Read join key column data
+    fn readJoinKeyColumn(self: *Self, table: *Table, col_idx: u32) !JoinKeyData {
+        _ = self;
+        const field = table.getFieldById(col_idx) orelse return error.InvalidColumn;
+        const logical_type = field.logical_type;
+
+        if (std.mem.indexOf(u8, logical_type, "int64") != null or
+            std.mem.indexOf(u8, logical_type, "int") != null)
+        {
+            const data = try table.readInt64Column(col_idx);
+            return .{ .int64 = data };
+        } else if (std.mem.indexOf(u8, logical_type, "int32") != null) {
+            const data = try table.readInt32Column(col_idx);
+            return .{ .int32 = data };
+        } else if (std.mem.indexOf(u8, logical_type, "float") != null or
+            std.mem.indexOf(u8, logical_type, "double") != null)
+        {
+            const data = try table.readFloat64Column(col_idx);
+            return .{ .float64 = data };
+        } else if (std.mem.indexOf(u8, logical_type, "string") != null or
+            std.mem.indexOf(u8, logical_type, "utf8") != null)
+        {
+            const data = try table.readStringColumn(col_idx);
+            return .{ .string = data };
+        }
+        return error.UnsupportedJoinKeyType;
+    }
+
+    /// Free join key data
+    fn freeJoinKeyData(self: *Self, data: JoinKeyData) void {
+        switch (data) {
+            .int64 => |d| self.allocator.free(d),
+            .int32 => |d| self.allocator.free(d),
+            .float64 => |d| self.allocator.free(d),
+            .string => |d| {
+                for (d) |s| self.allocator.free(s);
+                self.allocator.free(d);
+            },
+        }
+    }
+
+    /// Convert join key value at index to string for hashing
+    fn joinKeyToString(self: *Self, data: JoinKeyData, idx: usize) ![]u8 {
+        var buf: [64]u8 = undefined;
+        const result = switch (data) {
+            .int64 => |d| std.fmt.bufPrint(&buf, "{d}", .{d[idx]}),
+            .int32 => |d| std.fmt.bufPrint(&buf, "{d}", .{d[idx]}),
+            .float64 => |d| std.fmt.bufPrint(&buf, "{d:.10}", .{d[idx]}),
+            .string => |d| return try self.allocator.dupe(u8, d[idx]),
+        };
+        return try self.allocator.dupe(u8, result catch return error.FormatError);
+    }
+
+    /// Add columns from a table to the joined result
+    fn addJoinedColumns(
+        self: *Self,
+        table: *Table,
+        alias: []const u8,
+        row_indices: []const usize,
+        joined_data: *JoinedData,
+        col_names: *std.ArrayListUnmanaged([]const u8),
+        is_right_side: bool,
+    ) !void {
+        const schema = table.getSchema() orelse return error.NoSchema;
+
+        for (schema.fields) |field| {
+            if (field.id < 0) continue;
+            const col_idx: u32 = @intCast(field.id);
+
+            // Create qualified column name: "alias.column"
+            const qualified_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ alias, field.name });
+            errdefer self.allocator.free(qualified_name);
+
+            // Read and filter column data based on row indices
+            const col_data = try self.readJoinedColumnData(table, col_idx, row_indices, is_right_side);
+
+            try joined_data.columns.put(qualified_name, col_data);
+            try col_names.append(self.allocator, qualified_name);
+        }
+    }
+
+    /// Read column data for joined rows (handles NULL for outer joins)
+    fn readJoinedColumnData(
+        self: *Self,
+        table: *Table,
+        col_idx: u32,
+        row_indices: []const usize,
+        is_right_side: bool,
+    ) !CachedColumn {
+        _ = is_right_side;
+        const field = table.getFieldById(col_idx) orelse return error.InvalidColumn;
+        const logical_type = field.logical_type;
+
+        // Determine column type and read full data
+        if (std.mem.indexOf(u8, logical_type, "int64") != null or
+            std.mem.indexOf(u8, logical_type, "int") != null)
+        {
+            const all_data = try table.readInt64Column(col_idx);
+            defer self.allocator.free(all_data);
+
+            const result = try self.allocator.alloc(i64, row_indices.len);
+            for (row_indices, 0..) |idx, i| {
+                if (idx == std.math.maxInt(usize)) {
+                    result[i] = 0; // NULL represented as 0 for now
+                } else {
+                    result[i] = all_data[idx];
+                }
+            }
+            return .{ .int64 = result };
+        } else if (std.mem.indexOf(u8, logical_type, "float") != null or
+            std.mem.indexOf(u8, logical_type, "double") != null)
+        {
+            const all_data = try table.readFloat64Column(col_idx);
+            defer self.allocator.free(all_data);
+
+            const result = try self.allocator.alloc(f64, row_indices.len);
+            for (row_indices, 0..) |idx, i| {
+                if (idx == std.math.maxInt(usize)) {
+                    result[i] = std.math.nan(f64); // NULL as NaN
+                } else {
+                    result[i] = all_data[idx];
+                }
+            }
+            return .{ .float64 = result };
+        } else if (std.mem.indexOf(u8, logical_type, "string") != null or
+            std.mem.indexOf(u8, logical_type, "utf8") != null)
+        {
+            const all_data = try table.readStringColumn(col_idx);
+            defer {
+                for (all_data) |s| self.allocator.free(s);
+                self.allocator.free(all_data);
+            }
+
+            const result = try self.allocator.alloc([]const u8, row_indices.len);
+            for (row_indices, 0..) |idx, i| {
+                if (idx == std.math.maxInt(usize)) {
+                    result[i] = try self.allocator.dupe(u8, ""); // NULL as empty string
+                } else {
+                    result[i] = try self.allocator.dupe(u8, all_data[idx]);
+                }
+            }
+            return .{ .string = result };
+        }
+
+        return error.UnsupportedColumnType;
     }
 
     /// Release resources associated with a table source
@@ -430,6 +841,11 @@ pub const Executor = struct {
                 // Clean up executor and free heap allocation
                 lt.executor.deinit();
                 self.allocator.destroy(lt.executor);
+            },
+            .joined => |jd| {
+                // Clean up joined data
+                jd.deinit();
+                self.allocator.destroy(jd);
             },
         }
     }
