@@ -1,5 +1,143 @@
 # @logic_table: Business Logic That Runs WITH Your Data
 
+## Python User Quick Reference
+
+### What's Available in Each SQL Clause
+
+When your `@logic_table` method is called, it receives a `QueryContext` that tells you WHERE in the query you are and WHAT data you can access:
+
+| SQL Clause | `ctx.phase` | `ctx.filtered_indices` | `ctx.window_spec` | `ctx.predicates` | Cache Scope |
+|------------|-------------|------------------------|-------------------|------------------|-------------|
+| **WHERE** | `filter` | ❌ None yet (you're filtering!) | ❌ | ✅ Pushdown hints | Query |
+| **SELECT** | `projection` | ✅ Rows that passed WHERE | ❌ | ✅ | Query |
+| **HAVING** | `group_filter` | ✅ Rows in current group | ❌ | ✅ | Query |
+| **ORDER BY** | `ordering` | ✅ All projected rows | ❌ | ✅ | Query |
+| **OVER()** | `window` | ✅ Rows in current partition | ✅ Full window spec | ✅ | Partition |
+
+### Context Properties
+
+```python
+class QueryContext:
+    # Which SQL clause is calling this method
+    phase: str  # 'filter', 'projection', 'group_filter', 'ordering', 'window'
+
+    # Row information
+    total_rows: int              # Total rows in source table
+    matched_rows: int            # Rows that passed WHERE (0 during filter phase)
+    filtered_indices: list[int]  # Which row indices passed WHERE (None during filter phase)
+
+    # Predicate pushdown (hints from WHERE clause)
+    predicates: list[FilterPredicate]  # e.g., [{"column": "amount", "op": ">", "value": 1000}]
+
+    # Window function context (only when phase == 'window')
+    window_spec: WindowSpec      # partition_keys, order_keys, frame_bounds
+    partition_id: int            # Current partition number
+    partition_row_indices: list[int]  # Row indices in current partition
+
+    # Caching
+    result_cache: dict           # Auto-managed, keyed by (method, phase, window_spec, snapshot)
+```
+
+### Example: Phase-Aware Method
+
+```python
+@logic_table
+class SmartProcessor:
+    data = Table('orders.lance')
+
+    def smart_score(self, ctx: QueryContext) -> float:
+        if ctx.phase == 'filter':
+            # Called during WHERE evaluation
+            # Use quick estimate - ctx.filtered_indices is None here
+            # Can use ctx.predicates for pushdown hints
+            return self.quick_estimate()
+
+        elif ctx.phase == 'projection':
+            # Called during SELECT
+            # ctx.filtered_indices contains rows that passed WHERE
+            return self.full_calculation()
+
+        elif ctx.phase == 'window':
+            # Called during OVER(PARTITION BY ... ORDER BY ...)
+            # ctx.window_spec has partition_keys, order_keys, frame_bounds
+            # ctx.partition_row_indices has rows in this partition
+            return self.partition_aggregate(
+                ctx.window_spec.partition_keys,
+                ctx.partition_row_indices
+            )
+
+        return 0.0
+```
+
+### Example: Using Predicate Pushdown
+
+```python
+@logic_table
+class OptimizedProcessor:
+    data = Table('orders.lance')
+
+    def optimized_score(self, ctx: QueryContext) -> float:
+        # Check if WHERE clause has amount filter
+        for pred in ctx.predicates:
+            if pred.column == 'amount' and pred.op == '>':
+                # Early exit for rows we know won't pass
+                if self.data.amount < pred.value:
+                    return 0.0  # Skip expensive computation
+
+        return self.expensive_calculation()
+```
+
+### Example: Window Function with Partition Context
+
+```python
+@logic_table
+class WindowProcessor:
+    data = Table('orders.lance')
+
+    def running_avg(self, ctx: QueryContext) -> float:
+        if ctx.phase != 'window':
+            raise ValueError("running_avg must be used in OVER() clause")
+
+        # Get rows in current partition
+        partition_rows = ctx.partition_row_indices
+        current_pos = partition_rows.index(ctx.current_row)
+
+        # Compute running average up to current row
+        values = [self.data.amount[i] for i in partition_rows[:current_pos + 1]]
+        return sum(values) / len(values)
+```
+
+```sql
+-- SQL usage
+SELECT
+    order_id,
+    t.running_avg() OVER (PARTITION BY customer_id ORDER BY order_date)
+FROM logic_table('processor.py') AS t
+```
+
+### State Sharing Between Methods
+
+All methods in a `@logic_table` share the same context, enabling:
+
+```python
+@logic_table
+class FraudDetector:
+    orders = Table('orders.lance')
+
+    # Shared state via result_cache (auto-managed)
+    def amount_score(self) -> float:
+        return min(1.0, self.orders.amount / 50000)
+
+    def velocity_score(self) -> float:
+        return self.orders.amount / self.orders.avg_amount
+
+    def risk_score(self) -> float:
+        # These calls are memoized - computed once, reused everywhere
+        return self.amount_score() * 0.5 + self.velocity_score() * 0.5
+```
+
+---
+
 ## The Story
 
 A decade ago, I spent years writing complex SQL stored procedures. Business logic lived inside the database. It was fast because the logic ran WHERE the data lived.
