@@ -73,11 +73,12 @@ jobs:
           # Build metal0 AOT Python compiler
           cd deps/metal0
           zig build
-          cd ../..
 
           # Compile Python @logic_table to native static library
-          mkdir -p lib
-          deps/metal0/zig-out/bin/metal0 build --emit-logic-table benchmarks/vector_ops.py -o lib/vector_ops.a
+          # Must run from metal0 dir for correct vendor paths
+          mkdir -p ../../lib
+          ./zig-out/bin/metal0 build --emit-logic-table ../../benchmarks/vector_ops.py -o ../../lib/vector_ops.a
+          cd ../..
           echo "Compiled @logic_table:"
           ls -la lib/vector_ops.a
 
@@ -221,11 +222,12 @@ jobs:
           # Build metal0 AOT Python compiler
           cd deps/metal0
           zig build
-          cd ../..
 
           # Compile Python @logic_table to native static library
-          mkdir -p lib
-          deps/metal0/zig-out/bin/metal0 build --emit-logic-table benchmarks/vector_ops.py -o lib/vector_ops.a
+          # Must run from metal0 dir for correct vendor paths
+          mkdir -p ../../lib
+          ./zig-out/bin/metal0 build --emit-logic-table ../../benchmarks/vector_ops.py -o ../../lib/vector_ops.a
+          cd ../..
           echo "Compiled @logic_table:"
           ls -la lib/vector_ops.a
 
