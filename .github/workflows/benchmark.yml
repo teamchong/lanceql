@@ -69,7 +69,6 @@ jobs:
           lanceql --version || echo "LanceQL CLI installed"
 
       - name: Build metal0 and compile @logic_table
-        continue-on-error: true
         run: |
           # Build metal0 AOT Python compiler
           cd deps/metal0
@@ -223,7 +222,6 @@ jobs:
           sudo apt-get install -y libbz2-dev liblzma-dev
 
       - name: Build metal0 and compile @logic_table
-        continue-on-error: true
         run: |
           # Build metal0 AOT Python compiler
           cd deps/metal0
