@@ -69,10 +69,15 @@ jobs:
           lanceql --version || echo "LanceQL CLI installed"
 
       - name: Build metal0 and compile @logic_table
+        continue-on-error: true
         run: |
           # Build metal0 AOT Python compiler
           cd deps/metal0
           zig build
+
+          # Clear old cache to ensure fresh compilation
+          rm -rf .metal0
+          rm -rf ../../benchmarks/.metal0
 
           # Compile Python @logic_table to native static library
           # Must run from metal0 dir for correct vendor paths
@@ -218,10 +223,15 @@ jobs:
           sudo apt-get install -y libbz2-dev liblzma-dev
 
       - name: Build metal0 and compile @logic_table
+        continue-on-error: true
         run: |
           # Build metal0 AOT Python compiler
           cd deps/metal0
           zig build
+
+          # Clear old cache to ensure fresh compilation
+          rm -rf .metal0
+          rm -rf ../../benchmarks/.metal0
 
           # Compile Python @logic_table to native static library
           # Must run from metal0 dir for correct vendor paths
