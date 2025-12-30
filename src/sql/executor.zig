@@ -21,6 +21,11 @@ pub const AggregateType = enum {
     avg,
     min,
     max,
+    // Statistical aggregates
+    stddev, // Sample standard deviation
+    variance, // Sample variance
+    stddev_pop, // Population standard deviation
+    var_pop, // Population variance
 };
 
 /// Accumulator for aggregate computations
@@ -28,6 +33,7 @@ pub const Accumulator = struct {
     agg_type: AggregateType,
     count: i64,
     sum: f64,
+    sum_sq: f64, // Sum of squares for variance/stddev
     min_int: ?i64,
     max_int: ?i64,
     min_float: ?f64,
@@ -38,6 +44,7 @@ pub const Accumulator = struct {
             .agg_type = agg_type,
             .count = 0,
             .sum = 0,
+            .sum_sq = 0,
             .min_int = null,
             .max_int = null,
             .min_float = null,
@@ -46,8 +53,10 @@ pub const Accumulator = struct {
     }
 
     pub fn addInt(self: *Accumulator, value: i64) void {
+        const fval = @as(f64, @floatFromInt(value));
         self.count += 1;
-        self.sum += @as(f64, @floatFromInt(value));
+        self.sum += fval;
+        self.sum_sq += fval * fval;
         if (self.min_int == null or value < self.min_int.?) {
             self.min_int = value;
         }
@@ -59,6 +68,7 @@ pub const Accumulator = struct {
     pub fn addFloat(self: *Accumulator, value: f64) void {
         self.count += 1;
         self.sum += value;
+        self.sum_sq += value * value;
         if (self.min_float == null or value < self.min_float.?) {
             self.min_float = value;
         }
@@ -71,6 +81,23 @@ pub const Accumulator = struct {
         self.count += 1;
     }
 
+    /// Compute variance using the formula: (sum_sq - sum²/n) / divisor
+    /// where divisor is (n-1) for sample variance, n for population variance
+    fn computeVariance(self: Accumulator, population: bool) f64 {
+        if (self.count == 0) return 0;
+        if (!population and self.count == 1) return 0; // Sample variance undefined for n=1
+        const n = @as(f64, @floatFromInt(self.count));
+        const mean = self.sum / n;
+        // Variance = E[X²] - E[X]² = sum_sq/n - mean²
+        const variance_pop = self.sum_sq / n - mean * mean;
+        if (population) {
+            return variance_pop;
+        } else {
+            // Sample variance: multiply by n/(n-1) to get unbiased estimate
+            return variance_pop * n / (n - 1);
+        }
+    }
+
     pub fn getResult(self: Accumulator) f64 {
         return switch (self.agg_type) {
             .count, .count_star => @as(f64, @floatFromInt(self.count)),
@@ -78,6 +105,10 @@ pub const Accumulator = struct {
             .avg => if (self.count > 0) self.sum / @as(f64, @floatFromInt(self.count)) else 0,
             .min => self.min_float orelse @as(f64, @floatFromInt(self.min_int orelse 0)),
             .max => self.max_float orelse @as(f64, @floatFromInt(self.max_int orelse 0)),
+            .variance => self.computeVariance(false),
+            .var_pop => self.computeVariance(true),
+            .stddev => @sqrt(self.computeVariance(false)),
+            .stddev_pop => @sqrt(self.computeVariance(true)),
         };
     }
 
@@ -88,6 +119,7 @@ pub const Accumulator = struct {
             .avg => if (self.count > 0) @as(i64, @intFromFloat(self.sum / @as(f64, @floatFromInt(self.count)))) else 0,
             .min => self.min_int orelse 0,
             .max => self.max_int orelse 0,
+            .variance, .var_pop, .stddev, .stddev_pop => @as(i64, @intFromFloat(self.getResult())),
         };
     }
 };
@@ -1418,16 +1450,23 @@ pub const Executor = struct {
     /// Check if function name is an aggregate function
     fn isAggregateFunction(name: []const u8) bool {
         // Case-insensitive comparison
-        if (name.len < 3 or name.len > 5) return false;
+        if (name.len < 3 or name.len > 11) return false;
 
-        var upper_buf: [8]u8 = undefined;
-        const upper_name = std.ascii.upperString(&upper_buf, name);
+        var upper_buf: [16]u8 = undefined;
+        const len = @min(name.len, upper_buf.len);
+        const upper_name = std.ascii.upperString(upper_buf[0..len], name[0..len]);
 
         return std.mem.eql(u8, upper_name, "COUNT") or
             std.mem.eql(u8, upper_name, "SUM") or
             std.mem.eql(u8, upper_name, "AVG") or
             std.mem.eql(u8, upper_name, "MIN") or
-            std.mem.eql(u8, upper_name, "MAX");
+            std.mem.eql(u8, upper_name, "MAX") or
+            std.mem.eql(u8, upper_name, "STDDEV") or
+            std.mem.eql(u8, upper_name, "STDDEV_SAMP") or
+            std.mem.eql(u8, upper_name, "STDDEV_POP") or
+            std.mem.eql(u8, upper_name, "VARIANCE") or
+            std.mem.eql(u8, upper_name, "VAR_SAMP") or
+            std.mem.eql(u8, upper_name, "VAR_POP");
     }
 
     // ========================================================================
@@ -1839,8 +1878,9 @@ pub const Executor = struct {
 
     /// Parse aggregate function name to AggregateType
     fn parseAggregateType(name: []const u8, args: []const Expr) AggregateType {
-        var upper_buf: [8]u8 = undefined;
-        const upper_name = std.ascii.upperString(&upper_buf, name);
+        var upper_buf: [16]u8 = undefined;
+        const len = @min(name.len, upper_buf.len);
+        const upper_name = std.ascii.upperString(upper_buf[0..len], name[0..len]);
 
         if (std.mem.eql(u8, upper_name, "COUNT")) {
             // COUNT(*) vs COUNT(col)
@@ -1858,6 +1898,14 @@ pub const Executor = struct {
             return .min;
         } else if (std.mem.eql(u8, upper_name, "MAX")) {
             return .max;
+        } else if (std.mem.eql(u8, upper_name, "STDDEV") or std.mem.eql(u8, upper_name, "STDDEV_SAMP")) {
+            return .stddev;
+        } else if (std.mem.eql(u8, upper_name, "STDDEV_POP")) {
+            return .stddev_pop;
+        } else if (std.mem.eql(u8, upper_name, "VARIANCE") or std.mem.eql(u8, upper_name, "VAR_SAMP")) {
+            return .variance;
+        } else if (std.mem.eql(u8, upper_name, "VAR_POP")) {
+            return .var_pop;
         }
         return .count; // Default fallback
     }
@@ -2107,55 +2155,108 @@ pub const Executor = struct {
         else
             null;
 
-        // Allocate result array
-        const results = try self.allocator.alloc(i64, num_groups);
-        errdefer self.allocator.free(results);
+        // Check if this is a float-returning aggregate (stddev, variance)
+        const is_float_agg = agg_type == .stddev or agg_type == .stddev_pop or
+            agg_type == .variance or agg_type == .var_pop or agg_type == .avg;
 
-        // Handle case of no groups (aggregate over empty set or no GROUP BY with data)
-        if (groups.count() == 0) {
-            // Return 0 for COUNT, null would be better for others but use 0
-            results[0] = 0;
+        if (is_float_agg) {
+            // Allocate float64 result array
+            const results = try self.allocator.alloc(f64, num_groups);
+            errdefer self.allocator.free(results);
+
+            // Handle case of no groups
+            if (groups.count() == 0) {
+                results[0] = 0;
+                return Result.Column{
+                    .name = item.alias orelse call.name,
+                    .data = Result.ColumnData{ .float64 = results },
+                };
+            }
+
+            // Compute aggregate for each group
+            var group_idx: usize = 0;
+            var iter = groups.iterator();
+            while (iter.next()) |entry| {
+                const row_indices = entry.value_ptr.items;
+
+                var acc = Accumulator.init(agg_type);
+
+                for (row_indices) |row_idx| {
+                    if (agg_col_name) |col_name| {
+                        const cached = self.column_cache.get(col_name) orelse return error.ColumnNotCached;
+
+                        switch (cached) {
+                            .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| acc.addInt(data[row_idx]),
+                            .int32, .date32 => |data| acc.addInt(data[row_idx]),
+                            .float64 => |data| acc.addFloat(data[row_idx]),
+                            .float32 => |data| acc.addFloat(data[row_idx]),
+                            .bool_ => acc.addCount(),
+                            .string => acc.addCount(),
+                        }
+                    } else {
+                        acc.addCount();
+                    }
+                }
+
+                results[group_idx] = acc.getResult();
+                group_idx += 1;
+            }
+
+            return Result.Column{
+                .name = item.alias orelse call.name,
+                .data = Result.ColumnData{ .float64 = results },
+            };
+        } else {
+            // Allocate int64 result array for count, sum, min, max
+            const results = try self.allocator.alloc(i64, num_groups);
+            errdefer self.allocator.free(results);
+
+            // Handle case of no groups (aggregate over empty set or no GROUP BY with data)
+            if (groups.count() == 0) {
+                // Return 0 for COUNT, null would be better for others but use 0
+                results[0] = 0;
+                return Result.Column{
+                    .name = item.alias orelse call.name,
+                    .data = Result.ColumnData{ .int64 = results },
+                };
+            }
+
+            // Compute aggregate for each group
+            var group_idx: usize = 0;
+            var iter = groups.iterator();
+            while (iter.next()) |entry| {
+                const row_indices = entry.value_ptr.items;
+
+                var acc = Accumulator.init(agg_type);
+
+                for (row_indices) |row_idx| {
+                    if (agg_type == .count_star) {
+                        acc.addCount();
+                    } else if (agg_col_name) |col_name| {
+                        const cached = self.column_cache.get(col_name) orelse return error.ColumnNotCached;
+
+                        switch (cached) {
+                            .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| acc.addInt(data[row_idx]),
+                            .int32, .date32 => |data| acc.addInt(data[row_idx]),
+                            .float64 => |data| acc.addFloat(data[row_idx]),
+                            .float32 => |data| acc.addFloat(data[row_idx]),
+                            .bool_ => acc.addCount(), // COUNT for bools
+                            .string => acc.addCount(), // COUNT for strings
+                        }
+                    } else {
+                        acc.addCount();
+                    }
+                }
+
+                results[group_idx] = acc.getIntResult();
+                group_idx += 1;
+            }
+
             return Result.Column{
                 .name = item.alias orelse call.name,
                 .data = Result.ColumnData{ .int64 = results },
             };
         }
-
-        // Compute aggregate for each group
-        var group_idx: usize = 0;
-        var iter = groups.iterator();
-        while (iter.next()) |entry| {
-            const row_indices = entry.value_ptr.items;
-
-            var acc = Accumulator.init(agg_type);
-
-            for (row_indices) |row_idx| {
-                if (agg_type == .count_star) {
-                    acc.addCount();
-                } else if (agg_col_name) |col_name| {
-                    const cached = self.column_cache.get(col_name) orelse return error.ColumnNotCached;
-
-                    switch (cached) {
-                        .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| acc.addInt(data[row_idx]),
-                        .int32, .date32 => |data| acc.addInt(data[row_idx]),
-                        .float64 => |data| acc.addFloat(data[row_idx]),
-                        .float32 => |data| acc.addFloat(data[row_idx]),
-                        .bool_ => acc.addCount(), // COUNT for bools
-                        .string => acc.addCount(), // COUNT for strings
-                    }
-                } else {
-                    acc.addCount();
-                }
-            }
-
-            results[group_idx] = acc.getIntResult();
-            group_idx += 1;
-        }
-
-        return Result.Column{
-            .name = item.alias orelse call.name,
-            .data = Result.ColumnData{ .int64 = results },
-        };
     }
 
     /// Evaluate a GROUP BY column for all groups (return first value from each group)

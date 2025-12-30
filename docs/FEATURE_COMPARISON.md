@@ -80,11 +80,13 @@ This document compares LanceQL features against DuckDB and Polars for feature pa
 | SUM | Yes | Yes | Yes | Full support |
 | AVG | Yes | Yes | Yes | Full support |
 | MIN / MAX | Yes | Yes | Yes | Full support |
-| STDDEV | No | Yes | Yes | Easy to add |
-| VARIANCE | No | Yes | Yes | Easy to add |
-| PERCENTILE | No | Yes | Yes | Easy to add |
-| MEDIAN | No | Yes | Yes | Easy to add |
-| STRING_AGG | No | Yes | Yes | Easy to add |
+| STDDEV / STDDEV_SAMP | Yes | Yes | Yes | Sample standard deviation |
+| STDDEV_POP | Yes | Yes | Yes | Population standard deviation |
+| VARIANCE / VAR_SAMP | Yes | Yes | Yes | Sample variance |
+| VAR_POP | Yes | Yes | Yes | Population variance |
+| PERCENTILE | No | Yes | Yes | Future |
+| MEDIAN | No | Yes | Yes | Future |
+| STRING_AGG | No | Yes | Yes | Future |
 | ARRAY_AGG | No | Yes | Yes | Future |
 
 ### Data Types
@@ -162,10 +164,11 @@ This document compares LanceQL features against DuckDB and Polars for feature pa
 - IN (subquery) and IN (list) execution
 - Simple (non-correlated) only
 
-### Phase 5: Aggregations (P4)
-- STDDEV / VARIANCE
-- PERCENTILE / MEDIAN
-- STRING_AGG
+### Phase 5: Aggregations (P4) ✅ PARTIAL
+- STDDEV / STDDEV_SAMP / STDDEV_POP ✅
+- VARIANCE / VAR_SAMP / VAR_POP ✅
+- PERCENTILE / MEDIAN - Future
+- STRING_AGG - Future
 
 ### Phase 6: Date/Time (P5)
 - Full timestamp support

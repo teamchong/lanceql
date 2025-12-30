@@ -361,13 +361,13 @@ test "execute SELECT AVG(id)" {
     var result = try executor.execute(&stmt.select, &[_]Value{});
     defer result.deinit();
 
-    // Verify results - should have 1 row with avg 3 (15/5)
+    // Verify results - should have 1 row with avg 3.0 (15/5)
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 1), result.row_count);
 
-    try std.testing.expect(result.columns[0].data == .int64);
-    const values = result.columns[0].data.int64;
-    try std.testing.expectEqual(@as(i64, 3), values[0]);
+    try std.testing.expect(result.columns[0].data == .float64);
+    const values = result.columns[0].data.float64;
+    try std.testing.expectEqual(@as(f64, 3.0), values[0]);
 }
 
 test "execute SELECT MIN/MAX(id)" {
@@ -404,6 +404,86 @@ test "execute SELECT MIN/MAX(id)" {
         defer result.deinit();
 
         try std.testing.expectEqual(@as(i64, 5), result.columns[0].data.int64[0]);
+    }
+}
+
+test "execute SELECT STDDEV and VARIANCE" {
+    const allocator = std.testing.allocator;
+
+    // Open test Lance file - values are 1,2,3,4,5
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    var table = try Table.init(allocator, lance_data);
+    defer table.deinit();
+
+    // For values 1,2,3,4,5:
+    // Mean = 3
+    // Population variance = ((1-3)² + (2-3)² + (3-3)² + (4-3)² + (5-3)²) / 5 = 10/5 = 2.0
+    // Sample variance = 10/4 = 2.5
+    // Population stddev = sqrt(2) ≈ 1.4142
+    // Sample stddev = sqrt(2.5) ≈ 1.5811
+
+    // Test VARIANCE (sample)
+    {
+        const sql = "SELECT VARIANCE(id) FROM table";
+        var stmt = try parser.parseSQL(sql, allocator);
+        defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+        var executor = Executor.init(&table, allocator);
+        defer executor.deinit();
+        var result = try executor.execute(&stmt.select, &[_]Value{});
+        defer result.deinit();
+
+        try std.testing.expect(result.columns[0].data == .float64);
+        const variance = result.columns[0].data.float64[0];
+        try std.testing.expectApproxEqAbs(@as(f64, 2.5), variance, 0.0001);
+    }
+
+    // Test VAR_POP (population)
+    {
+        const sql = "SELECT VAR_POP(id) FROM table";
+        var stmt = try parser.parseSQL(sql, allocator);
+        defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+        var executor = Executor.init(&table, allocator);
+        defer executor.deinit();
+        var result = try executor.execute(&stmt.select, &[_]Value{});
+        defer result.deinit();
+
+        try std.testing.expect(result.columns[0].data == .float64);
+        const var_pop = result.columns[0].data.float64[0];
+        try std.testing.expectApproxEqAbs(@as(f64, 2.0), var_pop, 0.0001);
+    }
+
+    // Test STDDEV (sample)
+    {
+        const sql = "SELECT STDDEV(id) FROM table";
+        var stmt = try parser.parseSQL(sql, allocator);
+        defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+        var executor = Executor.init(&table, allocator);
+        defer executor.deinit();
+        var result = try executor.execute(&stmt.select, &[_]Value{});
+        defer result.deinit();
+
+        try std.testing.expect(result.columns[0].data == .float64);
+        const stddev = result.columns[0].data.float64[0];
+        try std.testing.expectApproxEqAbs(@as(f64, 1.5811388300841898), stddev, 0.0001);
+    }
+
+    // Test STDDEV_POP (population)
+    {
+        const sql = "SELECT STDDEV_POP(id) FROM table";
+        var stmt = try parser.parseSQL(sql, allocator);
+        defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+        var executor = Executor.init(&table, allocator);
+        defer executor.deinit();
+        var result = try executor.execute(&stmt.select, &[_]Value{});
+        defer result.deinit();
+
+        try std.testing.expect(result.columns[0].data == .float64);
+        const stddev_pop = result.columns[0].data.float64[0];
+        try std.testing.expectApproxEqAbs(@as(f64, 1.4142135623730951), stddev_pop, 0.0001);
     }
 }
 
