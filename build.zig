@@ -44,6 +44,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "lanceql.proto", .module = proto_mod },
             .{ .name = "lanceql.io", .module = io_mod },
+            .{ .name = "lanceql.encoding", .module = encoding_mod },
         },
     });
 
@@ -89,12 +90,18 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // SIMD and parallel compute primitives
+    const simd_mod = b.addModule("lanceql.simd", .{
+        .root_source_file = b.path("src/simd.zig"),
+    });
+
     const table_mod = b.addModule("lanceql.table", .{
         .root_source_file = b.path("src/table.zig"),
         .imports = &.{
             .{ .name = "lanceql.format", .module = format_mod },
             .{ .name = "lanceql.proto", .module = proto_mod },
             .{ .name = "lanceql.encoding", .module = encoding_mod },
+            .{ .name = "simd", .module = simd_mod },
         },
     });
 
@@ -436,12 +443,32 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
             .imports = &.{
                 .{ .name = "lanceql.table", .module = table_mod },
+                .{ .name = "lanceql.simd", .module = simd_mod },
             },
         }),
     });
     const run_bench_sql = b.addRunArtifact(bench_sql);
     const bench_sql_step = b.step("bench-sql", "FAIR end-to-end: SQL clauses (FILTER, AGGREGATE)");
     bench_sql_step.dependOn(&run_bench_sql.step);
+
+    // Column-first I/O benchmark - compares full-file vs column-first reading
+    const bench_column_io = b.addExecutable(.{
+        .name = "bench_column_io",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmarks/bench_column_io.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "lanceql.format", .module = format_mod },
+                .{ .name = "lanceql.io", .module = io_mod },
+                .{ .name = "lanceql.simd", .module = simd_mod },
+                .{ .name = "lanceql.table", .module = table_mod },
+            },
+        }),
+    });
+    const run_bench_column_io = b.addRunArtifact(bench_column_io);
+    const bench_column_io_step = b.step("bench-column-io", "Column-first I/O benchmark");
+    bench_column_io_step.dependOn(&run_bench_column_io.step);
 
     // @logic_table benchmark - uses REAL metal0 compiled lib/vector_ops.a
     // Build with: metal0 build --emit-logic-table benchmarks/vector_ops.py -o lib/vector_ops.a
@@ -453,6 +480,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
             .imports = &.{
                 .{ .name = "lanceql.table", .module = table_mod },
+                .{ .name = "lanceql.simd", .module = simd_mod },
             },
         }),
     });

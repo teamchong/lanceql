@@ -7,6 +7,7 @@ const std = @import("std");
 const format = @import("lanceql.format");
 const proto = @import("lanceql.proto");
 const encoding = @import("lanceql.encoding");
+const simd = @import("simd");
 
 const LanceFile = format.LanceFile;
 const Schema = proto.Schema;
@@ -768,6 +769,77 @@ pub const Table = struct {
             .offsets = merged_offsets,
             .data = merged_data,
         };
+    }
+
+    // ========================================================================
+    // Compute Operations (using SIMD with auto threshold dispatch)
+    // ========================================================================
+
+    /// Compute L2 norm (Euclidean length) of a float64 column.
+    /// Uses SIMD with automatic threshold-based dispatch.
+    pub fn computeL2Norm(self: Self, col_idx: u32) TableError!f64 {
+        const data = try self.readFloat64Column(col_idx);
+        defer self.allocator.free(data);
+        return simd.l2Norm(data);
+    }
+
+    /// Compute L2 norm by column name.
+    pub fn computeL2NormByName(self: Self, name: []const u8) TableError!f64 {
+        const idx = self.columnIndex(name) orelse return TableError.ColumnNotFound;
+        return self.computeL2Norm(@intCast(idx));
+    }
+
+    /// Compute sum of a float64 column.
+    /// Uses SIMD with automatic threshold-based dispatch.
+    pub fn computeSum(self: Self, col_idx: u32) TableError!f64 {
+        const data = try self.readFloat64Column(col_idx);
+        defer self.allocator.free(data);
+        return simd.sum(data);
+    }
+
+    /// Compute sum by column name.
+    pub fn computeSumByName(self: Self, name: []const u8) TableError!f64 {
+        const idx = self.columnIndex(name) orelse return TableError.ColumnNotFound;
+        return self.computeSum(@intCast(idx));
+    }
+
+    /// Count rows where column value > threshold.
+    /// Uses SIMD with automatic threshold-based dispatch.
+    pub fn countGreaterThan(self: Self, col_idx: u32, threshold: f64) TableError!u64 {
+        const data = try self.readFloat64Column(col_idx);
+        defer self.allocator.free(data);
+        return simd.countGreaterThan(data, threshold);
+    }
+
+    /// Count rows where column value > threshold, by column name.
+    pub fn countGreaterThanByName(self: Self, name: []const u8, threshold: f64) TableError!u64 {
+        const idx = self.columnIndex(name) orelse return TableError.ColumnNotFound;
+        return self.countGreaterThan(@intCast(idx), threshold);
+    }
+
+    /// Compute dot product of two float64 columns.
+    /// Uses SIMD with automatic threshold-based dispatch.
+    pub fn computeDotProduct(self: Self, col_a: u32, col_b: u32) TableError!f64 {
+        const data_a = try self.readFloat64Column(col_a);
+        defer self.allocator.free(data_a);
+        const data_b = try self.readFloat64Column(col_b);
+        defer self.allocator.free(data_b);
+        return simd.dotProduct(data_a, data_b);
+    }
+
+    /// Batch dot product: compute dot products of f32 embeddings against a query vector.
+    /// Returns array of scores (one per row).
+    /// Caller must free the returned slice.
+    pub fn batchDotProduct(self: Self, col_idx: u32, query: []const f64, dim: usize) TableError![]f64 {
+        const embeddings = try self.readFloat32Column(col_idx);
+        defer self.allocator.free(embeddings);
+
+        const num_rows = embeddings.len / dim;
+        const out = self.allocator.alloc(f64, num_rows) catch return TableError.OutOfMemory;
+        errdefer self.allocator.free(out);
+
+        simd.batchDotProductF32(embeddings, query, dim, out);
+        return out;
     }
 };
 

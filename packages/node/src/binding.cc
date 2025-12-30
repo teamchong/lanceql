@@ -516,6 +516,204 @@ Napi::Object Database::Init(Napi::Env env, Napi::Object exports) {
 }
 
 // ============================================================================
+// DynamicLogicTable - Load and call @logic_table compiled shared libraries
+// ============================================================================
+
+class DynamicLogicTable : public Napi::ObjectWrap<DynamicLogicTable> {
+private:
+    void* lib_handle;
+    std::string lib_path;
+    std::vector<std::string> symbols;
+
+    // Function signature for @logic_table vector operations: (f64*, f64*, usize) -> f64
+    typedef double (*VectorOpFn)(const double*, const double*, size_t);
+
+public:
+    static Napi::Object Init(Napi::Env env, Napi::Object exports);
+
+    DynamicLogicTable(const Napi::CallbackInfo& info);
+    ~DynamicLogicTable();
+
+    Napi::Value GetSymbols(const Napi::CallbackInfo& info);
+    Napi::Value Call(const Napi::CallbackInfo& info);
+    Napi::Value Close(const Napi::CallbackInfo& info);
+
+private:
+    void discoverSymbols();
+};
+
+DynamicLogicTable::DynamicLogicTable(const Napi::CallbackInfo& info)
+    : Napi::ObjectWrap<DynamicLogicTable>(info), lib_handle(nullptr) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 1 || !info[0].IsString()) {
+        Napi::TypeError::New(env, "Library path (string) required").ThrowAsJavaScriptException();
+        return;
+    }
+
+    lib_path = info[0].As<Napi::String>().Utf8Value();
+
+    // Load the shared library
+    lib_handle = dlopen(lib_path.c_str(), RTLD_LAZY);
+    if (!lib_handle) {
+        std::string err = dlerror();
+        Napi::Error::New(env, "Failed to load library '" + lib_path + "': " + err)
+            .ThrowAsJavaScriptException();
+        return;
+    }
+
+    // Discover exported symbols
+    discoverSymbols();
+}
+
+DynamicLogicTable::~DynamicLogicTable() {
+    if (lib_handle) {
+        dlclose(lib_handle);
+        lib_handle = nullptr;
+    }
+}
+
+void DynamicLogicTable::discoverSymbols() {
+    // Use nm command to discover exported symbols
+    // On macOS: nm -gU <lib> | grep " T "
+    // On Linux: nm -gD <lib> | grep " T "
+    symbols.clear();
+
+#ifdef _WIN32
+    // Windows: Use dumpbin (more complex, skip for now)
+    // Users can manually specify symbols
+#else
+    std::string cmd;
+#ifdef __APPLE__
+    cmd = "nm -gU \"" + lib_path + "\" 2>/dev/null | grep \" T \" | awk '{print $3}'";
+#else
+    cmd = "nm -gD \"" + lib_path + "\" 2>/dev/null | grep \" T \" | awk '{print $3}'";
+#endif
+
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (pipe) {
+        char buffer[256];
+        while (fgets(buffer, sizeof(buffer), pipe)) {
+            std::string symbol(buffer);
+            // Remove trailing newline
+            if (!symbol.empty() && symbol.back() == '\n') {
+                symbol.pop_back();
+            }
+
+            // On macOS, symbols have leading underscore - remove it
+            if (!symbol.empty() && symbol[0] == '_') {
+                symbol = symbol.substr(1);
+            }
+
+            // Filter out internal symbols
+            if (symbol.find("libdeflate_") == 0 ||
+                symbol.find("std_") == 0 ||
+                symbol.find("runtime_") == 0 ||
+                symbol.find("c_interop_") == 0 ||
+                symbol.find("__") == 0) {
+                continue;
+            }
+
+            // Only include symbols with ClassName_methodName pattern
+            if (symbol.find('_') != std::string::npos) {
+                symbols.push_back(symbol);
+            }
+        }
+        pclose(pipe);
+    }
+#endif
+}
+
+Napi::Value DynamicLogicTable::GetSymbols(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    Napi::Array result = Napi::Array::New(env, symbols.size());
+    for (size_t i = 0; i < symbols.size(); i++) {
+        result[i] = Napi::String::New(env, symbols[i]);
+    }
+
+    return result;
+}
+
+Napi::Value DynamicLogicTable::Call(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (!lib_handle) {
+        Napi::Error::New(env, "Library not loaded").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsArray()) {
+        Napi::TypeError::New(env, "Expected (symbolName: string, args: Array)").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    std::string symbol_name = info[0].As<Napi::String>().Utf8Value();
+    Napi::Array args = info[1].As<Napi::Array>();
+
+    // Look up the function
+    void* fn_ptr = dlsym(lib_handle, symbol_name.c_str());
+    if (!fn_ptr) {
+        Napi::Error::New(env, "Symbol not found: " + symbol_name).ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    // For @logic_table functions, we expect the signature: (f64*, f64*, usize) -> f64
+    // args[0] = first array, args[1] = second array
+    if (args.Length() < 2) {
+        Napi::TypeError::New(env, "Expected at least 2 array arguments").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    // Convert JavaScript arrays to C arrays
+    Napi::Array arr1 = args.Get(uint32_t(0)).As<Napi::Array>();
+    Napi::Array arr2 = args.Get(uint32_t(1)).As<Napi::Array>();
+
+    size_t len = arr1.Length();
+    if (arr2.Length() != len) {
+        Napi::TypeError::New(env, "Arrays must have same length").ThrowAsJavaScriptException();
+        return env.Null();
+    }
+
+    std::vector<double> vec1(len);
+    std::vector<double> vec2(len);
+
+    for (size_t i = 0; i < len; i++) {
+        vec1[i] = arr1.Get(i).As<Napi::Number>().DoubleValue();
+        vec2[i] = arr2.Get(i).As<Napi::Number>().DoubleValue();
+    }
+
+    // Call the function
+    VectorOpFn fn = (VectorOpFn)fn_ptr;
+    double result = fn(vec1.data(), vec2.data(), len);
+
+    return Napi::Number::New(env, result);
+}
+
+Napi::Value DynamicLogicTable::Close(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (lib_handle) {
+        dlclose(lib_handle);
+        lib_handle = nullptr;
+    }
+    symbols.clear();
+
+    return env.Undefined();
+}
+
+Napi::Object DynamicLogicTable::Init(Napi::Env env, Napi::Object exports) {
+    Napi::Function func = DefineClass(env, "DynamicLogicTable", {
+        InstanceMethod("getSymbols", &DynamicLogicTable::GetSymbols),
+        InstanceMethod("call", &DynamicLogicTable::Call),
+        InstanceMethod("close", &DynamicLogicTable::Close),
+    });
+
+    exports.Set("DynamicLogicTable", func);
+    return exports;
+}
+
+// ============================================================================
 // Module Cleanup
 // ============================================================================
 
@@ -591,6 +789,9 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
 
     // Initialize Database
     Database::Init(env, exports);
+
+    // Initialize DynamicLogicTable (for @logic_table runtime compilation)
+    DynamicLogicTable::Init(env, exports);
 
     // Register cleanup hook
     napi_add_env_cleanup_hook(env, CleanupModule, nullptr);

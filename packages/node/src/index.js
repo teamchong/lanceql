@@ -841,6 +841,18 @@ function loadLogicTable(path) {
 }
 
 // ============================================================================
+// @logic_table Runtime Compilation
+// ============================================================================
+
+const {
+    LogicTableCompiler,
+    CompiledLogicTable,
+    CompilerError,
+    compileLogicTable,
+    compileLogicTableFile,
+} = require('./compiler');
+
+// ============================================================================
 // Exports - Match better-sqlite3 export format exactly
 // ============================================================================
 
@@ -859,3 +871,9 @@ module.exports.Table = Table;
 module.exports.logicTable = logicTable;
 module.exports.LogicTableQuery = LogicTableQuery;
 module.exports.loadLogicTable = loadLogicTable;
+// @logic_table runtime compilation
+module.exports.LogicTableCompiler = LogicTableCompiler;
+module.exports.CompiledLogicTable = CompiledLogicTable;
+module.exports.CompilerError = CompilerError;
+module.exports.compileLogicTable = compileLogicTable;
+module.exports.compileLogicTableFile = compileLogicTableFile;

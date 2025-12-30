@@ -6,6 +6,13 @@ from . import parquet
 from .cache import HotTierCache, hot_tier_cache
 from .vector import VectorAccelerator, vector_accelerator
 from .remote import RemoteLanceDataset, IVFIndex
+from .compiler import (
+    LogicTableCompiler,
+    compile_logic_table,
+    compile_logic_table_file,
+    CompilerError,
+)
+from .logic_table import CompiledLogicTable
 
 # polars is optional - import lazily to avoid ImportError if not installed
 def __getattr__(name):
@@ -23,5 +30,11 @@ __all__ = [
     "vector_accelerator",
     "RemoteLanceDataset",
     "IVFIndex",
+    # @logic_table runtime compilation
+    "LogicTableCompiler",
+    "compile_logic_table",
+    "compile_logic_table_file",
+    "CompilerError",
+    "CompiledLogicTable",
     "__version__",
 ]

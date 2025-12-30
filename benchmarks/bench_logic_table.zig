@@ -1,7 +1,7 @@
 //! @logic_table Benchmark - HONEST End-to-End Comparison
 //!
 //! What we're comparing (all read from files, same 15-second duration):
-//!   1. LanceQL @logic_table  - Read Lance file → compute with COMPILED Python
+//!   1. LanceQL @logic_table  - Read Lance file → compute with library SIMD
 //!   2. DuckDB + Python loop  - Read Parquet → row-by-row Python calls
 //!   3. DuckDB → NumPy batch  - Read Parquet → pull to Python → NumPy compute
 //!   4. Polars + Python loop  - Read Parquet → row-by-row Python calls
@@ -11,7 +11,10 @@
 //!   - All methods read from disk (Lance or Parquet)
 //!   - All methods run for exactly 15 seconds
 //!   - Throughput measured as rows processed per second
-//!   - LanceQL uses VectorOps.dot_product - compiled from Python @logic_table
+//!   - LanceQL uses library simd.batchDotProductF32 for batch processing
+//!
+//! NOTE: LanceQL uses the library's SIMD+parallel compute functions from src/simd.zig
+//!       No benchmark-specific optimizations - this measures real library performance.
 //!
 //! Setup:
 //!   python3 benchmarks/generate_benchmark_data.py  # Creates test data
@@ -19,6 +22,7 @@
 
 const std = @import("std");
 const Table = @import("lanceql.table").Table;
+const simd = @import("lanceql.simd");
 
 // Extern declaration for COMPILED @logic_table functions
 // This is Python code compiled to native Zig by metal0
@@ -26,56 +30,6 @@ const Table = @import("lanceql.table").Table;
 
 // Scalar function (single vector dot product)
 extern fn VectorOps_dot_product(a: [*]const f64, b: [*]const f64, len: usize) f64;
-
-// =============================================================================
-// Native Zig batch function - processes all rows at once with explicit SIMD
-// This is what we want @logic_table to generate, implemented manually for now
-// =============================================================================
-
-// SIMD vector size - 8 floats = 256 bits (AVX/NEON)
-const SIMD_WIDTH = 8;
-const SimdVec = @Vector(SIMD_WIDTH, f32);
-
-fn batchDotProductF32(
-    matrix: [*]const f32,
-    vec_f64: [*]const f64,
-    num_rows: usize,
-    dim: usize,
-    out: [*]f64,
-) void {
-    // Pre-convert query vector to f32 ONCE (avoids per-element conversion)
-    var query_f32: [EMBEDDING_DIM]f32 = undefined;
-    for (0..dim) |i| {
-        query_f32[i] = @floatCast(vec_f64[i]);
-    }
-
-    // Process each row with explicit SIMD
-    for (0..num_rows) |row| {
-        const row_start = row * dim;
-        var sum_vec: SimdVec = @splat(0.0);
-
-        // SIMD loop - process SIMD_WIDTH elements at a time
-        var i: usize = 0;
-        while (i + SIMD_WIDTH <= dim) : (i += SIMD_WIDTH) {
-            // Load SIMD_WIDTH elements from matrix row
-            const mat_vec: SimdVec = matrix[row_start + i ..][0..SIMD_WIDTH].*;
-            // Load SIMD_WIDTH elements from query vector
-            const query_vec: SimdVec = query_f32[i..][0..SIMD_WIDTH].*;
-            // Fused multiply-add: sum += mat * query
-            sum_vec += mat_vec * query_vec;
-        }
-
-        // Horizontal sum of SIMD vector
-        var sum: f32 = @reduce(.Add, sum_vec);
-
-        // Handle remaining elements (if dim not divisible by SIMD_WIDTH)
-        while (i < dim) : (i += 1) {
-            sum += matrix[row_start + i] * query_f32[i];
-        }
-
-        out[row] = @floatCast(sum);
-    }
-}
 
 const WARMUP_SECONDS = 2;
 const BENCHMARK_SECONDS = 15;
@@ -249,15 +203,8 @@ pub fn main() !void {
                 scores = allocator.alloc(f64, num_rows) catch break;
             }
 
-            // BATCH: Compute ALL dot products in one call with SIMD
-            // No per-row loop needed - batch function handles everything
-            batchDotProductF32(
-                embeddings.ptr,
-                &query_vec,
-                num_rows,
-                EMBEDDING_DIM,
-                scores.ptr,
-            );
+            // BATCH: Use library SIMD function (auto-dispatches scalar/SIMD/parallel)
+            simd.batchDotProductF32(embeddings, &query_vec, EMBEDDING_DIM, scores);
             std.mem.doNotOptimizeAway(scores.ptr);
         }
 
@@ -281,14 +228,8 @@ pub fn main() !void {
                 scores = allocator.alloc(f64, num_rows) catch break;
             }
 
-            // BATCH: Compute ALL dot products in one call with SIMD
-            batchDotProductF32(
-                embeddings.ptr,
-                &query_vec,
-                num_rows,
-                EMBEDDING_DIM,
-                scores.ptr,
-            );
+            // BATCH: Use library SIMD function (auto-dispatches scalar/SIMD/parallel)
+            simd.batchDotProductF32(embeddings, &query_vec, EMBEDDING_DIM, scores);
             std.mem.doNotOptimizeAway(scores.ptr);
 
             iterations += 1;

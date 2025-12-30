@@ -10,6 +10,7 @@ const std = @import("std");
 pub const footer = @import("footer.zig");
 pub const version = @import("version.zig");
 pub const lance_file = @import("lance_file.zig");
+pub const lazy_lance_file = @import("lazy_lance_file.zig");
 
 // Parquet format
 pub const parquet_metadata = @import("parquet_metadata.zig");
@@ -22,6 +23,7 @@ pub const LANCE_MAGIC = footer.LANCE_MAGIC;
 pub const FOOTER_SIZE = footer.FOOTER_SIZE;
 pub const LanceFile = lance_file.LanceFile;
 pub const readFile = lance_file.readFile;
+pub const LazyLanceFile = lazy_lance_file.LazyLanceFile;
 
 // Re-export Parquet types
 pub const ParquetFile = parquet_file.ParquetFile;
