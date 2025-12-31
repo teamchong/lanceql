@@ -125,6 +125,823 @@ class MetadataCache {
 const metadataCache = new MetadataCache();
 
 /**
+ * WebGPU Accelerator - GPU-accelerated batch cosine similarity.
+ *
+ * Uses WebGPU compute shaders for massive parallelism:
+ * - CPU/WASM SIMD: ~4-8 floats parallel per instruction
+ * - WebGPU: Thousands of parallel cores, entire batch in one dispatch
+ *
+ * Falls back to WASM SIMD if WebGPU unavailable.
+ */
+class WebGPUAccelerator {
+    constructor() {
+        this.device = null;
+        this.pipeline = null;
+        this.available = false;
+        this._initPromise = null;
+    }
+
+    /**
+     * Initialize WebGPU. Call once before using.
+     * @returns {Promise<boolean>} Whether WebGPU is available
+     */
+    async init() {
+        if (this._initPromise) return this._initPromise;
+
+        this._initPromise = this._doInit();
+        return this._initPromise;
+    }
+
+    async _doInit() {
+        if (!navigator.gpu) {
+            console.log('[WebGPU] Not available in this browser');
+            return false;
+        }
+
+        try {
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) {
+                console.log('[WebGPU] No adapter found');
+                return false;
+            }
+
+            this.device = await adapter.requestDevice();
+            this._createPipeline();
+            this.available = true;
+            console.log('[WebGPU] Initialized successfully');
+            return true;
+        } catch (e) {
+            console.warn('[WebGPU] Init failed:', e);
+            return false;
+        }
+    }
+
+    _createPipeline() {
+        // Compute shader for batch cosine similarity
+        // Assumes L2-normalized vectors (dot product = cosine similarity)
+        const shaderCode = `
+            struct Params {
+                dim: u32,
+                numVectors: u32,
+            }
+
+            @group(0) @binding(0) var<uniform> params: Params;
+            @group(0) @binding(1) var<storage, read> query: array<f32>;
+            @group(0) @binding(2) var<storage, read> vectors: array<f32>;
+            @group(0) @binding(3) var<storage, read_write> scores: array<f32>;
+
+            @compute @workgroup_size(256)
+            fn main(@builtin(global_invocation_id) globalId: vec3u) {
+                let idx = globalId.x;
+                if (idx >= params.numVectors) {
+                    return;
+                }
+
+                let dim = params.dim;
+                let offset = idx * dim;
+
+                // Compute dot product (= cosine similarity for normalized vectors)
+                var dot: f32 = 0.0;
+                for (var i: u32 = 0u; i < dim; i++) {
+                    dot += query[i] * vectors[offset + i];
+                }
+
+                scores[idx] = dot;
+            }
+        `;
+
+        const shaderModule = this.device.createShaderModule({
+            code: shaderCode
+        });
+
+        this.pipeline = this.device.createComputePipeline({
+            layout: 'auto',
+            compute: {
+                module: shaderModule,
+                entryPoint: 'main'
+            }
+        });
+    }
+
+    /**
+     * Batch cosine similarity using WebGPU.
+     * @param {Float32Array} queryVec - Query vector (dim)
+     * @param {Float32Array[]} vectors - Array of candidate vectors
+     * @param {boolean} normalized - Whether vectors are L2-normalized
+     * @returns {Promise<Float32Array>} Similarity scores
+     */
+    async batchCosineSimilarity(queryVec, vectors, normalized = true) {
+        if (!this.available || vectors.length === 0) {
+            return null; // Caller should fallback to WASM
+        }
+
+        const dim = queryVec.length;
+        const numVectors = vectors.length;
+
+        // Check buffer size limit (default 128MB, but check device limits)
+        const vectorsBufferSize = numVectors * dim * 4;
+        const maxBufferSize = this.device.limits?.maxStorageBufferBindingSize || 134217728;
+        if (vectorsBufferSize > maxBufferSize) {
+            console.warn(`[WebGPU] Buffer size ${(vectorsBufferSize/1024/1024).toFixed(1)}MB exceeds limit ${(maxBufferSize/1024/1024).toFixed(1)}MB, falling back`);
+            return null; // Caller should fallback to WASM
+        }
+
+        // Create buffers
+        const paramsBuffer = this.device.createBuffer({
+            size: 8, // 2 x u32
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
+
+        const queryBuffer = this.device.createBuffer({
+            size: dim * 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+
+        const vectorsBuffer = this.device.createBuffer({
+            size: numVectors * dim * 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+
+        const scoresBuffer = this.device.createBuffer({
+            size: numVectors * 4,
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+        });
+
+        const readbackBuffer = this.device.createBuffer({
+            size: numVectors * 4,
+            usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+        });
+
+        // Write data to buffers
+        this.device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([dim, numVectors]));
+        this.device.queue.writeBuffer(queryBuffer, 0, queryVec);
+
+        // Flatten vectors into single array
+        const flatVectors = new Float32Array(numVectors * dim);
+        for (let i = 0; i < numVectors; i++) {
+            flatVectors.set(vectors[i], i * dim);
+        }
+        this.device.queue.writeBuffer(vectorsBuffer, 0, flatVectors);
+
+        // Create bind group
+        const bindGroup = this.device.createBindGroup({
+            layout: this.pipeline.getBindGroupLayout(0),
+            entries: [
+                { binding: 0, resource: { buffer: paramsBuffer } },
+                { binding: 1, resource: { buffer: queryBuffer } },
+                { binding: 2, resource: { buffer: vectorsBuffer } },
+                { binding: 3, resource: { buffer: scoresBuffer } },
+            ]
+        });
+
+        // Dispatch compute shader
+        const commandEncoder = this.device.createCommandEncoder();
+        const passEncoder = commandEncoder.beginComputePass();
+        passEncoder.setPipeline(this.pipeline);
+        passEncoder.setBindGroup(0, bindGroup);
+        passEncoder.dispatchWorkgroups(Math.ceil(numVectors / 256));
+        passEncoder.end();
+
+        // Copy results to readback buffer
+        commandEncoder.copyBufferToBuffer(scoresBuffer, 0, readbackBuffer, 0, numVectors * 4);
+        this.device.queue.submit([commandEncoder.finish()]);
+
+        // Read results
+        await readbackBuffer.mapAsync(GPUMapMode.READ);
+        const results = new Float32Array(readbackBuffer.getMappedRange().slice(0));
+        readbackBuffer.unmap();
+
+        // Cleanup
+        paramsBuffer.destroy();
+        queryBuffer.destroy();
+        vectorsBuffer.destroy();
+        scoresBuffer.destroy();
+        readbackBuffer.destroy();
+
+        return results;
+    }
+
+    /**
+     * Check if WebGPU is available and initialized
+     */
+    isAvailable() {
+        return this.available;
+    }
+
+    /**
+     * Get maximum vectors that can fit in a single WebGPU batch.
+     * @param {number} dim - Vector dimension
+     * @returns {number} Maximum vectors per batch
+     */
+    getMaxVectorsPerBatch(dim) {
+        if (!this.available) return 0;
+        const maxBufferSize = this.device.limits?.maxStorageBufferBindingSize || 134217728;
+        // Leave some headroom (use 90% of limit)
+        return Math.floor((maxBufferSize * 0.9) / (dim * 4));
+    }
+}
+
+// Global WebGPU accelerator instance
+const webgpuAccelerator = new WebGPUAccelerator();
+
+/**
+ * Statistics Manager - computes and caches column statistics for query optimization.
+ *
+ * Unlike pre-generated sidecar files, this computes statistics dynamically:
+ * 1. On first query to a column, stream through data to compute min/max/null_count
+ * 2. Cache computed stats in OPFS for reuse across sessions
+ * 3. Use statistics for fragment/page pruning during query execution
+ *
+ * This is the same approach used by DuckDB and DataFusion - no pre-processing required.
+ */
+class StatisticsManager {
+    constructor() {
+        this._cache = new Map(); // In-memory cache: datasetUrl -> { columns: Map<colName, stats> }
+        this._opfsRoot = null;
+        this._computing = new Map(); // Track in-progress computations to avoid duplicates
+    }
+
+    /**
+     * Get OPFS directory for statistics cache
+     */
+    async _getStatsDir() {
+        if (this._opfsRoot) return this._opfsRoot;
+
+        if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) {
+            return null; // OPFS not available
+        }
+
+        try {
+            const opfsRoot = await navigator.storage.getDirectory();
+            this._opfsRoot = await opfsRoot.getDirectoryHandle('lanceql-stats', { create: true });
+            return this._opfsRoot;
+        } catch (e) {
+            console.warn('[StatisticsManager] OPFS not available:', e);
+            return null;
+        }
+    }
+
+    /**
+     * Get cache key for a dataset
+     */
+    _getCacheKey(datasetUrl) {
+        // Hash the URL for filesystem-safe name
+        let hash = 0;
+        for (let i = 0; i < datasetUrl.length; i++) {
+            hash = ((hash << 5) - hash) + datasetUrl.charCodeAt(i);
+            hash |= 0;
+        }
+        return `stats_${Math.abs(hash).toString(16)}`;
+    }
+
+    /**
+     * Load cached statistics from OPFS
+     */
+    async loadFromCache(datasetUrl, version) {
+        const cacheKey = this._getCacheKey(datasetUrl);
+
+        // Check in-memory cache first
+        if (this._cache.has(cacheKey)) {
+            const cached = this._cache.get(cacheKey);
+            if (cached.version === version) {
+                return cached;
+            }
+        }
+
+        // Try OPFS
+        const statsDir = await this._getStatsDir();
+        if (!statsDir) return null;
+
+        try {
+            const fileHandle = await statsDir.getFileHandle(`${cacheKey}.json`);
+            const file = await fileHandle.getFile();
+            const text = await file.text();
+            const cached = JSON.parse(text);
+
+            // Validate version
+            if (cached.version !== version) {
+                return null; // Stale cache
+            }
+
+            // Store in memory cache
+            this._cache.set(cacheKey, cached);
+            return cached;
+        } catch (e) {
+            return null; // No cache or read error
+        }
+    }
+
+    /**
+     * Save statistics to OPFS cache
+     */
+    async saveToCache(datasetUrl, version, statistics) {
+        const cacheKey = this._getCacheKey(datasetUrl);
+
+        const cacheData = {
+            datasetUrl,
+            version,
+            timestamp: Date.now(),
+            columns: statistics.columns, // Map serialized as object
+            fragments: statistics.fragments || null
+        };
+
+        // Store in memory
+        this._cache.set(cacheKey, cacheData);
+
+        // Persist to OPFS
+        const statsDir = await this._getStatsDir();
+        if (!statsDir) return;
+
+        try {
+            const fileHandle = await statsDir.getFileHandle(`${cacheKey}.json`, { create: true });
+            const writable = await fileHandle.createWritable();
+            await writable.write(JSON.stringify(cacheData));
+            await writable.close();
+        } catch (e) {
+            console.warn('[StatisticsManager] Failed to persist stats:', e);
+        }
+    }
+
+    /**
+     * Get statistics for a column, computing if necessary.
+     *
+     * @param {RemoteLanceDataset} dataset - The dataset
+     * @param {string} columnName - Column name
+     * @param {object} options - Options
+     * @param {number} [options.sampleSize] - Max rows to sample (default: 100000)
+     * @returns {Promise<ColumnStatistics>}
+     */
+    async getColumnStats(dataset, columnName, options = {}) {
+        const datasetUrl = dataset.baseUrl;
+        const version = dataset._version;
+        const sampleSize = options.sampleSize || 100000;
+
+        // Try to load from cache
+        const cached = await this.loadFromCache(datasetUrl, version);
+        if (cached?.columns?.[columnName]) {
+            return cached.columns[columnName];
+        }
+
+        // Check if already computing
+        const computeKey = `${datasetUrl}:${columnName}`;
+        if (this._computing.has(computeKey)) {
+            return this._computing.get(computeKey);
+        }
+
+        // Compute statistics by streaming through data
+        const computePromise = this._computeColumnStats(dataset, columnName, sampleSize);
+        this._computing.set(computeKey, computePromise);
+
+        try {
+            const stats = await computePromise;
+
+            // Merge into cache
+            const existing = await this.loadFromCache(datasetUrl, version) || { columns: {} };
+            existing.columns[columnName] = stats;
+            await this.saveToCache(datasetUrl, version, existing);
+
+            return stats;
+        } finally {
+            this._computing.delete(computeKey);
+        }
+    }
+
+    /**
+     * Compute statistics for a column by streaming through data.
+     */
+    async _computeColumnStats(dataset, columnName, sampleSize) {
+        const colIdx = dataset.schema.findIndex(c => c.name === columnName);
+        if (colIdx === -1) {
+            throw new Error(`Column not found: ${columnName}`);
+        }
+
+        const colType = dataset._columnTypes?.[colIdx] || 'unknown';
+        const isNumeric = ['int8', 'int16', 'int32', 'int64', 'float32', 'float64', 'double'].includes(colType);
+
+        const stats = {
+            column: columnName,
+            type: colType,
+            rowCount: 0,
+            nullCount: 0,
+            min: null,
+            max: null,
+            computed: true,
+            sampleSize: 0
+        };
+
+        // Stream through fragments
+        let rowsProcessed = 0;
+
+        for (let fragIdx = 0; fragIdx < dataset._fragments.length && rowsProcessed < sampleSize; fragIdx++) {
+            try {
+                const fragFile = await dataset.openFragment(fragIdx);
+                const fragRows = Math.min(
+                    dataset._fragments[fragIdx].numRows,
+                    sampleSize - rowsProcessed
+                );
+
+                // Read column data
+                const indices = Array.from({ length: fragRows }, (_, i) => i);
+                const values = await fragFile.readColumnAtIndices(colIdx, indices);
+
+                for (const value of values) {
+                    stats.rowCount++;
+                    stats.sampleSize++;
+
+                    if (value === null || value === undefined) {
+                        stats.nullCount++;
+                        continue;
+                    }
+
+                    if (isNumeric) {
+                        if (stats.min === null || value < stats.min) stats.min = value;
+                        if (stats.max === null || value > stats.max) stats.max = value;
+                    }
+                }
+
+                rowsProcessed += values.length;
+            } catch (e) {
+                console.warn(`[StatisticsManager] Error reading fragment ${fragIdx}:`, e);
+            }
+        }
+
+        console.log(`[StatisticsManager] Computed stats for ${columnName}: min=${stats.min}, max=${stats.max}, nulls=${stats.nullCount}/${stats.rowCount}`);
+        return stats;
+    }
+
+    /**
+     * Compute statistics for all filter columns in a query plan.
+     * This is called before query execution to enable pruning.
+     */
+    async precomputeForPlan(dataset, plan) {
+        const filterColumns = new Set();
+
+        // Collect columns from pushed filters
+        for (const filter of (plan.pushedFilters || [])) {
+            if (filter.column) filterColumns.add(filter.column);
+            if (filter.left?.column) filterColumns.add(filter.left.column);
+            if (filter.right?.column) filterColumns.add(filter.right.column);
+        }
+
+        // Compute stats in parallel
+        const statsPromises = Array.from(filterColumns).map(col =>
+            this.getColumnStats(dataset, col).catch(e => {
+                console.warn(`[StatisticsManager] Failed to compute stats for ${col}:`, e);
+                return null;
+            })
+        );
+
+        const results = await Promise.all(statsPromises);
+        const statsMap = new Map();
+
+        Array.from(filterColumns).forEach((col, i) => {
+            if (results[i]) statsMap.set(col, results[i]);
+        });
+
+        return statsMap;
+    }
+
+    /**
+     * Check if a filter can be satisfied by a fragment's statistics.
+     * Returns false if we can definitively skip this fragment.
+     */
+    canMatchFragment(fragmentStats, filter) {
+        if (!fragmentStats || !filter) return true; // Can't determine, must scan
+
+        const colStats = fragmentStats[filter.column];
+        if (!colStats || colStats.min === null || colStats.max === null) return true;
+
+        switch (filter.type) {
+            case 'equality':
+                // col = value: skip if value outside [min, max]
+                return filter.value >= colStats.min && filter.value <= colStats.max;
+
+            case 'range':
+                switch (filter.op) {
+                    case '>':
+                        // col > value: skip if max <= value
+                        return colStats.max > filter.value;
+                    case '>=':
+                        return colStats.max >= filter.value;
+                    case '<':
+                        // col < value: skip if min >= value
+                        return colStats.min < filter.value;
+                    case '<=':
+                        return colStats.min <= filter.value;
+                }
+                break;
+
+            case 'between':
+                // col BETWEEN low AND high: skip if max < low OR min > high
+                return colStats.max >= filter.low && colStats.min <= filter.high;
+
+            case 'in':
+                // col IN (values): skip if all values outside [min, max]
+                if (Array.isArray(filter.values)) {
+                    return filter.values.some(v => v >= colStats.min && v <= colStats.max);
+                }
+                break;
+        }
+
+        return true; // Default: can't skip
+    }
+
+    /**
+     * Compute per-fragment statistics for a column.
+     * This enables fine-grained fragment pruning.
+     */
+    async getFragmentStats(dataset, columnName, fragmentIndex) {
+        const datasetUrl = dataset.baseUrl;
+        const version = dataset._version;
+        const cacheKey = `${datasetUrl}:frag${fragmentIndex}:${columnName}`;
+
+        // Check if already computed
+        const cached = await this.loadFromCache(datasetUrl, version);
+        if (cached?.fragments?.[fragmentIndex]?.[columnName]) {
+            return cached.fragments[fragmentIndex][columnName];
+        }
+
+        // Compute stats for this fragment only
+        const colIdx = dataset.schema.findIndex(c => c.name === columnName);
+        if (colIdx === -1) return null;
+
+        const colType = dataset._columnTypes?.[colIdx] || 'unknown';
+        const isNumeric = ['int8', 'int16', 'int32', 'int64', 'float32', 'float64', 'double'].includes(colType);
+
+        try {
+            const fragFile = await dataset.openFragment(fragmentIndex);
+            const fragRows = dataset._fragments[fragmentIndex].numRows;
+
+            // Sample up to 10000 rows for fragment stats
+            const sampleSize = Math.min(fragRows, 10000);
+            const indices = Array.from({ length: sampleSize }, (_, i) => i);
+            const values = await fragFile.readColumnAtIndices(colIdx, indices);
+
+            const stats = {
+                fragmentIndex,
+                column: columnName,
+                rowCount: fragRows,
+                sampledRows: sampleSize,
+                nullCount: 0,
+                min: null,
+                max: null
+            };
+
+            for (const value of values) {
+                if (value === null || value === undefined) {
+                    stats.nullCount++;
+                    continue;
+                }
+                if (isNumeric) {
+                    if (stats.min === null || value < stats.min) stats.min = value;
+                    if (stats.max === null || value > stats.max) stats.max = value;
+                }
+            }
+
+            // Cache fragment stats
+            const existing = await this.loadFromCache(datasetUrl, version) || { columns: {}, fragments: {} };
+            if (!existing.fragments) existing.fragments = {};
+            if (!existing.fragments[fragmentIndex]) existing.fragments[fragmentIndex] = {};
+            existing.fragments[fragmentIndex][columnName] = stats;
+            await this.saveToCache(datasetUrl, version, existing);
+
+            return stats;
+        } catch (e) {
+            console.warn(`[StatisticsManager] Error computing fragment ${fragmentIndex} stats:`, e);
+            return null;
+        }
+    }
+
+    /**
+     * Get fragments that might match a filter based on statistics.
+     * Returns indices of fragments that can't be pruned.
+     */
+    async getPrunableFragments(dataset, filters) {
+        if (!filters || filters.length === 0 || !dataset._fragments) {
+            return null; // Can't prune
+        }
+
+        const numFragments = dataset._fragments.length;
+        const matchingFragments = [];
+        let fragmentsPruned = 0;
+
+        // Get filter columns
+        const filterColumns = new Set();
+        for (const filter of filters) {
+            if (filter.column) filterColumns.add(filter.column);
+        }
+
+        for (let fragIdx = 0; fragIdx < numFragments; fragIdx++) {
+            let canPrune = false;
+
+            for (const filter of filters) {
+                if (!filter.column) continue;
+
+                // Get stats for this fragment/column (computed lazily)
+                const fragStats = await this.getFragmentStats(dataset, filter.column, fragIdx);
+
+                if (fragStats && !this.canMatchFragment({ [filter.column]: fragStats }, filter)) {
+                    canPrune = true;
+                    break;
+                }
+            }
+
+            if (!canPrune) {
+                matchingFragments.push(fragIdx);
+            } else {
+                fragmentsPruned++;
+            }
+        }
+
+        console.log(`[StatisticsManager] Fragment pruning: ${fragmentsPruned}/${numFragments} fragments pruned`);
+
+        return {
+            matchingFragments,
+            fragmentsPruned,
+            totalFragments: numFragments
+        };
+    }
+}
+
+// Global statistics manager instance
+const statisticsManager = new StatisticsManager();
+
+/**
+ * Cost Model - estimates query execution cost for remote vs local strategies.
+ *
+ * This enables the optimizer to choose between:
+ * - Remote: Minimize RTTs and bytes transferred (high latency, high bandwidth cost)
+ * - Local: Maximize sequential I/O (low latency, CPU-bound)
+ *
+ * Similar to how DuckDB and DataFusion estimate query costs.
+ */
+class CostModel {
+    constructor(options = {}) {
+        this.isRemote = options.isRemote ?? true;
+
+        // Network costs (ms)
+        this.rttLatency = options.rttLatency ?? 50; // Round-trip time
+        this.bandwidthMBps = options.bandwidthMBps ?? 10; // MB/s
+
+        // CPU costs (ms per row)
+        this.filterCostPerRow = options.filterCostPerRow ?? 0.001;
+        this.hashBuildCostPerRow = options.hashBuildCostPerRow ?? 0.01;
+        this.hashProbeCostPerRow = options.hashProbeCostPerRow ?? 0.005;
+
+        // Memory costs
+        this.memoryLimitMB = options.memoryLimitMB ?? 512;
+    }
+
+    /**
+     * Estimate cost of scanning a table/fragment
+     */
+    estimateScanCost(rowCount, columnBytes, selectivity = 1.0) {
+        const bytesToFetch = rowCount * columnBytes * selectivity;
+
+        // Network cost for remote, near-zero for local
+        const networkCost = this.isRemote
+            ? this.rttLatency + (bytesToFetch / (this.bandwidthMBps * 1024 * 1024)) * 1000
+            : 0.1; // Local disk is nearly instant
+
+        // CPU cost (filtering)
+        const cpuCost = rowCount * this.filterCostPerRow;
+
+        return {
+            totalMs: networkCost + cpuCost,
+            networkMs: networkCost,
+            cpuMs: cpuCost,
+            bytesToFetch,
+            rowsToScan: rowCount * selectivity
+        };
+    }
+
+    /**
+     * Estimate cost of a hash join
+     */
+    estimateJoinCost(leftRows, rightRows, leftBytes, rightBytes, joinSelectivity = 0.1) {
+        // Build phase: hash the smaller table
+        const buildRows = Math.min(leftRows, rightRows);
+        const buildBytes = buildRows < leftRows ? leftBytes : rightBytes;
+        const buildCost = buildRows * this.hashBuildCostPerRow;
+
+        // Probe phase: scan the larger table
+        const probeRows = Math.max(leftRows, rightRows);
+        const probeCost = probeRows * this.hashProbeCostPerRow;
+
+        // Memory check: can we fit build side in RAM?
+        const buildMemoryMB = (buildRows * buildBytes) / (1024 * 1024);
+        const needsSpill = buildMemoryMB > this.memoryLimitMB;
+
+        // Spill cost (OPFS write + read)
+        const spillCost = needsSpill ? buildMemoryMB * 10 : 0; // ~10ms per MB for OPFS
+
+        return {
+            totalMs: buildCost + probeCost + spillCost,
+            buildMs: buildCost,
+            probeMs: probeCost,
+            spillMs: spillCost,
+            needsSpill,
+            outputRows: Math.round(leftRows * rightRows * joinSelectivity)
+        };
+    }
+
+    /**
+     * Estimate cost of an aggregation
+     */
+    estimateAggregateCost(inputRows, groupCount, aggCount) {
+        // Cost scales with input rows and number of groups
+        const hashGroupCost = inputRows * this.hashBuildCostPerRow;
+        const aggComputeCost = inputRows * aggCount * 0.0001; // Aggregation is cheap
+
+        return {
+            totalMs: hashGroupCost + aggComputeCost,
+            outputRows: groupCount
+        };
+    }
+
+    /**
+     * Compare two plan costs and recommend the better one
+     */
+    comparePlans(planA, planB) {
+        const costA = planA.totalCost || this.estimatePlanCost(planA);
+        const costB = planB.totalCost || this.estimatePlanCost(planB);
+
+        return {
+            recommended: costA.totalMs < costB.totalMs ? 'A' : 'B',
+            costA,
+            costB,
+            savings: Math.abs(costA.totalMs - costB.totalMs)
+        };
+    }
+
+    /**
+     * Estimate total cost of a query plan
+     */
+    estimatePlanCost(plan) {
+        let totalMs = 0;
+        let totalBytes = 0;
+        let operations = [];
+
+        // Scan costs
+        if (plan.leftScan) {
+            const scanCost = this.estimateScanCost(
+                plan.leftScan.estimatedRows || 10000,
+                plan.leftScan.columnBytes || 100,
+                plan.leftScan.selectivity || 1.0
+            );
+            totalMs += scanCost.totalMs;
+            totalBytes += scanCost.bytesToFetch;
+            operations.push({ op: 'scan_left', ...scanCost });
+        }
+
+        if (plan.rightScan) {
+            const scanCost = this.estimateScanCost(
+                plan.rightScan.estimatedRows || 10000,
+                plan.rightScan.columnBytes || 100,
+                plan.rightScan.selectivity || 1.0
+            );
+            totalMs += scanCost.totalMs;
+            totalBytes += scanCost.bytesToFetch;
+            operations.push({ op: 'scan_right', ...scanCost });
+        }
+
+        // Join costs
+        if (plan.join) {
+            const joinCost = this.estimateJoinCost(
+                plan.leftScan?.estimatedRows || 10000,
+                plan.rightScan?.estimatedRows || 10000,
+                plan.leftScan?.columnBytes || 100,
+                plan.rightScan?.columnBytes || 100,
+                plan.join.selectivity || 0.1
+            );
+            totalMs += joinCost.totalMs;
+            operations.push({ op: 'join', ...joinCost });
+        }
+
+        // Aggregation costs
+        if (plan.aggregations && plan.aggregations.length > 0) {
+            const aggCost = this.estimateAggregateCost(
+                plan.estimatedInputRows || 10000,
+                plan.groupBy?.length || 1,
+                plan.aggregations.length
+            );
+            totalMs += aggCost.totalMs;
+            operations.push({ op: 'aggregate', ...aggCost });
+        }
+
+        return {
+            totalMs,
+            totalBytes,
+            operations,
+            isRemote: this.isRemote
+        };
+    }
+}
+
+// Export cost model
+
+
+/**
  * OPFS-only storage for Lance database files.
  *
  * Uses Origin Private File System (OPFS) exclusively - no IndexedDB.
@@ -310,6 +1127,1202 @@ class OPFSStorage {
         } catch (e) {
             return false;
         }
+    }
+
+    /**
+     * Read a byte range from a file without loading the entire file
+     * @param {string} path - File path
+     * @param {number} offset - Start byte offset
+     * @param {number} length - Number of bytes to read
+     * @returns {Promise<Uint8Array|null>}
+     */
+    async readRange(path, offset, length) {
+        try {
+            const parts = path.split('/');
+            const fileName = parts.pop();
+            const dirPath = parts.join('/');
+
+            const dir = dirPath ? await this.getDir(dirPath) : await this.getRoot();
+            const fileHandle = await dir.getFileHandle(fileName);
+            const file = await fileHandle.getFile();
+
+            // Use slice to read only the requested range
+            const blob = file.slice(offset, offset + length);
+            const buffer = await blob.arrayBuffer();
+            return new Uint8Array(buffer);
+        } catch (e) {
+            if (e.name === 'NotFoundError') {
+                return null;
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Get file size without loading the file
+     * @param {string} path - File path
+     * @returns {Promise<number|null>}
+     */
+    async getFileSize(path) {
+        try {
+            const parts = path.split('/');
+            const fileName = parts.pop();
+            const dirPath = parts.join('/');
+
+            const dir = dirPath ? await this.getDir(dirPath) : await this.getRoot();
+            const fileHandle = await dir.getFileHandle(fileName);
+            const file = await fileHandle.getFile();
+            return file.size;
+        } catch (e) {
+            if (e.name === 'NotFoundError') {
+                return null;
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Open a file for chunked reading
+     * @param {string} path - File path
+     * @returns {Promise<OPFSFileReader|null>}
+     */
+    async openFile(path) {
+        try {
+            const parts = path.split('/');
+            const fileName = parts.pop();
+            const dirPath = parts.join('/');
+
+            const dir = dirPath ? await this.getDir(dirPath) : await this.getRoot();
+            const fileHandle = await dir.getFileHandle(fileName);
+            return new OPFSFileReader(fileHandle);
+        } catch (e) {
+            if (e.name === 'NotFoundError') {
+                return null;
+            }
+            throw e;
+        }
+    }
+
+    /**
+     * Check if OPFS is supported in this browser
+     * @returns {Promise<boolean>}
+     */
+    async isSupported() {
+        try {
+            if (typeof navigator === 'undefined' || !navigator.storage?.getDirectory) {
+                return false;
+            }
+            // Actually try to access OPFS
+            await navigator.storage.getDirectory();
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    /**
+     * Get storage statistics
+     * @returns {Promise<{fileCount: number, totalSize: number}>}
+     */
+    async getStats() {
+        try {
+            const root = await this.getRoot();
+            let fileCount = 0;
+            let totalSize = 0;
+
+            async function countDir(dir) {
+                for await (const [name, handle] of dir.entries()) {
+                    if (handle.kind === 'file') {
+                        const file = await handle.getFile();
+                        fileCount++;
+                        totalSize += file.size;
+                    } else if (handle.kind === 'directory') {
+                        await countDir(handle);
+                    }
+                }
+            }
+
+            await countDir(root);
+            return { fileCount, totalSize };
+        } catch (e) {
+            return { fileCount: 0, totalSize: 0 };
+        }
+    }
+
+    /**
+     * List all files in storage with their sizes
+     * @returns {Promise<Array<{name: string, size: number, lastModified: number}>>}
+     */
+    async listFiles() {
+        try {
+            const root = await this.getRoot();
+            const files = [];
+
+            async function listDir(dir, prefix = '') {
+                for await (const [name, handle] of dir.entries()) {
+                    if (handle.kind === 'file') {
+                        const file = await handle.getFile();
+                        files.push({
+                            name: prefix ? `${prefix}/${name}` : name,
+                            size: file.size,
+                            lastModified: file.lastModified
+                        });
+                    } else if (handle.kind === 'directory') {
+                        await listDir(handle, prefix ? `${prefix}/${name}` : name);
+                    }
+                }
+            }
+
+            await listDir(root);
+            return files;
+        } catch (e) {
+            return [];
+        }
+    }
+
+    /**
+     * Clear all files in storage
+     * @returns {Promise<number>} Number of files deleted
+     */
+    async clearAll() {
+        try {
+            const root = await this.getRoot();
+            let count = 0;
+
+            const entries = [];
+            for await (const [name, handle] of root.entries()) {
+                entries.push({ name, kind: handle.kind });
+            }
+
+            for (const entry of entries) {
+                await root.removeEntry(entry.name, { recursive: entry.kind === 'directory' });
+                count++;
+            }
+
+            return count;
+        } catch (e) {
+            console.warn('Failed to clear OPFS:', e);
+            return 0;
+        }
+    }
+}
+
+/**
+ * OPFS File Reader for chunked/streaming reads
+ * Wraps a FileSystemFileHandle for efficient byte-range access
+ */
+class OPFSFileReader {
+    constructor(fileHandle) {
+        this.fileHandle = fileHandle;
+        this._file = null;
+        this._size = null;
+    }
+
+    /**
+     * Get the File object (cached)
+     */
+    async getFile() {
+        if (!this._file) {
+            this._file = await this.fileHandle.getFile();
+            this._size = this._file.size;
+        }
+        return this._file;
+    }
+
+    /**
+     * Get file size
+     * @returns {Promise<number>}
+     */
+    async getSize() {
+        if (this._size === null) {
+            await this.getFile();
+        }
+        return this._size;
+    }
+
+    /**
+     * Read a byte range
+     * @param {number} offset - Start byte offset
+     * @param {number} length - Number of bytes to read
+     * @returns {Promise<Uint8Array>}
+     */
+    async readRange(offset, length) {
+        const file = await this.getFile();
+        const blob = file.slice(offset, offset + length);
+        const buffer = await blob.arrayBuffer();
+        return new Uint8Array(buffer);
+    }
+
+    /**
+     * Read from end of file (useful for footer)
+     * @param {number} length - Number of bytes to read from end
+     * @returns {Promise<Uint8Array>}
+     */
+    async readFromEnd(length) {
+        const size = await this.getSize();
+        return this.readRange(size - length, length);
+    }
+
+    /**
+     * Invalidate cache (call after file is modified)
+     */
+    invalidate() {
+        this._file = null;
+        this._size = null;
+    }
+}
+
+/**
+ * LRU Cache for page data
+ * Keeps recently accessed pages in memory to avoid repeated OPFS reads
+ */
+class LRUCache {
+    constructor(maxSize = 50 * 1024 * 1024) { // 50MB default
+        this.maxSize = maxSize;
+        this.currentSize = 0;
+        this.cache = new Map(); // key -> { data, size, lastAccess }
+    }
+
+    /**
+     * Get item from cache
+     * @param {string} key - Cache key
+     * @returns {Uint8Array|null}
+     */
+    get(key) {
+        const entry = this.cache.get(key);
+        if (entry) {
+            entry.lastAccess = Date.now();
+            return entry.data;
+        }
+        return null;
+    }
+
+    /**
+     * Put item in cache
+     * @param {string} key - Cache key
+     * @param {Uint8Array} data - Data to cache
+     */
+    put(key, data) {
+        // Remove existing entry if present
+        if (this.cache.has(key)) {
+            this.currentSize -= this.cache.get(key).size;
+            this.cache.delete(key);
+        }
+
+        const size = data.byteLength;
+
+        // Evict if needed
+        while (this.currentSize + size > this.maxSize && this.cache.size > 0) {
+            this._evictOldest();
+        }
+
+        // Don't cache if single item is too large
+        if (size > this.maxSize) {
+            return;
+        }
+
+        this.cache.set(key, {
+            data,
+            size,
+            lastAccess: Date.now()
+        });
+        this.currentSize += size;
+    }
+
+    /**
+     * Evict oldest entry
+     */
+    _evictOldest() {
+        let oldestKey = null;
+        let oldestTime = Infinity;
+
+        for (const [key, entry] of this.cache) {
+            if (entry.lastAccess < oldestTime) {
+                oldestTime = entry.lastAccess;
+                oldestKey = key;
+            }
+        }
+
+        if (oldestKey) {
+            this.currentSize -= this.cache.get(oldestKey).size;
+            this.cache.delete(oldestKey);
+        }
+    }
+
+    /**
+     * Clear entire cache
+     */
+    clear() {
+        this.cache.clear();
+        this.currentSize = 0;
+    }
+
+    /**
+     * Get cache stats
+     */
+    stats() {
+        return {
+            entries: this.cache.size,
+            currentSize: this.currentSize,
+            maxSize: this.maxSize,
+            utilization: (this.currentSize / this.maxSize * 100).toFixed(1) + '%'
+        };
+    }
+}
+
+// Lance file format constants
+const LANCE_FOOTER_SIZE = 40;
+const LANCE_MAGIC = new Uint8Array([0x4C, 0x41, 0x4E, 0x43]); // "LANC"
+
+/**
+ * Chunked Lance File Reader
+ * Reads Lance files from OPFS without loading entire file into memory
+ */
+class ChunkedLanceReader {
+    /**
+     * @param {OPFSFileReader} fileReader - OPFS file reader
+     * @param {LRUCache} [pageCache] - Optional page cache (shared across readers)
+     */
+    constructor(fileReader, pageCache = null) {
+        this.fileReader = fileReader;
+        this.pageCache = pageCache || new LRUCache();
+        this.footer = null;
+        this.columnMetaCache = new Map(); // colIdx -> metadata
+        this._cacheKey = null; // For cache key generation
+    }
+
+    /**
+     * Open a Lance file from OPFS
+     * @param {OPFSStorage} storage - OPFS storage instance
+     * @param {string} path - File path in OPFS
+     * @param {LRUCache} [pageCache] - Optional shared page cache
+     * @returns {Promise<ChunkedLanceReader>}
+     */
+    static async open(storage, path, pageCache = null) {
+        const fileReader = await storage.openFile(path);
+        if (!fileReader) {
+            throw new Error(`File not found: ${path}`);
+        }
+        const reader = new ChunkedLanceReader(fileReader, pageCache);
+        reader._cacheKey = path;
+        await reader._readFooter();
+        return reader;
+    }
+
+    /**
+     * Read and parse the Lance footer
+     */
+    async _readFooter() {
+        const footerData = await this.fileReader.readFromEnd(LANCE_FOOTER_SIZE);
+
+        // Verify magic bytes
+        const magic = footerData.slice(36, 40);
+        if (!this._arraysEqual(magic, LANCE_MAGIC)) {
+            throw new Error('Invalid Lance file: magic bytes mismatch');
+        }
+
+        // Parse footer (little-endian)
+        const view = new DataView(footerData.buffer, footerData.byteOffset);
+        this.footer = {
+            columnMetaStart: view.getBigUint64(0, true),
+            columnMetaOffsetsStart: view.getBigUint64(8, true),
+            globalBuffOffsetsStart: view.getBigUint64(16, true),
+            numGlobalBuffers: view.getUint32(24, true),
+            numColumns: view.getUint32(28, true),
+            majorVersion: view.getUint16(32, true),
+            minorVersion: view.getUint16(34, true),
+        };
+
+        return this.footer;
+    }
+
+    /**
+     * Compare two Uint8Arrays
+     */
+    _arraysEqual(a, b) {
+        if (a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) {
+            if (a[i] !== b[i]) return false;
+        }
+        return true;
+    }
+
+    /**
+     * Get file size
+     * @returns {Promise<number>}
+     */
+    async getSize() {
+        return this.fileReader.getSize();
+    }
+
+    /**
+     * Get number of columns
+     * @returns {number}
+     */
+    getNumColumns() {
+        if (!this.footer) throw new Error('Footer not loaded');
+        return this.footer.numColumns;
+    }
+
+    /**
+     * Get Lance format version
+     * @returns {{major: number, minor: number}}
+     */
+    getVersion() {
+        if (!this.footer) throw new Error('Footer not loaded');
+        return {
+            major: this.footer.majorVersion,
+            minor: this.footer.minorVersion
+        };
+    }
+
+    /**
+     * Read column metadata offset table
+     * @returns {Promise<BigUint64Array>}
+     */
+    async _readColumnMetaOffsets() {
+        const numCols = this.footer.numColumns;
+        const offsetTableSize = numCols * 8; // 8 bytes per offset
+        const data = await this.fileReader.readRange(
+            Number(this.footer.columnMetaOffsetsStart),
+            offsetTableSize
+        );
+        return new BigUint64Array(data.buffer, data.byteOffset, numCols);
+    }
+
+    /**
+     * Read raw column metadata bytes
+     * @param {number} colIdx - Column index
+     * @returns {Promise<Uint8Array>}
+     */
+    async readColumnMetaRaw(colIdx) {
+        if (colIdx >= this.footer.numColumns) {
+            throw new Error(`Column index ${colIdx} out of range (${this.footer.numColumns} columns)`);
+        }
+
+        // Check cache
+        const cacheKey = `${this._cacheKey}:colmeta:${colIdx}`;
+        const cached = this.pageCache.get(cacheKey);
+        if (cached) return cached;
+
+        // Read offset table
+        const offsets = await this._readColumnMetaOffsets();
+
+        // Calculate start and end
+        const start = Number(this.footer.columnMetaStart) + Number(offsets[colIdx]);
+        const end = colIdx < this.footer.numColumns - 1
+            ? Number(this.footer.columnMetaStart) + Number(offsets[colIdx + 1])
+            : Number(this.footer.columnMetaOffsetsStart);
+
+        const data = await this.fileReader.readRange(start, end - start);
+
+        // Cache it
+        this.pageCache.put(cacheKey, data);
+        return data;
+    }
+
+    /**
+     * Read a specific byte range from the file
+     * @param {number} offset - Start offset
+     * @param {number} length - Number of bytes
+     * @returns {Promise<Uint8Array>}
+     */
+    async readRange(offset, length) {
+        // Check cache
+        const cacheKey = `${this._cacheKey}:range:${offset}:${length}`;
+        const cached = this.pageCache.get(cacheKey);
+        if (cached) return cached;
+
+        const data = await this.fileReader.readRange(offset, length);
+
+        // Cache if reasonably sized
+        if (length < 10 * 1024 * 1024) { // < 10MB
+            this.pageCache.put(cacheKey, data);
+        }
+        return data;
+    }
+
+    /**
+     * Get cache statistics
+     * @returns {object}
+     */
+    getCacheStats() {
+        return this.pageCache.stats();
+    }
+
+    /**
+     * Close the reader and release resources
+     */
+    close() {
+        this.fileReader.invalidate();
+        this.columnMetaCache.clear();
+    }
+}
+
+// =============================================================================
+// Memory Manager - Global memory monitoring and management
+// =============================================================================
+
+/**
+ * Global memory manager for browser environment.
+ * Monitors memory usage and triggers cleanup when needed.
+ */
+class MemoryManager {
+    constructor(options = {}) {
+        this.maxHeapMB = options.maxHeapMB || 100; // Target max heap usage
+        this.warningThreshold = options.warningThreshold || 0.8; // 80% warning
+        this.caches = new Set(); // Registered LRU caches
+        this.lastCheck = 0;
+        this.checkInterval = 5000; // Check every 5 seconds
+    }
+
+    /**
+     * Register a cache for memory management
+     * @param {LRUCache} cache - Cache to manage
+     */
+    registerCache(cache) {
+        this.caches.add(cache);
+    }
+
+    /**
+     * Unregister a cache
+     * @param {LRUCache} cache - Cache to remove
+     */
+    unregisterCache(cache) {
+        this.caches.delete(cache);
+    }
+
+    /**
+     * Get current memory usage (if available)
+     * @returns {Object|null} Memory info or null if not available
+     */
+    getMemoryUsage() {
+        if (typeof performance !== 'undefined' && performance.memory) {
+            // Chrome/Chromium only
+            return {
+                usedHeapMB: performance.memory.usedJSHeapSize / (1024 * 1024),
+                totalHeapMB: performance.memory.totalJSHeapSize / (1024 * 1024),
+                limitMB: performance.memory.jsHeapSizeLimit / (1024 * 1024),
+            };
+        }
+        return null;
+    }
+
+    /**
+     * Check memory and trigger cleanup if needed
+     * @returns {boolean} True if cleanup was triggered
+     */
+    checkAndCleanup() {
+        const now = Date.now();
+        if (now - this.lastCheck < this.checkInterval) {
+            return false;
+        }
+        this.lastCheck = now;
+
+        const memory = this.getMemoryUsage();
+        if (!memory) return false;
+
+        const usageRatio = memory.usedHeapMB / this.maxHeapMB;
+
+        if (usageRatio > this.warningThreshold) {
+            console.warn(`[MemoryManager] High memory usage: ${memory.usedHeapMB.toFixed(1)}MB / ${this.maxHeapMB}MB`);
+            this.cleanup();
+            return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * Force cleanup of all registered caches
+     */
+    cleanup() {
+        for (const cache of this.caches) {
+            // Evict 50% of entries
+            const stats = cache.stats();
+            const targetSize = stats.currentSize / 2;
+
+            while (cache.currentSize > targetSize && cache.cache.size > 0) {
+                cache._evictOldest();
+            }
+        }
+    }
+
+    /**
+     * Get aggregate cache stats
+     * @returns {Object} Combined stats from all caches
+     */
+    getCacheStats() {
+        let totalEntries = 0;
+        let totalSize = 0;
+        let totalMaxSize = 0;
+
+        for (const cache of this.caches) {
+            const stats = cache.stats();
+            totalEntries += stats.entries;
+            totalSize += stats.currentSize;
+            totalMaxSize += stats.maxSize;
+        }
+
+        return {
+            caches: this.caches.size,
+            totalEntries,
+            totalSizeMB: (totalSize / (1024 * 1024)).toFixed(2),
+            totalMaxSizeMB: (totalMaxSize / (1024 * 1024)).toFixed(2),
+            memory: this.getMemoryUsage(),
+        };
+    }
+}
+
+// Global memory manager instance
+const memoryManager = new MemoryManager();
+
+/**
+ * Streaming utilities for large file processing
+ */
+const StreamUtils = {
+    /**
+     * Process items in batches with memory-aware pacing
+     * @param {AsyncIterable} source - Source of items
+     * @param {Function} processor - Async function to process each batch
+     * @param {Object} options - Options
+     * @yields {any} Results from processor
+     */
+    async *processBatches(source, processor, options = {}) {
+        const batchSize = options.batchSize || 10000;
+        const pauseAfter = options.pauseAfter || 5; // Pause every N batches for GC
+        let batchCount = 0;
+
+        for await (const batch of source) {
+            yield await processor(batch);
+            batchCount++;
+
+            // Periodic memory check
+            if (batchCount % pauseAfter === 0) {
+                memoryManager.checkAndCleanup();
+                // Small delay to allow GC
+                await new Promise(r => setTimeout(r, 0));
+            }
+        }
+    },
+
+    /**
+     * Create a progress-reporting wrapper for async iterables
+     * @param {AsyncIterable} source - Source iterable
+     * @param {Function} onProgress - Progress callback (processed, total?)
+     */
+    async *withProgress(source, onProgress) {
+        let processed = 0;
+        for await (const item of source) {
+            processed += Array.isArray(item) ? item.length : 1;
+            onProgress(processed);
+            yield item;
+        }
+    },
+
+    /**
+     * Limit memory usage by processing in chunks with explicit cleanup
+     * @param {AsyncIterable} source - Source of data chunks
+     * @param {number} maxChunksInFlight - Max chunks to keep in memory
+     */
+    async *throttle(source, maxChunksInFlight = 3) {
+        const queue = [];
+
+        for await (const chunk of source) {
+            queue.push(chunk);
+
+            if (queue.length >= maxChunksInFlight) {
+                yield queue.shift();
+            }
+        }
+
+        // Drain remaining
+        while (queue.length > 0) {
+            yield queue.shift();
+        }
+    },
+};
+
+// Export memory utilities
+
+
+// =============================================================================
+// Protobuf Encoder - Minimal encoder for Lance column metadata
+// =============================================================================
+
+/**
+ * Simple Protobuf encoder for Lance metadata.
+ * Only implements what's needed for Lance file writing.
+ */
+class ProtobufEncoder {
+    constructor() {
+        this.chunks = [];
+    }
+
+    /**
+     * Encode a varint (variable-length integer)
+     * @param {number|bigint} value
+     * @returns {Uint8Array}
+     */
+    static encodeVarint(value) {
+        const bytes = [];
+        let v = typeof value === 'bigint' ? value : BigInt(value);
+        while (v > 0x7fn) {
+            bytes.push(Number(v & 0x7fn) | 0x80);
+            v >>= 7n;
+        }
+        bytes.push(Number(v));
+        return new Uint8Array(bytes);
+    }
+
+    /**
+     * Encode a field header (tag)
+     * @param {number} fieldNum - Field number
+     * @param {number} wireType - Wire type (0=varint, 2=length-delimited)
+     * @returns {Uint8Array}
+     */
+    static encodeFieldHeader(fieldNum, wireType) {
+        const tag = (fieldNum << 3) | wireType;
+        return ProtobufEncoder.encodeVarint(tag);
+    }
+
+    /**
+     * Encode a varint field
+     * @param {number} fieldNum
+     * @param {number|bigint} value
+     */
+    writeVarint(fieldNum, value) {
+        this.chunks.push(ProtobufEncoder.encodeFieldHeader(fieldNum, 0));
+        this.chunks.push(ProtobufEncoder.encodeVarint(value));
+    }
+
+    /**
+     * Encode a length-delimited field (bytes or nested message)
+     * @param {number} fieldNum
+     * @param {Uint8Array} data
+     */
+    writeBytes(fieldNum, data) {
+        this.chunks.push(ProtobufEncoder.encodeFieldHeader(fieldNum, 2));
+        this.chunks.push(ProtobufEncoder.encodeVarint(data.length));
+        this.chunks.push(data);
+    }
+
+    /**
+     * Encode packed repeated uint64 as varints
+     * @param {number} fieldNum
+     * @param {BigUint64Array|number[]} values
+     */
+    writePackedUint64(fieldNum, values) {
+        // First encode all varints
+        const varintChunks = [];
+        for (const v of values) {
+            varintChunks.push(ProtobufEncoder.encodeVarint(v));
+        }
+        // Calculate total length
+        const totalLen = varintChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+        // Write field header + length + data
+        this.chunks.push(ProtobufEncoder.encodeFieldHeader(fieldNum, 2));
+        this.chunks.push(ProtobufEncoder.encodeVarint(totalLen));
+        for (const chunk of varintChunks) {
+            this.chunks.push(chunk);
+        }
+    }
+
+    /**
+     * Get the encoded bytes
+     * @returns {Uint8Array}
+     */
+    toBytes() {
+        const totalLen = this.chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+        const result = new Uint8Array(totalLen);
+        let offset = 0;
+        for (const chunk of this.chunks) {
+            result.set(chunk, offset);
+            offset += chunk.length;
+        }
+        return result;
+    }
+
+    /**
+     * Clear the encoder for reuse
+     */
+    clear() {
+        this.chunks = [];
+    }
+}
+
+// =============================================================================
+// LanceFileWriter - Create Lance files in pure JavaScript
+// =============================================================================
+
+/**
+ * Lance column types
+ */
+const LanceColumnType = {
+    INT64: 'int64',
+    FLOAT64: 'float64',
+    STRING: 'string',
+    BOOL: 'bool',
+    INT32: 'int32',
+    FLOAT32: 'float32',
+};
+
+/**
+ * Pure JavaScript Lance File Writer - Creates Lance files without WASM.
+ * Use this when WASM is not available or for simple file creation.
+ * Supports basic column types: int64, float64, string, bool.
+ *
+ * @example
+ * const writer = new PureLanceWriter();
+ * writer.addInt64Column('id', BigInt64Array.from([1n, 2n, 3n]));
+ * writer.addFloat64Column('score', new Float64Array([0.5, 0.8, 0.3]));
+ * writer.addStringColumn('name', ['Alice', 'Bob', 'Charlie']);
+ * const lanceData = writer.finalize();
+ * await opfsStorage.save('mydata.lance', lanceData);
+ */
+class PureLanceWriter {
+    /**
+     * @param {Object} options
+     * @param {number} [options.majorVersion=0] - Lance format major version
+     * @param {number} [options.minorVersion=3] - Lance format minor version (3 = v2.0)
+     */
+    constructor(options = {}) {
+        this.majorVersion = options.majorVersion ?? 0;
+        this.minorVersion = options.minorVersion ?? 3; // v2.0
+        this.columns = []; // { name, type, data, metadata }
+        this.rowCount = null;
+    }
+
+    /**
+     * Validate row count consistency
+     * @param {number} count
+     */
+    _validateRowCount(count) {
+        if (this.rowCount === null) {
+            this.rowCount = count;
+        } else if (this.rowCount !== count) {
+            throw new Error(`Row count mismatch: expected ${this.rowCount}, got ${count}`);
+        }
+    }
+
+    /**
+     * Add an int64 column
+     * @param {string} name - Column name
+     * @param {BigInt64Array} values - Column values
+     */
+    addInt64Column(name, values) {
+        this._validateRowCount(values.length);
+        this.columns.push({
+            name,
+            type: LanceColumnType.INT64,
+            data: new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
+            length: values.length,
+        });
+    }
+
+    /**
+     * Add an int32 column
+     * @param {string} name - Column name
+     * @param {Int32Array} values - Column values
+     */
+    addInt32Column(name, values) {
+        this._validateRowCount(values.length);
+        this.columns.push({
+            name,
+            type: LanceColumnType.INT32,
+            data: new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
+            length: values.length,
+        });
+    }
+
+    /**
+     * Add a float64 column
+     * @param {string} name - Column name
+     * @param {Float64Array} values - Column values
+     */
+    addFloat64Column(name, values) {
+        this._validateRowCount(values.length);
+        this.columns.push({
+            name,
+            type: LanceColumnType.FLOAT64,
+            data: new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
+            length: values.length,
+        });
+    }
+
+    /**
+     * Add a float32 column
+     * @param {string} name - Column name
+     * @param {Float32Array} values - Column values
+     */
+    addFloat32Column(name, values) {
+        this._validateRowCount(values.length);
+        this.columns.push({
+            name,
+            type: LanceColumnType.FLOAT32,
+            data: new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
+            length: values.length,
+        });
+    }
+
+    /**
+     * Add a boolean column
+     * @param {string} name - Column name
+     * @param {boolean[]} values - Column values
+     */
+    addBoolColumn(name, values) {
+        this._validateRowCount(values.length);
+        // Pack booleans as bytes (1 byte per bool for simplicity)
+        const data = new Uint8Array(values.length);
+        for (let i = 0; i < values.length; i++) {
+            data[i] = values[i] ? 1 : 0;
+        }
+        this.columns.push({
+            name,
+            type: LanceColumnType.BOOL,
+            data,
+            length: values.length,
+        });
+    }
+
+    /**
+     * Add a string column
+     * @param {string} name - Column name
+     * @param {string[]} values - Column values
+     */
+    addStringColumn(name, values) {
+        this._validateRowCount(values.length);
+
+        const encoder = new TextEncoder();
+
+        // Build offsets and data
+        // Lance strings use i32 offsets followed by UTF-8 data
+        const offsets = new Int32Array(values.length + 1);
+        const dataChunks = [];
+        let currentOffset = 0;
+
+        for (let i = 0; i < values.length; i++) {
+            offsets[i] = currentOffset;
+            const encoded = encoder.encode(values[i]);
+            dataChunks.push(encoded);
+            currentOffset += encoded.length;
+        }
+        offsets[values.length] = currentOffset;
+
+        // Combine offsets and data
+        const offsetsBytes = new Uint8Array(offsets.buffer);
+        const totalDataLen = dataChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+        const stringData = new Uint8Array(totalDataLen);
+        let writePos = 0;
+        for (const chunk of dataChunks) {
+            stringData.set(chunk, writePos);
+            writePos += chunk.length;
+        }
+
+        // Store both parts
+        this.columns.push({
+            name,
+            type: LanceColumnType.STRING,
+            offsetsData: offsetsBytes,
+            stringData,
+            data: null, // Will be combined in finalize
+            length: values.length,
+        });
+    }
+
+    /**
+     * Build column metadata protobuf for a column
+     * @param {number} bufferOffset - Offset to column data
+     * @param {number} bufferSize - Size of column data
+     * @param {number} length - Number of rows
+     * @param {string} type - Column type
+     * @returns {Uint8Array}
+     */
+    _buildColumnMeta(bufferOffset, bufferSize, length, type) {
+        // Build Page message
+        const pageEncoder = new ProtobufEncoder();
+        pageEncoder.writePackedUint64(1, [BigInt(bufferOffset)]); // buffer_offsets
+        pageEncoder.writePackedUint64(2, [BigInt(bufferSize)]); // buffer_sizes
+        pageEncoder.writeVarint(3, length); // length
+        // Skip encoding (field 4) - use default
+        pageEncoder.writeVarint(5, 0); // priority
+        const pageBytes = pageEncoder.toBytes();
+
+        // Build ColumnMetadata message
+        const metaEncoder = new ProtobufEncoder();
+        // Skip encoding (field 1) - use default plain encoding
+        metaEncoder.writeBytes(2, pageBytes); // pages (repeated)
+        // Skip buffer_offsets and buffer_sizes at column level
+
+        return metaEncoder.toBytes();
+    }
+
+    /**
+     * Build column metadata for string column (2 buffers: offsets + data)
+     * @param {number} offsetsBufOffset - Offset to offsets buffer
+     * @param {number} offsetsBufSize - Size of offsets buffer
+     * @param {number} dataBufOffset - Offset to string data buffer
+     * @param {number} dataBufSize - Size of string data buffer
+     * @param {number} length - Number of rows
+     * @returns {Uint8Array}
+     */
+    _buildStringColumnMeta(offsetsBufOffset, offsetsBufSize, dataBufOffset, dataBufSize, length) {
+        // Build Page message with 2 buffers
+        const pageEncoder = new ProtobufEncoder();
+        pageEncoder.writePackedUint64(1, [BigInt(offsetsBufOffset), BigInt(dataBufOffset)]); // buffer_offsets
+        pageEncoder.writePackedUint64(2, [BigInt(offsetsBufSize), BigInt(dataBufSize)]); // buffer_sizes
+        pageEncoder.writeVarint(3, length); // length
+        pageEncoder.writeVarint(5, 0); // priority
+        const pageBytes = pageEncoder.toBytes();
+
+        // Build ColumnMetadata message
+        const metaEncoder = new ProtobufEncoder();
+        metaEncoder.writeBytes(2, pageBytes); // pages (repeated)
+
+        return metaEncoder.toBytes();
+    }
+
+    /**
+     * Finalize and create the Lance file
+     * @returns {Uint8Array} Complete Lance file data
+     */
+    finalize() {
+        if (this.columns.length === 0) {
+            throw new Error('No columns added');
+        }
+
+        const chunks = [];
+        let currentOffset = 0;
+
+        // 1. Write column data buffers
+        const columnBufferInfos = []; // { offset, size } for each column
+
+        for (const col of this.columns) {
+            if (col.type === LanceColumnType.STRING) {
+                // String columns have 2 buffers: offsets + data
+                const offsetsOffset = currentOffset;
+                chunks.push(col.offsetsData);
+                currentOffset += col.offsetsData.length;
+
+                const dataOffset = currentOffset;
+                chunks.push(col.stringData);
+                currentOffset += col.stringData.length;
+
+                columnBufferInfos.push({
+                    type: 'string',
+                    offsetsOffset,
+                    offsetsSize: col.offsetsData.length,
+                    dataOffset,
+                    dataSize: col.stringData.length,
+                    length: col.length,
+                });
+            } else {
+                // Simple column with single buffer
+                const bufferOffset = currentOffset;
+                chunks.push(col.data);
+                currentOffset += col.data.length;
+
+                columnBufferInfos.push({
+                    type: col.type,
+                    offset: bufferOffset,
+                    size: col.data.length,
+                    length: col.length,
+                });
+            }
+        }
+
+        // 2. Build column metadata
+        const columnMetadatas = [];
+        for (let i = 0; i < this.columns.length; i++) {
+            const info = columnBufferInfos[i];
+            let meta;
+            if (info.type === 'string') {
+                meta = this._buildStringColumnMeta(
+                    info.offsetsOffset, info.offsetsSize,
+                    info.dataOffset, info.dataSize,
+                    info.length
+                );
+            } else {
+                meta = this._buildColumnMeta(info.offset, info.size, info.length, info.type);
+            }
+            columnMetadatas.push(meta);
+        }
+
+        // 3. Write column metadata section
+        const columnMetaStart = currentOffset;
+        const columnMetaOffsets = [];
+        let metaOffset = 0;
+        for (const meta of columnMetadatas) {
+            columnMetaOffsets.push(metaOffset);
+            chunks.push(meta);
+            currentOffset += meta.length;
+            metaOffset += meta.length;
+        }
+
+        // 4. Write column metadata offset table
+        const columnMetaOffsetsStart = currentOffset;
+        const offsetTable = new BigUint64Array(columnMetaOffsets.length);
+        for (let i = 0; i < columnMetaOffsets.length; i++) {
+            offsetTable[i] = BigInt(columnMetaOffsets[i]);
+        }
+        const offsetTableBytes = new Uint8Array(offsetTable.buffer);
+        chunks.push(offsetTableBytes);
+        currentOffset += offsetTableBytes.length;
+
+        // 5. Write global buffer offsets (empty for now)
+        const globalBuffOffsetsStart = currentOffset;
+        const numGlobalBuffers = 0;
+
+        // 6. Write footer (40 bytes)
+        const footer = new ArrayBuffer(LANCE_FOOTER_SIZE);
+        const footerView = new DataView(footer);
+
+        footerView.setBigUint64(0, BigInt(columnMetaStart), true);           // column_meta_start
+        footerView.setBigUint64(8, BigInt(columnMetaOffsetsStart), true);    // column_meta_offsets_start
+        footerView.setBigUint64(16, BigInt(globalBuffOffsetsStart), true);   // global_buff_offsets_start
+        footerView.setUint32(24, numGlobalBuffers, true);                    // num_global_buffers
+        footerView.setUint32(28, this.columns.length, true);                 // num_columns
+        footerView.setUint16(32, this.majorVersion, true);                   // major_version
+        footerView.setUint16(34, this.minorVersion, true);                   // minor_version
+        // Magic "LANC"
+        new Uint8Array(footer, 36, 4).set(LANCE_MAGIC);
+
+        chunks.push(new Uint8Array(footer));
+
+        // 7. Combine all chunks
+        const totalSize = currentOffset + LANCE_FOOTER_SIZE;
+        const result = new Uint8Array(totalSize);
+        let writeOffset = 0;
+        for (const chunk of chunks) {
+            result.set(chunk, writeOffset);
+            writeOffset += chunk.length;
+        }
+
+        return result;
+    }
+
+    /**
+     * Get the number of columns
+     * @returns {number}
+     */
+    getNumColumns() {
+        return this.columns.length;
+    }
+
+    /**
+     * Get the row count
+     * @returns {number|null}
+     */
+    getRowCount() {
+        return this.rowCount;
+    }
+
+    /**
+     * Get column names
+     * @returns {string[]}
+     */
+    getColumnNames() {
+        return this.columns.map(c => c.name);
     }
 }
 
@@ -533,8 +2546,675 @@ class DatasetStorage {
 const opfsStorage = new OPFSStorage();  // OPFS-only (recommended)
 const datasetStorage = new DatasetStorage();  // Legacy IndexedDB + OPFS
 
-// Export storage for external use
+// =============================================================================
+// HotTierCache - OPFS-backed cache for remote Lance files (500-2000x faster)
+// =============================================================================
 
+/**
+ * HotTierCache provides fast local caching for remote Lance files.
+ *
+ * Architecture:
+ * - First request: Fetch from R2/S3 (50-200ms) → Cache to OPFS
+ * - Subsequent requests: Read from OPFS (<0.1ms) → 500-2000x faster
+ *
+ * Cache strategies:
+ * - Small files (<10MB): Cache entire file
+ * - Large files: Cache individual ranges/fragments on demand
+ *
+ * Storage layout:
+ *   _cache/
+ *     {urlHash}/
+ *       meta.json          - URL, size, version, cached ranges
+ *       data.lance         - Full file (if small) or range blocks
+ *       ranges/
+ *         {start}-{end}    - Cached range blocks (for large files)
+ */
+class HotTierCache {
+    constructor(storage = null, options = {}) {
+        this.storage = storage;
+        this.cacheDir = options.cacheDir || '_cache';
+        this.maxFileSize = options.maxFileSize || 10 * 1024 * 1024; // 10MB - cache whole file
+        this.maxCacheSize = options.maxCacheSize || 500 * 1024 * 1024; // 500MB total cache
+        this.enabled = options.enabled ?? true;
+        this._stats = {
+            hits: 0,
+            misses: 0,
+            bytesFromCache: 0,
+            bytesFromNetwork: 0,
+        };
+        // In-memory cache for metadata to avoid OPFS reads on every getRange call
+        this._metaCache = new Map();  // url -> { meta, fullFileData }
+    }
+
+    /**
+     * Initialize the cache (lazy initialization)
+     */
+    async init() {
+        if (this.storage) return;
+        this.storage = new OPFSStorage();
+        await this.storage.open();
+    }
+
+    /**
+     * Get cache key from URL (hash for safe filesystem names)
+     */
+    _getCacheKey(url) {
+        // Simple hash for URL → safe filename
+        let hash = 0;
+        for (let i = 0; i < url.length; i++) {
+            const char = url.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash; // Convert to 32-bit integer
+        }
+        return Math.abs(hash).toString(36);
+    }
+
+    /**
+     * Get cache path for a URL
+     */
+    _getCachePath(url, suffix = '') {
+        const key = this._getCacheKey(url);
+        return `${this.cacheDir}/${key}${suffix}`;
+    }
+
+    /**
+     * Check if a URL is cached
+     * @param {string} url - Remote URL
+     * @returns {Promise<{cached: boolean, meta?: object}>}
+     */
+    async isCached(url) {
+        if (!this.enabled) return { cached: false };
+
+        try {
+            await this.init();
+            const metaPath = this._getCachePath(url, '/meta.json');
+            const metaData = await this.storage.load(metaPath);
+            if (!metaData) return { cached: false };
+
+            const meta = JSON.parse(new TextDecoder().decode(metaData));
+            return { cached: true, meta };
+        } catch (e) {
+            return { cached: false };
+        }
+    }
+
+    /**
+     * Get or fetch a file, using cache when available
+     * @param {string} url - Remote URL
+     * @param {number} [fileSize] - Known file size (avoids HEAD request)
+     * @returns {Promise<Uint8Array>}
+     */
+    async getFile(url, fileSize = null) {
+        if (!this.enabled) {
+            return this._fetchFile(url);
+        }
+
+        await this.init();
+
+        // Check cache
+        const { cached, meta } = await this.isCached(url);
+        if (cached && meta.fullFile) {
+            const dataPath = this._getCachePath(url, '/data.lance');
+            const data = await this.storage.load(dataPath);
+            if (data) {
+                this._stats.hits++;
+                this._stats.bytesFromCache += data.byteLength;
+                console.log(`[HotTierCache] HIT: ${url} (${(data.byteLength / 1024).toFixed(1)} KB)`);
+                return data;
+            }
+        }
+
+        // Cache miss - fetch and cache
+        this._stats.misses++;
+        const data = await this._fetchFile(url);
+        this._stats.bytesFromNetwork += data.byteLength;
+
+        // Cache if small enough
+        if (data.byteLength <= this.maxFileSize) {
+            await this._cacheFile(url, data);
+        }
+
+        return data;
+    }
+
+    /**
+     * Get or fetch a byte range, using cache when available
+     * @param {string} url - Remote URL
+     * @param {number} start - Start byte offset
+     * @param {number} end - End byte offset (inclusive)
+     * @param {number} [fileSize] - Total file size
+     * @returns {Promise<ArrayBuffer>}
+     */
+    async getRange(url, start, end, fileSize = null) {
+        if (!this.enabled) {
+            return this._fetchRange(url, start, end);
+        }
+
+        // Fast path: check in-memory cache first (no async overhead)
+        const memCached = this._metaCache.get(url);
+        if (memCached?.fullFileData) {
+            const data = memCached.fullFileData;
+            if (data.byteLength > end) {
+                this._stats.hits++;
+                this._stats.bytesFromCache += (end - start + 1);
+                return data.slice(start, end + 1).buffer;
+            }
+        }
+
+        await this.init();
+
+        // Check OPFS cache (only once per URL, then cache in memory)
+        if (!memCached) {
+            const { cached, meta } = await this.isCached(url);
+            if (cached && meta.fullFile) {
+                const dataPath = this._getCachePath(url, '/data.lance');
+                const data = await this.storage.load(dataPath);
+                if (data && data.byteLength > end) {
+                    // Cache in memory for subsequent calls
+                    this._metaCache.set(url, { meta, fullFileData: data });
+                    this._stats.hits++;
+                    this._stats.bytesFromCache += (end - start + 1);
+                    return data.slice(start, end + 1).buffer;
+                }
+            }
+            // Mark as checked even if not cached
+            this._metaCache.set(url, { meta: cached ? meta : null, fullFileData: null });
+        }
+
+        // Cache miss - fetch from network
+        this._stats.misses++;
+        const data = await this._fetchRange(url, start, end);
+        this._stats.bytesFromNetwork += data.byteLength;
+
+        // Don't cache individual ranges to OPFS - too slow for IVF search
+        // Only full files are cached (via prefetch)
+
+        return data;
+    }
+
+    /**
+     * Prefetch and cache an entire file
+     * @param {string} url - Remote URL
+     * @param {function} [onProgress] - Progress callback (bytesLoaded, totalBytes)
+     */
+    async prefetch(url, onProgress = null) {
+        await this.init();
+
+        const { cached, meta } = await this.isCached(url);
+        if (cached && meta.fullFile) {
+            console.log(`[HotTierCache] Already cached: ${url}`);
+            return;
+        }
+
+        console.log(`[HotTierCache] Prefetching: ${url}`);
+        const data = await this._fetchFile(url, onProgress);
+        await this._cacheFile(url, data);
+        console.log(`[HotTierCache] Cached: ${url} (${(data.byteLength / 1024 / 1024).toFixed(2)} MB)`);
+    }
+
+    /**
+     * Evict a URL from cache
+     */
+    async evict(url) {
+        await this.init();
+        const cachePath = this._getCachePath(url);
+        await this.storage.delete(cachePath);
+        console.log(`[HotTierCache] Evicted: ${url}`);
+    }
+
+    /**
+     * Clear entire cache
+     */
+    async clear() {
+        await this.init();
+        await this.storage.delete(this.cacheDir);
+        this._stats = { hits: 0, misses: 0, bytesFromCache: 0, bytesFromNetwork: 0 };
+        console.log(`[HotTierCache] Cleared all cache`);
+    }
+
+    /**
+     * Get cache statistics
+     */
+    getStats() {
+        const hitRate = this._stats.hits + this._stats.misses > 0
+            ? (this._stats.hits / (this._stats.hits + this._stats.misses) * 100).toFixed(1)
+            : 0;
+        return {
+            ...this._stats,
+            hitRate: `${hitRate}%`,
+            bytesFromCacheMB: (this._stats.bytesFromCache / 1024 / 1024).toFixed(2),
+            bytesFromNetworkMB: (this._stats.bytesFromNetwork / 1024 / 1024).toFixed(2),
+        };
+    }
+
+    /**
+     * Fetch file from network
+     * @private
+     */
+    async _fetchFile(url, onProgress = null) {
+        const response = await fetch(url);
+        if (!response.ok) {
+            throw new Error(`HTTP error: ${response.status}`);
+        }
+
+        if (onProgress && response.headers.get('content-length')) {
+            const total = parseInt(response.headers.get('content-length'));
+            const reader = response.body.getReader();
+            const chunks = [];
+            let loaded = 0;
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                chunks.push(value);
+                loaded += value.length;
+                onProgress(loaded, total);
+            }
+
+            const result = new Uint8Array(loaded);
+            let offset = 0;
+            for (const chunk of chunks) {
+                result.set(chunk, offset);
+                offset += chunk.length;
+            }
+            return result;
+        }
+
+        const buffer = await response.arrayBuffer();
+        return new Uint8Array(buffer);
+    }
+
+    /**
+     * Fetch range from network
+     * @private
+     */
+    async _fetchRange(url, start, end) {
+        const response = await fetch(url, {
+            headers: { 'Range': `bytes=${start}-${end}` }
+        });
+        if (!response.ok && response.status !== 206) {
+            throw new Error(`HTTP error: ${response.status}`);
+        }
+        return response.arrayBuffer();
+    }
+
+    /**
+     * Cache a full file
+     * @private
+     */
+    async _cacheFile(url, data) {
+        const metaPath = this._getCachePath(url, '/meta.json');
+        const dataPath = this._getCachePath(url, '/data.lance');
+
+        const meta = {
+            url,
+            size: data.byteLength,
+            cachedAt: Date.now(),
+            fullFile: true,
+            ranges: null,
+        };
+
+        await this.storage.save(metaPath, new TextEncoder().encode(JSON.stringify(meta)));
+        await this.storage.save(dataPath, data);
+    }
+
+    /**
+     * Cache a byte range
+     * @private
+     */
+    async _cacheRange(url, start, end, data, fileSize) {
+        const metaPath = this._getCachePath(url, '/meta.json');
+        const rangePath = this._getCachePath(url, `/ranges/${start}-${end}`);
+
+        // Load existing meta or create new
+        let meta;
+        const { cached, meta: existingMeta } = await this.isCached(url);
+        if (cached) {
+            meta = existingMeta;
+            meta.ranges = meta.ranges || [];
+        } else {
+            meta = {
+                url,
+                size: fileSize,
+                cachedAt: Date.now(),
+                fullFile: false,
+                ranges: [],
+            };
+        }
+
+        // Add this range (merge overlapping ranges for efficiency)
+        meta.ranges.push({ start, end, cachedAt: Date.now() });
+        meta.ranges = this._mergeRanges(meta.ranges);
+
+        await this.storage.save(metaPath, new TextEncoder().encode(JSON.stringify(meta)));
+        await this.storage.save(rangePath, data);
+    }
+
+    /**
+     * Merge overlapping ranges
+     * @private
+     */
+    _mergeRanges(ranges) {
+        if (ranges.length <= 1) return ranges;
+
+        ranges.sort((a, b) => a.start - b.start);
+        const merged = [ranges[0]];
+
+        for (let i = 1; i < ranges.length; i++) {
+            const last = merged[merged.length - 1];
+            const current = ranges[i];
+
+            // Merge if overlapping or adjacent
+            if (current.start <= last.end + 1) {
+                last.end = Math.max(last.end, current.end);
+            } else {
+                merged.push(current);
+            }
+        }
+
+        return merged;
+    }
+}
+
+// Global hot-tier cache instance
+const hotTierCache = new HotTierCache();
+
+// Export storage and statistics for external use
+
+
+// =============================================================================
+// OPFSJoinExecutor - OPFS-backed join execution for TB-scale joins
+// =============================================================================
+
+/**
+ * OPFSJoinExecutor enables TB-scale JOINs in the browser by spilling to OPFS.
+ *
+ * Architecture:
+ * 1. Stream left table chunks → write to OPFS partitioned by hash(join_key)
+ * 2. Stream right table chunks → probe OPFS partitions → write matches to OPFS
+ * 3. Stream final results from OPFS
+ *
+ * This avoids loading entire tables into RAM. Only one chunk + one hash partition
+ * need to fit in memory at a time.
+ *
+ * Storage layout:
+ *   _join_temp/
+ *     {sessionId}/
+ *       left/
+ *         partition_000.jsonl   # Rows where hash(key) % numPartitions == 0
+ *         partition_001.jsonl
+ *         ...
+ *       right/
+ *         partition_000.jsonl
+ *         ...
+ *       results/
+ *         chunk_000.jsonl
+ *         chunk_001.jsonl
+ *         ...
+ */
+class OPFSJoinExecutor {
+    constructor(storage = opfsStorage) {
+        this.storage = storage;
+        this.sessionId = `join_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        this.basePath = `_join_temp/${this.sessionId}`;
+        this.numPartitions = 64;  // Number of hash partitions
+        this.chunkSize = 1000;    // Rows per chunk when streaming
+        this.stats = {
+            leftRowsWritten: 0,
+            rightRowsWritten: 0,
+            resultRowsWritten: 0,
+            bytesWrittenToOPFS: 0,
+            bytesReadFromOPFS: 0,
+            partitionsUsed: new Set(),
+        };
+    }
+
+    /**
+     * Execute a hash join using OPFS for intermediate storage
+     * @param {AsyncGenerator} leftStream - Async generator yielding {columns, rows} chunks
+     * @param {AsyncGenerator} rightStream - Async generator yielding {columns, rows} chunks
+     * @param {string} leftKey - Join key column name for left table
+     * @param {string} rightKey - Join key column name for right table
+     * @param {Object} options - Join options
+     * @returns {AsyncGenerator} Yields result chunks
+     */
+    async *executeHashJoin(leftStream, rightStream, leftKey, rightKey, options = {}) {
+        const { limit = Infinity, projection = null } = options;
+
+        console.log(`[OPFSJoin] Starting OPFS-backed hash join`);
+        console.log(`[OPFSJoin] Session: ${this.sessionId}`);
+        console.log(`[OPFSJoin] Partitions: ${this.numPartitions}`);
+
+        try {
+            // Phase 1: Partition left table to OPFS
+            console.log(`[OPFSJoin] Phase 1: Partitioning left table...`);
+            const leftMeta = await this._partitionToOPFS(leftStream, leftKey, 'left');
+            console.log(`[OPFSJoin] Left table: ${leftMeta.totalRows} rows in ${leftMeta.partitionsUsed.size} partitions`);
+
+            // Phase 2: Partition right table to OPFS
+            console.log(`[OPFSJoin] Phase 2: Partitioning right table...`);
+            const rightMeta = await this._partitionToOPFS(rightStream, rightKey, 'right');
+            console.log(`[OPFSJoin] Right table: ${rightMeta.totalRows} rows in ${rightMeta.partitionsUsed.size} partitions`);
+
+            // Phase 3: Join partition by partition
+            console.log(`[OPFSJoin] Phase 3: Joining partitions...`);
+            let totalYielded = 0;
+
+            // Only process partitions that have data on both sides
+            const activePartitions = new Set(
+                [...leftMeta.partitionsUsed].filter(p => rightMeta.partitionsUsed.has(p))
+            );
+            console.log(`[OPFSJoin] Active partitions (both sides): ${activePartitions.size}`);
+
+            for (const partitionId of activePartitions) {
+                if (totalYielded >= limit) break;
+
+                // Load left partition into memory (fits because we partitioned)
+                const leftPartition = await this._loadPartition('left', partitionId, leftMeta.columns);
+                if (leftPartition.length === 0) continue;
+
+                // Build in-memory hash map for this partition only
+                const hashMap = new Map();
+                const leftKeyIndex = leftMeta.columns.indexOf(leftKey);
+                for (const row of leftPartition) {
+                    const key = row[leftKeyIndex];
+                    if (key !== null && key !== undefined) {
+                        if (!hashMap.has(key)) hashMap.set(key, []);
+                        hashMap.get(key).push(row);
+                    }
+                }
+
+                // Stream right partition and probe hash map
+                const rightKeyIndex = rightMeta.columns.indexOf(rightKey);
+                const rightPartition = await this._loadPartition('right', partitionId, rightMeta.columns);
+
+                const chunk = [];
+                for (const rightRow of rightPartition) {
+                    if (totalYielded >= limit) break;
+
+                    const key = rightRow[rightKeyIndex];
+                    const leftRows = hashMap.get(key);
+
+                    if (leftRows) {
+                        for (const leftRow of leftRows) {
+                            if (totalYielded >= limit) break;
+
+                            const mergedRow = [...leftRow, ...rightRow];
+                            chunk.push(mergedRow);
+                            totalYielded++;
+
+                            // Yield in chunks to avoid memory buildup
+                            if (chunk.length >= this.chunkSize) {
+                                yield {
+                                    columns: [...leftMeta.columns, ...rightMeta.columns],
+                                    rows: chunk.splice(0),
+                                };
+                            }
+                        }
+                    }
+                }
+
+                // Yield remaining rows in chunk
+                if (chunk.length > 0) {
+                    yield {
+                        columns: [...leftMeta.columns, ...rightMeta.columns],
+                        rows: chunk,
+                    };
+                }
+            }
+
+            console.log(`[OPFSJoin] Join complete: ${totalYielded} result rows`);
+            console.log(`[OPFSJoin] Stats:`, this.getStats());
+
+        } finally {
+            // Cleanup temp files
+            await this.cleanup();
+        }
+    }
+
+    /**
+     * Partition a stream of data to OPFS files by hash(key)
+     */
+    async _partitionToOPFS(stream, keyColumn, side) {
+        const partitionBuffers = new Map();  // partitionId -> rows[]
+        const flushThreshold = 500;  // Flush to OPFS when buffer reaches this size
+        let columns = null;
+        let keyIndex = -1;
+        let totalRows = 0;
+        const partitionsUsed = new Set();
+
+        for await (const chunk of stream) {
+            if (!columns) {
+                columns = chunk.columns;
+                keyIndex = columns.indexOf(keyColumn);
+                if (keyIndex === -1) {
+                    throw new Error(`Join key column '${keyColumn}' not found in columns: ${columns.join(', ')}`);
+                }
+            }
+
+            for (const row of chunk.rows) {
+                const key = row[keyIndex];
+                const partitionId = this._hashToPartition(key);
+                partitionsUsed.add(partitionId);
+
+                if (!partitionBuffers.has(partitionId)) {
+                    partitionBuffers.set(partitionId, []);
+                }
+                partitionBuffers.get(partitionId).push(row);
+                totalRows++;
+
+                // Flush partition buffer if too large
+                if (partitionBuffers.get(partitionId).length >= flushThreshold) {
+                    await this._appendToPartition(side, partitionId, partitionBuffers.get(partitionId));
+                    partitionBuffers.set(partitionId, []);
+                }
+            }
+        }
+
+        // Flush remaining buffers
+        for (const [partitionId, rows] of partitionBuffers) {
+            if (rows.length > 0) {
+                await this._appendToPartition(side, partitionId, rows);
+            }
+        }
+
+        if (side === 'left') {
+            this.stats.leftRowsWritten = totalRows;
+        } else {
+            this.stats.rightRowsWritten = totalRows;
+        }
+
+        return { columns, totalRows, partitionsUsed };
+    }
+
+    /**
+     * Hash a value to a partition number
+     */
+    _hashToPartition(value) {
+        if (value === null || value === undefined) {
+            return 0;  // Null keys go to partition 0
+        }
+
+        // Simple string hash
+        const str = String(value);
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+            const char = str.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash;  // Convert to 32-bit integer
+        }
+        return Math.abs(hash) % this.numPartitions;
+    }
+
+    /**
+     * Append rows to a partition file in OPFS
+     */
+    async _appendToPartition(side, partitionId, rows) {
+        const path = `${this.basePath}/${side}/partition_${String(partitionId).padStart(3, '0')}.jsonl`;
+
+        // Serialize rows as JSONL (one JSON array per line)
+        const jsonl = rows.map(row => JSON.stringify(row)).join('\n') + '\n';
+        const data = new TextEncoder().encode(jsonl);
+
+        // Load existing data if any
+        const existing = await this.storage.load(path);
+
+        if (existing) {
+            // Append to existing
+            const combined = new Uint8Array(existing.length + data.length);
+            combined.set(existing);
+            combined.set(data, existing.length);
+            await this.storage.save(path, combined);
+            this.stats.bytesWrittenToOPFS += data.length;
+        } else {
+            await this.storage.save(path, data);
+            this.stats.bytesWrittenToOPFS += data.length;
+        }
+
+        this.stats.partitionsUsed.add(partitionId);
+    }
+
+    /**
+     * Load a partition from OPFS
+     */
+    async _loadPartition(side, partitionId, columns) {
+        const path = `${this.basePath}/${side}/partition_${String(partitionId).padStart(3, '0')}.jsonl`;
+
+        const data = await this.storage.load(path);
+        if (!data) return [];
+
+        this.stats.bytesReadFromOPFS += data.length;
+
+        const text = new TextDecoder().decode(data);
+        const lines = text.trim().split('\n').filter(line => line);
+
+        return lines.map(line => JSON.parse(line));
+    }
+
+    /**
+     * Get execution statistics
+     */
+    getStats() {
+        return {
+            ...this.stats,
+            partitionsUsed: this.stats.partitionsUsed.size,
+            bytesWrittenMB: (this.stats.bytesWrittenToOPFS / 1024 / 1024).toFixed(2),
+            bytesReadMB: (this.stats.bytesReadFromOPFS / 1024 / 1024).toFixed(2),
+        };
+    }
+
+    /**
+     * Cleanup temp files
+     */
+    async cleanup() {
+        try {
+            await this.storage.deleteDir(this.basePath);
+            console.log(`[OPFSJoin] Cleaned up temp files: ${this.basePath}`);
+        } catch (e) {
+            console.warn(`[OPFSJoin] Cleanup failed:`, e);
+        }
+    }
+}
 
 // =============================================================================
 // LocalDatabase - ACID-compliant local database with CRUD support
@@ -548,6 +3228,7 @@ const DataType = {
     INTEGER: 'int64',
     BIGINT: 'int64',
     FLOAT: 'float32',
+    REAL: 'float64',
     DOUBLE: 'float64',
     TEXT: 'string',
     VARCHAR: 'string',
@@ -566,6 +3247,9 @@ const DataType = {
  * - Durability: Persisted to OPFS (Origin Private File System)
  *
  * Storage: Uses OPFS exclusively for all data sizes. No IndexedDB migration needed.
+ *
+ * Write Buffer: Inserts are buffered in memory and flushed to OPFS periodically
+ * for high-throughput writes without exhausting file handles.
  */
 class LocalDatabase {
     constructor(name, storage = opfsStorage) {
@@ -574,6 +3258,13 @@ class LocalDatabase {
         this.tables = new Map();  // tableName -> TableState
         this.version = 0;
         this.manifestKey = `${name}/__manifest__`;
+
+        // Write buffer for fast inserts
+        this._writeBuffer = new Map();  // tableName -> [{row}, ...]
+        this._flushTimer = null;
+        this._flushInterval = 1000;  // Flush every 1 second
+        this._flushThreshold = 1000; // Or when buffer exceeds 1000 rows
+        this._flushing = false;
     }
 
     /**
@@ -608,15 +3299,19 @@ class LocalDatabase {
      * CREATE TABLE
      * @param {string} tableName - Table name
      * @param {Array} columns - Column definitions [{name, type, primaryKey?, vectorDim?}]
+     * @param {boolean} ifNotExists - If true, don't error if table already exists
      */
-    async createTable(tableName, columns) {
+    async createTable(tableName, columns, ifNotExists = false) {
         if (this.tables.has(tableName)) {
+            if (ifNotExists) {
+                return { success: true, existed: true };
+            }
             throw new Error(`Table '${tableName}' already exists`);
         }
 
         const schema = columns.map(col => ({
             name: col.name,
-            type: DataType[col.type?.toUpperCase()] || col.type || 'string',
+            type: DataType[(col.dataType || col.type)?.toUpperCase()] || col.dataType || col.type || 'string',
             primaryKey: col.primaryKey || false,
             vectorDim: col.vectorDim || null,
         }));
@@ -640,13 +3335,22 @@ class LocalDatabase {
     /**
      * DROP TABLE
      * @param {string} tableName - Table name
+     * @param {boolean} ifExists - If true, don't error if table doesn't exist
      */
-    async dropTable(tableName) {
+    async dropTable(tableName, ifExists = false) {
         if (!this.tables.has(tableName)) {
+            if (ifExists) {
+                // Also clear any orphaned buffer
+                this._writeBuffer.delete(tableName);
+                return { success: true, existed: false };
+            }
             throw new Error(`Table '${tableName}' does not exist`);
         }
 
         const table = this.tables.get(tableName);
+
+        // Clear write buffer for this table
+        this._writeBuffer.delete(tableName);
 
         // Delete all fragments
         for (const fragKey of table.fragments) {
@@ -660,7 +3364,7 @@ class LocalDatabase {
     }
 
     /**
-     * INSERT INTO
+     * INSERT INTO - buffers writes for performance, flushes periodically
      * @param {string} tableName - Table name
      * @param {Array} rows - Array of row objects [{col1: val1, col2: val2}, ...]
      */
@@ -671,24 +3375,90 @@ class LocalDatabase {
 
         const table = this.tables.get(tableName);
 
-        // Assign row IDs
+        // Assign row IDs and add to buffer
         const rowsWithIds = rows.map(row => ({
             __rowId: table.nextRowId++,
             ...row,
         }));
 
-        // Create new fragment
-        const fragKey = `${this.name}/${tableName}/frag_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-        const fragData = new TextEncoder().encode(JSON.stringify(rowsWithIds));
-        await this.storage.save(fragKey, fragData);
+        // Add to write buffer
+        if (!this._writeBuffer.has(tableName)) {
+            this._writeBuffer.set(tableName, []);
+        }
+        this._writeBuffer.get(tableName).push(...rowsWithIds);
+        table.rowCount += rows.length;
+
+        // Schedule flush if not already scheduled
+        this._scheduleFlush();
+
+        // Check if we should flush immediately (buffer threshold)
+        const bufferSize = this._writeBuffer.get(tableName).length;
+        if (bufferSize >= this._flushThreshold) {
+            await this._flushTable(tableName);
+        }
+
+        return { success: true, inserted: rows.length };
+    }
+
+    /**
+     * Schedule a flush to OPFS
+     */
+    _scheduleFlush() {
+        if (this._flushTimer) return;
+        this._flushTimer = setTimeout(() => {
+            this._flushTimer = null;
+            this.flush().catch(e => console.warn('[LocalDatabase] Flush error:', e));
+        }, this._flushInterval);
+    }
+
+    /**
+     * Flush all buffered writes to OPFS
+     */
+    async flush() {
+        if (this._flushing) return;
+        this._flushing = true;
+
+        try {
+            const tables = [...this._writeBuffer.keys()];
+            for (const tableName of tables) {
+                await this._flushTable(tableName);
+            }
+        } finally {
+            this._flushing = false;
+        }
+    }
+
+    /**
+     * Flush a single table's buffer to OPFS
+     */
+    async _flushTable(tableName) {
+        const buffer = this._writeBuffer.get(tableName);
+        if (!buffer || buffer.length === 0) return;
+
+        const table = this.tables.get(tableName);
+        if (!table) return;
+
+        // Take all buffered rows
+        const rowsToFlush = buffer.splice(0, buffer.length);
+
+        // Add __rowId to schema if not present
+        const schemaWithRowId = [
+            { name: '__rowId', type: 'int64', primaryKey: true },
+            ...table.schema.filter(c => c.name !== '__rowId')
+        ];
+
+        // Create Lance file using WASM writer
+        const writer = new LanceFileWriter(schemaWithRowId);
+        writer.addRows(rowsToFlush);
+        const lanceData = writer.build();
+
+        // Save as .lance fragment
+        const fragKey = `${this.name}/${tableName}/frag_${Date.now()}_${Math.random().toString(36).slice(2)}.lance`;
+        await this.storage.save(fragKey, lanceData);
 
         // Update table state
         table.fragments.push(fragKey);
-        table.rowCount += rows.length;
-
         await this._saveManifest();
-
-        return { success: true, inserted: rows.length };
     }
 
     /**
@@ -702,17 +3472,33 @@ class LocalDatabase {
         }
 
         const table = this.tables.get(tableName);
-        const allRows = await this._readAllRows(tableName);
-
         let deletedCount = 0;
-        for (const row of allRows) {
-            if (predicate(row)) {
-                table.deletionVector.push(row.__rowId);
-                deletedCount++;
-                table.rowCount--;
+
+        // Delete from buffer (rows not yet persisted)
+        const buffer = this._writeBuffer.get(tableName);
+        if (buffer && buffer.length > 0) {
+            const originalLen = buffer.length;
+            const remaining = buffer.filter(row => !predicate(row));
+            buffer.length = 0;
+            buffer.push(...remaining);
+            deletedCount += (originalLen - remaining.length);
+        }
+
+        // Delete from persisted fragments (add to deletion vector)
+        for (const fragKey of table.fragments) {
+            const fragData = await this.storage.load(fragKey);
+            if (fragData) {
+                const rows = this._parseFragment(fragData, table.schema);
+                for (const row of rows) {
+                    if (!table.deletionVector.includes(row.__rowId) && predicate(row)) {
+                        table.deletionVector.push(row.__rowId);
+                        deletedCount++;
+                    }
+                }
             }
         }
 
+        table.rowCount -= deletedCount;
         await this._saveManifest();
 
         return { success: true, deleted: deletedCount };
@@ -730,28 +3516,44 @@ class LocalDatabase {
         }
 
         const table = this.tables.get(tableName);
-        const allRows = await this._readAllRows(tableName);
-
-        const updatedRows = [];
         let updatedCount = 0;
 
-        for (const row of allRows) {
-            if (predicate(row)) {
-                // Mark old row as deleted
-                table.deletionVector.push(row.__rowId);
-                table.rowCount--;
-
-                // Create new row with updates
-                const newRow = { ...row, ...updates };
-                delete newRow.__rowId;
-                updatedRows.push(newRow);
-                updatedCount++;
+        // Update buffered rows in place
+        const buffer = this._writeBuffer.get(tableName);
+        if (buffer && buffer.length > 0) {
+            for (const row of buffer) {
+                if (predicate(row)) {
+                    Object.assign(row, updates);
+                    updatedCount++;
+                }
             }
         }
 
-        // Insert updated rows as new fragment
-        if (updatedRows.length > 0) {
-            await this.insert(tableName, updatedRows);
+        // Update persisted rows (mark as deleted, insert new)
+        const persistedUpdates = [];
+        for (const fragKey of table.fragments) {
+            const fragData = await this.storage.load(fragKey);
+            if (fragData) {
+                const rows = this._parseFragment(fragData, table.schema);
+                for (const row of rows) {
+                    if (!table.deletionVector.includes(row.__rowId) && predicate(row)) {
+                        // Mark old row as deleted
+                        table.deletionVector.push(row.__rowId);
+                        table.rowCount--;
+
+                        // Create new row with updates
+                        const newRow = { ...row, ...updates };
+                        delete newRow.__rowId;
+                        persistedUpdates.push(newRow);
+                        updatedCount++;
+                    }
+                }
+            }
+        }
+
+        // Insert updated rows (will go to buffer)
+        if (persistedUpdates.length > 0) {
+            await this.insert(tableName, persistedUpdates);
         } else {
             await this._saveManifest();
         }
@@ -817,16 +3619,18 @@ class LocalDatabase {
 
     /**
      * Read all rows from a table (excluding deleted)
+     * Includes both persisted fragments AND buffered (unflushed) rows
      */
     async _readAllRows(tableName) {
         const table = this.tables.get(tableName);
         const deletedSet = new Set(table.deletionVector);
         const allRows = [];
 
+        // Read from persisted fragments
         for (const fragKey of table.fragments) {
             const fragData = await this.storage.load(fragKey);
             if (fragData) {
-                const rows = JSON.parse(new TextDecoder().decode(fragData));
+                const rows = this._parseFragment(fragData, table.schema);
                 for (const row of rows) {
                     if (!deletedSet.has(row.__rowId)) {
                         allRows.push(row);
@@ -835,7 +3639,361 @@ class LocalDatabase {
             }
         }
 
+        // Include buffered (unflushed) rows
+        const buffer = this._writeBuffer.get(tableName);
+        if (buffer && buffer.length > 0) {
+            for (const row of buffer) {
+                if (!deletedSet.has(row.__rowId)) {
+                    allRows.push(row);
+                }
+            }
+        }
+
         return allRows;
+    }
+
+    /**
+     * Parse a fragment (Lance or JSON format)
+     */
+    _parseFragment(data, schema) {
+        // Check for Lance magic at end of file
+        if (data.length >= 40) {
+            const magic = new TextDecoder().decode(data.slice(-4));
+            if (magic === 'LANC') {
+                return this._parseLanceFragment(data, schema);
+            }
+        }
+
+        // Try JSON format
+        try {
+            const text = new TextDecoder().decode(data);
+            const parsed = JSON.parse(text);
+
+            // Check for LanceFileWriter JSON fallback format
+            if (parsed.format === 'json' && parsed.columns) {
+                return this._parseJsonColumnar(parsed);
+            }
+
+            // Legacy row-based JSON format
+            return Array.isArray(parsed) ? parsed : [parsed];
+        } catch (e) {
+            console.warn('[LocalDatabase] Failed to parse fragment:', e);
+            return [];
+        }
+    }
+
+    /**
+     * Parse JSON columnar format (LanceFileWriter fallback)
+     */
+    _parseJsonColumnar(data) {
+        const { schema, columns, rowCount } = data;
+        const rows = [];
+
+        for (let i = 0; i < rowCount; i++) {
+            const row = {};
+            for (const col of schema) {
+                row[col.name] = columns[col.name]?.[i] ?? null;
+            }
+            rows.push(row);
+        }
+
+        return rows;
+    }
+
+    /**
+     * Parse Lance file format using WASM reader API
+     * All parsing/decoding logic is in WASM, JS only marshals data.
+     */
+    _parseLanceFragment(data, tableSchema) {
+        if (!_w?.fragmentLoad) {
+            // Fallback to JS parsing if WASM not loaded
+            return this._parseLanceFragmentJS(data, tableSchema);
+        }
+
+        // Copy data to WASM memory
+        const ptr = _w.alloc(data.length);
+        new Uint8Array(_m.buffer, ptr, data.length).set(data);
+
+        // Load fragment in WASM
+        if (!_w.fragmentLoad(ptr, data.length)) {
+            _w.free(ptr, data.length);
+            throw new Error('Failed to load Lance fragment');
+        }
+
+        const numColumns = _w.fragmentGetColumnCount();
+        const rowCount = Number(_w.fragmentGetRowCount());
+
+        if (rowCount === 0) {
+            _w.free(ptr, data.length);
+            return [];
+        }
+
+        // Read column info and data
+        const columns = {};
+        const nameBuf = _w.alloc(64);
+        const typeBuf = _w.alloc(16);
+
+        for (let i = 0; i < numColumns; i++) {
+            // Get column name
+            const nameLen = _w.fragmentGetColumnName(i, nameBuf, 64);
+            const name = D.decode(new Uint8Array(_m.buffer, nameBuf, nameLen));
+
+            // Get column type
+            const typeLen = _w.fragmentGetColumnType(i, typeBuf, 16);
+            const type = D.decode(new Uint8Array(_m.buffer, typeBuf, typeLen));
+
+            // Read column data based on type
+            columns[name] = this._readColumnFromWasm(i, type, rowCount);
+        }
+
+        _w.free(nameBuf, 64);
+        _w.free(typeBuf, 16);
+        _w.free(ptr, data.length);
+
+        // Build rows
+        const rows = [];
+        const colNames = Object.keys(columns);
+        for (let i = 0; i < rowCount; i++) {
+            const row = {};
+            for (const name of colNames) {
+                row[name] = columns[name][i];
+            }
+            rows.push(row);
+        }
+
+        return rows;
+    }
+
+    /**
+     * Read column data from WASM using fragment reader API
+     */
+    _readColumnFromWasm(colIdx, type, rowCount) {
+        const typeLower = type.toLowerCase();
+
+        switch (typeLower) {
+            case 'int64':
+            case 'int':
+            case 'integer':
+            case 'bigint': {
+                const buf = _w.alloc(rowCount * 8);
+                const count = _w.fragmentReadInt64(colIdx, buf, rowCount);
+                const arr = new BigInt64Array(_m.buffer, buf, count);
+                const values = Array.from(arr, v => Number(v));
+                _w.free(buf, rowCount * 8);
+                return values;
+            }
+
+            case 'int32': {
+                const buf = _w.alloc(rowCount * 4);
+                const count = _w.fragmentReadInt32(colIdx, buf, rowCount);
+                const values = Array.from(new Int32Array(_m.buffer, buf, count));
+                _w.free(buf, rowCount * 4);
+                return values;
+            }
+
+            case 'float64':
+            case 'float':
+            case 'double': {
+                const buf = _w.alloc(rowCount * 8);
+                const count = _w.fragmentReadFloat64(colIdx, buf, rowCount);
+                const values = Array.from(new Float64Array(_m.buffer, buf, count));
+                _w.free(buf, rowCount * 8);
+                return values;
+            }
+
+            case 'float32': {
+                const buf = _w.alloc(rowCount * 4);
+                const count = _w.fragmentReadFloat32(colIdx, buf, rowCount);
+                const values = Array.from(new Float32Array(_m.buffer, buf, count));
+                _w.free(buf, rowCount * 4);
+                return values;
+            }
+
+            case 'string':
+            case 'text':
+            case 'varchar': {
+                const values = [];
+                const strBuf = _w.alloc(4096); // Max string length
+                for (let i = 0; i < rowCount; i++) {
+                    const len = _w.fragmentReadStringAt(colIdx, i, strBuf, 4096);
+                    values.push(D.decode(new Uint8Array(_m.buffer, strBuf, len)));
+                }
+                _w.free(strBuf, 4096);
+                return values;
+            }
+
+            case 'bool':
+            case 'boolean': {
+                const buf = _w.alloc(rowCount);
+                const count = _w.fragmentReadBool(colIdx, buf, rowCount);
+                const arr = new Uint8Array(_m.buffer, buf, count);
+                const values = Array.from(arr, v => v !== 0);
+                _w.free(buf, rowCount);
+                return values;
+            }
+
+            case 'vector': {
+                const dim = _w.fragmentGetColumnVectorDim(colIdx);
+                if (dim === 0) return new Array(rowCount).fill([]);
+
+                const vecBuf = _w.alloc(dim * 4);
+                const values = [];
+                for (let i = 0; i < rowCount; i++) {
+                    _w.fragmentReadVectorAt(colIdx, i, vecBuf, dim);
+                    values.push(Array.from(new Float32Array(_m.buffer, vecBuf, dim)));
+                }
+                _w.free(vecBuf, dim * 4);
+                return values;
+            }
+
+            default:
+                return this._readColumnFromWasm(colIdx, 'string', rowCount);
+        }
+    }
+
+    /**
+     * Fallback JS parser for when WASM not available
+     */
+    _parseLanceFragmentJS(data, tableSchema) {
+        const footer = data.slice(-40);
+        const view = new DataView(footer.buffer, footer.byteOffset, footer.byteLength);
+
+        const columnMetaStart = Number(view.getBigUint64(0, true));
+        const columnMetaOffsetsStart = Number(view.getBigUint64(8, true));
+        const numColumns = view.getUint32(28, true);
+
+        const schemaWithRowId = [
+            { name: '__rowId', type: 'int64' },
+            ...tableSchema.filter(c => c.name !== '__rowId')
+        ];
+
+        const metaOffsets = [];
+        const offsetsView = new DataView(data.buffer, data.byteOffset + columnMetaOffsetsStart);
+        for (let i = 0; i < numColumns; i++) {
+            metaOffsets.push(Number(offsetsView.getBigUint64(i * 8, true)));
+        }
+
+        const columnInfos = [];
+        for (let i = 0; i < numColumns; i++) {
+            const metaStart = metaOffsets[i];
+            const metaEnd = i < numColumns - 1 ? metaOffsets[i + 1] : columnMetaOffsetsStart;
+            const metaBytes = data.slice(metaStart, metaEnd);
+            const info = this._parseColumnMetadataJS(metaBytes);
+            info.schema = schemaWithRowId[i] || { name: `col_${i}`, type: 'string' };
+            columnInfos.push(info);
+        }
+
+        const rowCount = columnInfos[0]?.rowCount || 0;
+        if (rowCount === 0) return [];
+
+        const columns = {};
+        for (let i = 0; i < columnInfos.length; i++) {
+            const info = columnInfos[i];
+            const colName = info.name || info.schema.name;
+            const colType = info.type || info.schema.type || 'string';
+            const colData = data.slice(info.dataOffset, info.dataOffset + info.dataSize);
+            columns[colName] = this._decodeColumnDataJS(colData, colType, rowCount, info.schema);
+        }
+
+        const rows = [];
+        for (let i = 0; i < rowCount; i++) {
+            const row = {};
+            for (const name of Object.keys(columns)) {
+                row[name] = columns[name][i];
+            }
+            rows.push(row);
+        }
+        return rows;
+    }
+
+    _parseColumnMetadataJS(bytes) {
+        const info = { name: '', type: 'string', nullable: true, dataOffset: 0, rowCount: 0, dataSize: 0 };
+        let pos = 0;
+        while (pos < bytes.length) {
+            const byte = bytes[pos++];
+            const fieldNum = byte >> 3;
+            const wireType = byte & 0x7;
+            if (fieldNum === 1 && wireType === 2) {
+                const len = this._readVarintJS(bytes, pos);
+                pos = len.nextPos;
+                info.name = D.decode(bytes.slice(pos, pos + len.value));
+                pos += len.value;
+            } else if (fieldNum === 2 && wireType === 2) {
+                const len = this._readVarintJS(bytes, pos);
+                pos = len.nextPos;
+                info.type = D.decode(bytes.slice(pos, pos + len.value));
+                pos += len.value;
+            } else if (fieldNum === 3 && wireType === 0) {
+                const val = this._readVarintJS(bytes, pos);
+                pos = val.nextPos;
+                info.nullable = val.value !== 0;
+            } else if (fieldNum === 4 && wireType === 1) {
+                info.dataOffset = Number(new DataView(bytes.buffer, bytes.byteOffset + pos, 8).getBigUint64(0, true));
+                pos += 8;
+            } else if (fieldNum === 5 && wireType === 0) {
+                const val = this._readVarintJS(bytes, pos);
+                pos = val.nextPos;
+                info.rowCount = val.value;
+            } else if (fieldNum === 6 && wireType === 0) {
+                const val = this._readVarintJS(bytes, pos);
+                pos = val.nextPos;
+                info.dataSize = val.value;
+            } else if (wireType === 0) {
+                const val = this._readVarintJS(bytes, pos);
+                pos = val.nextPos;
+            } else if (wireType === 1) {
+                pos += 8;
+            } else if (wireType === 2) {
+                const len = this._readVarintJS(bytes, pos);
+                pos = len.nextPos + len.value;
+            } else if (wireType === 5) {
+                pos += 4;
+            }
+        }
+        return info;
+    }
+
+    _readVarintJS(bytes, pos) {
+        let value = 0, shift = 0;
+        while (pos < bytes.length) {
+            const byte = bytes[pos++];
+            value |= (byte & 0x7F) << shift;
+            if ((byte & 0x80) === 0) break;
+            shift += 7;
+        }
+        return { value, nextPos: pos };
+    }
+
+    _decodeColumnDataJS(data, type, rowCount, schema) {
+        const t = type.toLowerCase();
+        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+        if (t === 'int64' || t === 'int' || t === 'integer' || t === 'bigint') {
+            return Array.from({ length: rowCount }, (_, i) => Number(view.getBigInt64(i * 8, true)));
+        } else if (t === 'int32') {
+            return Array.from({ length: rowCount }, (_, i) => view.getInt32(i * 4, true));
+        } else if (t === 'float64' || t === 'float' || t === 'double') {
+            return Array.from({ length: rowCount }, (_, i) => view.getFloat64(i * 8, true));
+        } else if (t === 'float32') {
+            return Array.from({ length: rowCount }, (_, i) => view.getFloat32(i * 4, true));
+        } else if (t === 'string' || t === 'text' || t === 'varchar') {
+            const offsetsSize = (rowCount + 1) * 4;
+            const stringData = data.slice(0, data.length - offsetsSize);
+            const offsetsData = data.slice(data.length - offsetsSize);
+            const offView = new DataView(offsetsData.buffer, offsetsData.byteOffset);
+            return Array.from({ length: rowCount }, (_, i) => {
+                const start = offView.getUint32(i * 4, true);
+                const end = offView.getUint32((i + 1) * 4, true);
+                return D.decode(stringData.slice(start, end));
+            });
+        } else if (t === 'bool' || t === 'boolean') {
+            return Array.from({ length: rowCount }, (_, i) => (data[Math.floor(i / 8)] & (1 << (i % 8))) !== 0);
+        } else if (t === 'vector') {
+            const dim = schema?.vectorDim || 0;
+            if (dim === 0) return new Array(rowCount).fill([]);
+            return Array.from({ length: rowCount }, (_, i) =>
+                Array.from({ length: dim }, (_, j) => view.getFloat32((i * dim + j) * 4, true)));
+        }
+        return this._decodeColumnDataJS(data, 'string', rowCount, schema);
     }
 
     /**
@@ -874,10 +4032,10 @@ class LocalDatabase {
 
         switch (type) {
             case 'CREATE_TABLE':
-                return this.createTable(ast.table, ast.columns);
+                return this.createTable(ast.table, ast.columns, ast.ifNotExists);
 
             case 'DROP_TABLE':
-                return this.dropTable(ast.table);
+                return this.dropTable(ast.table, ast.ifExists);
 
             case 'INSERT': {
                 // Convert from parser format to insert format
@@ -923,6 +4081,17 @@ class LocalDatabase {
                 const tableName = ast.from?.name || ast.from?.table || ast.from;
                 if (!tableName) {
                     throw new Error('SELECT requires FROM clause for LocalDatabase');
+                }
+
+                // Check for aggregate functions
+                const aggFunctions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'];
+                const hasAggregates = ast.columns !== '*' && ast.columns.some(c =>
+                    c.expr?.type === 'call' && aggFunctions.includes(c.expr.name?.toUpperCase())
+                );
+
+                if (hasAggregates) {
+                    // Execute aggregate query
+                    return this._executeAggregate(tableName, ast);
                 }
 
                 const selectOptions = {
@@ -1028,6 +4197,51 @@ class LocalDatabase {
     }
 
     /**
+     * Execute aggregate query (COUNT, SUM, AVG, MIN, MAX)
+     */
+    async _executeAggregate(tableName, ast) {
+        if (!this.tables.has(tableName)) {
+            throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        // Get all rows (with WHERE filter)
+        let rows = await this._readAllRows(tableName);
+        if (ast.where) {
+            rows = rows.filter(row => this._evalWhereExpr(ast.where, row));
+        }
+
+        // Initialize result object
+        const result = {};
+        const aggFunctions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'];
+
+        for (const col of ast.columns) {
+            if (col.expr?.type === 'call') {
+                const funcName = col.expr.name.toUpperCase();
+                const alias = col.alias || `${funcName}(${col.expr.args[0]?.column || '*'})`;
+                const argCol = col.expr.args[0]?.column;
+
+                if (funcName === 'COUNT') {
+                    result[alias] = rows.length;
+                } else if (funcName === 'SUM') {
+                    result[alias] = rows.reduce((sum, row) => sum + (row[argCol] || 0), 0);
+                } else if (funcName === 'AVG') {
+                    const sum = rows.reduce((s, row) => s + (row[argCol] || 0), 0);
+                    result[alias] = rows.length > 0 ? sum / rows.length : null;
+                } else if (funcName === 'MIN') {
+                    result[alias] = rows.length > 0 ?
+                        Math.min(...rows.map(r => r[argCol]).filter(v => v != null)) : null;
+                } else if (funcName === 'MAX') {
+                    result[alias] = rows.length > 0 ?
+                        Math.max(...rows.map(r => r[argCol]).filter(v => v != null)) : null;
+                }
+            }
+        }
+
+        // Return as single row
+        return [result];
+    }
+
+    /**
      * Compact the database (merge fragments, remove deleted rows)
      */
     async compact() {
@@ -1057,12 +4271,401 @@ class LocalDatabase {
     }
 
     /**
+     * Streaming scan - yields batches of rows for memory-efficient processing
+     * @param {string} tableName - Table name
+     * @param {Object} options - Scan options {batchSize, where, columns}
+     * @yields {Object[]} Batch of rows
+     *
+     * @example
+     * for await (const batch of db.scan('users', { batchSize: 1000, where: r => r.age > 18 })) {
+     *   processBatch(batch);
+     * }
+     */
+    async *scan(tableName, options = {}) {
+        if (!this.tables.has(tableName)) {
+            throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        const table = this.tables.get(tableName);
+        const deletedSet = new Set(table.deletionVector);
+        const batchSize = options.batchSize || 10000;
+        const whereFn = options.where || (() => true);
+        const columns = options.columns;
+
+        let batch = [];
+
+        for (const fragKey of table.fragments) {
+            const fragData = await this.storage.load(fragKey);
+            if (!fragData) continue;
+
+            const rows = this._parseFragment(fragData, table.schema);
+
+            for (const row of rows) {
+                if (deletedSet.has(row.__rowId)) continue;
+                if (!whereFn(row)) continue;
+
+                // Project columns if specified
+                let projectedRow;
+                if (columns && columns.length > 0 && columns[0] !== '*') {
+                    projectedRow = {};
+                    for (const col of columns) {
+                        projectedRow[col] = row[col];
+                    }
+                } else {
+                    const { __rowId, ...rest } = row;
+                    projectedRow = rest;
+                }
+
+                batch.push(projectedRow);
+
+                if (batch.length >= batchSize) {
+                    yield batch;
+                    batch = [];
+                }
+            }
+        }
+
+        // Yield remaining rows
+        if (batch.length > 0) {
+            yield batch;
+        }
+    }
+
+    /**
+     * Count rows in a table (efficient - doesn't load data)
+     * @param {string} tableName - Table name
+     * @param {Function} [where] - Optional filter function
+     * @returns {Promise<number>}
+     */
+    async count(tableName, where = null) {
+        if (!this.tables.has(tableName)) {
+            throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        const table = this.tables.get(tableName);
+
+        // Fast path: if no filter and no deletions, return cached count
+        if (!where && table.deletionVector.length === 0) {
+            return table.rowCount;
+        }
+
+        // Otherwise count with filter/deletions
+        let count = 0;
+        for await (const batch of this.scan(tableName, { where })) {
+            count += batch.length;
+        }
+        return count;
+    }
+
+    /**
+     * Get table schema
+     * @param {string} tableName - Table name
+     * @returns {Array} Column schema
+     */
+    getSchema(tableName) {
+        const table = this.tables.get(tableName);
+        if (!table) {
+            throw new Error(`Table '${tableName}' does not exist`);
+        }
+        return table.schema;
+    }
+
+    /**
      * Close the database
      */
     async close() {
         await this._saveManifest();
     }
 }
+
+// =============================================================================
+// Unified LanceData API - Single interface for local and remote Lance files
+// =============================================================================
+
+/**
+ * Base class for unified Lance data access.
+ * Provides common interface for both local (OPFS) and remote (HTTP) Lance files.
+ */
+class LanceDataBase {
+    constructor(type) {
+        this.type = type; // 'local' | 'remote' | 'cached'
+    }
+
+    // Abstract methods - must be implemented by subclasses
+    async getSchema() { throw new Error('Not implemented'); }
+    async getRowCount() { throw new Error('Not implemented'); }
+    async readColumn(colIdx, start = 0, count = null) { throw new Error('Not implemented'); }
+    async *scan(options = {}) { throw new Error('Not implemented'); }
+
+    // Optional methods
+    async insert(rows) { throw new Error('Write not supported for this source'); }
+    isCached() { return false; }
+    async prefetch() { }
+    async evict() { }
+    async close() { }
+}
+
+/**
+ * OPFS-backed Lance data for local files.
+ * Uses ChunkedLanceReader for efficient memory usage.
+ */
+class OPFSLanceData extends LanceDataBase {
+    constructor(path, storage = opfsStorage) {
+        super('local');
+        this.path = path;
+        this.storage = storage;
+        this.reader = null;
+        this.database = null;
+        this._isDatabase = false;
+    }
+
+    /**
+     * Open OPFS Lance file or database
+     */
+    async open() {
+        // Check if it's a database (directory with manifest)
+        const manifestPath = `${this.path}/__manifest__`;
+        if (await this.storage.exists(manifestPath)) {
+            this._isDatabase = true;
+            this.database = new LocalDatabase(this.path, this.storage);
+            await this.database.open();
+        } else {
+            // Single Lance file
+            this.reader = await ChunkedLanceReader.open(this.storage, this.path);
+        }
+        return this;
+    }
+
+    async getSchema() {
+        if (this._isDatabase) {
+            const tables = this.database.listTables();
+            if (tables.length === 0) return [];
+            return this.database.getSchema(tables[0]);
+        }
+        // For single file, return column count (no schema info in simple Lance files)
+        return Array.from({ length: this.reader.getNumColumns() }, (_, i) => ({
+            name: `col_${i}`,
+            type: 'unknown'
+        }));
+    }
+
+    async getRowCount() {
+        if (this._isDatabase) {
+            const tables = this.database.listTables();
+            if (tables.length === 0) return 0;
+            return this.database.count(tables[0]);
+        }
+        // Read first column metadata for row count
+        const meta = await this.reader.readColumnMetaRaw(0);
+        // Parse row count from protobuf (simplified)
+        return 0; // Would need protobuf decoder
+    }
+
+    async readColumn(colIdx, start = 0, count = null) {
+        if (this._isDatabase) {
+            throw new Error('Use select() for database queries');
+        }
+        return this.reader.readColumnMetaRaw(colIdx);
+    }
+
+    async *scan(options = {}) {
+        if (this._isDatabase) {
+            const tables = this.database.listTables();
+            if (tables.length === 0) return;
+            yield* this.database.scan(tables[0], options);
+        } else {
+            throw new Error('scan() requires database, use readColumn() for single files');
+        }
+    }
+
+    async insert(rows) {
+        if (!this._isDatabase) {
+            throw new Error('insert() requires database');
+        }
+        const tables = this.database.listTables();
+        if (tables.length === 0) {
+            throw new Error('No tables in database');
+        }
+        return this.database.insert(tables[0], rows);
+    }
+
+    isCached() {
+        return true; // OPFS is always local
+    }
+
+    async close() {
+        if (this.reader) {
+            this.reader.close();
+        }
+        if (this.database) {
+            await this.database.close();
+        }
+    }
+}
+
+/**
+ * HTTP-backed Lance data for remote files.
+ * Uses HotTierCache for OPFS caching.
+ */
+class RemoteLanceData extends LanceDataBase {
+    constructor(url) {
+        super('remote');
+        this.url = url;
+        this.remoteFile = null;
+        this.cachedPath = null;
+    }
+
+    async open() {
+        // Check if already cached
+        const cacheInfo = await hotTierCache.getCacheInfo(this.url);
+        if (cacheInfo && cacheInfo.complete) {
+            this.type = 'cached';
+            this.cachedPath = cacheInfo.path;
+        }
+
+        // Open remote file (will use HTTP Range requests)
+        // This assumes RemoteLanceFile exists in the codebase
+        if (typeof RemoteLanceFile !== 'undefined') {
+            this.remoteFile = await RemoteLanceFile.open(null, this.url);
+        }
+
+        return this;
+    }
+
+    async getSchema() {
+        if (!this.remoteFile) {
+            return [];
+        }
+        // Get column types
+        const numCols = this.remoteFile.numColumns;
+        const schema = [];
+        for (let i = 0; i < numCols; i++) {
+            const type = await this.remoteFile.getColumnType(i);
+            schema.push({ name: `col_${i}`, type });
+        }
+        return schema;
+    }
+
+    async getRowCount() {
+        if (!this.remoteFile) return 0;
+        return this.remoteFile.getRowCount();
+    }
+
+    async readColumn(colIdx, start = 0, count = null) {
+        if (!this.remoteFile) {
+            throw new Error('Remote file not opened');
+        }
+        // Use remote file's column reading
+        const type = await this.remoteFile.getColumnType(colIdx);
+        if (type.includes('int64')) {
+            return this.remoteFile.readInt64Column(colIdx, count);
+        } else if (type.includes('float64')) {
+            return this.remoteFile.readFloat64Column(colIdx, count);
+        } else if (type.includes('string')) {
+            return this.remoteFile.readStrings(colIdx, count);
+        }
+        throw new Error(`Unsupported column type: ${type}`);
+    }
+
+    async *scan(options = {}) {
+        // For remote files, read in batches
+        const batchSize = options.batchSize || 10000;
+        const rowCount = await this.getRowCount();
+        const schema = await this.getSchema();
+
+        for (let offset = 0; offset < rowCount; offset += batchSize) {
+            const count = Math.min(batchSize, rowCount - offset);
+            const batch = [];
+
+            // Read each column for this batch
+            const columns = {};
+            for (let i = 0; i < schema.length; i++) {
+                columns[schema[i].name] = await this.readColumn(i, offset, count);
+            }
+
+            // Build rows
+            for (let r = 0; r < count; r++) {
+                const row = {};
+                for (const name of Object.keys(columns)) {
+                    row[name] = columns[name][r];
+                }
+                if (!options.where || options.where(row)) {
+                    batch.push(row);
+                }
+            }
+
+            yield batch;
+        }
+    }
+
+    isCached() {
+        return this.type === 'cached';
+    }
+
+    async prefetch() {
+        // Cache entire file to OPFS
+        await hotTierCache.cache(this.url);
+        const cacheInfo = await hotTierCache.getCacheInfo(this.url);
+        if (cacheInfo && cacheInfo.complete) {
+            this.type = 'cached';
+            this.cachedPath = cacheInfo.path;
+        }
+    }
+
+    async evict() {
+        await hotTierCache.evict(this.url);
+        this.type = 'remote';
+        this.cachedPath = null;
+    }
+
+    async close() {
+        if (this.remoteFile) {
+            this.remoteFile.close();
+        }
+    }
+}
+
+/**
+ * Factory function to open Lance data from any source.
+ * Supports:
+ * - opfs://path - Local OPFS file or database
+ * - https://url - Remote HTTP file (with optional caching)
+ *
+ * @param {string} source - Data source URI
+ * @returns {Promise<LanceDataBase>}
+ *
+ * @example
+ * // Local OPFS database
+ * const local = await openLance('opfs://mydb');
+ * for await (const batch of local.scan()) {
+ *   processBatch(batch);
+ * }
+ *
+ * // Remote file with caching
+ * const remote = await openLance('https://example.com/data.lance');
+ * await remote.prefetch(); // Cache to OPFS
+ * const data = await remote.readColumn(0);
+ */
+async function openLance(source) {
+    if (source.startsWith('opfs://')) {
+        const path = source.slice(7);
+        const data = new OPFSLanceData(path);
+        await data.open();
+        return data;
+    } else if (source.startsWith('http://') || source.startsWith('https://')) {
+        const data = new RemoteLanceData(source);
+        await data.open();
+        return data;
+    } else {
+        // Assume OPFS path without prefix
+        const data = new OPFSLanceData(source);
+        await data.open();
+        return data;
+    }
+}
+
+// Export unified API
+
 
 /**
  * SQL Parser for LocalDatabase (supports CREATE, INSERT, UPDATE, DELETE, SELECT)
@@ -1404,6 +5007,201 @@ const readStr = (ptr, len) => D.decode(new Uint8Array(_m.buffer, ptr, len));
 // Read bytes from WASM memory (returns copy)
 const readBytes = (ptr, len) => new Uint8Array(_m.buffer, ptr, len).slice();
 
+/**
+ * LanceFileWriter - Thin JS wrapper for WASM fragment writer
+ *
+ * Uses high-level WASM API: fragmentBegin -> fragmentAdd*Column -> fragmentEnd
+ * All encoding logic is in WASM, JS only marshals data.
+ */
+class LanceFileWriter {
+    constructor(schema) {
+        this.schema = schema;  // [{name, type, nullable?, vectorDim?}]
+        this.columns = new Map();  // columnName -> values[]
+        this.rowCount = 0;
+    }
+
+    addRows(rows) {
+        for (const row of rows) {
+            for (const col of this.schema) {
+                if (!this.columns.has(col.name)) {
+                    this.columns.set(col.name, []);
+                }
+                this.columns.get(col.name).push(row[col.name] ?? null);
+            }
+            this.rowCount++;
+        }
+    }
+
+    build() {
+        if (!_w?.fragmentBegin) {
+            return this._buildJson();
+        }
+
+        // Estimate buffer size
+        const estimatedSize = Math.max(64 * 1024, this.rowCount * 1024);
+        if (!_w.fragmentBegin(estimatedSize)) {
+            throw new Error('Failed to initialize WASM fragment writer');
+        }
+
+        // Add each column using high-level WASM API
+        for (const col of this.schema) {
+            const values = this.columns.get(col.name) || [];
+            this._addColumn(col, values);
+        }
+
+        // Finalize - WASM writes metadata, offsets table, and footer
+        const finalSize = _w.fragmentEnd();
+        if (finalSize === 0) {
+            throw new Error('Failed to finalize fragment');
+        }
+
+        const bufferPtr = _w.writerGetBuffer();
+        if (!bufferPtr) {
+            throw new Error('Failed to get writer buffer');
+        }
+
+        return new Uint8Array(_m.buffer, bufferPtr, finalSize).slice();
+    }
+
+    _addColumn(col, values) {
+        const type = (col.type || col.dataType || 'string').toLowerCase();
+        const nullable = col.nullable !== false;
+
+        // Allocate name in WASM memory
+        const nameBytes = E.encode(col.name);
+        const namePtr = _w.alloc(nameBytes.length);
+        new Uint8Array(_m.buffer, namePtr, nameBytes.length).set(nameBytes);
+
+        let result = 0;
+
+        switch (type) {
+            case 'int64':
+            case 'int':
+            case 'integer':
+            case 'bigint': {
+                const arr = new BigInt64Array(values.map(v => BigInt(v ?? 0)));
+                const ptr = _w.alloc(arr.byteLength);
+                new BigInt64Array(_m.buffer, ptr, values.length).set(arr);
+                result = _w.fragmentAddInt64Column(namePtr, nameBytes.length, ptr, values.length, nullable);
+                _w.free(ptr, arr.byteLength);
+                break;
+            }
+
+            case 'int32': {
+                const arr = new Int32Array(values.map(v => v ?? 0));
+                const ptr = _w.alloc(arr.byteLength);
+                new Int32Array(_m.buffer, ptr, values.length).set(arr);
+                result = _w.fragmentAddInt32Column(namePtr, nameBytes.length, ptr, values.length, nullable);
+                _w.free(ptr, arr.byteLength);
+                break;
+            }
+
+            case 'float64':
+            case 'float':
+            case 'double': {
+                const arr = new Float64Array(values.map(v => v ?? 0.0));
+                const ptr = _w.alloc(arr.byteLength);
+                new Float64Array(_m.buffer, ptr, values.length).set(arr);
+                result = _w.fragmentAddFloat64Column(namePtr, nameBytes.length, ptr, values.length, nullable);
+                _w.free(ptr, arr.byteLength);
+                break;
+            }
+
+            case 'float32': {
+                const arr = new Float32Array(values.map(v => v ?? 0.0));
+                const ptr = _w.alloc(arr.byteLength);
+                new Float32Array(_m.buffer, ptr, values.length).set(arr);
+                result = _w.fragmentAddFloat32Column(namePtr, nameBytes.length, ptr, values.length, nullable);
+                _w.free(ptr, arr.byteLength);
+                break;
+            }
+
+            case 'string':
+            case 'text':
+            case 'varchar': {
+                // Build string data and offsets
+                let currentOffset = 0;
+                const offsets = new Uint32Array(values.length + 1);
+                const allBytes = [];
+
+                for (let i = 0; i < values.length; i++) {
+                    offsets[i] = currentOffset;
+                    const bytes = E.encode(String(values[i] ?? ''));
+                    allBytes.push(...bytes);
+                    currentOffset += bytes.length;
+                }
+                offsets[values.length] = currentOffset;
+
+                const strData = new Uint8Array(allBytes);
+                const strPtr = _w.alloc(strData.length);
+                new Uint8Array(_m.buffer, strPtr, strData.length).set(strData);
+
+                const offPtr = _w.alloc(offsets.byteLength);
+                new Uint32Array(_m.buffer, offPtr, offsets.length).set(offsets);
+
+                result = _w.fragmentAddStringColumn(namePtr, nameBytes.length, strPtr, strData.length, offPtr, values.length, nullable);
+
+                _w.free(strPtr, strData.length);
+                _w.free(offPtr, offsets.byteLength);
+                break;
+            }
+
+            case 'bool':
+            case 'boolean': {
+                const byteCount = Math.ceil(values.length / 8);
+                const packed = new Uint8Array(byteCount);
+                for (let i = 0; i < values.length; i++) {
+                    if (values[i]) packed[Math.floor(i / 8)] |= (1 << (i % 8));
+                }
+                const ptr = _w.alloc(packed.length);
+                new Uint8Array(_m.buffer, ptr, packed.length).set(packed);
+                result = _w.fragmentAddBoolColumn(namePtr, nameBytes.length, ptr, packed.length, values.length, nullable);
+                _w.free(ptr, packed.length);
+                break;
+            }
+
+            case 'vector': {
+                const dim = col.vectorDim || (values[0]?.length || 0);
+                const allFloats = [];
+                for (const v of values) {
+                    if (Array.isArray(v)) {
+                        allFloats.push(...v);
+                    } else {
+                        for (let i = 0; i < dim; i++) allFloats.push(0);
+                    }
+                }
+                const arr = new Float32Array(allFloats);
+                const ptr = _w.alloc(arr.byteLength);
+                new Float32Array(_m.buffer, ptr, allFloats.length).set(arr);
+                result = _w.fragmentAddVectorColumn(namePtr, nameBytes.length, ptr, allFloats.length, dim, nullable);
+                _w.free(ptr, arr.byteLength);
+                break;
+            }
+
+            default:
+                // Fallback to string
+                _w.free(namePtr, nameBytes.length);
+                return this._addColumn({ ...col, type: 'string' }, values);
+        }
+
+        _w.free(namePtr, nameBytes.length);
+
+        if (!result) {
+            throw new Error(`Failed to add column '${col.name}'`);
+        }
+    }
+
+    _buildJson() {
+        const data = {
+            schema: this.schema,
+            columns: Object.fromEntries(this.columns),
+            rowCount: this.rowCount,
+            format: 'json'
+        };
+        return E.encode(JSON.stringify(data));
+    }
+}
+
 // WASM utils exported for advanced usage
 const wasmUtils = {
     readStr,
@@ -1443,6 +5241,8 @@ const _createLanceqlMethods = (proxy) => ({
      * @returns {Promise<RemoteLanceFile>}
      */
     async openUrl(url) {
+        // Ensure WebGPU is initialized for vector search
+        await webgpuAccelerator.init();
         return await RemoteLanceFile.open(proxy, url);
     },
 
@@ -1454,6 +5254,8 @@ const _createLanceqlMethods = (proxy) => ({
      * @returns {Promise<RemoteLanceDataset>}
      */
     async openDataset(baseUrl, options = {}) {
+        // Ensure WebGPU is initialized for vector search
+        await webgpuAccelerator.init();
         return await RemoteLanceDataset.open(proxy, baseUrl, options);
     },
 
@@ -2428,40 +6230,156 @@ class LanceFile {
     }
 
     /**
-     * Find top-k most similar vectors to query.
-     * @param {number} colIdx - Column index with vectors
+     * Batch cosine similarity using WASM SIMD.
+     * Much faster than calling cosineSimilarity in a loop.
      * @param {Float32Array} queryVec - Query vector
-     * @param {number} topK - Number of results to return
-     * @returns {{indices: Uint32Array, scores: Float32Array}}
+     * @param {Float32Array[]} vectors - Array of vectors to compare
+     * @param {boolean} normalized - Whether vectors are L2-normalized
+     * @returns {Float32Array} - Similarity scores
      */
-    vectorSearch(colIdx, queryVec, topK = 10) {
-        const queryPtr = this.wasm.allocFloat32Buffer(queryVec.length);
-        const indicesPtr = this.wasm.allocIndexBuffer(topK);
-        const scoresPtr = this.wasm.allocFloat32Buffer(topK);
+    batchCosineSimilarity(queryVec, vectors, normalized = true) {
+        if (vectors.length === 0) return new Float32Array(0);
 
-        if (!queryPtr || !indicesPtr || !scoresPtr) {
-            throw new Error('Failed to allocate buffers');
+        const dim = queryVec.length;
+        const numVectors = vectors.length;
+
+        // Allocate WASM buffers
+        const queryPtr = this.wasm.allocFloat32Buffer(dim);
+        const vectorsPtr = this.wasm.allocFloat32Buffer(numVectors * dim);
+        const scoresPtr = this.wasm.allocFloat32Buffer(numVectors);
+
+        if (!queryPtr || !vectorsPtr || !scoresPtr) {
+            throw new Error('Failed to allocate WASM buffers');
         }
 
         try {
-            new Float32Array(this.memory.buffer, queryPtr, queryVec.length).set(queryVec);
+            // Copy query vector
+            new Float32Array(this.memory.buffer, queryPtr, dim).set(queryVec);
 
-            const count = this.wasm.vectorSearchTopK(
-                colIdx, queryPtr, queryVec.length, topK, indicesPtr, scoresPtr
-            );
+            // Copy all vectors (flattened)
+            const flatVectors = new Float32Array(this.memory.buffer, vectorsPtr, numVectors * dim);
+            for (let i = 0; i < numVectors; i++) {
+                flatVectors.set(vectors[i], i * dim);
+            }
 
-            const indices = new Uint32Array(count);
-            const scores = new Float32Array(count);
+            // Call WASM batch similarity
+            this.wasm.batchCosineSimilarity(queryPtr, vectorsPtr, dim, numVectors, scoresPtr, normalized ? 1 : 0);
 
-            indices.set(new Uint32Array(this.memory.buffer, indicesPtr, count));
-            scores.set(new Float32Array(this.memory.buffer, scoresPtr, count));
-
-            return { indices, scores };
+            // Copy results
+            const scores = new Float32Array(numVectors);
+            scores.set(new Float32Array(this.memory.buffer, scoresPtr, numVectors));
+            return scores;
         } finally {
-            this.wasm.free(queryPtr, queryVec.length * 4);
-            this.wasm.free(indicesPtr, topK * 4);
-            this.wasm.free(scoresPtr, topK * 4);
+            this.wasm.free(queryPtr, dim * 4);
+            this.wasm.free(vectorsPtr, numVectors * dim * 4);
+            this.wasm.free(scoresPtr, numVectors * 4);
         }
+    }
+
+    /**
+     * Read all vectors from a column as array of Float32Arrays.
+     * @param {number} colIdx - Column index
+     * @returns {Float32Array[]} Array of vectors
+     */
+    readAllVectors(colIdx) {
+        const info = this.getVectorInfo(colIdx);
+        if (info.dimension === 0 || info.rows === 0) return [];
+
+        const dim = info.dimension;
+        const numRows = info.rows;
+        const vectors = [];
+
+        // Allocate buffer for all vectors at once
+        const bufPtr = this.wasm.allocFloat32Buffer(numRows * dim);
+        if (!bufPtr) throw new Error('Failed to allocate vector buffer');
+
+        try {
+            // Read all vectors in one WASM call (if supported)
+            // Otherwise fall back to individual reads
+            if (this.wasm.readVectorColumn) {
+                const count = this.wasm.readVectorColumn(colIdx, bufPtr, numRows * dim);
+                const allData = new Float32Array(this.memory.buffer, bufPtr, count);
+
+                for (let i = 0; i < numRows && i * dim < count; i++) {
+                    const vec = new Float32Array(dim);
+                    vec.set(allData.subarray(i * dim, (i + 1) * dim));
+                    vectors.push(vec);
+                }
+            } else {
+                // Fall back to individual reads
+                for (let i = 0; i < numRows; i++) {
+                    vectors.push(this.readVectorAt(colIdx, i));
+                }
+            }
+
+            return vectors;
+        } finally {
+            this.wasm.free(bufPtr, numRows * dim * 4);
+        }
+    }
+
+    /**
+     * Find top-k most similar vectors to query.
+     * Uses WebGPU if available, otherwise falls back to WASM SIMD.
+     * @param {number} colIdx - Column index with vectors
+     * @param {Float32Array} queryVec - Query vector
+     * @param {number} topK - Number of results to return
+     * @param {Function} onProgress - Progress callback (current, total)
+     * @returns {Promise<{indices: Uint32Array, scores: Float32Array}>}
+     */
+    async vectorSearch(colIdx, queryVec, topK = 10, onProgress = null) {
+        const dim = queryVec.length;
+        const info = this.getVectorInfo(colIdx);
+        const numRows = info.rows;
+
+        // Try WebGPU-accelerated path first
+        if (webgpuAccelerator.isAvailable()) {
+            if (onProgress) onProgress(0, numRows);
+
+            // Read all vectors (bulk read)
+            console.log(`[LanceFile.vectorSearch] Reading ${numRows} vectors...`);
+            const allVectors = this.readAllVectors(colIdx);
+
+            if (onProgress) onProgress(numRows, numRows);
+
+            console.log(`[LanceFile.vectorSearch] Computing similarity for ${allVectors.length} vectors via WebGPU`);
+
+            // Batch compute with WebGPU
+            const scores = await webgpuAccelerator.batchCosineSimilarity(queryVec, allVectors, true);
+
+            // Find top-k
+            const indexedScores = Array.from(scores).map((score, idx) => ({ idx, score }));
+            indexedScores.sort((a, b) => b.score - a.score);
+
+            const topResults = indexedScores.slice(0, topK);
+            const indices = new Uint32Array(topResults.map(r => r.idx));
+            const topScores = new Float32Array(topResults.map(r => r.score));
+
+            return { indices, scores: topScores };
+        }
+
+        // Fall back to WASM SIMD (uses batchCosineSimilarity internally)
+        console.log(`[LanceFile.vectorSearch] Using WASM SIMD`);
+
+        if (onProgress) onProgress(0, numRows);
+
+        // Read all vectors first
+        const allVectors = this.readAllVectors(colIdx);
+
+        if (onProgress) onProgress(numRows, numRows);
+
+        // Use WASM batch cosine similarity
+        const scores = this.lanceql.batchCosineSimilarity(queryVec, allVectors, true);
+
+        // Find top-k
+        const indexedScores = Array.from(scores).map((score, idx) => ({ idx, score }));
+        indexedScores.sort((a, b) => b.score - a.score);
+
+        const topResults = indexedScores.slice(0, topK);
+        const indices = new Uint32Array(topResults.map(r => r.idx));
+        const topScores = new Float32Array(topResults.map(r => r.score));
+
+        return { indices, scores: topScores };
     }
 
     // ========================================================================
@@ -2483,51 +6401,59 @@ class LanceFile {
 class DataFrame {
     constructor(file) {
         this.file = file;
-        this._filterOps = [];  // Array of {colIdx, op, value, type}
+        this._filterOps = [];  // Array of {colIdx, op, value, type, opStr}
         this._selectCols = null;
         this._limitValue = null;
+        this._isRemote = file._isRemote || file.baseUrl !== undefined;
     }
 
     /**
      * Filter rows where column matches condition.
+     * Immer-style: returns new DataFrame, original unchanged.
      * @param {number} colIdx - Column index
      * @param {string} op - Operator: '=', '!=', '<', '<=', '>', '>='
-     * @param {number|bigint} value - Value to compare
-     * @param {string} type - 'int64' or 'float64'
+     * @param {number|bigint|string} value - Value to compare
+     * @param {string} type - 'int64', 'float64', or 'string'
      * @returns {DataFrame}
      */
     filter(colIdx, op, value, type = 'int64') {
         const opMap = {
-            '=': LanceFile.Op.EQ, '==': LanceFile.Op.EQ,
-            '!=': LanceFile.Op.NE, '<>': LanceFile.Op.NE,
-            '<': LanceFile.Op.LT,
-            '<=': LanceFile.Op.LE,
-            '>': LanceFile.Op.GT,
-            '>=': LanceFile.Op.GE
+            '=': LanceFile.Op?.EQ ?? 0, '==': LanceFile.Op?.EQ ?? 0,
+            '!=': LanceFile.Op?.NE ?? 1, '<>': LanceFile.Op?.NE ?? 1,
+            '<': LanceFile.Op?.LT ?? 2,
+            '<=': LanceFile.Op?.LE ?? 3,
+            '>': LanceFile.Op?.GT ?? 4,
+            '>=': LanceFile.Op?.GE ?? 5
         };
 
         const df = new DataFrame(this.file);
-        df._filterOps = [...this._filterOps, { colIdx, op: opMap[op], value, type }];
+        df._filterOps = [...this._filterOps, { colIdx, op: opMap[op], opStr: op, value, type }];
         df._selectCols = this._selectCols;
         df._limitValue = this._limitValue;
+        df._isRemote = this._isRemote;
         return df;
     }
 
     /**
      * Select specific columns.
+     * Immer-style: returns new DataFrame, original unchanged.
      * @param {...number} colIndices - Column indices to select
      * @returns {DataFrame}
      */
     select(...colIndices) {
+        // Handle array passed as first arg: select([0,1,2]) or select(0,1,2)
+        const cols = Array.isArray(colIndices[0]) ? colIndices[0] : colIndices;
         const df = new DataFrame(this.file);
         df._filterOps = [...this._filterOps];
-        df._selectCols = colIndices;
+        df._selectCols = cols;
         df._limitValue = this._limitValue;
+        df._isRemote = this._isRemote;
         return df;
     }
 
     /**
      * Limit number of results.
+     * Immer-style: returns new DataFrame, original unchanged.
      * @param {number} n - Maximum rows
      * @returns {DataFrame}
      */
@@ -2536,14 +6462,52 @@ class DataFrame {
         df._filterOps = [...this._filterOps];
         df._selectCols = this._selectCols;
         df._limitValue = n;
+        df._isRemote = this._isRemote;
         return df;
     }
 
     /**
-     * Execute the query and return row indices.
+     * Generate SQL from DataFrame operations.
+     * @returns {string}
+     */
+    toSQL() {
+        const colNames = this.file.columnNames || this.file._schema?.map(s => s.name) ||
+            Array.from({ length: this.file._numColumns || 6 }, (_, i) => `col_${i}`);
+
+        // SELECT clause
+        let selectClause;
+        if (this._selectCols && this._selectCols.length > 0) {
+            selectClause = this._selectCols.map(i => colNames[i] || `col_${i}`).join(', ');
+        } else {
+            selectClause = '*';
+        }
+
+        // WHERE clause
+        let whereClause = '';
+        if (this._filterOps.length > 0) {
+            const conditions = this._filterOps.map(f => {
+                const colName = colNames[f.colIdx] || `col_${f.colIdx}`;
+                const val = f.type === 'string' ? `'${f.value}'` : f.value;
+                return `${colName} ${f.opStr} ${val}`;
+            });
+            whereClause = ` WHERE ${conditions.join(' AND ')}`;
+        }
+
+        // LIMIT clause
+        const limitClause = this._limitValue ? ` LIMIT ${this._limitValue}` : '';
+
+        return `SELECT ${selectClause} FROM dataset${whereClause}${limitClause}`;
+    }
+
+    /**
+     * Execute the query and return row indices (sync, local only).
      * @returns {Uint32Array}
      */
     collectIndices() {
+        if (this._isRemote) {
+            throw new Error('collectIndices() is sync-only. Use collect() for remote datasets.');
+        }
+
         let indices = null;
 
         // Apply filters
@@ -2581,37 +6545,56 @@ class DataFrame {
     }
 
     /**
-     * Execute the query and return results as arrays.
-     * @returns {Object} Object with column data arrays
+     * Execute the query and return results.
+     * Works with both local (sync) and remote (async) datasets.
+     * @returns {Promise<{columns: Array[], columnNames: string[], total: number}>}
      */
-    collect() {
-        const indices = this.collectIndices();
-        const result = { _indices: indices };
+    async collect() {
+        // Remote: generate SQL and execute
+        if (this._isRemote) {
+            const sql = this.toSQL();
+            return await this.file.executeSQL(sql);
+        }
 
+        // Local: use sync WASM methods
+        const indices = this.collectIndices();
         const cols = this._selectCols ||
             Array.from({ length: this.file.numColumns }, (_, i) => i);
 
+        const columns = [];
+        const columnNames = [];
+
         for (const colIdx of cols) {
+            columnNames.push(this.file.columnNames?.[colIdx] || `col_${colIdx}`);
             // Try int64 first, then float64
             try {
-                result[`col${colIdx}`] = this.file.readInt64AtIndices(colIdx, indices);
+                columns.push(Array.from(this.file.readInt64AtIndices(colIdx, indices)));
             } catch {
                 try {
-                    result[`col${colIdx}`] = this.file.readFloat64AtIndices(colIdx, indices);
+                    columns.push(Array.from(this.file.readFloat64AtIndices(colIdx, indices)));
                 } catch {
-                    result[`col${colIdx}`] = null;
+                    columns.push(indices.map(() => null));
                 }
             }
         }
 
-        return result;
+        return {
+            columns,
+            columnNames,
+            total: indices.length,
+            _indices: indices
+        };
     }
 
     /**
      * Count matching rows.
-     * @returns {number}
+     * @returns {Promise<number>|number}
      */
-    count() {
+    async count() {
+        if (this._isRemote) {
+            const result = await this.collect();
+            return result.columns[0]?.length || 0;
+        }
         return this.collectIndices().length;
     }
 }
@@ -2916,6 +6899,7 @@ class RemoteLanceFile {
 
     /**
      * Fetch bytes from the remote file at a specific range.
+     * Uses HotTierCache for OPFS-backed caching (500-2000x faster on cache hit).
      * @param {number} start - Start offset
      * @param {number} end - End offset (inclusive)
      * @returns {Promise<ArrayBuffer>}
@@ -2928,6 +6912,19 @@ class RemoteLanceFile {
             console.error(`Invalid range: ${start}-${end}, file size: ${this.size}`);
         }
 
+        // Use hot-tier cache if available
+        if (hotTierCache.enabled) {
+            const data = await hotTierCache.getRange(this.url, start, end, this.size);
+
+            // Track stats if callback available
+            if (this._onFetch) {
+                this._onFetch(data.byteLength, 1);
+            }
+
+            return data;
+        }
+
+        // Fallback to direct fetch
         const response = await fetch(this.url, {
             headers: {
                 'Range': `bytes=${start}-${end}`
@@ -4276,6 +8273,7 @@ class RemoteLanceFile {
     /**
      * Search using proper row ID mappings from auxiliary.idx.
      * Groups row IDs by fragment and fetches vectors efficiently.
+     * Uses WebGPU (if available) or WASM SIMD for batch cosine similarity.
      * @private
      */
     async _searchWithRowIdMappings(colIdx, queryVec, topK, rowIdMappings, onProgress) {
@@ -4292,43 +8290,53 @@ class RemoteLanceFile {
 
         console.log(`[IVFSearch] Fetching from ${byFragment.size} fragments`);
 
-        const topResults = [];
+        // Collect all vectors and their indices first
+        const allVectors = [];
+        const allIndices = [];
         let processed = 0;
         const total = rowIdMappings.length;
 
-        // Process each fragment
+        // Fetch all vectors
         for (const [fragId, offsets] of byFragment) {
             if (onProgress) onProgress(processed, total);
 
-            // Fetch vectors for this fragment's offsets
             const vectors = await this.readVectorsAtIndices(colIdx, offsets);
 
             for (let i = 0; i < offsets.length; i++) {
                 const vec = vectors[i];
-                if (!vec || vec.length !== dim) continue;
-
-                // Compute cosine similarity
-                let dot = 0, normA = 0, normB = 0;
-                for (let k = 0; k < dim; k++) {
-                    dot += queryVec[k] * vec[k];
-                    normA += queryVec[k] * queryVec[k];
-                    normB += vec[k] * vec[k];
+                if (vec && vec.length === dim) {
+                    allVectors.push(vec);
+                    // Reconstruct global row index
+                    allIndices.push(fragId * 50000 + offsets[i]);
                 }
-                const denom = Math.sqrt(normA) * Math.sqrt(normB);
-                const score = denom === 0 ? 0 : dot / denom;
-
-                // Reconstruct global row index from fragment ID and offset
-                const globalIdx = fragId * 50000 + offsets[i]; // Assuming 50K rows per fragment
-
-                if (topResults.length < topK) {
-                    topResults.push({ idx: globalIdx, score });
-                    topResults.sort((a, b) => b.score - a.score);
-                } else if (score > topResults[topK - 1].score) {
-                    topResults[topK - 1] = { idx: globalIdx, score };
-                    topResults.sort((a, b) => b.score - a.score);
-                }
-
                 processed++;
+            }
+        }
+
+        // Try WebGPU first, fallback to WASM SIMD
+        let scores;
+        if (webgpuAccelerator.isAvailable()) {
+            console.log(`[IVFSearch] Computing similarity for ${allVectors.length} vectors via WebGPU`);
+            scores = await webgpuAccelerator.batchCosineSimilarity(queryVec, allVectors, true);
+        }
+
+        if (!scores) {
+            console.log(`[IVFSearch] Computing similarity for ${allVectors.length} vectors via WASM SIMD`);
+            scores = this.lanceql.batchCosineSimilarity(queryVec, allVectors, true);
+        }
+
+        // Find top-k
+        const topResults = [];
+        for (let i = 0; i < scores.length; i++) {
+            const score = scores[i];
+            const idx = allIndices[i];
+
+            if (topResults.length < topK) {
+                topResults.push({ idx, score });
+                topResults.sort((a, b) => b.score - a.score);
+            } else if (score > topResults[topK - 1].score) {
+                topResults[topK - 1] = { idx, score };
+                topResults.sort((a, b) => b.score - a.score);
             }
         }
 
@@ -4338,7 +8346,7 @@ class RemoteLanceFile {
             indices: topResults.map(r => r.idx),
             scores: topResults.map(r => r.score),
             usedIndex: true,
-            searchedRows: total
+            searchedRows: allVectors.length
         };
     }
 
@@ -4409,6 +8417,100 @@ class RemoteLanceFile {
 
         return result;
     }
+
+    /**
+     * Read rows from this Lance file with pagination.
+     * @param {Object} options - Query options
+     * @param {number} options.offset - Starting row offset
+     * @param {number} options.limit - Maximum rows to return
+     * @param {number[]} options.columns - Column indices to read (optional, null = all)
+     * @returns {Promise<{columns: Array[], columnNames: string[], total: number}>}
+     */
+    async readRows({ offset = 0, limit = 50, columns = null } = {}) {
+        // Determine column indices to read
+        const colIndices = columns || Array.from({ length: this._numColumns }, (_, i) => i);
+
+        // Get total row count from first column
+        const totalRows = await this.getRowCount(0);
+
+        // Clamp offset and limit
+        const actualOffset = Math.min(offset, totalRows);
+        const actualLimit = Math.min(limit, totalRows - actualOffset);
+
+        if (actualLimit <= 0) {
+            return {
+                columns: colIndices.map(() => []),
+                columnNames: this.columnNames.slice(0, colIndices.length),
+                total: totalRows
+            };
+        }
+
+        // Generate indices for the requested rows
+        const indices = Array.from({ length: actualLimit }, (_, i) => actualOffset + i);
+
+        // Detect all column types first
+        const columnTypes = await this.detectColumnTypes();
+
+        // Read each column in parallel
+        const columnPromises = colIndices.map(async (colIdx) => {
+            const type = columnTypes[colIdx] || 'unknown';
+
+            try {
+                switch (type) {
+                    case 'string':
+                    case 'utf8':
+                    case 'large_utf8':
+                        return await this.readStringsAtIndices(colIdx, indices);
+
+                    case 'int64':
+                        return Array.from(await this.readInt64AtIndices(colIdx, indices));
+
+                    case 'int32':
+                        return Array.from(await this.readInt32AtIndices(colIdx, indices));
+
+                    case 'int16':
+                        return Array.from(await this.readInt16AtIndices(colIdx, indices));
+
+                    case 'uint8':
+                        return Array.from(await this.readUint8AtIndices(colIdx, indices));
+
+                    case 'float64':
+                    case 'double':
+                        return Array.from(await this.readFloat64AtIndices(colIdx, indices));
+
+                    case 'float32':
+                    case 'float':
+                        return Array.from(await this.readFloat32AtIndices(colIdx, indices));
+
+                    case 'bool':
+                    case 'boolean':
+                        return await this.readBoolAtIndices(colIdx, indices);
+
+                    case 'fixed_size_list':
+                    case 'vector':
+                        // For vectors, return as nested arrays
+                        const vectors = await this.readVectorsAtIndices(colIdx, indices);
+                        return Array.isArray(vectors) ? vectors : Array.from(vectors);
+
+                    default:
+                        // Try as string for unknown types
+                        console.warn(`[LanceQL] Unknown column type: ${type}, trying as string`);
+                        return await this.readStringsAtIndices(colIdx, indices);
+                }
+            } catch (e) {
+                console.warn(`[LanceQL] Error reading column ${colIdx} (${type}):`, e.message);
+                return indices.map(() => null);
+            }
+        });
+
+        const columnsData = await Promise.all(columnPromises);
+
+        return {
+            columns: columnsData,
+            columnNames: colIndices.map(i => this.columnNames[i] || `column_${i}`),
+            total: totalRows
+        };
+    }
 }
 
 // ============================================================================
@@ -4433,6 +8535,10 @@ class IVFIndex {
         this.partitionIndexUrl = null;  // URL to ivf_partitions.bin
         this.partitionStarts = null;    // Uint32Array[257] - cumulative row counts
         this.hasPartitionIndex = false; // Whether partition index is loaded
+
+        // Prefetched row IDs cache - avoids HTTP requests during search
+        this._rowIdCache = null;  // Map<partitionIdx, Array<{fragId, rowOffset}>>
+        this._rowIdCacheReady = false;
     }
 
     /**
@@ -4507,6 +8613,13 @@ class IVFIndex {
                 console.warn('[IVFIndex] Failed to load partition index:', e);
             }
 
+            // Prefetch all row IDs for fast search (no HTTP during search)
+            try {
+                await index.prefetchAllRowIds();
+            } catch (e) {
+                console.warn('[IVFIndex] Failed to prefetch row IDs:', e);
+            }
+
             return index;
         } catch (e) {
             console.warn('[IVFIndex] Failed to load:', e);
@@ -4545,6 +8658,7 @@ class IVFIndex {
 
     /**
      * Fetch partition data (row IDs and vectors) directly from ivf_vectors.bin.
+     * Uses OPFS cache for instant subsequent searches.
      * Each partition contains: [row_count: uint32][row_ids: uint32 × n][vectors: float32 × n × dim]
      * @param {number[]} partitionIndices - Partition indices to fetch
      * @param {number} dim - Vector dimension (default 384)
@@ -4561,19 +8675,45 @@ class IVFIndex {
         let totalBytesToFetch = 0;
         let bytesLoaded = 0;
 
-        // Calculate total bytes for progress reporting
+        // Separate cached vs uncached partitions
+        const uncachedPartitions = [];
+        const cachedResults = new Map();
+
         for (const p of partitionIndices) {
-            const startOffset = this.partitionOffsets[p];
-            const endOffset = this.partitionOffsets[p + 1];
-            totalBytesToFetch += endOffset - startOffset;
+            // Check in-memory cache first
+            if (this._partitionCache?.has(p)) {
+                cachedResults.set(p, this._partitionCache.get(p));
+            } else {
+                uncachedPartitions.push(p);
+                const startOffset = this.partitionOffsets[p];
+                const endOffset = this.partitionOffsets[p + 1];
+                totalBytesToFetch += endOffset - startOffset;
+            }
         }
 
-        console.log(`[IVFIndex] Fetching ${partitionIndices.length} partitions, ${(totalBytesToFetch / 1024 / 1024).toFixed(1)} MB total`);
+        if (uncachedPartitions.length === 0) {
+            console.log(`[IVFIndex] All ${partitionIndices.length} partitions from cache`);
+            // All from cache
+            for (const p of partitionIndices) {
+                const result = cachedResults.get(p);
+                allRowIds.push(...result.rowIds);
+                allVectors.push(...result.vectors);
+            }
+            if (onProgress) onProgress(100, 100);
+            return { rowIds: allRowIds, vectors: allVectors };
+        }
 
-        // Fetch partitions in parallel (max 4 concurrent)
-        const PARALLEL_LIMIT = 4;
-        for (let i = 0; i < partitionIndices.length; i += PARALLEL_LIMIT) {
-            const batch = partitionIndices.slice(i, i + PARALLEL_LIMIT);
+        console.log(`[IVFIndex] Fetching ${uncachedPartitions.length}/${partitionIndices.length} partitions, ${(totalBytesToFetch / 1024 / 1024).toFixed(1)} MB`);
+
+        // Initialize partition cache if needed
+        if (!this._partitionCache) {
+            this._partitionCache = new Map();
+        }
+
+        // Fetch uncached partitions in parallel (max 6 concurrent for speed)
+        const PARALLEL_LIMIT = 6;
+        for (let i = 0; i < uncachedPartitions.length; i += PARALLEL_LIMIT) {
+            const batch = uncachedPartitions.slice(i, i + PARALLEL_LIMIT);
 
             const results = await Promise.all(batch.map(async (p) => {
                 const startOffset = this.partitionOffsets[p];
@@ -4586,7 +8726,7 @@ class IVFIndex {
                     });
                     if (!resp.ok) {
                         console.warn(`[IVFIndex] Partition ${p} fetch failed: ${resp.status}`);
-                        return { rowIds: [], vectors: [] };
+                        return { p, rowIds: [], vectors: [] };
                     }
 
                     const data = await resp.arrayBuffer();
@@ -4610,15 +8750,26 @@ class IVFIndex {
                     bytesLoaded += byteSize;
                     if (onProgress) onProgress(bytesLoaded, totalBytesToFetch);
 
-                    return { rowIds: Array.from(rowIds), vectors };
+                    return { p, rowIds: Array.from(rowIds), vectors };
                 } catch (e) {
                     console.warn(`[IVFIndex] Error fetching partition ${p}:`, e);
-                    return { rowIds: [], vectors: [] };
+                    return { p, rowIds: [], vectors: [] };
                 }
             }));
 
-            // Collect results
+            // Cache results and collect
             for (const result of results) {
+                const { p, rowIds, vectors } = result;
+                // Cache in memory for subsequent searches
+                this._partitionCache.set(p, { rowIds, vectors });
+                cachedResults.set(p, { rowIds, vectors });
+            }
+        }
+
+        // Collect all results in original order
+        for (const p of partitionIndices) {
+            const result = cachedResults.get(p);
+            if (result) {
                 allRowIds.push(...result.rowIds);
                 allVectors.push(...result.vectors);
             }
@@ -5000,26 +9151,100 @@ class IVFIndex {
     }
 
     /**
-     * Fetch row IDs for specified partitions from auxiliary.idx.
-     * Returns array of decoded row IDs (as {fragId, rowOffset} pairs).
-     *
-     * The auxiliary.idx data region layout for each row:
-     * - Column 0: _rowid (uint64) - 8 bytes per row
-     * - Column 1: __pq_code (64 uint8s) - 64 bytes per row
-     * Total: 72 bytes per row if stored contiguously
-     *
-     * However, Lance stores columns separately, so we need to read
-     * just the _rowid column data.
+     * Prefetch ALL row IDs from auxiliary.idx into memory.
+     * This is called once during index loading to avoid HTTP requests during search.
+     * @returns {Promise<void>}
+     */
+    async prefetchAllRowIds() {
+        if (!this.auxiliaryUrl || !this._auxBufferOffsets) {
+            console.log('[IVFIndex] No auxiliary.idx available for prefetch');
+            return;
+        }
+
+        if (this._rowIdCacheReady) {
+            console.log('[IVFIndex] Row IDs already prefetched');
+            return;
+        }
+
+        const totalRows = this.partitionLengths.reduce((a, b) => a + b, 0);
+        if (totalRows === 0) {
+            console.log('[IVFIndex] No rows to prefetch');
+            return;
+        }
+
+        console.log(`[IVFIndex] Prefetching ${totalRows.toLocaleString()} row IDs...`);
+        const startTime = performance.now();
+
+        const dataStart = this._auxBufferOffsets[1];
+        const totalBytes = totalRows * 8;
+
+        try {
+            // Fetch ALL row IDs in a single request
+            const resp = await fetch(this.auxiliaryUrl, {
+                headers: { 'Range': `bytes=${dataStart}-${dataStart + totalBytes - 1}` }
+            });
+
+            if (!resp.ok) {
+                throw new Error(`HTTP ${resp.status}`);
+            }
+
+            const data = new Uint8Array(await resp.arrayBuffer());
+            const view = new DataView(data.buffer, data.byteOffset);
+
+            // Parse and organize by partition
+            this._rowIdCache = new Map();
+            let globalRowIdx = 0;
+
+            for (let p = 0; p < this.partitionLengths.length; p++) {
+                const numRows = this.partitionLengths[p];
+                const partitionRows = [];
+
+                for (let i = 0; i < numRows; i++) {
+                    const rowId = Number(view.getBigUint64(globalRowIdx * 8, true));
+                    const fragId = Math.floor(rowId / 0x100000000);
+                    const rowOffset = rowId % 0x100000000;
+                    partitionRows.push({ fragId, rowOffset });
+                    globalRowIdx++;
+                }
+
+                this._rowIdCache.set(p, partitionRows);
+            }
+
+            this._rowIdCacheReady = true;
+            const elapsed = performance.now() - startTime;
+            console.log(`[IVFIndex] Prefetched ${totalRows.toLocaleString()} row IDs in ${elapsed.toFixed(0)}ms (${(totalBytes / 1024 / 1024).toFixed(1)}MB)`);
+        } catch (e) {
+            console.warn('[IVFIndex] Failed to prefetch row IDs:', e);
+        }
+    }
+
+    /**
+     * Fetch row IDs for specified partitions.
+     * Uses prefetched cache if available (instant), otherwise fetches from network.
      *
      * @param {number[]} partitionIndices - Partition indices to fetch
      * @returns {Promise<Array<{fragId: number, rowOffset: number}>>}
      */
     async fetchPartitionRowIds(partitionIndices) {
+        // Fast path: use prefetched cache
+        if (this._rowIdCacheReady && this._rowIdCache) {
+            const results = [];
+            for (const p of partitionIndices) {
+                const cached = this._rowIdCache.get(p);
+                if (cached) {
+                    for (const row of cached) {
+                        results.push({ ...row, partition: p });
+                    }
+                }
+            }
+            return results;
+        }
+
+        // Slow path: fetch from network (fallback if prefetch failed)
         if (!this.auxiliaryUrl || !this._auxBufferOffsets) {
             return null;
         }
 
-        // Calculate total rows to fetch and their byte ranges
         const rowRanges = [];
         for (const p of partitionIndices) {
             if (p < this.partitionOffsets.length) {
@@ -5031,25 +9256,10 @@ class IVFIndex {
 
         if (rowRanges.length === 0) return [];
 
-        // The data region starts at bufferOffsets[1]
-        // auxiliary.idx stores _rowid as uint64 (8 bytes each)
-        // Data is stored with _rowid column first, then __pq_code column
-        // We only need _rowid values
-
-        // First, get the _rowid column metadata from auxiliary.idx footer
-        // For now, use a simpler approach: assume row IDs are stored at
-        // (dataStart + rowIndex * 8) for each row in the partition order
-
-        // Note: This is a simplification. Full implementation would parse
-        // the column encoding from auxiliary.idx metadata.
-
         const results = [];
         const dataStart = this._auxBufferOffsets[1];
 
-        // Fetch row IDs in batches
         for (const range of rowRanges) {
-            // Calculate byte offset for this partition's row IDs
-            // Row IDs are at the start of the data region
             const byteStart = dataStart + range.startRow * 8;
             const byteEnd = byteStart + range.numRows * 8 - 1;
 
@@ -5058,17 +9268,13 @@ class IVFIndex {
                     headers: { 'Range': `bytes=${byteStart}-${byteEnd}` }
                 });
 
-                if (!resp.ok) {
-                    console.warn(`[IVFIndex] Failed to fetch row IDs for partition ${range.partition}`);
-                    continue;
-                }
+                if (!resp.ok) continue;
 
                 const data = new Uint8Array(await resp.arrayBuffer());
                 const view = new DataView(data.buffer, data.byteOffset);
 
                 for (let i = 0; i < range.numRows; i++) {
                     const rowId = Number(view.getBigUint64(i * 8, true));
-                    // Decode Lance row ID: fragId = rowId >> 32, rowOffset = rowId & 0xFFFFFFFF
                     const fragId = Math.floor(rowId / 0x100000000);
                     const rowOffset = rowId % 0x100000000;
                     results.push({ fragId, rowOffset, partition: range.partition });
@@ -5625,11 +9831,14 @@ const TokenType = {
     SET: 'SET',
     DELETE: 'DELETE',
     DROP: 'DROP',
+    IF: 'IF',
+    EXISTS: 'EXISTS',
     // Data types
     INT: 'INT',
     INTEGER: 'INTEGER',
     BIGINT: 'BIGINT',
     FLOAT: 'FLOAT',
+    REAL: 'REAL',
     DOUBLE: 'DOUBLE',
     TEXT: 'TEXT',
     VARCHAR: 'VARCHAR',
@@ -5715,11 +9924,14 @@ const KEYWORDS = {
     'SET': TokenType.SET,
     'DELETE': TokenType.DELETE,
     'DROP': TokenType.DROP,
+    'IF': TokenType.IF,
+    'EXISTS': TokenType.EXISTS,
     // Data types
     'INT': TokenType.INT,
     'INTEGER': TokenType.INTEGER,
     'BIGINT': TokenType.BIGINT,
     'FLOAT': TokenType.FLOAT,
+    'REAL': TokenType.REAL,
     'DOUBLE': TokenType.DOUBLE,
     'TEXT': TokenType.TEXT,
     'VARCHAR': TokenType.VARCHAR,
@@ -6231,11 +10443,19 @@ class SQLParser {
 
     /**
      * Parse CREATE TABLE statement
-     * Syntax: CREATE TABLE table_name (col1 TYPE, col2 TYPE, ...)
+     * Syntax: CREATE TABLE [IF NOT EXISTS] table_name (col1 TYPE, col2 TYPE, ...)
      */
     parseCreateTable() {
         this.expect(TokenType.CREATE);
         this.expect(TokenType.TABLE);
+
+        // Check for IF NOT EXISTS
+        let ifNotExists = false;
+        if (this.match(TokenType.IF)) {
+            this.expect(TokenType.NOT);
+            this.expect(TokenType.EXISTS);
+            ifNotExists = true;
+        }
 
         // Table name
         const table = this.expect(TokenType.IDENTIFIER).value;
@@ -6255,7 +10475,7 @@ class SQLParser {
             if (this.check(TokenType.INT) || this.check(TokenType.INTEGER) || this.check(TokenType.BIGINT)) {
                 this.advance();
                 dataType = 'INT64';
-            } else if (this.check(TokenType.FLOAT) || this.check(TokenType.DOUBLE)) {
+            } else if (this.check(TokenType.FLOAT) || this.check(TokenType.REAL) || this.check(TokenType.DOUBLE)) {
                 this.advance();
                 dataType = 'FLOAT64';
             } else if (this.check(TokenType.TEXT) || this.check(TokenType.VARCHAR)) {
@@ -6289,16 +10509,24 @@ class SQLParser {
             type: 'CREATE_TABLE',
             table,
             columns,
+            ifNotExists,
         };
     }
 
     /**
      * Parse DROP TABLE statement
-     * Syntax: DROP TABLE table_name
+     * Syntax: DROP TABLE [IF EXISTS] table_name
      */
     parseDropTable() {
         this.expect(TokenType.DROP);
         this.expect(TokenType.TABLE);
+
+        // Check for IF EXISTS
+        let ifExists = false;
+        if (this.match(TokenType.IF)) {
+            this.expect(TokenType.EXISTS);
+            ifExists = true;
+        }
 
         // Table name
         const table = this.expect(TokenType.IDENTIFIER).value;
@@ -6306,6 +10534,7 @@ class SQLParser {
         return {
             type: 'DROP_TABLE',
             table,
+            ifExists,
         };
     }
 
@@ -6740,7 +10969,9 @@ class SQLExecutor {
         const parser = new SQLParser(tokens);
         const ast = parser.parse();
 
-        // Debug: console.log('Parsed SQL AST:', ast);
+        // Generate optimized query plan
+        const planner = new QueryPlanner();
+        const plan = planner.planSingleTable(ast);
 
         // Detect column types if not already done
         if (this.columnTypes.length === 0) {
@@ -6759,16 +10990,39 @@ class SQLExecutor {
             ? await this.file.getRowCount(0)
             : Number(this.file.getRowCount(0));
 
-        // Determine which columns to read
-        const neededColumns = this.collectNeededColumns(ast);
-        // Debug: console.log('Needed columns:', neededColumns);
+        // === STATISTICS-BASED OPTIMIZATION ===
+        // For queries with filters, compute statistics to enable pruning
+        let columnStats = null;
+        let prunedFragments = null;
+        let fragmentsPruned = 0;
+
+        if (ast.where && plan.pushedFilters.length > 0 && this.file._isRemote) {
+            // Compute stats for filter columns (cached after first computation)
+            columnStats = await statisticsManager.precomputeForPlan(this.file, plan);
+
+            // Log statistics info
+            if (columnStats.size > 0) {
+                console.log(`[SQLExecutor] Statistics available for ${columnStats.size} columns`);
+                for (const [col, stats] of columnStats) {
+                    console.log(`  ${col}: min=${stats.min}, max=${stats.max}, nulls=${stats.nullCount}`);
+                }
+            }
+
+            // Fragment pruning based on global statistics
+            // (Per-fragment stats would be even better - computed lazily)
+            plan.columnStats = Object.fromEntries(columnStats);
+        }
+
+        // Use plan's scan columns instead of basic column collection
+        const neededColumns = plan.scanColumns.length > 0
+            ? plan.scanColumns
+            : this.collectNeededColumns(ast);
 
         // Determine output columns
         const outputColumns = this.resolveOutputColumns(ast);
-        // Debug: console.log('Output columns:', outputColumns);
 
         // Check if this is an aggregation query
-        const hasAggregates = this.hasAggregates(ast);
+        const hasAggregates = plan.aggregations.length > 0 || this.hasAggregates(ast);
         if (hasAggregates) {
             // Special case: COUNT(*) without WHERE/SEARCH returns metadata row count (free)
             if (this.isSimpleCountStar(ast) && !ast.where && !ast.search) {
@@ -6783,6 +11037,7 @@ class SQLExecutor {
                         isPartialScan: false,
                         fromMetadata: true,
                     },
+                    queryPlan: plan,  // Include plan in result
                 };
             }
             // For aggregations with SEARCH, we need to run search first
@@ -6880,6 +11135,14 @@ class SQLExecutor {
             total: effectiveTotal,
             orderByOnSubset,
             orderByColumns: ast.orderBy ? ast.orderBy.map(ob => `${ob.column} ${ob.direction}`) : [],
+            // Query optimization info
+            queryPlan: plan,
+            optimization: {
+                statsComputed: columnStats?.size > 0,
+                columnStats: columnStats ? Object.fromEntries(columnStats) : null,
+                pushedFilters: plan.pushedFilters?.length || 0,
+                estimatedSelectivity: plan.estimatedSelectivity,
+            },
         };
     }
 
@@ -7484,6 +11747,156 @@ class SQLExecutor {
                 isPartialScan,
             },
         };
+    }
+
+    /**
+     * Execute SQL and return results as async generator (streaming).
+     * Yields chunks of {columns, rows} for memory-efficient processing.
+     * @param {string} sql - SQL query string
+     * @param {Object} options - Streaming options
+     * @returns {AsyncGenerator<{columns: string[], rows: any[][]}>}
+     */
+    async *executeStream(sql, options = {}) {
+        const { chunkSize = 1000 } = options;
+
+        // Parse SQL
+        const lexer = new SQLLexer(sql);
+        const tokens = lexer.tokenize();
+        const parser = new SQLParser(tokens);
+        const ast = parser.parse();
+
+        // Detect column types
+        if (this.columnTypes.length === 0) {
+            if (this.file._isRemote && this.file.detectColumnTypes) {
+                this.columnTypes = await this.file.detectColumnTypes();
+            } else if (this.file._columnTypes) {
+                this.columnTypes = this.file._columnTypes;
+            } else {
+                this.columnTypes = Array(this.file.numColumns || 0).fill('unknown');
+            }
+        }
+
+        // Get total rows
+        const totalRows = this.file._isRemote
+            ? await this.file.getRowCount(0)
+            : Number(this.file.getRowCount(0));
+
+        // Determine columns
+        const neededColumns = this.collectNeededColumns(ast);
+        const outputColumns = this.resolveOutputColumns(ast);
+
+        // Stream in chunks
+        const limit = ast.limit || totalRows;
+        let yielded = 0;
+
+        for (let offset = 0; offset < totalRows && yielded < limit; offset += chunkSize) {
+            const batchSize = Math.min(chunkSize, limit - yielded, totalRows - offset);
+
+            // Generate indices for this chunk
+            const indices = [];
+            for (let i = 0; i < batchSize; i++) {
+                indices.push(offset + i);
+            }
+
+            // Read column data for these indices
+            const columnData = [];
+            for (const colName of neededColumns) {
+                const colIdx = this.columnMap[colName.toLowerCase()];
+                if (colIdx !== undefined) {
+                    const data = await this.readColumnAtIndices(colIdx, indices);
+                    columnData.push(data);
+                } else {
+                    columnData.push(indices.map(() => null));
+                }
+            }
+
+            // Build rows
+            const rows = [];
+            for (let i = 0; i < indices.length; i++) {
+                const row = [];
+                for (let c = 0; c < neededColumns.length; c++) {
+                    row.push(columnData[c][i]);
+                }
+                rows.push(row);
+            }
+
+            // Apply WHERE filter if present
+            let filteredRows = rows;
+            if (ast.where) {
+                filteredRows = rows.filter((row, idx) => {
+                    return this.evaluateWhereExprOnRow(ast.where, neededColumns, row);
+                });
+            }
+
+            if (filteredRows.length > 0) {
+                yield {
+                    columns: neededColumns,
+                    rows: filteredRows,
+                };
+                yielded += filteredRows.length;
+            }
+        }
+    }
+
+    /**
+     * Evaluate WHERE expression on a single row
+     * @private
+     */
+    evaluateWhereExprOnRow(expr, columns, row) {
+        if (!expr) return true;
+
+        if (expr.type === 'binary') {
+            if (expr.op === 'AND') {
+                return this.evaluateWhereExprOnRow(expr.left, columns, row) &&
+                       this.evaluateWhereExprOnRow(expr.right, columns, row);
+            }
+            if (expr.op === 'OR') {
+                return this.evaluateWhereExprOnRow(expr.left, columns, row) ||
+                       this.evaluateWhereExprOnRow(expr.right, columns, row);
+            }
+
+            const leftVal = this._getValueFromExpr(expr.left, columns, row);
+            const rightVal = this._getValueFromExpr(expr.right, columns, row);
+
+            switch (expr.op) {
+                case '=':
+                case '==':
+                    return leftVal == rightVal;
+                case '!=':
+                case '<>':
+                    return leftVal != rightVal;
+                case '<':
+                    return leftVal < rightVal;
+                case '<=':
+                    return leftVal <= rightVal;
+                case '>':
+                    return leftVal > rightVal;
+                case '>=':
+                    return leftVal >= rightVal;
+                default:
+                    return true;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Get value from expression for row evaluation
+     * @private
+     */
+    _getValueFromExpr(expr, columns, row) {
+        if (expr.type === 'literal') {
+            return expr.value;
+        }
+        if (expr.type === 'column') {
+            const colName = expr.name || expr.column;
+            const idx = columns.indexOf(colName) !== -1
+                ? columns.indexOf(colName)
+                : columns.indexOf(colName.toLowerCase());
+            return idx !== -1 ? row[idx] : null;
+        }
+        return null;
     }
 }
 
@@ -8306,11 +12719,39 @@ class RemoteLanceDataset {
     }
 
     /**
-     * Get total size (sum of all fragment files).
+     * Get estimated total size based on row count and schema.
+     * More accurate than fragment count estimate.
      */
     get size() {
-        // Estimate based on fragments
-        return this._fragments.length * 100 * 1024 * 1024; // ~100MB per fragment estimate
+        if (this._cachedSize) return this._cachedSize;
+
+        // Estimate bytes per row based on column types
+        let bytesPerRow = 0;
+        for (let i = 0; i < (this._columnTypes?.length || 0); i++) {
+            const colType = this._columnTypes[i];
+            if (colType === 'int64' || colType === 'float64' || colType === 'double') {
+                bytesPerRow += 8;
+            } else if (colType === 'int32' || colType === 'float32') {
+                bytesPerRow += 4;
+            } else if (colType === 'string') {
+                bytesPerRow += 50; // Average string length estimate
+            } else if (colType === 'vector' || colType?.startsWith('vector[')) {
+                // Extract dimension from type like "vector[384]"
+                const match = colType?.match(/\[(\d+)\]/);
+                const dim = match ? parseInt(match[1]) : 384;
+                bytesPerRow += dim * 4; // float32 per dimension
+            } else {
+                bytesPerRow += 8; // Default
+            }
+        }
+
+        // Fallback if no column types
+        if (bytesPerRow === 0) {
+            bytesPerRow = 100; // Conservative default
+        }
+
+        this._cachedSize = this._totalRows * bytesPerRow;
+        return this._cachedSize;
     }
 
     /**
@@ -8692,7 +13133,7 @@ class RemoteLanceDataset {
     /**
      * IVF index-based ANN search.
      * Fetches partition data (row IDs + vectors) directly from ivf_vectors.bin.
-     * This is much faster than fetching scattered vectors from Lance files.
+     * Uses WebGPU for batch similarity computation.
      * @private
      */
     async _ivfIndexSearch(queryVec, topK, vectorColIdx, nprobe, onProgress) {
@@ -8706,8 +13147,9 @@ class RemoteLanceDataset {
             this._ivfIndex.dimension,
             (loaded, total) => {
                 if (onProgress) {
+                    // First 80% is downloading
                     const pct = total > 0 ? loaded / total : 0;
-                    onProgress(Math.floor(pct * 100), 100);
+                    onProgress(Math.floor(pct * 80), 100);
                 }
             }
         );
@@ -8717,20 +13159,79 @@ class RemoteLanceDataset {
         }
 
         const { rowIds, vectors } = partitionData;
-        console.log(`[VectorSearch] Computing similarities for ${rowIds.length.toLocaleString()} vectors`);
 
-        // Compute similarities - vectors are already loaded, no more network requests!
+        // Use hybrid WebGPU + WASM SIMD for batch similarity
+        const scores = new Float32Array(vectors.length);
+        const dim = queryVec.length;
+
+        if (webgpuAccelerator.isAvailable()) {
+            const maxBatch = webgpuAccelerator.getMaxVectorsPerBatch(dim);
+            let gpuProcessed = 0;
+            let wasmProcessed = 0;
+
+            // Process in chunks that fit in WebGPU buffer
+            for (let start = 0; start < vectors.length; start += maxBatch) {
+                const end = Math.min(start + maxBatch, vectors.length);
+                const chunk = vectors.slice(start, end);
+
+                try {
+                    const chunkScores = await webgpuAccelerator.batchCosineSimilarity(queryVec, chunk, true);
+                    if (chunkScores) {
+                        scores.set(chunkScores, start);
+                        gpuProcessed += chunk.length;
+                        continue;
+                    }
+                } catch (e) {
+                    // Fall through to WASM for this chunk
+                }
+
+                // WASM SIMD fallback for this chunk
+                if (this._fragments[0]?.lanceql?.batchCosineSimilarity) {
+                    const chunkScores = this._fragments[0].lanceql.batchCosineSimilarity(queryVec, chunk, true);
+                    scores.set(chunkScores, start);
+                    wasmProcessed += chunk.length;
+                } else {
+                    // JS fallback (slow)
+                    for (let i = 0; i < chunk.length; i++) {
+                        const vec = chunk[i];
+                        if (!vec || vec.length !== dim) continue;
+                        let dot = 0;
+                        for (let k = 0; k < dim; k++) {
+                            dot += queryVec[k] * vec[k];
+                        }
+                        scores[start + i] = dot;
+                    }
+                    wasmProcessed += chunk.length;
+                }
+            }
+
+            console.log(`[VectorSearch] Processed ${vectors.length.toLocaleString()} vectors: ${gpuProcessed.toLocaleString()} WebGPU, ${wasmProcessed.toLocaleString()} WASM SIMD`);
+        } else {
+            // Pure WASM SIMD path
+            console.log(`[VectorSearch] Computing similarities for ${rowIds.length.toLocaleString()} vectors via WASM SIMD`);
+            if (this._fragments[0]?.lanceql?.batchCosineSimilarity) {
+                const allScores = this._fragments[0].lanceql.batchCosineSimilarity(queryVec, vectors, true);
+                scores.set(allScores);
+            } else {
+                // JS fallback (slow)
+                for (let i = 0; i < vectors.length; i++) {
+                    const vec = vectors[i];
+                    if (!vec || vec.length !== dim) continue;
+                    let dot = 0;
+                    for (let k = 0; k < dim; k++) {
+                        dot += queryVec[k] * vec[k];
+                    }
+                    scores[i] = dot;
+                }
+            }
+        }
+
+        if (onProgress) onProgress(90, 100);
+
+        // Build results with row IDs
         const allResults = [];
         for (let i = 0; i < rowIds.length; i++) {
-            const vec = vectors[i];
-            if (!vec || vec.length !== queryVec.length) continue;
-
-            // Cosine similarity (vectors should be normalized)
-            let dot = 0;
-            for (let k = 0; k < queryVec.length; k++) {
-                dot += queryVec[k] * vec[k];
-            }
-            allResults.push({ index: rowIds[i], score: dot });
+            allResults.push({ index: rowIds[i], score: scores[i] });
         }
 
         // Sort and take top-k
@@ -9399,6 +13900,339 @@ class QueryPlanner {
 
         return JSON.stringify(expr);
     }
+
+    /**
+     * Generate optimized plan for single-table queries (SELECT, aggregations).
+     * This is the key optimization that makes us better than DuckDB for remote data:
+     *
+     * DuckDB approach (local-first):
+     *   1. Load data into memory
+     *   2. Build indexes
+     *   3. Execute query
+     *
+     * LanceQL approach (remote-first):
+     *   1. Analyze query to determine minimum columns needed
+     *   2. Use Lance column statistics to skip entire chunks
+     *   3. Stream only matching rows, never load full table
+     *   4. Apply projections at the data source
+     *
+     * @param {Object} ast - Parsed SQL AST
+     * @returns {Object} Physical execution plan
+     */
+    planSingleTable(ast) {
+        const plan = {
+            type: ast.type,
+            // Phase 1: Determine columns to fetch
+            scanColumns: [],
+            // Phase 2: Filters to push down (executed at data source)
+            pushedFilters: [],
+            // Phase 3: Filters that must be evaluated after fetch
+            postFilters: [],
+            // Phase 4: Aggregations (if any)
+            aggregations: [],
+            // Phase 5: GROUP BY (if any)
+            groupBy: [],
+            // Phase 6: HAVING (if any)
+            having: null,
+            // Phase 7: ORDER BY (if any)
+            orderBy: [],
+            // Phase 8: LIMIT/OFFSET
+            limit: ast.limit || null,
+            offset: ast.offset || 0,
+            // Phase 9: Final projection
+            projection: [],
+            // Optimization flags
+            canUseStatistics: false,
+            canStreamResults: true,
+            estimatedSelectivity: 1.0,
+        };
+
+        // Analyze columns needed
+        const neededColumns = new Set();
+
+        // 1. Columns from SELECT
+        if (ast.columns === '*' || (Array.isArray(ast.columns) && ast.columns.some(c => c.type === 'star'))) {
+            plan.projection = ['*'];
+            // For *, we can't prune columns - need all
+            plan.canStreamResults = false;
+        } else if (Array.isArray(ast.columns)) {
+            for (const col of ast.columns) {
+                this._collectColumnsFromSelectItem(col, neededColumns, plan);
+            }
+        }
+
+        // 2. Columns from WHERE (for filter evaluation)
+        if (ast.where) {
+            this._collectColumnsFromExpr(ast.where, neededColumns);
+            // Analyze filter for pushdown opportunities
+            this._analyzeFilterPushdown(ast.where, plan);
+        }
+
+        // 3. Columns from GROUP BY
+        if (ast.groupBy && ast.groupBy.length > 0) {
+            for (const groupExpr of ast.groupBy) {
+                this._collectColumnsFromExpr(groupExpr, neededColumns);
+                plan.groupBy.push(groupExpr);
+            }
+        }
+
+        // 4. Columns from HAVING
+        if (ast.having) {
+            this._collectColumnsFromExpr(ast.having, neededColumns);
+            plan.having = ast.having;
+        }
+
+        // 5. Columns from ORDER BY
+        if (ast.orderBy && ast.orderBy.length > 0) {
+            for (const orderItem of ast.orderBy) {
+                this._collectColumnsFromExpr(orderItem.expr || orderItem, neededColumns);
+                plan.orderBy.push(orderItem);
+            }
+        }
+
+        // Finalize scan columns
+        plan.scanColumns = Array.from(neededColumns);
+
+        // Calculate selectivity estimate based on filters
+        plan.estimatedSelectivity = this._estimateSelectivity(plan.pushedFilters);
+
+        // Determine if we can use column statistics to skip chunks
+        plan.canUseStatistics = plan.pushedFilters.some(f =>
+            f.type === 'range' || f.type === 'equality'
+        );
+
+        if (this.debug) {
+            this._logSingleTablePlan(plan, ast);
+        }
+
+        return plan;
+    }
+
+    /**
+     * Collect columns from a SELECT item
+     */
+    _collectColumnsFromSelectItem(item, columns, plan) {
+        if (item.type === 'star') {
+            plan.projection.push('*');
+            return;
+        }
+
+        if (item.type === 'expr') {
+            const expr = item.expr;
+
+            // Check for aggregation
+            if (expr.type === 'call') {
+                const funcName = expr.name.toUpperCase();
+                const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'VARIANCE'];
+
+                if (aggFuncs.includes(funcName)) {
+                    const agg = {
+                        type: funcName,
+                        column: null,
+                        alias: item.alias || `${funcName}(${expr.args[0]?.name || '*'})`,
+                        distinct: expr.distinct || false,
+                    };
+
+                    if (expr.args && expr.args.length > 0) {
+                        const arg = expr.args[0];
+                        if (arg.type === 'column') {
+                            agg.column = arg.name || arg.column;
+                            columns.add(agg.column);
+                        } else if (arg.type !== 'star') {
+                            this._collectColumnsFromExpr(arg, columns);
+                        }
+                    }
+
+                    plan.aggregations.push(agg);
+                    plan.projection.push({ type: 'aggregation', index: plan.aggregations.length - 1 });
+                    return;
+                }
+            }
+
+            // Regular column or expression
+            this._collectColumnsFromExpr(expr, columns);
+            plan.projection.push({
+                type: 'column',
+                expr: expr,
+                alias: item.alias
+            });
+        }
+    }
+
+    /**
+     * Collect column names from an expression
+     */
+    _collectColumnsFromExpr(expr, columns) {
+        if (!expr) return;
+
+        if (expr.type === 'column') {
+            columns.add(expr.name || expr.column);
+        } else if (expr.type === 'binary') {
+            this._collectColumnsFromExpr(expr.left, columns);
+            this._collectColumnsFromExpr(expr.right, columns);
+        } else if (expr.type === 'call') {
+            for (const arg of (expr.args || [])) {
+                this._collectColumnsFromExpr(arg, columns);
+            }
+        } else if (expr.type === 'unary') {
+            this._collectColumnsFromExpr(expr.operand, columns);
+        }
+    }
+
+    /**
+     * Analyze WHERE clause for filter pushdown opportunities.
+     *
+     * Pushable filters (can be evaluated at data source):
+     * - Simple comparisons: col > 5, col = 'foo', col BETWEEN 1 AND 10
+     * - IN clauses: col IN (1, 2, 3)
+     * - LIKE patterns: col LIKE 'prefix%' (prefix only)
+     *
+     * Non-pushable filters (must evaluate after fetch):
+     * - Complex expressions: col1 + col2 > 10
+     * - Functions: UPPER(col) = 'FOO'
+     * - Cross-column comparisons: col1 > col2
+     */
+    _analyzeFilterPushdown(expr, plan) {
+        if (!expr) return;
+
+        if (expr.type === 'binary') {
+            // Check if this is a simple pushable condition
+            if (this._isPushableFilter(expr)) {
+                plan.pushedFilters.push(this._classifyFilter(expr));
+            } else if (expr.op === 'AND') {
+                // AND - recurse into both sides
+                this._analyzeFilterPushdown(expr.left, plan);
+                this._analyzeFilterPushdown(expr.right, plan);
+            } else if (expr.op === 'OR') {
+                // OR with pushable conditions on same column can be pushed
+                const leftPushable = this._isPushableFilter(expr.left);
+                const rightPushable = this._isPushableFilter(expr.right);
+
+                if (leftPushable && rightPushable) {
+                    plan.pushedFilters.push({
+                        type: 'or',
+                        left: this._classifyFilter(expr.left),
+                        right: this._classifyFilter(expr.right),
+                    });
+                } else {
+                    // Can't push OR with non-pushable condition
+                    plan.postFilters.push(expr);
+                }
+            } else {
+                // Non-pushable binary expression
+                plan.postFilters.push(expr);
+            }
+        } else {
+            plan.postFilters.push(expr);
+        }
+    }
+
+    /**
+     * Check if a filter can be pushed down to data source
+     */
+    _isPushableFilter(expr) {
+        if (expr.type !== 'binary') return false;
+
+        const compOps = ['=', '==', '!=', '<>', '<', '<=', '>', '>=', 'LIKE', 'IN', 'BETWEEN'];
+        if (!compOps.includes(expr.op.toUpperCase())) return false;
+
+        // One side must be a column, other must be a literal/constant
+        const leftIsCol = expr.left.type === 'column';
+        const rightIsCol = expr.right?.type === 'column';
+        const leftIsLiteral = expr.left.type === 'literal' || expr.left.type === 'list';
+        const rightIsLiteral = expr.right?.type === 'literal' || expr.right?.type === 'list';
+
+        return (leftIsCol && rightIsLiteral) || (rightIsCol && leftIsLiteral);
+    }
+
+    /**
+     * Classify a filter for optimization
+     */
+    _classifyFilter(expr) {
+        const leftIsCol = expr.left.type === 'column';
+        const column = leftIsCol
+            ? (expr.left.name || expr.left.column)
+            : (expr.right.name || expr.right.column);
+        const value = leftIsCol ? expr.right.value : expr.left.value;
+
+        const op = expr.op.toUpperCase();
+
+        if (op === '=' || op === '==') {
+            return { type: 'equality', column, value, op: '=' };
+        } else if (op === '!=' || op === '<>') {
+            return { type: 'inequality', column, value, op: '!=' };
+        } else if (['<', '<=', '>', '>='].includes(op)) {
+            return { type: 'range', column, value, op };
+        } else if (op === 'LIKE') {
+            return { type: 'like', column, pattern: value };
+        } else if (op === 'IN') {
+            const values = expr.right.type === 'list' ? expr.right.values : [expr.right.value];
+            return { type: 'in', column, values };
+        } else if (op === 'BETWEEN') {
+            return { type: 'between', column, low: expr.right.low, high: expr.right.high };
+        }
+
+        return { type: 'unknown', expr };
+    }
+
+    /**
+     * Estimate selectivity of filters (what % of rows will pass)
+     */
+    _estimateSelectivity(filters) {
+        if (filters.length === 0) return 1.0;
+
+        let selectivity = 1.0;
+        for (const f of filters) {
+            switch (f.type) {
+                case 'equality':
+                    selectivity *= 0.1; // Assume 10% match for equality
+                    break;
+                case 'range':
+                    selectivity *= 0.3; // Assume 30% for range
+                    break;
+                case 'in':
+                    selectivity *= Math.min(0.5, f.values.length * 0.05);
+                    break;
+                case 'like':
+                    selectivity *= f.pattern.startsWith('%') ? 0.5 : 0.2;
+                    break;
+                default:
+                    selectivity *= 0.5;
+            }
+        }
+        return Math.max(0.01, selectivity); // At least 1%
+    }
+
+    /**
+     * Log single-table query plan
+     */
+    _logSingleTablePlan(plan, ast) {
+        console.log('\n' + '='.repeat(60));
+        console.log('📋 SINGLE-TABLE QUERY PLAN');
+        console.log('='.repeat(60));
+
+        console.log('\n🔍 Query Analysis:');
+        console.log(`  Type: ${plan.type}`);
+        console.log(`  Aggregations: ${plan.aggregations.length}`);
+        console.log(`  Group By: ${plan.groupBy.length} columns`);
+        console.log(`  Order By: ${plan.orderBy.length} columns`);
+        console.log(`  Limit: ${plan.limit || 'none'}`);
+
+        console.log('\n📊 Scan Strategy:');
+        console.log(`  Columns to fetch: [${plan.scanColumns.join(', ')}]`);
+        console.log(`  Pushed filters: ${plan.pushedFilters.length}`);
+        plan.pushedFilters.forEach((f, i) => {
+            console.log(`    ${i + 1}. ${f.type}: ${f.column} ${f.op || ''} ${JSON.stringify(f.value || f.values || f.pattern || '')}`);
+        });
+        console.log(`  Post-fetch filters: ${plan.postFilters.length}`);
+
+        console.log('\n💡 Optimizations:');
+        console.log(`  Can use column statistics: ${plan.canUseStatistics}`);
+        console.log(`  Can stream results: ${plan.canStreamResults}`);
+        console.log(`  Estimated selectivity: ${(plan.estimatedSelectivity * 100).toFixed(1)}%`);
+
+        console.log('\n' + '='.repeat(60) + '\n');
+    }
 }
 
 // ============================================================================
@@ -9562,7 +14396,8 @@ class LanceDatabase {
     }
 
     /**
-     * Execute hash join between two datasets using QueryPlanner
+     * Execute hash join between two datasets using OPFS for intermediate storage.
+     * This enables TB-scale joins in the browser by spilling to disk instead of RAM.
      */
     async _hashJoin(leftDataset, rightDataset, ast, context) {
         const { leftAlias, rightAlias, leftTableName, rightTableName } = context;
@@ -9585,111 +14420,101 @@ class LanceDatabase {
         const rightColumns = plan.rightScan.columns;
         const leftFilters = plan.leftScan.filters;
         const rightFilters = plan.rightScan.filters;
-        const leftLimit = plan.leftScan.limit;
 
-        // Build left SQL with filter pushdown
-        let leftWhereClause = '';
-        if (leftFilters.length > 0) {
-            const filterStr = leftFilters.map(f => this._filterToSQL(f)).join(' AND ');
-            leftWhereClause = ` WHERE ${filterStr}`;
-        }
-
-        // Ensure join key is included in columns
+        // Build SQL queries for streaming
         const leftColsWithKey = leftColumns.includes('*')
             ? ['*']
             : [...new Set([leftKey, ...leftColumns])];
 
-        const leftSQL = `SELECT ${leftColsWithKey.join(', ')} FROM ${leftTableName}${leftWhereClause} LIMIT ${leftLimit}`;
-        console.log('[LanceDatabase] Left query:', leftSQL);
-
-        const leftExecutor = new SQLExecutor(leftDataset);
-        const leftData = await leftExecutor.executeSQL(leftSQL);
-
-        if (!leftData.rows || leftData.rows.length === 0) {
-            return { columns: [], rows: [], total: 0 };
+        let leftWhereClause = '';
+        if (leftFilters.length > 0) {
+            leftWhereClause = ` WHERE ${leftFilters.map(f => this._filterToSQL(f)).join(' AND ')}`;
         }
+        const leftSQL = `SELECT ${leftColsWithKey.join(', ')} FROM ${leftTableName}${leftWhereClause}`;
 
-        console.log(`[LanceDatabase] Fetched ${leftData.rows.length} rows from left table`);
-
-        // Build hash map on left side
-        const hashMap = new Map();
-        const joinKeyIndex = leftData.columns.indexOf(leftKey);
-
-        for (const row of leftData.rows) {
-            const key = row[joinKeyIndex];
-            if (key !== null && key !== undefined) {
-                if (!hashMap.has(key)) {
-                    hashMap.set(key, []);
-                }
-                hashMap.get(key).push(row);
-            }
-        }
-
-        console.log(`[LanceDatabase] Built hash map with ${hashMap.size} unique keys`);
-
-        // Get unique join keys for right side
-        const joinKeys = Array.from(hashMap.keys());
-
-        if (joinKeys.length === 0) {
-            return { columns: [], rows: [], total: 0 };
-        }
-
-        // Build right SQL with filter pushdown AND join key filter
         const rightColsWithKey = rightColumns.includes('*')
             ? ['*']
             : [...new Set([rightKey, ...rightColumns])];
 
-        // Combine pushed-down filters with join key IN clause
-        const rightFilterParts = [];
+        let rightWhereClause = '';
         if (rightFilters.length > 0) {
-            rightFilterParts.push(rightFilters.map(f => this._filterToSQL(f)).join(' AND '));
+            rightWhereClause = ` WHERE ${rightFilters.map(f => this._filterToSQL(f)).join(' AND ')}`;
         }
-
-        // Add join key filter
-        const joinKeyValues = joinKeys.map(k => typeof k === 'string' ? `'${k}'` : k).join(',');
-        rightFilterParts.push(`${rightKey} IN (${joinKeyValues})`);
-
-        const rightWhereClause = ` WHERE ${rightFilterParts.join(' AND ')}`;
-
         const rightSQL = `SELECT ${rightColsWithKey.join(', ')} FROM ${rightTableName}${rightWhereClause}`;
+
+        console.log('[LanceDatabase] OPFS-backed hash join starting...');
+        console.log('[LanceDatabase] Left query:', leftSQL);
         console.log('[LanceDatabase] Right query:', rightSQL);
 
+        // Initialize OPFS storage
+        await opfsStorage.open();
+
+        // Create OPFS join executor
+        const joinExecutor = new OPFSJoinExecutor(opfsStorage);
+
+        // Create streaming executors
+        const leftExecutor = new SQLExecutor(leftDataset);
         const rightExecutor = new SQLExecutor(rightDataset);
-        const rightData = await rightExecutor.executeSQL(rightSQL);
 
-        console.log(`[LanceDatabase] Fetched ${rightData.rows.length} rows from right table`);
+        // Create async generators for streaming
+        const leftStream = leftExecutor.executeStream(leftSQL);
+        const rightStream = rightExecutor.executeStream(rightSQL);
 
-        // Perform hash join
+        // Execute OPFS-backed join
         const results = [];
-        const rightJoinKeyIndex = rightData.columns.indexOf(rightKey);
+        let resultColumns = null;
 
-        for (const rightRow of rightData.rows) {
-            const key = rightRow[rightJoinKeyIndex];
-            const leftRows = hashMap.get(key);
+        try {
+            for await (const chunk of joinExecutor.executeHashJoin(
+                leftStream,
+                rightStream,
+                leftKey,
+                rightKey,
+                { limit: ast.limit || Infinity }
+            )) {
+                if (!resultColumns) {
+                    resultColumns = chunk.columns;
+                }
+                results.push(...chunk.rows);
 
-            if (leftRows) {
-                for (const leftRow of leftRows) {
-                    // Merge rows
-                    results.push([...leftRow, ...rightRow]);
+                // Early exit if we have enough rows
+                if (ast.limit && results.length >= ast.limit) {
+                    break;
                 }
             }
+        } catch (e) {
+            console.error('[LanceDatabase] OPFS join failed:', e);
+            throw e;
         }
 
-        console.log(`[LanceDatabase] Joined ${results.length} rows`);
+        // Get stats
+        const stats = joinExecutor.getStats();
+        console.log('[LanceDatabase] OPFS Join Stats:', stats);
 
-        // Build result columns
-        const resultColumns = [...leftData.columns, ...rightData.columns];
+        // If no results, return empty
+        if (!resultColumns || results.length === 0) {
+            return { columns: [], rows: [], total: 0, opfsStats: stats };
+        }
 
-        // Apply projection to select only the requested columns
-        const projectedResults = this._applyProjection(results, resultColumns, plan.projection, leftAlias, rightAlias);
+        // Apply projection
+        const projectedResults = this._applyProjection(
+            results,
+            resultColumns,
+            plan.projection,
+            leftAlias,
+            rightAlias
+        );
 
         // Apply LIMIT
-        const limitedResults = ast.limit ? projectedResults.rows.slice(0, ast.limit) : projectedResults.rows;
+        const limitedResults = ast.limit
+            ? projectedResults.rows.slice(0, ast.limit)
+            : projectedResults.rows;
 
         return {
             columns: projectedResults.columns,
             rows: limitedResults,
-            total: limitedResults.length
+            total: limitedResults.length,
+            opfsStats: stats  // Include OPFS stats in result
         };
     }
 
@@ -11370,6 +16195,13 @@ async function initSqlJs(config = {}) {
         console.warn('[LanceQL] OPFS not available:', e.message);
     }
 
+    // Initialize WebGPU for accelerated vector search
+    try {
+        await webgpuAccelerator.init();
+    } catch (e) {
+        console.warn('[LanceQL] WebGPU not available:', e.message);
+    }
+
     return {
         Database,
         Statement,
@@ -11379,6 +16211,12 @@ async function initSqlJs(config = {}) {
 // Also export as sqljs for explicit naming
 
 
+// Export WebGPU accelerator for direct access
+
+
+// LogicTable exports (disabled - LanceDataset API not yet implemented)
+// export { Table, logicTable, LogicTableQuery, loadLogicTable } from './logic-table.js';
+
 // Default export for convenience
 // default export: LanceQL
 
@@ -11386,6 +16224,7 @@ async function initSqlJs(config = {}) {
 // CommonJS exports
 module.exports = {
     wasmUtils,
+    OPFSJoinExecutor,
     LocalDatabase,
     LanceQL,
     LanceFile,

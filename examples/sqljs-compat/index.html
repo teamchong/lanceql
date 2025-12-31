@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LanceQL vs sql.js - Compatibility & Benchmark</title>
+    <style>
+        :root {
+            --bg: #0a0a0a;
+            --surface: #141414;
+            --border: #2a2a2a;
+            --text: #e5e5e5;
+            --text-muted: #888;
+            --success: #22c55e;
+            --error: #ef4444;
+            --accent: #3b82f6;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'SF Mono', Monaco, monospace;
+            background: var(--bg);
+            color: var(--text);
+            padding: 24px;
+            line-height: 1.6;
+        }
+        h1 { margin-bottom: 8px; }
+        .subtitle { color: var(--text-muted); margin-bottom: 24px; }
+        .controls { margin-bottom: 24px; display: flex; gap: 12px; }
+        button {
+            background: var(--accent);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-family: inherit;
+        }
+        button:hover { opacity: 0.9; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        .results {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+        }
+        .panel {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+        }
+        .panel h2 {
+            font-size: 1rem;
+            margin-bottom: 12px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--border);
+        }
+        .panel.sqljs h2 { color: #f59e0b; }
+        .panel.lanceql h2 { color: var(--accent); }
+        .output {
+            font-size: 0.8rem;
+            white-space: pre-wrap;
+            max-height: 500px;
+            overflow-y: auto;
+        }
+        .pass { color: var(--success); }
+        .fail { color: var(--error); }
+        .time { color: var(--accent); }
+        .benchmark-results {
+            margin-top: 24px;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 16px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 12px;
+        }
+        th, td {
+            text-align: left;
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--border);
+        }
+        th { color: var(--text-muted); font-weight: normal; }
+        .faster { color: var(--success); font-weight: bold; }
+        .slower { color: var(--error); }
+    </style>
+</head>
+<body>
+    <h1>LanceQL vs sql.js</h1>
+    <p class="subtitle">Compatibility tests & performance benchmarks</p>
+
+    <div class="controls">
+        <button onclick="runCompatTests()">Run Compatibility Tests</button>
+        <button onclick="runBenchmarks()">Run Benchmarks</button>
+    </div>
+
+    <div class="results">
+        <div class="panel sqljs">
+            <h2>sql.js</h2>
+            <div id="sqljs-output" class="output">Click a button to start...</div>
+        </div>
+        <div class="panel lanceql">
+            <h2>LanceQL</h2>
+            <div id="lanceql-output" class="output">Click a button to start...</div>
+        </div>
+    </div>
+
+    <div class="benchmark-results" id="benchmark-results" style="display: none;">
+        <h2>Benchmark Results</h2>
+        <table id="benchmark-table">
+            <thead>
+                <tr>
+                    <th>Operation</th>
+                    <th>sql.js</th>
+                    <th>LanceQL</th>
+                    <th>Winner</th>
+                </tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+    </div>
+
+    <!-- sql.js from CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
+
+    <script type="module">
+        import { initSqlJs as initLanceQL } from '../../packages/browser/dist/lanceql.esm.js';
+
+        let sqljsDb = null;
+        let lanceqlDb = null;
+
+        function logSqljs(msg, type = '') {
+            const el = document.getElementById('sqljs-output');
+            el.innerHTML += `<span class="${type}">${msg}</span>\n`;
+            el.scrollTop = el.scrollHeight;
+        }
+
+        function logLanceql(msg, type = '') {
+            const el = document.getElementById('lanceql-output');
+            el.innerHTML += `<span class="${type}">${msg}</span>\n`;
+            el.scrollTop = el.scrollHeight;
+        }
+
+        function clearOutputs() {
+            document.getElementById('sqljs-output').innerHTML = '';
+            document.getElementById('lanceql-output').innerHTML = '';
+        }
+
+        // Compatibility test cases
+        const COMPAT_TESTS = [
+            {
+                name: 'DROP TABLE (cleanup)',
+                sql: 'DROP TABLE IF EXISTS users',
+                check: (result) => true
+            },
+            {
+                name: 'CREATE TABLE',
+                sql: 'CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)',
+                check: (result) => true // No error = pass
+            },
+            {
+                name: 'INSERT single row',
+                sql: "INSERT INTO users VALUES (1, 'Alice', 30)",
+                check: (result) => true
+            },
+            {
+                name: 'INSERT multiple rows',
+                setup: [
+                    "INSERT INTO users VALUES (2, 'Bob', 25)",
+                    "INSERT INTO users VALUES (3, 'Charlie', 35)",
+                    "INSERT INTO users VALUES (4, 'Diana', 28)",
+                    "INSERT INTO users VALUES (5, 'Eve', 32)"
+                ],
+                check: (result) => true
+            },
+            {
+                name: 'SELECT *',
+                sql: 'SELECT * FROM users',
+                check: (result) => result.length === 5
+            },
+            {
+                name: 'SELECT with WHERE',
+                sql: 'SELECT * FROM users WHERE age > 28',
+                check: (result) => result.length === 3
+            },
+            {
+                name: 'SELECT with ORDER BY',
+                sql: 'SELECT * FROM users ORDER BY age DESC',
+                check: (result) => result[0]?.age === 35
+            },
+            {
+                name: 'SELECT with LIMIT',
+                sql: 'SELECT * FROM users LIMIT 2',
+                check: (result) => result.length === 2
+            },
+            {
+                name: 'COUNT aggregate',
+                sql: 'SELECT COUNT(*) as cnt FROM users',
+                check: (result) => result[0]?.cnt === 5
+            },
+            {
+                name: 'SUM aggregate',
+                sql: 'SELECT SUM(age) as total FROM users',
+                check: (result) => result[0]?.total === 150
+            },
+            {
+                name: 'AVG aggregate',
+                sql: 'SELECT AVG(age) as avg_age FROM users',
+                check: (result) => result[0]?.avg_age === 30
+            },
+            {
+                name: 'MIN/MAX aggregate',
+                sql: 'SELECT MIN(age) as min_age, MAX(age) as max_age FROM users',
+                check: (result) => result[0]?.min_age === 25 && result[0]?.max_age === 35
+            },
+            {
+                name: 'UPDATE',
+                sql: "UPDATE users SET age = 31 WHERE name = 'Alice'",
+                verify: 'SELECT age FROM users WHERE name = \'Alice\'',
+                check: (result) => result[0]?.age === 31
+            },
+            {
+                name: 'DELETE',
+                sql: "DELETE FROM users WHERE id = 5",
+                verify: 'SELECT COUNT(*) as cnt FROM users',
+                check: (result) => result[0]?.cnt === 4
+            }
+        ];
+
+        async function initSqlJs() {
+            if (sqljsDb) return sqljsDb;
+            logSqljs('Loading sql.js WASM...');
+            const SQL = await window.initSqlJs({
+                locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${file}`
+            });
+            sqljsDb = new SQL.Database();
+            logSqljs('sql.js ready', 'pass');
+            return sqljsDb;
+        }
+
+        async function initLanceQLDb() {
+            if (lanceqlDb) return lanceqlDb;
+            logLanceql('Loading LanceQL WASM...');
+            const SQL = await initLanceQL();
+            lanceqlDb = new SQL.Database();
+            logLanceql('LanceQL ready', 'pass');
+            return lanceqlDb;
+        }
+
+        function sqljsExec(db, sql) {
+            const result = db.exec(sql);
+            if (result.length === 0) return [];
+            const cols = result[0].columns;
+            return result[0].values.map(row => {
+                const obj = {};
+                cols.forEach((col, i) => obj[col] = row[i]);
+                return obj;
+            });
+        }
+
+        async function lanceqlExec(db, sql) {
+            // LanceQL exec() is async
+            const result = await db.exec(sql);
+            if (!result || result.length === 0) return [];
+            if (result[0]?.columns) {
+                const cols = result[0].columns;
+                return result[0].values.map(row => {
+                    const obj = {};
+                    cols.forEach((col, i) => obj[col] = row[i]);
+                    return obj;
+                });
+            }
+            return result;
+        }
+
+        window.runCompatTests = async function() {
+            clearOutputs();
+            document.getElementById('benchmark-results').style.display = 'none';
+
+            try {
+                const sqljs = await initSqlJs();
+                const lanceql = await initLanceQLDb();
+
+                let sqljsPassed = 0, sqljsFailed = 0;
+                let lanceqlPassed = 0, lanceqlFailed = 0;
+
+                for (const test of COMPAT_TESTS) {
+                    // sql.js
+                    try {
+                        if (test.setup) {
+                            test.setup.forEach(sql => sqljs.run(sql));
+                        }
+                        if (test.sql) {
+                            sqljs.run(test.sql);
+                        }
+                        const verifySql = test.verify || test.sql;
+                        const result = verifySql?.startsWith('SELECT') ? sqljsExec(sqljs, verifySql) : [];
+                        const passed = test.check(result);
+                        logSqljs(`${test.name}: ${passed ? 'PASS' : 'FAIL'}`, passed ? 'pass' : 'fail');
+                        if (passed) sqljsPassed++; else sqljsFailed++;
+                    } catch (e) {
+                        logSqljs(`${test.name}: ERROR - ${e.message}`, 'fail');
+                        sqljsFailed++;
+                    }
+
+                    // LanceQL (async)
+                    try {
+                        if (test.setup) {
+                            for (const sql of test.setup) {
+                                await lanceql.run(sql);
+                            }
+                        }
+                        if (test.sql) {
+                            await lanceql.run(test.sql);
+                        }
+                        const verifySql = test.verify || test.sql;
+                        const result = verifySql?.startsWith('SELECT') ? await lanceqlExec(lanceql, verifySql) : [];
+                        const passed = test.check(result);
+                        if (!passed) {
+                            console.log(`LanceQL ${test.name} result:`, result);
+                        }
+                        logLanceql(`${test.name}: ${passed ? 'PASS' : 'FAIL'}${!passed ? ` (got ${result.length} rows)` : ''}`, passed ? 'pass' : 'fail');
+                        if (passed) lanceqlPassed++; else lanceqlFailed++;
+                    } catch (e) {
+                        logLanceql(`${test.name}: ERROR - ${e.message}`, 'fail');
+                        lanceqlFailed++;
+                    }
+                }
+
+                logSqljs(`\n--- Results: ${sqljsPassed}/${COMPAT_TESTS.length} passed ---`, sqljsFailed === 0 ? 'pass' : 'fail');
+                logLanceql(`\n--- Results: ${lanceqlPassed}/${COMPAT_TESTS.length} passed ---`, lanceqlFailed === 0 ? 'pass' : 'fail');
+
+            } catch (e) {
+                console.error(e);
+                logSqljs('Init error: ' + e.message, 'fail');
+                logLanceql('Init error: ' + e.message, 'fail');
+            }
+        };
+
+        // Benchmark tests
+        const BENCHMARKS = [
+            {
+                name: 'Insert 1K rows',
+                setup: 'CREATE TABLE IF NOT EXISTS bench (id INTEGER, value REAL, label TEXT)',
+                run: (db, execFn, isAsync) => {
+                    const promises = [];
+                    for (let i = 0; i < 1000; i++) {
+                        const p = db.run(`INSERT INTO bench VALUES (${i}, ${Math.random()}, 'item_${i}')`);
+                        if (isAsync) promises.push(p);
+                    }
+                    return isAsync ? Promise.all(promises) : null;
+                }
+            },
+            {
+                name: 'SELECT * (1K rows)',
+                run: (db, execFn) => execFn(db, 'SELECT * FROM bench')
+            },
+            {
+                name: 'SELECT with WHERE',
+                run: (db, execFn) => execFn(db, 'SELECT * FROM bench WHERE value > 0.5')
+            },
+            {
+                name: 'COUNT aggregate',
+                run: (db, execFn) => execFn(db, 'SELECT COUNT(*) FROM bench')
+            },
+            {
+                name: 'SUM aggregate',
+                run: (db, execFn) => execFn(db, 'SELECT SUM(value) FROM bench')
+            },
+            {
+                name: 'ORDER BY + LIMIT',
+                run: (db, execFn) => execFn(db, 'SELECT * FROM bench ORDER BY value DESC LIMIT 100')
+            }
+        ];
+
+        window.runBenchmarks = async function() {
+            clearOutputs();
+
+            try {
+                // Reinitialize fresh databases
+                sqljsDb = null;
+                lanceqlDb = null;
+                const sqljs = await initSqlJs();
+                const lanceql = await initLanceQLDb();
+
+                const results = [];
+                document.getElementById('benchmark-results').style.display = 'block';
+                const tbody = document.querySelector('#benchmark-table tbody');
+                tbody.innerHTML = '';
+
+                for (const bench of BENCHMARKS) {
+                    logSqljs(`Running: ${bench.name}...`);
+                    logLanceql(`Running: ${bench.name}...`);
+
+                    // Setup
+                    if (bench.setup) {
+                        try { sqljs.run(bench.setup); } catch(e) {}
+                        try { await lanceql.run(bench.setup); } catch(e) {}
+                    }
+
+                    // sql.js benchmark (sync)
+                    const sqljsStart = performance.now();
+                    try {
+                        bench.run(sqljs, sqljsExec, false);
+                    } catch (e) {
+                        logSqljs(`  Error: ${e.message}`, 'fail');
+                    }
+                    const sqljsTime = performance.now() - sqljsStart;
+                    logSqljs(`  Time: ${sqljsTime.toFixed(2)}ms`, 'time');
+
+                    // LanceQL benchmark (async)
+                    const lanceqlStart = performance.now();
+                    try {
+                        await bench.run(lanceql, lanceqlExec, true);
+                    } catch (e) {
+                        logLanceql(`  Error: ${e.message}`, 'fail');
+                    }
+                    const lanceqlTime = performance.now() - lanceqlStart;
+                    logLanceql(`  Time: ${lanceqlTime.toFixed(2)}ms`, 'time');
+
+                    // Determine winner (handle edge cases)
+                    let winner, ratio;
+                    if (sqljsTime < 0.1 && lanceqlTime < 0.1) {
+                        winner = 'tie';
+                        ratio = '~same';
+                    } else if (lanceqlTime < 0.1) {
+                        winner = 'LanceQL';
+                        ratio = 'instant';
+                    } else if (sqljsTime < lanceqlTime) {
+                        winner = 'sql.js';
+                        ratio = (lanceqlTime / sqljsTime).toFixed(1) + 'x slower';
+                    } else {
+                        winner = 'LanceQL';
+                        ratio = (sqljsTime / lanceqlTime).toFixed(1) + 'x faster';
+                    }
+
+                    // Add to table
+                    const row = document.createElement('tr');
+                    row.innerHTML = `
+                        <td>${bench.name}</td>
+                        <td class="${winner === 'sql.js' ? 'faster' : 'slower'}">${sqljsTime.toFixed(2)}ms</td>
+                        <td class="${winner === 'LanceQL' ? 'faster' : 'slower'}">${lanceqlTime.toFixed(2)}ms</td>
+                        <td class="${winner === 'LanceQL' ? 'faster' : ''}">${winner === 'LanceQL' ? ratio : winner}</td>
+                    `;
+                    tbody.appendChild(row);
+
+                    results.push({ name: bench.name, sqljsTime, lanceqlTime, winner });
+                }
+
+                logSqljs('\n--- Benchmark complete ---', 'pass');
+                logLanceql('\n--- Benchmark complete ---', 'pass');
+
+            } catch (e) {
+                console.error(e);
+                logSqljs('Benchmark error: ' + e.message, 'fail');
+                logLanceql('Benchmark error: ' + e.message, 'fail');
+            }
+        };
+    </script>
+</body>
+</html>

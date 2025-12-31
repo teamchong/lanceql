@@ -3228,6 +3228,7 @@ const DataType = {
     INTEGER: 'int64',
     BIGINT: 'int64',
     FLOAT: 'float32',
+    REAL: 'float64',
     DOUBLE: 'float64',
     TEXT: 'string',
     VARCHAR: 'string',
@@ -3246,6 +3247,9 @@ const DataType = {
  * - Durability: Persisted to OPFS (Origin Private File System)
  *
  * Storage: Uses OPFS exclusively for all data sizes. No IndexedDB migration needed.
+ *
+ * Write Buffer: Inserts are buffered in memory and flushed to OPFS periodically
+ * for high-throughput writes without exhausting file handles.
  */
 export class LocalDatabase {
     constructor(name, storage = opfsStorage) {
@@ -3254,6 +3258,13 @@ export class LocalDatabase {
         this.tables = new Map();  // tableName -> TableState
         this.version = 0;
         this.manifestKey = `${name}/__manifest__`;
+
+        // Write buffer for fast inserts
+        this._writeBuffer = new Map();  // tableName -> [{row}, ...]
+        this._flushTimer = null;
+        this._flushInterval = 1000;  // Flush every 1 second
+        this._flushThreshold = 1000; // Or when buffer exceeds 1000 rows
+        this._flushing = false;
     }
 
     /**
@@ -3288,15 +3299,19 @@ export class LocalDatabase {
      * CREATE TABLE
      * @param {string} tableName - Table name
      * @param {Array} columns - Column definitions [{name, type, primaryKey?, vectorDim?}]
+     * @param {boolean} ifNotExists - If true, don't error if table already exists
      */
-    async createTable(tableName, columns) {
+    async createTable(tableName, columns, ifNotExists = false) {
         if (this.tables.has(tableName)) {
+            if (ifNotExists) {
+                return { success: true, existed: true };
+            }
             throw new Error(`Table '${tableName}' already exists`);
         }
 
         const schema = columns.map(col => ({
             name: col.name,
-            type: DataType[col.type?.toUpperCase()] || col.type || 'string',
+            type: DataType[(col.dataType || col.type)?.toUpperCase()] || col.dataType || col.type || 'string',
             primaryKey: col.primaryKey || false,
             vectorDim: col.vectorDim || null,
         }));
@@ -3320,13 +3335,22 @@ export class LocalDatabase {
     /**
      * DROP TABLE
      * @param {string} tableName - Table name
+     * @param {boolean} ifExists - If true, don't error if table doesn't exist
      */
-    async dropTable(tableName) {
+    async dropTable(tableName, ifExists = false) {
         if (!this.tables.has(tableName)) {
+            if (ifExists) {
+                // Also clear any orphaned buffer
+                this._writeBuffer.delete(tableName);
+                return { success: true, existed: false };
+            }
             throw new Error(`Table '${tableName}' does not exist`);
         }
 
         const table = this.tables.get(tableName);
+
+        // Clear write buffer for this table
+        this._writeBuffer.delete(tableName);
 
         // Delete all fragments
         for (const fragKey of table.fragments) {
@@ -3340,7 +3364,7 @@ export class LocalDatabase {
     }
 
     /**
-     * INSERT INTO
+     * INSERT INTO - buffers writes for performance, flushes periodically
      * @param {string} tableName - Table name
      * @param {Array} rows - Array of row objects [{col1: val1, col2: val2}, ...]
      */
@@ -3351,21 +3375,81 @@ export class LocalDatabase {
 
         const table = this.tables.get(tableName);
 
+        // Assign row IDs and add to buffer
+        const rowsWithIds = rows.map(row => ({
+            __rowId: table.nextRowId++,
+            ...row,
+        }));
+
+        // Add to write buffer
+        if (!this._writeBuffer.has(tableName)) {
+            this._writeBuffer.set(tableName, []);
+        }
+        this._writeBuffer.get(tableName).push(...rowsWithIds);
+        table.rowCount += rows.length;
+
+        // Schedule flush if not already scheduled
+        this._scheduleFlush();
+
+        // Check if we should flush immediately (buffer threshold)
+        const bufferSize = this._writeBuffer.get(tableName).length;
+        if (bufferSize >= this._flushThreshold) {
+            await this._flushTable(tableName);
+        }
+
+        return { success: true, inserted: rows.length };
+    }
+
+    /**
+     * Schedule a flush to OPFS
+     */
+    _scheduleFlush() {
+        if (this._flushTimer) return;
+        this._flushTimer = setTimeout(() => {
+            this._flushTimer = null;
+            this.flush().catch(e => console.warn('[LocalDatabase] Flush error:', e));
+        }, this._flushInterval);
+    }
+
+    /**
+     * Flush all buffered writes to OPFS
+     */
+    async flush() {
+        if (this._flushing) return;
+        this._flushing = true;
+
+        try {
+            const tables = [...this._writeBuffer.keys()];
+            for (const tableName of tables) {
+                await this._flushTable(tableName);
+            }
+        } finally {
+            this._flushing = false;
+        }
+    }
+
+    /**
+     * Flush a single table's buffer to OPFS
+     */
+    async _flushTable(tableName) {
+        const buffer = this._writeBuffer.get(tableName);
+        if (!buffer || buffer.length === 0) return;
+
+        const table = this.tables.get(tableName);
+        if (!table) return;
+
+        // Take all buffered rows
+        const rowsToFlush = buffer.splice(0, buffer.length);
+
         // Add __rowId to schema if not present
         const schemaWithRowId = [
             { name: '__rowId', type: 'int64', primaryKey: true },
             ...table.schema.filter(c => c.name !== '__rowId')
         ];
 
-        // Assign row IDs
-        const rowsWithIds = rows.map(row => ({
-            __rowId: table.nextRowId++,
-            ...row,
-        }));
-
         // Create Lance file using WASM writer
         const writer = new LanceFileWriter(schemaWithRowId);
-        writer.addRows(rowsWithIds);
+        writer.addRows(rowsToFlush);
         const lanceData = writer.build();
 
         // Save as .lance fragment
@@ -3374,11 +3458,7 @@ export class LocalDatabase {
 
         // Update table state
         table.fragments.push(fragKey);
-        table.rowCount += rows.length;
-
         await this._saveManifest();
-
-        return { success: true, inserted: rows.length };
     }
 
     /**
@@ -3392,17 +3472,33 @@ export class LocalDatabase {
         }
 
         const table = this.tables.get(tableName);
-        const allRows = await this._readAllRows(tableName);
-
         let deletedCount = 0;
-        for (const row of allRows) {
-            if (predicate(row)) {
-                table.deletionVector.push(row.__rowId);
-                deletedCount++;
-                table.rowCount--;
+
+        // Delete from buffer (rows not yet persisted)
+        const buffer = this._writeBuffer.get(tableName);
+        if (buffer && buffer.length > 0) {
+            const originalLen = buffer.length;
+            const remaining = buffer.filter(row => !predicate(row));
+            buffer.length = 0;
+            buffer.push(...remaining);
+            deletedCount += (originalLen - remaining.length);
+        }
+
+        // Delete from persisted fragments (add to deletion vector)
+        for (const fragKey of table.fragments) {
+            const fragData = await this.storage.load(fragKey);
+            if (fragData) {
+                const rows = this._parseFragment(fragData, table.schema);
+                for (const row of rows) {
+                    if (!table.deletionVector.includes(row.__rowId) && predicate(row)) {
+                        table.deletionVector.push(row.__rowId);
+                        deletedCount++;
+                    }
+                }
             }
         }
 
+        table.rowCount -= deletedCount;
         await this._saveManifest();
 
         return { success: true, deleted: deletedCount };
@@ -3420,28 +3516,44 @@ export class LocalDatabase {
         }
 
         const table = this.tables.get(tableName);
-        const allRows = await this._readAllRows(tableName);
-
-        const updatedRows = [];
         let updatedCount = 0;
 
-        for (const row of allRows) {
-            if (predicate(row)) {
-                // Mark old row as deleted
-                table.deletionVector.push(row.__rowId);
-                table.rowCount--;
-
-                // Create new row with updates
-                const newRow = { ...row, ...updates };
-                delete newRow.__rowId;
-                updatedRows.push(newRow);
-                updatedCount++;
+        // Update buffered rows in place
+        const buffer = this._writeBuffer.get(tableName);
+        if (buffer && buffer.length > 0) {
+            for (const row of buffer) {
+                if (predicate(row)) {
+                    Object.assign(row, updates);
+                    updatedCount++;
+                }
             }
         }
 
-        // Insert updated rows as new fragment
-        if (updatedRows.length > 0) {
-            await this.insert(tableName, updatedRows);
+        // Update persisted rows (mark as deleted, insert new)
+        const persistedUpdates = [];
+        for (const fragKey of table.fragments) {
+            const fragData = await this.storage.load(fragKey);
+            if (fragData) {
+                const rows = this._parseFragment(fragData, table.schema);
+                for (const row of rows) {
+                    if (!table.deletionVector.includes(row.__rowId) && predicate(row)) {
+                        // Mark old row as deleted
+                        table.deletionVector.push(row.__rowId);
+                        table.rowCount--;
+
+                        // Create new row with updates
+                        const newRow = { ...row, ...updates };
+                        delete newRow.__rowId;
+                        persistedUpdates.push(newRow);
+                        updatedCount++;
+                    }
+                }
+            }
+        }
+
+        // Insert updated rows (will go to buffer)
+        if (persistedUpdates.length > 0) {
+            await this.insert(tableName, persistedUpdates);
         } else {
             await this._saveManifest();
         }
@@ -3507,12 +3619,14 @@ export class LocalDatabase {
 
     /**
      * Read all rows from a table (excluding deleted)
+     * Includes both persisted fragments AND buffered (unflushed) rows
      */
     async _readAllRows(tableName) {
         const table = this.tables.get(tableName);
         const deletedSet = new Set(table.deletionVector);
         const allRows = [];
 
+        // Read from persisted fragments
         for (const fragKey of table.fragments) {
             const fragData = await this.storage.load(fragKey);
             if (fragData) {
@@ -3521,6 +3635,16 @@ export class LocalDatabase {
                     if (!deletedSet.has(row.__rowId)) {
                         allRows.push(row);
                     }
+                }
+            }
+        }
+
+        // Include buffered (unflushed) rows
+        const buffer = this._writeBuffer.get(tableName);
+        if (buffer && buffer.length > 0) {
+            for (const row of buffer) {
+                if (!deletedSet.has(row.__rowId)) {
+                    allRows.push(row);
                 }
             }
         }
@@ -3908,10 +4032,10 @@ export class LocalDatabase {
 
         switch (type) {
             case 'CREATE_TABLE':
-                return this.createTable(ast.table, ast.columns);
+                return this.createTable(ast.table, ast.columns, ast.ifNotExists);
 
             case 'DROP_TABLE':
-                return this.dropTable(ast.table);
+                return this.dropTable(ast.table, ast.ifExists);
 
             case 'INSERT': {
                 // Convert from parser format to insert format
@@ -3957,6 +4081,17 @@ export class LocalDatabase {
                 const tableName = ast.from?.name || ast.from?.table || ast.from;
                 if (!tableName) {
                     throw new Error('SELECT requires FROM clause for LocalDatabase');
+                }
+
+                // Check for aggregate functions
+                const aggFunctions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'];
+                const hasAggregates = ast.columns !== '*' && ast.columns.some(c =>
+                    c.expr?.type === 'call' && aggFunctions.includes(c.expr.name?.toUpperCase())
+                );
+
+                if (hasAggregates) {
+                    // Execute aggregate query
+                    return this._executeAggregate(tableName, ast);
                 }
 
                 const selectOptions = {
@@ -4059,6 +4194,51 @@ export class LocalDatabase {
             default:
                 return true;
         }
+    }
+
+    /**
+     * Execute aggregate query (COUNT, SUM, AVG, MIN, MAX)
+     */
+    async _executeAggregate(tableName, ast) {
+        if (!this.tables.has(tableName)) {
+            throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        // Get all rows (with WHERE filter)
+        let rows = await this._readAllRows(tableName);
+        if (ast.where) {
+            rows = rows.filter(row => this._evalWhereExpr(ast.where, row));
+        }
+
+        // Initialize result object
+        const result = {};
+        const aggFunctions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'];
+
+        for (const col of ast.columns) {
+            if (col.expr?.type === 'call') {
+                const funcName = col.expr.name.toUpperCase();
+                const alias = col.alias || `${funcName}(${col.expr.args[0]?.column || '*'})`;
+                const argCol = col.expr.args[0]?.column;
+
+                if (funcName === 'COUNT') {
+                    result[alias] = rows.length;
+                } else if (funcName === 'SUM') {
+                    result[alias] = rows.reduce((sum, row) => sum + (row[argCol] || 0), 0);
+                } else if (funcName === 'AVG') {
+                    const sum = rows.reduce((s, row) => s + (row[argCol] || 0), 0);
+                    result[alias] = rows.length > 0 ? sum / rows.length : null;
+                } else if (funcName === 'MIN') {
+                    result[alias] = rows.length > 0 ?
+                        Math.min(...rows.map(r => r[argCol]).filter(v => v != null)) : null;
+                } else if (funcName === 'MAX') {
+                    result[alias] = rows.length > 0 ?
+                        Math.max(...rows.map(r => r[argCol]).filter(v => v != null)) : null;
+                }
+            }
+        }
+
+        // Return as single row
+        return [result];
     }
 
     /**
@@ -6221,51 +6401,59 @@ export class LanceFile {
 export class DataFrame {
     constructor(file) {
         this.file = file;
-        this._filterOps = [];  // Array of {colIdx, op, value, type}
+        this._filterOps = [];  // Array of {colIdx, op, value, type, opStr}
         this._selectCols = null;
         this._limitValue = null;
+        this._isRemote = file._isRemote || file.baseUrl !== undefined;
     }
 
     /**
      * Filter rows where column matches condition.
+     * Immer-style: returns new DataFrame, original unchanged.
      * @param {number} colIdx - Column index
      * @param {string} op - Operator: '=', '!=', '<', '<=', '>', '>='
-     * @param {number|bigint} value - Value to compare
-     * @param {string} type - 'int64' or 'float64'
+     * @param {number|bigint|string} value - Value to compare
+     * @param {string} type - 'int64', 'float64', or 'string'
      * @returns {DataFrame}
      */
     filter(colIdx, op, value, type = 'int64') {
         const opMap = {
-            '=': LanceFile.Op.EQ, '==': LanceFile.Op.EQ,
-            '!=': LanceFile.Op.NE, '<>': LanceFile.Op.NE,
-            '<': LanceFile.Op.LT,
-            '<=': LanceFile.Op.LE,
-            '>': LanceFile.Op.GT,
-            '>=': LanceFile.Op.GE
+            '=': LanceFile.Op?.EQ ?? 0, '==': LanceFile.Op?.EQ ?? 0,
+            '!=': LanceFile.Op?.NE ?? 1, '<>': LanceFile.Op?.NE ?? 1,
+            '<': LanceFile.Op?.LT ?? 2,
+            '<=': LanceFile.Op?.LE ?? 3,
+            '>': LanceFile.Op?.GT ?? 4,
+            '>=': LanceFile.Op?.GE ?? 5
         };
 
         const df = new DataFrame(this.file);
-        df._filterOps = [...this._filterOps, { colIdx, op: opMap[op], value, type }];
+        df._filterOps = [...this._filterOps, { colIdx, op: opMap[op], opStr: op, value, type }];
         df._selectCols = this._selectCols;
         df._limitValue = this._limitValue;
+        df._isRemote = this._isRemote;
         return df;
     }
 
     /**
      * Select specific columns.
+     * Immer-style: returns new DataFrame, original unchanged.
      * @param {...number} colIndices - Column indices to select
      * @returns {DataFrame}
      */
     select(...colIndices) {
+        // Handle array passed as first arg: select([0,1,2]) or select(0,1,2)
+        const cols = Array.isArray(colIndices[0]) ? colIndices[0] : colIndices;
         const df = new DataFrame(this.file);
         df._filterOps = [...this._filterOps];
-        df._selectCols = colIndices;
+        df._selectCols = cols;
         df._limitValue = this._limitValue;
+        df._isRemote = this._isRemote;
         return df;
     }
 
     /**
      * Limit number of results.
+     * Immer-style: returns new DataFrame, original unchanged.
      * @param {number} n - Maximum rows
      * @returns {DataFrame}
      */
@@ -6274,14 +6462,52 @@ export class DataFrame {
         df._filterOps = [...this._filterOps];
         df._selectCols = this._selectCols;
         df._limitValue = n;
+        df._isRemote = this._isRemote;
         return df;
     }
 
     /**
-     * Execute the query and return row indices.
+     * Generate SQL from DataFrame operations.
+     * @returns {string}
+     */
+    toSQL() {
+        const colNames = this.file.columnNames || this.file._schema?.map(s => s.name) ||
+            Array.from({ length: this.file._numColumns || 6 }, (_, i) => `col_${i}`);
+
+        // SELECT clause
+        let selectClause;
+        if (this._selectCols && this._selectCols.length > 0) {
+            selectClause = this._selectCols.map(i => colNames[i] || `col_${i}`).join(', ');
+        } else {
+            selectClause = '*';
+        }
+
+        // WHERE clause
+        let whereClause = '';
+        if (this._filterOps.length > 0) {
+            const conditions = this._filterOps.map(f => {
+                const colName = colNames[f.colIdx] || `col_${f.colIdx}`;
+                const val = f.type === 'string' ? `'${f.value}'` : f.value;
+                return `${colName} ${f.opStr} ${val}`;
+            });
+            whereClause = ` WHERE ${conditions.join(' AND ')}`;
+        }
+
+        // LIMIT clause
+        const limitClause = this._limitValue ? ` LIMIT ${this._limitValue}` : '';
+
+        return `SELECT ${selectClause} FROM dataset${whereClause}${limitClause}`;
+    }
+
+    /**
+     * Execute the query and return row indices (sync, local only).
      * @returns {Uint32Array}
      */
     collectIndices() {
+        if (this._isRemote) {
+            throw new Error('collectIndices() is sync-only. Use collect() for remote datasets.');
+        }
+
         let indices = null;
 
         // Apply filters
@@ -6319,37 +6545,56 @@ export class DataFrame {
     }
 
     /**
-     * Execute the query and return results as arrays.
-     * @returns {Object} Object with column data arrays
+     * Execute the query and return results.
+     * Works with both local (sync) and remote (async) datasets.
+     * @returns {Promise<{columns: Array[], columnNames: string[], total: number}>}
      */
-    collect() {
-        const indices = this.collectIndices();
-        const result = { _indices: indices };
+    async collect() {
+        // Remote: generate SQL and execute
+        if (this._isRemote) {
+            const sql = this.toSQL();
+            return await this.file.executeSQL(sql);
+        }
 
+        // Local: use sync WASM methods
+        const indices = this.collectIndices();
         const cols = this._selectCols ||
             Array.from({ length: this.file.numColumns }, (_, i) => i);
 
+        const columns = [];
+        const columnNames = [];
+
         for (const colIdx of cols) {
+            columnNames.push(this.file.columnNames?.[colIdx] || `col_${colIdx}`);
             // Try int64 first, then float64
             try {
-                result[`col${colIdx}`] = this.file.readInt64AtIndices(colIdx, indices);
+                columns.push(Array.from(this.file.readInt64AtIndices(colIdx, indices)));
             } catch {
                 try {
-                    result[`col${colIdx}`] = this.file.readFloat64AtIndices(colIdx, indices);
+                    columns.push(Array.from(this.file.readFloat64AtIndices(colIdx, indices)));
                 } catch {
-                    result[`col${colIdx}`] = null;
+                    columns.push(indices.map(() => null));
                 }
             }
         }
 
-        return result;
+        return {
+            columns,
+            columnNames,
+            total: indices.length,
+            _indices: indices
+        };
     }
 
     /**
      * Count matching rows.
-     * @returns {number}
+     * @returns {Promise<number>|number}
      */
-    count() {
+    async count() {
+        if (this._isRemote) {
+            const result = await this.collect();
+            return result.columns[0]?.length || 0;
+        }
         return this.collectIndices().length;
     }
 }
@@ -8172,6 +8417,100 @@ export class RemoteLanceFile {
 
         return result;
     }
+
+    /**
+     * Read rows from this Lance file with pagination.
+     * @param {Object} options - Query options
+     * @param {number} options.offset - Starting row offset
+     * @param {number} options.limit - Maximum rows to return
+     * @param {number[]} options.columns - Column indices to read (optional, null = all)
+     * @returns {Promise<{columns: Array[], columnNames: string[], total: number}>}
+     */
+    async readRows({ offset = 0, limit = 50, columns = null } = {}) {
+        // Determine column indices to read
+        const colIndices = columns || Array.from({ length: this._numColumns }, (_, i) => i);
+
+        // Get total row count from first column
+        const totalRows = await this.getRowCount(0);
+
+        // Clamp offset and limit
+        const actualOffset = Math.min(offset, totalRows);
+        const actualLimit = Math.min(limit, totalRows - actualOffset);
+
+        if (actualLimit <= 0) {
+            return {
+                columns: colIndices.map(() => []),
+                columnNames: this.columnNames.slice(0, colIndices.length),
+                total: totalRows
+            };
+        }
+
+        // Generate indices for the requested rows
+        const indices = Array.from({ length: actualLimit }, (_, i) => actualOffset + i);
+
+        // Detect all column types first
+        const columnTypes = await this.detectColumnTypes();
+
+        // Read each column in parallel
+        const columnPromises = colIndices.map(async (colIdx) => {
+            const type = columnTypes[colIdx] || 'unknown';
+
+            try {
+                switch (type) {
+                    case 'string':
+                    case 'utf8':
+                    case 'large_utf8':
+                        return await this.readStringsAtIndices(colIdx, indices);
+
+                    case 'int64':
+                        return Array.from(await this.readInt64AtIndices(colIdx, indices));
+
+                    case 'int32':
+                        return Array.from(await this.readInt32AtIndices(colIdx, indices));
+
+                    case 'int16':
+                        return Array.from(await this.readInt16AtIndices(colIdx, indices));
+
+                    case 'uint8':
+                        return Array.from(await this.readUint8AtIndices(colIdx, indices));
+
+                    case 'float64':
+                    case 'double':
+                        return Array.from(await this.readFloat64AtIndices(colIdx, indices));
+
+                    case 'float32':
+                    case 'float':
+                        return Array.from(await this.readFloat32AtIndices(colIdx, indices));
+
+                    case 'bool':
+                    case 'boolean':
+                        return await this.readBoolAtIndices(colIdx, indices);
+
+                    case 'fixed_size_list':
+                    case 'vector':
+                        // For vectors, return as nested arrays
+                        const vectors = await this.readVectorsAtIndices(colIdx, indices);
+                        return Array.isArray(vectors) ? vectors : Array.from(vectors);
+
+                    default:
+                        // Try as string for unknown types
+                        console.warn(`[LanceQL] Unknown column type: ${type}, trying as string`);
+                        return await this.readStringsAtIndices(colIdx, indices);
+                }
+            } catch (e) {
+                console.warn(`[LanceQL] Error reading column ${colIdx} (${type}):`, e.message);
+                return indices.map(() => null);
+            }
+        });
+
+        const columnsData = await Promise.all(columnPromises);
+
+        return {
+            columns: columnsData,
+            columnNames: colIndices.map(i => this.columnNames[i] || `column_${i}`),
+            total: totalRows
+        };
+    }
 }
 
 // ============================================================================
@@ -9492,11 +9831,14 @@ const TokenType = {
     SET: 'SET',
     DELETE: 'DELETE',
     DROP: 'DROP',
+    IF: 'IF',
+    EXISTS: 'EXISTS',
     // Data types
     INT: 'INT',
     INTEGER: 'INTEGER',
     BIGINT: 'BIGINT',
     FLOAT: 'FLOAT',
+    REAL: 'REAL',
     DOUBLE: 'DOUBLE',
     TEXT: 'TEXT',
     VARCHAR: 'VARCHAR',
@@ -9582,11 +9924,14 @@ const KEYWORDS = {
     'SET': TokenType.SET,
     'DELETE': TokenType.DELETE,
     'DROP': TokenType.DROP,
+    'IF': TokenType.IF,
+    'EXISTS': TokenType.EXISTS,
     // Data types
     'INT': TokenType.INT,
     'INTEGER': TokenType.INTEGER,
     'BIGINT': TokenType.BIGINT,
     'FLOAT': TokenType.FLOAT,
+    'REAL': TokenType.REAL,
     'DOUBLE': TokenType.DOUBLE,
     'TEXT': TokenType.TEXT,
     'VARCHAR': TokenType.VARCHAR,
@@ -10098,11 +10443,19 @@ export class SQLParser {
 
     /**
      * Parse CREATE TABLE statement
-     * Syntax: CREATE TABLE table_name (col1 TYPE, col2 TYPE, ...)
+     * Syntax: CREATE TABLE [IF NOT EXISTS] table_name (col1 TYPE, col2 TYPE, ...)
      */
     parseCreateTable() {
         this.expect(TokenType.CREATE);
         this.expect(TokenType.TABLE);
+
+        // Check for IF NOT EXISTS
+        let ifNotExists = false;
+        if (this.match(TokenType.IF)) {
+            this.expect(TokenType.NOT);
+            this.expect(TokenType.EXISTS);
+            ifNotExists = true;
+        }
 
         // Table name
         const table = this.expect(TokenType.IDENTIFIER).value;
@@ -10122,7 +10475,7 @@ export class SQLParser {
             if (this.check(TokenType.INT) || this.check(TokenType.INTEGER) || this.check(TokenType.BIGINT)) {
                 this.advance();
                 dataType = 'INT64';
-            } else if (this.check(TokenType.FLOAT) || this.check(TokenType.DOUBLE)) {
+            } else if (this.check(TokenType.FLOAT) || this.check(TokenType.REAL) || this.check(TokenType.DOUBLE)) {
                 this.advance();
                 dataType = 'FLOAT64';
             } else if (this.check(TokenType.TEXT) || this.check(TokenType.VARCHAR)) {
@@ -10156,16 +10509,24 @@ export class SQLParser {
             type: 'CREATE_TABLE',
             table,
             columns,
+            ifNotExists,
         };
     }
 
     /**
      * Parse DROP TABLE statement
-     * Syntax: DROP TABLE table_name
+     * Syntax: DROP TABLE [IF EXISTS] table_name
      */
     parseDropTable() {
         this.expect(TokenType.DROP);
         this.expect(TokenType.TABLE);
+
+        // Check for IF EXISTS
+        let ifExists = false;
+        if (this.match(TokenType.IF)) {
+            this.expect(TokenType.EXISTS);
+            ifExists = true;
+        }
 
         // Table name
         const table = this.expect(TokenType.IDENTIFIER).value;
@@ -10173,6 +10534,7 @@ export class SQLParser {
         return {
             type: 'DROP_TABLE',
             table,
+            ifExists,
         };
     }
 
