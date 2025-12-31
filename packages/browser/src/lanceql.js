@@ -3265,6 +3265,9 @@ export class LocalDatabase {
         this._flushInterval = 1000;  // Flush every 1 second
         this._flushThreshold = 1000; // Or when buffer exceeds 1000 rows
         this._flushing = false;
+
+        // Read cache for fast queries
+        this._readCache = new Map();  // fragKey -> [{row}, ...]
     }
 
     /**
@@ -3352,8 +3355,9 @@ export class LocalDatabase {
         // Clear write buffer for this table
         this._writeBuffer.delete(tableName);
 
-        // Delete all fragments
+        // Clear read cache and delete all fragments
         for (const fragKey of table.fragments) {
+            this._readCache.delete(fragKey);
             await this.storage.delete(fragKey);
         }
 
@@ -3620,21 +3624,32 @@ export class LocalDatabase {
     /**
      * Read all rows from a table (excluding deleted)
      * Includes both persisted fragments AND buffered (unflushed) rows
+     * Uses read cache for fast repeated queries
      */
     async _readAllRows(tableName) {
         const table = this.tables.get(tableName);
         const deletedSet = new Set(table.deletionVector);
         const allRows = [];
 
-        // Read from persisted fragments
+        // Read from persisted fragments (with caching)
         for (const fragKey of table.fragments) {
-            const fragData = await this.storage.load(fragKey);
-            if (fragData) {
-                const rows = this._parseFragment(fragData, table.schema);
-                for (const row of rows) {
-                    if (!deletedSet.has(row.__rowId)) {
-                        allRows.push(row);
-                    }
+            let rows = this._readCache.get(fragKey);
+
+            if (!rows) {
+                // Cache miss - load from OPFS and cache
+                const fragData = await this.storage.load(fragKey);
+                if (fragData) {
+                    rows = this._parseFragment(fragData, table.schema);
+                    this._readCache.set(fragKey, rows);
+                } else {
+                    rows = [];
+                }
+            }
+
+            // Filter deleted rows
+            for (const row of rows) {
+                if (!deletedSet.has(row.__rowId)) {
+                    allRows.push(row);
                 }
             }
         }
