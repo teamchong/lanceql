@@ -1,16 +1,20 @@
-//! LanceQL CLI - Native query interface for Lance/Parquet files
+//! LanceQL CLI - High-performance data pipeline for Lance files
 //!
 //! Usage:
-//!   lanceql "SELECT * FROM 'data.lance' LIMIT 10"
-//!   lanceql -f query.sql
-//!   lanceql -c "SELECT COUNT(*) FROM 'data.parquet'"
-//!   lanceql --benchmark "SELECT * FROM 'data.lance' WHERE x > 100"
+//!   lanceql query "SELECT * FROM 'data.lance' LIMIT 10"
+//!   lanceql ingest data.csv -o out.lance
+//!   lanceql transform data.lance --select "a,b"
+//!   lanceql enrich data.lance --embed text
+//!   lanceql serve data.lance
+//!   lanceql (no args) - auto-detect config or serve
 //!
 //! Designed for apple-to-apple comparison with:
 //!   duckdb -c "SELECT * FROM 'data.parquet' LIMIT 10"
 //!   polars -c "SELECT * FROM read_parquet('data.parquet') LIMIT 10"
 
 const std = @import("std");
+const args = @import("cli/args.zig");
+const ingest = @import("cli/ingest.zig");
 const lanceql = @import("lanceql");
 const metal = @import("lanceql.metal");
 const Table = @import("lanceql.table").Table;
@@ -41,9 +45,189 @@ fn detectFileType(path: []const u8, data: []const u8) FileType {
     return .unknown;
 }
 
-const version = "0.1.0";
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-const Args = struct {
+    const parsed = try args.parse(allocator);
+
+    // Handle global commands
+    switch (parsed.command) {
+        .version => {
+            std.debug.print("lanceql {s}\n", .{args.version});
+            return;
+        },
+        .help => {
+            args.printHelp();
+            return;
+        },
+        .query => {
+            if (parsed.global.help or parsed.query.help) {
+                args.printQueryHelp();
+                return;
+            }
+            try cmdQuery(allocator, parsed.query);
+        },
+        .ingest => {
+            if (parsed.global.help or parsed.ingest.help) {
+                args.printIngestHelp();
+                return;
+            }
+            try cmdIngest(allocator, parsed.ingest);
+        },
+        .transform => {
+            if (parsed.global.help or parsed.transform.help) {
+                // TODO: printTransformHelp()
+                args.printHelp();
+                return;
+            }
+            try cmdTransform(allocator, parsed.transform);
+        },
+        .enrich => {
+            if (parsed.global.help or parsed.enrich.help) {
+                // TODO: printEnrichHelp()
+                args.printHelp();
+                return;
+            }
+            try cmdEnrich(allocator, parsed.enrich);
+        },
+        .serve => {
+            if (parsed.global.help or parsed.serve.help) {
+                args.printServeHelp();
+                return;
+            }
+            try cmdServe(allocator, parsed.serve);
+        },
+        .none => {
+            // No command - auto-detect mode
+            // Check for config file or start serve
+            if (parsed.global.config) |config_path| {
+                try runConfigFile(allocator, config_path);
+            } else if (findConfigFile()) |config_path| {
+                try runConfigFile(allocator, config_path);
+            } else {
+                // Default to help
+                args.printHelp();
+            }
+        },
+    }
+}
+
+/// Query command - execute SQL on Lance/Parquet files
+fn cmdQuery(allocator: std.mem.Allocator, opts: args.QueryOptions) !void {
+    // Read query from file if specified
+    var query_text = opts.query;
+    var file_content: ?[]const u8 = null;
+
+    if (opts.file) |file_path| {
+        const f = std.fs.cwd().openFile(file_path, .{}) catch |err| {
+            std.debug.print("Error opening file '{s}': {}\n", .{ file_path, err });
+            return;
+        };
+        defer f.close();
+
+        file_content = f.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+            std.debug.print("Error reading file: {}\n", .{err});
+            return;
+        };
+        query_text = file_content;
+    }
+
+    defer if (file_content) |fc| allocator.free(fc);
+
+    if (query_text == null) {
+        args.printQueryHelp();
+        return;
+    }
+
+    // Initialize GPU if available
+    _ = metal.initGPU();
+    defer metal.cleanupGPU();
+
+    const query = query_text.?;
+
+    // Convert QueryOptions to legacy Args for existing functions
+    const legacy_args = LegacyArgs{
+        .query = query,
+        .benchmark = opts.benchmark,
+        .iterations = opts.iterations,
+        .warmup = opts.warmup,
+        .json = opts.json,
+        .csv = opts.csv,
+    };
+
+    if (opts.benchmark) {
+        try runBenchmark(allocator, query, legacy_args);
+    } else {
+        try runQuery(allocator, query, legacy_args);
+    }
+}
+
+/// Ingest command - convert CSV/JSON/Parquet to Lance
+fn cmdIngest(allocator: std.mem.Allocator, opts: args.IngestOptions) !void {
+    try ingest.run(allocator, opts);
+}
+
+/// Transform command - apply transformations to Lance data
+fn cmdTransform(allocator: std.mem.Allocator, opts: args.TransformOptions) !void {
+    _ = allocator;
+    if (opts.input == null) {
+        std.debug.print("Error: Input file required.\n", .{});
+        return;
+    }
+
+    std.debug.print("Transform: {s}\n", .{opts.input.?});
+    std.debug.print("Note: Transform command not yet implemented.\n", .{});
+}
+
+/// Enrich command - add embeddings and indexes
+fn cmdEnrich(allocator: std.mem.Allocator, opts: args.EnrichOptions) !void {
+    _ = allocator;
+    if (opts.input == null) {
+        std.debug.print("Error: Input file required.\n", .{});
+        return;
+    }
+
+    std.debug.print("Enrich: {s}\n", .{opts.input.?});
+    std.debug.print("Note: Enrich command not yet implemented.\n", .{});
+}
+
+/// Serve command - start interactive web server
+fn cmdServe(allocator: std.mem.Allocator, opts: args.ServeOptions) !void {
+    _ = allocator;
+    std.debug.print("Starting server on {s}:{d}...\n", .{ opts.host, opts.port });
+    if (opts.input) |input| {
+        std.debug.print("Serving: {s}\n", .{input});
+    }
+    std.debug.print("Note: Serve command not yet implemented.\n", .{});
+}
+
+/// Run pipeline from config file
+fn runConfigFile(allocator: std.mem.Allocator, config_path: []const u8) !void {
+    _ = allocator;
+    std.debug.print("Loading config: {s}\n", .{config_path});
+    std.debug.print("Note: Config file execution not yet implemented.\n", .{});
+}
+
+/// Find config file in current directory
+fn findConfigFile() ?[]const u8 {
+    const config_names = [_][]const u8{
+        "lanceql.yaml",
+        "lanceql.yml",
+        ".lanceqlrc.yaml",
+    };
+
+    for (config_names) |name| {
+        if (std.fs.cwd().access(name, .{})) |_| {
+            return name;
+        } else |_| {}
+    }
+    return null;
+}
+
+/// Legacy Args struct for backward compatibility with existing query functions
+const LegacyArgs = struct {
     query: ?[]const u8 = null,
     file: ?[]const u8 = null,
     benchmark: bool = false,
@@ -55,142 +239,6 @@ const Args = struct {
     csv: bool = false,
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const args = try parseArgs(allocator);
-
-    if (args.show_version) {
-        std.debug.print("lanceql {s}\n", .{version});
-        return;
-    }
-
-    if (args.help or args.query == null) {
-        printUsage();
-        return;
-    }
-
-    // Initialize GPU if available
-    _ = metal.initGPU();
-    defer metal.cleanupGPU();
-
-    const query = args.query.?;
-
-    if (args.benchmark) {
-        try runBenchmark(allocator, query, args);
-    } else {
-        try runQuery(allocator, query, args);
-    }
-}
-
-fn parseArgs(allocator: std.mem.Allocator) !Args {
-    const argv = try std.process.argsAlloc(allocator);
-    // Don't free argv - we need to keep strings alive
-
-    var args = Args{};
-    var i: usize = 1;
-
-    while (i < argv.len) : (i += 1) {
-        const arg = argv[i];
-
-        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            args.help = true;
-        } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
-            args.show_version = true;
-        } else if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--command")) {
-            i += 1;
-            if (i < argv.len) args.query = argv[i];
-        } else if (std.mem.eql(u8, arg, "-f") or std.mem.eql(u8, arg, "--file")) {
-            i += 1;
-            if (i < argv.len) args.file = argv[i];
-        } else if (std.mem.eql(u8, arg, "-b") or std.mem.eql(u8, arg, "--benchmark")) {
-            args.benchmark = true;
-        } else if (std.mem.eql(u8, arg, "-i") or std.mem.eql(u8, arg, "--iterations")) {
-            i += 1;
-            if (i < argv.len) {
-                args.iterations = std.fmt.parseInt(usize, argv[i], 10) catch 10;
-            }
-        } else if (std.mem.eql(u8, arg, "-w") or std.mem.eql(u8, arg, "--warmup")) {
-            i += 1;
-            if (i < argv.len) {
-                args.warmup = std.fmt.parseInt(usize, argv[i], 10) catch 3;
-            }
-        } else if (std.mem.eql(u8, arg, "--json")) {
-            args.json = true;
-        } else if (std.mem.eql(u8, arg, "--csv")) {
-            args.csv = true;
-        } else if (!std.mem.startsWith(u8, arg, "-")) {
-            // Positional argument = query
-            args.query = argv[i];
-        }
-    }
-
-    // Read query from file if specified
-    if (args.file) |file_path| {
-        const f = std.fs.cwd().openFile(file_path, .{}) catch |err| {
-            std.debug.print("Error opening file '{s}': {}\n", .{ file_path, err });
-            return args;
-        };
-        defer f.close();
-
-        const content = f.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
-            std.debug.print("Error reading file: {}\n", .{err});
-            return args;
-        };
-        args.query = content;
-    }
-
-    return args;
-}
-
-fn printUsage() void {
-    std.debug.print(
-        \\LanceQL - Native query engine for Lance/Parquet files
-        \\
-        \\Usage:
-        \\  lanceql [OPTIONS] "SQL QUERY"
-        \\  lanceql -c "SELECT * FROM 'data.lance' LIMIT 10"
-        \\  lanceql -f query.sql
-        \\  lanceql --benchmark "SELECT COUNT(*) FROM 'data.parquet'"
-        \\
-        \\Options:
-        \\  -c, --command <SQL>    Execute SQL query
-        \\  -f, --file <PATH>      Read SQL from file
-        \\  -b, --benchmark        Run query in benchmark mode (measure time)
-        \\  -i, --iterations <N>   Benchmark iterations (default: 10)
-        \\  -w, --warmup <N>       Warmup iterations (default: 3)
-        \\      --json             Output results as JSON
-        \\      --csv              Output results as CSV
-        \\  -h, --help             Show this help
-        \\  -v, --version          Show version
-        \\
-        \\Examples:
-        \\  # Query Lance file
-        \\  lanceql "SELECT * FROM 'users.lance' WHERE age > 25 LIMIT 100"
-        \\
-        \\  # Query Parquet file
-        \\  lanceql "SELECT COUNT(*), AVG(price) FROM 'sales.parquet'"
-        \\
-        \\  # Vector search
-        \\  lanceql "SELECT * FROM 'embeddings.lance' NEAR 'search query' TOPK 20"
-        \\
-        \\  # Benchmark query
-        \\  lanceql -b -i 20 "SELECT * FROM 'data.parquet' WHERE x > 100"
-        \\
-        \\Comparison with other tools:
-        \\  # DuckDB
-        \\  duckdb -c "SELECT * FROM 'data.parquet' LIMIT 10"
-        \\
-        \\  # Polars (Python)
-        \\  python -c "import polars as pl; print(pl.read_parquet('data.parquet').head(10))"
-        \\
-        \\  # LanceQL (this tool)
-        \\  lanceql -c "SELECT * FROM 'data.parquet' LIMIT 10"
-        \\
-    , .{});
-}
 
 /// Extract table path from SQL query (finds 'path' in FROM clause)
 fn extractTablePath(query: []const u8) ?[]const u8 {
@@ -278,7 +326,7 @@ fn openFileOrDataset(allocator: std.mem.Allocator, path: []const u8) ?[]const u8
     return file.readToEndAlloc(allocator, 500 * 1024 * 1024) catch null;
 }
 
-fn runQuery(allocator: std.mem.Allocator, query: []const u8, args: Args) !void {
+fn runQuery(allocator: std.mem.Allocator, query: []const u8, legacy_args: LegacyArgs) !void {
     // Extract table path from query
     const table_path = extractTablePath(query) orelse {
         std.debug.print("Error: Could not extract table path from query\n", .{});
@@ -298,19 +346,19 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, args: Args) !void {
 
     switch (file_type) {
         .parquet => {
-            runParquetQuery(allocator, data, query, args) catch |err| {
+            runParquetQuery(allocator, data, query, legacy_args) catch |err| {
                 std.debug.print("Parquet query error: {}\n", .{err});
             };
         },
         .lance => {
-            runLanceQuery(allocator, data, query, args) catch |err| {
+            runLanceQuery(allocator, data, query, legacy_args) catch |err| {
                 std.debug.print("Lance query error: {}\n", .{err});
             };
         },
         .unknown => {
             // Try Lance first, then Parquet
-            runLanceQuery(allocator, data, query, args) catch {
-                runParquetQuery(allocator, data, query, args) catch |err| {
+            runLanceQuery(allocator, data, query, legacy_args) catch {
+                runParquetQuery(allocator, data, query, legacy_args) catch |err| {
                     std.debug.print("Query error: {}\n", .{err});
                 };
             };
@@ -318,7 +366,7 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, args: Args) !void {
     }
 }
 
-fn runLanceQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, args: Args) !void {
+fn runLanceQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
     // Initialize Lance Table
     var table = Table.init(allocator, data) catch |err| {
         return err;
@@ -348,16 +396,16 @@ fn runLanceQuery(allocator: std.mem.Allocator, data: []const u8, query: []const 
     defer result.deinit();
 
     // Output results
-    if (args.json) {
+    if (legacy_args.json) {
         printResultsJson(&result);
-    } else if (args.csv) {
+    } else if (legacy_args.csv) {
         printResultsCsv(&result);
     } else {
         printResultsTable(&result);
     }
 }
 
-fn runParquetQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, args: Args) !void {
+fn runParquetQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
     _ = query; // TODO: Parse and execute full SQL
 
     // Initialize Parquet Table
@@ -373,12 +421,12 @@ fn runParquetQuery(allocator: std.mem.Allocator, data: []const u8, query: []cons
     // TODO: Implement full SQL parsing for Parquet
 
     // Print header
-    if (args.json) {
+    if (legacy_args.json) {
         std.debug.print("[", .{});
     } else {
         for (col_names, 0..) |name, i| {
             if (i > 0) {
-                if (args.csv) std.debug.print(",", .{}) else std.debug.print("\t", .{});
+                if (legacy_args.csv) std.debug.print(",", .{}) else std.debug.print("\t", .{});
             }
             std.debug.print("{s}", .{name});
         }
@@ -415,29 +463,29 @@ fn runParquetQuery(allocator: std.mem.Allocator, data: []const u8, query: []cons
 
     // Print rows
     for (0..limit) |row| {
-        if (args.json) {
+        if (legacy_args.json) {
             if (row > 0) std.debug.print(",", .{});
             std.debug.print("{{", .{});
         }
 
         for (col_data.items, 0..) |cv, i| {
-            if (args.json) {
+            if (legacy_args.json) {
                 if (i > 0) std.debug.print(",", .{});
                 std.debug.print("\"{s}\":", .{col_names[i]});
             } else if (i > 0) {
-                if (args.csv) std.debug.print(",", .{}) else std.debug.print("\t", .{});
+                if (legacy_args.csv) std.debug.print(",", .{}) else std.debug.print("\t", .{});
             }
-            printParquetValue(cv, row, args.json);
+            printParquetValue(cv, row, legacy_args.json);
         }
 
-        if (args.json) {
+        if (legacy_args.json) {
             std.debug.print("}}", .{});
         } else {
             std.debug.print("\n", .{});
         }
     }
 
-    if (args.json) {
+    if (legacy_args.json) {
         std.debug.print("]\n", .{});
     }
 }
@@ -582,7 +630,7 @@ fn printValueJson(data: executor.Result.ColumnData, row: usize) void {
     }
 }
 
-fn runBenchmark(allocator: std.mem.Allocator, query: []const u8, args: Args) !void {
+fn runBenchmark(allocator: std.mem.Allocator, query: []const u8, legacy_args: LegacyArgs) !void {
     // Extract table path from query
     const table_path = extractTablePath(query) orelse {
         std.debug.print("Error: Could not extract table path from query\n", .{});
@@ -634,10 +682,10 @@ fn runBenchmark(allocator: std.mem.Allocator, query: []const u8, args: Args) !vo
     std.debug.print("=================\n", .{});
     std.debug.print("Query: {s}\n", .{query});
     std.debug.print("Table: {s} ({d} columns)\n", .{ table_path, num_rows });
-    std.debug.print("Warmup: {d}, Iterations: {d}\n\n", .{ args.warmup, args.iterations });
+    std.debug.print("Warmup: {d}, Iterations: {d}\n\n", .{ legacy_args.warmup, legacy_args.iterations });
 
     // Warmup
-    for (0..args.warmup) |_| {
+    for (0..legacy_args.warmup) |_| {
         var exec = executor.Executor.init(&table, allocator);
         var result = exec.execute(&stmt.select, &[_]ast.Value{}) catch continue;
         result.deinit();
@@ -645,10 +693,10 @@ fn runBenchmark(allocator: std.mem.Allocator, query: []const u8, args: Args) !vo
     }
 
     // Benchmark
-    var times = try allocator.alloc(u64, args.iterations);
+    var times = try allocator.alloc(u64, legacy_args.iterations);
     defer allocator.free(times);
 
-    for (0..args.iterations) |i| {
+    for (0..legacy_args.iterations) |i| {
         var timer = try std.time.Timer.start();
         var exec = executor.Executor.init(&table, allocator);
         var result = exec.execute(&stmt.select, &[_]ast.Value{}) catch {
@@ -673,13 +721,13 @@ fn runBenchmark(allocator: std.mem.Allocator, query: []const u8, args: Args) !vo
         total_ns += t;
     }
 
-    const avg_ns = total_ns / args.iterations;
+    const avg_ns = total_ns / legacy_args.iterations;
     const avg_ms = @as(f64, @floatFromInt(avg_ns)) / 1_000_000;
     const min_ms = @as(f64, @floatFromInt(min_ns)) / 1_000_000;
     const max_ms = @as(f64, @floatFromInt(max_ns)) / 1_000_000;
     const throughput = @as(f64, @floatFromInt(num_rows)) / avg_ms / 1000;
 
-    if (args.json) {
+    if (legacy_args.json) {
         std.debug.print(
             \\{{"query": "{s}", "columns": {d}, "min_ms": {d:.3}, "avg_ms": {d:.3}, "max_ms": {d:.3}, "throughput_mrows_sec": {d:.2}}}
             \\

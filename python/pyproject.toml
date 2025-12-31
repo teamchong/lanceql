@@ -39,6 +39,9 @@ all = [
     "polars>=0.20.0",
 ]
 
+[project.scripts]
+lanceql = "metal0.lanceql.__main__:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["metal0*"]
