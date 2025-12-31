@@ -3958,12 +3958,20 @@ const getStoreWorker = getLanceWorker;
  * const user = await store.get('user');
  */
 export class Store {
+    /**
+     * @param {string} name - Store name
+     * @param {Object} options - Store options
+     * @param {boolean} options.session - If true, clears data on tab close
+     * @param {Function} options.getEncryptionKey - Async callback returning encryption key (CryptoKey or raw bytes)
+     */
     constructor(name, options = {}) {
         this.name = name;
         this.options = options;
         this._ready = false;
         this._sessionMode = options.session || false;
         this._semanticSearchEnabled = false;
+        this._getEncryptionKey = options.getEncryptionKey || null;
+        this._encryptionKeyId = null;  // Sent to worker to identify key
     }
 
     /**
@@ -3973,7 +3981,39 @@ export class Store {
     async open() {
         if (this._ready) return this;
 
-        await workerRPC('open', { name: this.name, options: this.options });
+        // If encryption is enabled, derive key and send to worker
+        let encryptionConfig = null;
+        if (this._getEncryptionKey) {
+            const key = await this._getEncryptionKey();
+            this._encryptionKeyId = `${this.name}:${Date.now()}`;
+
+            // Convert key to raw bytes if needed
+            let keyBytes;
+            if (key instanceof CryptoKey) {
+                keyBytes = await crypto.subtle.exportKey('raw', key);
+            } else if (key instanceof ArrayBuffer || key instanceof Uint8Array) {
+                keyBytes = key instanceof Uint8Array ? key : new Uint8Array(key);
+            } else if (typeof key === 'string') {
+                // Hash string to get 256-bit key
+                const encoder = new TextEncoder();
+                const data = encoder.encode(key);
+                const hash = await crypto.subtle.digest('SHA-256', data);
+                keyBytes = new Uint8Array(hash);
+            } else {
+                throw new Error('Encryption key must be CryptoKey, ArrayBuffer, Uint8Array, or string');
+            }
+
+            encryptionConfig = {
+                keyId: this._encryptionKeyId,
+                keyBytes: Array.from(keyBytes instanceof Uint8Array ? keyBytes : new Uint8Array(keyBytes))
+            };
+        }
+
+        await workerRPC('open', {
+            name: this.name,
+            options: this.options,
+            encryption: encryptionConfig
+        });
 
         // Session mode cleanup
         if (this._sessionMode && typeof window !== 'undefined') {
@@ -4154,6 +4194,7 @@ export class Store {
  * @param {string} name - Store name (used as OPFS directory)
  * @param {Object} options - Store options
  * @param {boolean} options.session - If true, clears data on tab close
+ * @param {Function} options.getEncryptionKey - Async callback returning encryption key
  * @returns {Promise<Store>}
  *
  * @example
@@ -4162,6 +4203,15 @@ export class Store {
  *
  * // Session store (clears on tab close)
  * const session = await lanceStore('temp', { session: true });
+ *
+ * // Encrypted store (AES-256-GCM)
+ * const secure = await lanceStore('vault', {
+ *     getEncryptionKey: async () => {
+ *         // Return key from password, hardware token, etc.
+ *         const password = await promptPassword();
+ *         return password; // String, Uint8Array, ArrayBuffer, or CryptoKey
+ *     }
+ * });
  */
 export async function lanceStore(name, options = {}) {
     const store = new Store(name, options);

@@ -189,6 +189,54 @@ class OPFSStorage {
 const opfsStorage = new OPFSStorage();
 
 // ============================================================================
+// Encryption helpers (AES-256-GCM)
+// ============================================================================
+
+const encryptionKeys = new Map();  // keyId -> CryptoKey
+
+async function importEncryptionKey(keyBytes) {
+    return crypto.subtle.importKey(
+        'raw',
+        new Uint8Array(keyBytes),
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+    );
+}
+
+async function encryptData(data, cryptoKey) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));  // 96-bit IV for GCM
+    const encoder = new TextEncoder();
+    const plaintext = encoder.encode(JSON.stringify(data));
+
+    const ciphertext = await crypto.subtle.encrypt(
+        { name: 'AES-GCM', iv },
+        cryptoKey,
+        plaintext
+    );
+
+    // Format: [iv (12 bytes)][ciphertext]
+    const result = new Uint8Array(12 + ciphertext.byteLength);
+    result.set(iv, 0);
+    result.set(new Uint8Array(ciphertext), 12);
+    return result;
+}
+
+async function decryptData(encrypted, cryptoKey) {
+    const iv = encrypted.slice(0, 12);
+    const ciphertext = encrypted.slice(12);
+
+    const plaintext = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv },
+        cryptoKey,
+        ciphertext
+    );
+
+    const decoder = new TextDecoder();
+    return JSON.parse(decoder.decode(plaintext));
+}
+
+// ============================================================================
 // WorkerStore - Key-value storage (for Store API)
 // ============================================================================
 
@@ -199,10 +247,21 @@ class WorkerStore {
         this._root = null;
         this._ready = false;
         this._embedder = null;
+        this._encryptionKeyId = null;
     }
 
-    async open() {
+    async open(encryptionConfig = null) {
         if (this._ready) return this;
+
+        // Set up encryption if provided
+        if (encryptionConfig) {
+            const { keyId, keyBytes } = encryptionConfig;
+            if (!encryptionKeys.has(keyId)) {
+                const cryptoKey = await importEncryptionKey(keyBytes);
+                encryptionKeys.set(keyId, cryptoKey);
+            }
+            this._encryptionKeyId = keyId;
+        }
 
         try {
             const opfsRoot = await navigator.storage.getDirectory();
@@ -216,14 +275,26 @@ class WorkerStore {
         return this;
     }
 
+    _getCryptoKey() {
+        return this._encryptionKeyId ? encryptionKeys.get(this._encryptionKeyId) : null;
+    }
+
     async get(key) {
         await this._ensureOpen();
 
         try {
-            const fileHandle = await this._root.getFileHandle(`${key}.json`);
+            const cryptoKey = this._getCryptoKey();
+            const ext = cryptoKey ? '.enc' : '.json';
+            const fileHandle = await this._root.getFileHandle(`${key}${ext}`);
             const file = await fileHandle.getFile();
-            const text = await file.text();
-            return JSON.parse(text);
+
+            if (cryptoKey) {
+                const buffer = await file.arrayBuffer();
+                return decryptData(new Uint8Array(buffer), cryptoKey);
+            } else {
+                const text = await file.text();
+                return JSON.parse(text);
+            }
         } catch (e) {
             if (e.name === 'NotFoundError') return undefined;
             throw e;
@@ -233,17 +304,29 @@ class WorkerStore {
     async set(key, value) {
         await this._ensureOpen();
 
-        const fileHandle = await this._root.getFileHandle(`${key}.json`, { create: true });
+        const cryptoKey = this._getCryptoKey();
+        const ext = cryptoKey ? '.enc' : '.json';
+        const fileHandle = await this._root.getFileHandle(`${key}${ext}`, { create: true });
         const writable = await fileHandle.createWritable();
-        await writable.write(JSON.stringify(value));
+
+        if (cryptoKey) {
+            const encrypted = await encryptData(value, cryptoKey);
+            await writable.write(encrypted);
+        } else {
+            await writable.write(JSON.stringify(value));
+        }
+
         await writable.close();
     }
 
     async delete(key) {
         await this._ensureOpen();
 
+        const cryptoKey = this._getCryptoKey();
+        const ext = cryptoKey ? '.enc' : '.json';
+
         try {
-            await this._root.removeEntry(`${key}.json`);
+            await this._root.removeEntry(`${key}${ext}`);
         } catch (e) {
             if (e.name !== 'NotFoundError') throw e;
         }
@@ -252,10 +335,13 @@ class WorkerStore {
     async keys() {
         await this._ensureOpen();
 
+        const cryptoKey = this._getCryptoKey();
+        const ext = cryptoKey ? '.enc' : '.json';
+
         const keys = [];
         for await (const [name] of this._root.entries()) {
-            if (name.endsWith('.json')) {
-                keys.push(name.slice(0, -5));
+            if (name.endsWith(ext)) {
+                keys.push(name.slice(0, -ext.length));
             }
         }
         return keys;
@@ -1608,11 +1694,13 @@ async function executeSQL(db, sql) {
 // Get or create instances
 // ============================================================================
 
-async function getStore(name, options = {}) {
-    const key = `${name}:${JSON.stringify(options)}`;
+async function getStore(name, options = {}, encryptionConfig = null) {
+    // Include encryption key ID in cache key (but not the actual key bytes)
+    const encKeyId = encryptionConfig?.keyId || 'none';
+    const key = `${name}:${encKeyId}:${JSON.stringify(options)}`;
     if (!stores.has(key)) {
         const store = new WorkerStore(name, options);
-        await store.open();
+        await store.open(encryptionConfig);
         stores.set(key, store);
     }
     return stores.get(key);
@@ -1683,7 +1771,7 @@ async function handleMessage(port, data) {
         if (method === 'ping') {
             result = 'pong';
         } else if (method === 'open') {
-            await getStore(args.name, args.options);
+            await getStore(args.name, args.options, args.encryption);
             result = true;
         } else if (method === 'get') {
             result = await (await getStore(args.name)).get(args.key);
