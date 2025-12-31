@@ -3252,50 +3252,34 @@ const DataType = {
  * for high-throughput writes without exhausting file handles.
  */
 export class LocalDatabase {
-    constructor(name, storage = opfsStorage) {
+    /**
+     * Create a LocalDatabase instance.
+     * All operations are executed in a SharedWorker for OPFS sync access.
+     *
+     * @param {string} name - Database name
+     */
+    constructor(name) {
         this.name = name;
-        this.storage = storage;
-        this.tables = new Map();  // tableName -> TableState
-        this.version = 0;
-        this.manifestKey = `${name}/__manifest__`;
-
-        // Write buffer for fast inserts
-        this._writeBuffer = new Map();  // tableName -> [{row}, ...]
-        this._flushTimer = null;
-        this._flushInterval = 1000;  // Flush every 1 second
-        this._flushThreshold = 1000; // Or when buffer exceeds 1000 rows
-        this._flushing = false;
-
-        // Read cache for fast queries
-        this._readCache = new Map();  // fragKey -> [{row}, ...]
+        this._ready = false;
     }
 
     /**
-     * Open or create the database
+     * Open or create the database.
+     * Connects to the SharedWorker.
+     *
+     * @returns {Promise<LocalDatabase>}
      */
     async open() {
-        // Load manifest from storage
-        const manifestData = await this.storage.load(this.manifestKey);
-        if (manifestData) {
-            const manifest = JSON.parse(new TextDecoder().decode(manifestData));
-            this.version = manifest.version || 0;
-            this.tables = new Map(Object.entries(manifest.tables || {}));
-        }
+        if (this._ready) return this;
+        await workerRPC('db:open', { name: this.name });
+        this._ready = true;
         return this;
     }
 
-    /**
-     * Save manifest to storage (atomic commit point)
-     */
-    async _saveManifest() {
-        this.version++;
-        const manifest = {
-            version: this.version,
-            timestamp: Date.now(),
-            tables: Object.fromEntries(this.tables),
-        };
-        const data = new TextEncoder().encode(JSON.stringify(manifest));
-        await this.storage.save(this.manifestKey, data);
+    async _ensureOpen() {
+        if (!this._ready) {
+            await this.open();
+        }
     }
 
     /**
@@ -3303,1093 +3287,191 @@ export class LocalDatabase {
      * @param {string} tableName - Table name
      * @param {Array} columns - Column definitions [{name, type, primaryKey?, vectorDim?}]
      * @param {boolean} ifNotExists - If true, don't error if table already exists
+     * @returns {Promise<{success: boolean, table?: string, existed?: boolean}>}
      */
     async createTable(tableName, columns, ifNotExists = false) {
-        if (this.tables.has(tableName)) {
-            if (ifNotExists) {
-                return { success: true, existed: true };
-            }
-            throw new Error(`Table '${tableName}' already exists`);
-        }
-
-        const schema = columns.map(col => ({
-            name: col.name,
-            type: DataType[(col.dataType || col.type)?.toUpperCase()] || col.dataType || col.type || 'string',
-            primaryKey: col.primaryKey || false,
-            vectorDim: col.vectorDim || null,
-        }));
-
-        const tableState = {
-            name: tableName,
-            schema,
-            fragments: [],      // List of data fragment keys
-            deletionVector: [], // Row IDs that are deleted
-            rowCount: 0,
-            nextRowId: 0,
-            createdAt: Date.now(),
-        };
-
-        this.tables.set(tableName, tableState);
-        await this._saveManifest();
-
-        return { success: true, table: tableName };
+        await this._ensureOpen();
+        return workerRPC('db:createTable', {
+            db: this.name,
+            tableName,
+            columns,
+            ifNotExists
+        });
     }
 
     /**
      * DROP TABLE
      * @param {string} tableName - Table name
      * @param {boolean} ifExists - If true, don't error if table doesn't exist
+     * @returns {Promise<{success: boolean, table?: string, existed?: boolean}>}
      */
     async dropTable(tableName, ifExists = false) {
-        if (!this.tables.has(tableName)) {
-            if (ifExists) {
-                // Also clear any orphaned buffer
-                this._writeBuffer.delete(tableName);
-                return { success: true, existed: false };
-            }
-            throw new Error(`Table '${tableName}' does not exist`);
-        }
-
-        const table = this.tables.get(tableName);
-
-        // Clear write buffer for this table
-        this._writeBuffer.delete(tableName);
-
-        // Clear read cache and delete all fragments
-        for (const fragKey of table.fragments) {
-            this._readCache.delete(fragKey);
-            await this.storage.delete(fragKey);
-        }
-
-        this.tables.delete(tableName);
-        await this._saveManifest();
-
-        return { success: true, table: tableName };
+        await this._ensureOpen();
+        return workerRPC('db:dropTable', {
+            db: this.name,
+            tableName,
+            ifExists
+        });
     }
 
     /**
-     * INSERT INTO - buffers writes for performance, flushes periodically
+     * INSERT INTO
      * @param {string} tableName - Table name
      * @param {Array} rows - Array of row objects [{col1: val1, col2: val2}, ...]
+     * @returns {Promise<{success: boolean, inserted: number}>}
      */
     async insert(tableName, rows) {
-        if (!this.tables.has(tableName)) {
-            throw new Error(`Table '${tableName}' does not exist`);
-        }
-
-        const table = this.tables.get(tableName);
-
-        // Assign row IDs and add to buffer
-        const rowsWithIds = rows.map(row => ({
-            __rowId: table.nextRowId++,
-            ...row,
-        }));
-
-        // Add to write buffer
-        if (!this._writeBuffer.has(tableName)) {
-            this._writeBuffer.set(tableName, []);
-        }
-        this._writeBuffer.get(tableName).push(...rowsWithIds);
-        table.rowCount += rows.length;
-
-        // Schedule flush if not already scheduled
-        this._scheduleFlush();
-
-        // Check if we should flush immediately (buffer threshold)
-        const bufferSize = this._writeBuffer.get(tableName).length;
-        if (bufferSize >= this._flushThreshold) {
-            await this._flushTable(tableName);
-        }
-
-        return { success: true, inserted: rows.length };
-    }
-
-    /**
-     * Schedule a flush to OPFS
-     */
-    _scheduleFlush() {
-        if (this._flushTimer) return;
-        this._flushTimer = setTimeout(() => {
-            this._flushTimer = null;
-            this.flush().catch(e => console.warn('[LocalDatabase] Flush error:', e));
-        }, this._flushInterval);
+        await this._ensureOpen();
+        return workerRPC('db:insert', {
+            db: this.name,
+            tableName,
+            rows
+        });
     }
 
     /**
      * Flush all buffered writes to OPFS
+     * @returns {Promise<void>}
      */
     async flush() {
-        if (this._flushing) return;
-        this._flushing = true;
-
-        try {
-            const tables = [...this._writeBuffer.keys()];
-            for (const tableName of tables) {
-                await this._flushTable(tableName);
-            }
-        } finally {
-            this._flushing = false;
-        }
-    }
-
-    /**
-     * Flush a single table's buffer to OPFS
-     */
-    async _flushTable(tableName) {
-        const buffer = this._writeBuffer.get(tableName);
-        if (!buffer || buffer.length === 0) return;
-
-        const table = this.tables.get(tableName);
-        if (!table) return;
-
-        // Take all buffered rows
-        const rowsToFlush = buffer.splice(0, buffer.length);
-
-        // Add __rowId to schema if not present
-        const schemaWithRowId = [
-            { name: '__rowId', type: 'int64', primaryKey: true },
-            ...table.schema.filter(c => c.name !== '__rowId')
-        ];
-
-        // Create Lance file using WASM writer
-        const writer = new LanceFileWriter(schemaWithRowId);
-        writer.addRows(rowsToFlush);
-        const lanceData = writer.build();
-
-        // Save as .lance fragment
-        const fragKey = `${this.name}/${tableName}/frag_${Date.now()}_${Math.random().toString(36).slice(2)}.lance`;
-        await this.storage.save(fragKey, lanceData);
-
-        // Update table state
-        table.fragments.push(fragKey);
-        await this._saveManifest();
+        await this._ensureOpen();
+        return workerRPC('db:flush', { db: this.name });
     }
 
     /**
      * DELETE FROM
      * @param {string} tableName - Table name
-     * @param {Function} predicate - Filter function (row) => boolean
+     * @param {Object} where - WHERE clause as parsed AST (column/op/value)
+     * @returns {Promise<{success: boolean, deleted: number}>}
      */
-    async delete(tableName, predicate) {
-        if (!this.tables.has(tableName)) {
-            throw new Error(`Table '${tableName}' does not exist`);
-        }
-
-        const table = this.tables.get(tableName);
-        let deletedCount = 0;
-
-        // Delete from buffer (rows not yet persisted)
-        const buffer = this._writeBuffer.get(tableName);
-        if (buffer && buffer.length > 0) {
-            const originalLen = buffer.length;
-            const remaining = buffer.filter(row => !predicate(row));
-            buffer.length = 0;
-            buffer.push(...remaining);
-            deletedCount += (originalLen - remaining.length);
-        }
-
-        // Delete from persisted fragments (add to deletion vector)
-        for (const fragKey of table.fragments) {
-            const fragData = await this.storage.load(fragKey);
-            if (fragData) {
-                const rows = this._parseFragment(fragData, table.schema);
-                for (const row of rows) {
-                    if (!table.deletionVector.includes(row.__rowId) && predicate(row)) {
-                        table.deletionVector.push(row.__rowId);
-                        deletedCount++;
-                    }
-                }
-            }
-        }
-
-        table.rowCount -= deletedCount;
-        await this._saveManifest();
-
-        return { success: true, deleted: deletedCount };
+    async delete(tableName, where = null) {
+        await this._ensureOpen();
+        return workerRPC('db:delete', {
+            db: this.name,
+            tableName,
+            where
+        });
     }
 
     /**
      * UPDATE
      * @param {string} tableName - Table name
      * @param {Object} updates - Column updates {col1: newVal, col2: newVal}
-     * @param {Function} predicate - Filter function (row) => boolean
+     * @param {Object} where - WHERE clause as parsed AST (column/op/value)
+     * @returns {Promise<{success: boolean, updated: number}>}
      */
-    async update(tableName, updates, predicate) {
-        if (!this.tables.has(tableName)) {
-            throw new Error(`Table '${tableName}' does not exist`);
-        }
-
-        const table = this.tables.get(tableName);
-        let updatedCount = 0;
-
-        // Update buffered rows in place
-        const buffer = this._writeBuffer.get(tableName);
-        if (buffer && buffer.length > 0) {
-            for (const row of buffer) {
-                if (predicate(row)) {
-                    Object.assign(row, updates);
-                    updatedCount++;
-                }
-            }
-        }
-
-        // Update persisted rows (mark as deleted, insert new)
-        const persistedUpdates = [];
-        for (const fragKey of table.fragments) {
-            const fragData = await this.storage.load(fragKey);
-            if (fragData) {
-                const rows = this._parseFragment(fragData, table.schema);
-                for (const row of rows) {
-                    if (!table.deletionVector.includes(row.__rowId) && predicate(row)) {
-                        // Mark old row as deleted
-                        table.deletionVector.push(row.__rowId);
-                        table.rowCount--;
-
-                        // Create new row with updates
-                        const newRow = { ...row, ...updates };
-                        delete newRow.__rowId;
-                        persistedUpdates.push(newRow);
-                        updatedCount++;
-                    }
-                }
-            }
-        }
-
-        // Insert updated rows (will go to buffer)
-        if (persistedUpdates.length > 0) {
-            await this.insert(tableName, persistedUpdates);
-        } else {
-            await this._saveManifest();
-        }
-
-        return { success: true, updated: updatedCount };
+    async update(tableName, updates, where = null) {
+        await this._ensureOpen();
+        return workerRPC('db:update', {
+            db: this.name,
+            tableName,
+            updates,
+            where
+        });
     }
 
     /**
      * SELECT (query)
      * @param {string} tableName - Table name
      * @param {Object} options - Query options {columns, where, limit, offset, orderBy}
+     * @returns {Promise<Array>}
      */
     async select(tableName, options = {}) {
-        if (!this.tables.has(tableName)) {
-            throw new Error(`Table '${tableName}' does not exist`);
-        }
+        await this._ensureOpen();
 
-        let rows = await this._readAllRows(tableName);
+        // Convert where function to AST if needed (cannot serialize functions)
+        const rpcOptions = { ...options };
+        delete rpcOptions.where; // Functions can't be serialized
 
-        // WHERE filter
-        if (options.where) {
-            rows = rows.filter(options.where);
-        }
-
-        // ORDER BY
-        if (options.orderBy) {
-            const { column, desc } = options.orderBy;
-            rows.sort((a, b) => {
-                const cmp = a[column] < b[column] ? -1 : a[column] > b[column] ? 1 : 0;
-                return desc ? -cmp : cmp;
-            });
-        }
-
-        // OFFSET
-        if (options.offset) {
-            rows = rows.slice(options.offset);
-        }
-
-        // LIMIT
-        if (options.limit) {
-            rows = rows.slice(0, options.limit);
-        }
-
-        // Column projection
-        if (options.columns && options.columns.length > 0 && options.columns[0] !== '*') {
-            rows = rows.map(row => {
-                const projected = {};
-                for (const col of options.columns) {
-                    projected[col] = row[col];
-                }
-                return projected;
-            });
-        }
-
-        // Remove internal __rowId
-        rows = rows.map(row => {
-            const { __rowId, ...rest } = row;
-            return rest;
+        return workerRPC('db:select', {
+            db: this.name,
+            tableName,
+            options: rpcOptions,
+            where: options.whereAST || null
         });
-
-        return rows;
     }
 
     /**
-     * Read all rows from a table (excluding deleted)
-     * Includes both persisted fragments AND buffered (unflushed) rows
-     * Uses read cache for fast repeated queries
-     */
-    async _readAllRows(tableName) {
-        const table = this.tables.get(tableName);
-        const deletedSet = new Set(table.deletionVector);
-        const allRows = [];
-
-        // Read from persisted fragments (with caching)
-        for (const fragKey of table.fragments) {
-            let rows = this._readCache.get(fragKey);
-
-            if (!rows) {
-                // Cache miss - load from OPFS and cache
-                const fragData = await this.storage.load(fragKey);
-                if (fragData) {
-                    rows = this._parseFragment(fragData, table.schema);
-                    this._readCache.set(fragKey, rows);
-                } else {
-                    rows = [];
-                }
-            }
-
-            // Filter deleted rows
-            for (const row of rows) {
-                if (!deletedSet.has(row.__rowId)) {
-                    allRows.push(row);
-                }
-            }
-        }
-
-        // Include buffered (unflushed) rows
-        const buffer = this._writeBuffer.get(tableName);
-        if (buffer && buffer.length > 0) {
-            for (const row of buffer) {
-                if (!deletedSet.has(row.__rowId)) {
-                    allRows.push(row);
-                }
-            }
-        }
-
-        return allRows;
-    }
-
-    /**
-     * Parse a fragment (Lance or JSON format)
-     */
-    _parseFragment(data, schema) {
-        // Check for Lance magic at end of file
-        if (data.length >= 40) {
-            const magic = new TextDecoder().decode(data.slice(-4));
-            if (magic === 'LANC') {
-                return this._parseLanceFragment(data, schema);
-            }
-        }
-
-        // Try JSON format
-        try {
-            const text = new TextDecoder().decode(data);
-            const parsed = JSON.parse(text);
-
-            // Check for LanceFileWriter JSON fallback format
-            if (parsed.format === 'json' && parsed.columns) {
-                return this._parseJsonColumnar(parsed);
-            }
-
-            // Legacy row-based JSON format
-            return Array.isArray(parsed) ? parsed : [parsed];
-        } catch (e) {
-            console.warn('[LocalDatabase] Failed to parse fragment:', e);
-            return [];
-        }
-    }
-
-    /**
-     * Parse JSON columnar format (LanceFileWriter fallback)
-     */
-    _parseJsonColumnar(data) {
-        const { schema, columns, rowCount } = data;
-        const rows = [];
-
-        for (let i = 0; i < rowCount; i++) {
-            const row = {};
-            for (const col of schema) {
-                row[col.name] = columns[col.name]?.[i] ?? null;
-            }
-            rows.push(row);
-        }
-
-        return rows;
-    }
-
-    /**
-     * Parse Lance file format using WASM reader API
-     * All parsing/decoding logic is in WASM, JS only marshals data.
-     */
-    _parseLanceFragment(data, tableSchema) {
-        if (!_w?.fragmentLoad) {
-            // Fallback to JS parsing if WASM not loaded
-            return this._parseLanceFragmentJS(data, tableSchema);
-        }
-
-        // Copy data to WASM memory
-        const ptr = _w.alloc(data.length);
-        new Uint8Array(_m.buffer, ptr, data.length).set(data);
-
-        // Load fragment in WASM
-        if (!_w.fragmentLoad(ptr, data.length)) {
-            _w.free(ptr, data.length);
-            throw new Error('Failed to load Lance fragment');
-        }
-
-        const numColumns = _w.fragmentGetColumnCount();
-        const rowCount = Number(_w.fragmentGetRowCount());
-
-        if (rowCount === 0) {
-            _w.free(ptr, data.length);
-            return [];
-        }
-
-        // Read column info and data
-        const columns = {};
-        const nameBuf = _w.alloc(64);
-        const typeBuf = _w.alloc(16);
-
-        for (let i = 0; i < numColumns; i++) {
-            // Get column name
-            const nameLen = _w.fragmentGetColumnName(i, nameBuf, 64);
-            const name = D.decode(new Uint8Array(_m.buffer, nameBuf, nameLen));
-
-            // Get column type
-            const typeLen = _w.fragmentGetColumnType(i, typeBuf, 16);
-            const type = D.decode(new Uint8Array(_m.buffer, typeBuf, typeLen));
-
-            // Read column data based on type
-            columns[name] = this._readColumnFromWasm(i, type, rowCount);
-        }
-
-        _w.free(nameBuf, 64);
-        _w.free(typeBuf, 16);
-        _w.free(ptr, data.length);
-
-        // Build rows
-        const rows = [];
-        const colNames = Object.keys(columns);
-        for (let i = 0; i < rowCount; i++) {
-            const row = {};
-            for (const name of colNames) {
-                row[name] = columns[name][i];
-            }
-            rows.push(row);
-        }
-
-        return rows;
-    }
-
-    /**
-     * Read column data from WASM using fragment reader API
-     */
-    _readColumnFromWasm(colIdx, type, rowCount) {
-        const typeLower = type.toLowerCase();
-
-        switch (typeLower) {
-            case 'int64':
-            case 'int':
-            case 'integer':
-            case 'bigint': {
-                const buf = _w.alloc(rowCount * 8);
-                const count = _w.fragmentReadInt64(colIdx, buf, rowCount);
-                const arr = new BigInt64Array(_m.buffer, buf, count);
-                const values = Array.from(arr, v => Number(v));
-                _w.free(buf, rowCount * 8);
-                return values;
-            }
-
-            case 'int32': {
-                const buf = _w.alloc(rowCount * 4);
-                const count = _w.fragmentReadInt32(colIdx, buf, rowCount);
-                const values = Array.from(new Int32Array(_m.buffer, buf, count));
-                _w.free(buf, rowCount * 4);
-                return values;
-            }
-
-            case 'float64':
-            case 'float':
-            case 'double': {
-                const buf = _w.alloc(rowCount * 8);
-                const count = _w.fragmentReadFloat64(colIdx, buf, rowCount);
-                const values = Array.from(new Float64Array(_m.buffer, buf, count));
-                _w.free(buf, rowCount * 8);
-                return values;
-            }
-
-            case 'float32': {
-                const buf = _w.alloc(rowCount * 4);
-                const count = _w.fragmentReadFloat32(colIdx, buf, rowCount);
-                const values = Array.from(new Float32Array(_m.buffer, buf, count));
-                _w.free(buf, rowCount * 4);
-                return values;
-            }
-
-            case 'string':
-            case 'text':
-            case 'varchar': {
-                const values = [];
-                const strBuf = _w.alloc(4096); // Max string length
-                for (let i = 0; i < rowCount; i++) {
-                    const len = _w.fragmentReadStringAt(colIdx, i, strBuf, 4096);
-                    values.push(D.decode(new Uint8Array(_m.buffer, strBuf, len)));
-                }
-                _w.free(strBuf, 4096);
-                return values;
-            }
-
-            case 'bool':
-            case 'boolean': {
-                const buf = _w.alloc(rowCount);
-                const count = _w.fragmentReadBool(colIdx, buf, rowCount);
-                const arr = new Uint8Array(_m.buffer, buf, count);
-                const values = Array.from(arr, v => v !== 0);
-                _w.free(buf, rowCount);
-                return values;
-            }
-
-            case 'vector': {
-                const dim = _w.fragmentGetColumnVectorDim(colIdx);
-                if (dim === 0) return new Array(rowCount).fill([]);
-
-                const vecBuf = _w.alloc(dim * 4);
-                const values = [];
-                for (let i = 0; i < rowCount; i++) {
-                    _w.fragmentReadVectorAt(colIdx, i, vecBuf, dim);
-                    values.push(Array.from(new Float32Array(_m.buffer, vecBuf, dim)));
-                }
-                _w.free(vecBuf, dim * 4);
-                return values;
-            }
-
-            default:
-                return this._readColumnFromWasm(colIdx, 'string', rowCount);
-        }
-    }
-
-    /**
-     * Fallback JS parser for when WASM not available
-     */
-    _parseLanceFragmentJS(data, tableSchema) {
-        const footer = data.slice(-40);
-        const view = new DataView(footer.buffer, footer.byteOffset, footer.byteLength);
-
-        const columnMetaStart = Number(view.getBigUint64(0, true));
-        const columnMetaOffsetsStart = Number(view.getBigUint64(8, true));
-        const numColumns = view.getUint32(28, true);
-
-        const schemaWithRowId = [
-            { name: '__rowId', type: 'int64' },
-            ...tableSchema.filter(c => c.name !== '__rowId')
-        ];
-
-        const metaOffsets = [];
-        const offsetsView = new DataView(data.buffer, data.byteOffset + columnMetaOffsetsStart);
-        for (let i = 0; i < numColumns; i++) {
-            metaOffsets.push(Number(offsetsView.getBigUint64(i * 8, true)));
-        }
-
-        const columnInfos = [];
-        for (let i = 0; i < numColumns; i++) {
-            const metaStart = metaOffsets[i];
-            const metaEnd = i < numColumns - 1 ? metaOffsets[i + 1] : columnMetaOffsetsStart;
-            const metaBytes = data.slice(metaStart, metaEnd);
-            const info = this._parseColumnMetadataJS(metaBytes);
-            info.schema = schemaWithRowId[i] || { name: `col_${i}`, type: 'string' };
-            columnInfos.push(info);
-        }
-
-        const rowCount = columnInfos[0]?.rowCount || 0;
-        if (rowCount === 0) return [];
-
-        const columns = {};
-        for (let i = 0; i < columnInfos.length; i++) {
-            const info = columnInfos[i];
-            const colName = info.name || info.schema.name;
-            const colType = info.type || info.schema.type || 'string';
-            const colData = data.slice(info.dataOffset, info.dataOffset + info.dataSize);
-            columns[colName] = this._decodeColumnDataJS(colData, colType, rowCount, info.schema);
-        }
-
-        const rows = [];
-        for (let i = 0; i < rowCount; i++) {
-            const row = {};
-            for (const name of Object.keys(columns)) {
-                row[name] = columns[name][i];
-            }
-            rows.push(row);
-        }
-        return rows;
-    }
-
-    _parseColumnMetadataJS(bytes) {
-        const info = { name: '', type: 'string', nullable: true, dataOffset: 0, rowCount: 0, dataSize: 0 };
-        let pos = 0;
-        while (pos < bytes.length) {
-            const byte = bytes[pos++];
-            const fieldNum = byte >> 3;
-            const wireType = byte & 0x7;
-            if (fieldNum === 1 && wireType === 2) {
-                const len = this._readVarintJS(bytes, pos);
-                pos = len.nextPos;
-                info.name = D.decode(bytes.slice(pos, pos + len.value));
-                pos += len.value;
-            } else if (fieldNum === 2 && wireType === 2) {
-                const len = this._readVarintJS(bytes, pos);
-                pos = len.nextPos;
-                info.type = D.decode(bytes.slice(pos, pos + len.value));
-                pos += len.value;
-            } else if (fieldNum === 3 && wireType === 0) {
-                const val = this._readVarintJS(bytes, pos);
-                pos = val.nextPos;
-                info.nullable = val.value !== 0;
-            } else if (fieldNum === 4 && wireType === 1) {
-                info.dataOffset = Number(new DataView(bytes.buffer, bytes.byteOffset + pos, 8).getBigUint64(0, true));
-                pos += 8;
-            } else if (fieldNum === 5 && wireType === 0) {
-                const val = this._readVarintJS(bytes, pos);
-                pos = val.nextPos;
-                info.rowCount = val.value;
-            } else if (fieldNum === 6 && wireType === 0) {
-                const val = this._readVarintJS(bytes, pos);
-                pos = val.nextPos;
-                info.dataSize = val.value;
-            } else if (wireType === 0) {
-                const val = this._readVarintJS(bytes, pos);
-                pos = val.nextPos;
-            } else if (wireType === 1) {
-                pos += 8;
-            } else if (wireType === 2) {
-                const len = this._readVarintJS(bytes, pos);
-                pos = len.nextPos + len.value;
-            } else if (wireType === 5) {
-                pos += 4;
-            }
-        }
-        return info;
-    }
-
-    _readVarintJS(bytes, pos) {
-        let value = 0, shift = 0;
-        while (pos < bytes.length) {
-            const byte = bytes[pos++];
-            value |= (byte & 0x7F) << shift;
-            if ((byte & 0x80) === 0) break;
-            shift += 7;
-        }
-        return { value, nextPos: pos };
-    }
-
-    _decodeColumnDataJS(data, type, rowCount, schema) {
-        const t = type.toLowerCase();
-        const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-        if (t === 'int64' || t === 'int' || t === 'integer' || t === 'bigint') {
-            return Array.from({ length: rowCount }, (_, i) => Number(view.getBigInt64(i * 8, true)));
-        } else if (t === 'int32') {
-            return Array.from({ length: rowCount }, (_, i) => view.getInt32(i * 4, true));
-        } else if (t === 'float64' || t === 'float' || t === 'double') {
-            return Array.from({ length: rowCount }, (_, i) => view.getFloat64(i * 8, true));
-        } else if (t === 'float32') {
-            return Array.from({ length: rowCount }, (_, i) => view.getFloat32(i * 4, true));
-        } else if (t === 'string' || t === 'text' || t === 'varchar') {
-            const offsetsSize = (rowCount + 1) * 4;
-            const stringData = data.slice(0, data.length - offsetsSize);
-            const offsetsData = data.slice(data.length - offsetsSize);
-            const offView = new DataView(offsetsData.buffer, offsetsData.byteOffset);
-            return Array.from({ length: rowCount }, (_, i) => {
-                const start = offView.getUint32(i * 4, true);
-                const end = offView.getUint32((i + 1) * 4, true);
-                return D.decode(stringData.slice(start, end));
-            });
-        } else if (t === 'bool' || t === 'boolean') {
-            return Array.from({ length: rowCount }, (_, i) => (data[Math.floor(i / 8)] & (1 << (i % 8))) !== 0);
-        } else if (t === 'vector') {
-            const dim = schema?.vectorDim || 0;
-            if (dim === 0) return new Array(rowCount).fill([]);
-            return Array.from({ length: rowCount }, (_, i) =>
-                Array.from({ length: dim }, (_, j) => view.getFloat32((i * dim + j) * 4, true)));
-        }
-        return this._decodeColumnDataJS(data, 'string', rowCount, schema);
-    }
-
-    /**
-     * Get table info
-     */
-    getTable(tableName) {
-        return this.tables.get(tableName);
-    }
-
-    /**
-     * List all tables
-     */
-    listTables() {
-        return Array.from(this.tables.keys());
-    }
-
-    /**
-     * Execute SQL statement using standard SQLParser
+     * Execute SQL statement
      * @param {string} sql - SQL statement
      * @returns {Promise<any>} Result
      */
     async exec(sql) {
-        const lexer = new SQLLexer(sql);
-        const tokens = lexer.tokenize();
-        const parser = new SQLParser(tokens);
-        const ast = parser.parse();
-
-        return this._executeAST(ast);
+        await this._ensureOpen();
+        return workerRPC('db:exec', { db: this.name, sql });
     }
 
     /**
-     * Execute parsed AST
+     * Get table info
+     * @param {string} tableName - Table name
+     * @returns {Promise<Object>} Table state
      */
-    async _executeAST(ast) {
-        const type = ast.type.toUpperCase();
-
-        switch (type) {
-            case 'CREATE_TABLE':
-                return this.createTable(ast.table, ast.columns, ast.ifNotExists);
-
-            case 'DROP_TABLE':
-                return this.dropTable(ast.table, ast.ifExists);
-
-            case 'INSERT': {
-                // Convert from parser format to insert format
-                const table = this.tables.get(ast.table);
-                if (!table) {
-                    throw new Error(`Table '${ast.table}' does not exist`);
-                }
-
-                // Map value rows to row objects
-                const columnNames = ast.columns || table.schema.map(c => c.name);
-                const rows = ast.rows.map(valueRow => {
-                    const row = {};
-                    valueRow.forEach((val, i) => {
-                        row[columnNames[i]] = val.value;
-                    });
-                    return row;
-                });
-
-                return this.insert(ast.table, rows);
-            }
-
-            case 'DELETE': {
-                const deletePredicate = ast.where
-                    ? (row) => this._evalWhereExpr(ast.where, row)
-                    : () => true;
-                return this.delete(ast.table, deletePredicate);
-            }
-
-            case 'UPDATE': {
-                // Convert assignments to updates object
-                const updates = {};
-                for (const assignment of ast.assignments) {
-                    updates[assignment.column] = assignment.value.value;
-                }
-
-                const updatePredicate = ast.where
-                    ? (row) => this._evalWhereExpr(ast.where, row)
-                    : () => true;
-                return this.update(ast.table, updates, updatePredicate);
-            }
-
-            case 'SELECT': {
-                const tableName = ast.from?.name || ast.from?.table || ast.from;
-                if (!tableName) {
-                    throw new Error('SELECT requires FROM clause for LocalDatabase');
-                }
-
-                // Check for aggregate functions
-                const aggFunctions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'];
-                const hasAggregates = ast.columns !== '*' && ast.columns.some(c =>
-                    c.expr?.type === 'call' && aggFunctions.includes(c.expr.name?.toUpperCase())
-                );
-
-                if (hasAggregates) {
-                    // Execute aggregate query
-                    return this._executeAggregate(tableName, ast);
-                }
-
-                const selectOptions = {
-                    columns: ast.columns === '*' ? ['*'] :
-                        ast.columns.map(c => c.type === 'star' ? '*' : c.expr?.column || c.column || c),
-                    where: ast.where ? (row) => this._evalWhereExpr(ast.where, row) : null,
-                    limit: ast.limit,
-                    offset: ast.offset,
-                    orderBy: ast.orderBy?.[0] ? {
-                        column: ast.orderBy[0].column,
-                        desc: ast.orderBy[0].descending
-                    } : null,
-                };
-                return this.select(tableName, selectOptions);
-            }
-
-            default:
-                throw new Error(`Unknown statement type: ${ast.type}`);
-        }
+    async getTable(tableName) {
+        await this._ensureOpen();
+        return workerRPC('db:getTable', { db: this.name, tableName });
     }
 
     /**
-     * Evaluate WHERE expression from standard SQLParser AST
+     * List all tables
+     * @returns {Promise<string[]>} Table names
      */
-    _evalWhereExpr(expr, row) {
-        if (!expr) return true;
-
-        if (expr.type === 'binary') {
-            const op = expr.op;
-
-            // Handle AND/OR
-            if (op === 'AND' || op === '&&') {
-                return this._evalWhereExpr(expr.left, row) && this._evalWhereExpr(expr.right, row);
-            }
-            if (op === 'OR' || op === '||') {
-                return this._evalWhereExpr(expr.left, row) || this._evalWhereExpr(expr.right, row);
-            }
-
-            // Get column value and literal value
-            const leftVal = expr.left.type === 'column' ?
-                row[expr.left.column] :
-                expr.left.value;
-            const rightVal = expr.right.type === 'column' ?
-                row[expr.right.column] :
-                expr.right.value;
-
-            switch (op) {
-                case '=':
-                case '==':
-                    return leftVal === rightVal;
-                case '!=':
-                case '<>':
-                    return leftVal !== rightVal;
-                case '<':
-                    return leftVal < rightVal;
-                case '<=':
-                    return leftVal <= rightVal;
-                case '>':
-                    return leftVal > rightVal;
-                case '>=':
-                    return leftVal >= rightVal;
-                case 'LIKE':
-                    const pattern = String(rightVal).replace(/%/g, '.*').replace(/_/g, '.');
-                    return new RegExp(`^${pattern}$`, 'i').test(leftVal);
-                default:
-                    return true;
-            }
-        }
-
-        return true;
-    }
-
-    /**
-     * Evaluate WHERE clause
-     */
-    _evalWhere(where, row) {
-        if (!where) return true;
-
-        switch (where.op) {
-            case 'AND':
-                return this._evalWhere(where.left, row) && this._evalWhere(where.right, row);
-            case 'OR':
-                return this._evalWhere(where.left, row) || this._evalWhere(where.right, row);
-            case '=':
-                return row[where.column] === where.value;
-            case '!=':
-            case '<>':
-                return row[where.column] !== where.value;
-            case '<':
-                return row[where.column] < where.value;
-            case '<=':
-                return row[where.column] <= where.value;
-            case '>':
-                return row[where.column] > where.value;
-            case '>=':
-                return row[where.column] >= where.value;
-            case 'LIKE':
-                const pattern = where.value.replace(/%/g, '.*').replace(/_/g, '.');
-                return new RegExp(`^${pattern}$`, 'i').test(row[where.column]);
-            default:
-                return true;
-        }
-    }
-
-    /**
-     * Execute aggregate query (COUNT, SUM, AVG, MIN, MAX)
-     */
-    async _executeAggregate(tableName, ast) {
-        if (!this.tables.has(tableName)) {
-            throw new Error(`Table '${tableName}' does not exist`);
-        }
-
-        // Get all rows (with WHERE filter)
-        let rows = await this._readAllRows(tableName);
-        if (ast.where) {
-            rows = rows.filter(row => this._evalWhereExpr(ast.where, row));
-        }
-
-        // Initialize result object
-        const result = {};
-        const aggFunctions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'];
-
-        for (const col of ast.columns) {
-            if (col.expr?.type === 'call') {
-                const funcName = col.expr.name.toUpperCase();
-                const alias = col.alias || `${funcName}(${col.expr.args[0]?.column || '*'})`;
-                const argCol = col.expr.args[0]?.column;
-
-                if (funcName === 'COUNT') {
-                    result[alias] = rows.length;
-                } else if (funcName === 'SUM') {
-                    result[alias] = rows.reduce((sum, row) => sum + (row[argCol] || 0), 0);
-                } else if (funcName === 'AVG') {
-                    const sum = rows.reduce((s, row) => s + (row[argCol] || 0), 0);
-                    result[alias] = rows.length > 0 ? sum / rows.length : null;
-                } else if (funcName === 'MIN') {
-                    result[alias] = rows.length > 0 ?
-                        Math.min(...rows.map(r => r[argCol]).filter(v => v != null)) : null;
-                } else if (funcName === 'MAX') {
-                    result[alias] = rows.length > 0 ?
-                        Math.max(...rows.map(r => r[argCol]).filter(v => v != null)) : null;
-                }
-            }
-        }
-
-        // Return as single row
-        return [result];
+    async listTables() {
+        await this._ensureOpen();
+        return workerRPC('db:listTables', { db: this.name });
     }
 
     /**
      * Compact the database (merge fragments, remove deleted rows)
+     * @returns {Promise<{success: boolean, compacted: number}>}
      */
     async compact() {
-        for (const [tableName, table] of this.tables) {
-            const allRows = await this._readAllRows(tableName);
-
-            // Delete old fragments
-            for (const fragKey of table.fragments) {
-                await this.storage.delete(fragKey);
-            }
-
-            // Reset table state
-            table.fragments = [];
-            table.deletionVector = [];
-            table.rowCount = 0;
-            table.nextRowId = 0;
-
-            // Re-insert all rows as single fragment
-            if (allRows.length > 0) {
-                // Remove old __rowId
-                const cleanRows = allRows.map(({ __rowId, ...rest }) => rest);
-                await this.insert(tableName, cleanRows);
-            }
-        }
-
-        return { success: true, compacted: this.tables.size };
+        await this._ensureOpen();
+        return workerRPC('db:compact', { db: this.name });
     }
 
     /**
      * Streaming scan - yields batches of rows for memory-efficient processing
      * @param {string} tableName - Table name
-     * @param {Object} options - Scan options {batchSize, where, columns}
+     * @param {Object} options - Scan options {batchSize, columns}
      * @yields {Object[]} Batch of rows
      *
      * @example
-     * for await (const batch of db.scan('users', { batchSize: 1000, where: r => r.age > 18 })) {
+     * for await (const batch of db.scan('users', { batchSize: 1000 })) {
      *   processBatch(batch);
      * }
      */
     async *scan(tableName, options = {}) {
-        if (!this.tables.has(tableName)) {
-            throw new Error(`Table '${tableName}' does not exist`);
-        }
+        await this._ensureOpen();
 
-        const table = this.tables.get(tableName);
-        const deletedSet = new Set(table.deletionVector);
-        const batchSize = options.batchSize || 10000;
-        const whereFn = options.where || (() => true);
-        const columns = options.columns;
+        // Start scan stream
+        const streamId = await workerRPC('db:scanStart', {
+            db: this.name,
+            tableName,
+            options
+        });
 
-        let batch = [];
+        // Iterate through batches
+        while (true) {
+            const { batch, done } = await workerRPC('db:scanNext', {
+                db: this.name,
+                streamId
+            });
 
-        for (const fragKey of table.fragments) {
-            const fragData = await this.storage.load(fragKey);
-            if (!fragData) continue;
-
-            const rows = this._parseFragment(fragData, table.schema);
-
-            for (const row of rows) {
-                if (deletedSet.has(row.__rowId)) continue;
-                if (!whereFn(row)) continue;
-
-                // Project columns if specified
-                let projectedRow;
-                if (columns && columns.length > 0 && columns[0] !== '*') {
-                    projectedRow = {};
-                    for (const col of columns) {
-                        projectedRow[col] = row[col];
-                    }
-                } else {
-                    const { __rowId, ...rest } = row;
-                    projectedRow = rest;
-                }
-
-                batch.push(projectedRow);
-
-                if (batch.length >= batchSize) {
-                    yield batch;
-                    batch = [];
-                }
+            if (batch.length > 0) {
+                yield batch;
             }
-        }
 
-        // Yield remaining rows
-        if (batch.length > 0) {
-            yield batch;
+            if (done) break;
         }
-    }
-
-    /**
-     * Count rows in a table (efficient - doesn't load data)
-     * @param {string} tableName - Table name
-     * @param {Function} [where] - Optional filter function
-     * @returns {Promise<number>}
-     */
-    async count(tableName, where = null) {
-        if (!this.tables.has(tableName)) {
-            throw new Error(`Table '${tableName}' does not exist`);
-        }
-
-        const table = this.tables.get(tableName);
-
-        // Fast path: if no filter and no deletions, return cached count
-        if (!where && table.deletionVector.length === 0) {
-            return table.rowCount;
-        }
-
-        // Otherwise count with filter/deletions
-        let count = 0;
-        for await (const batch of this.scan(tableName, { where })) {
-            count += batch.length;
-        }
-        return count;
-    }
-
-    /**
-     * Get table schema
-     * @param {string} tableName - Table name
-     * @returns {Array} Column schema
-     */
-    getSchema(tableName) {
-        const table = this.tables.get(tableName);
-        if (!table) {
-            throw new Error(`Table '${tableName}' does not exist`);
-        }
-        return table.schema;
     }
 
     /**
      * Close the database
+     * @returns {Promise<void>}
      */
     async close() {
-        await this._saveManifest();
+        await this._ensureOpen();
+        await this.flush();
     }
 }
 
@@ -4681,6 +3763,417 @@ async function openLance(source) {
 
 // Export unified API
 export { openLance, LanceDataBase, OPFSLanceData, RemoteLanceData };
+
+// =============================================================================
+// Simple Store API - localStorage-like interface with OPFS power
+// =============================================================================
+
+// SharedWorker singleton (shared across all Store/Database instances)
+let _lanceWorker = null;
+let _lanceWorkerReady = null;
+let _requestId = 0;
+const _pendingRequests = new Map();
+
+// Transfer mode detection
+let _transferMode = 'clone'; // 'sharedBuffer' | 'transfer' | 'clone'
+let _sharedBuffer = null;
+const SHARED_BUFFER_SIZE = 16 * 1024 * 1024; // 16MB shared buffer
+
+/**
+ * Check if SharedArrayBuffer is available (requires COOP/COEP headers).
+ */
+function checkSharedArrayBuffer() {
+    try {
+        if (typeof SharedArrayBuffer !== 'undefined' &&
+            typeof crossOriginIsolated !== 'undefined' && crossOriginIsolated) {
+            _sharedBuffer = new SharedArrayBuffer(SHARED_BUFFER_SIZE);
+            _transferMode = 'sharedBuffer';
+            console.log('[LanceQL] Using SharedArrayBuffer (zero-copy)');
+            return true;
+        }
+    } catch (e) {
+        // SharedArrayBuffer not available
+    }
+
+    // Check if Transferable works
+    try {
+        const test = new ArrayBuffer(8);
+        // We can't actually test transfer without losing the buffer, so just check type
+        if (typeof ArrayBuffer.prototype.transfer !== 'undefined' || true) {
+            _transferMode = 'transfer';
+            console.log('[LanceQL] Using Transferable ArrayBuffers');
+            return false;
+        }
+    } catch (e) {
+        // Fall back to structured clone
+    }
+
+    _transferMode = 'clone';
+    console.log('[LanceQL] Using structured clone (fallback)');
+    return false;
+}
+
+/**
+ * Get or create the SharedWorker.
+ */
+function getLanceWorker() {
+    if (_lanceWorker) return _lanceWorkerReady;
+
+    // Check transfer capabilities on first init
+    checkSharedArrayBuffer();
+
+    _lanceWorkerReady = new Promise((resolve, reject) => {
+        try {
+            // Try SharedWorker first
+            _lanceWorker = new SharedWorker(
+                new URL('./lanceql-worker.js', import.meta.url),
+                { type: 'module', name: 'lanceql' }
+            );
+
+            _lanceWorker.port.onmessage = (e) => {
+                handleWorkerMessage(e.data, _lanceWorker.port, resolve);
+            };
+
+            _lanceWorker.port.onmessageerror = (e) => {
+                console.error('[LanceQL] Worker message error:', e);
+            };
+
+            _lanceWorker.onerror = (e) => {
+                console.error('[LanceQL] Worker error:', e);
+                reject(e);
+            };
+
+            _lanceWorker.port.start();
+
+            // Send shared buffer if available
+            if (_sharedBuffer) {
+                _lanceWorker.port.postMessage({
+                    type: 'initSharedBuffer',
+                    buffer: _sharedBuffer
+                });
+            }
+        } catch (e) {
+            // SharedWorker not supported, fall back to regular Worker
+            console.log('[LanceQL] SharedWorker not available, using Worker');
+            _lanceWorker = new Worker(
+                new URL('./lanceql-worker.js', import.meta.url),
+                { type: 'module', name: 'lanceql' }
+            );
+
+            _lanceWorker.onmessage = (e) => {
+                handleWorkerMessage(e.data, _lanceWorker, resolve);
+            };
+
+            _lanceWorker.onerror = (e) => {
+                console.error('[LanceQL] Worker error:', e);
+                reject(e);
+            };
+
+            // Send shared buffer if available
+            if (_sharedBuffer) {
+                _lanceWorker.postMessage({
+                    type: 'initSharedBuffer',
+                    buffer: _sharedBuffer
+                });
+            }
+        }
+    });
+
+    return _lanceWorkerReady;
+}
+
+/**
+ * Handle worker messages.
+ */
+function handleWorkerMessage(data, port, resolveReady) {
+    if (data.type === 'ready') {
+        console.log('[LanceQL] Worker ready, mode:', _transferMode);
+        resolveReady(port);
+        return;
+    }
+
+    // Handle RPC responses
+    if (data.id !== undefined) {
+        const pending = _pendingRequests.get(data.id);
+        if (pending) {
+            _pendingRequests.delete(data.id);
+
+            // Handle SharedArrayBuffer response
+            if (data.sharedOffset !== undefined && _sharedBuffer) {
+                const view = new Uint8Array(_sharedBuffer, data.sharedOffset, data.sharedLength);
+                const result = JSON.parse(new TextDecoder().decode(view));
+                pending.resolve(result);
+            } else if (data.error) {
+                pending.reject(new Error(data.error));
+            } else {
+                pending.resolve(data.result);
+            }
+        }
+    }
+}
+
+/**
+ * Send RPC request to worker with optimal transfer strategy.
+ */
+async function workerRPC(method, args) {
+    const port = await getLanceWorker();
+    const id = ++_requestId;
+
+    return new Promise((resolve, reject) => {
+        _pendingRequests.set(id, { resolve, reject });
+
+        // For large array data, use Transferable if possible
+        const transferables = [];
+        if (_transferMode === 'transfer' && args) {
+            // Find ArrayBuffer properties to transfer
+            for (const key of Object.keys(args)) {
+                const val = args[key];
+                if (val instanceof ArrayBuffer) {
+                    transferables.push(val);
+                } else if (ArrayBuffer.isView(val)) {
+                    transferables.push(val.buffer);
+                }
+            }
+        }
+
+        if (transferables.length > 0) {
+            port.postMessage({ id, method, args }, transferables);
+        } else {
+            port.postMessage({ id, method, args });
+        }
+    });
+}
+
+// Alias for backwards compatibility
+const getStoreWorker = getLanceWorker;
+
+/**
+ * Store - Simple key-value and collection storage with search.
+ *
+ * All operations run in a SharedWorker for OPFS sync access and shared GPU.
+ *
+ * @example
+ * const store = await lanceStore('myapp');
+ * await store.set('user', { name: 'Alice' });
+ * const user = await store.get('user');
+ */
+export class Store {
+    constructor(name, options = {}) {
+        this.name = name;
+        this.options = options;
+        this._ready = false;
+        this._sessionMode = options.session || false;
+        this._semanticSearchEnabled = false;
+    }
+
+    /**
+     * Initialize the store (connects to SharedWorker).
+     * @returns {Promise<Store>}
+     */
+    async open() {
+        if (this._ready) return this;
+
+        await workerRPC('open', { name: this.name, options: this.options });
+
+        // Session mode cleanup
+        if (this._sessionMode && typeof window !== 'undefined') {
+            window.addEventListener('beforeunload', () => {
+                this.clear().catch(() => {});
+            });
+        }
+
+        this._ready = true;
+        return this;
+    }
+
+    /**
+     * Get a value by key.
+     * @param {string} key
+     * @returns {Promise<any>} The stored value, or undefined if not found
+     */
+    async get(key) {
+        await this._ensureOpen();
+        return workerRPC('get', { name: this.name, key });
+    }
+
+    /**
+     * Set a value. Accepts any JSON-serializable value.
+     * @param {string} key
+     * @param {any} value
+     * @returns {Promise<void>}
+     */
+    async set(key, value) {
+        await this._ensureOpen();
+        await workerRPC('set', { name: this.name, key, value });
+    }
+
+    /**
+     * Delete a key.
+     * @param {string} key
+     * @returns {Promise<boolean>} True if key existed
+     */
+    async delete(key) {
+        await this._ensureOpen();
+        return workerRPC('delete', { name: this.name, key });
+    }
+
+    /**
+     * Check if a key exists.
+     * @param {string} key
+     * @returns {Promise<boolean>}
+     */
+    async has(key) {
+        const value = await this.get(key);
+        return value !== undefined;
+    }
+
+    /**
+     * List all keys.
+     * @returns {Promise<string[]>}
+     */
+    async keys() {
+        await this._ensureOpen();
+        return workerRPC('keys', { name: this.name });
+    }
+
+    /**
+     * Clear all data.
+     * @returns {Promise<void>}
+     */
+    async clear() {
+        await this._ensureOpen();
+        await workerRPC('clear', { name: this.name });
+    }
+
+    /**
+     * Filter items in a collection.
+     * @param {string} key - Collection key
+     * @param {Object} query - Filter query (MongoDB-style operators)
+     * @returns {Promise<Array>} Matching items
+     */
+    async filter(key, query = {}) {
+        await this._ensureOpen();
+        return workerRPC('filter', { name: this.name, key, query });
+    }
+
+    /**
+     * Find first item matching query.
+     * @param {string} key - Collection key
+     * @param {Object} query - Filter query
+     * @returns {Promise<Object|undefined>} First matching item
+     */
+    async find(key, query = {}) {
+        await this._ensureOpen();
+        return workerRPC('find', { name: this.name, key, query });
+    }
+
+    /**
+     * Semantic search within a collection.
+     * @param {string} key - Collection key
+     * @param {string} text - Search text
+     * @param {number} limit - Max results (default 10)
+     * @returns {Promise<Array>} Matching items with similarity scores
+     */
+    async search(key, text, limit = 10) {
+        await this._ensureOpen();
+        return workerRPC('search', { name: this.name, key, text, limit });
+    }
+
+    /**
+     * Count items in a collection, optionally filtered.
+     * @param {string} key - Collection key
+     * @param {Object} query - Optional filter query
+     * @returns {Promise<number>}
+     */
+    async count(key, query = null) {
+        await this._ensureOpen();
+        return workerRPC('count', { name: this.name, key, query });
+    }
+
+    /**
+     * Subscribe to changes (reactive updates).
+     * @param {string} key - Key to watch
+     * @param {Function} callback - Called with new value on changes
+     * @returns {Function} Unsubscribe function
+     */
+    subscribe(key, callback) {
+        console.warn('[Store] subscribe() not yet implemented');
+        return () => {};
+    }
+
+    /**
+     * Enable semantic search with WebGPU-accelerated text encoding.
+     * Model is loaded and runs in the SharedWorker.
+     *
+     * @param {Object} options - Configuration options
+     * @param {string} options.model - Model name ('minilm', 'clip', or GGUF URL)
+     * @returns {Promise<Object>} Model info (dimensions, type)
+     */
+    async enableSemanticSearch(options = {}) {
+        await this._ensureOpen();
+        const result = await workerRPC('enableSemanticSearch', {
+            name: this.name,
+            options
+        });
+        if (result) {
+            this._semanticSearchEnabled = true;
+        }
+        return result;
+    }
+
+    /**
+     * Disable semantic search and free GPU resources.
+     */
+    async disableSemanticSearch() {
+        await workerRPC('disableSemanticSearch', { name: this.name });
+        this._semanticSearchEnabled = false;
+    }
+
+    /**
+     * Check if semantic search is enabled.
+     * @returns {boolean}
+     */
+    hasSemanticSearch() {
+        return this._semanticSearchEnabled;
+    }
+
+    // =========================================================================
+    // Internal helpers
+    // =========================================================================
+
+    async _ensureOpen() {
+        if (!this._ready) {
+            await this.open();
+        }
+    }
+}
+
+/**
+ * Create a new Store instance.
+ *
+ * @param {string} name - Store name (used as OPFS directory)
+ * @param {Object} options - Store options
+ * @param {boolean} options.session - If true, clears data on tab close
+ * @returns {Promise<Store>}
+ *
+ * @example
+ * // Persistent store
+ * const store = await lanceStore('myapp');
+ *
+ * // Session store (clears on tab close)
+ * const session = await lanceStore('temp', { session: true });
+ */
+export async function lanceStore(name, options = {}) {
+    const store = new Store(name, options);
+    await store.open();
+    return store;
+}
+
+// Alias for backwards compatibility
+export { lanceStore as createStore };
+
+// Export Store class for manual instantiation
+export { Store as KeyValueStore };
 
 /**
  * SQL Parser for LocalDatabase (supports CREATE, INSERT, UPDATE, DELETE, SELECT)

@@ -16,7 +16,11 @@
 //!   zig build bench-analytics
 
 const std = @import("std");
-const Table = @import("lanceql.table").Table;
+const format = @import("lanceql.format");
+const io = @import("lanceql.io");
+
+const LazyLanceFile = format.LazyLanceFile;
+const FileReader = io.FileReader;
 
 const WARMUP_SECONDS = 2;
 const BENCHMARK_SECONDS = 15;
@@ -41,35 +45,22 @@ fn checkPythonModule(allocator: std.mem.Allocator, module: []const u8) bool {
     }
 }
 
-fn readLanceFile(allocator: std.mem.Allocator) ![]const u8 {
-    var data_dir = std.fs.cwd().openDir(LANCE_PATH ++ "/data", .{ .iterate = true }) catch return error.FileNotFound;
+/// Find the .lance file path in a Lance dataset directory
+fn findLanceFilePath(allocator: std.mem.Allocator, lance_dir: []const u8) ![]const u8 {
+    const data_path = try std.fmt.allocPrint(allocator, "{s}/data", .{lance_dir});
+    defer allocator.free(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
     defer data_dir.close();
 
     var iter = data_dir.iterate();
-    var lance_file_name_buf: [256]u8 = undefined;
-    var lance_file_name: ?[]const u8 = null;
-
-    while (iter.next() catch null) |entry| {
-        if (std.mem.endsWith(u8, entry.name, ".lance")) {
-            const len = @min(entry.name.len, lance_file_name_buf.len);
-            @memcpy(lance_file_name_buf[0..len], entry.name[0..len]);
-            lance_file_name = lance_file_name_buf[0..len];
-            break;
+    while (try iter.next()) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".lance")) {
+            return std.fmt.allocPrint(allocator, "{s}/{s}", .{ data_path, entry.name });
         }
     }
 
-    if (lance_file_name == null) return error.FileNotFound;
-
-    const data_file = data_dir.openFile(lance_file_name.?, .{}) catch return error.FileNotFound;
-    defer data_file.close();
-
-    const file_size = (data_file.stat() catch return error.FileNotFound).size;
-    const file_data = allocator.alloc(u8, file_size) catch return error.OutOfMemory;
-
-    const bytes_read = data_file.readAll(file_data) catch return error.ReadError;
-    if (bytes_read != file_size) return error.ReadError;
-
-    return file_data;
+    return error.LanceFileNotFound;
 }
 
 pub fn main() !void {
@@ -112,8 +103,15 @@ pub fn main() !void {
 
     var lanceql_throughput: f64 = 0;
 
-    // 1. LanceQL native (read Lance file → aggregate)
+    // 1. LanceQL native (column-first I/O → aggregate)
     {
+        // Find lance file path once
+        const lance_file_path = findLanceFilePath(allocator, LANCE_PATH) catch {
+            std.debug.print("{s:<35} {s:>12} {s:>12} {s:>10}\n", .{ "LanceQL native", "error", "-", "-" });
+            return;
+        };
+        defer allocator.free(lance_file_path);
+
         const warmup_end = std.time.nanoTimestamp() + WARMUP_SECONDS * std.time.ns_per_s;
         const benchmark_end_time = warmup_end + BENCHMARK_SECONDS * std.time.ns_per_s;
 
@@ -122,13 +120,13 @@ pub fn main() !void {
 
         // Warmup
         while (std.time.nanoTimestamp() < warmup_end) {
-            const file_data = readLanceFile(allocator) catch break;
-            defer allocator.free(file_data);
+            var file_reader = FileReader.open(lance_file_path) catch break;
+            defer file_reader.close();
 
-            var table = Table.init(allocator, file_data) catch break;
-            defer table.deinit();
+            var lazy = LazyLanceFile.init(allocator, file_reader.reader()) catch break;
+            defer lazy.deinit();
 
-            const amounts = table.readFloat64Column(1) catch break;
+            const amounts = lazy.readFloat64Column(1) catch break;
             defer allocator.free(amounts);
 
             var sum: f64 = 0;
@@ -149,13 +147,13 @@ pub fn main() !void {
         // Benchmark
         const start_time = std.time.nanoTimestamp();
         while (std.time.nanoTimestamp() < benchmark_end_time) {
-            const file_data = readLanceFile(allocator) catch break;
-            defer allocator.free(file_data);
+            var file_reader = FileReader.open(lance_file_path) catch break;
+            defer file_reader.close();
 
-            var table = Table.init(allocator, file_data) catch break;
-            defer table.deinit();
+            var lazy = LazyLanceFile.init(allocator, file_reader.reader()) catch break;
+            defer lazy.deinit();
 
-            const amounts = table.readFloat64Column(1) catch break;
+            const amounts = lazy.readFloat64Column(1) catch break;
             defer allocator.free(amounts);
 
             var sum: f64 = 0;

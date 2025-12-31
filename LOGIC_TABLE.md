@@ -1235,16 +1235,24 @@ examples/python/
 
 ## Benchmarks (Apple M2 Pro)
 
-### @logic_table vs UDF Performance (100K rows × 384 dims)
+### @logic_table vs Python UDF Workflows (100K rows × 384 dims)
+
+**What this benchmark measures**: Compiled native code vs Python interpreter overhead for custom logic.
 
 | Method | Total (ms) | Per Row (μs) | Notes |
 |--------|------------|--------------|-------|
-| LanceQL @logic_table | ~10 | 0.1 | Compiled, pushdown |
+| LanceQL @logic_table | ~10 | 0.1 | Compiled Zig, SIMD batch |
 | DuckDB Python UDF | 10,102 | 101 | Row-by-row Python calls |
-| DuckDB → Python Batch | 1,805 | 18 | Pull then process |
+| DuckDB → Python Batch | 1,805 | 18 | Pull to Python, then NumPy |
 | Polars .map_elements() | 9,376 | 94 | Row-by-row Python calls |
 
-**Key insight**: @logic_table can be 100–1000× faster than Python UDF-style execution in these benchmarks because:
+**What this shows**: Eliminating Python interpreter overhead for UDF-style workflows.
+
+**What this does NOT show**: LanceQL SQL vs DuckDB SQL (native query performance).
+
+For pure SQL operations (FILTER, AGGREGATE, JOIN), see [bench_sql_clauses.zig](./benchmarks/bench_sql_clauses.zig) which compares native implementations fairly.
+
+**Why @logic_table is faster for custom logic**:
 1. Zero Python at runtime (compiled Zig/WASM/GPU code only)
 2. Only processes filtered rows (pushdown)
 3. GPU/SIMD acceleration

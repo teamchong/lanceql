@@ -1,8 +1,8 @@
 {
   "name": "@metal0/lanceql",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "type": "module",
-  "description": "Query Lance columnar files in the browser with SQL, vector search, and CSS-driven data binding",
+  "description": "localStorage that scales - OPFS-backed storage with query and smart search for the browser",
   "main": "dist/lanceql.js",
   "module": "dist/lanceql.esm.js",
   "types": "dist/lanceql.d.ts",
@@ -11,6 +11,23 @@
       "import": "./dist/lanceql.esm.js",
       "require": "./dist/lanceql.js",
       "types": "./dist/lanceql.d.ts"
+    },
+    "./browser": {
+      "import": "./dist/lanceql.esm.js",
+      "require": "./dist/lanceql.js",
+      "types": "./dist/lanceql.d.ts"
+    },
+    "./browser/react": {
+      "import": "./dist/react.js",
+      "types": "./dist/react.d.ts"
+    },
+    "./browser/svelte": {
+      "import": "./dist/svelte.js",
+      "types": "./dist/svelte.d.ts"
+    },
+    "./browser/vue": {
+      "import": "./dist/vue.js",
+      "types": "./dist/vue.d.ts"
     },
     "./wasm": "./dist/lanceql.wasm"
   },
@@ -25,17 +42,19 @@
     "prepublishOnly": "npm run build"
   },
   "keywords": [
-    "lance",
-    "columnar",
-    "sql",
-    "wasm",
-    "webassembly",
-    "arrow",
-    "vector-search",
-    "analytics",
+    "localStorage",
+    "opfs",
+    "storage",
+    "persistence",
     "browser",
-    "css-data",
-    "declarative"
+    "wasm",
+    "vector-search",
+    "semantic-search",
+    "react",
+    "svelte",
+    "vue",
+    "query",
+    "filter"
   ],
   "author": "LanceQL Contributors",
   "license": "Apache-2.0",

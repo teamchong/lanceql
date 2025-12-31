@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebGPU Shader Tests</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            max-width: 800px;
+            margin: 40px auto;
+            padding: 20px;
+            background: #0a0a0a;
+            color: #e5e5e5;
+        }
+        h1 { color: #3b82f6; }
+        .test-group { margin: 20px 0; padding: 15px; background: #141414; border-radius: 8px; }
+        .test-group h2 { margin-top: 0; font-size: 1.1rem; }
+        .test { padding: 8px 12px; margin: 5px 0; border-radius: 4px; }
+        .pass { background: #052e16; color: #22c55e; }
+        .fail { background: #450a0a; color: #ef4444; }
+        .skip { background: #1e1b4b; color: #a5b4fc; }
+        .pending { background: #1f1f1f; color: #888; }
+        .error { font-size: 0.85rem; margin-top: 5px; color: #f87171; }
+        #summary { margin-top: 30px; padding: 20px; background: #1f1f1f; border-radius: 8px; }
+        .stats { display: flex; gap: 20px; }
+        .stat { padding: 10px 20px; border-radius: 4px; }
+        .stat.pass { background: #052e16; }
+        .stat.fail { background: #450a0a; }
+        .stat.skip { background: #1e1b4b; }
+        button { background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 1rem; }
+        button:hover { background: #2563eb; }
+        button:disabled { background: #555; cursor: not-allowed; }
+        pre { background: #0a0a0a; padding: 10px; border-radius: 4px; overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <h1>WebGPU Shader Unit Tests</h1>
+
+    <div id="status">
+        <button id="runBtn" onclick="runTests()">Run Tests</button>
+        <span id="statusText" style="margin-left: 15px;"></span>
+    </div>
+
+    <div id="results"></div>
+    <div id="summary"></div>
+
+    <script type="module">
+        // Test framework
+        const results = { pass: 0, fail: 0, skip: 0 };
+        const testResults = [];
+
+        function log(group, name, status, error = null) {
+            testResults.push({ group, name, status, error });
+            results[status]++;
+        }
+
+        function assertClose(actual, expected, tolerance = 1e-5) {
+            if (actual.length !== expected.length) {
+                throw new Error(`Length mismatch: ${actual.length} vs ${expected.length}`);
+            }
+            for (let i = 0; i < actual.length; i++) {
+                const diff = Math.abs(actual[i] - expected[i]);
+                if (diff >= tolerance) {
+                    throw new Error(`Element ${i}: ${actual[i]} != ${expected[i]} (diff: ${diff.toExponential(2)})`);
+                }
+            }
+        }
+
+        // CPU reference implementations
+        function cpuGemm(A, B, M, N, K) {
+            const C = new Float32Array(M * N);
+            for (let i = 0; i < M; i++) {
+                for (let j = 0; j < N; j++) {
+                    let sum = 0;
+                    for (let k = 0; k < K; k++) {
+                        sum += A[i * K + k] * B[k * N + j];
+                    }
+                    C[i * N + j] = sum;
+                }
+            }
+            return C;
+        }
+
+        function cpuGelu(input) {
+            const output = new Float32Array(input.length);
+            for (let i = 0; i < input.length; i++) {
+                const x = input[i];
+                const sigmoid = 1 / (1 + Math.exp(-1.702 * x));
+                output[i] = x * sigmoid;
+            }
+            return output;
+        }
+
+        function cpuLayerNorm(input, gamma, beta, eps = 1e-5) {
+            const mean = input.reduce((a, b) => a + b, 0) / input.length;
+            const variance = input.reduce((a, b) => a + (b - mean) ** 2, 0) / input.length;
+            const invStd = 1 / Math.sqrt(variance + eps);
+
+            const output = new Float32Array(input.length);
+            for (let i = 0; i < input.length; i++) {
+                output[i] = ((input[i] - mean) * invStd) * gamma[i] + beta[i];
+            }
+            return output;
+        }
+
+        // Shader sources
+        const GEMM_SHADER = `
+struct Dimensions { M: u32, N: u32, K: u32, alpha: f32 }
+@group(0) @binding(0) var<uniform> dims: Dimensions;
+@group(0) @binding(1) var<storage, read> A: array<f32>;
+@group(0) @binding(2) var<storage, read> B: array<f32>;
+@group(0) @binding(3) var<storage, read_write> C: array<f32>;
+
+@compute @workgroup_size(16, 16)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let row = gid.y; let col = gid.x;
+    if (row >= dims.M || col >= dims.N) { return; }
+    var acc: f32 = 0.0;
+    for (var k: u32 = 0u; k < dims.K; k++) {
+        acc += A[row * dims.K + k] * B[k * dims.N + col];
+    }
+    C[row * dims.N + col] = dims.alpha * acc;
+}`;
+
+        const GELU_SHADER = `
+struct Params { size: u32 }
+@group(0) @binding(0) var<uniform> params: Params;
+@group(0) @binding(1) var<storage, read> input: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output: array<f32>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let idx = gid.x;
+    if (idx >= params.size) { return; }
+    let x = input[idx];
+    let sigmoid = 1.0 / (1.0 + exp(-1.702 * x));
+    output[idx] = x * sigmoid;
+}`;
+
+        // GPU context
+        let device = null;
+
+        async function initGPU() {
+            if (!navigator.gpu) return null;
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) return null;
+            return adapter.requestDevice();
+        }
+
+        function createBuffer(device, data, usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC) {
+            const buffer = device.createBuffer({ size: data.byteLength, usage, mappedAtCreation: true });
+            new Float32Array(buffer.getMappedRange()).set(data);
+            buffer.unmap();
+            return buffer;
+        }
+
+        function createUniform(device, data) {
+            const size = Math.ceil(data.byteLength / 16) * 16;
+            const buffer = device.createBuffer({ size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+            device.queue.writeBuffer(buffer, 0, data);
+            return buffer;
+        }
+
+        async function readBuffer(device, buffer, size) {
+            const readBuf = device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+            const encoder = device.createCommandEncoder();
+            encoder.copyBufferToBuffer(buffer, 0, readBuf, 0, size);
+            device.queue.submit([encoder.finish()]);
+            await readBuf.mapAsync(GPUMapMode.READ);
+            const result = new Float32Array(readBuf.getMappedRange().slice(0));
+            readBuf.unmap();
+            readBuf.destroy();
+            return result;
+        }
+
+        // Tests
+        async function testGemm2x2() {
+            const M = 2, N = 2, K = 2;
+            const A = new Float32Array([1, 2, 3, 4]);
+            const B = new Float32Array([5, 6, 7, 8]);
+            const expected = cpuGemm(A, B, M, N, K);
+
+            const uniform = new ArrayBuffer(16);
+            const v = new DataView(uniform);
+            v.setUint32(0, M, true); v.setUint32(4, N, true); v.setUint32(8, K, true); v.setFloat32(12, 1.0, true);
+
+            const uniformBuf = createUniform(device, uniform);
+            const bufA = createBuffer(device, A);
+            const bufB = createBuffer(device, B);
+            const bufC = createBuffer(device, new Float32Array(M * N));
+
+            const module = device.createShaderModule({ code: GEMM_SHADER });
+            const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+
+            const bindGroup = device.createBindGroup({
+                layout: pipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: uniformBuf } },
+                    { binding: 1, resource: { buffer: bufA } },
+                    { binding: 2, resource: { buffer: bufB } },
+                    { binding: 3, resource: { buffer: bufC } },
+                ],
+            });
+
+            const encoder = device.createCommandEncoder();
+            const pass = encoder.beginComputePass();
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, bindGroup);
+            pass.dispatchWorkgroups(1, 1);
+            pass.end();
+            device.queue.submit([encoder.finish()]);
+
+            const result = await readBuffer(device, bufC, M * N * 4);
+            assertClose(result, expected);
+        }
+
+        async function testGelu() {
+            const input = new Float32Array([-2, -1, 0, 1, 2]);
+            const expected = cpuGelu(input);
+
+            const uniform = new ArrayBuffer(16);
+            new DataView(uniform).setUint32(0, input.length, true);
+
+            const uniformBuf = createUniform(device, uniform);
+            const inputBuf = createBuffer(device, input);
+            const outputBuf = createBuffer(device, new Float32Array(input.length));
+
+            const module = device.createShaderModule({ code: GELU_SHADER });
+            const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+
+            const bindGroup = device.createBindGroup({
+                layout: pipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: uniformBuf } },
+                    { binding: 1, resource: { buffer: inputBuf } },
+                    { binding: 2, resource: { buffer: outputBuf } },
+                ],
+            });
+
+            const encoder = device.createCommandEncoder();
+            const pass = encoder.beginComputePass();
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, bindGroup);
+            pass.dispatchWorkgroups(1);
+            pass.end();
+            device.queue.submit([encoder.finish()]);
+
+            const result = await readBuffer(device, outputBuf, input.length * 4);
+            assertClose(result, expected);
+        }
+
+        async function testGeluLarge() {
+            const size = 1024;
+            const input = new Float32Array(size).map(() => (Math.random() - 0.5) * 4);
+            const expected = cpuGelu(input);
+
+            const uniform = new ArrayBuffer(16);
+            new DataView(uniform).setUint32(0, size, true);
+
+            const uniformBuf = createUniform(device, uniform);
+            const inputBuf = createBuffer(device, input);
+            const outputBuf = createBuffer(device, new Float32Array(size));
+
+            const module = device.createShaderModule({ code: GELU_SHADER });
+            const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+
+            const bindGroup = device.createBindGroup({
+                layout: pipeline.getBindGroupLayout(0),
+                entries: [
+                    { binding: 0, resource: { buffer: uniformBuf } },
+                    { binding: 1, resource: { buffer: inputBuf } },
+                    { binding: 2, resource: { buffer: outputBuf } },
+                ],
+            });
+
+            const encoder = device.createCommandEncoder();
+            const pass = encoder.beginComputePass();
+            pass.setPipeline(pipeline);
+            pass.setBindGroup(0, bindGroup);
+            pass.dispatchWorkgroups(Math.ceil(size / 256));
+            pass.end();
+            device.queue.submit([encoder.finish()]);
+
+            const result = await readBuffer(device, outputBuf, size * 4);
+            assertClose(result, expected);
+        }
+
+        // Run all tests
+        window.runTests = async function() {
+            const btn = document.getElementById('runBtn');
+            const statusText = document.getElementById('statusText');
+            btn.disabled = true;
+            statusText.textContent = 'Initializing WebGPU...';
+
+            // Reset
+            results.pass = results.fail = results.skip = 0;
+            testResults.length = 0;
+
+            // Init GPU
+            device = await initGPU();
+            if (!device) {
+                statusText.textContent = 'WebGPU not available!';
+                log('WebGPU', 'Initialization', 'skip', 'WebGPU not supported in this browser');
+            }
+
+            // CPU tests
+            statusText.textContent = 'Running CPU tests...';
+            try {
+                const A = new Float32Array([1, 2, 3, 4]);
+                const B = new Float32Array([5, 6, 7, 8]);
+                assertClose(cpuGemm(A, B, 2, 2, 2), new Float32Array([19, 22, 43, 50]));
+                log('CPU', 'cpuGemm 2x2', 'pass');
+            } catch (e) {
+                log('CPU', 'cpuGemm 2x2', 'fail', e.message);
+            }
+
+            try {
+                const result = cpuGelu(new Float32Array([-2, -1, 0, 1, 2]));
+                if (result[2] !== 0) throw new Error('GELU(0) should be 0');
+                log('CPU', 'cpuGelu', 'pass');
+            } catch (e) {
+                log('CPU', 'cpuGelu', 'fail', e.message);
+            }
+
+            try {
+                const input = new Float32Array([1, 2, 3, 4, 5]);
+                const gamma = new Float32Array(5).fill(1);
+                const beta = new Float32Array(5).fill(0);
+                const result = cpuLayerNorm(input, gamma, beta);
+                const mean = result.reduce((a, b) => a + b, 0) / result.length;
+                if (Math.abs(mean) > 1e-5) throw new Error(`Mean should be 0, got ${mean}`);
+                log('CPU', 'cpuLayerNorm', 'pass');
+            } catch (e) {
+                log('CPU', 'cpuLayerNorm', 'fail', e.message);
+            }
+
+            // GPU tests
+            if (device) {
+                statusText.textContent = 'Running GPU tests...';
+
+                try {
+                    await testGemm2x2();
+                    log('GEMM', '2x2 matrix multiply', 'pass');
+                } catch (e) {
+                    log('GEMM', '2x2 matrix multiply', 'fail', e.message);
+                }
+
+                try {
+                    await testGelu();
+                    log('GELU', 'Basic activation', 'pass');
+                } catch (e) {
+                    log('GELU', 'Basic activation', 'fail', e.message);
+                }
+
+                try {
+                    await testGeluLarge();
+                    log('GELU', 'Large array (1024)', 'pass');
+                } catch (e) {
+                    log('GELU', 'Large array (1024)', 'fail', e.message);
+                }
+            }
+
+            // Render results
+            renderResults();
+            btn.disabled = false;
+            statusText.textContent = 'Done!';
+        };
+
+        function renderResults() {
+            const container = document.getElementById('results');
+            container.innerHTML = '';
+
+            const groups = {};
+            for (const t of testResults) {
+                if (!groups[t.group]) groups[t.group] = [];
+                groups[t.group].push(t);
+            }
+
+            for (const [group, tests] of Object.entries(groups)) {
+                const div = document.createElement('div');
+                div.className = 'test-group';
+                div.innerHTML = `<h2>${group}</h2>`;
+
+                for (const t of tests) {
+                    const testDiv = document.createElement('div');
+                    testDiv.className = `test ${t.status}`;
+                    testDiv.innerHTML = `${t.status.toUpperCase()}: ${t.name}`;
+                    if (t.error) {
+                        testDiv.innerHTML += `<div class="error">${t.error}</div>`;
+                    }
+                    div.appendChild(testDiv);
+                }
+
+                container.appendChild(div);
+            }
+
+            document.getElementById('summary').innerHTML = `
+                <h3>Summary</h3>
+                <div class="stats">
+                    <div class="stat pass">Passed: ${results.pass}</div>
+                    <div class="stat fail">Failed: ${results.fail}</div>
+                    <div class="stat skip">Skipped: ${results.skip}</div>
+                </div>
+            `;
+        }
+
+        // Auto-run on load
+        window.addEventListener('load', () => {
+            document.getElementById('statusText').textContent = 'Ready. Click "Run Tests" to start.';
+        });
+    </script>
+</body>
+</html>

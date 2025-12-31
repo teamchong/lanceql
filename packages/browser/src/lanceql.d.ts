@@ -1210,3 +1210,109 @@ export class LanceData {
 }
 
 export { LanceData };
+
+// =============================================================================
+// Simple Store API (localStorage that scales)
+// =============================================================================
+
+export interface StoreOptions {
+  /** If true, clears data when tab closes */
+  session?: boolean;
+}
+
+export interface SearchResult<T = any> {
+  item: T;
+  score: number;
+}
+
+export interface SemanticSearchOptions {
+  /** Model name ('minilm', 'clip', or GGUF URL) */
+  model?: string;
+  /** Progress callback for model loading */
+  onProgress?: (loaded: number, total: number) => void;
+}
+
+export interface SemanticSearchInfo {
+  model: string;
+  dimensions: number;
+  type: string;
+  gpuInfo?: {
+    vendor: string;
+    architecture: string;
+    device: string;
+    description: string;
+    features: string[];
+    limits: Record<string, number>;
+  } | null;
+}
+
+/**
+ * Simple key-value store with OPFS persistence.
+ * Like localStorage but scales to gigabytes and supports semantic search.
+ */
+export interface Store {
+  /** Store name */
+  readonly name: string;
+
+  /** Initialize the store */
+  open(): Promise<Store>;
+
+  /** Get a value by key */
+  get<T = any>(key: string): Promise<T | undefined>;
+
+  /** Set a value (any JSON-serializable data) */
+  set<T = any>(key: string, value: T): Promise<void>;
+
+  /** Delete a key */
+  delete(key: string): Promise<void>;
+
+  /** Clear all data */
+  clear(): Promise<void>;
+
+  /** Get all keys */
+  keys(): Promise<string[]>;
+
+  /** Filter a collection with MongoDB-style queries */
+  filter<T = any>(key: string, query: Record<string, any>): Promise<T[]>;
+
+  /** Find first matching item */
+  find<T = any>(key: string, query: Record<string, any>): Promise<T | undefined>;
+
+  /** Semantic or text search */
+  search<T = any>(key: string, text: string, limit?: number): Promise<SearchResult<T>[]>;
+
+  /** Count items in a collection */
+  count(key: string, query?: Record<string, any>): Promise<number>;
+
+  /** Subscribe to changes (not yet implemented) */
+  subscribe(key: string, callback: (value: any) => void): () => void;
+
+  /** Enable WebGPU-accelerated semantic search */
+  enableSemanticSearch(options?: SemanticSearchOptions): Promise<SemanticSearchInfo | null>;
+
+  /** Disable semantic search and free GPU resources */
+  disableSemanticSearch(): void;
+
+  /** Check if semantic search is enabled */
+  hasSemanticSearch(): boolean;
+}
+
+/**
+ * Create a new Store instance.
+ *
+ * @param name Store name (used as OPFS directory)
+ * @param options Store options
+ * @returns Promise resolving to initialized Store
+ *
+ * @example
+ * const store = await lanceStore('myapp');
+ * await store.set('user', { name: 'Alice' });
+ * const user = await store.get('user');
+ */
+export function lanceStore(name: string, options?: StoreOptions): Promise<Store>;
+
+/** Alias for backwards compatibility */
+export { lanceStore as createStore };
+
+/** Store class for manual instantiation */
+export { Store as KeyValueStore };

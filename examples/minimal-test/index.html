@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>LanceQL Minimal Test</title>
+    <style>
+        body { font-family: system-ui; padding: 20px; background: #1a1a2e; color: #eee; }
+        .test { margin: 10px 0; padding: 10px; background: #16213e; border-radius: 4px; }
+        .pass { border-left: 3px solid #4ade80; }
+        .fail { border-left: 3px solid #f87171; }
+        .pending { border-left: 3px solid #fbbf24; }
+        pre { background: #0f0f23; padding: 10px; overflow-x: auto; font-size: 12px; }
+        button { background: #3b82f6; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; margin: 5px; }
+        button:hover { background: #2563eb; }
+        h1 { color: #60a5fa; }
+        #results { margin-top: 20px; }
+    </style>
+</head>
+<body>
+    <h1>@metal0/lanceql - Minimal Test</h1>
+
+    <div>
+        <button onclick="runAllTests()">Run All Tests</button>
+        <button onclick="testRemoteDataset()">Test Remote Dataset</button>
+    </div>
+
+    <div id="results"></div>
+
+    <script type="module">
+        // Import from local package
+        import {
+            LanceQL,
+            RemoteLanceDataset,
+            parseSQL,
+            DataFrame
+        } from '../../packages/browser/dist/lanceql.esm.js';
+
+        const results = document.getElementById('results');
+        let lanceql = null;
+
+        function log(name, status, detail = '') {
+            const div = document.createElement('div');
+            div.className = `test ${status}`;
+            div.innerHTML = `<strong>${name}</strong>: ${status.toUpperCase()}${detail ? `<pre>${detail}</pre>` : ''}`;
+            results.appendChild(div);
+        }
+
+        function clear() {
+            results.innerHTML = '';
+        }
+
+        // Test 1: Load WASM
+        async function testWASMLoad() {
+            try {
+                lanceql = await LanceQL.load('../../packages/browser/dist/lanceql.wasm');
+                log('1. WASM Load', 'pass', `Memory: ${lanceql.memory.buffer.byteLength} bytes`);
+                return true;
+            } catch (e) {
+                log('1. WASM Load', 'fail', e.message);
+                return false;
+            }
+        }
+
+        // Test 2: SQL Parser
+        async function testSQLParser() {
+            try {
+                const ast = parseSQL("SELECT name, age FROM users WHERE age > 21 LIMIT 10");
+                log('2. SQL Parser', 'pass', JSON.stringify(ast, null, 2).slice(0, 500) + '...');
+                return true;
+            } catch (e) {
+                log('2. SQL Parser', 'fail', e.message);
+                return false;
+            }
+        }
+
+        // Test 3: SQL with aggregates
+        async function testSQLAggregates() {
+            try {
+                const ast = parseSQL("SELECT category, COUNT(*), AVG(price) FROM products GROUP BY category");
+                const hasGroupBy = ast.groupBy && ast.groupBy.length > 0;
+                // Aggregates are { type: "expr", expr: { type: "call", name: "COUNT" } }
+                const hasAgg = ast.columns.some(c => c.expr && c.expr.type === 'call');
+                log('3. SQL Aggregates', hasGroupBy && hasAgg ? 'pass' : 'fail',
+                    `GROUP BY: ${hasGroupBy}, Aggregates: ${hasAgg}\nFunctions: ${ast.columns.filter(c => c.expr?.type === 'call').map(c => c.expr.name).join(', ')}`);
+                return hasGroupBy && hasAgg;
+            } catch (e) {
+                log('3. SQL Aggregates', 'fail', e.message);
+                return false;
+            }
+        }
+
+        // Test 4: SQL with JOIN
+        async function testSQLJoin() {
+            try {
+                const ast = parseSQL("SELECT o.id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id");
+                // JOINs are in top-level ast.joins array
+                const hasJoin = ast.joins && ast.joins.length > 0;
+                const joinType = ast.joins?.[0]?.type || 'none';
+                log('4. SQL JOIN', hasJoin ? 'pass' : 'fail',
+                    `JOIN detected: ${hasJoin}, type: ${joinType}`);
+                return hasJoin;
+            } catch (e) {
+                log('4. SQL JOIN', 'fail', e.message);
+                return false;
+            }
+        }
+
+        // Test 5: SQL with ORDER BY + DISTINCT
+        async function testSQLOrderBy() {
+            try {
+                const ast = parseSQL("SELECT DISTINCT category FROM products ORDER BY category DESC LIMIT 10");
+                const hasOrderBy = ast.orderBy && ast.orderBy.length > 0;
+                const hasDistinct = ast.distinct === true;
+                const hasLimit = ast.limit === 10;
+                const allPass = hasOrderBy && hasDistinct && hasLimit;
+                log('5. SQL ORDER BY/DISTINCT', allPass ? 'pass' : 'fail',
+                    `ORDER BY: ${hasOrderBy}, DISTINCT: ${hasDistinct}, LIMIT: ${hasLimit}`);
+                return allPass;
+            } catch (e) {
+                log('5. SQL ORDER BY/DISTINCT', 'fail', e.message);
+                return false;
+            }
+        }
+
+        // Test 6: Remote dataset (requires network)
+        window.testRemoteDataset = async function() {
+            clear();
+            const baseUrl = 'https://data.metal0.dev/laion-1m/images.lance';
+            log('Remote Dataset Test', 'pending', `Loading from ${baseUrl} ...`);
+
+            // Test parallel fetch (same pattern as RemoteLanceDataset._loadManifest)
+            const checkVersions = [1, 5, 10, 20, 50, 100];
+            log('Parallel HEAD checks', 'pending', `Checking versions: ${checkVersions.join(', ')}`);
+
+            const checks = await Promise.all(
+                checkVersions.map(async v => {
+                    try {
+                        const url = `${baseUrl}/_versions/${v}.manifest`;
+                        const response = await fetch(url, { method: 'HEAD' });
+                        return response.ok ? v : 0;
+                    } catch (e) {
+                        console.error(`Version ${v} check failed:`, e);
+                        return 0;
+                    }
+                })
+            );
+
+            const highestFound = Math.max(...checks);
+            log('Parallel HEAD results', highestFound > 0 ? 'pass' : 'fail',
+                `Results: [${checks.join(', ')}], highest: ${highestFound}`);
+
+            // Check sidecar (tried before manifest)
+            try {
+                const sidecarUrl = `${baseUrl}/.meta.json`;
+                log('Sidecar check', 'pending', sidecarUrl);
+                const resp = await fetch(sidecarUrl);
+                if (resp.ok) {
+                    const json = await resp.json();
+                    log('Sidecar', 'pass', `Keys: ${Object.keys(json).join(', ')}`);
+                } else {
+                    log('Sidecar', 'fail', `Status: ${resp.status} (this is OK, will fall back to manifest)`);
+                }
+            } catch (e) {
+                log('Sidecar', 'fail', `Error: ${e.name}: ${e.message} (this is OK)`);
+            }
+
+            // Try GET request for version 1 manifest
+            try {
+                const url = `${baseUrl}/_versions/1.manifest`;
+                log('GET manifest v1', 'pending', url);
+                const resp = await fetch(url);
+                if (resp.ok) {
+                    const data = await resp.arrayBuffer();
+                    log('GET manifest v1', 'pass', `Size: ${data.byteLength} bytes`);
+                } else {
+                    log('GET manifest v1', 'fail', `Status: ${resp.status}`);
+                }
+            } catch (e) {
+                log('GET manifest v1', 'fail', `Error: ${e.name}: ${e.message}`);
+            }
+
+            // Now try RemoteLanceDataset
+            try {
+                if (!lanceql) {
+                    lanceql = await LanceQL.load('../../packages/browser/dist/lanceql.wasm');
+                }
+
+                log('Opening RemoteLanceDataset', 'pending', 'skipCache=true');
+                const dataset = await RemoteLanceDataset.open(
+                    lanceql,
+                    baseUrl,
+                    { skipCache: true }  // Skip IndexedDB cache to force fresh load
+                );
+
+                const info = {
+                    totalRows: dataset._totalRows,
+                    numColumns: dataset._numColumns,
+                    fragments: dataset._fragments.length,
+                    schema: dataset._schema?.slice(0, 3).map(f => f.name)
+                };
+
+                log('Remote Dataset', 'pass', JSON.stringify(info, null, 2));
+
+                // Try reading some data
+                const result = await dataset.readRows({ offset: 0, limit: 5 });
+                log('Read 5 Rows', 'pass', `Got ${result.columns[0]?.length || 0} rows, columns: ${result.columnNames.join(', ')}`);
+
+                // Test SQL query on remote dataset (avoid "text" - reserved keyword)
+                log('SQL Query (Remote)', 'pending', 'Testing SQL execution on remote dataset...');
+                try {
+                    const sql = "SELECT url, width, height FROM dataset WHERE width > 500 LIMIT 5";
+                    const sqlResult = await dataset.executeSQL(sql);
+
+                    log('SQL Query (Remote)', 'pass',
+                        `Query: ${sql}\n` +
+                        `Result: ${sqlResult.columns[0]?.length || 0} rows\n` +
+                        `Columns: ${sqlResult.columnNames?.join(', ')}\n` +
+                        `Sample widths: ${sqlResult.columns[1]?.slice(0, 3).join(', ')}`
+                    );
+                } catch (e) {
+                    log('SQL Query (Remote)', 'fail', e.stack || e.message);
+                }
+
+                // Test DataFrame API (Immer-style) on remote dataset
+                log('DataFrame (Remote)', 'pending', 'Testing Immer-style chained operations...');
+                try {
+                    const df = new DataFrame(dataset);
+
+                    // Chain operations - each returns new immutable DataFrame
+                    const filtered = df
+                        .filter(2, '>', 1000, 'int64')  // width > 1000
+                        .select(0, 2, 3)                 // url, width, height (skip text)
+                        .limit(5);
+
+                    // Show generated SQL
+                    const generatedSQL = filtered.toSQL();
+                    log('DataFrame.toSQL()', 'pass', generatedSQL);
+
+                    // Execute and collect results
+                    const dfResult = await filtered.collect();
+
+                    log('DataFrame (Remote)', 'pass',
+                        `Chained: .filter(width > 1000).select(0,2,3).limit(5)\n` +
+                        `Result: ${dfResult.columns[0]?.length || 0} rows\n` +
+                        `Columns: ${dfResult.columnNames?.join(', ')}\n` +
+                        `Sample widths: ${dfResult.columns[1]?.slice(0, 3).join(', ')}`
+                    );
+                } catch (e) {
+                    log('DataFrame (Remote)', 'fail', e.stack || e.message);
+                }
+
+            } catch (e) {
+                log('Remote Dataset', 'fail', e.stack || e.message);
+            }
+        };
+
+        // Run all tests
+        window.runAllTests = async function() {
+            clear();
+            console.log('Starting tests...');
+
+            await testWASMLoad();
+            await testSQLParser();
+            await testSQLAggregates();
+            await testSQLJoin();
+            await testSQLOrderBy();
+
+            // Test DataFrame API creation (local, no data)
+            log('DataFrame API (Local)', 'pending', 'Testing DataFrame creation...');
+            try {
+                // Create a mock file-like object to test DataFrame chaining
+                const mockFile = { _numColumns: 4, columnNames: ['id', 'name', 'value', 'count'] };
+                const df = new DataFrame(mockFile);
+                const chained = df.filter(2, '>', 100, 'int64').select(0, 1, 2).limit(10);
+                const sql = chained.toSQL();
+                log('DataFrame API (Local)', 'pass',
+                    `Created: df.filter(value > 100).select(0,1,2).limit(10)\n` +
+                    `Generated SQL: ${sql}\n` +
+                    `Note: collect() requires actual data - see Remote Dataset test`
+                );
+            } catch (e) {
+                log('DataFrame API (Local)', 'fail', e.message);
+            }
+
+            log('---', 'pass', 'Core tests complete. Click "Test Remote Dataset" for execution tests with real data.');
+        };
+
+        // Auto-run on load
+        runAllTests();
+    </script>
+</body>
+</html>

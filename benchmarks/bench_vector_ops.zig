@@ -18,7 +18,11 @@
 //!   zig build bench-vector
 
 const std = @import("std");
-const Table = @import("lanceql.table").Table;
+const format = @import("lanceql.format");
+const io = @import("lanceql.io");
+
+const LazyLanceFile = format.LazyLanceFile;
+const FileReader = io.FileReader;
 
 const WARMUP_SECONDS = 2;
 const BENCHMARK_SECONDS = 15;
@@ -43,33 +47,31 @@ fn checkPythonModule(allocator: std.mem.Allocator, module: []const u8) bool {
     }
 }
 
-fn readLanceFile(allocator: std.mem.Allocator) ![]const u8 {
-    var data_dir = std.fs.cwd().openDir(LANCE_PATH ++ "/data", .{ .iterate = true }) catch return error.FileNotFound;
+/// Find the .lance file path in a Lance dataset directory
+fn findLanceFilePath(allocator: std.mem.Allocator, lance_dir: []const u8) ![]const u8 {
+    const data_path = try std.fmt.allocPrint(allocator, "{s}/data", .{lance_dir});
+    defer allocator.free(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
     defer data_dir.close();
 
     var iter = data_dir.iterate();
-    var lance_file_name_buf: [256]u8 = undefined;
-    var lance_file_name: ?[]const u8 = null;
-
-    while (iter.next() catch null) |entry| {
+    while (try iter.next()) |entry| {
         if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".lance")) {
-            const len = @min(entry.name.len, lance_file_name_buf.len);
-            @memcpy(lance_file_name_buf[0..len], entry.name[0..len]);
-            lance_file_name = lance_file_name_buf[0..len];
-            break;
+            return std.fmt.allocPrint(allocator, "{s}/{s}", .{ data_path, entry.name });
         }
     }
 
-    const file_name = lance_file_name orelse return error.LanceFileNotFound;
-    const file = data_dir.openFile(file_name, .{}) catch return error.FileNotFound;
-    defer file.close();
+    return error.LanceFileNotFound;
+}
 
-    const file_size = file.getEndPos() catch return error.ReadError;
-    const bytes = allocator.alloc(u8, file_size) catch return error.OutOfMemory;
-    errdefer allocator.free(bytes);
-
-    _ = file.readAll(bytes) catch return error.ReadError;
-    return bytes;
+/// Compute L2 norm (Euclidean length) of a vector
+fn computeL2Norm(data: []const f64) f64 {
+    var sum_sq: f64 = 0;
+    for (data) |v| {
+        sum_sq += v * v;
+    }
+    return @sqrt(sum_sq);
 }
 
 pub fn main() !void {
@@ -122,24 +124,32 @@ pub fn main() !void {
     var lanceql_rows_per_sec: f64 = 0;
 
     // =========================================================================
-    // LanceQL - Read Lance file, compute L2 norm using library SIMD
-    // Uses Table.computeL2Norm() which auto-dispatches: scalar/SIMD/parallel
+    // LanceQL - Column-first I/O, compute L2 norm
     // =========================================================================
     {
+        // Find lance file path once
+        const lance_file_path = findLanceFilePath(allocator, LANCE_PATH) catch {
+            std.debug.print("{s:<44} {s:>12} {s:>12} {s:>10}\n", .{ "LanceQL (L2 norm)", "error", "-", "-" });
+            return;
+        };
+        defer allocator.free(lance_file_path);
+
         var iterations: u64 = 0;
         var total_rows: u64 = 0;
 
         // Warmup
         const warmup_end = std.time.nanoTimestamp() + WARMUP_SECONDS * 1_000_000_000;
         while (std.time.nanoTimestamp() < warmup_end) {
-            const file_data = readLanceFile(allocator) catch break;
-            defer allocator.free(file_data);
+            var file_reader = FileReader.open(lance_file_path) catch break;
+            defer file_reader.close();
 
-            var table = Table.init(allocator, file_data) catch break;
-            defer table.deinit();
+            var lazy = LazyLanceFile.init(allocator, file_reader.reader()) catch break;
+            defer lazy.deinit();
 
-            // Use library's compute function (SIMD with auto-dispatch)
-            const norm = table.computeL2Norm(1) catch break;
+            const amounts = lazy.readFloat64Column(1) catch break;
+            defer allocator.free(amounts);
+
+            const norm = computeL2Norm(amounts);
             std.mem.doNotOptimizeAway(&norm);
         }
 
@@ -147,18 +157,20 @@ pub fn main() !void {
         const benchmark_end_time = std.time.nanoTimestamp() + BENCHMARK_SECONDS * 1_000_000_000;
         const start_time = std.time.nanoTimestamp();
         while (std.time.nanoTimestamp() < benchmark_end_time) {
-            const file_data = readLanceFile(allocator) catch break;
-            defer allocator.free(file_data);
+            var file_reader = FileReader.open(lance_file_path) catch break;
+            defer file_reader.close();
 
-            var table = Table.init(allocator, file_data) catch break;
-            defer table.deinit();
+            var lazy = LazyLanceFile.init(allocator, file_reader.reader()) catch break;
+            defer lazy.deinit();
 
-            // Use library's compute function (SIMD with auto-dispatch)
-            const norm = table.computeL2Norm(1) catch break;
+            const amounts = lazy.readFloat64Column(1) catch break;
+            defer allocator.free(amounts);
+
+            const norm = computeL2Norm(amounts);
             std.mem.doNotOptimizeAway(&norm);
 
             iterations += 1;
-            total_rows += table.rowCount(1) catch 0;
+            total_rows += amounts.len;
         }
 
         const elapsed_ns = std.time.nanoTimestamp() - start_time;
@@ -166,7 +178,7 @@ pub fn main() !void {
         lanceql_rows_per_sec = @as(f64, @floatFromInt(total_rows)) / elapsed_s;
 
         std.debug.print("{s:<44} {d:>10.0}K {d:>12} {s:>10}\n", .{
-            "LanceQL (L2 norm via library SIMD)",
+            "LanceQL (L2 norm via column-first I/O)",
             lanceql_rows_per_sec / 1000.0,
             iterations,
             "1.0x",
