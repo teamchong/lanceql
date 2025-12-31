@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vault SQL Test Suite</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        h1 { color: #333; margin-bottom: 10px; }
+        .subtitle { color: #666; margin-bottom: 30px; }
+        .test-section {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 15px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .test-section h2 {
+            margin: 0 0 15px 0;
+            font-size: 1.1rem;
+            color: #333;
+        }
+        button {
+            background: #3b82f6;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        button:hover:not(:disabled) {
+            background: #2563eb;
+        }
+        .status {
+            margin-top: 10px;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        .status.loading {
+            background: #eff6ff;
+            color: #3b82f6;
+            border-left: 4px solid #3b82f6;
+        }
+        .status.success {
+            background: #f0fdf4;
+            color: #16a34a;
+            border-left: 4px solid #22c55e;
+        }
+        .status.error {
+            background: #fef2f2;
+            color: #dc2626;
+            border-left: 4px solid #ef4444;
+        }
+        .result {
+            margin-top: 15px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+            margin-top: 10px;
+        }
+        th, td {
+            border: 1px solid #e5e7eb;
+            padding: 8px 12px;
+            text-align: left;
+        }
+        th {
+            background: #f9fafb;
+            font-weight: 600;
+        }
+        tr:nth-child(even) { background: #fafafa; }
+        .pass { color: #16a34a; font-weight: 600; }
+        .fail { color: #dc2626; font-weight: 600; }
+        .sql-code {
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 12px;
+            background: #f3f4f6;
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
+        .summary {
+            background: #1e293b;
+            color: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-top: 20px;
+        }
+        .summary h2 { color: white; margin: 0 0 15px 0; }
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+            gap: 10px;
+        }
+        .summary-item {
+            background: rgba(255,255,255,0.1);
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .summary-item .label { font-size: 12px; opacity: 0.8; }
+        .summary-item .value { font-size: 24px; font-weight: 600; }
+        #run-all {
+            background: #059669;
+            font-size: 16px;
+            padding: 12px 24px;
+        }
+        #run-all:hover:not(:disabled) { background: #047857; }
+        pre.error-detail {
+            background: #fef2f2;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔐 Vault SQL Test Suite</h1>
+    <p class="subtitle">Comprehensive browser tests for vault.exec() SQL operations</p>
+
+    <button id="run-all" onclick="runAllTests()">▶ Run All Tests</button>
+
+    <div class="test-section">
+        <h2>1. Initialize Vault</h2>
+        <button id="btn-init" onclick="testInit()">Initialize</button>
+        <div id="status-init"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>2. CREATE TABLE</h2>
+        <button id="btn-create" onclick="testCreate()" disabled>Run Tests</button>
+        <div id="status-create"></div>
+        <div id="result-create" class="result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>3. INSERT</h2>
+        <button id="btn-insert" onclick="testInsert()" disabled>Run Tests</button>
+        <div id="status-insert"></div>
+        <div id="result-insert" class="result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>4. SELECT Basic</h2>
+        <button id="btn-select-basic" onclick="testSelectBasic()" disabled>Run Tests</button>
+        <div id="status-select-basic"></div>
+        <div id="result-select-basic" class="result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>5. SELECT WHERE Operators</h2>
+        <button id="btn-select-where" onclick="testSelectWhere()" disabled>Run Tests</button>
+        <div id="status-select-where"></div>
+        <div id="result-select-where" class="result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>6. SELECT Logic (AND/OR)</h2>
+        <button id="btn-select-logic" onclick="testSelectLogic()" disabled>Run Tests</button>
+        <div id="status-select-logic"></div>
+        <div id="result-select-logic" class="result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>7. UPDATE</h2>
+        <button id="btn-update" onclick="testUpdate()" disabled>Run Tests</button>
+        <div id="status-update"></div>
+        <div id="result-update" class="result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>8. DELETE</h2>
+        <button id="btn-delete" onclick="testDelete()" disabled>Run Tests</button>
+        <div id="status-delete"></div>
+        <div id="result-delete" class="result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>9. Aggregations</h2>
+        <button id="btn-aggregations" onclick="testAggregations()" disabled>Run Tests</button>
+        <div id="status-aggregations"></div>
+        <div id="result-aggregations" class="result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>10. GROUP BY / HAVING</h2>
+        <button id="btn-groupby" onclick="testGroupBy()" disabled>Run Tests</button>
+        <div id="status-groupby"></div>
+        <div id="result-groupby" class="result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>11. ORDER BY / LIMIT / OFFSET</h2>
+        <button id="btn-orderby" onclick="testOrderBy()" disabled>Run Tests</button>
+        <div id="status-orderby"></div>
+        <div id="result-orderby" class="result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>12. JOINs</h2>
+        <button id="btn-joins" onclick="testJoins()" disabled>Run Tests</button>
+        <div id="status-joins"></div>
+        <div id="result-joins" class="result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>13. DROP TABLE</h2>
+        <button id="btn-drop" onclick="testDrop()" disabled>Run Tests</button>
+        <div id="status-drop"></div>
+        <div id="result-drop" class="result"></div>
+    </div>
+
+    <div id="summary" class="summary" style="display: none;">
+        <h2>📊 Test Summary</h2>
+        <div class="summary-grid">
+            <div class="summary-item">
+                <div class="label">Total Tests</div>
+                <div class="value" id="total-tests">0</div>
+            </div>
+            <div class="summary-item">
+                <div class="label">Passed</div>
+                <div class="value" id="passed-tests" style="color: #22c55e;">0</div>
+            </div>
+            <div class="summary-item">
+                <div class="label">Failed</div>
+                <div class="value" id="failed-tests" style="color: #ef4444;">0</div>
+            </div>
+            <div class="summary-item">
+                <div class="label">Total Time</div>
+                <div class="value" id="total-time">0ms</div>
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        import { vault } from './lanceql.js';
+
+        let v = null;
+        let testResults = { total: 0, passed: 0, failed: 0, time: 0 };
+
+        function setStatus(id, type, message) {
+            const el = document.getElementById(`status-${id}`);
+            el.className = `status ${type}`;
+            el.innerHTML = message;
+        }
+
+        function enableButton(id) {
+            document.getElementById(`btn-${id}`).disabled = false;
+        }
+
+        async function runTest(sql, validate = null) {
+            const start = performance.now();
+            try {
+                const result = await v.exec(sql);
+                const time = performance.now() - start;
+                testResults.time += time;
+
+                if (validate) {
+                    const valid = validate(result);
+                    if (!valid.pass) {
+                        return { pass: false, time, error: valid.reason, result };
+                    }
+                }
+                return { pass: true, time, result };
+            } catch (e) {
+                return { pass: false, time: performance.now() - start, error: e.message };
+            }
+        }
+
+        function renderResults(tests) {
+            let html = '<table><tr><th>SQL</th><th>Result</th><th>Time</th><th>Details</th></tr>';
+            let allPassed = true;
+
+            for (const t of tests) {
+                testResults.total++;
+                if (t.pass) {
+                    testResults.passed++;
+                    html += `<tr>
+                        <td><code class="sql-code">${escapeHtml(t.sql)}</code></td>
+                        <td class="pass">✓ PASS</td>
+                        <td>${t.time.toFixed(2)}ms</td>
+                        <td>${t.details || ''}</td>
+                    </tr>`;
+                } else {
+                    testResults.failed++;
+                    allPassed = false;
+                    html += `<tr>
+                        <td><code class="sql-code">${escapeHtml(t.sql)}</code></td>
+                        <td class="fail">✗ FAIL</td>
+                        <td>${t.time.toFixed(2)}ms</td>
+                        <td>${escapeHtml(t.error || '')}</td>
+                    </tr>`;
+                }
+            }
+            html += '</table>';
+            return { html, allPassed };
+        }
+
+        function escapeHtml(str) {
+            if (!str) return '';
+            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        function updateSummary() {
+            document.getElementById('summary').style.display = 'block';
+            document.getElementById('total-tests').textContent = testResults.total;
+            document.getElementById('passed-tests').textContent = testResults.passed;
+            document.getElementById('failed-tests').textContent = testResults.failed;
+            document.getElementById('total-time').textContent = testResults.time.toFixed(0) + 'ms';
+        }
+
+        // =========================================================================
+        // Test Functions
+        // =========================================================================
+
+        window.testInit = async function() {
+            setStatus('init', 'loading', '⏳ Initializing vault...');
+            try {
+                v = await vault();
+                setStatus('init', 'success', '✓ Vault initialized successfully');
+                enableButton('create');
+            } catch (e) {
+                setStatus('init', 'error', `✗ Failed: ${e.message}`);
+            }
+        };
+
+        window.testCreate = async function() {
+            setStatus('create', 'loading', '⏳ Running CREATE TABLE tests...');
+            const tests = [];
+
+            // Test 1: Basic CREATE TABLE
+            let r = await runTest("CREATE TABLE users (id INT, name TEXT, age INT)");
+            tests.push({ sql: "CREATE TABLE users (id INT, name TEXT, age INT)", ...r });
+
+            // Test 2: CREATE TABLE IF NOT EXISTS (should not error)
+            r = await runTest("CREATE TABLE IF NOT EXISTS users (id INT, name TEXT)");
+            tests.push({ sql: "CREATE TABLE IF NOT EXISTS users (id INT)", ...r });
+
+            // Test 3: Create another table
+            r = await runTest("CREATE TABLE products (id INT, name TEXT, price FLOAT)");
+            tests.push({ sql: "CREATE TABLE products (id INT, name TEXT, price FLOAT)", ...r });
+
+            // Test 4: Create orders table for JOIN tests
+            r = await runTest("CREATE TABLE orders (id INT, user_id INT, product TEXT, amount INT)");
+            tests.push({ sql: "CREATE TABLE orders (...)", ...r });
+
+            const { html, allPassed } = renderResults(tests);
+            document.getElementById('result-create').innerHTML = html;
+            setStatus('create', allPassed ? 'success' : 'error',
+                allPassed ? `✓ All ${tests.length} CREATE tests passed` : '✗ Some tests failed');
+            if (allPassed) enableButton('insert');
+            updateSummary();
+        };
+
+        window.testInsert = async function() {
+            setStatus('insert', 'loading', '⏳ Running INSERT tests...');
+            const tests = [];
+
+            // Single row insert
+            let r = await runTest("INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)");
+            tests.push({ sql: "INSERT INTO users VALUES (1, 'Alice', 30)", ...r });
+
+            // Multiple row insert
+            r = await runTest("INSERT INTO users VALUES (2, 'Bob', 25), (3, 'Charlie', 35), (4, 'Diana', 28)");
+            tests.push({ sql: "INSERT INTO users VALUES (2, 'Bob', 25), (3, ...), (4, ...)", ...r });
+
+            // More users for testing
+            r = await runTest("INSERT INTO users VALUES (5, 'Eve', 30), (6, 'Frank', 45)");
+            tests.push({ sql: "INSERT INTO users VALUES (5, 'Eve', 30), (6, 'Frank', 45)", ...r });
+
+            // Insert into products
+            r = await runTest("INSERT INTO products VALUES (1, 'Laptop', 999.99), (2, 'Phone', 599.50), (3, 'Tablet', 399.00)");
+            tests.push({ sql: "INSERT INTO products VALUES (...)", ...r });
+
+            // Insert into orders for JOIN tests
+            r = await runTest("INSERT INTO orders VALUES (1, 1, 'Laptop', 1), (2, 2, 'Phone', 2), (3, 1, 'Tablet', 1)");
+            tests.push({ sql: "INSERT INTO orders VALUES (...)", ...r });
+
+            const { html, allPassed } = renderResults(tests);
+            document.getElementById('result-insert').innerHTML = html;
+            setStatus('insert', allPassed ? 'success' : 'error',
+                allPassed ? `✓ All ${tests.length} INSERT tests passed` : '✗ Some tests failed');
+            if (allPassed) enableButton('select-basic');
+            updateSummary();
+        };
+
+        window.testSelectBasic = async function() {
+            setStatus('select-basic', 'loading', '⏳ Running basic SELECT tests...');
+            const tests = [];
+
+            // SELECT *
+            let r = await runTest("SELECT * FROM users", (res) => ({
+                pass: res.rows && res.rows.length === 6,
+                reason: `Expected 6 rows, got ${res.rows?.length}`
+            }));
+            tests.push({ sql: "SELECT * FROM users", ...r, details: `${r.result?.rows?.length} rows` });
+
+            // SELECT specific columns
+            r = await runTest("SELECT name, age FROM users", (res) => ({
+                pass: res.columns?.length === 2,
+                reason: `Expected 2 columns, got ${res.columns?.length}`
+            }));
+            tests.push({ sql: "SELECT name, age FROM users", ...r, details: `cols: ${r.result?.columns?.join(', ')}` });
+
+            // SELECT DISTINCT
+            r = await runTest("SELECT DISTINCT age FROM users", (res) => ({
+                pass: res.rows && res.rows.length <= 6,
+                reason: 'DISTINCT should reduce duplicates'
+            }));
+            tests.push({ sql: "SELECT DISTINCT age FROM users", ...r, details: `${r.result?.rows?.length} unique ages` });
+
+            // SELECT with simple WHERE
+            r = await runTest("SELECT * FROM users WHERE id = 1", (res) => ({
+                pass: res.rows?.length === 1,
+                reason: `Expected 1 row, got ${res.rows?.length}`
+            }));
+            tests.push({ sql: "SELECT * FROM users WHERE id = 1", ...r, details: `${r.result?.rows?.length} row` });
+
+            const { html, allPassed } = renderResults(tests);
+            document.getElementById('result-select-basic').innerHTML = html;
+            setStatus('select-basic', allPassed ? 'success' : 'error',
+                allPassed ? `✓ All ${tests.length} basic SELECT tests passed` : '✗ Some tests failed');
+            if (allPassed) enableButton('select-where');
+            updateSummary();
+        };
+
+        window.testSelectWhere = async function() {
+            setStatus('select-where', 'loading', '⏳ Running WHERE operator tests...');
+            const tests = [];
+
+            // Greater than
+            let r = await runTest("SELECT * FROM users WHERE age > 30");
+            tests.push({ sql: "SELECT * FROM users WHERE age > 30", ...r, details: `${r.result?.rows?.length} rows` });
+
+            // Less than or equal
+            r = await runTest("SELECT * FROM users WHERE age <= 28");
+            tests.push({ sql: "SELECT * FROM users WHERE age <= 28", ...r, details: `${r.result?.rows?.length} rows` });
+
+            // Not equal
+            r = await runTest("SELECT * FROM users WHERE name != 'Alice'");
+            tests.push({ sql: "SELECT * FROM users WHERE name != 'Alice'", ...r, details: `${r.result?.rows?.length} rows` });
+
+            // LIKE with %
+            r = await runTest("SELECT * FROM users WHERE name LIKE 'A%'");
+            tests.push({ sql: "SELECT * FROM users WHERE name LIKE 'A%'", ...r, details: `${r.result?.rows?.length} rows` });
+
+            // LIKE with suffix
+            r = await runTest("SELECT * FROM users WHERE name LIKE '%e'");
+            tests.push({ sql: "SELECT * FROM users WHERE name LIKE '%e'", ...r, details: `${r.result?.rows?.length} rows` });
+
+            // BETWEEN
+            r = await runTest("SELECT * FROM users WHERE age BETWEEN 25 AND 35");
+            tests.push({ sql: "SELECT * FROM users WHERE age BETWEEN 25 AND 35", ...r, details: `${r.result?.rows?.length} rows` });
+
+            // IN
+            r = await runTest("SELECT * FROM users WHERE id IN (1, 2, 3)");
+            tests.push({ sql: "SELECT * FROM users WHERE id IN (1, 2, 3)", ...r, details: `${r.result?.rows?.length} rows` });
+
+            const { html, allPassed } = renderResults(tests);
+            document.getElementById('result-select-where').innerHTML = html;
+            setStatus('select-where', allPassed ? 'success' : 'error',
+                allPassed ? `✓ All ${tests.length} WHERE operator tests passed` : '✗ Some tests failed');
+            if (allPassed) enableButton('select-logic');
+            updateSummary();
+        };
+
+        window.testSelectLogic = async function() {
+            setStatus('select-logic', 'loading', '⏳ Running AND/OR logic tests...');
+            const tests = [];
+
+            // AND
+            let r = await runTest("SELECT * FROM users WHERE age > 25 AND age < 35");
+            tests.push({ sql: "SELECT * FROM users WHERE age > 25 AND age < 35", ...r, details: `${r.result?.rows?.length} rows` });
+
+            // OR
+            r = await runTest("SELECT * FROM users WHERE age < 26 OR age > 40");
+            tests.push({ sql: "SELECT * FROM users WHERE age < 26 OR age > 40", ...r, details: `${r.result?.rows?.length} rows` });
+
+            // AND with different columns
+            r = await runTest("SELECT * FROM users WHERE age >= 30 AND name != 'Frank'");
+            tests.push({ sql: "SELECT * FROM users WHERE age >= 30 AND name != 'Frank'", ...r, details: `${r.result?.rows?.length} rows` });
+
+            // Complex: AND + OR
+            r = await runTest("SELECT * FROM users WHERE age > 30 OR name = 'Bob'");
+            tests.push({ sql: "SELECT * FROM users WHERE age > 30 OR name = 'Bob'", ...r, details: `${r.result?.rows?.length} rows` });
+
+            const { html, allPassed } = renderResults(tests);
+            document.getElementById('result-select-logic').innerHTML = html;
+            setStatus('select-logic', allPassed ? 'success' : 'error',
+                allPassed ? `✓ All ${tests.length} logic tests passed` : '✗ Some tests failed');
+            if (allPassed) enableButton('update');
+            updateSummary();
+        };
+
+        window.testUpdate = async function() {
+            setStatus('update', 'loading', '⏳ Running UPDATE tests...');
+            const tests = [];
+
+            // UPDATE with WHERE
+            let r = await runTest("UPDATE users SET age = 31 WHERE name = 'Alice'");
+            tests.push({ sql: "UPDATE users SET age = 31 WHERE name = 'Alice'", ...r });
+
+            // Verify update
+            r = await runTest("SELECT age FROM users WHERE name = 'Alice'", (res) => ({
+                pass: res.rows?.[0]?.[0] === 31,
+                reason: `Expected age=31, got ${res.rows?.[0]?.[0]}`
+            }));
+            tests.push({ sql: "SELECT age FROM users WHERE name = 'Alice'", ...r, details: `age = ${r.result?.rows?.[0]?.[0]}` });
+
+            // UPDATE multiple columns
+            r = await runTest("UPDATE users SET age = 26, name = 'Bobby' WHERE id = 2");
+            tests.push({ sql: "UPDATE users SET age = 26, name = 'Bobby' WHERE id = 2", ...r });
+
+            const { html, allPassed } = renderResults(tests);
+            document.getElementById('result-update').innerHTML = html;
+            setStatus('update', allPassed ? 'success' : 'error',
+                allPassed ? `✓ All ${tests.length} UPDATE tests passed` : '✗ Some tests failed');
+            if (allPassed) enableButton('delete');
+            updateSummary();
+        };
+
+        window.testDelete = async function() {
+            setStatus('delete', 'loading', '⏳ Running DELETE tests...');
+            const tests = [];
+
+            // Count before delete
+            let r = await runTest("SELECT COUNT(*) FROM users");
+            const countBefore = r.result?.rows?.[0]?.[0] || 0;
+            tests.push({ sql: "SELECT COUNT(*) FROM users", ...r, details: `count = ${countBefore}` });
+
+            // DELETE with WHERE
+            r = await runTest("DELETE FROM users WHERE id = 6");
+            tests.push({ sql: "DELETE FROM users WHERE id = 6", ...r });
+
+            // Verify deletion
+            r = await runTest("SELECT COUNT(*) FROM users", (res) => ({
+                pass: res.rows?.[0]?.[0] === countBefore - 1,
+                reason: `Expected ${countBefore - 1} rows, got ${res.rows?.[0]?.[0]}`
+            }));
+            tests.push({ sql: "SELECT COUNT(*) FROM users (after delete)", ...r, details: `count = ${r.result?.rows?.[0]?.[0]}` });
+
+            const { html, allPassed } = renderResults(tests);
+            document.getElementById('result-delete').innerHTML = html;
+            setStatus('delete', allPassed ? 'success' : 'error',
+                allPassed ? `✓ All ${tests.length} DELETE tests passed` : '✗ Some tests failed');
+            if (allPassed) enableButton('aggregations');
+            updateSummary();
+        };
+
+        window.testAggregations = async function() {
+            setStatus('aggregations', 'loading', '⏳ Running aggregation tests...');
+            const tests = [];
+
+            // COUNT(*)
+            let r = await runTest("SELECT COUNT(*) FROM users");
+            tests.push({ sql: "SELECT COUNT(*) FROM users", ...r, details: `count = ${r.result?.rows?.[0]?.[0]}` });
+
+            // SUM
+            r = await runTest("SELECT SUM(age) FROM users");
+            tests.push({ sql: "SELECT SUM(age) FROM users", ...r, details: `sum = ${r.result?.rows?.[0]?.[0]}` });
+
+            // AVG
+            r = await runTest("SELECT AVG(age) FROM users");
+            tests.push({ sql: "SELECT AVG(age) FROM users", ...r, details: `avg = ${r.result?.rows?.[0]?.[0]?.toFixed(2)}` });
+
+            // MIN
+            r = await runTest("SELECT MIN(age) FROM users");
+            tests.push({ sql: "SELECT MIN(age) FROM users", ...r, details: `min = ${r.result?.rows?.[0]?.[0]}` });
+
+            // MAX
+            r = await runTest("SELECT MAX(age) FROM users");
+            tests.push({ sql: "SELECT MAX(age) FROM users", ...r, details: `max = ${r.result?.rows?.[0]?.[0]}` });
+
+            // Multiple aggregations
+            r = await runTest("SELECT COUNT(*), AVG(age), MIN(age), MAX(age) FROM users");
+            tests.push({ sql: "SELECT COUNT(*), AVG(age), MIN(age), MAX(age) FROM users", ...r });
+
+            const { html, allPassed } = renderResults(tests);
+            document.getElementById('result-aggregations').innerHTML = html;
+            setStatus('aggregations', allPassed ? 'success' : 'error',
+                allPassed ? `✓ All ${tests.length} aggregation tests passed` : '✗ Some tests failed');
+            if (allPassed) enableButton('groupby');
+            updateSummary();
+        };
+
+        window.testGroupBy = async function() {
+            setStatus('groupby', 'loading', '⏳ Running GROUP BY tests...');
+            const tests = [];
+
+            // Simple GROUP BY
+            let r = await runTest("SELECT age, COUNT(*) FROM users GROUP BY age");
+            tests.push({ sql: "SELECT age, COUNT(*) FROM users GROUP BY age", ...r, details: `${r.result?.rows?.length} groups` });
+
+            // GROUP BY with HAVING
+            r = await runTest("SELECT age, COUNT(*) FROM users GROUP BY age HAVING COUNT(*) >= 1");
+            tests.push({ sql: "SELECT age, COUNT(*) ... HAVING COUNT(*) >= 1", ...r, details: `${r.result?.rows?.length} groups` });
+
+            const { html, allPassed } = renderResults(tests);
+            document.getElementById('result-groupby').innerHTML = html;
+            setStatus('groupby', allPassed ? 'success' : 'error',
+                allPassed ? `✓ All ${tests.length} GROUP BY tests passed` : '✗ Some tests failed');
+            if (allPassed) enableButton('orderby');
+            updateSummary();
+        };
+
+        window.testOrderBy = async function() {
+            setStatus('orderby', 'loading', '⏳ Running ORDER BY tests...');
+            const tests = [];
+
+            // ORDER BY ASC
+            let r = await runTest("SELECT name, age FROM users ORDER BY age ASC");
+            tests.push({ sql: "SELECT name, age FROM users ORDER BY age ASC", ...r, details: `first: ${r.result?.rows?.[0]?.[0]}` });
+
+            // ORDER BY DESC
+            r = await runTest("SELECT name, age FROM users ORDER BY age DESC");
+            tests.push({ sql: "SELECT name, age FROM users ORDER BY age DESC", ...r, details: `first: ${r.result?.rows?.[0]?.[0]}` });
+
+            // LIMIT
+            r = await runTest("SELECT * FROM users LIMIT 3", (res) => ({
+                pass: res.rows?.length === 3,
+                reason: `Expected 3 rows, got ${res.rows?.length}`
+            }));
+            tests.push({ sql: "SELECT * FROM users LIMIT 3", ...r, details: `${r.result?.rows?.length} rows` });
+
+            // LIMIT with OFFSET
+            r = await runTest("SELECT * FROM users LIMIT 2 OFFSET 2");
+            tests.push({ sql: "SELECT * FROM users LIMIT 2 OFFSET 2", ...r, details: `${r.result?.rows?.length} rows` });
+
+            // ORDER BY + LIMIT
+            r = await runTest("SELECT name, age FROM users ORDER BY age DESC LIMIT 2");
+            tests.push({ sql: "SELECT ... ORDER BY age DESC LIMIT 2", ...r, details: `${r.result?.rows?.length} rows` });
+
+            const { html, allPassed } = renderResults(tests);
+            document.getElementById('result-orderby').innerHTML = html;
+            setStatus('orderby', allPassed ? 'success' : 'error',
+                allPassed ? `✓ All ${tests.length} ORDER BY tests passed` : '✗ Some tests failed');
+            if (allPassed) enableButton('joins');
+            updateSummary();
+        };
+
+        window.testJoins = async function() {
+            setStatus('joins', 'loading', '⏳ Running JOIN tests...');
+            const tests = [];
+
+            // INNER JOIN
+            let r = await runTest("SELECT u.name, o.product FROM users u JOIN orders o ON u.id = o.user_id");
+            tests.push({ sql: "SELECT u.name, o.product FROM users u JOIN orders o ON u.id = o.user_id", ...r, details: `${r.result?.rows?.length} rows` });
+
+            // LEFT JOIN
+            r = await runTest("SELECT u.name, o.product FROM users u LEFT JOIN orders o ON u.id = o.user_id");
+            tests.push({ sql: "SELECT ... LEFT JOIN orders ...", ...r, details: `${r.result?.rows?.length} rows` });
+
+            const { html, allPassed } = renderResults(tests);
+            document.getElementById('result-joins').innerHTML = html;
+            setStatus('joins', allPassed ? 'success' : 'error',
+                allPassed ? `✓ All ${tests.length} JOIN tests passed` : '✗ Some tests failed');
+            if (allPassed) enableButton('drop');
+            updateSummary();
+        };
+
+        window.testDrop = async function() {
+            setStatus('drop', 'loading', '⏳ Running DROP TABLE tests...');
+            const tests = [];
+
+            // DROP TABLE
+            let r = await runTest("DROP TABLE orders");
+            tests.push({ sql: "DROP TABLE orders", ...r });
+
+            // DROP TABLE IF EXISTS (should not error)
+            r = await runTest("DROP TABLE IF EXISTS nonexistent");
+            tests.push({ sql: "DROP TABLE IF EXISTS nonexistent", ...r });
+
+            // Clean up other tables
+            r = await runTest("DROP TABLE products");
+            tests.push({ sql: "DROP TABLE products", ...r });
+
+            r = await runTest("DROP TABLE users");
+            tests.push({ sql: "DROP TABLE users", ...r });
+
+            const { html, allPassed } = renderResults(tests);
+            document.getElementById('result-drop').innerHTML = html;
+            setStatus('drop', allPassed ? 'success' : 'error',
+                allPassed ? `✓ All ${tests.length} DROP TABLE tests passed` : '✗ Some tests failed');
+            updateSummary();
+        };
+
+        // Run all tests sequentially
+        window.runAllTests = async function() {
+            testResults = { total: 0, passed: 0, failed: 0, time: 0 };
+            const btn = document.getElementById('run-all');
+            btn.disabled = true;
+            btn.textContent = '⏳ Running...';
+
+            await testInit();
+            if (v) {
+                await testCreate();
+                await testInsert();
+                await testSelectBasic();
+                await testSelectWhere();
+                await testSelectLogic();
+                await testUpdate();
+                await testDelete();
+                await testAggregations();
+                await testGroupBy();
+                await testOrderBy();
+                await testJoins();
+                await testDrop();
+            }
+
+            btn.disabled = false;
+            btn.textContent = '▶ Run All Tests';
+            updateSummary();
+        };
+    </script>
+</body>
+</html>

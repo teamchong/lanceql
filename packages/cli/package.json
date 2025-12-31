@@ -1,0 +1,53 @@
+{
+  "name": "@metal0/lanceql",
+  "version": "0.1.0",
+  "description": "LanceQL CLI - Native query interface for Lance/Parquet files",
+  "keywords": [
+    "lance",
+    "parquet",
+    "sql",
+    "query",
+    "cli",
+    "database",
+    "analytics"
+  ],
+  "author": "Metal0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/teamchong/lanceql.git",
+    "directory": "packages/cli"
+  },
+  "bin": {
+    "lanceql": "./bin/lanceql"
+  },
+  "files": [
+    "bin",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js",
+    "build": "cd ../.. && zig build cli",
+    "test": "node --test test/cli.test.js",
+    "test:verbose": "node --test --test-reporter spec test/cli.test.js"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "optionalDependencies": {
+    "@metal0/lanceql-darwin-arm64": "0.1.0",
+    "@metal0/lanceql-darwin-x64": "0.1.0",
+    "@metal0/lanceql-linux-arm64": "0.1.0",
+    "@metal0/lanceql-linux-x64": "0.1.0",
+    "@metal0/lanceql-win32-x64": "0.1.0"
+  }
+}

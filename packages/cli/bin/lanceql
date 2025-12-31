@@ -1,0 +1,90 @@
+#!/usr/bin/env node
+/**
+ * LanceQL CLI wrapper
+ *
+ * This script locates and executes the native lanceql binary for the current platform.
+ */
+
+const { spawn } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+
+const PLATFORM_PACKAGES = {
+  'darwin-arm64': '@metal0/lanceql-darwin-arm64',
+  'darwin-x64': '@metal0/lanceql-darwin-x64',
+  'linux-arm64': '@metal0/lanceql-linux-arm64',
+  'linux-x64': '@metal0/lanceql-linux-x64',
+  'win32-x64': '@metal0/lanceql-win32-x64',
+};
+
+function getBinaryPath() {
+  const platform = process.platform;
+  const arch = process.arch;
+  const key = `${platform}-${arch}`;
+
+  // Try platform-specific package first
+  const platformPkg = PLATFORM_PACKAGES[key];
+  if (platformPkg) {
+    try {
+      const pkgPath = require.resolve(`${platformPkg}/package.json`);
+      const pkgDir = path.dirname(pkgPath);
+      const binName = platform === 'win32' ? 'lanceql.exe' : 'lanceql';
+      const binPath = path.join(pkgDir, 'bin', binName);
+      if (fs.existsSync(binPath)) {
+        return binPath;
+      }
+    } catch (e) {
+      // Package not installed, try fallback
+    }
+  }
+
+  // Fallback: check if binary was built locally
+  const localBin = path.join(__dirname, '..', '..', '..', 'zig-out', 'bin', 'lanceql');
+  if (fs.existsSync(localBin)) {
+    return localBin;
+  }
+
+  // Fallback: check system PATH
+  const pathDirs = (process.env.PATH || '').split(path.delimiter);
+  for (const dir of pathDirs) {
+    const binPath = path.join(dir, platform === 'win32' ? 'lanceql.exe' : 'lanceql');
+    if (fs.existsSync(binPath)) {
+      return binPath;
+    }
+  }
+
+  return null;
+}
+
+function main() {
+  const binaryPath = getBinaryPath();
+
+  if (!binaryPath) {
+    console.error('Error: lanceql binary not found.');
+    console.error('');
+    console.error('To install:');
+    console.error('  1. Build from source: cd lanceql && zig build cli');
+    console.error('  2. Or install platform package: npm install @metal0/lanceql-darwin-arm64');
+    console.error('');
+    process.exit(1);
+  }
+
+  // Forward all arguments to the native binary
+  const args = process.argv.slice(2);
+
+  const child = spawn(binaryPath, args, {
+    stdio: 'inherit',
+    env: process.env,
+  });
+
+  child.on('error', (err) => {
+    console.error(`Failed to execute lanceql: ${err.message}`);
+    process.exit(1);
+  });
+
+  child.on('close', (code) => {
+    process.exit(code || 0);
+  });
+}
+
+main();

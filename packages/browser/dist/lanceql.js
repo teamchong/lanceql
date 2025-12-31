@@ -3947,7 +3947,383 @@ async function workerRPC(method, args) {
 // Alias for backwards compatibility
 const getStoreWorker = getLanceWorker;
 
+// ============================================================================
+// Vault - Unified storage API with encryption, KV, SQL, and DataFrame
+// ============================================================================
+
 /**
+ * Vault - Unified encrypted storage with KV, SQL, and DataFrame support.
+ *
+ * @example
+ * import { vault } from '@metal0/lanceql/browser';
+ *
+ * // Unencrypted
+ * const v = await vault();
+ *
+ * // Encrypted
+ * const v = await vault(async () => password);
+ *
+ * // KV operations
+ * await v.set('user:1', { name: 'Alice' });
+ * const user = await v.get('user:1');
+ *
+ * // SQL operations
+ * await v.exec('CREATE TABLE products (id INT, name TEXT)');
+ * await v.exec('SELECT * FROM products WHERE name NEAR "shoes"');
+ *
+ * // DataFrame operations
+ * v.table('products').filter('price', '<', 100).similar('name', 'shoes').limit(10);
+ */
+class Vault {
+    /**
+     * @param {Function|null} getEncryptionKey - Async callback returning encryption key
+     */
+    constructor(getEncryptionKey = null) {
+        this._getEncryptionKey = getEncryptionKey;
+        this._encryptionKeyId = null;
+        this._ready = false;
+    }
+
+    /**
+     * Initialize the vault (connects to SharedWorker).
+     * @returns {Promise<Vault>}
+     */
+    async _init() {
+        if (this._ready) return this;
+
+        // If encryption is enabled, derive key and send to worker
+        let encryptionConfig = null;
+        if (this._getEncryptionKey) {
+            const key = await this._getEncryptionKey();
+            this._encryptionKeyId = `vault:${Date.now()}`;
+
+            // Convert key to raw bytes if needed
+            let keyBytes;
+            if (key instanceof CryptoKey) {
+                keyBytes = await crypto.subtle.exportKey('raw', key);
+            } else if (key instanceof ArrayBuffer || key instanceof Uint8Array) {
+                keyBytes = key instanceof Uint8Array ? key : new Uint8Array(key);
+            } else if (typeof key === 'string') {
+                // Hash string to get 256-bit key
+                const encoder = new TextEncoder();
+                const data = encoder.encode(key);
+                const hash = await crypto.subtle.digest('SHA-256', data);
+                keyBytes = new Uint8Array(hash);
+            } else {
+                throw new Error('Encryption key must be CryptoKey, ArrayBuffer, Uint8Array, or string');
+            }
+
+            encryptionConfig = {
+                keyId: this._encryptionKeyId,
+                keyBytes: Array.from(keyBytes instanceof Uint8Array ? keyBytes : new Uint8Array(keyBytes))
+            };
+        }
+
+        await workerRPC('vault:open', { encryption: encryptionConfig });
+        this._ready = true;
+        return this;
+    }
+
+    // =========================================================================
+    // KV Operations (stored in encrypted JSON file)
+    // =========================================================================
+
+    /**
+     * Get a value by key.
+     * @param {string} key
+     * @returns {Promise<any>} The stored value, or undefined if not found
+     */
+    async get(key) {
+        return workerRPC('vault:get', { key });
+    }
+
+    /**
+     * Set a value. Accepts any JSON-serializable value.
+     * @param {string} key
+     * @param {any} value
+     * @returns {Promise<void>}
+     */
+    async set(key, value) {
+        await workerRPC('vault:set', { key, value });
+    }
+
+    /**
+     * Delete a key.
+     * @param {string} key
+     * @returns {Promise<boolean>} True if key existed
+     */
+    async delete(key) {
+        return workerRPC('vault:delete', { key });
+    }
+
+    /**
+     * List all keys.
+     * @returns {Promise<string[]>}
+     */
+    async keys() {
+        return workerRPC('vault:keys', {});
+    }
+
+    /**
+     * Check if a key exists.
+     * @param {string} key
+     * @returns {Promise<boolean>}
+     */
+    async has(key) {
+        const value = await this.get(key);
+        return value !== undefined;
+    }
+
+    // =========================================================================
+    // SQL Operations (tables in Lance format)
+    // =========================================================================
+
+    /**
+     * Execute a SQL statement.
+     * @param {string} sql - SQL statement
+     * @returns {Promise<any>} Query results or affected row count
+     *
+     * @example
+     * await v.exec('CREATE TABLE users (id INT, name TEXT, embedding VECTOR(384))');
+     * await v.exec('INSERT INTO users VALUES (1, "Alice", [...])');
+     * const results = await v.exec('SELECT * FROM users WHERE name NEAR "alice"');
+     */
+    async exec(sql) {
+        return workerRPC('vault:exec', { sql });
+    }
+
+    /**
+     * Execute a SQL query and return results as array of objects.
+     * @param {string} sql - SELECT statement
+     * @returns {Promise<Object[]>} Array of row objects
+     */
+    async query(sql) {
+        const result = await this.exec(sql);
+        if (!result || !result.columns || !result.rows) return [];
+
+        return result.rows.map(row => {
+            const obj = {};
+            result.columns.forEach((col, i) => {
+                obj[col] = row[i];
+            });
+            return obj;
+        });
+    }
+
+    // =========================================================================
+    // DataFrame Operations
+    // =========================================================================
+
+    /**
+     * Get a DataFrame reference to a table.
+     * @param {string} name - Table name
+     * @returns {TableRef} DataFrame-style query builder
+     */
+    table(name) {
+        return new TableRef(this, name);
+    }
+
+    /**
+     * List all tables.
+     * @returns {Promise<string[]>}
+     */
+    async tables() {
+        return workerRPC('vault:tables', {});
+    }
+}
+
+/**
+ * TableRef - DataFrame-style query builder for vault tables.
+ */
+class TableRef {
+    constructor(vault, tableName) {
+        this._vault = vault;
+        this._tableName = tableName;
+        this._filters = [];
+        this._similar = null;
+        this._selectCols = null;
+        this._limitValue = null;
+        this._orderBy = null;
+    }
+
+    /**
+     * Filter rows by condition.
+     * @param {string} column - Column name
+     * @param {string} op - Operator ('=', '!=', '<', '<=', '>', '>=')
+     * @param {any} value - Value to compare
+     * @returns {TableRef} New TableRef with filter applied
+     */
+    filter(column, op, value) {
+        const ref = this._clone();
+        ref._filters.push({ column, op, value });
+        return ref;
+    }
+
+    /**
+     * Semantic similarity search.
+     * @param {string} column - Column name (text or vector)
+     * @param {string} text - Search text
+     * @param {number} limit - Max results (default 20)
+     * @returns {TableRef} New TableRef with similarity search
+     */
+    similar(column, text, limit = 20) {
+        const ref = this._clone();
+        ref._similar = { column, text, limit };
+        return ref;
+    }
+
+    /**
+     * Select specific columns.
+     * @param {...string} columns - Column names
+     * @returns {TableRef} New TableRef with columns selected
+     */
+    select(...columns) {
+        const ref = this._clone();
+        ref._selectCols = columns.flat();
+        return ref;
+    }
+
+    /**
+     * Limit number of results.
+     * @param {number} n - Max rows
+     * @returns {TableRef} New TableRef with limit
+     */
+    limit(n) {
+        const ref = this._clone();
+        ref._limitValue = n;
+        return ref;
+    }
+
+    /**
+     * Order results.
+     * @param {string} column - Column to order by
+     * @param {string} direction - 'ASC' or 'DESC'
+     * @returns {TableRef} New TableRef with ordering
+     */
+    orderBy(column, direction = 'ASC') {
+        const ref = this._clone();
+        ref._orderBy = { column, direction };
+        return ref;
+    }
+
+    /**
+     * Execute query and return results as array of objects.
+     * @returns {Promise<Object[]>}
+     */
+    async toArray() {
+        const sql = this._toSQL();
+        return this._vault.query(sql);
+    }
+
+    /**
+     * Execute query and return first result.
+     * @returns {Promise<Object|null>}
+     */
+    async first() {
+        const ref = this._clone();
+        ref._limitValue = 1;
+        const results = await ref.toArray();
+        return results[0] || null;
+    }
+
+    /**
+     * Count matching rows.
+     * @returns {Promise<number>}
+     */
+    async count() {
+        const sql = this._toSQL(true);
+        const result = await this._vault.exec(sql);
+        return result?.rows?.[0]?.[0] || 0;
+    }
+
+    /**
+     * Generate SQL from this query.
+     * @param {boolean} countOnly - Generate COUNT(*) query
+     * @returns {string}
+     */
+    _toSQL(countOnly = false) {
+        const cols = countOnly ? 'COUNT(*)' : (this._selectCols?.join(', ') || '*');
+        let sql = `SELECT ${cols} FROM ${this._tableName}`;
+
+        const whereClauses = [];
+
+        // Add filter conditions
+        for (const f of this._filters) {
+            const val = typeof f.value === 'string' ? `'${f.value}'` : f.value;
+            whereClauses.push(`${f.column} ${f.op} ${val}`);
+        }
+
+        // Add NEAR condition for vector similarity search
+        if (this._similar) {
+            whereClauses.push(`${this._similar.column} NEAR '${this._similar.text}'`);
+        }
+
+        if (whereClauses.length > 0) {
+            sql += ' WHERE ' + whereClauses.join(' AND ');
+        }
+
+        if (this._orderBy && !countOnly) {
+            sql += ` ORDER BY ${this._orderBy.column} ${this._orderBy.direction}`;
+        }
+
+        // Use similar limit if set, otherwise use explicit limit
+        const limit = this._similar?.limit || this._limitValue;
+        if (limit && !countOnly) {
+            sql += ` LIMIT ${limit}`;
+        }
+
+        return sql;
+    }
+
+    _clone() {
+        const ref = new TableRef(this._vault, this._tableName);
+        ref._filters = [...this._filters];
+        ref._similar = this._similar;
+        ref._selectCols = this._selectCols ? [...this._selectCols] : null;
+        ref._limitValue = this._limitValue;
+        ref._orderBy = this._orderBy;
+        return ref;
+    }
+}
+
+/**
+ * Create a new Vault instance.
+ *
+ * @param {Function|null} getEncryptionKey - Async callback returning encryption key
+ * @returns {Promise<Vault>}
+ *
+ * @example
+ * // Unencrypted vault
+ * const v = await vault();
+ *
+ * // Encrypted vault
+ * const v = await vault(async () => {
+ *     return await promptUserForPassword();
+ * });
+ *
+ * // KV operations
+ * await v.set('user', { name: 'Alice' });
+ * const user = await v.get('user');
+ *
+ * // SQL operations
+ * await v.exec('CREATE TABLE products (id INT, name TEXT)');
+ * await v.exec('SELECT * FROM products WHERE name NEAR "shoes"');
+ */
+async function vault(getEncryptionKey = null) {
+    const v = new Vault(getEncryptionKey);
+    await v._init();
+    return v;
+}
+
+// Export Vault class for type checking
+
+
+// ============================================================================
+// Legacy Store API (deprecated, use vault() instead)
+// ============================================================================
+
+/**
+ * @deprecated Use vault() instead
  * Store - Simple key-value and collection storage with search.
  *
  * All operations run in a SharedWorker for OPFS sync access and shared GPU.
@@ -10362,6 +10738,12 @@ class SQLParser {
             return { type: 'like', expr: left, pattern };
         }
 
+        // NEAR - vector similarity search in WHERE clause
+        if (this.match(TokenType.NEAR)) {
+            const text = this.parsePrimary();
+            return { type: 'near', column: left, text };
+        }
+
         // Comparison operators
         const opMap = {
             [TokenType.EQ]: '==',
@@ -10757,6 +11139,9 @@ class SQLExecutor {
             case 'like':
                 this.collectColumnsFromExpr(expr.expr, columns);
                 break;
+            case 'near':
+                this.collectColumnsFromExpr(expr.column, columns);
+                break;
         }
     }
 
@@ -10808,6 +11193,12 @@ class SQLExecutor {
     }
 
     async evaluateWhere(whereExpr, totalRows, onProgress) {
+        // Check for NEAR conditions in WHERE clause
+        const nearInfo = this._extractNearCondition(whereExpr);
+        if (nearInfo) {
+            return await this._evaluateWithNear(nearInfo, whereExpr, totalRows, onProgress);
+        }
+
         // Optimization: For simple conditions on a single numeric column,
         // fetch only the filter column first, then fetch other columns only for matches
         const simpleFilter = this._detectSimpleFilter(whereExpr);
@@ -10818,6 +11209,153 @@ class SQLExecutor {
 
         // Complex conditions: fetch all needed columns in batches
         return await this._evaluateComplexFilter(whereExpr, totalRows, onProgress);
+    }
+
+    /**
+     * Extract NEAR condition from WHERE expression.
+     * Returns { column, text, limit } if found, null otherwise.
+     * @private
+     */
+    _extractNearCondition(expr) {
+        if (!expr) return null;
+
+        if (expr.type === 'near') {
+            const columnName = expr.column?.name || expr.column;
+            const text = expr.text?.value || expr.text;
+            return { column: columnName, text, limit: 20 };
+        }
+
+        // Check AND/OR for NEAR condition
+        if (expr.type === 'binary' && (expr.op === 'AND' || expr.op === 'OR')) {
+            const leftNear = this._extractNearCondition(expr.left);
+            if (leftNear) return leftNear;
+            return this._extractNearCondition(expr.right);
+        }
+
+        return null;
+    }
+
+    /**
+     * Remove NEAR condition from expression, returning remaining conditions.
+     * @private
+     */
+    _removeNearCondition(expr) {
+        if (!expr) return null;
+
+        if (expr.type === 'near') {
+            return null;  // Remove the NEAR condition
+        }
+
+        if (expr.type === 'binary' && (expr.op === 'AND' || expr.op === 'OR')) {
+            const leftIsNear = expr.left?.type === 'near';
+            const rightIsNear = expr.right?.type === 'near';
+
+            if (leftIsNear && rightIsNear) return null;
+            if (leftIsNear) return this._removeNearCondition(expr.right);
+            if (rightIsNear) return this._removeNearCondition(expr.left);
+
+            const newLeft = this._removeNearCondition(expr.left);
+            const newRight = this._removeNearCondition(expr.right);
+
+            if (!newLeft && !newRight) return null;
+            if (!newLeft) return newRight;
+            if (!newRight) return newLeft;
+
+            return { ...expr, left: newLeft, right: newRight };
+        }
+
+        return expr;
+    }
+
+    /**
+     * Evaluate WHERE with NEAR condition.
+     * Executes vector search first, then applies remaining conditions.
+     * @private
+     */
+    async _evaluateWithNear(nearInfo, whereExpr, totalRows, onProgress) {
+        if (onProgress) {
+            onProgress('Executing vector search...', 0, 100);
+        }
+
+        // Execute vector search to get candidate indices
+        // This reuses the existing vector search infrastructure
+        const searchResults = await this._executeNearSearch(nearInfo, totalRows);
+
+        if (!searchResults || searchResults.length === 0) {
+            return [];
+        }
+
+        // Get remaining conditions after removing NEAR
+        const remainingExpr = this._removeNearCondition(whereExpr);
+
+        if (!remainingExpr) {
+            // No other conditions, return search results directly
+            return searchResults;
+        }
+
+        if (onProgress) {
+            onProgress('Applying filters...', 50, 100);
+        }
+
+        // Apply remaining conditions to search results
+        const neededCols = new Set();
+        this.collectColumnsFromExpr(remainingExpr, neededCols);
+
+        // Fetch column data for candidate rows
+        const columnData = {};
+        for (const colName of neededCols) {
+            const colIdx = this.columnMap[colName.toLowerCase()];
+            if (colIdx !== undefined) {
+                columnData[colName.toLowerCase()] = await this.readColumnData(colIdx, searchResults);
+            }
+        }
+
+        // Filter by remaining conditions
+        const matchingIndices = [];
+        for (let i = 0; i < searchResults.length; i++) {
+            const result = this.evaluateExpr(remainingExpr, columnData, i);
+            if (result) {
+                matchingIndices.push(searchResults[i]);
+            }
+        }
+
+        return matchingIndices;
+    }
+
+    /**
+     * Execute NEAR vector search.
+     * @private
+     */
+    async _executeNearSearch(nearInfo, totalRows) {
+        // Find vector column for the specified column
+        const { column, text, limit } = nearInfo;
+
+        // Look for embedding/vector column
+        // Convention: embedding column is named 'embedding' or '<column>_embedding'
+        const vectorColName = this.file.columnNames?.find(n =>
+            n === 'embedding' ||
+            n === `${column}_embedding` ||
+            n.endsWith('_embedding') ||
+            n.endsWith('_vector')
+        );
+
+        if (!vectorColName) {
+            // No vector column found, fall back to text-based search
+            // For now, throw an error - full text search not implemented yet
+            throw new Error(`NEAR requires a vector column. Add 'embedding' column or use LIKE for text patterns.`);
+        }
+
+        // Use existing vector search infrastructure
+        const topK = Math.min(limit, totalRows);
+
+        try {
+            // Call the file's vectorSearch method
+            const results = await this.file.vectorSearch(text, topK);
+            return results.map(r => r.index);
+        } catch (e) {
+            console.error('[SQLExecutor] Vector search failed:', e);
+            throw new Error(`NEAR search failed: ${e.message}`);
+        }
     }
 
     /**
@@ -11028,6 +11566,11 @@ class SQLExecutor {
                 const regex = new RegExp('^' + pattern.replace(/%/g, '.*').replace(/_/g, '.') + '$', 'i');
                 return regex.test(value);
             }
+
+            case 'near':
+                // NEAR is handled specially at the evaluateWhere level
+                // If we reach here, the row is already in the NEAR result set
+                return true;
 
             case 'call':
                 // Aggregate functions not supported in row-level evaluation
@@ -15799,6 +16342,7 @@ module.exports = {
     WorkerPool,
     SharedVectorStore,
     LanceData,
+    vault,
     lanceStore,
     parseSQL,
     initSqlJs,

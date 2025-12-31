@@ -405,6 +405,27 @@ pub fn build(b: *std.Build) void {
     const test_dataframe_step = b.step("test-dataframe", "Run DataFrame module tests");
     test_dataframe_step.dependOn(&run_test_dataframe.step);
 
+    // Ingest command tests (CSV, TSV, JSON, JSONL, Parquet → Lance)
+    const test_ingest = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/test_ingest.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lanceql", .module = lanceql_mod },
+                .{ .name = "lanceql.encoding", .module = encoding_mod },
+                .{ .name = "lanceql.format", .module = format_mod },
+                .{ .name = "lanceql.encoding.parquet", .module = parquet_encoding_mod },
+            },
+        }),
+    });
+
+    const run_test_ingest = b.addRunArtifact(test_ingest);
+    test_step.dependOn(&run_test_ingest.step);
+
+    const test_ingest_step = b.step("test-ingest", "Run ingest command tests (CSV, TSV, JSON, JSONL, Parquet)");
+    test_ingest_step.dependOn(&run_test_ingest.step);
+
     // Metal module tests (with framework linking on macOS)
     const test_metal = b.addTest(.{
         .root_module = b.createModule(.{

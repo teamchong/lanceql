@@ -1212,9 +1212,113 @@ export class LanceData {
 export { LanceData };
 
 // =============================================================================
-// Simple Store API (localStorage that scales)
+// Vault API - Unified storage with encryption, KV, and SQL
 // =============================================================================
 
+/**
+ * Callback for providing encryption key.
+ * Can return CryptoKey, ArrayBuffer, Uint8Array, or string (will be hashed to 256-bit key).
+ */
+export type GetEncryptionKey = () => Promise<CryptoKey | ArrayBuffer | Uint8Array | string>;
+
+/**
+ * TableRef - DataFrame-style query builder for vault tables.
+ */
+export interface TableRef {
+  /** Filter rows by column comparison */
+  filter(column: string, op: string, value: any): TableRef;
+
+  /** Semantic similarity search on a column */
+  similar(column: string, text: string, limit?: number): TableRef;
+
+  /** Select specific columns */
+  select(...columns: string[]): TableRef;
+
+  /** Limit results */
+  limit(n: number): TableRef;
+
+  /** Order by column */
+  orderBy(column: string, direction?: 'ASC' | 'DESC'): TableRef;
+
+  /** Execute query and return results as array */
+  toArray(): Promise<any[]>;
+
+  /** Execute query and return first result */
+  first(): Promise<any | undefined>;
+
+  /** Count matching rows */
+  count(): Promise<number>;
+}
+
+/**
+ * Vault - Unified storage with encryption, KV operations, and SQL tables.
+ *
+ * @example
+ * // Unencrypted vault
+ * const v = await vault();
+ *
+ * // Encrypted vault
+ * const v = await vault(async () => userPassword);
+ *
+ * // KV operations
+ * await v.set('user', { name: 'Alice' });
+ * const user = await v.get('user');
+ *
+ * // SQL operations
+ * await v.exec('CREATE TABLE products (id INT, name TEXT)');
+ * await v.exec('SELECT * FROM products WHERE name NEAR "shoes"');
+ *
+ * // DataFrame operations
+ * const results = await v.table('products').filter('price', '<', 100).similar('name', 'shoes').toArray();
+ */
+export interface Vault {
+  /** Get a value by key */
+  get<T = any>(key: string): Promise<T | undefined>;
+
+  /** Set a value (any JSON-serializable data) */
+  set<T = any>(key: string, value: T): Promise<void>;
+
+  /** Delete a key */
+  delete(key: string): Promise<boolean>;
+
+  /** Get all keys */
+  keys(): Promise<string[]>;
+
+  /** Check if key exists */
+  has(key: string): Promise<boolean>;
+
+  /** Execute SQL statement */
+  exec(sql: string): Promise<any>;
+
+  /** Execute SQL and return results as objects */
+  query(sql: string): Promise<Record<string, any>[]>;
+
+  /** Get a table reference for DataFrame-style queries */
+  table(name: string): TableRef;
+}
+
+/**
+ * Create a new Vault instance.
+ *
+ * @param getEncryptionKey Optional async callback returning encryption key
+ * @returns Promise resolving to initialized Vault
+ *
+ * @example
+ * // Unencrypted
+ * const v = await vault();
+ *
+ * // Encrypted with password
+ * const v = await vault(async () => prompt('Enter password:'));
+ */
+export function vault(getEncryptionKey?: GetEncryptionKey): Promise<Vault>;
+
+export { Vault, TableRef };
+
+// =============================================================================
+// Simple Store API (deprecated - use vault() instead)
+// =============================================================================
+
+/** @deprecated Use vault() instead */
 export interface StoreOptions {
   /** If true, clears data when tab closes */
   session?: boolean;
@@ -1249,6 +1353,7 @@ export interface SemanticSearchInfo {
 /**
  * Simple key-value store with OPFS persistence.
  * Like localStorage but scales to gigabytes and supports semantic search.
+ * @deprecated Use vault() instead
  */
 export interface Store {
   /** Store name */
@@ -1299,6 +1404,7 @@ export interface Store {
 
 /**
  * Create a new Store instance.
+ * @deprecated Use vault() instead
  *
  * @param name Store name (used as OPFS directory)
  * @param options Store options
@@ -1311,8 +1417,8 @@ export interface Store {
  */
 export function lanceStore(name: string, options?: StoreOptions): Promise<Store>;
 
-/** Alias for backwards compatibility */
+/** @deprecated Use vault() instead */
 export { lanceStore as createStore };
 
-/** Store class for manual instantiation */
+/** @deprecated Use vault() instead */
 export { Store as KeyValueStore };

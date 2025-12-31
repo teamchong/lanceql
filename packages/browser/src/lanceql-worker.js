@@ -1148,6 +1148,16 @@ const TokenType = {
     KEY: 'KEY', ORDER: 'ORDER', BY: 'BY', ASC: 'ASC', DESC: 'DESC',
     LIMIT: 'LIMIT', OFFSET: 'OFFSET', AND: 'AND', OR: 'OR',
     NULL: 'NULL', TRUE: 'TRUE', FALSE: 'FALSE', LIKE: 'LIKE',
+    // JOIN keywords
+    JOIN: 'JOIN', LEFT: 'LEFT', RIGHT: 'RIGHT', INNER: 'INNER', ON: 'ON', AS: 'AS',
+    // GROUP BY / HAVING
+    GROUP: 'GROUP', HAVING: 'HAVING',
+    // Aggregate functions
+    COUNT: 'COUNT', SUM: 'SUM', AVG: 'AVG', MIN: 'MIN', MAX: 'MAX',
+    // Additional operators
+    DISTINCT: 'DISTINCT', BETWEEN: 'BETWEEN', IN: 'IN',
+    // Vector search
+    NEAR: 'NEAR', TOPK: 'TOPK',
 
     // Literals
     IDENTIFIER: 'IDENTIFIER', STRING: 'STRING', NUMBER: 'NUMBER',
@@ -1155,7 +1165,7 @@ const TokenType = {
     // Operators
     EQ: '=', NE: '!=', LT: '<', LE: '<=', GT: '>', GE: '>=',
     STAR: '*', COMMA: ',', LPAREN: '(', RPAREN: ')',
-    LBRACKET: '[', RBRACKET: ']',
+    LBRACKET: '[', RBRACKET: ']', DOT: '.',
 
     // Special
     EOF: 'EOF',
@@ -1202,6 +1212,7 @@ class SQLLexer {
             '=': TokenType.EQ,
             '<': TokenType.LT,
             '>': TokenType.GT,
+            '.': TokenType.DOT,
         };
 
         if (singleChars[ch]) {
@@ -1531,31 +1542,62 @@ class SQLParser {
     parseSelect() {
         this.expect(TokenType.SELECT);
 
+        // Check for DISTINCT
+        const distinct = !!this.match(TokenType.DISTINCT);
+
+        // Parse column list (may include aggregate functions, table.column, etc.)
         const columns = [];
-        if (this.match(TokenType.STAR)) {
-            columns.push('*');
-        } else {
-            columns.push(this.expect(TokenType.IDENTIFIER).value);
-            while (this.match(TokenType.COMMA)) {
-                columns.push(this.expect(TokenType.IDENTIFIER).value);
-            }
+        columns.push(this.parseSelectColumn());
+        while (this.match(TokenType.COMMA)) {
+            columns.push(this.parseSelectColumn());
         }
 
         this.expect(TokenType.FROM);
-        const tableName = this.expect(TokenType.IDENTIFIER).value;
+
+        // Parse table with optional alias
+        const tables = [];
+        tables.push(this.parseTableRef());
+
+        // Parse JOINs
+        const joins = [];
+        while (this.peek().type === TokenType.JOIN ||
+               this.peek().type === TokenType.LEFT ||
+               this.peek().type === TokenType.RIGHT ||
+               this.peek().type === TokenType.INNER) {
+            joins.push(this.parseJoin());
+        }
 
         let where = null;
         if (this.match(TokenType.WHERE)) {
             where = this.parseWhereExpr();
         }
 
+        // Parse GROUP BY
+        let groupBy = null;
+        if (this.match(TokenType.GROUP)) {
+            this.expect(TokenType.BY);
+            groupBy = [this.parseColumnRef()];
+            while (this.match(TokenType.COMMA)) {
+                groupBy.push(this.parseColumnRef());
+            }
+        }
+
+        // Parse HAVING
+        let having = null;
+        if (this.match(TokenType.HAVING)) {
+            having = this.parseWhereExpr();
+        }
+
         let orderBy = null;
         if (this.match(TokenType.ORDER)) {
             this.expect(TokenType.BY);
-            const column = this.expect(TokenType.IDENTIFIER).value;
-            const desc = !!this.match(TokenType.DESC);
-            if (!desc) this.match(TokenType.ASC);
-            orderBy = { column, desc };
+            orderBy = [];
+            do {
+                const column = this.parseColumnRef();
+                const desc = !!this.match(TokenType.DESC);
+                if (!desc) this.match(TokenType.ASC);
+                orderBy.push({ column, desc });
+            } while (this.match(TokenType.COMMA));
         }
 
         let limit = null;
@@ -1568,7 +1610,142 @@ class SQLParser {
             offset = parseInt(this.expect(TokenType.NUMBER).value);
         }
 
-        return { type: 'SELECT', table: tableName, columns, where, orderBy, limit, offset };
+        // For backwards compatibility, use first table name as 'table'
+        const tableName = tables[0].name;
+
+        return {
+            type: 'SELECT',
+            table: tableName,
+            tables,
+            columns,
+            distinct,
+            joins,
+            where,
+            groupBy,
+            having,
+            orderBy,
+            limit,
+            offset
+        };
+    }
+
+    // Parse a single column in SELECT clause
+    parseSelectColumn() {
+        // Check for * first
+        if (this.match(TokenType.STAR)) {
+            return { type: 'star', value: '*' };
+        }
+
+        // Check for aggregate functions
+        const aggFuncs = [TokenType.COUNT, TokenType.SUM, TokenType.AVG, TokenType.MIN, TokenType.MAX];
+        for (const funcType of aggFuncs) {
+            if (this.match(funcType)) {
+                const funcName = funcType;
+                this.expect(TokenType.LPAREN);
+                let arg;
+                if (this.match(TokenType.STAR)) {
+                    arg = '*';
+                } else if (this.match(TokenType.DISTINCT)) {
+                    const col = this.parseColumnRef();
+                    arg = { distinct: true, column: col };
+                } else {
+                    arg = this.parseColumnRef();
+                }
+                this.expect(TokenType.RPAREN);
+
+                // Optional alias
+                let alias = null;
+                if (this.match(TokenType.AS)) {
+                    alias = this.expect(TokenType.IDENTIFIER).value;
+                } else if (this.peek().type === TokenType.IDENTIFIER) {
+                    alias = this.advance().value;
+                }
+
+                return { type: 'aggregate', func: funcName.toLowerCase(), arg, alias };
+            }
+        }
+
+        // Regular column (may be table.column)
+        const col = this.parseColumnRef();
+
+        // Optional alias
+        let alias = null;
+        if (this.match(TokenType.AS)) {
+            alias = this.expect(TokenType.IDENTIFIER).value;
+        } else if (this.peek().type === TokenType.IDENTIFIER &&
+                   this.peek().type !== TokenType.FROM &&
+                   this.peek().type !== TokenType.COMMA) {
+            // Peek next to avoid consuming FROM as alias
+            const nextType = this.peek().type;
+            if (nextType !== TokenType.FROM && nextType !== TokenType.COMMA &&
+                nextType !== TokenType.WHERE && nextType !== TokenType.ORDER &&
+                nextType !== TokenType.GROUP && nextType !== TokenType.LIMIT) {
+                alias = this.advance().value;
+            }
+        }
+
+        return { type: 'column', value: col, alias };
+    }
+
+    // Parse column reference (may be table.column or just column)
+    parseColumnRef() {
+        const first = this.expect(TokenType.IDENTIFIER).value;
+        if (this.match(TokenType.DOT)) {
+            const second = this.expect(TokenType.IDENTIFIER).value;
+            return { table: first, column: second };
+        }
+        return first;
+    }
+
+    // Parse table reference with optional alias
+    parseTableRef() {
+        const name = this.expect(TokenType.IDENTIFIER).value;
+        let alias = null;
+        if (this.match(TokenType.AS)) {
+            alias = this.expect(TokenType.IDENTIFIER).value;
+        } else if (this.peek().type === TokenType.IDENTIFIER) {
+            // Check if next token looks like an alias (not a keyword)
+            const nextType = this.peek().type;
+            if (nextType !== TokenType.WHERE && nextType !== TokenType.ORDER &&
+                nextType !== TokenType.GROUP && nextType !== TokenType.LIMIT &&
+                nextType !== TokenType.JOIN && nextType !== TokenType.LEFT &&
+                nextType !== TokenType.RIGHT && nextType !== TokenType.INNER &&
+                nextType !== TokenType.ON) {
+                alias = this.advance().value;
+            }
+        }
+        return { name, alias };
+    }
+
+    // Parse JOIN clause
+    parseJoin() {
+        let joinType = 'INNER';
+        if (this.match(TokenType.LEFT)) {
+            joinType = 'LEFT';
+            this.match(TokenType.JOIN); // LEFT JOIN
+        } else if (this.match(TokenType.RIGHT)) {
+            joinType = 'RIGHT';
+            this.match(TokenType.JOIN); // RIGHT JOIN
+        } else if (this.match(TokenType.INNER)) {
+            joinType = 'INNER';
+            this.match(TokenType.JOIN); // INNER JOIN
+        } else {
+            this.expect(TokenType.JOIN); // Just JOIN
+        }
+
+        const table = this.parseTableRef();
+        this.expect(TokenType.ON);
+        const on = this.parseJoinCondition();
+
+        return { type: joinType, table, on };
+    }
+
+    // Parse JOIN ON condition (left.col = right.col)
+    parseJoinCondition() {
+        const left = this.parseColumnRef();
+        this.expect(TokenType.EQ);
+        const right = this.parseColumnRef();
+        return { left, right };
     }
 
     parseWhereExpr() {
@@ -1594,7 +1771,70 @@ class SQLParser {
     }
 
     parseComparison() {
-        const column = this.expect(TokenType.IDENTIFIER).value;
+        // Handle parenthesized expressions
+        if (this.match(TokenType.LPAREN)) {
+            const expr = this.parseOrExpr();
+            this.expect(TokenType.RPAREN);
+            return expr;
+        }
+
+        // Handle aggregate functions in HAVING clause
+        const aggFuncs = [TokenType.COUNT, TokenType.SUM, TokenType.AVG, TokenType.MIN, TokenType.MAX];
+        let column;
+        let isAggregate = false;
+        let aggFunc = null;
+        let aggArg = null;
+
+        for (const funcType of aggFuncs) {
+            if (this.match(funcType)) {
+                isAggregate = true;
+                aggFunc = funcType.toLowerCase();
+                this.expect(TokenType.LPAREN);
+                if (this.match(TokenType.STAR)) {
+                    aggArg = '*';
+                } else {
+                    aggArg = this.parseColumnRef();
+                }
+                this.expect(TokenType.RPAREN);
+                column = { type: 'aggregate', func: aggFunc, arg: aggArg };
+                break;
+            }
+        }
+
+        if (!isAggregate) {
+            // Parse column (may be dotted like table.column)
+            column = this.parseColumnRef();
+        }
+
+        // Handle BETWEEN
+        if (this.match(TokenType.BETWEEN)) {
+            const low = this.parseValue();
+            this.expect(TokenType.AND);
+            const high = this.parseValue();
+            return { op: 'BETWEEN', column, low, high };
+        }
+
+        // Handle IN
+        if (this.match(TokenType.IN)) {
+            this.expect(TokenType.LPAREN);
+            const values = [this.parseValue()];
+            while (this.match(TokenType.COMMA)) {
+                values.push(this.parseValue());
+            }
+            this.expect(TokenType.RPAREN);
+            return { op: 'IN', column, values };
+        }
+
+        // Handle NEAR (vector similarity search)
+        // Syntax: column NEAR 'text' [TOPK n]
+        if (this.match(TokenType.NEAR)) {
+            const text = this.expect(TokenType.STRING).value;
+            let topK = null;
+            if (this.match(TokenType.TOPK)) {
+                topK = parseInt(this.expect(TokenType.NUMBER).value, 10);
+            }
+            return { op: 'NEAR', column, text, topK };
+        }
 
         let op;
         if (this.match(TokenType.EQ)) op = '=';
@@ -1611,34 +1851,252 @@ class SQLParser {
     }
 }
 
-// SQL Executor helper
-function evalWhere(where, row) {
+// SQL Executor helper - get column value from row
+function getColumnValue(row, column, tableAliases = {}) {
+    if (typeof column === 'string') {
+        return row[column];
+    }
+    if (column && column.table && column.column) {
+        // Try table.column directly first (e.g., u.id)
+        const fullKey = `${column.table}.${column.column}`;
+        if (fullKey in row) return row[fullKey];
+        // Try using alias mapping to get actual table name
+        const tableName = tableAliases[column.table] || column.table;
+        const aliasKey = `${tableName}.${column.column}`;
+        if (aliasKey in row) return row[aliasKey];
+        // Try just the column name (fallback for non-JOIN queries)
+        if (column.column in row) return row[column.column];
+    }
+    return undefined;
+}
+
+function evalWhere(where, row, tableAliases = {}) {
     if (!where) return true;
 
     switch (where.op) {
         case 'AND':
-            return evalWhere(where.left, row) && evalWhere(where.right, row);
+            return evalWhere(where.left, row, tableAliases) && evalWhere(where.right, row, tableAliases);
         case 'OR':
-            return evalWhere(where.left, row) || evalWhere(where.right, row);
-        case '=':
-            return row[where.column] === where.value;
+            return evalWhere(where.left, row, tableAliases) || evalWhere(where.right, row, tableAliases);
+        case '=': {
+            const val = getColumnValue(row, where.column, tableAliases);
+            return val === where.value;
+        }
         case '!=':
-        case '<>':
-            return row[where.column] !== where.value;
-        case '<':
-            return row[where.column] < where.value;
-        case '<=':
-            return row[where.column] <= where.value;
-        case '>':
-            return row[where.column] > where.value;
-        case '>=':
-            return row[where.column] >= where.value;
-        case 'LIKE':
+        case '<>': {
+            const val = getColumnValue(row, where.column, tableAliases);
+            return val !== where.value;
+        }
+        case '<': {
+            const val = getColumnValue(row, where.column, tableAliases);
+            return val < where.value;
+        }
+        case '<=': {
+            const val = getColumnValue(row, where.column, tableAliases);
+            return val <= where.value;
+        }
+        case '>': {
+            const val = getColumnValue(row, where.column, tableAliases);
+            return val > where.value;
+        }
+        case '>=': {
+            const val = getColumnValue(row, where.column, tableAliases);
+            return val >= where.value;
+        }
+        case 'LIKE': {
+            const val = getColumnValue(row, where.column, tableAliases);
             const pattern = where.value.replace(/%/g, '.*').replace(/_/g, '.');
-            return new RegExp(`^${pattern}$`, 'i').test(row[where.column]);
+            return new RegExp(`^${pattern}$`, 'i').test(val);
+        }
+        case 'BETWEEN': {
+            const val = getColumnValue(row, where.column, tableAliases);
+            return val >= where.low && val <= where.high;
+        }
+        case 'IN': {
+            const val = getColumnValue(row, where.column, tableAliases);
+            return where.values.includes(val);
+        }
         default:
             return true;
     }
+}
+
+// Calculate aggregate function value
+function calculateAggregate(func, arg, rows) {
+    if (rows.length === 0) return func === 'count' ? 0 : null;
+
+    const colName = arg === '*' ? null : (typeof arg === 'string' ? arg : (arg.column || arg));
+
+    switch (func) {
+        case 'count':
+            if (arg === '*') return rows.length;
+            return rows.filter(r => r[colName] != null).length;
+        case 'sum': {
+            let sum = 0;
+            for (const row of rows) {
+                const val = row[colName];
+                if (typeof val === 'number') sum += val;
+            }
+            return sum;
+        }
+        case 'avg': {
+            let sum = 0, count = 0;
+            for (const row of rows) {
+                const val = row[colName];
+                if (typeof val === 'number') {
+                    sum += val;
+                    count++;
+                }
+            }
+            return count > 0 ? sum / count : null;
+        }
+        case 'min': {
+            let min = Infinity;
+            for (const row of rows) {
+                const val = row[colName];
+                if (val != null && val < min) min = val;
+            }
+            return min === Infinity ? null : min;
+        }
+        case 'max': {
+            let max = -Infinity;
+            for (const row of rows) {
+                const val = row[colName];
+                if (val != null && val > max) max = val;
+            }
+            return max === -Infinity ? null : max;
+        }
+        default:
+            return null;
+    }
+}
+
+// Evaluate HAVING clause (similar to WHERE but works on aggregated values)
+function evalHaving(having, row) {
+    if (!having) return true;
+
+    switch (having.op) {
+        case 'AND':
+            return evalHaving(having.left, row) && evalHaving(having.right, row);
+        case 'OR':
+            return evalHaving(having.left, row) || evalHaving(having.right, row);
+        default: {
+            // For aggregate comparisons, the column is already in the row
+            let val;
+            if (having.column && having.column.type === 'aggregate') {
+                const aggName = `${having.column.func}(${having.column.arg === '*' ? '*' : (typeof having.column.arg === 'string' ? having.column.arg : having.column.arg.column)})`;
+                val = row[aggName];
+            } else {
+                const colName = typeof having.column === 'string' ? having.column : having.column.column;
+                val = row[colName];
+            }
+
+            switch (having.op) {
+                case '=': return val === having.value;
+                case '!=':
+                case '<>': return val !== having.value;
+                case '<': return val < having.value;
+                case '<=': return val <= having.value;
+                case '>': return val > having.value;
+                case '>=': return val >= having.value;
+                default: return true;
+            }
+        }
+    }
+}
+
+// Extract NEAR condition from WHERE expression
+function extractNearCondition(expr) {
+    if (!expr) return null;
+    if (expr.op === 'NEAR') {
+        return expr;
+    }
+    if (expr.op === 'AND' || expr.op === 'OR') {
+        const leftNear = extractNearCondition(expr.left);
+        if (leftNear) return leftNear;
+        return extractNearCondition(expr.right);
+    }
+    return null;
+}
+
+// Remove NEAR condition from expression, returning remaining conditions
+function removeNearCondition(expr) {
+    if (!expr) return null;
+    if (expr.op === 'NEAR') return null;
+    if (expr.op === 'AND' || expr.op === 'OR') {
+        const left = removeNearCondition(expr.left);
+        const right = removeNearCondition(expr.right);
+        if (!left && !right) return null;
+        if (!left) return right;
+        if (!right) return left;
+        return { op: expr.op, left, right };
+    }
+    return expr;
+}
+
+// Cosine similarity between two vectors
+function cosineSimilarity(a, b) {
+    if (!a || !b || a.length !== b.length) return 0;
+    let dot = 0, magA = 0, magB = 0;
+    for (let i = 0; i < a.length; i++) {
+        dot += a[i] * b[i];
+        magA += a[i] * a[i];
+        magB += b[i] * b[i];
+    }
+    return dot / (Math.sqrt(magA) * Math.sqrt(magB));
+}
+
+// Execute NEAR vector search
+async function executeNearSearch(rows, nearCondition, limit) {
+    const column = typeof nearCondition.column === 'string' ? nearCondition.column : nearCondition.column.column;
+    const text = nearCondition.text;
+    const topK = nearCondition.topK || limit || 10;
+
+    // Check if gpuTransformer is available and has a loaded model
+    if (!gpuTransformer) {
+        throw new Error('NEAR requires a text encoder model. Load a model first with store.loadModel()');
+    }
+
+    // Generate query embedding
+    let queryVec;
+    try {
+        // Try to get any loaded model
+        const models = gpuTransformer.getLoadedModels?.() || [];
+        if (models.length === 0) {
+            throw new Error('No text encoder model loaded');
+        }
+        queryVec = await gpuTransformer.encodeText(text, models[0]);
+    } catch (e) {
+        throw new Error(`NEAR failed to encode query: ${e.message}`);
+    }
+
+    // Score each row
+    const scored = [];
+    for (const row of rows) {
+        const colValue = row[column];
+
+        // If column is already a vector (array of numbers), use it directly
+        if (Array.isArray(colValue) && typeof colValue[0] === 'number') {
+            const score = cosineSimilarity(queryVec, colValue);
+            scored.push({ row, score });
+        }
+        // If column is text, we need to embed it (expensive)
+        else if (typeof colValue === 'string') {
+            const cacheKey = `sql:${column}:${colValue}`;
+            let itemVec = embeddingCache.get(cacheKey);
+            if (!itemVec) {
+                const models = gpuTransformer.getLoadedModels?.() || [];
+                itemVec = await gpuTransformer.encodeText(colValue, models[0]);
+                embeddingCache.set(cacheKey, itemVec);
+            }
+            const score = cosineSimilarity(queryVec, itemVec);
+            scored.push({ row, score });
+        }
+    }
+
+    // Sort by score descending and take top K
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, topK).map(s => ({ ...s.row, _score: s.score }));
 }
 
 async function executeSQL(db, sql) {
@@ -1657,7 +2115,21 @@ async function executeSQL(db, sql) {
             return db.dropTable(ast.table, ast.ifExists);
 
         case 'INSERT': {
-            return db.insert(ast.table, ast.rows);
+            // If rows are arrays (no column names in INSERT), convert to objects using table schema
+            let rows = ast.rows;
+            if (rows.length > 0 && Array.isArray(rows[0])) {
+                const tableState = db.tables.get(ast.table);
+                if (tableState && tableState.schema) {
+                    rows = rows.map(valueArray => {
+                        const row = {};
+                        tableState.schema.forEach((col, i) => {
+                            row[col.name] = valueArray[i];
+                        });
+                        return row;
+                    });
+                }
+            }
+            return db.insert(ast.table, rows);
         }
 
         case 'DELETE': {
@@ -1675,19 +2147,355 @@ async function executeSQL(db, sql) {
         }
 
         case 'SELECT': {
-            const options = {
-                columns: ast.columns,
-                where: ast.where ? (row) => evalWhere(ast.where, row) : null,
-                limit: ast.limit,
-                offset: ast.offset,
-                orderBy: ast.orderBy,
-            };
-            return db.select(ast.table, options);
+            // Build table alias mapping
+            const tableAliases = {};
+            if (ast.tables) {
+                for (const t of ast.tables) {
+                    if (t.alias) tableAliases[t.alias] = t.name;
+                }
+            }
+            if (ast.joins) {
+                for (const j of ast.joins) {
+                    if (j.table.alias) tableAliases[j.table.alias] = j.table.name;
+                }
+            }
+
+            // Fetch data from main table
+            let rows = await db.select(ast.table, {});
+
+            // Process JOINs
+            if (ast.joins && ast.joins.length > 0) {
+                // Add prefixes for the first table before any JOINs
+                const firstTableName = ast.tables[0].alias || ast.tables[0].name;
+                rows = rows.map(row => {
+                    const prefixed = { ...row };
+                    for (const key of Object.keys(row)) {
+                        prefixed[`${firstTableName}.${key}`] = row[key];
+                    }
+                    return prefixed;
+                });
+
+                for (const join of ast.joins) {
+                    const rightTable = join.table.name;
+                    const rightRows = await db.select(rightTable, {});
+                    const newRows = [];
+                    const matchedRightIndices = new Set();
+
+                    // Get right table info for namespacing
+                    const rightTableName = join.table.alias || join.table.name;
+
+                    for (const leftRow of rows) {
+                        let matched = false;
+                        for (let ri = 0; ri < rightRows.length; ri++) {
+                            const rightRow = rightRows[ri];
+                            // Evaluate ON condition
+                            const leftVal = getColumnValue(leftRow, join.on.left, tableAliases);
+                            const rightVal = getColumnValue(rightRow, join.on.right, tableAliases);
+                            if (leftVal === rightVal) {
+                                matched = true;
+                                matchedRightIndices.add(ri);
+                                // Merge rows - keep left row as-is, add right row with prefix
+                                const merged = { ...leftRow };
+                                // Add right row columns with table prefix
+                                for (const key of Object.keys(rightRow)) {
+                                    // Don't overwrite with plain key if it already exists
+                                    if (!(key in merged)) merged[key] = rightRow[key];
+                                    merged[`${rightTableName}.${key}`] = rightRow[key];
+                                }
+                                newRows.push(merged);
+                            }
+                        }
+                        // LEFT JOIN: include left row even if no match
+                        if (!matched && join.type === 'LEFT') {
+                            newRows.push({ ...leftRow });
+                        }
+                    }
+
+                    // RIGHT JOIN: include unmatched right rows
+                    if (join.type === 'RIGHT') {
+                        for (let ri = 0; ri < rightRows.length; ri++) {
+                            if (!matchedRightIndices.has(ri)) {
+                                const merged = {};
+                                for (const key of Object.keys(rightRows[ri])) {
+                                    merged[key] = rightRows[ri][key];
+                                    merged[`${rightTableName}.${key}`] = rightRows[ri][key];
+                                }
+                                newRows.push(merged);
+                            }
+                        }
+                    }
+                    rows = newRows;
+                }
+            }
+
+            // Check for NEAR condition in WHERE clause
+            const nearCondition = extractNearCondition(ast.where);
+            if (nearCondition) {
+                // Execute NEAR search first
+                rows = await executeNearSearch(rows, nearCondition, ast.limit);
+                // Apply remaining WHERE conditions
+                const remainingWhere = removeNearCondition(ast.where);
+                if (remainingWhere) {
+                    rows = rows.filter(row => evalWhere(remainingWhere, row, tableAliases));
+                }
+            } else if (ast.where) {
+                // Apply regular WHERE clause
+                rows = rows.filter(row => evalWhere(ast.where, row, tableAliases));
+            }
+
+            // Apply GROUP BY with aggregations
+            if (ast.groupBy && ast.groupBy.length > 0) {
+                const groups = new Map();
+                for (const row of rows) {
+                    const keyParts = ast.groupBy.map(col => {
+                        const colName = typeof col === 'string' ? col : col.column;
+                        return String(row[colName]);
+                    });
+                    const key = keyParts.join('|');
+                    if (!groups.has(key)) {
+                        groups.set(key, []);
+                    }
+                    groups.get(key).push(row);
+                }
+
+                // Process each group
+                const groupedRows = [];
+                for (const [, groupRows] of groups) {
+                    const resultRow = {};
+                    // Add GROUP BY columns
+                    for (const col of ast.groupBy) {
+                        const colName = typeof col === 'string' ? col : col.column;
+                        resultRow[colName] = groupRows[0][colName];
+                    }
+                    // Calculate aggregates
+                    for (const col of ast.columns) {
+                        if (col.type === 'aggregate') {
+                            const rawName = `${col.func}(${col.arg === '*' ? '*' : (typeof col.arg === 'string' ? col.arg : col.arg.column)})`;
+                            const aggValue = calculateAggregate(col.func, col.arg, groupRows);
+                            // Store with raw name for HAVING clause lookups
+                            resultRow[rawName] = aggValue;
+                            // Also store with alias if different
+                            if (col.alias && col.alias !== rawName) {
+                                resultRow[col.alias] = aggValue;
+                            }
+                        }
+                    }
+                    groupedRows.push(resultRow);
+                }
+                rows = groupedRows;
+
+                // Apply HAVING
+                if (ast.having) {
+                    rows = rows.filter(row => evalHaving(ast.having, row));
+                }
+            }
+            // Handle aggregates without GROUP BY (whole table aggregate)
+            else if (ast.columns.some(c => c.type === 'aggregate')) {
+                const resultRow = {};
+                for (const col of ast.columns) {
+                    if (col.type === 'aggregate') {
+                        const aggName = col.alias || `${col.func}(${col.arg === '*' ? '*' : (typeof col.arg === 'string' ? col.arg : col.arg.column)})`;
+                        resultRow[aggName] = calculateAggregate(col.func, col.arg, rows);
+                    } else if (col.type === 'column') {
+                        const colName = typeof col.value === 'string' ? col.value : col.value.column;
+                        if (rows.length > 0) resultRow[colName] = rows[0][colName];
+                    }
+                }
+                rows = [resultRow];
+            }
+
+            // Apply ORDER BY first (before projection, using original column values)
+            if (ast.orderBy && ast.orderBy.length > 0) {
+                rows.sort((a, b) => {
+                    for (const order of ast.orderBy) {
+                        const col = typeof order.column === 'string' ? order.column : order.column.column;
+                        const aVal = a[col];
+                        const bVal = b[col];
+                        if (aVal < bVal) return order.desc ? 1 : -1;
+                        if (aVal > bVal) return order.desc ? -1 : 1;
+                    }
+                    return 0;
+                });
+            }
+
+            // Apply OFFSET
+            if (ast.offset) {
+                rows = rows.slice(ast.offset);
+            }
+
+            // Apply LIMIT
+            if (ast.limit) {
+                rows = rows.slice(0, ast.limit);
+            }
+
+            // Project columns (after ORDER BY, OFFSET, LIMIT)
+            let columnNames = [];
+            if (!ast.columns.some(c => c.type === 'star') && !ast.groupBy) {
+                rows = rows.map(row => {
+                    const result = {};
+                    for (const col of ast.columns) {
+                        if (col.type === 'column') {
+                            const colName = typeof col.value === 'string' ? col.value : col.value.column;
+                            const alias = col.alias || colName;
+                            // Use getColumnValue to properly resolve table-prefixed columns
+                            result[alias] = getColumnValue(row, col.value, tableAliases);
+                            if (!columnNames.includes(alias)) columnNames.push(alias);
+                        } else if (col.type === 'aggregate') {
+                            const aggName = col.alias || `${col.func}(${col.arg === '*' ? '*' : (typeof col.arg === 'string' ? col.arg : col.arg.column)})`;
+                            result[aggName] = row[aggName];
+                            if (!columnNames.includes(aggName)) columnNames.push(aggName);
+                        }
+                    }
+                    return result;
+                });
+            } else if (rows.length > 0) {
+                columnNames = Object.keys(rows[0]);
+            }
+
+            // Apply DISTINCT (after projection)
+            if (ast.distinct) {
+                const seen = new Set();
+                rows = rows.filter(row => {
+                    const key = JSON.stringify(row);
+                    if (seen.has(key)) return false;
+                    seen.add(key);
+                    return true;
+                });
+            }
+
+            return { rows, columns: columnNames };
         }
 
         default:
             throw new Error(`Unknown statement type: ${ast.type}`);
     }
+}
+
+// ============================================================================
+// WorkerVault - Unified vault storage (KV + tables)
+// ============================================================================
+
+class WorkerVault {
+    constructor() {
+        this._root = null;
+        this._ready = false;
+        this._kv = {};  // KV data loaded from JSON
+        this._encryptionKeyId = null;
+        this._db = null;  // Embedded database for SQL tables
+    }
+
+    async open(encryptionConfig = null) {
+        if (this._ready) return this;
+
+        // Set up encryption if provided
+        if (encryptionConfig) {
+            const { keyId, keyBytes } = encryptionConfig;
+            if (!encryptionKeys.has(keyId)) {
+                const cryptoKey = await importEncryptionKey(keyBytes);
+                encryptionKeys.set(keyId, cryptoKey);
+            }
+            this._encryptionKeyId = keyId;
+        }
+
+        try {
+            const opfsRoot = await navigator.storage.getDirectory();
+            this._root = await opfsRoot.getDirectoryHandle('vault', { create: true });
+            await this._loadKV();
+
+            // Initialize embedded database for SQL tables
+            this._db = new WorkerDatabase('vault');
+            await this._db.open();
+
+            this._ready = true;
+        } catch (e) {
+            console.error('[WorkerVault] Failed to open OPFS:', e);
+            throw e;
+        }
+
+        return this;
+    }
+
+    _getCryptoKey() {
+        return this._encryptionKeyId ? encryptionKeys.get(this._encryptionKeyId) : null;
+    }
+
+    async _loadKV() {
+        try {
+            const cryptoKey = this._getCryptoKey();
+            const filename = cryptoKey ? '_vault.json.enc' : '_vault.json';
+            const fileHandle = await this._root.getFileHandle(filename);
+            const file = await fileHandle.getFile();
+
+            if (cryptoKey) {
+                const buffer = await file.arrayBuffer();
+                this._kv = await decryptData(new Uint8Array(buffer), cryptoKey);
+            } else {
+                const text = await file.text();
+                this._kv = JSON.parse(text);
+            }
+        } catch (e) {
+            if (e.name === 'NotFoundError') {
+                this._kv = {};
+            } else {
+                throw e;
+            }
+        }
+    }
+
+    async _saveKV() {
+        const cryptoKey = this._getCryptoKey();
+        const filename = cryptoKey ? '_vault.json.enc' : '_vault.json';
+        const fileHandle = await this._root.getFileHandle(filename, { create: true });
+        const writable = await fileHandle.createWritable();
+
+        if (cryptoKey) {
+            const encrypted = await encryptData(this._kv, cryptoKey);
+            await writable.write(encrypted);
+        } else {
+            await writable.write(JSON.stringify(this._kv));
+        }
+
+        await writable.close();
+    }
+
+    async get(key) {
+        return this._kv[key];
+    }
+
+    async set(key, value) {
+        this._kv[key] = value;
+        await this._saveKV();
+    }
+
+    async delete(key) {
+        delete this._kv[key];
+        await this._saveKV();
+    }
+
+    async keys() {
+        return Object.keys(this._kv);
+    }
+
+    async has(key) {
+        return key in this._kv;
+    }
+
+    async exec(sql) {
+        // Delegate SQL execution to embedded database
+        return executeSQL(this._db, sql);
+    }
+}
+
+// Vault singleton
+let vaultInstance = null;
+
+async function getVault(encryptionConfig = null) {
+    if (!vaultInstance) {
+        vaultInstance = new WorkerVault();
+    }
+    // Re-open with encryption if not already done
+    await vaultInstance.open(encryptionConfig);
+    return vaultInstance;
 }
 
 // ============================================================================
@@ -1848,6 +2656,25 @@ async function handleMessage(port, data) {
         } else if (method === 'db:scanNext') {
             const db = await getDatabase(args.db);
             result = db.scanNext(args.streamId);
+        }
+        // Vault operations
+        else if (method === 'vault:open') {
+            await getVault(args.encryption);
+            result = true;
+        } else if (method === 'vault:get') {
+            result = await (await getVault()).get(args.key);
+        } else if (method === 'vault:set') {
+            await (await getVault()).set(args.key, args.value);
+            result = true;
+        } else if (method === 'vault:delete') {
+            await (await getVault()).delete(args.key);
+            result = true;
+        } else if (method === 'vault:keys') {
+            result = await (await getVault()).keys();
+        } else if (method === 'vault:has') {
+            result = await (await getVault()).has(args.key);
+        } else if (method === 'vault:exec') {
+            result = await (await getVault()).exec(args.sql);
         }
         // Unknown method
         else {
