@@ -2979,16 +2979,29 @@ export class OPFSJoinExecutor {
      * @returns {AsyncGenerator} Yields result chunks
      */
     async *executeHashJoin(leftStream, rightStream, leftKey, rightKey, options = {}) {
-        const { limit = Infinity, projection = null } = options;
+        const {
+            limit = Infinity,
+            projection = null,
+            leftAlias = 'left',
+            rightAlias = 'right',
+            joinType = 'INNER',
+            prePartitionedLeft = null  // Optional: pre-partitioned left metadata for semi-join optimization
+        } = options;
 
-        console.log(`[OPFSJoin] Starting OPFS-backed hash join`);
+        console.log(`[OPFSJoin] Starting OPFS-backed hash join (${joinType})`);
         console.log(`[OPFSJoin] Session: ${this.sessionId}`);
         console.log(`[OPFSJoin] Partitions: ${this.numPartitions}`);
 
         try {
-            // Phase 1: Partition left table to OPFS
-            console.log(`[OPFSJoin] Phase 1: Partitioning left table...`);
-            const leftMeta = await this._partitionToOPFS(leftStream, leftKey, 'left');
+            // Phase 1: Partition left table to OPFS (skip if pre-partitioned)
+            let leftMeta;
+            if (prePartitionedLeft) {
+                console.log(`[OPFSJoin] Phase 1: Using pre-partitioned left table (semi-join optimization)`);
+                leftMeta = prePartitionedLeft;
+            } else {
+                console.log(`[OPFSJoin] Phase 1: Partitioning left table...`);
+                leftMeta = await this._partitionToOPFS(leftStream, leftKey, 'left');
+            }
             console.log(`[OPFSJoin] Left table: ${leftMeta.totalRows} rows in ${leftMeta.partitionsUsed.size} partitions`);
 
             // Phase 2: Partition right table to OPFS
@@ -2997,58 +3010,139 @@ export class OPFSJoinExecutor {
             console.log(`[OPFSJoin] Right table: ${rightMeta.totalRows} rows in ${rightMeta.partitionsUsed.size} partitions`);
 
             // Phase 3: Join partition by partition
-            console.log(`[OPFSJoin] Phase 3: Joining partitions...`);
+            console.log(`[OPFSJoin] Phase 3: Joining partitions (${joinType})...`);
             let totalYielded = 0;
 
-            // Only process partitions that have data on both sides
-            const activePartitions = new Set(
+            // Create NULL padding arrays for outer joins
+            const leftNulls = new Array(leftMeta.columns.length).fill(null);
+            const rightNulls = new Array(rightMeta.columns.length).fill(null);
+
+            // Helper to build result columns
+            const resultColumns = [
+                ...leftMeta.columns.map(c => `${leftAlias}.${c}`),
+                ...rightMeta.columns.map(c => `${rightAlias}.${c}`)
+            ];
+
+            // Helper to yield a chunk
+            const yieldChunk = function*(chunk) {
+                if (chunk.length > 0) {
+                    yield { columns: resultColumns, rows: chunk.splice(0) };
+                }
+            };
+
+            // For CROSS JOIN: cartesian product without partitioning
+            if (joinType === 'CROSS') {
+                console.log(`[OPFSJoin] CROSS JOIN: computing cartesian product`);
+                const chunk = [];
+
+                // Load all partitions for both tables
+                for (const leftPartitionId of leftMeta.partitionsUsed) {
+                    const leftPartition = await this._loadPartition('left', leftPartitionId, leftMeta.columns);
+                    for (const rightPartitionId of rightMeta.partitionsUsed) {
+                        const rightPartition = await this._loadPartition('right', rightPartitionId, rightMeta.columns);
+                        for (const leftRow of leftPartition) {
+                            for (const rightRow of rightPartition) {
+                                if (totalYielded >= limit) break;
+                                chunk.push([...leftRow, ...rightRow]);
+                                totalYielded++;
+                                if (chunk.length >= this.chunkSize) {
+                                    yield { columns: resultColumns, rows: chunk.splice(0) };
+                                }
+                            }
+                            if (totalYielded >= limit) break;
+                        }
+                        if (totalYielded >= limit) break;
+                    }
+                    if (totalYielded >= limit) break;
+                }
+                if (chunk.length > 0) {
+                    yield { columns: resultColumns, rows: chunk };
+                }
+                console.log(`[OPFSJoin] CROSS JOIN complete: ${totalYielded} result rows`);
+                return;
+            }
+
+            // For hash-based joins, determine which partitions to process
+            const leftKeyIndex = leftMeta.columns.indexOf(leftKey);
+            const rightKeyIndex = rightMeta.columns.indexOf(rightKey);
+
+            // Track matched rows for outer joins
+            const isLeftOuter = joinType === 'LEFT' || joinType === 'FULL';
+            const isRightOuter = joinType === 'RIGHT' || joinType === 'FULL';
+
+            // For RIGHT/FULL: track which right rows have been matched (by partition_rowIndex)
+            const matchedRightRows = isRightOuter ? new Set() : null;
+
+            // Process partitions that have data on both sides (for INNER and outer join matches)
+            const bothSidesPartitions = new Set(
                 [...leftMeta.partitionsUsed].filter(p => rightMeta.partitionsUsed.has(p))
             );
-            console.log(`[OPFSJoin] Active partitions (both sides): ${activePartitions.size}`);
+            console.log(`[OPFSJoin] Partitions with both sides: ${bothSidesPartitions.size}`);
 
-            for (const partitionId of activePartitions) {
+            for (const partitionId of bothSidesPartitions) {
                 if (totalYielded >= limit) break;
 
-                // Load left partition into memory (fits because we partitioned)
+                // Load left partition into memory
                 const leftPartition = await this._loadPartition('left', partitionId, leftMeta.columns);
                 if (leftPartition.length === 0) continue;
 
-                // Build in-memory hash map for this partition only
+                // Build hash map and track matched left rows for LEFT/FULL JOIN
                 const hashMap = new Map();
-                const leftKeyIndex = leftMeta.columns.indexOf(leftKey);
-                for (const row of leftPartition) {
+                const matchedLeftIndices = isLeftOuter ? new Set() : null;
+
+                for (let i = 0; i < leftPartition.length; i++) {
+                    const row = leftPartition[i];
                     const key = row[leftKeyIndex];
                     if (key !== null && key !== undefined) {
                         if (!hashMap.has(key)) hashMap.set(key, []);
-                        hashMap.get(key).push(row);
+                        hashMap.get(key).push({ row, index: i });
                     }
                 }
 
-                // Stream right partition and probe hash map
-                const rightKeyIndex = rightMeta.columns.indexOf(rightKey);
+                // Load right partition and probe hash map
                 const rightPartition = await this._loadPartition('right', partitionId, rightMeta.columns);
 
                 const chunk = [];
-                for (const rightRow of rightPartition) {
+                for (let rightIdx = 0; rightIdx < rightPartition.length; rightIdx++) {
                     if (totalYielded >= limit) break;
 
+                    const rightRow = rightPartition[rightIdx];
                     const key = rightRow[rightKeyIndex];
-                    const leftRows = hashMap.get(key);
+                    const leftEntries = hashMap.get(key);
 
-                    if (leftRows) {
-                        for (const leftRow of leftRows) {
+                    if (leftEntries) {
+                        // Track that this right row matched (for RIGHT/FULL)
+                        if (matchedRightRows) {
+                            matchedRightRows.add(`${partitionId}_${rightIdx}`);
+                        }
+
+                        for (const { row: leftRow, index: leftIdx } of leftEntries) {
                             if (totalYielded >= limit) break;
 
-                            const mergedRow = [...leftRow, ...rightRow];
-                            chunk.push(mergedRow);
+                            // Track that this left row matched (for LEFT/FULL)
+                            if (matchedLeftIndices) {
+                                matchedLeftIndices.add(leftIdx);
+                            }
+
+                            chunk.push([...leftRow, ...rightRow]);
                             totalYielded++;
 
-                            // Yield in chunks to avoid memory buildup
                             if (chunk.length >= this.chunkSize) {
-                                yield {
-                                    columns: [...leftMeta.columns, ...rightMeta.columns],
-                                    rows: chunk.splice(0),
-                                };
+                                yield { columns: resultColumns, rows: chunk.splice(0) };
+                            }
+                        }
+                    }
+                }
+
+                // For LEFT/FULL: emit unmatched left rows with NULL right side
+                if (isLeftOuter && matchedLeftIndices) {
+                    for (let i = 0; i < leftPartition.length; i++) {
+                        if (totalYielded >= limit) break;
+                        if (!matchedLeftIndices.has(i)) {
+                            chunk.push([...leftPartition[i], ...rightNulls]);
+                            totalYielded++;
+                            if (chunk.length >= this.chunkSize) {
+                                yield { columns: resultColumns, rows: chunk.splice(0) };
                             }
                         }
                     }
@@ -3056,14 +3150,61 @@ export class OPFSJoinExecutor {
 
                 // Yield remaining rows in chunk
                 if (chunk.length > 0) {
-                    yield {
-                        columns: [...leftMeta.columns, ...rightMeta.columns],
-                        rows: chunk,
-                    };
+                    yield { columns: resultColumns, rows: chunk };
                 }
             }
 
-            console.log(`[OPFSJoin] Join complete: ${totalYielded} result rows`);
+            // For LEFT/FULL: handle left-only partitions (no matching right data)
+            if (isLeftOuter) {
+                for (const partitionId of leftMeta.partitionsUsed) {
+                    if (totalYielded >= limit) break;
+                    if (bothSidesPartitions.has(partitionId)) continue;  // Already processed
+
+                    const leftPartition = await this._loadPartition('left', partitionId, leftMeta.columns);
+                    const chunk = [];
+                    for (const leftRow of leftPartition) {
+                        if (totalYielded >= limit) break;
+                        chunk.push([...leftRow, ...rightNulls]);
+                        totalYielded++;
+                        if (chunk.length >= this.chunkSize) {
+                            yield { columns: resultColumns, rows: chunk.splice(0) };
+                        }
+                    }
+                    if (chunk.length > 0) {
+                        yield { columns: resultColumns, rows: chunk };
+                    }
+                }
+            }
+
+            // For RIGHT/FULL: emit unmatched right rows with NULL left side
+            if (isRightOuter) {
+                for (const partitionId of rightMeta.partitionsUsed) {
+                    if (totalYielded >= limit) break;
+
+                    const rightPartition = await this._loadPartition('right', partitionId, rightMeta.columns);
+                    const chunk = [];
+
+                    for (let rightIdx = 0; rightIdx < rightPartition.length; rightIdx++) {
+                        if (totalYielded >= limit) break;
+
+                        // Check if this row was matched during the main join
+                        const rowKey = `${partitionId}_${rightIdx}`;
+                        if (!matchedRightRows.has(rowKey)) {
+                            chunk.push([...leftNulls, ...rightPartition[rightIdx]]);
+                            totalYielded++;
+                            if (chunk.length >= this.chunkSize) {
+                                yield { columns: resultColumns, rows: chunk.splice(0) };
+                            }
+                        }
+                    }
+
+                    if (chunk.length > 0) {
+                        yield { columns: resultColumns, rows: chunk };
+                    }
+                }
+            }
+
+            console.log(`[OPFSJoin] ${joinType} JOIN complete: ${totalYielded} result rows`);
             console.log(`[OPFSJoin] Stats:`, this.getStats());
 
         } finally {
@@ -3074,14 +3215,19 @@ export class OPFSJoinExecutor {
 
     /**
      * Partition a stream of data to OPFS files by hash(key)
+     * @param {AsyncGenerator} stream - Data stream to partition
+     * @param {string} keyColumn - Column name to use as partition key
+     * @param {string} side - 'left' or 'right' table
+     * @param {boolean} collectKeys - If true, collect unique key values for semi-join optimization
      */
-    async _partitionToOPFS(stream, keyColumn, side) {
+    async _partitionToOPFS(stream, keyColumn, side, collectKeys = false) {
         const partitionBuffers = new Map();  // partitionId -> rows[]
         const flushThreshold = 500;  // Flush to OPFS when buffer reaches this size
         let columns = null;
         let keyIndex = -1;
         let totalRows = 0;
         const partitionsUsed = new Set();
+        const collectedKeys = collectKeys ? new Set() : null;
 
         for await (const chunk of stream) {
             if (!columns) {
@@ -3096,6 +3242,11 @@ export class OPFSJoinExecutor {
                 const key = row[keyIndex];
                 const partitionId = this._hashToPartition(key);
                 partitionsUsed.add(partitionId);
+
+                // Collect unique keys for semi-join optimization
+                if (collectKeys && key !== null && key !== undefined) {
+                    collectedKeys.add(key);
+                }
 
                 if (!partitionBuffers.has(partitionId)) {
                     partitionBuffers.set(partitionId, []);
@@ -3124,7 +3275,7 @@ export class OPFSJoinExecutor {
             this.stats.rightRowsWritten = totalRows;
         }
 
-        return { columns, totalRows, partitionsUsed };
+        return { columns, totalRows, partitionsUsed, collectedKeys };
     }
 
     /**
@@ -9736,6 +9887,10 @@ const TokenType = {
     FALSE: 'FALSE',
     GROUP: 'GROUP',
     HAVING: 'HAVING',
+    ROLLUP: 'ROLLUP',
+    CUBE: 'CUBE',
+    GROUPING: 'GROUPING',
+    SETS: 'SETS',
     COUNT: 'COUNT',
     SUM: 'SUM',
     AVG: 'AVG',
@@ -9781,6 +9936,39 @@ const TokenType = {
     VECTOR: 'VECTOR',
     PRIMARY: 'PRIMARY',
     KEY: 'KEY',
+    // CTE keywords
+    WITH: 'WITH',
+    RECURSIVE: 'RECURSIVE',
+    UNION: 'UNION',
+    ALL: 'ALL',
+    // PIVOT/UNPIVOT keywords
+    PIVOT: 'PIVOT',
+    UNPIVOT: 'UNPIVOT',
+    FOR: 'FOR',
+    // Set operation keywords
+    INTERSECT: 'INTERSECT',
+    EXCEPT: 'EXCEPT',
+    // Window function keywords
+    OVER: 'OVER',
+    PARTITION: 'PARTITION',
+    ROW_NUMBER: 'ROW_NUMBER',
+    RANK: 'RANK',
+    DENSE_RANK: 'DENSE_RANK',
+    NTILE: 'NTILE',
+    LAG: 'LAG',
+    LEAD: 'LEAD',
+    FIRST_VALUE: 'FIRST_VALUE',
+    LAST_VALUE: 'LAST_VALUE',
+    NTH_VALUE: 'NTH_VALUE',
+    ROWS: 'ROWS',
+    RANGE: 'RANGE',
+    UNBOUNDED: 'UNBOUNDED',
+    PRECEDING: 'PRECEDING',
+    FOLLOWING: 'FOLLOWING',
+    CURRENT: 'CURRENT',
+    ROW: 'ROW',
+    // Query optimization
+    EXPLAIN: 'EXPLAIN',
 
     // Literals
     IDENTIFIER: 'IDENTIFIER',
@@ -9831,6 +10019,10 @@ const KEYWORDS = {
     'FALSE': TokenType.FALSE,
     'GROUP': TokenType.GROUP,
     'HAVING': TokenType.HAVING,
+    'ROLLUP': TokenType.ROLLUP,
+    'CUBE': TokenType.CUBE,
+    'GROUPING': TokenType.GROUPING,
+    'SETS': TokenType.SETS,
     'COUNT': TokenType.COUNT,
     'SUM': TokenType.SUM,
     'AVG': TokenType.AVG,
@@ -9874,6 +10066,39 @@ const KEYWORDS = {
     'VECTOR': TokenType.VECTOR,
     'PRIMARY': TokenType.PRIMARY,
     'KEY': TokenType.KEY,
+    // CTE keywords
+    'WITH': TokenType.WITH,
+    'RECURSIVE': TokenType.RECURSIVE,
+    'UNION': TokenType.UNION,
+    'ALL': TokenType.ALL,
+    // PIVOT/UNPIVOT keywords
+    'PIVOT': TokenType.PIVOT,
+    'UNPIVOT': TokenType.UNPIVOT,
+    'FOR': TokenType.FOR,
+    // Set operation keywords
+    'INTERSECT': TokenType.INTERSECT,
+    'EXCEPT': TokenType.EXCEPT,
+    // Window function keywords
+    'OVER': TokenType.OVER,
+    'PARTITION': TokenType.PARTITION,
+    'ROW_NUMBER': TokenType.ROW_NUMBER,
+    'RANK': TokenType.RANK,
+    'DENSE_RANK': TokenType.DENSE_RANK,
+    'NTILE': TokenType.NTILE,
+    'LAG': TokenType.LAG,
+    'LEAD': TokenType.LEAD,
+    'FIRST_VALUE': TokenType.FIRST_VALUE,
+    'LAST_VALUE': TokenType.LAST_VALUE,
+    'NTH_VALUE': TokenType.NTH_VALUE,
+    'ROWS': TokenType.ROWS,
+    'RANGE': TokenType.RANGE,
+    'UNBOUNDED': TokenType.UNBOUNDED,
+    'PRECEDING': TokenType.PRECEDING,
+    'FOLLOWING': TokenType.FOLLOWING,
+    'CURRENT': TokenType.CURRENT,
+    'ROW': TokenType.ROW,
+    // Query optimization
+    'EXPLAIN': TokenType.EXPLAIN,
 };
 
 /**
@@ -10076,9 +10301,24 @@ export class SQLParser {
      * Parse SQL statement (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE)
      */
     parse() {
+        // Handle EXPLAIN prefix
+        if (this.check(TokenType.EXPLAIN)) {
+            this.advance();  // consume EXPLAIN
+            const statement = this.parse();  // Parse the inner statement
+            return { type: 'EXPLAIN', statement };
+        }
+
+        // Check for WITH clause (CTEs)
+        let ctes = [];
+        if (this.check(TokenType.WITH)) {
+            ctes = this.parseWithClause();
+        }
+
         // Dispatch based on first keyword
         if (this.check(TokenType.SELECT)) {
-            return this.parseSelect();
+            const result = this.parseSelect();
+            result.ctes = ctes;  // Attach CTEs to SELECT
+            return result;
         } else if (this.check(TokenType.INSERT)) {
             return this.parseInsert();
         } else if (this.check(TokenType.UPDATE)) {
@@ -10090,14 +10330,78 @@ export class SQLParser {
         } else if (this.check(TokenType.DROP)) {
             return this.parseDropTable();
         } else {
-            throw new Error(`Unexpected token: ${this.current().type}. Expected SELECT, INSERT, UPDATE, DELETE, CREATE, or DROP`);
+            throw new Error(`Unexpected token: ${this.current().type}. Expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, or EXPLAIN`);
         }
     }
 
     /**
-     * Parse SELECT statement
+     * Parse WITH clause (Common Table Expressions)
+     * Syntax: WITH [RECURSIVE] name [(columns)] AS (subquery) [, ...]
      */
-    parseSelect() {
+    parseWithClause() {
+        this.expect(TokenType.WITH);
+        const isRecursive = !!this.match(TokenType.RECURSIVE);
+
+        const ctes = [];
+        do {
+            const name = this.expect(TokenType.IDENTIFIER).value;
+
+            // Optional column list
+            let columns = [];
+            if (this.match(TokenType.LPAREN)) {
+                columns.push(this.expect(TokenType.IDENTIFIER).value);
+                while (this.match(TokenType.COMMA)) {
+                    columns.push(this.expect(TokenType.IDENTIFIER).value);
+                }
+                this.expect(TokenType.RPAREN);
+            }
+
+            this.expect(TokenType.AS);
+            this.expect(TokenType.LPAREN);
+
+            // Parse CTE body - may contain UNION ALL for recursive CTEs
+            const body = this.parseCteBody(isRecursive);
+
+            this.expect(TokenType.RPAREN);
+
+            ctes.push({
+                name,
+                columns,
+                body,
+                recursive: isRecursive
+            });
+        } while (this.match(TokenType.COMMA));
+
+        return ctes;
+    }
+
+    /**
+     * Parse CTE body which may contain UNION ALL for recursive CTEs
+     */
+    parseCteBody(isRecursive) {
+        // Parse anchor query - disable set operation parsing, we handle UNION ALL here
+        const anchor = this.parseSelect(true, true);  // isSubquery=true, noSetOps=true
+
+        // Check for UNION ALL (required for recursive CTEs)
+        if (isRecursive && this.match(TokenType.UNION)) {
+            this.expect(TokenType.ALL);
+            const recursive = this.parseSelect(true, true);  // Same for recursive part
+            return {
+                type: 'RECURSIVE_CTE',
+                anchor,
+                recursive
+            };
+        }
+
+        return anchor;
+    }
+
+    /**
+     * Parse SELECT statement
+     * @param {boolean} isSubquery - If true, don't require EOF at end (for subqueries)
+     * @param {boolean} noSetOps - If true, don't parse set operations (for CTE body parsing)
+     */
+    parseSelect(isSubquery = false, noSetOps = false) {
         this.expect(TokenType.SELECT);
 
         // DISTINCT
@@ -10120,17 +10424,81 @@ export class SQLParser {
             joins.push(this.parseJoinClause());
         }
 
+        // PIVOT clause (optional)
+        // Syntax: PIVOT (aggregate FOR column IN (value1, value2, ...))
+        let pivot = null;
+        if (this.match(TokenType.PIVOT)) {
+            this.expect(TokenType.LPAREN);
+
+            // Parse aggregate function
+            const aggFunc = this.parsePrimary();
+            if (aggFunc.type !== 'call') {
+                throw new Error('PIVOT requires an aggregate function (e.g., SUM, COUNT, AVG)');
+            }
+
+            this.expect(TokenType.FOR);
+            const forColumn = this.expect(TokenType.IDENTIFIER).value;
+
+            this.expect(TokenType.IN);
+            this.expect(TokenType.LPAREN);
+
+            // Parse IN values
+            const inValues = [];
+            inValues.push(this.parsePrimary().value);
+            while (this.match(TokenType.COMMA)) {
+                inValues.push(this.parsePrimary().value);
+            }
+            this.expect(TokenType.RPAREN);
+            this.expect(TokenType.RPAREN);
+
+            pivot = {
+                aggregate: aggFunc,
+                forColumn,
+                inValues
+            };
+        }
+
+        // UNPIVOT clause (optional)
+        // Syntax: UNPIVOT (valueColumn FOR nameColumn IN (col1, col2, ...))
+        let unpivot = null;
+        if (this.match(TokenType.UNPIVOT)) {
+            this.expect(TokenType.LPAREN);
+
+            const valueColumn = this.expect(TokenType.IDENTIFIER).value;
+
+            this.expect(TokenType.FOR);
+            const nameColumn = this.expect(TokenType.IDENTIFIER).value;
+
+            this.expect(TokenType.IN);
+            this.expect(TokenType.LPAREN);
+
+            // Parse IN columns
+            const inColumns = [];
+            inColumns.push(this.expect(TokenType.IDENTIFIER).value);
+            while (this.match(TokenType.COMMA)) {
+                inColumns.push(this.expect(TokenType.IDENTIFIER).value);
+            }
+            this.expect(TokenType.RPAREN);
+            this.expect(TokenType.RPAREN);
+
+            unpivot = {
+                valueColumn,
+                nameColumn,
+                inColumns
+            };
+        }
+
         // WHERE
         let where = null;
         if (this.match(TokenType.WHERE)) {
             where = this.parseExpr();
         }
 
-        // GROUP BY
+        // GROUP BY (supports ROLLUP, CUBE, GROUPING SETS)
         let groupBy = [];
         if (this.match(TokenType.GROUP)) {
             this.expect(TokenType.BY);
-            groupBy = this.parseColumnList();
+            groupBy = this.parseGroupByList();
         }
 
         // HAVING
@@ -10179,50 +10547,102 @@ export class SQLParser {
             search = { query, searchRow, column, topK, encoder };
         }
 
-        // ORDER BY and LIMIT can appear in either order
-        let orderBy = [];
-        let limit = null;
-        let offset = null;
-
-        // First pass: check for ORDER BY or LIMIT
-        if (this.match(TokenType.ORDER)) {
-            this.expect(TokenType.BY);
-            orderBy = this.parseOrderByList();
-        }
-        if (this.match(TokenType.LIMIT)) {
-            limit = parseInt(this.expect(TokenType.NUMBER).value, 10);
-        }
-
-        // Second pass: allow ORDER BY after LIMIT (non-standard but common)
-        if (orderBy.length === 0 && this.match(TokenType.ORDER)) {
-            this.expect(TokenType.BY);
-            orderBy = this.parseOrderByList();
-        }
-
-        // OFFSET (can come after LIMIT)
-        if (this.match(TokenType.OFFSET)) {
-            offset = parseInt(this.expect(TokenType.NUMBER).value, 10);
-        }
-
-        // Check that we've consumed all tokens
-        if (this.current().type !== TokenType.EOF) {
-            throw new Error(`Unexpected token after query: ${this.current().type} (${this.current().value}). Check your SQL syntax.`);
-        }
-
-        return {
+        // Build the base SELECT AST (without ORDER BY/LIMIT/OFFSET yet)
+        const baseAst = {
             type: 'SELECT',
             distinct,
             columns,
             from,
             joins,
+            pivot,
+            unpivot,
             where,
             groupBy,
             having,
             search,
-            orderBy,
-            limit,
-            offset,
+            orderBy: [],
+            limit: null,
+            offset: null,
         };
+
+        // Check for set operations (UNION, INTERSECT, EXCEPT) BEFORE parsing ORDER BY/LIMIT
+        // This ensures ORDER BY/LIMIT apply to the set operation result, not individual SELECTs
+        if (!noSetOps && (this.check(TokenType.UNION) || this.check(TokenType.INTERSECT) || this.check(TokenType.EXCEPT))) {
+            const operator = this.advance().type;
+            const all = !!this.match(TokenType.ALL);
+            // Parse right side without set operations (will be handled here) and without ORDER BY/LIMIT
+            const right = this.parseSelect(true, true);  // noSetOps=true for right side
+
+            // Now parse ORDER BY/LIMIT/OFFSET for the combined result
+            let orderBy = [];
+            let limit = null;
+            let offset = null;
+
+            if (this.match(TokenType.ORDER)) {
+                this.expect(TokenType.BY);
+                orderBy = this.parseOrderByList();
+            }
+            if (this.match(TokenType.LIMIT)) {
+                limit = parseInt(this.expect(TokenType.NUMBER).value, 10);
+            }
+            if (orderBy.length === 0 && this.match(TokenType.ORDER)) {
+                this.expect(TokenType.BY);
+                orderBy = this.parseOrderByList();
+            }
+            if (this.match(TokenType.OFFSET)) {
+                offset = parseInt(this.expect(TokenType.NUMBER).value, 10);
+            }
+
+            // Check that we've consumed all tokens (unless this is a subquery)
+            if (!isSubquery && this.current().type !== TokenType.EOF) {
+                throw new Error(`Unexpected token after query: ${this.current().type} (${this.current().value}). Check your SQL syntax.`);
+            }
+
+            return {
+                type: 'SET_OPERATION',
+                operator,
+                all,
+                left: baseAst,
+                right,
+                orderBy,
+                limit,
+                offset,
+            };
+        }
+
+        // No set operation - parse ORDER BY/LIMIT/OFFSET for this SELECT
+        // UNLESS noSetOps is true (we're part of a set operation and ORDER BY/LIMIT belong to outer context)
+        if (!noSetOps) {
+            let orderBy = [];
+            let limit = null;
+            let offset = null;
+
+            if (this.match(TokenType.ORDER)) {
+                this.expect(TokenType.BY);
+                orderBy = this.parseOrderByList();
+            }
+            if (this.match(TokenType.LIMIT)) {
+                limit = parseInt(this.expect(TokenType.NUMBER).value, 10);
+            }
+            if (orderBy.length === 0 && this.match(TokenType.ORDER)) {
+                this.expect(TokenType.BY);
+                orderBy = this.parseOrderByList();
+            }
+            if (this.match(TokenType.OFFSET)) {
+                offset = parseInt(this.expect(TokenType.NUMBER).value, 10);
+            }
+
+            baseAst.orderBy = orderBy;
+            baseAst.limit = limit;
+            baseAst.offset = offset;
+        }
+
+        // Check that we've consumed all tokens (unless this is a subquery)
+        if (!isSubquery && this.current().type !== TokenType.EOF) {
+            throw new Error(`Unexpected token after query: ${this.current().type} (${this.current().value}). Check your SQL syntax.`);
+        }
+
+        return baseAst;
     }
 
     /**
@@ -10639,6 +11059,63 @@ export class SQLParser {
         return columns;
     }
 
+    /**
+     * Parse GROUP BY list with support for ROLLUP, CUBE, GROUPING SETS
+     * Returns array of items, each with { type, column/columns/sets }
+     */
+    parseGroupByList() {
+        const items = [];
+
+        do {
+            if (this.match(TokenType.ROLLUP)) {
+                // ROLLUP(col1, col2, ...)
+                this.expect(TokenType.LPAREN);
+                const columns = this.parseColumnList();
+                this.expect(TokenType.RPAREN);
+                items.push({ type: 'ROLLUP', columns });
+            } else if (this.match(TokenType.CUBE)) {
+                // CUBE(col1, col2, ...)
+                this.expect(TokenType.LPAREN);
+                const columns = this.parseColumnList();
+                this.expect(TokenType.RPAREN);
+                items.push({ type: 'CUBE', columns });
+            } else if (this.match(TokenType.GROUPING)) {
+                // GROUPING SETS((col1, col2), (col1), ())
+                this.expect(TokenType.SETS);
+                this.expect(TokenType.LPAREN);
+                const sets = this.parseGroupingSets();
+                this.expect(TokenType.RPAREN);
+                items.push({ type: 'GROUPING_SETS', sets });
+            } else {
+                // Simple column
+                items.push({ type: 'COLUMN', column: this.expect(TokenType.IDENTIFIER).value });
+            }
+        } while (this.match(TokenType.COMMA));
+
+        return items;
+    }
+
+    /**
+     * Parse the sets inside GROUPING SETS(...)
+     * Each set is (col1, col2) or () for grand total
+     */
+    parseGroupingSets() {
+        const sets = [];
+
+        do {
+            this.expect(TokenType.LPAREN);
+            if (this.check(TokenType.RPAREN)) {
+                // Empty set () = grand total
+                sets.push([]);
+            } else {
+                sets.push(this.parseColumnList());
+            }
+            this.expect(TokenType.RPAREN);
+        } while (this.match(TokenType.COMMA));
+
+        return sets;
+    }
+
     parseOrderByList() {
         const items = [this.parseOrderByItem()];
 
@@ -10712,9 +11189,18 @@ export class SQLParser {
             };
         }
 
-        // IN
+        // IN - can be a list of values or a subquery
         if (this.match(TokenType.IN)) {
             this.expect(TokenType.LPAREN);
+
+            // Check if this is a subquery (starts with SELECT)
+            if (this.check(TokenType.SELECT)) {
+                const subquery = this.parseSelect(true);  // isSubquery=true
+                this.expect(TokenType.RPAREN);
+                return { type: 'in', expr: left, values: [{ type: 'subquery', query: subquery }] };
+            }
+
+            // Otherwise, parse as list of values
             const values = [];
             values.push(this.parsePrimary());
             while (this.match(TokenType.COMMA)) {
@@ -10823,8 +11309,30 @@ export class SQLParser {
             return { type: 'literal', value };
         }
 
+        // Window function keywords (ROW_NUMBER, RANK, etc.)
+        const windowFuncTokens = [
+            TokenType.ROW_NUMBER, TokenType.RANK, TokenType.DENSE_RANK, TokenType.NTILE,
+            TokenType.LAG, TokenType.LEAD, TokenType.FIRST_VALUE, TokenType.LAST_VALUE, TokenType.NTH_VALUE
+        ];
+        if (windowFuncTokens.some(t => this.check(t))) {
+            const name = this.advance().type;  // Use token type as function name
+            this.expect(TokenType.LPAREN);
+            const args = [];
+            if (!this.check(TokenType.RPAREN)) {
+                args.push(this.parseExpr());
+                while (this.match(TokenType.COMMA)) {
+                    args.push(this.parseExpr());
+                }
+            }
+            this.expect(TokenType.RPAREN);
+
+            // OVER clause is required for window functions
+            const over = this.parseOverClause();
+            return { type: 'call', name, args, distinct: false, over };
+        }
+
         // Function call or column reference
-        if (this.check(TokenType.IDENTIFIER) || this.check(TokenType.COUNT, TokenType.SUM, TokenType.AVG, TokenType.MIN, TokenType.MAX)) {
+        if (this.check(TokenType.IDENTIFIER) || this.check(TokenType.COUNT, TokenType.SUM, TokenType.AVG, TokenType.MIN, TokenType.MAX, TokenType.GROUPING)) {
             const name = this.advance().value;
 
             // Function call
@@ -10846,7 +11354,14 @@ export class SQLParser {
                 }
 
                 this.expect(TokenType.RPAREN);
-                return { type: 'call', name: name.toUpperCase(), args, distinct };
+
+                // Check for OVER clause (aggregate as window function)
+                let over = null;
+                if (this.check(TokenType.OVER)) {
+                    over = this.parseOverClause();
+                }
+
+                return { type: 'call', name: name.toUpperCase(), args, distinct, over };
             }
 
             // Column reference - check for table.column syntax
@@ -10863,8 +11378,14 @@ export class SQLParser {
             return { type: 'column', column: name };
         }
 
-        // Parenthesized expression
+        // Parenthesized expression or subquery
         if (this.match(TokenType.LPAREN)) {
+            // Check if this is a subquery (starts with SELECT)
+            if (this.check(TokenType.SELECT)) {
+                const subquery = this.parseSelect(true);  // isSubquery=true
+                this.expect(TokenType.RPAREN);
+                return { type: 'subquery', query: subquery };
+            }
             const expr = this.parseExpr();
             this.expect(TokenType.RPAREN);
             return expr;
@@ -10877,6 +11398,96 @@ export class SQLParser {
 
         throw new Error(`Unexpected token: ${this.current().type} (${this.current().value})`);
     }
+
+    /**
+     * Parse OVER clause for window functions
+     * Syntax: OVER ([PARTITION BY expr, ...] [ORDER BY expr [ASC|DESC], ...] [frame_clause])
+     */
+    parseOverClause() {
+        this.expect(TokenType.OVER);
+        this.expect(TokenType.LPAREN);
+
+        const over = { partitionBy: [], orderBy: [], frame: null };
+
+        // PARTITION BY clause
+        if (this.match(TokenType.PARTITION)) {
+            this.expect(TokenType.BY);
+            over.partitionBy.push(this.parseExpr());
+            while (this.match(TokenType.COMMA)) {
+                over.partitionBy.push(this.parseExpr());
+            }
+        }
+
+        // ORDER BY clause
+        if (this.match(TokenType.ORDER)) {
+            this.expect(TokenType.BY);
+            over.orderBy = this.parseOrderByList();
+        }
+
+        // Optional frame clause: ROWS/RANGE BETWEEN ... AND ...
+        if (this.check(TokenType.ROWS) || this.check(TokenType.RANGE)) {
+            over.frame = this.parseFrameClause();
+        }
+
+        this.expect(TokenType.RPAREN);
+        return over;
+    }
+
+    /**
+     * Parse frame clause for window functions
+     * Syntax: ROWS|RANGE BETWEEN frame_start AND frame_end
+     *         or: ROWS|RANGE frame_start
+     */
+    parseFrameClause() {
+        const frameType = this.advance().type;  // ROWS or RANGE
+        const frame = { type: frameType, start: null, end: null };
+
+        // Check for BETWEEN ... AND ... syntax
+        if (this.match(TokenType.BETWEEN)) {
+            frame.start = this.parseFrameBound();
+            this.expect(TokenType.AND);
+            frame.end = this.parseFrameBound();
+        } else {
+            // Single bound (implies CURRENT ROW as end for some DBs, or just start)
+            frame.start = this.parseFrameBound();
+            frame.end = { type: 'CURRENT ROW' };  // Default end
+        }
+
+        return frame;
+    }
+
+    /**
+     * Parse a frame bound
+     * Options: UNBOUNDED PRECEDING, UNBOUNDED FOLLOWING, CURRENT ROW, N PRECEDING, N FOLLOWING
+     */
+    parseFrameBound() {
+        if (this.match(TokenType.UNBOUNDED)) {
+            if (this.match(TokenType.PRECEDING)) {
+                return { type: 'UNBOUNDED PRECEDING' };
+            } else if (this.match(TokenType.FOLLOWING)) {
+                return { type: 'UNBOUNDED FOLLOWING' };
+            }
+            throw new Error('Expected PRECEDING or FOLLOWING after UNBOUNDED');
+        }
+
+        if (this.match(TokenType.CURRENT)) {
+            this.expect(TokenType.ROW);
+            return { type: 'CURRENT ROW' };
+        }
+
+        // N PRECEDING or N FOLLOWING
+        if (this.check(TokenType.NUMBER)) {
+            const n = parseInt(this.advance().value, 10);
+            if (this.match(TokenType.PRECEDING)) {
+                return { type: 'PRECEDING', offset: n };
+            } else if (this.match(TokenType.FOLLOWING)) {
+                return { type: 'FOLLOWING', offset: n };
+            }
+            throw new Error('Expected PRECEDING or FOLLOWING after number');
+        }
+
+        throw new Error('Invalid frame bound');
+    }
 }
 
 /**
@@ -10887,6 +11498,8 @@ export class SQLExecutor {
         this.file = file;
         this.columnMap = {};
         this.columnTypes = [];
+        this._cteResults = new Map();  // Store materialized CTE results
+        this._database = null;          // Reference to LanceDatabase for subqueries
 
         // Build column name -> index map
         if (file.columnNames) {
@@ -10894,6 +11507,13 @@ export class SQLExecutor {
                 this.columnMap[name.toLowerCase()] = idx;
             });
         }
+    }
+
+    /**
+     * Set reference to parent database for CTE/subquery execution
+     */
+    setDatabase(db) {
+        this._database = db;
     }
 
     /**
@@ -11576,9 +12196,779 @@ export class SQLExecutor {
                 // Aggregate functions not supported in row-level evaluation
                 return null;
 
+            case 'subquery': {
+                // Execute subquery and return scalar result
+                // For correlated subqueries, pass outer row context
+                return this._executeSubquery(expr.query, columnData, rowIdx);
+            }
+
             default:
                 return null;
         }
+    }
+
+    /**
+     * Execute a subquery and return its result.
+     * For scalar subqueries (returns single value), returns that value.
+     * For correlated subqueries, substitutes outer row values.
+     */
+    _executeSubquery(subqueryAst, outerColumnData, outerRowIdx) {
+        // Clone the subquery AST to avoid mutating the original
+        const resolvedAst = JSON.parse(JSON.stringify(subqueryAst));
+
+        // Check for correlated references (columns not in the subquery's FROM)
+        // and substitute with outer row values
+        const subqueryTable = resolvedAst.from?.name || resolvedAst.from?.table;
+        const correlatedColumns = this._findCorrelatedColumns(resolvedAst, subqueryTable);
+
+        // Build correlation context with outer row values
+        const correlationContext = {};
+        for (const col of correlatedColumns) {
+            const colName = col.column.toLowerCase();
+            if (outerColumnData[colName]) {
+                correlationContext[col.table + '.' + col.column] = outerColumnData[colName][outerRowIdx];
+            }
+        }
+
+        // If we have correlations, modify the WHERE clause to use literals
+        if (Object.keys(correlationContext).length > 0) {
+            this._substituteCorrelations(resolvedAst.where, correlationContext);
+        }
+
+        // Check if FROM references a CTE
+        const tableName = resolvedAst.from?.name?.toLowerCase() || resolvedAst.from?.table?.toLowerCase();
+        if (tableName && this._cteResults?.has(tableName)) {
+            const result = this._executeOnInMemoryData(resolvedAst, this._cteResults.get(tableName));
+            return result.rows.length > 0 ? result.rows[0][0] : null;  // Scalar result
+        }
+
+        // Execute against database if available
+        if (this._database) {
+            try {
+                const result = this._database._executeSingleTable(resolvedAst);
+                if (result && result.then) {
+                    // This is async - we need to handle it synchronously for expression evaluation
+                    // For now, return null and recommend using CTE approach instead
+                    console.warn('[SQLExecutor] Async subquery in expression context - consider using CTE');
+                    return null;
+                }
+                return result?.rows?.[0]?.[0] ?? null;
+            } catch (e) {
+                console.warn('[SQLExecutor] Subquery execution failed:', e.message);
+                return null;
+            }
+        }
+
+        console.warn('[SQLExecutor] Subquery execution requires LanceDatabase context');
+        return null;
+    }
+
+    /**
+     * Find columns that reference the outer query (correlated columns)
+     */
+    _findCorrelatedColumns(ast, subqueryTable) {
+        const correlatedCols = [];
+
+        const walkExpr = (expr) => {
+            if (!expr) return;
+
+            if (expr.type === 'column' && expr.table && expr.table !== subqueryTable) {
+                correlatedCols.push(expr);
+            } else if (expr.type === 'binary') {
+                walkExpr(expr.left);
+                walkExpr(expr.right);
+            } else if (expr.type === 'unary') {
+                walkExpr(expr.operand);
+            } else if (expr.type === 'in') {
+                walkExpr(expr.expr);
+                expr.values?.forEach(walkExpr);
+            } else if (expr.type === 'between') {
+                walkExpr(expr.expr);
+                walkExpr(expr.low);
+                walkExpr(expr.high);
+            } else if (expr.type === 'like') {
+                walkExpr(expr.expr);
+                walkExpr(expr.pattern);
+            } else if (expr.type === 'call') {
+                expr.args?.forEach(walkExpr);
+            }
+        };
+
+        walkExpr(ast.where);
+        return correlatedCols;
+    }
+
+    /**
+     * Substitute correlated column references with literal values
+     */
+    _substituteCorrelations(expr, correlationContext) {
+        if (!expr) return;
+
+        if (expr.type === 'column' && expr.table) {
+            const key = expr.table + '.' + expr.column;
+            if (correlationContext.hasOwnProperty(key)) {
+                // Convert to literal
+                expr.type = 'literal';
+                expr.value = correlationContext[key];
+                delete expr.table;
+                delete expr.column;
+            }
+        } else if (expr.type === 'binary') {
+            this._substituteCorrelations(expr.left, correlationContext);
+            this._substituteCorrelations(expr.right, correlationContext);
+        } else if (expr.type === 'unary') {
+            this._substituteCorrelations(expr.operand, correlationContext);
+        } else if (expr.type === 'in') {
+            this._substituteCorrelations(expr.expr, correlationContext);
+            expr.values?.forEach(v => this._substituteCorrelations(v, correlationContext));
+        } else if (expr.type === 'between') {
+            this._substituteCorrelations(expr.expr, correlationContext);
+            this._substituteCorrelations(expr.low, correlationContext);
+            this._substituteCorrelations(expr.high, correlationContext);
+        } else if (expr.type === 'like') {
+            this._substituteCorrelations(expr.expr, correlationContext);
+            this._substituteCorrelations(expr.pattern, correlationContext);
+        } else if (expr.type === 'call') {
+            expr.args?.forEach(a => this._substituteCorrelations(a, correlationContext));
+        }
+    }
+
+    /**
+     * Materialize CTEs before query execution
+     * @param {Array} ctes - Array of CTE definitions from AST
+     * @param {LanceDatabase} db - Database reference for executing CTE bodies
+     */
+    async materializeCTEs(ctes, db) {
+        this._database = db;
+        for (const cte of ctes) {
+            const cteName = cte.name.toLowerCase();
+            if (cte.body.type === 'RECURSIVE_CTE') {
+                // Execute anchor query first
+                const anchorResult = await this._executeCTEBody(cte.body.anchor, db);
+                let result = { columns: anchorResult.columns, rows: [...anchorResult.rows] };
+
+                // Iterate recursive part until no new rows (max 1000 iterations)
+                for (let i = 0; i < 1000; i++) {
+                    this._cteResults.set(cteName, result);
+                    const recursiveResult = await this._executeCTEBody(cte.body.recursive, db);
+                    if (recursiveResult.rows.length === 0) break;
+                    result = { columns: result.columns, rows: [...result.rows, ...recursiveResult.rows] };
+                }
+                this._cteResults.set(cteName, result);
+            } else {
+                const result = await this._executeCTEBody(cte.body, db);
+                this._cteResults.set(cteName, result);
+            }
+        }
+    }
+
+    /**
+     * Execute a CTE body - either against database or against already-materialized CTE
+     */
+    async _executeCTEBody(bodyAst, db) {
+        // Check if FROM references another CTE
+        const tableName = bodyAst.from?.name?.toLowerCase() || bodyAst.from?.table?.toLowerCase();
+        if (tableName && this._cteResults.has(tableName)) {
+            return this._executeOnInMemoryData(bodyAst, this._cteResults.get(tableName));
+        }
+        // Fall back to database execution
+        return db._executeSingleTable(bodyAst);
+    }
+
+    /**
+     * Execute query on in-memory data (for CTEs and subqueries)
+     * @param {Object} ast - Parsed SELECT AST
+     * @param {Object} data - In-memory data { columns: string[], rows: any[][] }
+     * @returns {Object} - Query result { columns: string[], rows: any[][] }
+     */
+    _executeOnInMemoryData(ast, data) {
+        // Build column lookup: column name -> array of values
+        const columnData = {};
+        for (let i = 0; i < data.columns.length; i++) {
+            const colName = data.columns[i].toLowerCase();
+            columnData[colName] = data.rows.map(row => row[i]);
+        }
+
+        // Apply WHERE filter
+        const filteredIndices = [];
+        for (let i = 0; i < data.rows.length; i++) {
+            if (!ast.where || this._evaluateInMemoryExpr(ast.where, columnData, i)) {
+                filteredIndices.push(i);
+            }
+        }
+
+        // Check for GROUP BY or aggregations
+        const hasGroupBy = ast.groupBy && ast.groupBy.length > 0;
+        const hasAggregates = this._hasAggregatesInSelect(ast.columns);
+
+        if (hasGroupBy || hasAggregates) {
+            return this._executeGroupByAggregation(ast, data, columnData, filteredIndices);
+        }
+
+        // Project columns and build result
+        const resultColumns = [];
+        const resultRows = [];
+
+        // Handle SELECT * - parser returns { type: 'star' } directly, not { expr: { type: 'star' } }
+        const isSelectStar = ast.columns.length === 1 &&
+            (ast.columns[0].type === 'star' || ast.columns[0].expr?.type === 'star');
+        if (isSelectStar) {
+            for (const colName of data.columns) {
+                resultColumns.push(colName);
+            }
+            for (const idx of filteredIndices) {
+                resultRows.push([...data.rows[idx]]);
+            }
+        } else {
+            // Named columns
+            for (const col of ast.columns) {
+                resultColumns.push(col.alias || col.expr?.column || '*');
+            }
+            for (const idx of filteredIndices) {
+                const row = ast.columns.map(col => {
+                    if (col.type === 'star' || col.expr?.type === 'star') {
+                        return data.rows[idx];
+                    }
+                    return this._evaluateInMemoryExpr(col.expr, columnData, idx);
+                });
+                resultRows.push(row.flat());
+            }
+        }
+
+        // Apply ORDER BY
+        if (ast.orderBy && ast.orderBy.length > 0) {
+            const colIdxMap = {};
+            resultColumns.forEach((name, idx) => { colIdxMap[name.toLowerCase()] = idx; });
+
+            resultRows.sort((a, b) => {
+                for (const ob of ast.orderBy) {
+                    const colIdx = colIdxMap[ob.column.toLowerCase()];
+                    if (colIdx === undefined) continue;
+                    const valA = a[colIdx], valB = b[colIdx];
+                    // Parser uses 'descending' boolean, some places use 'direction' string
+                    const dir = (ob.descending || ob.direction === 'DESC') ? -1 : 1;
+                    if (valA == null && valB == null) continue;
+                    if (valA == null) return 1 * dir;
+                    if (valB == null) return -1 * dir;
+                    if (valA < valB) return -1 * dir;
+                    if (valA > valB) return 1 * dir;
+                }
+                return 0;
+            });
+        }
+
+        // Apply LIMIT/OFFSET
+        const offset = ast.offset || 0;
+        let rows = resultRows;
+        if (offset > 0) rows = rows.slice(offset);
+        if (ast.limit) rows = rows.slice(0, ast.limit);
+
+        return { columns: resultColumns, rows, total: filteredIndices.length };
+    }
+
+    /**
+     * Check if SELECT columns contain aggregate functions
+     */
+    _hasAggregatesInSelect(columns) {
+        const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'VARIANCE'];
+        for (const col of columns) {
+            if (col.expr?.type === 'call') {
+                const funcName = (col.expr.name || '').toUpperCase();
+                if (aggFuncs.includes(funcName)) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Execute GROUP BY with aggregation on in-memory data
+     */
+    _executeGroupByAggregation(ast, data, columnData, filteredIndices) {
+        const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'VARIANCE'];
+        const hasGroupBy = ast.groupBy && ast.groupBy.length > 0;
+
+        // Group rows by GROUP BY columns
+        const groups = new Map();
+        for (const idx of filteredIndices) {
+            let groupKey = '';
+            if (hasGroupBy) {
+                groupKey = ast.groupBy.map(expr => {
+                    const colName = (expr.column || expr.name || '').toLowerCase();
+                    const val = columnData[colName]?.[idx];
+                    return JSON.stringify(val);
+                }).join('|');
+            }
+
+            if (!groups.has(groupKey)) {
+                groups.set(groupKey, []);
+            }
+            groups.get(groupKey).push(idx);
+        }
+
+        // If no GROUP BY and no rows, create one group with empty indices for aggregate results
+        // (e.g., COUNT(*) on empty table should return 0, not empty result)
+        if (!hasGroupBy && groups.size === 0) {
+            groups.set('', []);
+        }
+
+        // Build result columns
+        const resultColumns = [];
+        for (const col of ast.columns) {
+            if (col.alias) {
+                resultColumns.push(col.alias);
+            } else if (col.expr?.type === 'call') {
+                const argName = col.expr.args?.[0]?.name || col.expr.args?.[0]?.column || '*';
+                resultColumns.push(`${col.expr.name}(${argName})`);
+            } else if (col.expr?.type === 'column') {
+                resultColumns.push(col.expr.name || col.expr.column);
+            } else {
+                resultColumns.push('?');
+            }
+        }
+
+        // Compute aggregations for each group
+        const resultRows = [];
+        for (const [, groupIndices] of groups) {
+            const row = [];
+            for (const col of ast.columns) {
+                const expr = col.expr;
+                if (expr?.type === 'call' && aggFuncs.includes((expr.name || '').toUpperCase())) {
+                    const funcName = expr.name.toUpperCase();
+                    const argExpr = expr.args?.[0];
+                    const isStar = argExpr?.type === 'star';
+                    const colName = (argExpr?.name || argExpr?.column || '').toLowerCase();
+
+                    let result = null;
+                    switch (funcName) {
+                        case 'COUNT':
+                            if (isStar) {
+                                result = groupIndices.length;
+                            } else {
+                                result = groupIndices.filter(i => columnData[colName]?.[i] != null).length;
+                            }
+                            break;
+                        case 'SUM': {
+                            let sum = 0;
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && !isNaN(v)) sum += v;
+                            }
+                            result = sum;
+                            break;
+                        }
+                        case 'AVG': {
+                            let sum = 0, count = 0;
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && !isNaN(v)) { sum += v; count++; }
+                            }
+                            result = count > 0 ? sum / count : null;
+                            break;
+                        }
+                        case 'MIN': {
+                            let min = null;
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && (min === null || v < min)) min = v;
+                            }
+                            result = min;
+                            break;
+                        }
+                        case 'MAX': {
+                            let max = null;
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && (max === null || v > max)) max = v;
+                            }
+                            result = max;
+                            break;
+                        }
+                    }
+                    row.push(result);
+                } else if (expr?.type === 'column') {
+                    // Non-aggregate column - take first value from group
+                    const colName = (expr.name || expr.column || '').toLowerCase();
+                    row.push(columnData[colName]?.[groupIndices[0]] ?? null);
+                } else {
+                    row.push(this._evaluateInMemoryExpr(expr, columnData, groupIndices[0]));
+                }
+            }
+            resultRows.push(row);
+        }
+
+        // Apply ORDER BY
+        if (ast.orderBy && ast.orderBy.length > 0) {
+            const colIdxMap = {};
+            resultColumns.forEach((name, idx) => { colIdxMap[name.toLowerCase()] = idx; });
+
+            resultRows.sort((a, b) => {
+                for (const ob of ast.orderBy) {
+                    const colIdx = colIdxMap[ob.column.toLowerCase()];
+                    if (colIdx === undefined) continue;
+                    const valA = a[colIdx], valB = b[colIdx];
+                    const dir = (ob.descending || ob.direction === 'DESC') ? -1 : 1;
+                    if (valA == null && valB == null) continue;
+                    if (valA == null) return 1 * dir;
+                    if (valB == null) return -1 * dir;
+                    if (valA < valB) return -1 * dir;
+                    if (valA > valB) return 1 * dir;
+                }
+                return 0;
+            });
+        }
+
+        // Apply LIMIT/OFFSET
+        const offset = ast.offset || 0;
+        let rows = resultRows;
+        if (offset > 0) rows = rows.slice(offset);
+        if (ast.limit) rows = rows.slice(0, ast.limit);
+
+        return { columns: resultColumns, rows, total: groups.size };
+    }
+
+    /**
+     * Evaluate expression on in-memory data
+     */
+    _evaluateInMemoryExpr(expr, columnData, rowIdx) {
+        if (!expr) return null;
+
+        switch (expr.type) {
+            case 'literal':
+                return expr.value;
+
+            case 'column': {
+                const colName = expr.column.toLowerCase();
+                const col = columnData[colName];
+                return col ? col[rowIdx] : null;
+            }
+
+            case 'binary': {
+                const left = this._evaluateInMemoryExpr(expr.left, columnData, rowIdx);
+                const right = this._evaluateInMemoryExpr(expr.right, columnData, rowIdx);
+                const op = expr.op || expr.operator;  // Parser uses 'op', some places use 'operator'
+                switch (op) {
+                    case '=': case '==': return left == right;
+                    case '!=': case '<>': return left != right;
+                    case '<': return left < right;
+                    case '<=': return left <= right;
+                    case '>': return left > right;
+                    case '>=': return left >= right;
+                    case '+': return Number(left) + Number(right);
+                    case '-': return Number(left) - Number(right);
+                    case '*': return Number(left) * Number(right);
+                    case '/': return right !== 0 ? Number(left) / Number(right) : null;
+                    case 'AND': return left && right;
+                    case 'OR': return left || right;
+                    default: return null;
+                }
+            }
+
+            case 'unary': {
+                const operand = this._evaluateInMemoryExpr(expr.operand, columnData, rowIdx);
+                const op = expr.op || expr.operator;
+                switch (op) {
+                    case 'NOT': return !operand;
+                    case '-': return -operand;
+                    case 'IS NULL': return operand == null;
+                    case 'IS NOT NULL': return operand != null;
+                    default: return null;
+                }
+            }
+
+            case 'call': {
+                // Aggregate functions would need special handling
+                const funcName = expr.name.toUpperCase();
+                const args = expr.args?.map(a => this._evaluateInMemoryExpr(a, columnData, rowIdx)) || [];
+                switch (funcName) {
+                    case 'UPPER': return String(args[0]).toUpperCase();
+                    case 'LOWER': return String(args[0]).toLowerCase();
+                    case 'LENGTH': return String(args[0]).length;
+                    case 'SUBSTR': case 'SUBSTRING': return String(args[0]).substring(args[1] - 1, args[2] ? args[1] - 1 + args[2] : undefined);
+                    case 'COALESCE': return args.find(a => a != null) ?? null;
+                    case 'ABS': return Math.abs(args[0]);
+                    case 'ROUND': return Math.round(args[0] * Math.pow(10, args[1] || 0)) / Math.pow(10, args[1] || 0);
+                    case 'GROUPING': {
+                        // GROUPING(col) returns 1 if col is a super-aggregate (null due to ROLLUP/CUBE), 0 otherwise
+                        // The column name is in the first argument
+                        const colArg = expr.args?.[0];
+                        const colName = colArg?.column || colArg?.name;
+                        if (!colName) return 0;
+                        // Check if this column is in the current grouping set
+                        // columnData._groupingSet contains the columns that are grouped (not super-aggregate)
+                        const groupingSet = columnData._groupingSet || [];
+                        return groupingSet.includes(colName.toLowerCase()) ? 0 : 1;
+                    }
+                    default: return null;
+                }
+            }
+
+            case 'in': {
+                const val = this._evaluateInMemoryExpr(expr.expr, columnData, rowIdx);
+                const values = expr.values.map(v => v.value ?? this._evaluateInMemoryExpr(v, columnData, rowIdx));
+                return values.includes(val);
+            }
+
+            case 'between': {
+                const val = this._evaluateInMemoryExpr(expr.expr, columnData, rowIdx);
+                const low = this._evaluateInMemoryExpr(expr.low, columnData, rowIdx);
+                const high = this._evaluateInMemoryExpr(expr.high, columnData, rowIdx);
+                return val >= low && val <= high;
+            }
+
+            case 'like': {
+                const val = String(this._evaluateInMemoryExpr(expr.expr, columnData, rowIdx));
+                const pattern = this._evaluateInMemoryExpr(expr.pattern, columnData, rowIdx);
+                const regex = new RegExp('^' + String(pattern).replace(/%/g, '.*').replace(/_/g, '.') + '$', 'i');
+                return regex.test(val);
+            }
+
+            default:
+                return null;
+        }
+    }
+
+    /**
+     * Check if query has window functions
+     */
+    hasWindowFunctions(ast) {
+        return ast.columns?.some(col => col.expr?.type === 'call' && col.expr.over);
+    }
+
+    /**
+     * Execute window functions on in-memory data
+     * Window functions are computed after WHERE but before ORDER BY/LIMIT
+     */
+    computeWindowFunctions(ast, rows, columnData) {
+        const windowColumns = [];
+
+        for (const col of ast.columns) {
+            if (col.expr?.type === 'call' && col.expr.over) {
+                const values = this._computeWindowFunction(
+                    col.expr.name,
+                    col.expr.args,
+                    col.expr.over,
+                    rows,
+                    columnData
+                );
+                windowColumns.push({
+                    alias: col.alias || col.expr.name,
+                    values
+                });
+            }
+        }
+
+        return windowColumns;
+    }
+
+    /**
+     * Compute a single window function
+     */
+    _computeWindowFunction(funcName, args, over, rows, columnData) {
+        const results = new Array(rows.length).fill(null);
+
+        // Partition rows
+        const partitions = this._partitionRows(rows, over.partitionBy, columnData);
+
+        for (const partition of partitions) {
+            // Sort partition by ORDER BY if specified
+            if (over.orderBy && over.orderBy.length > 0) {
+                partition.sort((a, b) => this._compareRowsByOrder(a, b, over.orderBy, columnData));
+            }
+
+            // Compute function for each row in partition
+            for (let i = 0; i < partition.length; i++) {
+                const rowIdx = partition[i].idx;
+
+                switch (funcName) {
+                    case 'ROW_NUMBER':
+                        results[rowIdx] = i + 1;
+                        break;
+
+                    case 'RANK': {
+                        // RANK: same rank for ties, gaps after ties
+                        let rank = 1;
+                        for (let j = 0; j < i; j++) {
+                            if (this._compareRowsByOrder(partition[j], partition[i], over.orderBy, columnData) !== 0) {
+                                rank = j + 1;
+                            }
+                        }
+                        if (i > 0 && this._compareRowsByOrder(partition[i-1], partition[i], over.orderBy, columnData) === 0) {
+                            results[rowIdx] = results[partition[i-1].idx];
+                        } else {
+                            results[rowIdx] = i + 1;
+                        }
+                        break;
+                    }
+
+                    case 'DENSE_RANK': {
+                        // DENSE_RANK: same rank for ties, no gaps
+                        if (i === 0) {
+                            results[rowIdx] = 1;
+                        } else if (this._compareRowsByOrder(partition[i-1], partition[i], over.orderBy, columnData) === 0) {
+                            results[rowIdx] = results[partition[i-1].idx];
+                        } else {
+                            results[rowIdx] = results[partition[i-1].idx] + 1;
+                        }
+                        break;
+                    }
+
+                    case 'NTILE': {
+                        const n = args[0]?.value || 1;
+                        const bucketSize = Math.ceil(partition.length / n);
+                        results[rowIdx] = Math.floor(i / bucketSize) + 1;
+                        break;
+                    }
+
+                    case 'LAG': {
+                        const lagCol = args[0];
+                        const lagN = args[1]?.value || 1;
+                        const defaultVal = args[2]?.value ?? null;
+                        if (i >= lagN) {
+                            const prevRowIdx = partition[i - lagN].idx;
+                            results[rowIdx] = this._evaluateInMemoryExpr(lagCol, columnData, prevRowIdx);
+                        } else {
+                            results[rowIdx] = defaultVal;
+                        }
+                        break;
+                    }
+
+                    case 'LEAD': {
+                        const leadCol = args[0];
+                        const leadN = args[1]?.value || 1;
+                        const defaultVal = args[2]?.value ?? null;
+                        if (i + leadN < partition.length) {
+                            const nextRowIdx = partition[i + leadN].idx;
+                            results[rowIdx] = this._evaluateInMemoryExpr(leadCol, columnData, nextRowIdx);
+                        } else {
+                            results[rowIdx] = defaultVal;
+                        }
+                        break;
+                    }
+
+                    case 'FIRST_VALUE': {
+                        const firstRowIdx = partition[0].idx;
+                        results[rowIdx] = this._evaluateInMemoryExpr(args[0], columnData, firstRowIdx);
+                        break;
+                    }
+
+                    case 'LAST_VALUE': {
+                        // Note: With default frame (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
+                        // LAST_VALUE returns current row. We'll use full partition for simplicity.
+                        const lastRowIdx = partition[partition.length - 1].idx;
+                        results[rowIdx] = this._evaluateInMemoryExpr(args[0], columnData, lastRowIdx);
+                        break;
+                    }
+
+                    case 'NTH_VALUE': {
+                        const n = args[1]?.value || 1;
+                        if (n > 0 && n <= partition.length) {
+                            const nthRowIdx = partition[n - 1].idx;
+                            results[rowIdx] = this._evaluateInMemoryExpr(args[0], columnData, nthRowIdx);
+                        } else {
+                            results[rowIdx] = null;
+                        }
+                        break;
+                    }
+
+                    // Aggregate window functions
+                    case 'SUM': {
+                        let sum = 0;
+                        for (let j = 0; j <= i; j++) {
+                            const val = this._evaluateInMemoryExpr(args[0], columnData, partition[j].idx);
+                            if (val != null) sum += Number(val);
+                        }
+                        results[rowIdx] = sum;
+                        break;
+                    }
+
+                    case 'AVG': {
+                        let sum = 0, count = 0;
+                        for (let j = 0; j <= i; j++) {
+                            const val = this._evaluateInMemoryExpr(args[0], columnData, partition[j].idx);
+                            if (val != null) { sum += Number(val); count++; }
+                        }
+                        results[rowIdx] = count > 0 ? sum / count : null;
+                        break;
+                    }
+
+                    case 'COUNT': {
+                        let count = 0;
+                        for (let j = 0; j <= i; j++) {
+                            const val = args[0]?.type === 'star' ? 1 : this._evaluateInMemoryExpr(args[0], columnData, partition[j].idx);
+                            if (val != null) count++;
+                        }
+                        results[rowIdx] = count;
+                        break;
+                    }
+
+                    case 'MIN': {
+                        let min = null;
+                        for (let j = 0; j <= i; j++) {
+                            const val = this._evaluateInMemoryExpr(args[0], columnData, partition[j].idx);
+                            if (val != null && (min === null || val < min)) min = val;
+                        }
+                        results[rowIdx] = min;
+                        break;
+                    }
+
+                    case 'MAX': {
+                        let max = null;
+                        for (let j = 0; j <= i; j++) {
+                            const val = this._evaluateInMemoryExpr(args[0], columnData, partition[j].idx);
+                            if (val != null && (max === null || val > max)) max = val;
+                        }
+                        results[rowIdx] = max;
+                        break;
+                    }
+
+                    default:
+                        results[rowIdx] = null;
+                }
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * Partition rows based on PARTITION BY expressions
+     */
+    _partitionRows(rows, partitionBy, columnData) {
+        if (!partitionBy || partitionBy.length === 0) {
+            // No partitioning - all rows in one partition
+            return [rows.map((r, i) => ({ idx: i, row: r }))];
+        }
+
+        const groups = new Map();
+        for (let i = 0; i < rows.length; i++) {
+            const key = partitionBy
+                .map(expr => JSON.stringify(this._evaluateInMemoryExpr(expr, columnData, i)))
+                .join('|');
+            if (!groups.has(key)) {
+                groups.set(key, []);
+            }
+            groups.get(key).push({ idx: i, row: rows[i] });
+        }
+
+        return Array.from(groups.values());
+    }
+
+    /**
+     * Compare two rows based on ORDER BY specification
+     */
+    _compareRowsByOrder(a, b, orderBy, columnData) {
+        for (const ob of orderBy) {
+            const valA = this._evaluateInMemoryExpr({ type: 'column', column: ob.column }, columnData, a.idx);
+            const valB = this._evaluateInMemoryExpr({ type: 'column', column: ob.column }, columnData, b.idx);
+
+            const dir = ob.direction === 'DESC' ? -1 : 1;
+            if (valA == null && valB == null) continue;
+            if (valA == null) return 1 * dir;
+            if (valB == null) return -1 * dir;
+            if (valA < valB) return -1 * dir;
+            if (valA > valB) return 1 * dir;
+        }
+        return 0;
     }
 
     applyOrderBy(rows, orderBy, outputColumns) {
@@ -11833,6 +13223,37 @@ export class SQLExecutor {
             }
         }
 
+        // Apply HAVING filter if present
+        if (ast.having) {
+            // Build column data for HAVING evaluation
+            const havingColumnData = {};
+            for (let i = 0; i < colNames.length; i++) {
+                // Support both column name and alias lookup
+                const colName = colNames[i].toLowerCase();
+                havingColumnData[colName] = [resultRow[i]];
+                // Also support aggregate function names like COUNT(*)
+                const cleanName = colName.replace(/[()]/g, '').replace('*', 'star');
+                havingColumnData[cleanName] = [resultRow[i]];
+            }
+
+            // Evaluate HAVING condition
+            if (!this._evaluateInMemoryExpr(ast.having, havingColumnData, 0)) {
+                // HAVING condition not met - return empty result
+                return {
+                    columns: colNames,
+                    rows: [],
+                    total: 0,
+                    aggregationStats: {
+                        scannedRows,
+                        totalRows,
+                        coveragePercent: totalRows > 0 ? ((scannedRows / totalRows) * 100).toFixed(2) : 100,
+                        isPartialScan: scannedRows < totalRows,
+                        havingFiltered: true,
+                    },
+                };
+            }
+        }
+
         // Calculate coverage stats
         const coveragePercent = totalRows > 0 ? ((scannedRows / totalRows) * 100).toFixed(2) : 100;
         const isPartialScan = scannedRows < totalRows;
@@ -11848,6 +13269,97 @@ export class SQLExecutor {
                 isPartialScan,
             },
         };
+    }
+
+    /**
+     * Expand GROUP BY clause into list of grouping sets.
+     * Handles ROLLUP, CUBE, and GROUPING SETS operators.
+     * @param {Array} groupBy - Array of GROUP BY items
+     * @returns {Array<Array<string>>} - List of grouping sets (each is array of column names)
+     */
+    _expandGroupBy(groupBy) {
+        if (!groupBy || groupBy.length === 0) return [[]];
+
+        // Check if it's old-style simple column list (backward compat)
+        // Old style: ['col1', 'col2']
+        if (typeof groupBy[0] === 'string') {
+            return [groupBy];
+        }
+
+        let result = [[]];
+
+        for (const item of groupBy) {
+            if (item.type === 'COLUMN') {
+                // Simple column: cross-product with single column added
+                result = result.map(set => [...set, item.column]);
+            } else if (item.type === 'ROLLUP') {
+                // ROLLUP(a, b, c) generates: (a,b,c), (a,b), (a), ()
+                const rollupSets = [];
+                for (let i = item.columns.length; i >= 0; i--) {
+                    rollupSets.push(item.columns.slice(0, i));
+                }
+                result = this._crossProductSets(result, rollupSets);
+            } else if (item.type === 'CUBE') {
+                // CUBE(a, b) generates all 2^n subsets: (a,b), (a), (b), ()
+                const cubeSets = this._powerSet(item.columns);
+                result = this._crossProductSets(result, cubeSets);
+            } else if (item.type === 'GROUPING_SETS') {
+                // GROUPING SETS uses explicit sets
+                result = this._crossProductSets(result, item.sets);
+            }
+        }
+
+        // Deduplicate grouping sets
+        const seen = new Set();
+        return result.filter(set => {
+            const key = JSON.stringify(set.sort());
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+    }
+
+    /**
+     * Generate power set (all subsets) of an array
+     * @param {Array} arr - Input array
+     * @returns {Array<Array>} - All subsets
+     */
+    _powerSet(arr) {
+        const result = [[]];
+        for (const item of arr) {
+            const len = result.length;
+            for (let i = 0; i < len; i++) {
+                result.push([...result[i], item]);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Cross-product two lists of sets
+     * @param {Array<Array>} sets1 - First list of sets
+     * @param {Array<Array>} sets2 - Second list of sets
+     * @returns {Array<Array>} - Combined sets
+     */
+    _crossProductSets(sets1, sets2) {
+        const result = [];
+        for (const s1 of sets1) {
+            for (const s2 of sets2) {
+                result.push([...s1, ...s2]);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Check if GROUP BY uses advanced operators (ROLLUP, CUBE, GROUPING SETS)
+     */
+    _hasAdvancedGroupBy(groupBy) {
+        if (!groupBy || groupBy.length === 0) return false;
+        if (typeof groupBy[0] === 'string') return false;
+        return groupBy.some(item =>
+            item.type === 'ROLLUP' || item.type === 'CUBE' || item.type === 'GROUPING_SETS'
+        );
     }
 
     /**
@@ -13856,11 +15368,21 @@ export class QueryPlanner {
                 walk(e.left);
                 walk(e.right);
             } else if (e.type === 'unary') {
-                walk(e.expr);
+                walk(e.operand);  // Note: parser uses 'operand', not 'expr'
             } else if (e.type === 'call') {
                 for (const arg of e.args || []) {
                     walk(arg);
                 }
+            } else if (e.type === 'in') {
+                walk(e.expr);
+                for (const v of e.values || []) walk(v);
+            } else if (e.type === 'between') {
+                walk(e.expr);
+                walk(e.low);
+                walk(e.high);
+            } else if (e.type === 'like') {
+                walk(e.expr);
+                walk(e.pattern);
             }
         };
 
@@ -14341,6 +15863,36 @@ export class QueryPlanner {
 // ============================================================================
 
 /**
+ * MemoryTable - In-memory table for temporary data storage.
+ * Ephemeral by design - lost on page refresh.
+ * Used for intermediate results, temp tables, and JOIN lookups.
+ */
+class MemoryTable {
+    constructor(name, schema) {
+        this.name = name;
+        this.schema = schema;  // [{ name, dataType, primaryKey }]
+        this.columns = schema.map(c => c.name);
+        this.rows = [];
+        this._columnIndex = new Map();
+        this.columns.forEach((col, i) => this._columnIndex.set(col.toLowerCase(), i));
+    }
+
+    /**
+     * Convert to format compatible with _executeOnInMemoryData
+     */
+    toInMemoryData() {
+        return { columns: this.columns, rows: this.rows };
+    }
+
+    /**
+     * Get row count
+     */
+    get rowCount() {
+        return this.rows.length;
+    }
+}
+
+/**
  * LanceDatabase manages multiple Lance datasets and executes multi-table queries.
  * Supports SQL JOINs across remote datasets with smart byte-range fetching.
  *
@@ -14366,6 +15918,11 @@ export class LanceDatabase {
     constructor() {
         this.tables = new Map(); // name -> RemoteLanceDataset
         this.aliases = new Map(); // alias -> table name
+        // Query plan cache
+        this._planCache = new Map(); // normalized SQL -> { plan, hits, lastUsed }
+        this._planCacheMaxSize = 100;
+        // In-memory tables (ephemeral)
+        this.memoryTables = new Map(); // name -> MemoryTable
     }
 
     /**
@@ -14409,17 +15966,61 @@ export class LanceDatabase {
     }
 
     /**
-     * Execute SQL query (supports SELECT with JOINs)
+     * Execute SQL query (supports SELECT with JOINs, CTEs, SET operations, and EXPLAIN)
      */
     async executeSQL(sql) {
-        // Parse SQL
-        const lexer = new SQLLexer(sql);
-        const tokens = lexer.tokenize();
-        const parser = new SQLParser(tokens);
-        const ast = parser.parse();
+        // Check plan cache first
+        const cachedPlan = this._getCachedPlan(sql);
+        let ast;
+
+        if (cachedPlan) {
+            ast = cachedPlan;
+        } else {
+            // Parse SQL
+            const lexer = new SQLLexer(sql);
+            const tokens = lexer.tokenize();
+            const parser = new SQLParser(tokens);
+            ast = parser.parse();
+
+            // Cache the plan (unless it's EXPLAIN which is meta)
+            if (ast.type !== 'EXPLAIN') {
+                this._setCachedPlan(sql, ast);
+            }
+        }
+
+        // Handle EXPLAIN - return plan without executing
+        if (ast.type === 'EXPLAIN') {
+            return this._explainQuery(ast.statement);
+        }
+
+        // Handle memory table operations (CREATE, DROP, INSERT, UPDATE, DELETE)
+        if (ast.type === 'CREATE_TABLE') {
+            return this._executeCreateTable(ast);
+        }
+        if (ast.type === 'DROP_TABLE') {
+            return this._executeDropTable(ast);
+        }
+        if (ast.type === 'INSERT') {
+            return this._executeInsert(ast);
+        }
+        if (ast.type === 'UPDATE') {
+            return this._executeUpdate(ast);
+        }
+        if (ast.type === 'DELETE') {
+            return this._executeDelete(ast);
+        }
+
+        if (ast.type === 'SET_OPERATION') {
+            return this._executeSetOperation(ast);
+        }
 
         if (ast.type !== 'SELECT') {
             throw new Error('Only SELECT queries are supported in LanceDatabase');
+        }
+
+        // Handle CTEs - materialize them first
+        if (ast.ctes && ast.ctes.length > 0) {
+            return this._executeWithCTEs(ast);
         }
 
         // No joins - simple single-table query
@@ -14429,6 +16030,198 @@ export class LanceDatabase {
 
         // Multi-table query with JOINs
         return this._executeJoin(ast);
+    }
+
+    /**
+     * Execute query with CTEs
+     */
+    async _executeWithCTEs(ast) {
+        // Create a temporary executor for CTE materialization
+        const cteExecutor = new SQLExecutor({ columnNames: [] });
+        cteExecutor.setDatabase(this);
+        await cteExecutor.materializeCTEs(ast.ctes, this);
+
+        // Check if main query references a CTE
+        const mainTableName = ast.from?.name?.toLowerCase() || ast.from?.table?.toLowerCase();
+        if (mainTableName && cteExecutor._cteResults.has(mainTableName)) {
+            // Execute main query against CTE result
+            return cteExecutor._executeOnInMemoryData(ast, cteExecutor._cteResults.get(mainTableName));
+        }
+
+        // Otherwise execute against actual tables
+        if (!ast.joins || ast.joins.length === 0) {
+            return this._executeSingleTable(ast);
+        }
+        return this._executeJoin(ast);
+    }
+
+    /**
+     * Execute SET operation (UNION, INTERSECT, EXCEPT)
+     */
+    async _executeSetOperation(ast) {
+        // Execute left and right sides
+        const leftResult = await this.executeSQL(this._astToSQL(ast.left));
+        const rightResult = await this.executeSQL(this._astToSQL(ast.right));
+
+        if (leftResult.columns.length !== rightResult.columns.length) {
+            throw new Error('SET operations require same number of columns');
+        }
+
+        const rowKey = row => JSON.stringify(row);
+        let combinedRows;
+
+        switch (ast.operator) {
+            case 'UNION':
+                combinedRows = [...leftResult.rows, ...rightResult.rows];
+                if (!ast.all) {
+                    const seen = new Set();
+                    combinedRows = combinedRows.filter(row => {
+                        const key = rowKey(row);
+                        if (seen.has(key)) return false;
+                        seen.add(key);
+                        return true;
+                    });
+                }
+                break;
+
+            case 'INTERSECT':
+                const rightKeys = new Set(rightResult.rows.map(rowKey));
+                combinedRows = leftResult.rows.filter(row => rightKeys.has(rowKey(row)));
+                if (!ast.all) {
+                    const seenI = new Set();
+                    combinedRows = combinedRows.filter(row => {
+                        const key = rowKey(row);
+                        if (seenI.has(key)) return false;
+                        seenI.add(key);
+                        return true;
+                    });
+                }
+                break;
+
+            case 'EXCEPT':
+                const excludeKeys = new Set(rightResult.rows.map(rowKey));
+                combinedRows = leftResult.rows.filter(row => !excludeKeys.has(rowKey(row)));
+                if (!ast.all) {
+                    const seenE = new Set();
+                    combinedRows = combinedRows.filter(row => {
+                        const key = rowKey(row);
+                        if (seenE.has(key)) return false;
+                        seenE.add(key);
+                        return true;
+                    });
+                }
+                break;
+
+            default:
+                throw new Error(`Unknown SET operator: ${ast.operator}`);
+        }
+
+        // Apply ORDER BY to combined result
+        if (ast.orderBy && ast.orderBy.length > 0) {
+            const colIdxMap = {};
+            leftResult.columns.forEach((name, idx) => { colIdxMap[name.toLowerCase()] = idx; });
+
+            combinedRows.sort((a, b) => {
+                for (const ob of ast.orderBy) {
+                    const colIdx = colIdxMap[ob.column.toLowerCase()];
+                    if (colIdx === undefined) continue;
+                    const valA = a[colIdx], valB = b[colIdx];
+                    const dir = ob.direction === 'DESC' ? -1 : 1;
+                    if (valA == null && valB == null) continue;
+                    if (valA == null) return 1 * dir;
+                    if (valB == null) return -1 * dir;
+                    if (valA < valB) return -1 * dir;
+                    if (valA > valB) return 1 * dir;
+                }
+                return 0;
+            });
+        }
+
+        // Apply LIMIT/OFFSET to combined result
+        const offset = ast.offset || 0;
+        if (offset > 0) combinedRows = combinedRows.slice(offset);
+        if (ast.limit) combinedRows = combinedRows.slice(0, ast.limit);
+
+        return { columns: leftResult.columns, rows: combinedRows, total: combinedRows.length };
+    }
+
+    /**
+     * Convert AST back to SQL (for recursive SET operation execution)
+     */
+    _astToSQL(ast) {
+        if (ast.type === 'SET_OPERATION') {
+            const left = this._astToSQL(ast.left);
+            const right = this._astToSQL(ast.right);
+            const op = ast.operator + (ast.all ? ' ALL' : '');
+            return `(${left}) ${op} (${right})`;
+        }
+
+        // Build SELECT statement
+        let sql = ast.distinct ? 'SELECT DISTINCT ' : 'SELECT ';
+        sql += ast.columns.map(col => {
+            if (col.expr?.type === 'star') return '*';
+            const expr = this._exprToSQL(col.expr);
+            return col.alias ? `${expr} AS ${col.alias}` : expr;
+        }).join(', ');
+
+        if (ast.from) {
+            const tableName = ast.from.name || ast.from.table;
+            sql += ` FROM ${tableName}`;
+            if (ast.from.alias) sql += ` AS ${ast.from.alias}`;
+        }
+
+        if (ast.joins) {
+            for (const join of ast.joins) {
+                const rightTable = join.table?.name || join.table?.table;
+                sql += ` ${join.type} ${rightTable}`;
+                if (join.alias) sql += ` AS ${join.alias}`;
+                if (join.on) sql += ` ON ${this._exprToSQL(join.on)}`;
+            }
+        }
+
+        if (ast.where) sql += ` WHERE ${this._exprToSQL(ast.where)}`;
+        if (ast.groupBy?.length) sql += ` GROUP BY ${ast.groupBy.join(', ')}`;
+        if (ast.having) sql += ` HAVING ${this._exprToSQL(ast.having)}`;
+        if (ast.orderBy?.length) {
+            sql += ` ORDER BY ${ast.orderBy.map(o => `${o.column} ${o.direction || 'ASC'}`).join(', ')}`;
+        }
+        if (ast.limit) sql += ` LIMIT ${ast.limit}`;
+        if (ast.offset) sql += ` OFFSET ${ast.offset}`;
+
+        return sql;
+    }
+
+    /**
+     * Convert expression AST to SQL string
+     */
+    _exprToSQL(expr) {
+        if (!expr) return '';
+        switch (expr.type) {
+            case 'literal':
+                if (expr.value === null) return 'NULL';
+                if (typeof expr.value === 'string') return `'${expr.value.replace(/'/g, "''")}'`;
+                return String(expr.value);
+            case 'column':
+                return expr.table ? `${expr.table}.${expr.column}` : expr.column;
+            case 'star':
+                return '*';
+            case 'binary':
+                return `(${this._exprToSQL(expr.left)} ${expr.operator} ${this._exprToSQL(expr.right)})`;
+            case 'unary':
+                return `(${expr.operator} ${this._exprToSQL(expr.operand)})`;
+            case 'call':
+                const args = expr.args.map(a => this._exprToSQL(a)).join(', ');
+                return `${expr.name}(${expr.distinct ? 'DISTINCT ' : ''}${args})`;
+            case 'in':
+                const vals = expr.values.map(v => this._exprToSQL(v)).join(', ');
+                return `${this._exprToSQL(expr.expr)} IN (${vals})`;
+            case 'between':
+                return `${this._exprToSQL(expr.expr)} BETWEEN ${this._exprToSQL(expr.low)} AND ${this._exprToSQL(expr.high)}`;
+            case 'like':
+                return `${this._exprToSQL(expr.expr)} LIKE ${this._exprToSQL(expr.pattern)}`;
+            default:
+                return '';
+        }
     }
 
     /**
@@ -14445,6 +16238,16 @@ export class LanceDatabase {
             throw new Error('Single-table queries must use registered table names, not URLs');
         }
 
+        const tableNameLower = tableName.toLowerCase();
+
+        // Check memory table first
+        if (this.memoryTables.has(tableNameLower)) {
+            const memTable = this.memoryTables.get(tableNameLower);
+            const executor = new SQLExecutor({ columnNames: memTable.columns });
+            return executor._executeOnInMemoryData(ast, memTable.toInMemoryData());
+        }
+
+        // Otherwise use remote dataset
         const dataset = this.getTable(tableName);
 
         // Build SQL and execute
@@ -14467,33 +16270,64 @@ export class LanceDatabase {
             this.aliases.set(ast.from.alias, leftTableName);
         }
 
-        // For now, support only single JOIN (can extend later)
-        if (ast.joins.length > 1) {
-            throw new Error('Multiple JOINs not yet supported. Coming soon!');
+        // Process joins iteratively: (A JOIN B) JOIN C
+        // Each join's result becomes the left input for the next
+        console.log(`[LanceDatabase] Processing ${ast.joins.length} JOIN(s)`);
+
+        let currentResult = null;  // In-memory intermediate result
+        let currentAlias = leftAlias;
+        let currentTableName = leftTableName;
+        let leftDataset = this.getTable(leftTableName);
+
+        for (let i = 0; i < ast.joins.length; i++) {
+            const join = ast.joins[i];
+            const rightTableName = join.table.name || join.table.table;
+            const rightAlias = join.alias || rightTableName;
+
+            // Register right table alias
+            if (join.alias) {
+                this.aliases.set(join.alias, rightTableName);
+            }
+
+            console.log(`[LanceDatabase] JOIN ${i + 1}/${ast.joins.length}: ${currentTableName} (${currentAlias}) ${join.type} ${rightTableName} (${rightAlias})`);
+
+            // Get right dataset
+            const rightDataset = this.getTable(rightTableName);
+
+            // Build AST for this single join
+            const singleJoinAst = {
+                ...ast,
+                joins: [join],  // Only this join
+                // For intermediate joins, don't apply final limit/projection
+                limit: (i === ast.joins.length - 1) ? ast.limit : undefined,
+                columns: (i === ast.joins.length - 1) ? ast.columns : [{ type: 'column', column: '*' }]
+            };
+
+            // Execute hash join
+            if (currentResult === null) {
+                // First join: left is a dataset
+                currentResult = await this._hashJoin(
+                    leftDataset,
+                    rightDataset,
+                    singleJoinAst,
+                    { leftAlias: currentAlias, rightAlias, leftTableName: currentTableName, rightTableName }
+                );
+            } else {
+                // Subsequent joins: left is in-memory result
+                currentResult = await this._hashJoinWithInMemoryLeft(
+                    currentResult,
+                    rightDataset,
+                    singleJoinAst,
+                    { leftAlias: currentAlias, rightAlias, leftTableName: currentTableName, rightTableName }
+                );
+            }
+
+            // Update current state for next iteration
+            currentAlias = `${currentAlias}_${rightAlias}`;  // Compound alias for tracing
+            currentTableName = `(${currentTableName} JOIN ${rightTableName})`;
         }
 
-        const join = ast.joins[0];
-        const rightTableName = join.table.name || join.table.table;
-        const rightAlias = join.alias || rightTableName;
-
-        // Register right table alias
-        if (join.alias) {
-            this.aliases.set(join.alias, rightTableName);
-        }
-
-        console.log(`[LanceDatabase] JOIN: ${leftTableName} (${leftAlias}) ${join.type} ${rightTableName} (${rightAlias})`);
-
-        // Get datasets
-        const leftDataset = this.getTable(leftTableName);
-        const rightDataset = this.getTable(rightTableName);
-
-        // Execute hash join
-        return this._hashJoin(
-            leftDataset,
-            rightDataset,
-            ast,
-            { leftAlias, rightAlias, leftTableName, rightTableName }
-        );
+        return currentResult;
     }
 
     /**
@@ -14503,49 +16337,63 @@ export class LanceDatabase {
     async _hashJoin(leftDataset, rightDataset, ast, context) {
         const { leftAlias, rightAlias, leftTableName, rightTableName } = context;
         const join = ast.joins[0];
+        const joinType = join.type || 'INNER';
 
-        // Parse JOIN ON condition (e.g., i.id = c.image_id)
+        // For CROSS JOIN, no ON condition is required
         const joinCondition = join.on;
-        if (!joinCondition || joinCondition.type !== 'binary' || joinCondition.op !== '=') {
-            throw new Error('JOIN ON condition must be an equality (e.g., table1.col1 = table2.col2)');
+        if (joinType !== 'CROSS') {
+            if (!joinCondition || joinCondition.type !== 'binary' || joinCondition.op !== '=') {
+                throw new Error('JOIN ON condition must be an equality (e.g., table1.col1 = table2.col2)');
+            }
         }
 
-        // Use QueryPlanner to generate optimized execution plan
-        const planner = new QueryPlanner();
-        const plan = planner.plan(ast, context);
+        // For CROSS JOIN, use simplified execution (no keys needed)
+        let leftKey, rightKey, leftSQL, rightSQL;
 
-        // Extract columns and keys from the plan
-        const leftKey = plan.join.leftKey;
-        const rightKey = plan.join.rightKey;
-        const leftColumns = plan.leftScan.columns;
-        const rightColumns = plan.rightScan.columns;
-        const leftFilters = plan.leftScan.filters;
-        const rightFilters = plan.rightScan.filters;
+        if (joinType === 'CROSS') {
+            // CROSS JOIN: select all columns, no join keys
+            leftKey = null;
+            rightKey = null;
+            leftSQL = `SELECT * FROM ${leftTableName}`;
+            rightSQL = `SELECT * FROM ${rightTableName}`;
+            console.log('[LanceDatabase] CROSS JOIN - no keys, cartesian product');
+        } else {
+            // Use QueryPlanner to generate optimized execution plan
+            const planner = new QueryPlanner();
+            const plan = planner.plan(ast, context);
 
-        // Build SQL queries for streaming
-        const leftColsWithKey = leftColumns.includes('*')
-            ? ['*']
-            : [...new Set([leftKey, ...leftColumns])];
+            // Extract columns and keys from the plan
+            leftKey = plan.join.leftKey;
+            rightKey = plan.join.rightKey;
+            const leftColumns = plan.leftScan.columns;
+            const rightColumns = plan.rightScan.columns;
+            const leftFilters = plan.leftScan.filters;
+            const rightFilters = plan.rightScan.filters;
 
-        let leftWhereClause = '';
-        if (leftFilters.length > 0) {
-            leftWhereClause = ` WHERE ${leftFilters.map(f => this._filterToSQL(f)).join(' AND ')}`;
+            // Build SQL queries for streaming
+            const leftColsWithKey = leftColumns.includes('*')
+                ? ['*']
+                : [...new Set([leftKey, ...leftColumns])];
+
+            let leftWhereClause = '';
+            if (leftFilters.length > 0) {
+                leftWhereClause = ` WHERE ${leftFilters.map(f => this._filterToSQL(f)).join(' AND ')}`;
+            }
+            leftSQL = `SELECT ${leftColsWithKey.join(', ')} FROM ${leftTableName}${leftWhereClause}`;
+
+            const rightColsWithKey = rightColumns.includes('*')
+                ? ['*']
+                : [...new Set([rightKey, ...rightColumns])];
+
+            let rightWhereClause = '';
+            if (rightFilters.length > 0) {
+                rightWhereClause = ` WHERE ${rightFilters.map(f => this._filterToSQL(f)).join(' AND ')}`;
+            }
+            rightSQL = `SELECT ${rightColsWithKey.join(', ')} FROM ${rightTableName}${rightWhereClause}`;
         }
-        const leftSQL = `SELECT ${leftColsWithKey.join(', ')} FROM ${leftTableName}${leftWhereClause}`;
-
-        const rightColsWithKey = rightColumns.includes('*')
-            ? ['*']
-            : [...new Set([rightKey, ...rightColumns])];
-
-        let rightWhereClause = '';
-        if (rightFilters.length > 0) {
-            rightWhereClause = ` WHERE ${rightFilters.map(f => this._filterToSQL(f)).join(' AND ')}`;
-        }
-        const rightSQL = `SELECT ${rightColsWithKey.join(', ')} FROM ${rightTableName}${rightWhereClause}`;
 
         console.log('[LanceDatabase] OPFS-backed hash join starting...');
         console.log('[LanceDatabase] Left query:', leftSQL);
-        console.log('[LanceDatabase] Right query:', rightSQL);
 
         // Initialize OPFS storage
         await opfsStorage.open();
@@ -14557,21 +16405,42 @@ export class LanceDatabase {
         const leftExecutor = new SQLExecutor(leftDataset);
         const rightExecutor = new SQLExecutor(rightDataset);
 
-        // Create async generators for streaming
+        // Semi-join optimization: partition left first and collect keys
         const leftStream = leftExecutor.executeStream(leftSQL);
-        const rightStream = rightExecutor.executeStream(rightSQL);
+        const leftMeta = await joinExecutor._partitionToOPFS(leftStream, leftKey, 'left', true);
+        console.log(`[LanceDatabase] Left partitioned: ${leftMeta.totalRows} rows, ${leftMeta.collectedKeys?.size || 0} unique keys`);
 
-        // Execute OPFS-backed join
+        // Build optimized right SQL with IN clause if we have reasonable key count
+        let optimizedRightSQL = rightSQL;
+        const maxKeysForInClause = 1000;  // Don't create huge IN clauses
+        if (leftMeta.collectedKeys && leftMeta.collectedKeys.size > 0 &&
+            leftMeta.collectedKeys.size <= maxKeysForInClause) {
+            const inClause = this._buildInClause(rightKey, leftMeta.collectedKeys);
+            optimizedRightSQL = this._appendWhereClause(rightSQL, inClause);
+            console.log(`[LanceDatabase] Semi-join optimization: added IN clause with ${leftMeta.collectedKeys.size} keys`);
+        }
+        console.log('[LanceDatabase] Right query:', optimizedRightSQL);
+
+        // Create right stream with optimized SQL
+        const rightStream = rightExecutor.executeStream(optimizedRightSQL);
+
+        // Execute OPFS-backed join with pre-partitioned left
         const results = [];
         let resultColumns = null;
 
         try {
             for await (const chunk of joinExecutor.executeHashJoin(
-                leftStream,
+                null,  // leftStream already partitioned
                 rightStream,
                 leftKey,
                 rightKey,
-                { limit: ast.limit || Infinity }
+                {
+                    limit: ast.limit || Infinity,
+                    leftAlias,
+                    rightAlias,
+                    joinType: join.type || 'INNER',
+                    prePartitionedLeft: leftMeta
+                }
             )) {
                 if (!resultColumns) {
                     resultColumns = chunk.columns;
@@ -14620,7 +16489,183 @@ export class LanceDatabase {
     }
 
     /**
+     * Execute hash join with in-memory left side (for multiple JOINs).
+     * The left side comes from a previous join's result.
+     */
+    async _hashJoinWithInMemoryLeft(leftResult, rightDataset, ast, context) {
+        const { leftAlias, rightAlias, leftTableName, rightTableName } = context;
+        const join = ast.joins[0];
+        const joinType = join.type || 'INNER';
+
+        // For CROSS JOIN, no ON condition required
+        const joinCondition = join.on;
+        if (joinType !== 'CROSS') {
+            if (!joinCondition || joinCondition.type !== 'binary' || joinCondition.op !== '=') {
+                throw new Error('JOIN ON condition must be an equality (e.g., table1.col1 = table2.col2)');
+            }
+        }
+
+        // Extract join keys
+        let leftKey, rightKey;
+        if (joinType === 'CROSS') {
+            leftKey = null;
+            rightKey = null;
+        } else {
+            // Extract keys from ON condition
+            const leftExpr = joinCondition.left;
+            const rightExpr = joinCondition.right;
+
+            // Determine which side refers to left vs right
+            const leftCol = leftExpr.column;
+            const rightCol = rightExpr.column;
+
+            // Find which column is in the left result columns
+            const leftColsSet = new Set(leftResult.columns.map(c => {
+                const parts = c.split('.');
+                return parts[parts.length - 1];  // Get base column name
+            }));
+
+            if (leftColsSet.has(leftCol)) {
+                leftKey = leftCol;
+                rightKey = rightCol;
+            } else {
+                leftKey = rightCol;
+                rightKey = leftCol;
+            }
+        }
+
+        console.log(`[LanceDatabase] Multi-JOIN: left in-memory (${leftResult.rows.length} rows), right: ${rightTableName}`);
+
+        // Build right SQL - select all for now
+        let rightSQL = `SELECT * FROM ${rightTableName}`;
+
+        // Semi-join optimization: use in-memory left keys to filter right
+        const maxKeysForInClause = 1000;
+        if (leftKey && joinType !== 'CROSS') {
+            const leftKeyIndex = this._findColumnIndex(leftResult.columns, leftKey);
+            if (leftKeyIndex !== -1) {
+                const leftKeys = new Set();
+                for (const row of leftResult.rows) {
+                    const key = row[leftKeyIndex];
+                    if (key !== null && key !== undefined) {
+                        leftKeys.add(key);
+                    }
+                }
+                if (leftKeys.size > 0 && leftKeys.size <= maxKeysForInClause) {
+                    const inClause = this._buildInClause(rightKey, leftKeys);
+                    rightSQL = this._appendWhereClause(rightSQL, inClause);
+                    console.log(`[LanceDatabase] Multi-JOIN semi-join: ${leftKeys.size} keys`);
+                }
+            }
+        }
+
+        // Execute right query
+        const rightExecutor = new SQLExecutor(rightDataset);
+        const rightResult = await rightExecutor.execute(new SQLParser(new SQLLexer(rightSQL).tokenize()).parse());
+
+        // Find key indices for in-memory hash join
+        const leftKeyIndex = leftKey ? this._findColumnIndex(leftResult.columns, leftKey) : -1;
+        const rightKeyIndex = rightKey ? this._findColumnIndex(rightResult.columns, rightKey) : -1;
+
+        // Build result columns
+        const resultColumns = [
+            ...leftResult.columns,
+            ...rightResult.columns.map(c => `${rightAlias}.${c}`)
+        ];
+
+        // Execute in-memory hash join
+        const results = [];
+        const rightNulls = new Array(rightResult.columns.length).fill(null);
+        const leftNulls = new Array(leftResult.columns.length).fill(null);
+
+        if (joinType === 'CROSS') {
+            // Cartesian product
+            for (const leftRow of leftResult.rows) {
+                for (const rightRow of rightResult.rows) {
+                    results.push([...leftRow, ...rightRow]);
+                    if (ast.limit && results.length >= ast.limit) break;
+                }
+                if (ast.limit && results.length >= ast.limit) break;
+            }
+        } else {
+            // Build hash table from right side
+            const rightHash = new Map();
+            for (const row of rightResult.rows) {
+                const key = row[rightKeyIndex];
+                if (key !== null && key !== undefined) {
+                    if (!rightHash.has(key)) rightHash.set(key, []);
+                    rightHash.get(key).push(row);
+                }
+            }
+
+            // Track matched right rows for FULL/RIGHT joins
+            const matchedRightRows = (joinType === 'FULL' || joinType === 'RIGHT')
+                ? new Set() : null;
+
+            // Probe with left rows
+            for (const leftRow of leftResult.rows) {
+                const key = leftRow[leftKeyIndex];
+                const rightMatches = rightHash.get(key) || [];
+
+                if (rightMatches.length > 0) {
+                    for (const rightRow of rightMatches) {
+                        results.push([...leftRow, ...rightRow]);
+                        if (matchedRightRows) {
+                            matchedRightRows.add(rightResult.rows.indexOf(rightRow));
+                        }
+                        if (ast.limit && results.length >= ast.limit) break;
+                    }
+                } else if (joinType === 'LEFT' || joinType === 'FULL') {
+                    // Left row with no match
+                    results.push([...leftRow, ...rightNulls]);
+                }
+                if (ast.limit && results.length >= ast.limit) break;
+            }
+
+            // Add unmatched right rows for RIGHT/FULL joins
+            if ((joinType === 'RIGHT' || joinType === 'FULL') && matchedRightRows) {
+                for (let i = 0; i < rightResult.rows.length; i++) {
+                    if (!matchedRightRows.has(i)) {
+                        results.push([...leftNulls, ...rightResult.rows[i]]);
+                        if (ast.limit && results.length >= ast.limit) break;
+                    }
+                }
+            }
+        }
+
+        // Apply projection if this is the final join
+        const limitedResults = ast.limit ? results.slice(0, ast.limit) : results;
+
+        return {
+            columns: resultColumns,
+            rows: limitedResults,
+            total: limitedResults.length
+        };
+    }
+
+    /**
+     * Find column index by name, handling qualified names (table.column)
+     */
+    _findColumnIndex(columns, columnName) {
+        // Try exact match first
+        let idx = columns.indexOf(columnName);
+        if (idx !== -1) return idx;
+
+        // Try with any table prefix (for qualified names like "users.id")
+        for (let i = 0; i < columns.length; i++) {
+            const col = columns[i];
+            const parts = col.split('.');
+            if (parts[parts.length - 1] === columnName) {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    /**
      * Convert filter expression to SQL WHERE clause
+     * Note: Strips table aliases since pushed-down queries are single-table
      */
     _filterToSQL(expr) {
         if (!expr) return '';
@@ -14630,17 +16675,39 @@ export class LanceDatabase {
             const right = this._filterToSQL(expr.right);
             return `${left} ${expr.op} ${right}`;
         } else if (expr.type === 'column') {
-            return expr.table ? `${expr.table}.${expr.column}` : expr.column;
+            // Strip table alias - pushed query is single-table
+            return expr.column;
         } else if (expr.type === 'literal') {
             if (typeof expr.value === 'string') {
-                return `'${expr.value}'`;
+                // Escape single quotes to prevent SQL injection
+                const escaped = expr.value.replace(/'/g, "''");
+                return `'${escaped}'`;
             }
+            if (expr.value === null) return 'NULL';
             return String(expr.value);
         } else if (expr.type === 'call') {
             const args = (expr.args || []).map(a => this._filterToSQL(a)).join(', ');
             return `${expr.name}(${args})`;
+        } else if (expr.type === 'in') {
+            const col = this._filterToSQL(expr.expr);
+            const vals = expr.values.map(v => this._filterToSQL(v)).join(', ');
+            return `${col} IN (${vals})`;
+        } else if (expr.type === 'between') {
+            const col = this._filterToSQL(expr.expr);
+            const low = this._filterToSQL(expr.low);
+            const high = this._filterToSQL(expr.high);
+            return `${col} BETWEEN ${low} AND ${high}`;
+        } else if (expr.type === 'like') {
+            const col = this._filterToSQL(expr.expr);
+            const pattern = this._filterToSQL(expr.pattern);
+            return `${col} LIKE ${pattern}`;
+        } else if (expr.type === 'unary') {
+            const operand = this._filterToSQL(expr.operand);
+            if (expr.op === 'NOT') return `NOT ${operand}`;
+            return `${expr.op}${operand}`;
         }
 
+        console.warn('[LanceDB] Unknown filter expression type:', expr.type);
         return '';
     }
 
@@ -14663,19 +16730,26 @@ export class LanceDatabase {
                 continue;
             }
 
-            const targetCol = col.table
-                ? `${col.column}`  // Use just column name for matching
-                : col.column;
+            let idx = -1;
+            let outputColName = col.column;
 
-            // Find column in result set
-            let idx = allColumns.indexOf(targetCol);
+            if (col.table) {
+                // Try exact match with table prefix first (most specific)
+                const qualifiedName = `${col.table}.${col.column}`;
+                idx = allColumns.indexOf(qualifiedName);
+                outputColName = qualifiedName;
+            }
+
             if (idx === -1) {
-                // Try with table prefix
-                idx = allColumns.indexOf(`${col.table}.${col.column}`);
+                // Fallback: find first column ending with this column name
+                idx = allColumns.findIndex(c => c === col.column || c.endsWith(`.${col.column}`));
+                if (idx !== -1) {
+                    outputColName = allColumns[idx];
+                }
             }
 
             if (idx !== -1) {
-                projectedColumns.push(col.alias || targetCol);
+                projectedColumns.push(col.alias || outputColName);
                 columnIndices.push(idx);
             }
         }
@@ -14724,6 +16798,614 @@ export class LanceDatabase {
         }
 
         return columns.length > 0 ? columns : ['*'];
+    }
+
+    /**
+     * Build an IN clause for semi-join optimization
+     * @param {string} column - Column name for IN clause
+     * @param {Set} keys - Unique key values collected from left table
+     * @returns {string} SQL IN clause fragment
+     */
+    _buildInClause(column, keys) {
+        const values = Array.from(keys).map(k => {
+            if (typeof k === 'string') {
+                return `'${k.replace(/'/g, "''")}'`;  // Escape single quotes
+            }
+            if (k === null) return 'NULL';
+            return String(k);
+        }).join(', ');
+        return `${column} IN (${values})`;
+    }
+
+    /**
+     * Append a WHERE clause or AND condition to existing SQL
+     * @param {string} sql - Existing SQL query
+     * @param {string} clause - Condition to add
+     * @returns {string} SQL with added condition
+     */
+    _appendWhereClause(sql, clause) {
+        const upperSQL = sql.toUpperCase();
+        if (upperSQL.includes('WHERE')) {
+            // Insert after WHERE keyword
+            return sql.replace(/WHERE\s+/i, `WHERE ${clause} AND `);
+        }
+        // Find FROM table (with optional alias) and add WHERE after
+        // Match: FROM tablename or FROM tablename alias
+        return sql.replace(/FROM\s+(\w+)(\s+\w+)?/i, (match) => `${match} WHERE ${clause}`);
+    }
+
+    // ========================================================================
+    // Phase 9: Query Optimization Methods
+    // ========================================================================
+
+    /**
+     * Get cached query plan
+     * @param {string} sql - SQL query string
+     * @returns {Object|null} Cached plan or null
+     */
+    _getCachedPlan(sql) {
+        const normalized = this._normalizeSQL(sql);
+        const cached = this._planCache.get(normalized);
+        if (cached) {
+            cached.hits++;
+            cached.lastUsed = Date.now();
+            return cached.plan;
+        }
+        return null;
+    }
+
+    /**
+     * Cache a query plan
+     * @param {string} sql - SQL query string
+     * @param {Object} plan - Parsed AST plan
+     */
+    _setCachedPlan(sql, plan) {
+        const normalized = this._normalizeSQL(sql);
+
+        // LRU eviction if at capacity
+        if (this._planCache.size >= this._planCacheMaxSize) {
+            let oldest = null;
+            let oldestTime = Infinity;
+            for (const [key, value] of this._planCache) {
+                if (value.lastUsed < oldestTime) {
+                    oldestTime = value.lastUsed;
+                    oldest = key;
+                }
+            }
+            if (oldest) this._planCache.delete(oldest);
+        }
+
+        this._planCache.set(normalized, {
+            plan,
+            hits: 0,
+            lastUsed: Date.now(),
+            created: Date.now()
+        });
+    }
+
+    /**
+     * Normalize SQL for cache key (remove extra whitespace, lowercase)
+     * @param {string} sql - SQL query string
+     * @returns {string} Normalized SQL
+     */
+    _normalizeSQL(sql) {
+        return sql.trim().replace(/\s+/g, ' ').toLowerCase();
+    }
+
+    /**
+     * Clear the query plan cache
+     */
+    clearPlanCache() {
+        this._planCache.clear();
+    }
+
+    /**
+     * Get plan cache statistics
+     * @returns {Object} Cache stats
+     */
+    getPlanCacheStats() {
+        let totalHits = 0;
+        for (const v of this._planCache.values()) {
+            totalHits += v.hits;
+        }
+        return {
+            size: this._planCache.size,
+            maxSize: this._planCacheMaxSize,
+            totalHits
+        };
+    }
+
+    /**
+     * Optimize expression with constant folding and boolean simplification
+     * @param {Object} expr - Expression AST node
+     * @returns {Object} Optimized expression
+     */
+    _optimizeExpr(expr) {
+        if (!expr) return expr;
+
+        // Recursively optimize children
+        if (expr.left) expr.left = this._optimizeExpr(expr.left);
+        if (expr.right) expr.right = this._optimizeExpr(expr.right);
+        if (expr.operand) expr.operand = this._optimizeExpr(expr.operand);
+        if (expr.args) expr.args = expr.args.map(a => this._optimizeExpr(a));
+
+        // Get operator - AST may use 'op' or 'operator'
+        const op = expr.op || expr.operator;
+
+        // Constant folding for binary operations
+        if (expr.type === 'binary' &&
+            this._isConstantExpr(expr.left) &&
+            this._isConstantExpr(expr.right)) {
+            return this._foldBinary(expr);
+        }
+
+        // Boolean simplification
+        if (expr.type === 'binary' && op === 'AND') {
+            if (this._isTrueExpr(expr.right)) return expr.left;
+            if (this._isTrueExpr(expr.left)) return expr.right;
+            if (this._isFalseExpr(expr.left) || this._isFalseExpr(expr.right)) {
+                return { type: 'literal', value: false };
+            }
+        }
+        if (expr.type === 'binary' && op === 'OR') {
+            if (this._isFalseExpr(expr.right)) return expr.left;
+            if (this._isFalseExpr(expr.left)) return expr.right;
+            if (this._isTrueExpr(expr.left) || this._isTrueExpr(expr.right)) {
+                return { type: 'literal', value: true };
+            }
+        }
+
+        return expr;
+    }
+
+    /**
+     * Check if expression is a constant
+     */
+    _isConstantExpr(expr) {
+        return expr && ['literal', 'number', 'string'].includes(expr.type);
+    }
+
+    /**
+     * Check if expression is TRUE
+     */
+    _isTrueExpr(expr) {
+        return expr?.type === 'literal' && expr.value === true;
+    }
+
+    /**
+     * Check if expression is FALSE
+     */
+    _isFalseExpr(expr) {
+        return expr?.type === 'literal' && expr.value === false;
+    }
+
+    /**
+     * Fold binary constant expression
+     * @param {Object} expr - Binary expression with constant operands
+     * @returns {Object} Literal result
+     */
+    _foldBinary(expr) {
+        const left = this._getConstantValueExpr(expr.left);
+        const right = this._getConstantValueExpr(expr.right);
+
+        // Get operator - AST may use 'op' or 'operator'
+        const op = expr.op || expr.operator;
+
+        let result;
+        switch (op) {
+            case '+': result = left + right; break;
+            case '-': result = left - right; break;
+            case '*': result = left * right; break;
+            case '/': result = right !== 0 ? left / right : null; break;
+            case '%': result = left % right; break;
+            case '=': case '==': result = left === right; break;
+            case '!=': case '<>': result = left !== right; break;
+            case '<': result = left < right; break;
+            case '>': result = left > right; break;
+            case '<=': result = left <= right; break;
+            case '>=': result = left >= right; break;
+            default: return expr;  // Can't fold
+        }
+
+        return { type: 'literal', value: result };
+    }
+
+    /**
+     * Get constant value from expression
+     */
+    _getConstantValueExpr(expr) {
+        if (expr.type === 'number') return expr.value;
+        if (expr.type === 'string') return expr.value;
+        if (expr.type === 'literal') return expr.value;
+        return null;
+    }
+
+    /**
+     * Extract range predicates from WHERE clause for statistics-based pruning
+     * @param {Object} where - WHERE clause AST
+     * @returns {Array} Array of predicate objects
+     */
+    _extractRangePredicates(where) {
+        const predicates = [];
+        this._collectRangePredicates(where, predicates);
+        return predicates;
+    }
+
+    /**
+     * Recursively collect range predicates
+     */
+    _collectRangePredicates(expr, predicates) {
+        if (!expr) return;
+
+        // Get operator - AST uses 'op' or 'operator'
+        const op = expr.op || expr.operator;
+
+        // Handle AND - recurse both sides
+        if (expr.type === 'binary' && op === 'AND') {
+            this._collectRangePredicates(expr.left, predicates);
+            this._collectRangePredicates(expr.right, predicates);
+            return;
+        }
+
+        // Range operators (normalize '==' to '=')
+        const normalizedOp = op === '==' ? '=' : op;
+        if (['>', '<', '>=', '<=', '=', '!=', '<>'].includes(normalizedOp)) {
+            // Column on left, constant on right
+            if (this._isColumnRefExpr(expr.left) && this._isConstantExpr(expr.right)) {
+                predicates.push({
+                    column: this._getColumnNameExpr(expr.left),
+                    operator: normalizedOp,
+                    value: this._getConstantValueExpr(expr.right)
+                });
+            }
+            // Constant on left, column on right - flip operator
+            else if (this._isConstantExpr(expr.left) && this._isColumnRefExpr(expr.right)) {
+                predicates.push({
+                    column: this._getColumnNameExpr(expr.right),
+                    operator: this._flipOperatorExpr(normalizedOp),
+                    value: this._getConstantValueExpr(expr.left)
+                });
+            }
+        }
+
+        // BETWEEN clause
+        if (expr.type === 'between' && expr.expr) {
+            const col = this._getColumnNameExpr(expr.expr);
+            if (col && expr.low && expr.high) {
+                predicates.push({
+                    column: col,
+                    operator: '>=',
+                    value: this._getConstantValueExpr(expr.low)
+                });
+                predicates.push({
+                    column: col,
+                    operator: '<=',
+                    value: this._getConstantValueExpr(expr.high)
+                });
+            }
+        }
+    }
+
+    /**
+     * Flip comparison operator (for constant on left side)
+     */
+    _flipOperatorExpr(op) {
+        const flips = { '>': '<', '<': '>', '>=': '<=', '<=': '>=' };
+        return flips[op] || op;
+    }
+
+    /**
+     * Check if expression is a column reference
+     */
+    _isColumnRefExpr(expr) {
+        return expr && (expr.type === 'column' || expr.type === 'identifier');
+    }
+
+    /**
+     * Get column name from expression
+     */
+    _getColumnNameExpr(expr) {
+        if (expr.type === 'column') return expr.name || expr.column;
+        if (expr.type === 'identifier') return expr.name || expr.value;
+        return null;
+    }
+
+    /**
+     * Check if a fragment can be pruned based on statistics and predicates
+     * @param {Object} fragmentStats - Column statistics for the fragment
+     * @param {Array} predicates - Extracted predicates from WHERE clause
+     * @returns {boolean} True if fragment can be safely skipped
+     */
+    _canPruneFragment(fragmentStats, predicates) {
+        for (const pred of predicates) {
+            const stats = fragmentStats[pred.column];
+            if (!stats) continue;  // No stats for this column
+
+            const { min, max, nullCount, rowCount } = stats;
+
+            // All nulls - can't satisfy any comparison
+            if (nullCount === rowCount) return true;
+
+            switch (pred.operator) {
+                case '>':
+                    // If max <= value, no rows can satisfy > value
+                    if (max <= pred.value) return true;
+                    break;
+                case '>=':
+                    if (max < pred.value) return true;
+                    break;
+                case '<':
+                    if (min >= pred.value) return true;
+                    break;
+                case '<=':
+                    if (min > pred.value) return true;
+                    break;
+                case '=':
+                    // If value outside [min, max], no match possible
+                    if (pred.value < min || pred.value > max) return true;
+                    break;
+                case '!=':
+                case '<>':
+                    // Can only prune if all values are the same and equal to pred.value
+                    if (min === max && min === pred.value) return true;
+                    break;
+            }
+        }
+
+        return false;  // Cannot prune
+    }
+
+    /**
+     * Execute EXPLAIN query - return query plan without executing
+     * @param {Object} ast - Parsed AST of the inner query
+     * @returns {Object} Plan information
+     */
+    _explainQuery(ast) {
+        const plan = {
+            type: ast.type,
+            tables: [],
+            predicates: [],
+            optimizations: []
+        };
+
+        // Collect table info
+        if (ast.from) {
+            plan.tables.push({
+                name: ast.from.name || ast.from.table,
+                alias: ast.from.alias
+            });
+        }
+
+        // Collect joined tables
+        if (ast.joins) {
+            for (const join of ast.joins) {
+                plan.tables.push({
+                    name: join.table?.name || join.table?.table,
+                    alias: join.table?.alias,
+                    joinType: join.type
+                });
+            }
+        }
+
+        // Extract predicates from WHERE
+        if (ast.where) {
+            plan.predicates = this._extractRangePredicates(ast.where);
+        }
+
+        // Identify optimizations
+        if (ast.where) {
+            plan.optimizations.push('PREDICATE_PUSHDOWN');
+        }
+        if (ast.groupBy) {
+            plan.optimizations.push('AGGREGATE');
+        }
+        if (ast.orderBy) {
+            plan.optimizations.push('SORT');
+        }
+        if (ast.limit) {
+            plan.optimizations.push('LIMIT_PUSHDOWN');
+        }
+
+        return {
+            columns: ['Plan'],
+            rows: [[JSON.stringify(plan, null, 2)]],
+            total: 1
+        };
+    }
+
+    // ========================================================================
+    // Phase 10: Memory Table CRUD Operations
+    // ========================================================================
+
+    /**
+     * Execute CREATE TABLE - creates an in-memory table
+     * @param {Object} ast - Parsed CREATE TABLE AST
+     * @returns {Object} Result with success flag
+     */
+    _executeCreateTable(ast) {
+        const tableName = (ast.table || ast.name || '').toLowerCase();
+
+        if (!tableName) {
+            throw new Error('CREATE TABLE requires a table name');
+        }
+
+        // Check if table already exists (memory or remote)
+        if (this.memoryTables.has(tableName) || this.tables.has(tableName)) {
+            if (ast.ifNotExists) {
+                return { success: true, existed: true, table: tableName };
+            }
+            throw new Error(`Table '${tableName}' already exists`);
+        }
+
+        // Build schema from AST columns
+        const schema = (ast.columns || []).map(col => ({
+            name: col.name,
+            dataType: col.dataType || col.type || 'TEXT',
+            primaryKey: col.primaryKey || false
+        }));
+
+        if (schema.length === 0) {
+            throw new Error('CREATE TABLE requires at least one column');
+        }
+
+        // Create and store the memory table
+        const table = new MemoryTable(tableName, schema);
+        this.memoryTables.set(tableName, table);
+
+        return {
+            success: true,
+            table: tableName,
+            columns: schema.map(c => c.name)
+        };
+    }
+
+    /**
+     * Execute DROP TABLE - removes an in-memory table
+     * @param {Object} ast - Parsed DROP TABLE AST
+     * @returns {Object} Result with success flag
+     */
+    _executeDropTable(ast) {
+        const tableName = (ast.table || ast.name || '').toLowerCase();
+
+        if (!this.memoryTables.has(tableName)) {
+            if (ast.ifExists) {
+                return { success: true, existed: false, table: tableName };
+            }
+            throw new Error(`Memory table '${tableName}' not found`);
+        }
+
+        this.memoryTables.delete(tableName);
+        return { success: true, table: tableName };
+    }
+
+    /**
+     * Execute INSERT - adds rows to a memory table
+     * @param {Object} ast - Parsed INSERT AST
+     * @returns {Object} Result with inserted count
+     */
+    _executeInsert(ast) {
+        const tableName = (ast.table || '').toLowerCase();
+        const table = this.memoryTables.get(tableName);
+
+        if (!table) {
+            throw new Error(`Memory table '${tableName}' not found. Use CREATE TABLE first.`);
+        }
+
+        // Get column names to insert into (use table columns if not specified)
+        const insertCols = ast.columns || table.columns;
+        let inserted = 0;
+
+        // Process each row from VALUES clause
+        for (const astRow of (ast.rows || ast.values || [])) {
+            const row = new Array(table.columns.length).fill(null);
+
+            insertCols.forEach((colName, i) => {
+                const colIdx = table._columnIndex.get(
+                    (typeof colName === 'string' ? colName : colName.name || colName).toLowerCase()
+                );
+                if (colIdx !== undefined && i < astRow.length) {
+                    // Handle AST value nodes or raw values
+                    const val = astRow[i];
+                    row[colIdx] = val?.value !== undefined ? val.value : val;
+                }
+            });
+
+            table.rows.push(row);
+            inserted++;
+        }
+
+        return {
+            success: true,
+            inserted,
+            total: table.rows.length
+        };
+    }
+
+    /**
+     * Execute UPDATE - modifies rows in a memory table
+     * @param {Object} ast - Parsed UPDATE AST
+     * @returns {Object} Result with updated count
+     */
+    _executeUpdate(ast) {
+        const tableName = (ast.table || '').toLowerCase();
+        const table = this.memoryTables.get(tableName);
+
+        if (!table) {
+            throw new Error(`Memory table '${tableName}' not found`);
+        }
+
+        // Build column data for WHERE expression evaluation
+        const columnData = {};
+        table.columns.forEach((col, idx) => {
+            columnData[col.toLowerCase()] = table.rows.map(row => row[idx]);
+        });
+
+        // Create executor for expression evaluation
+        const executor = new SQLExecutor({ columnNames: table.columns });
+        let updated = 0;
+
+        // Process each row
+        for (let i = 0; i < table.rows.length; i++) {
+            // Check WHERE condition (if present)
+            const matches = !ast.where || executor._evaluateInMemoryExpr(ast.where, columnData, i);
+
+            if (matches) {
+                // Apply SET assignments
+                for (const assignment of (ast.assignments || ast.set || [])) {
+                    const colName = (assignment.column || assignment.name || '').toLowerCase();
+                    const colIdx = table._columnIndex.get(colName);
+
+                    if (colIdx !== undefined) {
+                        const val = assignment.value;
+                        table.rows[i][colIdx] = val?.value !== undefined ? val.value : val;
+                    }
+                }
+                updated++;
+            }
+        }
+
+        return { success: true, updated };
+    }
+
+    /**
+     * Execute DELETE - removes rows from a memory table
+     * @param {Object} ast - Parsed DELETE AST
+     * @returns {Object} Result with deleted count
+     */
+    _executeDelete(ast) {
+        const tableName = (ast.table || '').toLowerCase();
+        const table = this.memoryTables.get(tableName);
+
+        if (!table) {
+            throw new Error(`Memory table '${tableName}' not found`);
+        }
+
+        const originalCount = table.rows.length;
+
+        if (ast.where) {
+            // Build column data for WHERE expression evaluation
+            const columnData = {};
+            table.columns.forEach((col, idx) => {
+                columnData[col.toLowerCase()] = table.rows.map(row => row[idx]);
+            });
+
+            // Create executor for expression evaluation
+            const executor = new SQLExecutor({ columnNames: table.columns });
+
+            // Keep rows that DON'T match the WHERE condition
+            table.rows = table.rows.filter((_, i) =>
+                !executor._evaluateInMemoryExpr(ast.where, columnData, i)
+            );
+        } else {
+            // DELETE without WHERE = truncate
+            table.rows = [];
+        }
+
+        return {
+            success: true,
+            deleted: originalCount - table.rows.length,
+            remaining: table.rows.length
+        };
     }
 }
 
