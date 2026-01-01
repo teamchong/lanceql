@@ -189,13 +189,31 @@ pub const XlsxReader = struct {
 
     /// Decompress deflate-compressed data
     fn decompressDeflate(self: *Self, compressed: []const u8, uncompressed_size: usize) !ExtractResult {
-        // Deflate decompression requires complex buffer management in Zig 0.15
-        // For now, return error for compressed files
-        // Users should use uncompressed XLSX or pre-process files
-        _ = self;
-        _ = compressed;
-        _ = uncompressed_size;
-        return error.DeflateNotSupported;
+        // Create input reader from compressed data
+        var input_reader = std.Io.Reader.fixed(compressed);
+
+        // Create window buffer for decompression
+        var window_buf: [std.compress.flate.max_window_len]u8 = undefined;
+
+        // Initialize decompressor for raw deflate (no zlib headers - ZIP uses raw deflate)
+        var decomp = std.compress.flate.Decompress.init(&input_reader, .raw, &window_buf);
+
+        // Allocate output buffer with expected uncompressed size
+        const result = decomp.reader.allocRemaining(self.allocator, std.Io.Limit.limited(uncompressed_size * 2)) catch |err| {
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.StreamTooLong => error.InvalidXlsxFile,
+                else => error.InvalidXlsxFile,
+            };
+        };
+
+        // Check for decompression errors
+        if (decomp.err) |_| {
+            self.allocator.free(result);
+            return error.InvalidXlsxFile;
+        }
+
+        return .{ .data = result, .allocated = true };
     }
 
     /// Parse sheet XML to extract cell data
