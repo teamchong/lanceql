@@ -9960,6 +9960,8 @@ const TokenType = {
     FIRST_VALUE: 'FIRST_VALUE',
     LAST_VALUE: 'LAST_VALUE',
     NTH_VALUE: 'NTH_VALUE',
+    PERCENT_RANK: 'PERCENT_RANK',
+    CUME_DIST: 'CUME_DIST',
     ROWS: 'ROWS',
     RANGE: 'RANGE',
     UNBOUNDED: 'UNBOUNDED',
@@ -10090,6 +10092,8 @@ const KEYWORDS = {
     'FIRST_VALUE': TokenType.FIRST_VALUE,
     'LAST_VALUE': TokenType.LAST_VALUE,
     'NTH_VALUE': TokenType.NTH_VALUE,
+    'PERCENT_RANK': TokenType.PERCENT_RANK,
+    'CUME_DIST': TokenType.CUME_DIST,
     'ROWS': TokenType.ROWS,
     'RANGE': TokenType.RANGE,
     'UNBOUNDED': TokenType.UNBOUNDED,
@@ -11312,7 +11316,8 @@ export class SQLParser {
         // Window function keywords (ROW_NUMBER, RANK, etc.)
         const windowFuncTokens = [
             TokenType.ROW_NUMBER, TokenType.RANK, TokenType.DENSE_RANK, TokenType.NTILE,
-            TokenType.LAG, TokenType.LEAD, TokenType.FIRST_VALUE, TokenType.LAST_VALUE, TokenType.NTH_VALUE
+            TokenType.LAG, TokenType.LEAD, TokenType.FIRST_VALUE, TokenType.LAST_VALUE, TokenType.NTH_VALUE,
+            TokenType.PERCENT_RANK, TokenType.CUME_DIST
         ];
         if (windowFuncTokens.some(t => this.check(t))) {
             const name = this.advance().type;  // Use token type as function name
@@ -12405,6 +12410,11 @@ export class SQLExecutor {
             return this._executeGroupByAggregation(ast, data, columnData, filteredIndices);
         }
 
+        // Check for window functions
+        if (this.hasWindowFunctions(ast)) {
+            return this._executeWindowFunctions(ast, data, columnData, filteredIndices);
+        }
+
         // Project columns and build result
         const resultColumns = [];
         const resultRows = [];
@@ -12473,6 +12483,8 @@ export class SQLExecutor {
         const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'VARIANCE'];
         for (const col of columns) {
             if (col.expr?.type === 'call') {
+                // Skip window functions (those with OVER clause)
+                if (col.expr.over) continue;
                 const funcName = (col.expr.name || '').toUpperCase();
                 if (aggFuncs.includes(funcName)) return true;
             }
@@ -12627,6 +12639,87 @@ export class SQLExecutor {
     }
 
     /**
+     * Execute window functions on in-memory data
+     */
+    _executeWindowFunctions(ast, data, columnData, filteredIndices) {
+        // Build filtered rows
+        const filteredRows = filteredIndices.map(idx => data.rows[idx]);
+
+        // Compute window function results
+        const windowResults = this.computeWindowFunctions(ast, filteredRows, columnData);
+
+        // Build result columns
+        const resultColumns = [];
+        for (const col of ast.columns) {
+            if (col.alias) {
+                resultColumns.push(col.alias);
+            } else if (col.expr?.type === 'call') {
+                const argName = col.expr.args?.[0]?.name || col.expr.args?.[0]?.column || '*';
+                resultColumns.push(`${col.expr.name}(${argName})`);
+            } else if (col.expr?.type === 'column') {
+                resultColumns.push(col.expr.name || col.expr.column);
+            } else {
+                resultColumns.push('?');
+            }
+        }
+
+        // Build result rows
+        const resultRows = [];
+        for (let i = 0; i < filteredIndices.length; i++) {
+            const origIdx = filteredIndices[i];
+            const row = [];
+
+            for (let c = 0; c < ast.columns.length; c++) {
+                const col = ast.columns[c];
+                const expr = col.expr;
+
+                // Check if this is a window function column
+                if (expr?.over) {
+                    // Find the corresponding window result
+                    const windowCol = windowResults.find(w => w.colIndex === c);
+                    row.push(windowCol ? windowCol.values[i] : null);
+                } else if (expr?.type === 'column') {
+                    const colName = (expr.name || expr.column || '').toLowerCase();
+                    row.push(columnData[colName]?.[origIdx] ?? null);
+                } else {
+                    row.push(this._evaluateInMemoryExpr(expr, columnData, origIdx));
+                }
+            }
+
+            resultRows.push(row);
+        }
+
+        // Apply ORDER BY
+        if (ast.orderBy && ast.orderBy.length > 0) {
+            const colIdxMap = {};
+            resultColumns.forEach((name, idx) => { colIdxMap[name.toLowerCase()] = idx; });
+
+            resultRows.sort((a, b) => {
+                for (const ob of ast.orderBy) {
+                    const colIdx = colIdxMap[ob.column.toLowerCase()];
+                    if (colIdx === undefined) continue;
+                    const valA = a[colIdx], valB = b[colIdx];
+                    const dir = (ob.descending || ob.direction === 'DESC') ? -1 : 1;
+                    if (valA == null && valB == null) continue;
+                    if (valA == null) return 1 * dir;
+                    if (valB == null) return -1 * dir;
+                    if (valA < valB) return -1 * dir;
+                    if (valA > valB) return 1 * dir;
+                }
+                return 0;
+            });
+        }
+
+        // Apply LIMIT/OFFSET
+        const offset = ast.offset || 0;
+        let rows = resultRows;
+        if (offset > 0) rows = rows.slice(offset);
+        if (ast.limit) rows = rows.slice(0, ast.limit);
+
+        return { columns: resultColumns, rows, total: filteredIndices.length };
+    }
+
+    /**
      * Evaluate expression on in-memory data
      */
     _evaluateInMemoryExpr(expr, columnData, rowIdx) {
@@ -12741,7 +12834,8 @@ export class SQLExecutor {
     computeWindowFunctions(ast, rows, columnData) {
         const windowColumns = [];
 
-        for (const col of ast.columns) {
+        for (let colIndex = 0; colIndex < ast.columns.length; colIndex++) {
+            const col = ast.columns[colIndex];
             if (col.expr?.type === 'call' && col.expr.over) {
                 const values = this._computeWindowFunction(
                     col.expr.name,
@@ -12751,6 +12845,7 @@ export class SQLExecutor {
                     columnData
                 );
                 windowColumns.push({
+                    colIndex,
                     alias: col.alias || col.expr.name,
                     values
                 });
@@ -12819,6 +12914,34 @@ export class SQLExecutor {
                         break;
                     }
 
+                    case 'PERCENT_RANK': {
+                        // PERCENT_RANK = (rank - 1) / (partition_size - 1)
+                        // First row in partition always 0, only row returns 0
+                        // rank = position of first row with same value (ties get same rank)
+                        let rank = i + 1;
+                        for (let j = 0; j < i; j++) {
+                            if (this._compareRowsByOrder(partition[j], partition[i], over.orderBy, columnData) === 0) {
+                                rank = j + 1;  // Found a tie - use its position
+                                break;
+                            }
+                        }
+                        const partitionSize = partition.length;
+                        results[rowIdx] = partitionSize > 1 ? (rank - 1) / (partitionSize - 1) : 0;
+                        break;
+                    }
+
+                    case 'CUME_DIST': {
+                        // CUME_DIST = (rows with value <= current) / total_rows
+                        // Includes all tied rows
+                        let countLessOrEqual = 0;
+                        for (let j = 0; j < partition.length; j++) {
+                            const cmp = this._compareRowsByOrder(partition[j], partition[i], over.orderBy, columnData);
+                            if (cmp <= 0) countLessOrEqual++;
+                        }
+                        results[rowIdx] = countLessOrEqual / partition.length;
+                        break;
+                    }
+
                     case 'LAG': {
                         const lagCol = args[0];
                         const lagN = args[1]?.value || 1;
@@ -12852,9 +12975,15 @@ export class SQLExecutor {
                     }
 
                     case 'LAST_VALUE': {
-                        // Note: With default frame (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW),
-                        // LAST_VALUE returns current row. We'll use full partition for simplicity.
-                        const lastRowIdx = partition[partition.length - 1].idx;
+                        // LAST_VALUE returns the last value within the frame
+                        // Default frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                        const frame = over.frame || {
+                            type: 'RANGE',
+                            start: { type: 'UNBOUNDED_PRECEDING' },
+                            end: { type: 'CURRENT_ROW' }
+                        };
+                        const [, endIdx] = this._getFrameBounds(frame, partition, i);
+                        const lastRowIdx = partition[endIdx].idx;
                         results[rowIdx] = this._evaluateInMemoryExpr(args[0], columnData, lastRowIdx);
                         break;
                     }
@@ -12870,54 +12999,52 @@ export class SQLExecutor {
                         break;
                     }
 
-                    // Aggregate window functions
-                    case 'SUM': {
-                        let sum = 0;
-                        for (let j = 0; j <= i; j++) {
-                            const val = this._evaluateInMemoryExpr(args[0], columnData, partition[j].idx);
-                            if (val != null) sum += Number(val);
-                        }
-                        results[rowIdx] = sum;
-                        break;
-                    }
-
-                    case 'AVG': {
-                        let sum = 0, count = 0;
-                        for (let j = 0; j <= i; j++) {
-                            const val = this._evaluateInMemoryExpr(args[0], columnData, partition[j].idx);
-                            if (val != null) { sum += Number(val); count++; }
-                        }
-                        results[rowIdx] = count > 0 ? sum / count : null;
-                        break;
-                    }
-
-                    case 'COUNT': {
-                        let count = 0;
-                        for (let j = 0; j <= i; j++) {
-                            const val = args[0]?.type === 'star' ? 1 : this._evaluateInMemoryExpr(args[0], columnData, partition[j].idx);
-                            if (val != null) count++;
-                        }
-                        results[rowIdx] = count;
-                        break;
-                    }
-
-                    case 'MIN': {
-                        let min = null;
-                        for (let j = 0; j <= i; j++) {
-                            const val = this._evaluateInMemoryExpr(args[0], columnData, partition[j].idx);
-                            if (val != null && (min === null || val < min)) min = val;
-                        }
-                        results[rowIdx] = min;
-                        break;
-                    }
-
+                    // Aggregate window functions (frame-aware)
+                    case 'SUM':
+                    case 'AVG':
+                    case 'COUNT':
+                    case 'MIN':
                     case 'MAX': {
-                        let max = null;
-                        for (let j = 0; j <= i; j++) {
-                            const val = this._evaluateInMemoryExpr(args[0], columnData, partition[j].idx);
-                            if (val != null && (max === null || val > max)) max = val;
+                        // Get frame bounds - default to RANGE UNBOUNDED PRECEDING TO CURRENT ROW
+                        const frame = over.frame || {
+                            type: 'RANGE',
+                            start: { type: 'UNBOUNDED_PRECEDING' },
+                            end: { type: 'CURRENT_ROW' }
+                        };
+                        const [startIdx, endIdx] = this._getFrameBounds(frame, partition, i);
+
+                        // Collect values within frame
+                        const isStar = args[0]?.type === 'star';
+                        let values = [];
+                        let frameRowCount = 0;
+                        for (let j = startIdx; j <= endIdx; j++) {
+                            frameRowCount++;
+                            if (!isStar) {
+                                const val = this._evaluateInMemoryExpr(args[0], columnData, partition[j].idx);
+                                if (val != null) values.push(Number(val));
+                            }
                         }
-                        results[rowIdx] = max;
+
+                        // Compute aggregate
+                        let result = null;
+                        switch (funcName) {
+                            case 'SUM':
+                                result = values.reduce((a, b) => a + b, 0);
+                                break;
+                            case 'AVG':
+                                result = values.length > 0 ? values.reduce((a, b) => a + b, 0) / values.length : null;
+                                break;
+                            case 'COUNT':
+                                result = isStar ? frameRowCount : values.length;
+                                break;
+                            case 'MIN':
+                                result = values.length > 0 ? Math.min(...values) : null;
+                                break;
+                            case 'MAX':
+                                result = values.length > 0 ? Math.max(...values) : null;
+                                break;
+                        }
+                        results[rowIdx] = result;
                         break;
                     }
 
@@ -12969,6 +13096,59 @@ export class SQLExecutor {
             if (valA > valB) return 1 * dir;
         }
         return 0;
+    }
+
+    /**
+     * Calculate frame bounds for window function
+     * @param {Object} frame - Frame specification { type, start, end }
+     * @param {Array} partition - Sorted partition rows
+     * @param {number} currentIdx - Current row index within partition
+     * @returns {[number, number]} - [startIdx, endIdx] bounds
+     */
+    _getFrameBounds(frame, partition, currentIdx) {
+        const n = partition.length;
+        let startIdx = 0;
+        let endIdx = currentIdx;
+
+        // Parse start bound (parser uses spaces in type names)
+        const start = frame.start || { type: 'UNBOUNDED PRECEDING' };
+        const startType = start.type.replace(' ', '_').toUpperCase();
+        switch (startType) {
+            case 'UNBOUNDED_PRECEDING':
+                startIdx = 0;
+                break;
+            case 'CURRENT_ROW':
+                startIdx = currentIdx;
+                break;
+            case 'PRECEDING':
+                startIdx = Math.max(0, currentIdx - (start.offset || start.value || 1));
+                break;
+            case 'FOLLOWING':
+                startIdx = Math.min(n - 1, currentIdx + (start.offset || start.value || 1));
+                break;
+        }
+
+        // Parse end bound
+        const end = frame.end || { type: 'CURRENT ROW' };
+        const endType = end.type.replace(' ', '_').toUpperCase();
+        switch (endType) {
+            case 'UNBOUNDED_FOLLOWING':
+                endIdx = n - 1;
+                break;
+            case 'CURRENT_ROW':
+                endIdx = currentIdx;
+                break;
+            case 'PRECEDING':
+                endIdx = Math.max(0, currentIdx - (end.offset || end.value || 1));
+                break;
+            case 'FOLLOWING':
+                endIdx = Math.min(n - 1, currentIdx + (end.offset || end.value || 1));
+                break;
+        }
+
+        // Ensure valid bounds
+        if (startIdx > endIdx) [startIdx, endIdx] = [endIdx, startIdx];
+        return [startIdx, endIdx];
     }
 
     applyOrderBy(rows, orderBy, outputColumns) {

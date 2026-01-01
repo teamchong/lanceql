@@ -2252,3 +2252,257 @@ test.describe('Phase 10: Memory Tables', () => {
         expect(result.allNinetyNine).toBe(true);
     });
 });
+
+// Phase 11: Window Function Enhancements Tests
+test.describe('Phase 11: Window Function Enhancements', () => {
+    test.beforeEach(async ({ page }) => {
+        await page.goto('/test-join.html');
+    });
+
+    test('11.1 PERCENT_RANK returns 0 for first row', async ({ page }) => {
+        const result = await page.evaluate(async () => {
+            const { LanceDatabase } = window;
+            const db = new LanceDatabase();
+
+            await db.executeSQL('CREATE TABLE scores (id INT, score INT)');
+            await db.executeSQL('INSERT INTO scores VALUES (1, 100), (2, 200), (3, 300), (4, 400)');
+
+            const selectResult = await db.executeSQL(`
+                SELECT id, score, PERCENT_RANK() OVER (ORDER BY score) as pct_rank
+                FROM scores
+            `);
+
+            return {
+                rows: selectResult.rows,
+                columns: selectResult.columns
+            };
+        });
+
+        // First row should be 0, last row should be 1
+        expect(result.rows[0][2]).toBe(0);
+        expect(result.rows[3][2]).toBe(1);
+    });
+
+    test('11.2 PERCENT_RANK with ties', async ({ page }) => {
+        const result = await page.evaluate(async () => {
+            const { LanceDatabase } = window;
+            const db = new LanceDatabase();
+
+            await db.executeSQL('CREATE TABLE scores (id INT, score INT)');
+            await db.executeSQL('INSERT INTO scores VALUES (1, 100), (2, 100), (3, 200), (4, 300)');
+
+            const selectResult = await db.executeSQL(`
+                SELECT id, score, PERCENT_RANK() OVER (ORDER BY score) as pct_rank
+                FROM scores
+            `);
+
+            return selectResult.rows;
+        });
+
+        // First two rows have same score, should both be 0
+        expect(result[0][2]).toBe(0);
+        expect(result[1][2]).toBe(0);
+    });
+
+    test('11.3 CUME_DIST returns fraction of rows', async ({ page }) => {
+        const result = await page.evaluate(async () => {
+            const { LanceDatabase } = window;
+            const db = new LanceDatabase();
+
+            await db.executeSQL('CREATE TABLE scores (id INT, score INT)');
+            await db.executeSQL('INSERT INTO scores VALUES (1, 100), (2, 200), (3, 300), (4, 400)');
+
+            const selectResult = await db.executeSQL(`
+                SELECT id, score, CUME_DIST() OVER (ORDER BY score) as cum_dist
+                FROM scores
+            `);
+
+            return selectResult.rows;
+        });
+
+        // CUME_DIST: count(rows <= current) / total
+        // Row 1: 1/4 = 0.25, Row 2: 2/4 = 0.5, Row 3: 3/4 = 0.75, Row 4: 4/4 = 1.0
+        expect(result[0][2]).toBe(0.25);
+        expect(result[1][2]).toBe(0.5);
+        expect(result[2][2]).toBe(0.75);
+        expect(result[3][2]).toBe(1);
+    });
+
+    test('11.4 SUM with ROWS BETWEEN frame', async ({ page }) => {
+        const result = await page.evaluate(async () => {
+            const { LanceDatabase } = window;
+            const db = new LanceDatabase();
+
+            await db.executeSQL('CREATE TABLE data (id INT, val INT)');
+            await db.executeSQL('INSERT INTO data VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)');
+
+            const selectResult = await db.executeSQL(`
+                SELECT id, val, SUM(val) OVER (
+                    ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+                ) as moving_sum
+                FROM data
+            `);
+
+            return selectResult.rows;
+        });
+
+        // Row 1: 10+20 = 30 (no preceding)
+        // Row 2: 10+20+30 = 60
+        // Row 3: 20+30+40 = 90
+        // Row 4: 30+40+50 = 120
+        // Row 5: 40+50 = 90 (no following)
+        expect(result[0][2]).toBe(30);
+        expect(result[1][2]).toBe(60);
+        expect(result[2][2]).toBe(90);
+        expect(result[3][2]).toBe(120);
+        expect(result[4][2]).toBe(90);
+    });
+
+    test('11.5 AVG with running average (UNBOUNDED PRECEDING)', async ({ page }) => {
+        const result = await page.evaluate(async () => {
+            const { LanceDatabase } = window;
+            const db = new LanceDatabase();
+
+            await db.executeSQL('CREATE TABLE data (id INT, val INT)');
+            await db.executeSQL('INSERT INTO data VALUES (1, 10), (2, 20), (3, 30), (4, 40)');
+
+            const selectResult = await db.executeSQL(`
+                SELECT id, val, AVG(val) OVER (
+                    ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) as running_avg
+                FROM data
+            `);
+
+            return selectResult.rows;
+        });
+
+        // Row 1: 10/1 = 10
+        // Row 2: 30/2 = 15
+        // Row 3: 60/3 = 20
+        // Row 4: 100/4 = 25
+        expect(result[0][2]).toBe(10);
+        expect(result[1][2]).toBe(15);
+        expect(result[2][2]).toBe(20);
+        expect(result[3][2]).toBe(25);
+    });
+
+    test('11.6 LAST_VALUE with frame to end', async ({ page }) => {
+        const result = await page.evaluate(async () => {
+            const { LanceDatabase } = window;
+            const db = new LanceDatabase();
+
+            await db.executeSQL('CREATE TABLE data (id INT, val INT)');
+            await db.executeSQL('INSERT INTO data VALUES (1, 10), (2, 20), (3, 30), (4, 40)');
+
+            const selectResult = await db.executeSQL(`
+                SELECT id, val, LAST_VALUE(val) OVER (
+                    ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+                ) as last_val
+                FROM data
+            `);
+
+            return selectResult.rows;
+        });
+
+        // All rows should get 40 (the actual last value in partition)
+        expect(result[0][2]).toBe(40);
+        expect(result[1][2]).toBe(40);
+        expect(result[2][2]).toBe(40);
+        expect(result[3][2]).toBe(40);
+    });
+
+    test('11.7 COUNT with N PRECEDING frame', async ({ page }) => {
+        const result = await page.evaluate(async () => {
+            const { LanceDatabase } = window;
+            const db = new LanceDatabase();
+
+            await db.executeSQL('CREATE TABLE data (id INT, val INT)');
+            await db.executeSQL('INSERT INTO data VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)');
+
+            const selectResult = await db.executeSQL(`
+                SELECT id, val, COUNT(*) OVER (
+                    ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+                ) as cnt
+                FROM data
+            `);
+
+            return selectResult.rows;
+        });
+
+        // Row 1: 1, Row 2: 2, Row 3+: 3
+        expect(result[0][2]).toBe(1);
+        expect(result[1][2]).toBe(2);
+        expect(result[2][2]).toBe(3);
+        expect(result[3][2]).toBe(3);
+        expect(result[4][2]).toBe(3);
+    });
+
+    test('11.8 PERCENT_RANK single row returns 0', async ({ page }) => {
+        const result = await page.evaluate(async () => {
+            const { LanceDatabase } = window;
+            const db = new LanceDatabase();
+
+            await db.executeSQL('CREATE TABLE single (id INT, val INT)');
+            await db.executeSQL('INSERT INTO single VALUES (1, 100)');
+
+            const selectResult = await db.executeSQL(`
+                SELECT id, PERCENT_RANK() OVER (ORDER BY val) as pct_rank
+                FROM single
+            `);
+
+            return selectResult.rows[0][1];
+        });
+
+        // Single row should return 0
+        expect(result).toBe(0);
+    });
+
+    test('11.9 CUME_DIST single row returns 1', async ({ page }) => {
+        const result = await page.evaluate(async () => {
+            const { LanceDatabase } = window;
+            const db = new LanceDatabase();
+
+            await db.executeSQL('CREATE TABLE single (id INT, val INT)');
+            await db.executeSQL('INSERT INTO single VALUES (1, 100)');
+
+            const selectResult = await db.executeSQL(`
+                SELECT id, CUME_DIST() OVER (ORDER BY val) as cum_dist
+                FROM single
+            `);
+
+            return selectResult.rows[0][1];
+        });
+
+        // Single row should return 1
+        expect(result).toBe(1);
+    });
+
+    test('11.10 MIN/MAX with frame', async ({ page }) => {
+        const result = await page.evaluate(async () => {
+            const { LanceDatabase } = window;
+            const db = new LanceDatabase();
+
+            await db.executeSQL('CREATE TABLE data (id INT, val INT)');
+            await db.executeSQL('INSERT INTO data VALUES (1, 50), (2, 10), (3, 30), (4, 20), (5, 40)');
+
+            const selectResult = await db.executeSQL(`
+                SELECT id, val,
+                    MIN(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) as frame_min,
+                    MAX(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) as frame_max
+                FROM data
+            `);
+
+            return selectResult.rows;
+        });
+
+        // Row 1 (val=50): frame [50,10] -> min=10, max=50
+        // Row 2 (val=10): frame [50,10,30] -> min=10, max=50
+        // Row 3 (val=30): frame [10,30,20] -> min=10, max=30
+        // Row 4 (val=20): frame [30,20,40] -> min=20, max=40
+        // Row 5 (val=40): frame [20,40] -> min=20, max=40
+        expect(result[0][2]).toBe(10);  // min
+        expect(result[0][3]).toBe(50);  // max
+        expect(result[2][2]).toBe(10);  // min for row 3
+        expect(result[2][3]).toBe(30);  // max for row 3
+    });
+});
