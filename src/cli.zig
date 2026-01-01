@@ -19,6 +19,8 @@ const lanceql = @import("lanceql");
 const metal = @import("lanceql.metal");
 const Table = @import("lanceql.table").Table;
 const ParquetTable = @import("lanceql.parquet_table").ParquetTable;
+const DeltaTable = @import("lanceql.delta_table").DeltaTable;
+const IcebergTable = @import("lanceql.iceberg_table").IcebergTable;
 const executor = @import("lanceql.sql.executor");
 const lexer = @import("lanceql.sql.lexer");
 const parser = @import("lanceql.sql.parser");
@@ -28,6 +30,8 @@ const ast = @import("lanceql.sql.ast");
 const FileType = enum {
     lance,
     parquet,
+    delta,
+    iceberg,
     unknown,
 };
 
@@ -36,6 +40,16 @@ fn detectFileType(path: []const u8, data: []const u8) FileType {
     if (std.mem.endsWith(u8, path, ".parquet")) return .parquet;
     if (std.mem.endsWith(u8, path, ".lance")) return .lance;
 
+    // Check for Delta directory (has _delta_log/ subdirectory)
+    if (std.mem.endsWith(u8, path, ".delta") or isDeltaDirectory(path)) {
+        return .delta;
+    }
+
+    // Check for Iceberg directory (has metadata/ subdirectory)
+    if (std.mem.endsWith(u8, path, ".iceberg") or isIcebergDirectory(path)) {
+        return .iceberg;
+    }
+
     // Check magic bytes
     if (data.len >= 4) {
         if (std.mem.eql(u8, data[0..4], "PAR1")) return .parquet;
@@ -43,6 +57,26 @@ fn detectFileType(path: []const u8, data: []const u8) FileType {
     }
 
     return .unknown;
+}
+
+/// Check if path is a Delta Lake table (directory with _delta_log/)
+fn isDeltaDirectory(path: []const u8) bool {
+    var path_buf: [4096]u8 = undefined;
+    const delta_log_path = std.fmt.bufPrint(&path_buf, "{s}/_delta_log", .{path}) catch return false;
+
+    // Try to stat the _delta_log directory
+    const stat = std.fs.cwd().statFile(delta_log_path) catch return false;
+    return stat.kind == .directory;
+}
+
+/// Check if path is an Iceberg table (directory with metadata/)
+fn isIcebergDirectory(path: []const u8) bool {
+    var path_buf: [4096]u8 = undefined;
+    const metadata_path = std.fmt.bufPrint(&path_buf, "{s}/metadata", .{path}) catch return false;
+
+    // Try to stat the metadata directory
+    const stat = std.fs.cwd().statFile(metadata_path) catch return false;
+    return stat.kind == .directory;
 }
 
 pub fn main() !void {
@@ -78,16 +112,14 @@ pub fn main() !void {
         },
         .transform => {
             if (parsed.global.help or parsed.transform.help) {
-                // TODO: printTransformHelp()
-                args.printHelp();
+                args.printTransformHelp();
                 return;
             }
             try cmdTransform(allocator, parsed.transform);
         },
         .enrich => {
             if (parsed.global.help or parsed.enrich.help) {
-                // TODO: printEnrichHelp()
-                args.printHelp();
+                args.printEnrichHelp();
                 return;
             }
             try cmdEnrich(allocator, parsed.enrich);
@@ -172,42 +204,46 @@ fn cmdIngest(allocator: std.mem.Allocator, opts: args.IngestOptions) !void {
 /// Transform command - apply transformations to Lance data
 fn cmdTransform(allocator: std.mem.Allocator, opts: args.TransformOptions) !void {
     _ = allocator;
-    if (opts.input == null) {
-        std.debug.print("Error: Input file required.\n", .{});
-        return;
-    }
-
-    std.debug.print("Transform: {s}\n", .{opts.input.?});
-    std.debug.print("Note: Transform command not yet implemented.\n", .{});
+    _ = opts;
+    std.debug.print("Error: Transform command not yet implemented.\n", .{});
+    std.debug.print("\nTransform will support operations like:\n", .{});
+    std.debug.print("  - Column projection and renaming\n", .{});
+    std.debug.print("  - Row filtering\n", .{});
+    std.debug.print("  - Data type conversions\n", .{});
+    std.debug.print("\nWorkaround: Use SQL queries with 'lanceql query'\n", .{});
 }
 
 /// Enrich command - add embeddings and indexes
 fn cmdEnrich(allocator: std.mem.Allocator, opts: args.EnrichOptions) !void {
     _ = allocator;
-    if (opts.input == null) {
-        std.debug.print("Error: Input file required.\n", .{});
-        return;
-    }
-
-    std.debug.print("Enrich: {s}\n", .{opts.input.?});
-    std.debug.print("Note: Enrich command not yet implemented.\n", .{});
+    _ = opts;
+    std.debug.print("Error: Enrich command not yet implemented.\n", .{});
+    std.debug.print("\nEnrich will support operations like:\n", .{});
+    std.debug.print("  - Text embedding generation\n", .{});
+    std.debug.print("  - Vector index creation (IVF, HNSW)\n", .{});
+    std.debug.print("  - Full-text search indexing\n", .{});
 }
 
 /// Serve command - start interactive web server
 fn cmdServe(allocator: std.mem.Allocator, opts: args.ServeOptions) !void {
     _ = allocator;
-    std.debug.print("Starting server on {s}:{d}...\n", .{ opts.host, opts.port });
-    if (opts.input) |input| {
-        std.debug.print("Serving: {s}\n", .{input});
-    }
-    std.debug.print("Note: Serve command not yet implemented.\n", .{});
+    _ = opts;
+    std.debug.print("Error: Serve command not yet implemented.\n", .{});
+    std.debug.print("\nServe will provide:\n", .{});
+    std.debug.print("  - REST API for SQL queries\n", .{});
+    std.debug.print("  - Vector search endpoints\n", .{});
+    std.debug.print("  - Web UI for data exploration\n", .{});
 }
 
 /// Run pipeline from config file
 fn runConfigFile(allocator: std.mem.Allocator, config_path: []const u8) !void {
     _ = allocator;
-    std.debug.print("Loading config: {s}\n", .{config_path});
-    std.debug.print("Note: Config file execution not yet implemented.\n", .{});
+    std.debug.print("Error: Config file execution not yet implemented.\n", .{});
+    std.debug.print("Config path: {s}\n", .{config_path});
+    std.debug.print("\nConfig files will support:\n", .{});
+    std.debug.print("  - YAML pipeline definitions\n", .{});
+    std.debug.print("  - Multi-step data processing\n", .{});
+    std.debug.print("  - Scheduled execution\n", .{});
 }
 
 /// Find config file in current directory
@@ -278,45 +314,13 @@ fn extractTablePath(query: []const u8) ?[]const u8 {
 fn openFileOrDataset(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
     // Check if path is a file or directory
     const stat = std.fs.cwd().statFile(path) catch {
-        // Try as directory
-        var data_path_buf: [4096]u8 = undefined;
-        const data_path = std.fmt.bufPrint(&data_path_buf, "{s}/data", .{path}) catch return null;
-
-        var data_dir = std.fs.cwd().openDir(data_path, .{ .iterate = true }) catch return null;
-        defer data_dir.close();
-
-        // Find first .lance file in data directory
-        var iter = data_dir.iterate();
-        while (iter.next() catch null) |entry| {
-            if (entry.kind != .file) continue;
-            if (std.mem.endsWith(u8, entry.name, ".lance")) {
-                var file = data_dir.openFile(entry.name, .{}) catch continue;
-                defer file.close();
-                return file.readToEndAlloc(allocator, 500 * 1024 * 1024) catch null;
-            }
-        }
-        return null;
+        // Try as directory - read all .lance fragments
+        return readLanceDataset(allocator, path);
     };
 
     if (stat.kind == .directory) {
         // It's a directory, try to open as Lance dataset
-        var data_path_buf: [4096]u8 = undefined;
-        const data_path = std.fmt.bufPrint(&data_path_buf, "{s}/data", .{path}) catch return null;
-
-        var data_dir = std.fs.cwd().openDir(data_path, .{ .iterate = true }) catch return null;
-        defer data_dir.close();
-
-        // Find first .lance file in data directory
-        var iter = data_dir.iterate();
-        while (iter.next() catch null) |entry| {
-            if (entry.kind != .file) continue;
-            if (std.mem.endsWith(u8, entry.name, ".lance")) {
-                var file = data_dir.openFile(entry.name, .{}) catch continue;
-                defer file.close();
-                return file.readToEndAlloc(allocator, 500 * 1024 * 1024) catch null;
-            }
-        }
-        return null;
+        return readLanceDataset(allocator, path);
     }
 
     // It's a file, open it directly
@@ -326,6 +330,63 @@ fn openFileOrDataset(allocator: std.mem.Allocator, path: []const u8) ?[]const u8
     return file.readToEndAlloc(allocator, 500 * 1024 * 1024) catch null;
 }
 
+/// Read all .lance fragments from a Lance dataset directory
+fn readLanceDataset(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    var data_path_buf: [4096]u8 = undefined;
+    const data_path = std.fmt.bufPrint(&data_path_buf, "{s}/data", .{path}) catch return null;
+
+    var data_dir = std.fs.cwd().openDir(data_path, .{ .iterate = true }) catch return null;
+    defer data_dir.close();
+
+    // Collect all .lance files
+    var lance_files = std.ArrayList([]const u8){};
+    defer {
+        for (lance_files.items) |name| allocator.free(name);
+        lance_files.deinit(allocator);
+    }
+
+    var iter = data_dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.endsWith(u8, entry.name, ".lance")) {
+            lance_files.append(allocator, allocator.dupe(u8, entry.name) catch continue) catch continue;
+        }
+    }
+
+    if (lance_files.items.len == 0) return null;
+
+    // Sort by filename (0.lance, 1.lance, 2.lance, etc.)
+    std.mem.sort([]const u8, lance_files.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            // Extract numeric prefix for proper sorting
+            const a_num = extractFragmentNumber(a);
+            const b_num = extractFragmentNumber(b);
+            if (a_num != null and b_num != null) {
+                return a_num.? < b_num.?;
+            }
+            return std.mem.lessThan(u8, a, b);
+        }
+        fn extractFragmentNumber(name: []const u8) ?u64 {
+            // Parse "0.lance", "1.lance", etc.
+            const dot_pos = std.mem.indexOf(u8, name, ".") orelse return null;
+            return std.fmt.parseInt(u64, name[0..dot_pos], 10) catch null;
+        }
+    }.lessThan);
+
+    // Read and concatenate all fragments
+    var combined = std.ArrayList(u8){};
+    for (lance_files.items) |name| {
+        var file = data_dir.openFile(name, .{}) catch continue;
+        defer file.close();
+        const content = file.readToEndAlloc(allocator, 500 * 1024 * 1024) catch continue;
+        defer allocator.free(content);
+        combined.appendSlice(allocator, content) catch continue;
+    }
+
+    if (combined.items.len == 0) return null;
+    return combined.toOwnedSlice(allocator) catch null;
+}
+
 fn runQuery(allocator: std.mem.Allocator, query: []const u8, legacy_args: LegacyArgs) !void {
     // Extract table path from query
     const table_path = extractTablePath(query) orelse {
@@ -333,6 +394,22 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, legacy_args: Legacy
         std.debug.print("Query should be: SELECT ... FROM 'path/to/file.parquet'\n", .{});
         return;
     };
+
+    // Check for Delta first (directory-based, doesn't need to read file data)
+    if (isDeltaDirectory(table_path) or std.mem.endsWith(u8, table_path, ".delta")) {
+        runDeltaQuery(allocator, table_path, query, legacy_args) catch |err| {
+            std.debug.print("Delta query error: {}\n", .{err});
+        };
+        return;
+    }
+
+    // Check for Iceberg (directory-based, doesn't need to read file data)
+    if (isIcebergDirectory(table_path) or std.mem.endsWith(u8, table_path, ".iceberg")) {
+        runIcebergQuery(allocator, table_path, query, legacy_args) catch |err| {
+            std.debug.print("Iceberg query error: {}\n", .{err});
+        };
+        return;
+    }
 
     // Read file into memory
     const data = openFileOrDataset(allocator, table_path) orelse {
@@ -355,6 +432,18 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, legacy_args: Legacy
                 std.debug.print("Lance query error: {}\n", .{err});
             };
         },
+        .delta => {
+            // Should not reach here since we check Delta first, but handle anyway
+            runDeltaQuery(allocator, table_path, query, legacy_args) catch |err| {
+                std.debug.print("Delta query error: {}\n", .{err});
+            };
+        },
+        .iceberg => {
+            // Should not reach here since we check Iceberg first, but handle anyway
+            runIcebergQuery(allocator, table_path, query, legacy_args) catch |err| {
+                std.debug.print("Iceberg query error: {}\n", .{err});
+            };
+        },
         .unknown => {
             // Try Lance first, then Parquet
             runLanceQuery(allocator, data, query, legacy_args) catch {
@@ -363,6 +452,45 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, legacy_args: Legacy
                 };
             };
         },
+    }
+}
+
+fn runParquetQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
+    // Initialize Parquet Table
+    var pq_table = ParquetTable.init(allocator, data) catch |err| {
+        return err;
+    };
+    defer pq_table.deinit();
+
+    // Tokenize
+    var lex = lexer.Lexer.init(query);
+    var tokens = std.ArrayList(lexer.Token){};
+    defer tokens.deinit(allocator);
+
+    while (true) {
+        const tok = try lex.nextToken();
+        try tokens.append(allocator, tok);
+        if (tok.type == .EOF) break;
+    }
+
+    // Parse
+    var parse = parser.Parser.init(tokens.items, allocator);
+    const stmt = try parse.parseStatement();
+
+    // Execute using Parquet-aware executor
+    var exec = executor.Executor.initWithParquet(&pq_table, allocator);
+    defer exec.deinit();
+
+    var result = try exec.execute(&stmt.select, &[_]ast.Value{});
+    defer result.deinit();
+
+    // Output results
+    if (legacy_args.json) {
+        printResultsJson(&result);
+    } else if (legacy_args.csv) {
+        printResultsCsv(&result);
+    } else {
+        printResultsTable(&result);
     }
 }
 
@@ -405,131 +533,87 @@ fn runLanceQuery(allocator: std.mem.Allocator, data: []const u8, query: []const 
     }
 }
 
-fn runParquetQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
-    _ = query; // TODO: Parse and execute full SQL
-
-    // Initialize Parquet Table
-    var pq_table = ParquetTable.init(allocator, data) catch |err| {
+fn runDeltaQuery(allocator: std.mem.Allocator, path: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
+    // Initialize Delta Table (takes directory path, not file data)
+    var delta_table = DeltaTable.init(allocator, path) catch |err| {
         return err;
     };
-    defer pq_table.deinit();
+    defer delta_table.deinit();
 
-    const col_names = pq_table.getColumnNames();
-    const num_rows = pq_table.numRows();
+    // Tokenize
+    var lex = lexer.Lexer.init(query);
+    var tokens = std.ArrayList(lexer.Token){};
+    defer tokens.deinit(allocator);
 
-    // For now, do a simple full scan (SELECT *)
-    // TODO: Implement full SQL parsing for Parquet
+    while (true) {
+        const tok = try lex.nextToken();
+        try tokens.append(allocator, tok);
+        if (tok.type == .EOF) break;
+    }
 
-    // Print header
+    // Parse
+    var parse = parser.Parser.init(tokens.items, allocator);
+    const stmt = try parse.parseStatement();
+
+    // Execute using Delta-aware executor
+    var exec = executor.Executor.initWithDelta(&delta_table, allocator);
+    defer exec.deinit();
+
+    var result = try exec.execute(&stmt.select, &[_]ast.Value{});
+    defer result.deinit();
+
+    // Output results
     if (legacy_args.json) {
-        std.debug.print("[", .{});
+        printResultsJson(&result);
+    } else if (legacy_args.csv) {
+        printResultsCsv(&result);
     } else {
-        for (col_names, 0..) |name, i| {
-            if (i > 0) {
-                if (legacy_args.csv) std.debug.print(",", .{}) else std.debug.print("\t", .{});
-            }
-            std.debug.print("{s}", .{name});
-        }
-        std.debug.print("\n", .{});
-    }
-
-    // Read and print rows (limit to first 1000 for safety)
-    const limit = @min(num_rows, 1000);
-
-    // Read all columns
-    var col_data = std.ArrayList(ColumnValues){};
-    defer {
-        for (col_data.items) |*cv| cv.deinit(allocator);
-        col_data.deinit(allocator);
-    }
-
-    for (0..col_names.len) |col_idx| {
-        const col_type = pq_table.getColumnType(col_idx);
-        var cv = ColumnValues{};
-
-        if (col_type) |ct| {
-            switch (ct) {
-                .int64 => cv.int64 = pq_table.readInt64Column(col_idx) catch null,
-                .int32 => cv.int32 = pq_table.readInt32Column(col_idx) catch null,
-                .double => cv.float64 = pq_table.readFloat64Column(col_idx) catch null,
-                .float => cv.float32 = pq_table.readFloat32Column(col_idx) catch null,
-                .byte_array => cv.string = pq_table.readStringColumn(col_idx) catch null,
-                .boolean => cv.bool_ = pq_table.readBoolColumn(col_idx) catch null,
-                else => {},
-            }
-        }
-        col_data.append(allocator, cv) catch {};
-    }
-
-    // Print rows
-    for (0..limit) |row| {
-        if (legacy_args.json) {
-            if (row > 0) std.debug.print(",", .{});
-            std.debug.print("{{", .{});
-        }
-
-        for (col_data.items, 0..) |cv, i| {
-            if (legacy_args.json) {
-                if (i > 0) std.debug.print(",", .{});
-                std.debug.print("\"{s}\":", .{col_names[i]});
-            } else if (i > 0) {
-                if (legacy_args.csv) std.debug.print(",", .{}) else std.debug.print("\t", .{});
-            }
-            printParquetValue(cv, row, legacy_args.json);
-        }
-
-        if (legacy_args.json) {
-            std.debug.print("}}", .{});
-        } else {
-            std.debug.print("\n", .{});
-        }
-    }
-
-    if (legacy_args.json) {
-        std.debug.print("]\n", .{});
+        printResultsTable(&result);
     }
 }
 
-const ColumnValues = struct {
-    int64: ?[]i64 = null,
-    int32: ?[]i32 = null,
-    float64: ?[]f64 = null,
-    float32: ?[]f32 = null,
-    string: ?[][]const u8 = null,
-    bool_: ?[]bool = null,
+fn runIcebergQuery(allocator: std.mem.Allocator, path: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
+    // Initialize Iceberg Table (takes directory path, not file data)
+    var iceberg_table = IcebergTable.init(allocator, path) catch |err| {
+        return err;
+    };
+    defer iceberg_table.deinit();
 
-    fn deinit(self: *ColumnValues, allocator: std.mem.Allocator) void {
-        if (self.int64) |v| allocator.free(v);
-        if (self.int32) |v| allocator.free(v);
-        if (self.float64) |v| allocator.free(v);
-        if (self.float32) |v| allocator.free(v);
-        if (self.string) |v| {
-            for (v) |s| allocator.free(s);
-            allocator.free(v);
-        }
-        if (self.bool_) |v| allocator.free(v);
+    // Check if table has data
+    if (iceberg_table.numRows() == 0) {
+        std.debug.print("Warning: Iceberg table has no data files\n", .{});
+        return;
     }
-};
 
-fn printParquetValue(cv: ColumnValues, row: usize, json: bool) void {
-    if (cv.int64) |arr| {
-        if (row < arr.len) std.debug.print("{d}", .{arr[row]}) else std.debug.print("null", .{});
-    } else if (cv.int32) |arr| {
-        if (row < arr.len) std.debug.print("{d}", .{arr[row]}) else std.debug.print("null", .{});
-    } else if (cv.float64) |arr| {
-        if (row < arr.len) std.debug.print("{d:.6}", .{arr[row]}) else std.debug.print("null", .{});
-    } else if (cv.float32) |arr| {
-        if (row < arr.len) std.debug.print("{d:.6}", .{arr[row]}) else std.debug.print("null", .{});
-    } else if (cv.string) |arr| {
-        if (row < arr.len) {
-            if (json) std.debug.print("\"{s}\"", .{arr[row]}) else std.debug.print("{s}", .{arr[row]});
-        } else {
-            std.debug.print("null", .{});
-        }
-    } else if (cv.bool_) |arr| {
-        if (row < arr.len) std.debug.print("{}", .{arr[row]}) else std.debug.print("null", .{});
+    // Tokenize
+    var lex = lexer.Lexer.init(query);
+    var tokens = std.ArrayList(lexer.Token){};
+    defer tokens.deinit(allocator);
+
+    while (true) {
+        const tok = try lex.nextToken();
+        try tokens.append(allocator, tok);
+        if (tok.type == .EOF) break;
+    }
+
+    // Parse
+    var parse = parser.Parser.init(tokens.items, allocator);
+    const stmt = try parse.parseStatement();
+
+    // Execute using Iceberg-aware executor
+    var exec = executor.Executor.initWithIceberg(&iceberg_table, allocator);
+    defer exec.deinit();
+
+    var result = try exec.execute(&stmt.select, &[_]ast.Value{});
+    defer result.deinit();
+
+    // Output results
+    if (legacy_args.json) {
+        printResultsJson(&result);
+    } else if (legacy_args.csv) {
+        printResultsCsv(&result);
     } else {
-        std.debug.print("null", .{});
+        printResultsTable(&result);
     }
 }
 

@@ -8,6 +8,11 @@
 //!
 //! Also provides parsers for common formats:
 //! - CSV/TSV: Delimiter-separated values
+//! - JSON/JSONL: JavaScript Object Notation
+//! - Arrow IPC: Apache Arrow columnar format
+//! - Avro: Apache Avro container format
+//! - ORC: Optimized Row Columnar format
+//! - XLSX: Microsoft Excel format
 
 const std = @import("std");
 
@@ -15,6 +20,12 @@ pub const plain = @import("plain.zig");
 pub const writer = @import("writer.zig");
 pub const csv = @import("csv.zig");
 pub const json = @import("json.zig");
+pub const arrow_ipc = @import("arrow_ipc.zig");
+pub const avro = @import("avro.zig");
+pub const orc = @import("orc.zig");
+pub const xlsx = @import("xlsx.zig");
+pub const delta = @import("delta.zig");
+pub const iceberg = @import("iceberg.zig");
 
 // Re-export main types
 pub const PlainDecoder = plain.PlainDecoder;
@@ -41,6 +52,35 @@ pub const JsonConfig = json.Config;
 pub const JsonColumnType = json.ColumnType;
 pub const readJson = json.readJson;
 pub const detectJsonFormat = json.detectFormat;
+
+// Arrow IPC types
+pub const ArrowIpcReader = arrow_ipc.ArrowIpcReader;
+pub const ArrowType = arrow_ipc.ArrowType;
+pub const ArrowColumnInfo = arrow_ipc.ColumnInfo;
+
+// Avro types
+pub const AvroReader = avro.AvroReader;
+pub const AvroType = avro.AvroType;
+pub const AvroCodec = avro.Codec;
+pub const AvroFieldInfo = avro.FieldInfo;
+
+// ORC types
+pub const OrcReader = orc.OrcReader;
+pub const OrcType = orc.OrcType;
+pub const OrcCompressionKind = orc.CompressionKind;
+pub const OrcColumnInfo = orc.ColumnInfo;
+
+// XLSX types
+pub const XlsxReader = xlsx.XlsxReader;
+pub const XlsxCellType = xlsx.CellType;
+pub const XlsxCellValue = xlsx.CellValue;
+pub const XlsxSheet = xlsx.Sheet;
+
+// Delta Lake types
+pub const DeltaReader = delta.DeltaReader;
+
+// Iceberg types
+pub const IcebergReader = iceberg.IcebergReader;
 
 test {
     std.testing.refAllDecls(@This());

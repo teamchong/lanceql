@@ -1,11 +1,14 @@
-//! SQL Executor - Execute parsed SQL queries against Lance files
+//! SQL Executor - Execute parsed SQL queries against Lance and Parquet files
 //!
-//! Takes a parsed AST and executes it against Lance columnar files,
+//! Takes a parsed AST and executes it against Lance or Parquet columnar files,
 //! returning results in columnar format compatible with better-sqlite3.
 
 const std = @import("std");
 const ast = @import("ast");
 const Table = @import("lanceql.table").Table;
+const ParquetTable = @import("lanceql.parquet_table").ParquetTable;
+const DeltaTable = @import("lanceql.delta_table").DeltaTable;
+const IcebergTable = @import("lanceql.iceberg_table").IcebergTable;
 const hash = @import("lanceql.hash");
 pub const logic_table_dispatch = @import("logic_table_dispatch.zig");
 
@@ -341,6 +344,12 @@ pub const TableSource = union(enum) {
 pub const Executor = struct {
     /// Default table (used when FROM is a simple table name or not specified)
     table: ?*Table,
+    /// Parquet table (alternative to Lance table)
+    parquet_table: ?*ParquetTable = null,
+    /// Delta table (alternative to Lance table)
+    delta_table: ?*DeltaTable = null,
+    /// Iceberg table (alternative to Lance table)
+    iceberg_table: ?*IcebergTable = null,
     allocator: std.mem.Allocator,
     column_cache: std.StringHashMap(CachedColumn),
     /// Optional dispatcher for @logic_table method calls
@@ -351,18 +360,76 @@ pub const Executor = struct {
     active_source: ?TableSource = null,
     /// Registered tables by name (for JOINs and multi-table queries)
     tables: std.StringHashMap(*Table),
+    /// Cache for @logic_table method batch results
+    /// Key: "ClassName.methodName", Value: results array
+    method_results_cache: std.StringHashMap([]const f64),
 
     const Self = @This();
 
     pub fn init(table: ?*Table, allocator: std.mem.Allocator) Self {
         return .{
             .table = table,
+            .parquet_table = null,
+            .delta_table = null,
+            .iceberg_table = null,
             .allocator = allocator,
             .column_cache = std.StringHashMap(CachedColumn).init(allocator),
             .dispatcher = null,
             .logic_table_aliases = std.StringHashMap([]const u8).init(allocator),
             .active_source = null,
             .tables = std.StringHashMap(*Table).init(allocator),
+            .method_results_cache = std.StringHashMap([]const f64).init(allocator),
+        };
+    }
+
+    /// Initialize executor with a Parquet table
+    pub fn initWithParquet(parquet_table: *ParquetTable, allocator: std.mem.Allocator) Self {
+        return .{
+            .table = null,
+            .parquet_table = parquet_table,
+            .delta_table = null,
+            .iceberg_table = null,
+            .allocator = allocator,
+            .column_cache = std.StringHashMap(CachedColumn).init(allocator),
+            .dispatcher = null,
+            .logic_table_aliases = std.StringHashMap([]const u8).init(allocator),
+            .active_source = null,
+            .tables = std.StringHashMap(*Table).init(allocator),
+            .method_results_cache = std.StringHashMap([]const f64).init(allocator),
+        };
+    }
+
+    /// Initialize executor with a Delta table
+    pub fn initWithDelta(delta_table: *DeltaTable, allocator: std.mem.Allocator) Self {
+        return .{
+            .table = null,
+            .parquet_table = null,
+            .delta_table = delta_table,
+            .iceberg_table = null,
+            .allocator = allocator,
+            .column_cache = std.StringHashMap(CachedColumn).init(allocator),
+            .dispatcher = null,
+            .logic_table_aliases = std.StringHashMap([]const u8).init(allocator),
+            .active_source = null,
+            .tables = std.StringHashMap(*Table).init(allocator),
+            .method_results_cache = std.StringHashMap([]const f64).init(allocator),
+        };
+    }
+
+    /// Initialize executor with an Iceberg table
+    pub fn initWithIceberg(iceberg_table: *IcebergTable, allocator: std.mem.Allocator) Self {
+        return .{
+            .table = null,
+            .parquet_table = null,
+            .delta_table = null,
+            .iceberg_table = iceberg_table,
+            .allocator = allocator,
+            .column_cache = std.StringHashMap(CachedColumn).init(allocator),
+            .dispatcher = null,
+            .logic_table_aliases = std.StringHashMap([]const u8).init(allocator),
+            .active_source = null,
+            .tables = std.StringHashMap(*Table).init(allocator),
+            .method_results_cache = std.StringHashMap([]const f64).init(allocator),
         };
     }
 
@@ -385,6 +452,63 @@ pub const Executor = struct {
     /// This is used by internal methods that expect a table to be configured.
     inline fn tbl(self: *Self) *Table {
         return self.table orelse unreachable;
+    }
+
+    /// Check if operating in Parquet mode
+    inline fn isParquetMode(self: *Self) bool {
+        return self.parquet_table != null;
+    }
+
+    /// Check if operating in Delta mode
+    inline fn isDeltaMode(self: *Self) bool {
+        return self.delta_table != null;
+    }
+
+    /// Check if operating in Iceberg mode
+    inline fn isIcebergMode(self: *Self) bool {
+        return self.iceberg_table != null;
+    }
+
+    /// Get row count (works with Lance, Parquet, Delta, or Iceberg)
+    fn getRowCount(self: *Self) !usize {
+        if (self.parquet_table) |pq| {
+            return pq.numRows();
+        }
+        if (self.delta_table) |dt| {
+            return dt.numRows();
+        }
+        if (self.iceberg_table) |it| {
+            return it.numRows();
+        }
+        return try self.tbl().rowCount(0);
+    }
+
+    /// Get column names (works with Lance, Parquet, Delta, or Iceberg)
+    fn getColumnNames(self: *Self) ![][]const u8 {
+        if (self.parquet_table) |pq| {
+            return pq.getColumnNames();
+        }
+        if (self.delta_table) |dt| {
+            return dt.getColumnNames();
+        }
+        if (self.iceberg_table) |it| {
+            return it.getColumnNames();
+        }
+        return try self.tbl().columnNames();
+    }
+
+    /// Get physical column ID by name (works with Lance, Parquet, Delta, or Iceberg)
+    fn getPhysicalColumnId(self: *Self, name: []const u8) ?u32 {
+        if (self.parquet_table) |pq| {
+            return if (pq.columnIndex(name)) |idx| @intCast(idx) else null;
+        }
+        if (self.delta_table) |dt| {
+            return if (dt.columnIndex(name)) |idx| @intCast(idx) else null;
+        }
+        if (self.iceberg_table) |it| {
+            return if (it.columnIndex(name)) |idx| @intCast(idx) else null;
+        }
+        return self.tbl().physicalColumnId(name);
     }
 
     /// Set the dispatcher for @logic_table method calls
@@ -422,6 +546,14 @@ pub const Executor = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.logic_table_aliases.deinit();
+
+        // Free method results cache
+        var results_iter = self.method_results_cache.iterator();
+        while (results_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.method_results_cache.deinit();
 
         // Clean up registered tables map (tables are owned by caller, just deinit the map)
         self.tables.deinit();
@@ -465,6 +597,21 @@ pub const Executor = struct {
 
     /// Preload columns into cache
     fn preloadColumns(self: *Self, col_names: []const []const u8) !void {
+        // Use Parquet-specific preloading if in Parquet mode
+        if (self.parquet_table) |pq| {
+            return self.preloadParquetColumns(pq, col_names);
+        }
+
+        // Use Delta-specific preloading if in Delta mode
+        if (self.delta_table) |dt| {
+            return self.preloadDeltaColumns(dt, col_names);
+        }
+
+        // Use Iceberg-specific preloading if in Iceberg mode
+        if (self.iceberg_table) |it| {
+            return self.preloadIcebergColumns(it, col_names);
+        }
+
         for (col_names) |name| {
             // Skip if already cached
             if (self.column_cache.contains(name)) continue;
@@ -527,6 +674,126 @@ pub const Executor = struct {
                 try self.column_cache.put(name, CachedColumn{ .string = data });
             } else {
                 return error.UnsupportedColumnType;
+            }
+        }
+    }
+
+    /// Preload Parquet columns into cache
+    fn preloadParquetColumns(self: *Self, pq: *ParquetTable, col_names: []const []const u8) !void {
+        for (col_names) |name| {
+            // Skip if already cached
+            if (self.column_cache.contains(name)) continue;
+
+            const col_idx = pq.columnIndex(name) orelse return error.ColumnNotFound;
+            const col_type = pq.getColumnType(col_idx) orelse return error.InvalidColumn;
+
+            // Read and cache column based on Parquet type
+            switch (col_type) {
+                .int64 => {
+                    const data = pq.readInt64Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .int64 = data });
+                },
+                .int32 => {
+                    const data = pq.readInt32Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .int32 = data });
+                },
+                .double => {
+                    const data = pq.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .float64 = data });
+                },
+                .float => {
+                    const data = pq.readFloat32Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .float32 = data });
+                },
+                .boolean => {
+                    const data = pq.readBoolColumn(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .bool_ = data });
+                },
+                .byte_array, .fixed_len_byte_array => {
+                    const data = pq.readStringColumn(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .string = data });
+                },
+                else => return error.UnsupportedColumnType,
+            }
+        }
+    }
+
+    /// Preload columns into cache from Delta table
+    fn preloadDeltaColumns(self: *Self, dt: *DeltaTable, col_names: []const []const u8) !void {
+        for (col_names) |name| {
+            // Skip if already cached
+            if (self.column_cache.contains(name)) continue;
+
+            const col_idx = dt.columnIndex(name) orelse return error.ColumnNotFound;
+            const col_type = dt.getColumnType(col_idx) orelse return error.InvalidColumn;
+
+            // Read and cache column based on Parquet type (Delta uses Parquet underneath)
+            switch (col_type) {
+                .int64 => {
+                    const data = dt.readInt64Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .int64 = data });
+                },
+                .int32 => {
+                    const data = dt.readInt32Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .int32 = data });
+                },
+                .double => {
+                    const data = dt.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .float64 = data });
+                },
+                .float => {
+                    const data = dt.readFloat32Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .float32 = data });
+                },
+                .boolean => {
+                    const data = dt.readBoolColumn(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .bool_ = data });
+                },
+                .byte_array, .fixed_len_byte_array => {
+                    const data = dt.readStringColumn(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .string = data });
+                },
+                else => return error.UnsupportedColumnType,
+            }
+        }
+    }
+
+    /// Preload columns into cache from Iceberg table
+    fn preloadIcebergColumns(self: *Self, it: *IcebergTable, col_names: []const []const u8) !void {
+        for (col_names) |name| {
+            // Skip if already cached
+            if (self.column_cache.contains(name)) continue;
+
+            const col_idx = it.columnIndex(name) orelse return error.ColumnNotFound;
+            const col_type = it.getColumnType(col_idx) orelse return error.InvalidColumn;
+
+            // Read and cache column based on Parquet type (Iceberg uses Parquet underneath)
+            switch (col_type) {
+                .int64 => {
+                    const data = it.readInt64Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .int64 = data });
+                },
+                .int32 => {
+                    const data = it.readInt32Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .int32 = data });
+                },
+                .double => {
+                    const data = it.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .float64 = data });
+                },
+                .float => {
+                    const data = it.readFloat32Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .float32 = data });
+                },
+                .boolean => {
+                    const data = it.readBoolColumn(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .bool_ = data });
+                },
+                .byte_array, .fixed_len_byte_array => {
+                    const data = it.readStringColumn(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .string = data });
+                },
+                else => return error.UnsupportedColumnType,
             }
         }
     }
@@ -973,6 +1240,21 @@ pub const Executor = struct {
 
     /// Execute a SELECT statement
     pub fn execute(self: *Self, stmt: *const SelectStmt, params: []const Value) !Result {
+        // For Parquet mode, skip table source resolution - we already have the table
+        if (self.parquet_table != null) {
+            return self.executeParquet(stmt, params);
+        }
+
+        // For Delta mode, skip table source resolution - we already have the table
+        if (self.delta_table != null) {
+            return self.executeDelta(stmt, params);
+        }
+
+        // For Iceberg mode, skip table source resolution - we already have the table
+        if (self.iceberg_table != null) {
+            return self.executeIceberg(stmt, params);
+        }
+
         // 0. Resolve FROM clause to get table source
         var source = try self.resolveTableSource(&stmt.from);
         defer self.releaseTableSource(&source);
@@ -1066,6 +1348,189 @@ pub const Executor = struct {
         }
 
         return result;
+    }
+
+    /// Execute a SELECT statement on a Parquet table
+    fn executeParquet(self: *Self, stmt: *const SelectStmt, params: []const Value) !Result {
+        _ = self.parquet_table.?; // Ensure we're in Parquet mode
+
+        // 1. Preload columns referenced in WHERE clause
+        if (stmt.where) |where_expr| {
+            var col_names = std.ArrayList([]const u8){};
+            defer col_names.deinit(self.allocator);
+
+            try self.extractColumnNames(&where_expr, &col_names);
+            try self.preloadColumns(col_names.items);
+        }
+
+        // 2. Apply WHERE clause to get filtered row indices
+        const indices = if (stmt.where) |where_expr|
+            try self.evaluateWhere(&where_expr, params)
+        else
+            try self.getAllIndices();
+
+        defer self.allocator.free(indices);
+
+        // 3. Check if we need GROUP BY processing
+        const has_group_by = stmt.group_by != null;
+        const has_aggregates = self.hasAggregates(stmt.columns);
+
+        if (has_group_by or has_aggregates) {
+            // Aggregates work via column_cache which is already populated for Parquet
+            return self.executeWithGroupBy(stmt, indices);
+        }
+
+        // 4. Read columns based on SELECT list (reuse existing readColumns)
+        const base_columns = try self.readColumns(stmt.columns, indices);
+        defer self.allocator.free(base_columns);
+
+        var columns_list = std.ArrayList(Result.Column){};
+        errdefer {
+            for (columns_list.items) |*col| {
+                self.freeColumnData(&col.data);
+            }
+            columns_list.deinit(self.allocator);
+        }
+        try columns_list.appendSlice(self.allocator, base_columns);
+
+        const columns = try columns_list.toOwnedSlice(self.allocator);
+        var row_count = indices.len;
+
+        // 5. Apply ORDER BY
+        if (stmt.order_by) |order_by| {
+            try self.applyOrderBy(columns, order_by);
+        }
+
+        // 6. Apply LIMIT and OFFSET
+        row_count = self.applyLimitOffset(columns, stmt.limit, stmt.offset);
+
+        return Result{
+            .columns = columns,
+            .row_count = row_count,
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Execute query in Delta mode
+    fn executeDelta(self: *Self, stmt: *const SelectStmt, params: []const Value) !Result {
+        _ = self.delta_table.?; // Ensure we're in Delta mode
+
+        // 1. Preload columns referenced in WHERE clause
+        if (stmt.where) |where_expr| {
+            var col_names = std.ArrayList([]const u8){};
+            defer col_names.deinit(self.allocator);
+
+            try self.extractColumnNames(&where_expr, &col_names);
+            try self.preloadColumns(col_names.items);
+        }
+
+        // 2. Apply WHERE clause to get filtered row indices
+        const indices = if (stmt.where) |where_expr|
+            try self.evaluateWhere(&where_expr, params)
+        else
+            try self.getAllIndices();
+
+        defer self.allocator.free(indices);
+
+        // 3. Check if we need GROUP BY processing
+        const has_group_by = stmt.group_by != null;
+        const has_aggregates = self.hasAggregates(stmt.columns);
+
+        if (has_group_by or has_aggregates) {
+            // Aggregates work via column_cache which is already populated for Delta
+            return self.executeWithGroupBy(stmt, indices);
+        }
+
+        // 4. Read columns based on SELECT list (reuse existing readColumns)
+        const base_columns = try self.readColumns(stmt.columns, indices);
+        defer self.allocator.free(base_columns);
+
+        var columns_list = std.ArrayList(Result.Column){};
+        errdefer {
+            for (columns_list.items) |*col| {
+                self.freeColumnData(&col.data);
+            }
+            columns_list.deinit(self.allocator);
+        }
+        try columns_list.appendSlice(self.allocator, base_columns);
+
+        const columns = try columns_list.toOwnedSlice(self.allocator);
+        var row_count = indices.len;
+
+        // 5. Apply ORDER BY
+        if (stmt.order_by) |order_by| {
+            try self.applyOrderBy(columns, order_by);
+        }
+
+        // 6. Apply LIMIT and OFFSET
+        row_count = self.applyLimitOffset(columns, stmt.limit, stmt.offset);
+
+        return Result{
+            .columns = columns,
+            .row_count = row_count,
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Execute query in Iceberg mode
+    fn executeIceberg(self: *Self, stmt: *const SelectStmt, params: []const Value) !Result {
+        _ = self.iceberg_table.?; // Ensure we're in Iceberg mode
+
+        // 1. Preload columns referenced in WHERE clause
+        if (stmt.where) |where_expr| {
+            var col_names = std.ArrayList([]const u8){};
+            defer col_names.deinit(self.allocator);
+
+            try self.extractColumnNames(&where_expr, &col_names);
+            try self.preloadColumns(col_names.items);
+        }
+
+        // 2. Apply WHERE clause to get filtered row indices
+        const indices = if (stmt.where) |where_expr|
+            try self.evaluateWhere(&where_expr, params)
+        else
+            try self.getAllIndices();
+
+        defer self.allocator.free(indices);
+
+        // 3. Check if we need GROUP BY processing
+        const has_group_by = stmt.group_by != null;
+        const has_aggregates = self.hasAggregates(stmt.columns);
+
+        if (has_group_by or has_aggregates) {
+            // Aggregates work via column_cache which is already populated for Iceberg
+            return self.executeWithGroupBy(stmt, indices);
+        }
+
+        // 4. Read columns based on SELECT list (reuse existing readColumns)
+        const base_columns = try self.readColumns(stmt.columns, indices);
+        defer self.allocator.free(base_columns);
+
+        var columns_list = std.ArrayList(Result.Column){};
+        errdefer {
+            for (columns_list.items) |*col| {
+                self.freeColumnData(&col.data);
+            }
+            columns_list.deinit(self.allocator);
+        }
+        try columns_list.appendSlice(self.allocator, base_columns);
+
+        const columns = try columns_list.toOwnedSlice(self.allocator);
+        var row_count = indices.len;
+
+        // 5. Apply ORDER BY
+        if (stmt.order_by) |order_by| {
+            try self.applyOrderBy(columns, order_by);
+        }
+
+        // 6. Apply LIMIT and OFFSET
+        row_count = self.applyLimitOffset(columns, stmt.limit, stmt.offset);
+
+        return Result{
+            .columns = columns,
+            .row_count = row_count,
+            .allocator = self.allocator,
+        };
     }
 
     // ========================================================================
@@ -1240,22 +1705,22 @@ pub const Executor = struct {
             switch (col.data) {
                 .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| {
                     var buf: [32]u8 = undefined;
-                    const s = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch unreachable;
+                    const s = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch "?";
                     try key_parts.appendSlice(self.allocator, s);
                 },
                 .int32, .date32 => |data| {
-                    var buf: [16]u8 = undefined;
-                    const s = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch unreachable;
+                    var buf: [24]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch "?";
                     try key_parts.appendSlice(self.allocator, s);
                 },
                 .float64 => |data| {
                     var buf: [64]u8 = undefined;
-                    const s = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch unreachable;
+                    const s = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch "?";
                     try key_parts.appendSlice(self.allocator, s);
                 },
                 .float32 => |data| {
-                    var buf: [32]u8 = undefined;
-                    const s = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch unreachable;
+                    var buf: [48]u8 = undefined;
+                    const s = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch "?";
                     try key_parts.appendSlice(self.allocator, s);
                 },
                 .bool_ => |data| {
@@ -2666,8 +3131,8 @@ pub const Executor = struct {
         var bound_expr = try self.bindParameters(where_expr, params);
         defer self.freeExpr(&bound_expr);
 
-        // Get total row count
-        const row_count = try self.tbl().rowCount(0);
+        // Get total row count (works with both Lance and Parquet)
+        const row_count = try self.getRowCount();
 
         // Evaluate expression for each row
         var matching_indices = std.ArrayList(u32){};
@@ -3162,15 +3627,20 @@ pub const Executor = struct {
     }
 
     /// Evaluate a @logic_table method call (e.g., t.risk_score())
+    ///
+    /// This uses batch dispatch to compute all method results at once, then caches them.
+    /// On subsequent calls with different row indices, the cached results are returned.
+    ///
+    /// For methods that require column data (Phase 3/4), the inputs need to be populated
+    /// with ColumnBinding data from the Lance table.
+    ///
     fn evaluateMethodCall(self: *Self, mc: anytype, row_idx: u32) !Value {
-        _ = row_idx; // TODO: Support row-wise method calls
-
         // Get class name from alias
         const class_name = self.logic_table_aliases.get(mc.object) orelse
             return error.TableAliasNotFound;
 
         // Get dispatcher
-        const dispatcher = self.dispatcher orelse
+        var dispatcher = self.dispatcher orelse
             return error.NoDispatcherConfigured;
 
         // For now, we only support methods with no runtime arguments
@@ -3179,12 +3649,73 @@ pub const Executor = struct {
             return error.MethodArgsNotSupported;
         }
 
-        // Call the method via dispatcher (0-arg methods for now)
-        // TODO: This is placeholder - real impl needs LogicTableContext data binding
+        // Build cache key: "ClassName.methodName"
+        var cache_key_buf: [256]u8 = undefined;
+        const cache_key = std.fmt.bufPrint(&cache_key_buf, "{s}.{s}", .{ class_name, mc.method }) catch
+            return error.CacheKeyTooLong;
+
+        // Check if we have cached results
+        if (self.method_results_cache.get(cache_key)) |cached_results| {
+            if (row_idx < cached_results.len) {
+                return Value{ .float = cached_results[row_idx] };
+            }
+            return error.RowIndexOutOfBounds;
+        }
+
+        // No cached results - compute batch results
+
+        // Determine row count from the current table
+        const row_count: usize = blk: {
+            if (self.table) |t| {
+                // Get row count from column 0
+                const count = t.rowCount(0) catch 1000;
+                break :blk @intCast(count);
+            }
+            // No table - use a default batch size
+            break :blk 1000;
+        };
+
+        // Check if this is a batch method
+        if (dispatcher.isBatchMethod(class_name, mc.method)) {
+            // Allocate output buffer
+            var output = logic_table_dispatch.ColumnBuffer.initFloat64(self.allocator, row_count) catch
+                return error.OutOfMemory;
+            errdefer output.deinit(self.allocator);
+
+            // TODO (Phase 3): Get method dependencies and load column data
+            // For now, pass empty inputs - methods that don't need column data will work
+            const inputs = &[_]logic_table_dispatch.ColumnBinding{};
+
+            // Call batch dispatch
+            dispatcher.callMethodBatch(class_name, mc.method, inputs, null, &output, null) catch |err| {
+                return switch (err) {
+                    logic_table_dispatch.DispatchError.MethodNotFound => error.MethodNotFound,
+                    logic_table_dispatch.DispatchError.ArgumentCountMismatch => error.ArgumentCountMismatch,
+                    else => error.ExecutionFailed,
+                };
+            };
+
+            // Cache the results
+            const results = output.f64 orelse return error.NoResults;
+            const cache_key_copy = self.allocator.dupe(u8, cache_key) catch
+                return error.OutOfMemory;
+            self.method_results_cache.put(cache_key_copy, results) catch {
+                self.allocator.free(cache_key_copy);
+                return error.CachePutFailed;
+            };
+
+            // Return the result for this row
+            if (row_idx < results.len) {
+                return Value{ .float = results[row_idx] };
+            }
+            return error.RowIndexOutOfBounds;
+        }
+
+        // Fallback to scalar dispatch for non-batch methods
         const result = dispatcher.callMethod0(class_name, mc.method) catch |err| {
             return switch (err) {
-                error.MethodNotFound => error.MethodNotFound,
-                error.ArgumentCountMismatch => error.ArgumentCountMismatch,
+                logic_table_dispatch.DispatchError.MethodNotFound => error.MethodNotFound,
+                logic_table_dispatch.DispatchError.ArgumentCountMismatch => error.ArgumentCountMismatch,
                 else => error.ExecutionFailed,
             };
         };
@@ -4061,8 +4592,8 @@ pub const Executor = struct {
 
     /// Get all row indices (0, 1, 2, ..., n-1)
     fn getAllIndices(self: *Self) ![]u32 {
-        // Get row count from first column
-        const row_count = try self.tbl().rowCount(0);
+        // Get row count (works with both Lance and Parquet)
+        const row_count = try self.getRowCount();
         const indices = try self.allocator.alloc(u32, @intCast(row_count));
 
         for (indices, 0..) |*idx, i| {
@@ -4096,13 +4627,15 @@ pub const Executor = struct {
 
             // Handle SELECT *
             if (item.expr == .column and std.mem.eql(u8, item.expr.column.name, "*")) {
-                const col_names = try self.tbl().columnNames();
-                defer self.allocator.free(col_names);
+                const col_names = try self.getColumnNames();
+                // Note: Parquet returns stored slice, Lance allocates - handle both cases
+                const should_free = !self.isParquetMode();
+                defer if (should_free) self.allocator.free(col_names);
 
                 for (col_names) |col_name| {
                     // Look up the physical column ID from the name
                     // The physical column ID maps to the column metadata index
-                    const physical_col_id = self.tbl().physicalColumnId(col_name) orelse return error.ColumnNotFound;
+                    const physical_col_id = self.getPhysicalColumnId(col_name) orelse return error.ColumnNotFound;
                     const data = try self.readColumnAtIndices(physical_col_id, indices);
 
                     try columns.append(self.allocator, Result.Column{
@@ -4116,7 +4649,7 @@ pub const Executor = struct {
             // Handle regular column
             if (item.expr == .column) {
                 const col_name = item.expr.column.name;
-                const col_idx = self.tbl().physicalColumnId(col_name) orelse return error.ColumnNotFound;
+                const col_idx = self.getPhysicalColumnId(col_name) orelse return error.ColumnNotFound;
                 const data = try self.readColumnAtIndices(col_idx, indices);
 
                 try columns.append(self.allocator, Result.Column{
@@ -4139,6 +4672,21 @@ pub const Executor = struct {
         col_idx: u32,
         indices: []const u32,
     ) !Result.ColumnData {
+        // Use Parquet-specific reading if in Parquet mode
+        if (self.parquet_table) |pq| {
+            return self.readParquetColumnAtIndices(pq, col_idx, indices);
+        }
+
+        // Use Delta-specific reading if in Delta mode
+        if (self.delta_table) |dt| {
+            return self.readDeltaColumnAtIndices(dt, col_idx, indices);
+        }
+
+        // Use Iceberg-specific reading if in Iceberg mode
+        if (self.iceberg_table) |it| {
+            return self.readIcebergColumnAtIndices(it, col_idx, indices);
+        }
+
         const field = self.tbl().getFieldById(col_idx) orelse return error.InvalidColumn;
 
         // Phase 2: Table API now has readAtIndices() methods
@@ -4270,6 +4818,243 @@ pub const Executor = struct {
             return Result.ColumnData{ .string = filtered };
         } else {
             return error.UnsupportedColumnType;
+        }
+    }
+
+    /// Read Parquet column data at specific row indices
+    fn readParquetColumnAtIndices(
+        self: *Self,
+        pq: *ParquetTable,
+        col_idx: u32,
+        indices: []const u32,
+    ) !Result.ColumnData {
+        const col_type = pq.getColumnType(col_idx) orelse return error.InvalidColumn;
+
+        switch (col_type) {
+            .int64 => {
+                const all_data = pq.readInt64Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+
+                const filtered = try self.allocator.alloc(i64, indices.len);
+                for (indices, 0..) |idx, i| {
+                    filtered[i] = all_data[idx];
+                }
+                return Result.ColumnData{ .int64 = filtered };
+            },
+            .int32 => {
+                const all_data = pq.readInt32Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+
+                const filtered = try self.allocator.alloc(i32, indices.len);
+                for (indices, 0..) |idx, i| {
+                    filtered[i] = all_data[idx];
+                }
+                return Result.ColumnData{ .int32 = filtered };
+            },
+            .double => {
+                const all_data = pq.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+
+                const filtered = try self.allocator.alloc(f64, indices.len);
+                for (indices, 0..) |idx, i| {
+                    filtered[i] = all_data[idx];
+                }
+                return Result.ColumnData{ .float64 = filtered };
+            },
+            .float => {
+                const all_data = pq.readFloat32Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+
+                const filtered = try self.allocator.alloc(f32, indices.len);
+                for (indices, 0..) |idx, i| {
+                    filtered[i] = all_data[idx];
+                }
+                return Result.ColumnData{ .float32 = filtered };
+            },
+            .boolean => {
+                const all_data = pq.readBoolColumn(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+
+                const filtered = try self.allocator.alloc(bool, indices.len);
+                for (indices, 0..) |idx, i| {
+                    filtered[i] = all_data[idx];
+                }
+                return Result.ColumnData{ .bool_ = filtered };
+            },
+            .byte_array, .fixed_len_byte_array => {
+                const all_data = pq.readStringColumn(col_idx) catch return error.ColumnReadError;
+                defer {
+                    for (all_data) |str| {
+                        self.allocator.free(str);
+                    }
+                    self.allocator.free(all_data);
+                }
+
+                const filtered = try self.allocator.alloc([]const u8, indices.len);
+                for (indices, 0..) |idx, i| {
+                    filtered[i] = try self.allocator.dupe(u8, all_data[idx]);
+                }
+                return Result.ColumnData{ .string = filtered };
+            },
+            else => return error.UnsupportedColumnType,
+        }
+    }
+
+    /// Read Delta column data at specific indices (filtered access)
+    fn readDeltaColumnAtIndices(
+        self: *Self,
+        dt: *DeltaTable,
+        col_idx: u32,
+        indices: []const u32,
+    ) !Result.ColumnData {
+        const col_type = dt.getColumnType(col_idx) orelse return error.InvalidColumn;
+
+        switch (col_type) {
+            .int64 => {
+                const all_data = dt.readInt64Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+
+                const filtered = try self.allocator.alloc(i64, indices.len);
+                for (indices, 0..) |idx, i| {
+                    filtered[i] = all_data[idx];
+                }
+                return Result.ColumnData{ .int64 = filtered };
+            },
+            .int32 => {
+                const all_data = dt.readInt32Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+
+                const filtered = try self.allocator.alloc(i32, indices.len);
+                for (indices, 0..) |idx, i| {
+                    filtered[i] = all_data[idx];
+                }
+                return Result.ColumnData{ .int32 = filtered };
+            },
+            .double => {
+                const all_data = dt.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+
+                const filtered = try self.allocator.alloc(f64, indices.len);
+                for (indices, 0..) |idx, i| {
+                    filtered[i] = all_data[idx];
+                }
+                return Result.ColumnData{ .float64 = filtered };
+            },
+            .float => {
+                const all_data = dt.readFloat32Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+
+                const filtered = try self.allocator.alloc(f32, indices.len);
+                for (indices, 0..) |idx, i| {
+                    filtered[i] = all_data[idx];
+                }
+                return Result.ColumnData{ .float32 = filtered };
+            },
+            .boolean => {
+                const all_data = dt.readBoolColumn(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+
+                const filtered = try self.allocator.alloc(bool, indices.len);
+                for (indices, 0..) |idx, i| {
+                    filtered[i] = all_data[idx];
+                }
+                return Result.ColumnData{ .bool_ = filtered };
+            },
+            .byte_array, .fixed_len_byte_array => {
+                const all_data = dt.readStringColumn(col_idx) catch return error.ColumnReadError;
+                defer {
+                    for (all_data) |str| {
+                        self.allocator.free(str);
+                    }
+                    self.allocator.free(all_data);
+                }
+
+                const filtered = try self.allocator.alloc([]const u8, indices.len);
+                for (indices, 0..) |idx, i| {
+                    filtered[i] = try self.allocator.dupe(u8, all_data[idx]);
+                }
+                return Result.ColumnData{ .string = filtered };
+            },
+            else => return error.UnsupportedColumnType,
+        }
+    }
+
+    /// Read Iceberg column data at specific indices (filtered access)
+    fn readIcebergColumnAtIndices(
+        self: *Self,
+        it: *IcebergTable,
+        col_idx: u32,
+        indices: []const u32,
+    ) !Result.ColumnData {
+        const col_type = it.getColumnType(col_idx) orelse return error.InvalidColumn;
+
+        switch (col_type) {
+            .int64 => {
+                const all_data = it.readInt64Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+
+                const filtered = try self.allocator.alloc(i64, indices.len);
+                for (indices, 0..) |idx, i| {
+                    filtered[i] = all_data[idx];
+                }
+                return Result.ColumnData{ .int64 = filtered };
+            },
+            .int32 => {
+                const all_data = it.readInt32Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+
+                const filtered = try self.allocator.alloc(i32, indices.len);
+                for (indices, 0..) |idx, i| {
+                    filtered[i] = all_data[idx];
+                }
+                return Result.ColumnData{ .int32 = filtered };
+            },
+            .double => {
+                const all_data = it.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+
+                const filtered = try self.allocator.alloc(f64, indices.len);
+                for (indices, 0..) |idx, i| {
+                    filtered[i] = all_data[idx];
+                }
+                return Result.ColumnData{ .float64 = filtered };
+            },
+            .float => {
+                const all_data = it.readFloat32Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+
+                const filtered = try self.allocator.alloc(f32, indices.len);
+                for (indices, 0..) |idx, i| {
+                    filtered[i] = all_data[idx];
+                }
+                return Result.ColumnData{ .float32 = filtered };
+            },
+            .boolean => {
+                const all_data = it.readBoolColumn(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+
+                const filtered = try self.allocator.alloc(bool, indices.len);
+                for (indices, 0..) |idx, i| {
+                    filtered[i] = all_data[idx];
+                }
+                return Result.ColumnData{ .bool_ = filtered };
+            },
+            .byte_array, .fixed_len_byte_array => {
+                const all_data = it.readStringColumn(col_idx) catch return error.ColumnReadError;
+                defer {
+                    for (all_data) |str| {
+                        self.allocator.free(str);
+                    }
+                    self.allocator.free(all_data);
+                }
+
+                const filtered = try self.allocator.alloc([]const u8, indices.len);
+                for (indices, 0..) |idx, i| {
+                    filtered[i] = try self.allocator.dupe(u8, all_data[idx]);
+                }
+                return Result.ColumnData{ .string = filtered };
+            },
+            else => return error.UnsupportedColumnType,
         }
     }
 
