@@ -1537,4 +1537,2795 @@ test.describe('Vault SQL Operations', () => {
             expect(t.pass, `${t.sql}: ${t.error || ''}`).toBe(true);
         }
     });
+
+    test('COALESCE function', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE coalesce_test (id INT, val1 TEXT, val2 TEXT, val3 TEXT)');
+            await v.exec("INSERT INTO coalesce_test VALUES (1, NULL, 'second', 'third')");
+            await v.exec("INSERT INTO coalesce_test VALUES (2, 'first', 'second', 'third')");
+            await v.exec("INSERT INTO coalesce_test VALUES (3, NULL, NULL, 'third')");
+
+            // Test COALESCE returns first non-null
+            try {
+                const res = await v.exec("SELECT COALESCE(val1, val2, val3) AS result FROM coalesce_test WHERE id = 1");
+                tests.push({
+                    name: 'COALESCE skips null',
+                    pass: res.rows[0].result === 'second',
+                    error: `Expected 'second', got ${res.rows[0]?.result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'COALESCE skips null', pass: false, error: e.message });
+            }
+
+            // Test COALESCE returns first when not null
+            try {
+                const res = await v.exec("SELECT COALESCE(val1, val2, val3) AS result FROM coalesce_test WHERE id = 2");
+                tests.push({
+                    name: 'COALESCE returns first non-null',
+                    pass: res.rows[0].result === 'first',
+                    error: `Expected 'first', got ${res.rows[0]?.result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'COALESCE returns first non-null', pass: false, error: e.message });
+            }
+
+            // Test COALESCE with literal default
+            try {
+                const res = await v.exec("SELECT COALESCE(val1, 'default') AS result FROM coalesce_test WHERE id = 1");
+                tests.push({
+                    name: 'COALESCE with literal',
+                    pass: res.rows[0].result === 'default',
+                    error: `Expected 'default', got ${res.rows[0]?.result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'COALESCE with literal', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE coalesce_test');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || ''}`).toBe(true);
+        }
+    });
+
+    test('NULLIF function', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE nullif_test (id INT, val INT)');
+            await v.exec('INSERT INTO nullif_test VALUES (1, 0), (2, 5), (3, 0)');
+
+            // Test NULLIF returns null when equal
+            try {
+                const res = await v.exec('SELECT NULLIF(val, 0) AS result FROM nullif_test WHERE id = 1');
+                tests.push({
+                    name: 'NULLIF returns null when equal',
+                    pass: res.rows[0].result === null,
+                    error: `Expected null, got ${res.rows[0]?.result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'NULLIF returns null when equal', pass: false, error: e.message });
+            }
+
+            // Test NULLIF returns value when not equal
+            try {
+                const res = await v.exec('SELECT NULLIF(val, 0) AS result FROM nullif_test WHERE id = 2');
+                tests.push({
+                    name: 'NULLIF returns value when not equal',
+                    pass: res.rows[0].result === 5,
+                    error: `Expected 5, got ${res.rows[0]?.result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'NULLIF returns value when not equal', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE nullif_test');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || ''}`).toBe(true);
+        }
+    });
+
+    test('CASE WHEN expression', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE case_test (id INT, status TEXT, score INT)');
+            await v.exec("INSERT INTO case_test VALUES (1, 'active', 85)");
+            await v.exec("INSERT INTO case_test VALUES (2, 'pending', 60)");
+            await v.exec("INSERT INTO case_test VALUES (3, 'inactive', 40)");
+
+            // Test simple CASE (value matching)
+            try {
+                const res = await v.exec("SELECT CASE status WHEN 'active' THEN 'A' WHEN 'pending' THEN 'P' ELSE 'X' END AS code FROM case_test WHERE id = 1");
+                tests.push({
+                    name: 'Simple CASE returns matched value',
+                    pass: res.rows[0].code === 'A',
+                    error: `Expected 'A', got ${res.rows[0]?.code}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Simple CASE returns matched value', pass: false, error: e.message });
+            }
+
+            // Test CASE ELSE
+            try {
+                const res = await v.exec("SELECT CASE status WHEN 'active' THEN 'A' WHEN 'pending' THEN 'P' ELSE 'X' END AS code FROM case_test WHERE id = 3");
+                tests.push({
+                    name: 'CASE returns ELSE when no match',
+                    pass: res.rows[0].code === 'X',
+                    error: `Expected 'X', got ${res.rows[0]?.code}`
+                });
+            } catch (e) {
+                tests.push({ name: 'CASE returns ELSE when no match', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE case_test');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || ''}`).toBe(true);
+        }
+    });
+
+    test('String functions', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE str_test (id INT, name TEXT)');
+            await v.exec("INSERT INTO str_test VALUES (1, 'Hello World')");
+
+            // Test UPPER
+            try {
+                const res = await v.exec('SELECT UPPER(name) AS result FROM str_test');
+                tests.push({
+                    name: 'UPPER',
+                    pass: res.rows[0].result === 'HELLO WORLD',
+                    error: `Expected 'HELLO WORLD', got ${res.rows[0]?.result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'UPPER', pass: false, error: e.message });
+            }
+
+            // Test LOWER
+            try {
+                const res = await v.exec('SELECT LOWER(name) AS result FROM str_test');
+                tests.push({
+                    name: 'LOWER',
+                    pass: res.rows[0].result === 'hello world',
+                    error: `Expected 'hello world', got ${res.rows[0]?.result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'LOWER', pass: false, error: e.message });
+            }
+
+            // Test LENGTH
+            try {
+                const res = await v.exec('SELECT LENGTH(name) AS result FROM str_test');
+                tests.push({
+                    name: 'LENGTH',
+                    pass: res.rows[0].result === 11,
+                    error: `Expected 11, got ${res.rows[0]?.result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'LENGTH', pass: false, error: e.message });
+            }
+
+            // Test SUBSTR
+            try {
+                const res = await v.exec('SELECT SUBSTR(name, 1, 5) AS result FROM str_test');
+                tests.push({
+                    name: 'SUBSTR',
+                    pass: res.rows[0].result === 'Hello',
+                    error: `Expected 'Hello', got ${res.rows[0]?.result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'SUBSTR', pass: false, error: e.message });
+            }
+
+            // Test CONCAT
+            try {
+                const res = await v.exec("SELECT CONCAT(name, '!') AS result FROM str_test");
+                tests.push({
+                    name: 'CONCAT',
+                    pass: res.rows[0].result === 'Hello World!',
+                    error: `Expected 'Hello World!', got ${res.rows[0]?.result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'CONCAT', pass: false, error: e.message });
+            }
+
+            // Test REPLACE
+            try {
+                const res = await v.exec("SELECT REPLACE(name, 'World', 'SQL') AS result FROM str_test");
+                tests.push({
+                    name: 'REPLACE',
+                    pass: res.rows[0].result === 'Hello SQL',
+                    error: `Expected 'Hello SQL', got ${res.rows[0]?.result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'REPLACE', pass: false, error: e.message });
+            }
+
+            // Test TRIM
+            await v.exec("INSERT INTO str_test VALUES (2, '  padded  ')");
+            try {
+                const res = await v.exec('SELECT TRIM(name) AS result FROM str_test WHERE id = 2');
+                tests.push({
+                    name: 'TRIM',
+                    pass: res.rows[0].result === 'padded',
+                    error: `Expected 'padded', got '${res.rows[0]?.result}'`
+                });
+            } catch (e) {
+                tests.push({ name: 'TRIM', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE str_test');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || ''}`).toBe(true);
+        }
+    });
+
+    test('Math functions', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE math_test (id INT, val FLOAT)');
+            await v.exec('INSERT INTO math_test VALUES (1, -5.7), (2, 16), (3, 3.14159)');
+
+            // Test ABS
+            try {
+                const res = await v.exec('SELECT ABS(val) AS result FROM math_test WHERE id = 1');
+                tests.push({
+                    name: 'ABS',
+                    pass: Math.abs(res.rows[0].result - 5.7) < 0.001,
+                    error: `Expected 5.7, got ${res.rows[0]?.result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'ABS', pass: false, error: e.message });
+            }
+
+            // Test SQRT
+            try {
+                const res = await v.exec('SELECT SQRT(val) AS result FROM math_test WHERE id = 2');
+                tests.push({
+                    name: 'SQRT',
+                    pass: res.rows[0].result === 4,
+                    error: `Expected 4, got ${res.rows[0]?.result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'SQRT', pass: false, error: e.message });
+            }
+
+            // Test ROUND
+            try {
+                const res = await v.exec('SELECT ROUND(val, 2) AS result FROM math_test WHERE id = 3');
+                tests.push({
+                    name: 'ROUND',
+                    pass: res.rows[0].result === 3.14,
+                    error: `Expected 3.14, got ${res.rows[0]?.result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'ROUND', pass: false, error: e.message });
+            }
+
+            // Test CEIL
+            try {
+                const res = await v.exec('SELECT CEIL(val) AS result FROM math_test WHERE id = 3');
+                tests.push({
+                    name: 'CEIL',
+                    pass: res.rows[0].result === 4,
+                    error: `Expected 4, got ${res.rows[0]?.result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'CEIL', pass: false, error: e.message });
+            }
+
+            // Test FLOOR
+            try {
+                const res = await v.exec('SELECT FLOOR(val) AS result FROM math_test WHERE id = 3');
+                tests.push({
+                    name: 'FLOOR',
+                    pass: res.rows[0].result === 3,
+                    error: `Expected 3, got ${res.rows[0]?.result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'FLOOR', pass: false, error: e.message });
+            }
+
+            // Test MOD
+            try {
+                const res = await v.exec('SELECT MOD(val, 3) AS result FROM math_test WHERE id = 2');
+                tests.push({
+                    name: 'MOD',
+                    pass: res.rows[0].result === 1,
+                    error: `Expected 1, got ${res.rows[0]?.result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'MOD', pass: false, error: e.message });
+            }
+
+            // Test POWER
+            try {
+                const res = await v.exec('SELECT POWER(val, 2) AS result FROM math_test WHERE id = 2');
+                tests.push({
+                    name: 'POWER',
+                    pass: res.rows[0].result === 256,
+                    error: `Expected 256, got ${res.rows[0]?.result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'POWER', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE math_test');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || ''}`).toBe(true);
+        }
+    });
+
+    test('IS NULL and IS NOT NULL', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE null_test (id INT, name TEXT, value INT)');
+            await v.exec("INSERT INTO null_test VALUES (1, 'Alice', 100)");
+            await v.exec("INSERT INTO null_test VALUES (2, NULL, 200)");
+            await v.exec("INSERT INTO null_test VALUES (3, 'Bob', NULL)");
+
+            // Test IS NULL
+            try {
+                const res = await v.exec('SELECT * FROM null_test WHERE name IS NULL');
+                tests.push({
+                    name: 'IS NULL',
+                    pass: res.rows.length === 1 && res.rows[0].id === 2,
+                    error: `Expected 1 row with id=2, got ${res.rows.length} rows`
+                });
+            } catch (e) {
+                tests.push({ name: 'IS NULL', pass: false, error: e.message });
+            }
+
+            // Test IS NOT NULL
+            try {
+                const res = await v.exec('SELECT * FROM null_test WHERE name IS NOT NULL');
+                tests.push({
+                    name: 'IS NOT NULL',
+                    pass: res.rows.length === 2,
+                    error: `Expected 2 rows, got ${res.rows.length}`
+                });
+            } catch (e) {
+                tests.push({ name: 'IS NOT NULL', pass: false, error: e.message });
+            }
+
+            // Test IS NULL on value column
+            try {
+                const res = await v.exec('SELECT * FROM null_test WHERE value IS NULL');
+                tests.push({
+                    name: 'IS NULL (value)',
+                    pass: res.rows.length === 1 && res.rows[0].id === 3,
+                    error: `Expected 1 row with id=3, got ${res.rows.length} rows`
+                });
+            } catch (e) {
+                tests.push({ name: 'IS NULL (value)', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE null_test');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || ''}`).toBe(true);
+        }
+    });
+
+    test('NOT IN, NOT LIKE, NOT BETWEEN', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE not_test (id INT, name TEXT, age INT)');
+            await v.exec("INSERT INTO not_test VALUES (1, 'Alice', 25)");
+            await v.exec("INSERT INTO not_test VALUES (2, 'Bob', 30)");
+            await v.exec("INSERT INTO not_test VALUES (3, 'Charlie', 35)");
+            await v.exec("INSERT INTO not_test VALUES (4, 'David', 40)");
+
+            // Test NOT IN
+            try {
+                const res = await v.exec('SELECT * FROM not_test WHERE id NOT IN (1, 2)');
+                tests.push({
+                    name: 'NOT IN',
+                    pass: res.rows.length === 2 && res.rows[0].id === 3 && res.rows[1].id === 4,
+                    error: `Expected 2 rows with ids 3,4, got ${res.rows.length} rows`
+                });
+            } catch (e) {
+                tests.push({ name: 'NOT IN', pass: false, error: e.message });
+            }
+
+            // Test NOT LIKE
+            try {
+                const res = await v.exec("SELECT * FROM not_test WHERE name NOT LIKE 'A%'");
+                tests.push({
+                    name: 'NOT LIKE',
+                    pass: res.rows.length === 3,
+                    error: `Expected 3 rows (Bob, Charlie, David), got ${res.rows.length}`
+                });
+            } catch (e) {
+                tests.push({ name: 'NOT LIKE', pass: false, error: e.message });
+            }
+
+            // Test NOT BETWEEN
+            try {
+                const res = await v.exec('SELECT * FROM not_test WHERE age NOT BETWEEN 28 AND 38');
+                tests.push({
+                    name: 'NOT BETWEEN',
+                    pass: res.rows.length === 2 && res.rows[0].id === 1 && res.rows[1].id === 4,
+                    error: `Expected 2 rows (Alice=25, David=40), got ${res.rows.length}`
+                });
+            } catch (e) {
+                tests.push({ name: 'NOT BETWEEN', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE not_test');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || ''}`).toBe(true);
+        }
+    });
+
+    test('Subquery in WHERE with IN', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE orders (id INT, customer_id INT, amount INT)');
+            await v.exec('CREATE TABLE vip_customers (id INT, name TEXT)');
+
+            await v.exec('INSERT INTO orders VALUES (1, 100, 500)');
+            await v.exec('INSERT INTO orders VALUES (2, 101, 300)');
+            await v.exec('INSERT INTO orders VALUES (3, 100, 200)');
+            await v.exec('INSERT INTO orders VALUES (4, 102, 800)');
+
+            await v.exec("INSERT INTO vip_customers VALUES (100, 'Alice')");
+            await v.exec("INSERT INTO vip_customers VALUES (102, 'Charlie')");
+
+            // Test IN subquery
+            try {
+                const res = await v.exec('SELECT * FROM orders WHERE customer_id IN (SELECT id FROM vip_customers)');
+                tests.push({
+                    name: 'IN subquery',
+                    pass: res.rows.length === 3,
+                    error: `Expected 3 rows (orders from VIP customers), got ${res.rows.length}`
+                });
+            } catch (e) {
+                tests.push({ name: 'IN subquery', pass: false, error: e.message });
+            }
+
+            // Test NOT IN subquery
+            try {
+                const res = await v.exec('SELECT * FROM orders WHERE customer_id NOT IN (SELECT id FROM vip_customers)');
+                tests.push({
+                    name: 'NOT IN subquery',
+                    pass: res.rows.length === 1 && res.rows[0].customer_id === 101,
+                    error: `Expected 1 row (customer 101), got ${res.rows.length}`
+                });
+            } catch (e) {
+                tests.push({ name: 'NOT IN subquery', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE orders');
+            await v.exec('DROP TABLE vip_customers');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || ''}`).toBe(true);
+        }
+    });
+
+    test('UNION and UNION ALL', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE us_sales (id INT, product TEXT, amount INT)');
+            await v.exec('CREATE TABLE eu_sales (id INT, product TEXT, amount INT)');
+
+            await v.exec("INSERT INTO us_sales VALUES (1, 'Widget', 100)");
+            await v.exec("INSERT INTO us_sales VALUES (2, 'Gadget', 200)");
+            await v.exec("INSERT INTO us_sales VALUES (3, 'Widget', 100)");  // Duplicate row
+
+            await v.exec("INSERT INTO eu_sales VALUES (4, 'Widget', 150)");
+            await v.exec("INSERT INTO eu_sales VALUES (5, 'Widget', 100)");  // Same as US row 1 and 3
+
+            // Test UNION (removes duplicates)
+            try {
+                const res = await v.exec('SELECT product, amount FROM us_sales UNION SELECT product, amount FROM eu_sales');
+                tests.push({
+                    name: 'UNION removes duplicates',
+                    pass: res.rows.length === 3,  // (Widget,100), (Gadget,200), (Widget,150)
+                    error: `Expected 3 unique rows, got ${res.rows.length}`
+                });
+            } catch (e) {
+                tests.push({ name: 'UNION removes duplicates', pass: false, error: e.message });
+            }
+
+            // Test UNION ALL (keeps duplicates)
+            try {
+                const res = await v.exec('SELECT product, amount FROM us_sales UNION ALL SELECT product, amount FROM eu_sales');
+                tests.push({
+                    name: 'UNION ALL keeps duplicates',
+                    pass: res.rows.length === 5,  // All 5 rows
+                    error: `Expected 5 rows, got ${res.rows.length}`
+                });
+            } catch (e) {
+                tests.push({ name: 'UNION ALL keeps duplicates', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE us_sales');
+            await v.exec('DROP TABLE eu_sales');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || ''}`).toBe(true);
+        }
+    });
+
+    test('INTERSECT and EXCEPT', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE set_a (id INT, val TEXT)');
+            await v.exec('CREATE TABLE set_b (id INT, val TEXT)');
+
+            await v.exec("INSERT INTO set_a VALUES (1, 'A')");
+            await v.exec("INSERT INTO set_a VALUES (2, 'B')");
+            await v.exec("INSERT INTO set_a VALUES (3, 'C')");
+
+            await v.exec("INSERT INTO set_b VALUES (2, 'B')");
+            await v.exec("INSERT INTO set_b VALUES (3, 'C')");
+            await v.exec("INSERT INTO set_b VALUES (4, 'D')");
+
+            // Test INTERSECT (common rows)
+            try {
+                const res = await v.exec('SELECT id, val FROM set_a INTERSECT SELECT id, val FROM set_b');
+                tests.push({
+                    name: 'INTERSECT',
+                    pass: res.rows.length === 2,  // (2,'B') and (3,'C')
+                    error: `Expected 2 common rows, got ${res.rows.length}`
+                });
+            } catch (e) {
+                tests.push({ name: 'INTERSECT', pass: false, error: e.message });
+            }
+
+            // Test EXCEPT (rows in A but not B)
+            try {
+                const res = await v.exec('SELECT id, val FROM set_a EXCEPT SELECT id, val FROM set_b');
+                tests.push({
+                    name: 'EXCEPT',
+                    pass: res.rows.length === 1 && res.rows[0].id === 1,
+                    error: `Expected 1 row (id=1), got ${res.rows.length}`
+                });
+            } catch (e) {
+                tests.push({ name: 'EXCEPT', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE set_a');
+            await v.exec('DROP TABLE set_b');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || ''}`).toBe(true);
+        }
+    });
+
+    test('WITH clause (CTEs)', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE employees (id INT, name TEXT, dept_id INT, salary INT)');
+            await v.exec('CREATE TABLE departments (id INT, name TEXT)');
+
+            await v.exec("INSERT INTO employees VALUES (1, 'Alice', 10, 50000)");
+            await v.exec("INSERT INTO employees VALUES (2, 'Bob', 10, 60000)");
+            await v.exec("INSERT INTO employees VALUES (3, 'Charlie', 20, 70000)");
+            await v.exec("INSERT INTO employees VALUES (4, 'David', 20, 55000)");
+
+            await v.exec("INSERT INTO departments VALUES (10, 'Engineering')");
+            await v.exec("INSERT INTO departments VALUES (20, 'Sales')");
+
+            // Test simple CTE
+            try {
+                const res = await v.exec(`
+                    WITH high_earners AS (
+                        SELECT id, name, salary FROM employees WHERE salary > 55000
+                    )
+                    SELECT * FROM high_earners
+                `);
+                tests.push({
+                    name: 'Simple CTE',
+                    pass: res.rows.length === 2,  // Bob (60000) and Charlie (70000)
+                    error: `Expected 2 high earners, got ${res.rows.length}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Simple CTE', pass: false, error: e.message });
+            }
+
+            // Test CTE with aggregation
+            try {
+                const res = await v.exec(`
+                    WITH dept_totals AS (
+                        SELECT dept_id, SUM(salary) AS total_salary FROM employees GROUP BY dept_id
+                    )
+                    SELECT * FROM dept_totals ORDER BY total_salary DESC
+                `);
+                tests.push({
+                    name: 'CTE with aggregation',
+                    pass: res.rows.length === 2 && res.rows[0].total_salary === 125000,
+                    error: `Expected 2 departments, first with 125000, got ${res.rows.length} rows with first total ${res.rows[0]?.total_salary}`
+                });
+            } catch (e) {
+                tests.push({ name: 'CTE with aggregation', pass: false, error: e.message });
+            }
+
+            // Test multiple CTEs
+            try {
+                const res = await v.exec(`
+                    WITH
+                        eng_emp AS (SELECT id, name FROM employees WHERE dept_id = 10),
+                        sales_emp AS (SELECT id, name FROM employees WHERE dept_id = 20)
+                    SELECT * FROM eng_emp UNION ALL SELECT * FROM sales_emp
+                `);
+                tests.push({
+                    name: 'Multiple CTEs',
+                    pass: res.rows.length === 4,  // All 4 employees
+                    error: `Expected 4 employees, got ${res.rows.length}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Multiple CTEs', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE employees');
+            await v.exec('DROP TABLE departments');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || ''}`).toBe(true);
+        }
+    });
+
+    test('Window functions', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE sales (id INT, region TEXT, amount INT)');
+            await v.exec("INSERT INTO sales VALUES (1, 'North', 100)");
+            await v.exec("INSERT INTO sales VALUES (2, 'North', 200)");
+            await v.exec("INSERT INTO sales VALUES (3, 'South', 150)");
+            await v.exec("INSERT INTO sales VALUES (4, 'South', 250)");
+            await v.exec("INSERT INTO sales VALUES (5, 'North', 300)");
+
+            // Test ROW_NUMBER() OVER (PARTITION BY)
+            try {
+                const res = await v.exec('SELECT id, region, ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount) AS rn FROM sales');
+                const northRows = res.rows.filter(r => r.region === 'North');
+                tests.push({
+                    name: 'ROW_NUMBER with PARTITION BY',
+                    pass: northRows.length === 3 && northRows.some(r => r.rn === 1) && northRows.some(r => r.rn === 2) && northRows.some(r => r.rn === 3),
+                    error: `Expected North to have row numbers 1,2,3, got ${JSON.stringify(northRows)}`
+                });
+            } catch (e) {
+                tests.push({ name: 'ROW_NUMBER with PARTITION BY', pass: false, error: e.message });
+            }
+
+            // Test SUM() OVER (PARTITION BY) - running total
+            try {
+                const res = await v.exec('SELECT id, region, SUM(amount) OVER (PARTITION BY region) AS region_total FROM sales');
+                const northRows = res.rows.filter(r => r.region === 'North');
+                tests.push({
+                    name: 'SUM OVER PARTITION BY',
+                    pass: northRows.every(r => r.region_total === 600),  // 100+200+300
+                    error: `Expected all North rows to have region_total=600, got ${JSON.stringify(northRows)}`
+                });
+            } catch (e) {
+                tests.push({ name: 'SUM OVER PARTITION BY', pass: false, error: e.message });
+            }
+
+            // Test RANK() with ties
+            await v.exec('DROP TABLE sales');
+            await v.exec('CREATE TABLE scores (id INT, score INT)');
+            await v.exec('INSERT INTO scores VALUES (1, 100)');
+            await v.exec('INSERT INTO scores VALUES (2, 90)');
+            await v.exec('INSERT INTO scores VALUES (3, 90)');  // Tie
+            await v.exec('INSERT INTO scores VALUES (4, 80)');
+
+            try {
+                const res = await v.exec('SELECT id, score, RANK() OVER (ORDER BY score DESC) AS rnk FROM scores');
+                const ranks = res.rows.map(r => ({ id: r.id, rnk: r.rnk }));
+                // Expected: id=1 -> rank 1, id=2 -> rank 2, id=3 -> rank 2 (tie), id=4 -> rank 4 (skips 3)
+                const id1Rank = ranks.find(r => r.id === 1)?.rnk;
+                const id2Rank = ranks.find(r => r.id === 2)?.rnk;
+                const id3Rank = ranks.find(r => r.id === 3)?.rnk;
+                const id4Rank = ranks.find(r => r.id === 4)?.rnk;
+                tests.push({
+                    name: 'RANK with ties',
+                    pass: id1Rank === 1 && id2Rank === 2 && id3Rank === 2 && id4Rank === 4,
+                    error: `Expected ranks 1,2,2,4, got ${JSON.stringify(ranks)}`
+                });
+            } catch (e) {
+                tests.push({ name: 'RANK with ties', pass: false, error: e.message });
+            }
+
+            // Test DENSE_RANK() - no gaps
+            try {
+                const res = await v.exec('SELECT id, score, DENSE_RANK() OVER (ORDER BY score DESC) AS rnk FROM scores');
+                const ranks = res.rows.map(r => ({ id: r.id, rnk: r.rnk }));
+                // Expected: id=1 -> rank 1, id=2 -> rank 2, id=3 -> rank 2 (tie), id=4 -> rank 3 (no gap)
+                const id4Rank = ranks.find(r => r.id === 4)?.rnk;
+                tests.push({
+                    name: 'DENSE_RANK no gaps',
+                    pass: id4Rank === 3,
+                    error: `Expected id=4 to have rank 3, got ${id4Rank}`
+                });
+            } catch (e) {
+                tests.push({ name: 'DENSE_RANK no gaps', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE scores');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || ''}`).toBe(true);
+        }
+    });
+
+    // Date/Time functions
+    test('Date/Time functions', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup test table
+            await v.exec('DROP TABLE IF EXISTS dt_test');
+            await v.exec('CREATE TABLE dt_test (id INTEGER, event_time TEXT)');
+            await v.exec("INSERT INTO dt_test VALUES (1, '2024-06-15 14:30:45')");
+            await v.exec("INSERT INTO dt_test VALUES (2, '2023-12-25 09:00:00')");
+            await v.exec("INSERT INTO dt_test VALUES (3, '2024-01-01 00:00:00')");
+
+            // NOW() returns ISO timestamp
+            try {
+                const res = await v.exec('SELECT NOW() AS now_val FROM dt_test LIMIT 1');
+                const now = res.rows[0].now_val;
+                tests.push({
+                    name: 'NOW returns ISO timestamp',
+                    pass: now && now.includes('T') && now.includes('Z'),
+                    error: `Expected ISO timestamp, got ${now}`
+                });
+            } catch (e) {
+                tests.push({ name: 'NOW returns ISO timestamp', pass: false, error: e.message });
+            }
+
+            // CURRENT_DATE returns YYYY-MM-DD
+            try {
+                const res = await v.exec('SELECT CURRENT_DATE() AS today FROM dt_test LIMIT 1');
+                const today = res.rows[0].today;
+                tests.push({
+                    name: 'CURRENT_DATE returns date',
+                    pass: today && /^\d{4}-\d{2}-\d{2}$/.test(today),
+                    error: `Expected YYYY-MM-DD, got ${today}`
+                });
+            } catch (e) {
+                tests.push({ name: 'CURRENT_DATE returns date', pass: false, error: e.message });
+            }
+
+            // DATE() extracts date
+            try {
+                const res = await v.exec("SELECT DATE('2024-06-15 14:30:45') AS d FROM dt_test LIMIT 1");
+                tests.push({
+                    name: 'DATE extracts date',
+                    pass: res.rows[0].d === '2024-06-15',
+                    error: `Expected 2024-06-15, got ${res.rows[0].d}`
+                });
+            } catch (e) {
+                tests.push({ name: 'DATE extracts date', pass: false, error: e.message });
+            }
+
+            // YEAR, MONTH, DAY extractors
+            try {
+                const res = await v.exec("SELECT YEAR('2024-06-15') AS y, MONTH('2024-06-15') AS m, DAY('2024-06-15') AS d FROM dt_test LIMIT 1");
+                tests.push({
+                    name: 'YEAR/MONTH/DAY extract parts',
+                    pass: res.rows[0].y === 2024 && res.rows[0].m === 6 && res.rows[0].d === 15,
+                    error: `Expected 2024,6,15, got ${res.rows[0].y},${res.rows[0].m},${res.rows[0].d}`
+                });
+            } catch (e) {
+                tests.push({ name: 'YEAR/MONTH/DAY extract parts', pass: false, error: e.message });
+            }
+
+            // HOUR, MINUTE, SECOND extractors (use ISO format with Z for UTC)
+            try {
+                const res = await v.exec("SELECT HOUR('2024-06-15T14:30:45Z') AS h, MINUTE('2024-06-15T14:30:45Z') AS mi, SECOND('2024-06-15T14:30:45Z') AS s FROM dt_test LIMIT 1");
+                tests.push({
+                    name: 'HOUR/MINUTE/SECOND extract parts',
+                    pass: res.rows[0].h === 14 && res.rows[0].mi === 30 && res.rows[0].s === 45,
+                    error: `Expected 14,30,45, got ${res.rows[0].h},${res.rows[0].mi},${res.rows[0].s}`
+                });
+            } catch (e) {
+                tests.push({ name: 'HOUR/MINUTE/SECOND extract parts', pass: false, error: e.message });
+            }
+
+            // STRFTIME formats date
+            try {
+                const res = await v.exec("SELECT STRFTIME('%Y/%m/%d', '2024-06-15') AS fmt FROM dt_test LIMIT 1");
+                tests.push({
+                    name: 'STRFTIME formats date',
+                    pass: res.rows[0].fmt === '2024/06/15',
+                    error: `Expected 2024/06/15, got ${res.rows[0].fmt}`
+                });
+            } catch (e) {
+                tests.push({ name: 'STRFTIME formats date', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE dt_test');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || ''}`).toBe(true);
+        }
+    });
+
+    // Additional string functions
+    test('Additional string functions', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('DROP TABLE IF EXISTS str_test');
+            await v.exec('CREATE TABLE str_test (id INTEGER, txt TEXT)');
+            await v.exec("INSERT INTO str_test VALUES (1, 'Hello World')");
+
+            // LEFT
+            try {
+                const res = await v.exec("SELECT LEFT('Hello', 3) AS val FROM str_test LIMIT 1");
+                tests.push({
+                    name: 'LEFT extracts chars',
+                    pass: res.rows[0].val === 'Hel',
+                    error: `Expected 'Hel', got '${res.rows[0].val}'`
+                });
+            } catch (e) {
+                tests.push({ name: 'LEFT extracts chars', pass: false, error: e.message });
+            }
+
+            // RIGHT
+            try {
+                const res = await v.exec("SELECT RIGHT('Hello', 3) AS val FROM str_test LIMIT 1");
+                tests.push({
+                    name: 'RIGHT extracts chars',
+                    pass: res.rows[0].val === 'llo',
+                    error: `Expected 'llo', got '${res.rows[0].val}'`
+                });
+            } catch (e) {
+                tests.push({ name: 'RIGHT extracts chars', pass: false, error: e.message });
+            }
+
+            // LPAD
+            try {
+                const res = await v.exec("SELECT LPAD('Hi', 5, '*') AS val FROM str_test LIMIT 1");
+                tests.push({
+                    name: 'LPAD pads left',
+                    pass: res.rows[0].val === '***Hi',
+                    error: `Expected '***Hi', got '${res.rows[0].val}'`
+                });
+            } catch (e) {
+                tests.push({ name: 'LPAD pads left', pass: false, error: e.message });
+            }
+
+            // RPAD
+            try {
+                const res = await v.exec("SELECT RPAD('Hi', 5, '*') AS val FROM str_test LIMIT 1");
+                tests.push({
+                    name: 'RPAD pads right',
+                    pass: res.rows[0].val === 'Hi***',
+                    error: `Expected 'Hi***', got '${res.rows[0].val}'`
+                });
+            } catch (e) {
+                tests.push({ name: 'RPAD pads right', pass: false, error: e.message });
+            }
+
+            // POSITION (str, substr) - finds substr in str, returns 1-based position
+            try {
+                const res = await v.exec("SELECT POSITION('Hello World', 'World') AS val FROM str_test LIMIT 1");
+                tests.push({
+                    name: 'POSITION finds substring',
+                    pass: res.rows[0].val === 7,
+                    error: `Expected 7, got ${res.rows[0].val}`
+                });
+            } catch (e) {
+                tests.push({ name: 'POSITION finds substring', pass: false, error: e.message });
+            }
+
+            // REPEAT
+            try {
+                const res = await v.exec("SELECT REPEAT('ab', 3) AS val FROM str_test LIMIT 1");
+                tests.push({
+                    name: 'REPEAT repeats string',
+                    pass: res.rows[0].val === 'ababab',
+                    error: `Expected 'ababab', got '${res.rows[0].val}'`
+                });
+            } catch (e) {
+                tests.push({ name: 'REPEAT repeats string', pass: false, error: e.message });
+            }
+
+            // REVERSE
+            try {
+                const res = await v.exec("SELECT REVERSE('Hello') AS val FROM str_test LIMIT 1");
+                tests.push({
+                    name: 'REVERSE reverses string',
+                    pass: res.rows[0].val === 'olleH',
+                    error: `Expected 'olleH', got '${res.rows[0].val}'`
+                });
+            } catch (e) {
+                tests.push({ name: 'REVERSE reverses string', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE str_test');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || ''}`).toBe(true);
+        }
+    });
+
+    // Arithmetic operators in SELECT
+    test('Arithmetic operators in SELECT', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('DROP TABLE IF EXISTS math_test');
+            await v.exec('CREATE TABLE math_test (id INTEGER, price REAL, quantity INTEGER)');
+            await v.exec('INSERT INTO math_test VALUES (1, 10.5, 3)');
+            await v.exec('INSERT INTO math_test VALUES (2, 25.0, 2)');
+            await v.exec('INSERT INTO math_test VALUES (3, 15.75, 4)');
+
+            // Addition: col + col
+            try {
+                const res = await v.exec('SELECT id, price + quantity AS total FROM math_test WHERE id = 1');
+                tests.push({
+                    name: 'Addition: col + col',
+                    pass: res.rows[0].total === 13.5,
+                    error: `Expected 13.5, got ${res.rows[0].total}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Addition: col + col', pass: false, error: e.message });
+            }
+
+            // Subtraction: col - col
+            try {
+                const res = await v.exec('SELECT id, price - quantity AS diff FROM math_test WHERE id = 1');
+                tests.push({
+                    name: 'Subtraction: col - col',
+                    pass: res.rows[0].diff === 7.5,
+                    error: `Expected 7.5, got ${res.rows[0].diff}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Subtraction: col - col', pass: false, error: e.message });
+            }
+
+            // Multiplication: col * col
+            try {
+                const res = await v.exec('SELECT id, price * quantity AS product FROM math_test WHERE id = 1');
+                tests.push({
+                    name: 'Multiplication: col * col',
+                    pass: res.rows[0].product === 31.5,
+                    error: `Expected 31.5, got ${res.rows[0].product}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Multiplication: col * col', pass: false, error: e.message });
+            }
+
+            // Division: col / col
+            try {
+                const res = await v.exec('SELECT id, price / quantity AS avg_price FROM math_test WHERE id = 1');
+                tests.push({
+                    name: 'Division: col / col',
+                    pass: res.rows[0].avg_price === 3.5,
+                    error: `Expected 3.5, got ${res.rows[0].avg_price}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Division: col / col', pass: false, error: e.message });
+            }
+
+            // Precedence: a + b * c
+            try {
+                const res = await v.exec('SELECT id, 2 + 3 * 4 AS result FROM math_test WHERE id = 1');
+                tests.push({
+                    name: 'Precedence: + and * (2 + 3 * 4 = 14)',
+                    pass: res.rows[0].result === 14,
+                    error: `Expected 14, got ${res.rows[0].result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Precedence: + and *', pass: false, error: e.message });
+            }
+
+            // Parentheses: (a + b) * c
+            try {
+                const res = await v.exec('SELECT id, (2 + 3) * 4 AS result FROM math_test WHERE id = 1');
+                tests.push({
+                    name: 'Parentheses: (2 + 3) * 4 = 20',
+                    pass: res.rows[0].result === 20,
+                    error: `Expected 20, got ${res.rows[0].result}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Parentheses: (2 + 3) * 4', pass: false, error: e.message });
+            }
+
+            // Literal with column: col * 0.1
+            try {
+                const res = await v.exec('SELECT id, price * 0.1 AS discount FROM math_test WHERE id = 1');
+                const discount = Math.round(res.rows[0].discount * 1000) / 1000; // Handle float precision
+                tests.push({
+                    name: 'Literal with column: price * 0.1',
+                    pass: discount === 1.05,
+                    error: `Expected 1.05, got ${discount}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Literal with column', pass: false, error: e.message });
+            }
+
+            // Unary minus
+            try {
+                const res = await v.exec('SELECT id, -price AS neg FROM math_test WHERE id = 1');
+                tests.push({
+                    name: 'Unary minus: -price',
+                    pass: res.rows[0].neg === -10.5,
+                    error: `Expected -10.5, got ${res.rows[0].neg}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Unary minus: -price', pass: false, error: e.message });
+            }
+
+            // Alias for arithmetic expression
+            try {
+                const res = await v.exec('SELECT id, price * quantity AS total_value FROM math_test');
+                // Check that arithmetic works with alias
+                const row1 = res.rows.find(r => r.id === 1);
+                const row3 = res.rows.find(r => r.id === 3);
+                tests.push({
+                    name: 'Alias for arithmetic expression',
+                    pass: row1.total_value === 31.5 && row3.total_value === 63 && res.rows.length === 3,
+                    error: `Expected row1=31.5, row3=63, got row1=${row1?.total_value}, row3=${row3?.total_value}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Alias for arithmetic expression', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE math_test');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || ''}`).toBe(true);
+        }
+    });
+
+    // NULLS FIRST/LAST in ORDER BY
+    test('NULLS FIRST/LAST in ORDER BY', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('DROP TABLE IF EXISTS nulls_test');
+            await v.exec('CREATE TABLE nulls_test (id INTEGER, val INTEGER)');
+            await v.exec('INSERT INTO nulls_test VALUES (1, 10)');
+            await v.exec('INSERT INTO nulls_test VALUES (2, NULL)');
+            await v.exec('INSERT INTO nulls_test VALUES (3, 30)');
+            await v.exec('INSERT INTO nulls_test VALUES (4, NULL)');
+            await v.exec('INSERT INTO nulls_test VALUES (5, 20)');
+
+            // Default ASC: NULLs last
+            try {
+                const res = await v.exec('SELECT * FROM nulls_test ORDER BY val ASC');
+                const ids = res.rows.map(r => r.id);
+                // Non-null values sorted first, then nulls
+                tests.push({
+                    name: 'Default ASC: NULLs last',
+                    pass: ids[0] === 1 && ids[1] === 5 && ids[2] === 3 && (ids[3] === 2 || ids[3] === 4),
+                    error: `Expected non-nulls first then nulls, got ${ids.join(',')}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Default ASC: NULLs last', pass: false, error: e.message });
+            }
+
+            // Default DESC: NULLs first
+            try {
+                const res = await v.exec('SELECT * FROM nulls_test ORDER BY val DESC');
+                const ids = res.rows.map(r => r.id);
+                // Nulls first, then non-null values sorted desc
+                tests.push({
+                    name: 'Default DESC: NULLs first',
+                    pass: (ids[0] === 2 || ids[0] === 4) && ids[2] === 3 && ids[3] === 5 && ids[4] === 1,
+                    error: `Expected nulls first then desc values, got ${ids.join(',')}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Default DESC: NULLs first', pass: false, error: e.message });
+            }
+
+            // ASC NULLS FIRST
+            try {
+                const res = await v.exec('SELECT * FROM nulls_test ORDER BY val ASC NULLS FIRST');
+                const ids = res.rows.map(r => r.id);
+                tests.push({
+                    name: 'ASC NULLS FIRST',
+                    pass: (ids[0] === 2 || ids[0] === 4) && ids[2] === 1,
+                    error: `Expected nulls first, got ${ids.join(',')}`
+                });
+            } catch (e) {
+                tests.push({ name: 'ASC NULLS FIRST', pass: false, error: e.message });
+            }
+
+            // DESC NULLS LAST
+            try {
+                const res = await v.exec('SELECT * FROM nulls_test ORDER BY val DESC NULLS LAST');
+                const ids = res.rows.map(r => r.id);
+                tests.push({
+                    name: 'DESC NULLS LAST',
+                    pass: ids[0] === 3 && (ids[3] === 2 || ids[3] === 4),
+                    error: `Expected desc values then nulls last, got ${ids.join(',')}`
+                });
+            } catch (e) {
+                tests.push({ name: 'DESC NULLS LAST', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE nulls_test');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || ''}`).toBe(true);
+        }
+    });
+
+    test('Quick wins - GREATEST, LEAST, IIF functions', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // GREATEST
+            try {
+                const res = await v.exec('SELECT GREATEST(1, 5, 3) AS max_val');
+                const pass = res.rows[0].max_val === 5;
+                tests.push({ name: 'GREATEST(1, 5, 3)', pass, actual: res.rows[0].max_val });
+            } catch (e) {
+                tests.push({ name: 'GREATEST(1, 5, 3)', pass: false, error: e.message });
+            }
+
+            // LEAST
+            try {
+                const res = await v.exec('SELECT LEAST(1, 5, 3) AS min_val');
+                const pass = res.rows[0].min_val === 1;
+                tests.push({ name: 'LEAST(1, 5, 3)', pass, actual: res.rows[0].min_val });
+            } catch (e) {
+                tests.push({ name: 'LEAST(1, 5, 3)', pass: false, error: e.message });
+            }
+
+            // GREATEST with NULLs
+            try {
+                const res = await v.exec('SELECT GREATEST(1, NULL, 3) AS max_val');
+                const pass = res.rows[0].max_val === 3;
+                tests.push({ name: 'GREATEST with NULL', pass, actual: res.rows[0].max_val });
+            } catch (e) {
+                tests.push({ name: 'GREATEST with NULL', pass: false, error: e.message });
+            }
+
+            // IIF true
+            try {
+                const res = await v.exec("SELECT IIF(1 > 0, 'yes', 'no') AS result");
+                const pass = res.rows[0].result === 'yes';
+                tests.push({ name: 'IIF(1 > 0)', pass, actual: res.rows[0].result });
+            } catch (e) {
+                tests.push({ name: 'IIF(1 > 0)', pass: false, error: e.message });
+            }
+
+            // IIF false
+            try {
+                const res = await v.exec("SELECT IIF(1 < 0, 'yes', 'no') AS result");
+                const pass = res.rows[0].result === 'no';
+                tests.push({ name: 'IIF(1 < 0)', pass, actual: res.rows[0].result });
+            } catch (e) {
+                tests.push({ name: 'IIF(1 < 0)', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('Quick wins - Math functions', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // LOG
+            try {
+                const res = await v.exec('SELECT LOG(2.718281828) AS log_val');
+                const pass = Math.abs(res.rows[0].log_val - 1) < 0.001;
+                tests.push({ name: 'LOG(e)', pass, actual: res.rows[0].log_val });
+            } catch (e) {
+                tests.push({ name: 'LOG(e)', pass: false, error: e.message });
+            }
+
+            // EXP
+            try {
+                const res = await v.exec('SELECT EXP(1) AS exp_val');
+                const pass = Math.abs(res.rows[0].exp_val - Math.E) < 0.001;
+                tests.push({ name: 'EXP(1)', pass, actual: res.rows[0].exp_val });
+            } catch (e) {
+                tests.push({ name: 'EXP(1)', pass: false, error: e.message });
+            }
+
+            // SIN
+            try {
+                const res = await v.exec('SELECT SIN(0) AS sin_val');
+                const pass = res.rows[0].sin_val === 0;
+                tests.push({ name: 'SIN(0)', pass, actual: res.rows[0].sin_val });
+            } catch (e) {
+                tests.push({ name: 'SIN(0)', pass: false, error: e.message });
+            }
+
+            // COS
+            try {
+                const res = await v.exec('SELECT COS(0) AS cos_val');
+                const pass = res.rows[0].cos_val === 1;
+                tests.push({ name: 'COS(0)', pass, actual: res.rows[0].cos_val });
+            } catch (e) {
+                tests.push({ name: 'COS(0)', pass: false, error: e.message });
+            }
+
+            // PI
+            try {
+                const res = await v.exec('SELECT PI() AS pi_val');
+                const pass = Math.abs(res.rows[0].pi_val - Math.PI) < 0.0001;
+                tests.push({ name: 'PI()', pass, actual: res.rows[0].pi_val });
+            } catch (e) {
+                tests.push({ name: 'PI()', pass: false, error: e.message });
+            }
+
+            // SIGN
+            try {
+                const res = await v.exec('SELECT SIGN(-5) AS sign_neg, SIGN(0) AS sign_zero, SIGN(5) AS sign_pos');
+                const pass = res.rows[0].sign_neg === -1 && res.rows[0].sign_zero === 0 && res.rows[0].sign_pos === 1;
+                tests.push({ name: 'SIGN', pass, actual: JSON.stringify(res.rows[0]) });
+            } catch (e) {
+                tests.push({ name: 'SIGN', pass: false, error: e.message });
+            }
+
+            // DEGREES
+            try {
+                const res = await v.exec('SELECT DEGREES(3.14159265359) AS deg_val');
+                const pass = Math.abs(res.rows[0].deg_val - 180) < 0.01;
+                tests.push({ name: 'DEGREES(PI)', pass, actual: res.rows[0].deg_val });
+            } catch (e) {
+                tests.push({ name: 'DEGREES(PI)', pass: false, error: e.message });
+            }
+
+            // RADIANS
+            try {
+                const res = await v.exec('SELECT RADIANS(180) AS rad_val');
+                const pass = Math.abs(res.rows[0].rad_val - Math.PI) < 0.01;
+                tests.push({ name: 'RADIANS(180)', pass, actual: res.rows[0].rad_val });
+            } catch (e) {
+                tests.push({ name: 'RADIANS(180)', pass: false, error: e.message });
+            }
+
+            // TRUNCATE
+            try {
+                const res = await v.exec('SELECT TRUNCATE(3.7) AS trunc_val');
+                const pass = res.rows[0].trunc_val === 3;
+                tests.push({ name: 'TRUNCATE(3.7)', pass, actual: res.rows[0].trunc_val });
+            } catch (e) {
+                tests.push({ name: 'TRUNCATE(3.7)', pass: false, error: e.message });
+            }
+
+            // RANDOM
+            try {
+                const res = await v.exec('SELECT RANDOM() AS rand_val');
+                const pass = res.rows[0].rand_val >= 0 && res.rows[0].rand_val < 1;
+                tests.push({ name: 'RANDOM()', pass, actual: res.rows[0].rand_val });
+            } catch (e) {
+                tests.push({ name: 'RANDOM()', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('Quick wins - CAST function', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // CAST to INTEGER
+            try {
+                const res = await v.exec("SELECT CAST('123' AS INTEGER) AS int_val");
+                const pass = res.rows[0].int_val === 123;
+                tests.push({ name: "CAST('123' AS INTEGER)", pass, actual: res.rows[0].int_val });
+            } catch (e) {
+                tests.push({ name: "CAST('123' AS INTEGER)", pass: false, error: e.message });
+            }
+
+            // CAST to TEXT
+            try {
+                const res = await v.exec('SELECT CAST(456 AS TEXT) AS text_val');
+                const pass = res.rows[0].text_val === '456';
+                tests.push({ name: 'CAST(456 AS TEXT)', pass, actual: res.rows[0].text_val });
+            } catch (e) {
+                tests.push({ name: 'CAST(456 AS TEXT)', pass: false, error: e.message });
+            }
+
+            // CAST float to INTEGER (truncates)
+            try {
+                const res = await v.exec('SELECT CAST(3.9 AS INTEGER) AS int_val');
+                const pass = res.rows[0].int_val === 3;
+                tests.push({ name: 'CAST(3.9 AS INTEGER)', pass, actual: res.rows[0].int_val });
+            } catch (e) {
+                tests.push({ name: 'CAST(3.9 AS INTEGER)', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('Advanced aggregates - STDDEV, VARIANCE, MEDIAN', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE agg_test (val INTEGER)');
+            await v.exec('INSERT INTO agg_test VALUES (2), (4), (4), (4), (5), (5), (7), (9)');
+
+            // STDDEV (sample)
+            try {
+                const res = await v.exec('SELECT STDDEV(val) AS std FROM agg_test');
+                const pass = Math.abs(res.rows[0].std - 2.138) < 0.01;
+                tests.push({ name: 'STDDEV(val)', pass, actual: res.rows[0].std });
+            } catch (e) {
+                tests.push({ name: 'STDDEV(val)', pass: false, error: e.message });
+            }
+
+            // VARIANCE (sample)
+            try {
+                const res = await v.exec('SELECT VARIANCE(val) AS var FROM agg_test');
+                const pass = Math.abs(res.rows[0].var - 4.571) < 0.01;
+                tests.push({ name: 'VARIANCE(val)', pass, actual: res.rows[0].var });
+            } catch (e) {
+                tests.push({ name: 'VARIANCE(val)', pass: false, error: e.message });
+            }
+
+            // MEDIAN (even count)
+            try {
+                const res = await v.exec('SELECT MEDIAN(val) AS med FROM agg_test');
+                const pass = res.rows[0].med === 4.5;
+                tests.push({ name: 'MEDIAN(val) even', pass, actual: res.rows[0].med });
+            } catch (e) {
+                tests.push({ name: 'MEDIAN(val) even', pass: false, error: e.message });
+            }
+
+            // Cleanup and setup for odd count
+            await v.exec('DROP TABLE agg_test');
+            await v.exec('CREATE TABLE agg_test (val INTEGER)');
+            await v.exec('INSERT INTO agg_test VALUES (1), (3), (5), (7), (9)');
+
+            // MEDIAN (odd count)
+            try {
+                const res = await v.exec('SELECT MEDIAN(val) AS med FROM agg_test');
+                const pass = res.rows[0].med === 5;
+                tests.push({ name: 'MEDIAN(val) odd', pass, actual: res.rows[0].med });
+            } catch (e) {
+                tests.push({ name: 'MEDIAN(val) odd', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE agg_test');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('Advanced aggregates - STRING_AGG', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE str_test (name TEXT, category TEXT)');
+            await v.exec("INSERT INTO str_test VALUES ('apple', 'fruit'), ('banana', 'fruit'), ('carrot', 'veg')");
+
+            // STRING_AGG with custom separator
+            try {
+                const res = await v.exec("SELECT STRING_AGG(name, '; ') AS names FROM str_test");
+                const pass = res.rows[0].names === 'apple; banana; carrot';
+                tests.push({ name: "STRING_AGG with '; '", pass, actual: res.rows[0].names });
+            } catch (e) {
+                tests.push({ name: "STRING_AGG with '; '", pass: false, error: e.message });
+            }
+
+            // STRING_AGG with GROUP BY
+            try {
+                const res = await v.exec("SELECT category, STRING_AGG(name, ', ') AS names FROM str_test GROUP BY category ORDER BY category");
+                const pass = res.rows.length === 2 &&
+                    res.rows[0].names === 'apple, banana' &&
+                    res.rows[1].names === 'carrot';
+                tests.push({ name: 'STRING_AGG with GROUP BY', pass, actual: JSON.stringify(res.rows) });
+            } catch (e) {
+                tests.push({ name: 'STRING_AGG with GROUP BY', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE str_test');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('Window functions - NTILE', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE ntile_test (id INTEGER, score INTEGER)');
+            await v.exec('INSERT INTO ntile_test VALUES (1, 90), (2, 80), (3, 70), (4, 60), (5, 50), (6, 40), (7, 30), (8, 20)');
+
+            // NTILE(4) - divide into quartiles
+            try {
+                const res = await v.exec('SELECT id, NTILE(4) OVER (ORDER BY score DESC) AS quartile FROM ntile_test');
+                const pass = res.rows.length === 8 &&
+                    res.rows[0].quartile === 1 && res.rows[1].quartile === 1 &&
+                    res.rows[2].quartile === 2 && res.rows[3].quartile === 2 &&
+                    res.rows[4].quartile === 3 && res.rows[5].quartile === 3 &&
+                    res.rows[6].quartile === 4 && res.rows[7].quartile === 4;
+                tests.push({ name: 'NTILE(4)', pass, actual: JSON.stringify(res.rows.map(r => r.quartile)) });
+            } catch (e) {
+                tests.push({ name: 'NTILE(4)', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE ntile_test');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('Window functions - PERCENT_RANK, CUME_DIST', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE prank_test (id INTEGER, val INTEGER)');
+            await v.exec('INSERT INTO prank_test VALUES (1, 10), (2, 20), (3, 30), (4, 40)');
+
+            // PERCENT_RANK
+            try {
+                const res = await v.exec('SELECT id, PERCENT_RANK() OVER (ORDER BY val) AS prank FROM prank_test');
+                const pass = res.rows.length === 4 &&
+                    res.rows[0].prank === 0 &&
+                    Math.abs(res.rows[1].prank - 0.333) < 0.01 &&
+                    Math.abs(res.rows[2].prank - 0.667) < 0.01 &&
+                    res.rows[3].prank === 1;
+                tests.push({ name: 'PERCENT_RANK()', pass, actual: JSON.stringify(res.rows.map(r => r.prank)) });
+            } catch (e) {
+                tests.push({ name: 'PERCENT_RANK()', pass: false, error: e.message });
+            }
+
+            // CUME_DIST
+            try {
+                const res = await v.exec('SELECT id, CUME_DIST() OVER (ORDER BY val) AS cdist FROM prank_test');
+                const pass = res.rows.length === 4 &&
+                    res.rows[0].cdist === 0.25 &&
+                    res.rows[1].cdist === 0.5 &&
+                    res.rows[2].cdist === 0.75 &&
+                    res.rows[3].cdist === 1;
+                tests.push({ name: 'CUME_DIST()', pass, actual: JSON.stringify(res.rows.map(r => r.cdist)) });
+            } catch (e) {
+                tests.push({ name: 'CUME_DIST()', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE prank_test');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('Window functions - FIRST_VALUE, LAST_VALUE', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE flv_test (region TEXT, amount INTEGER)');
+            await v.exec("INSERT INTO flv_test VALUES ('North', 100), ('North', 200), ('South', 150), ('South', 250)");
+
+            // FIRST_VALUE
+            try {
+                const res = await v.exec('SELECT region, amount, FIRST_VALUE(amount) OVER (PARTITION BY region ORDER BY amount) AS first_amt FROM flv_test');
+                const pass = res.rows.length === 4 &&
+                    res.rows[0].first_amt === 100 && res.rows[1].first_amt === 100 &&
+                    res.rows[2].first_amt === 150 && res.rows[3].first_amt === 150;
+                tests.push({ name: 'FIRST_VALUE()', pass, actual: JSON.stringify(res.rows.map(r => r.first_amt)) });
+            } catch (e) {
+                tests.push({ name: 'FIRST_VALUE()', pass: false, error: e.message });
+            }
+
+            // LAST_VALUE with full frame
+            try {
+                const res = await v.exec('SELECT region, amount, LAST_VALUE(amount) OVER (PARTITION BY region ORDER BY amount ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_amt FROM flv_test');
+                const pass = res.rows.length === 4 &&
+                    res.rows[0].last_amt === 200 && res.rows[1].last_amt === 200 &&
+                    res.rows[2].last_amt === 250 && res.rows[3].last_amt === 250;
+                tests.push({ name: 'LAST_VALUE() with full frame', pass, actual: JSON.stringify(res.rows.map(r => r.last_amt)) });
+            } catch (e) {
+                tests.push({ name: 'LAST_VALUE() with full frame', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE flv_test');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('Window frames - ROWS BETWEEN', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE frame_test (id INTEGER, val INTEGER)');
+            await v.exec('INSERT INTO frame_test VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)');
+
+            // SUM with 1 PRECEDING and 1 FOLLOWING
+            try {
+                const res = await v.exec('SELECT id, val, SUM(val) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS moving_sum FROM frame_test');
+                // Row 1: 10+20 = 30, Row 2: 10+20+30 = 60, Row 3: 20+30+40 = 90, Row 4: 30+40+50 = 120, Row 5: 40+50 = 90
+                const pass = res.rows.length === 5 &&
+                    res.rows[0].moving_sum === 30 &&
+                    res.rows[1].moving_sum === 60 &&
+                    res.rows[2].moving_sum === 90 &&
+                    res.rows[3].moving_sum === 120 &&
+                    res.rows[4].moving_sum === 90;
+                tests.push({ name: 'SUM with ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING', pass, actual: JSON.stringify(res.rows.map(r => r.moving_sum)) });
+            } catch (e) {
+                tests.push({ name: 'SUM with ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING', pass: false, error: e.message });
+            }
+
+            // AVG with CURRENT ROW and 2 FOLLOWING
+            try {
+                const res = await v.exec('SELECT id, val, AVG(val) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) AS moving_avg FROM frame_test');
+                // Row 1: (10+20+30)/3 = 20, Row 2: (20+30+40)/3 = 30, Row 3: (30+40+50)/3 = 40, Row 4: (40+50)/2 = 45, Row 5: 50/1 = 50
+                const pass = res.rows.length === 5 &&
+                    res.rows[0].moving_avg === 20 &&
+                    res.rows[1].moving_avg === 30 &&
+                    res.rows[2].moving_avg === 40 &&
+                    res.rows[3].moving_avg === 45 &&
+                    res.rows[4].moving_avg === 50;
+                tests.push({ name: 'AVG with ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING', pass, actual: JSON.stringify(res.rows.map(r => r.moving_avg)) });
+            } catch (e) {
+                tests.push({ name: 'AVG with ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE frame_test');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('FROM subqueries (derived tables)', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE orders (id INTEGER, customer_id INTEGER, amount REAL)');
+            await v.exec('INSERT INTO orders VALUES (1, 1, 100), (2, 1, 200), (3, 2, 150), (4, 2, 250), (5, 3, 300)');
+
+            // Simple FROM subquery
+            try {
+                const res = await v.exec('SELECT * FROM (SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id) sub ORDER BY total DESC');
+                const pass = res.rows.length === 3 &&
+                    res.rows[0].total === 400 && // customer 2
+                    res.rows[1].total === 300 && // customer 3
+                    res.rows[2].total === 300;   // customer 1
+                tests.push({ name: 'FROM subquery', pass, actual: JSON.stringify(res.rows) });
+            } catch (e) {
+                tests.push({ name: 'FROM subquery', pass: false, error: e.message });
+            }
+
+            // Subquery with filter
+            try {
+                const res = await v.exec('SELECT * FROM (SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id) sub WHERE total > 300');
+                const pass = res.rows.length === 1 && res.rows[0].total === 400;
+                tests.push({ name: 'FROM subquery with WHERE', pass, actual: JSON.stringify(res.rows) });
+            } catch (e) {
+                tests.push({ name: 'FROM subquery with WHERE', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE orders');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('EXISTS and NOT EXISTS', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE customers (id INTEGER, name TEXT)');
+            await v.exec('CREATE TABLE orders (id INTEGER, customer_id INTEGER)');
+            await v.exec("INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')");
+            await v.exec('INSERT INTO orders VALUES (1, 1), (2, 1), (3, 2)');
+
+            // EXISTS - returns all rows when subquery has results
+            try {
+                const res = await v.exec('SELECT * FROM customers WHERE EXISTS (SELECT 1 FROM orders)');
+                const pass = res.rows.length === 3;
+                tests.push({ name: 'EXISTS with results', pass, actual: res.rows.length });
+            } catch (e) {
+                tests.push({ name: 'EXISTS with results', pass: false, error: e.message });
+            }
+
+            // NOT EXISTS - returns no rows when subquery has results
+            try {
+                const res = await v.exec('SELECT * FROM customers WHERE NOT EXISTS (SELECT 1 FROM orders)');
+                const pass = res.rows.length === 0;
+                tests.push({ name: 'NOT EXISTS with results', pass, actual: res.rows.length });
+            } catch (e) {
+                tests.push({ name: 'NOT EXISTS with results', pass: false, error: e.message });
+            }
+
+            // EXISTS with empty subquery
+            try {
+                const res = await v.exec('SELECT * FROM customers WHERE EXISTS (SELECT 1 FROM orders WHERE customer_id = 999)');
+                const pass = res.rows.length === 0;
+                tests.push({ name: 'EXISTS with no results', pass, actual: res.rows.length });
+            } catch (e) {
+                tests.push({ name: 'EXISTS with no results', pass: false, error: e.message });
+            }
+
+            // NOT EXISTS with empty subquery
+            try {
+                const res = await v.exec('SELECT * FROM customers WHERE NOT EXISTS (SELECT 1 FROM orders WHERE customer_id = 999)');
+                const pass = res.rows.length === 3;
+                tests.push({ name: 'NOT EXISTS with no results', pass, actual: res.rows.length });
+            } catch (e) {
+                tests.push({ name: 'NOT EXISTS with no results', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE customers');
+            await v.exec('DROP TABLE orders');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    // ============================================================================
+    // Phase 3: Advanced JOINs, REGEXP, JSON, Scalar Subqueries
+    // ============================================================================
+
+    test('FULL OUTER JOIN operations', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE left_tbl (id INT, val TEXT)');
+            await v.exec('CREATE TABLE right_tbl (id INT, val TEXT)');
+            await v.exec("INSERT INTO left_tbl VALUES (1, 'A'), (2, 'B'), (3, 'C')");
+            await v.exec("INSERT INTO right_tbl VALUES (2, 'X'), (3, 'Y'), (4, 'Z')");
+
+            // FULL OUTER JOIN
+            try {
+                const res = await v.exec('SELECT l.id, l.val, r.id, r.val FROM left_tbl l FULL OUTER JOIN right_tbl r ON l.id = r.id ORDER BY l.id, r.id');
+                // Should have 4 rows: (1,A,null), (2,B,2,X), (3,C,3,Y), (null,null,4,Z)
+                const pass = res.rows.length === 4;
+                tests.push({ name: 'FULL OUTER JOIN row count', pass, actual: res.rows.length });
+            } catch (e) {
+                tests.push({ name: 'FULL OUTER JOIN row count', pass: false, error: e.message });
+            }
+
+            // FULL JOIN (without OUTER keyword)
+            try {
+                const res = await v.exec('SELECT l.id FROM left_tbl l FULL JOIN right_tbl r ON l.id = r.id');
+                const pass = res.rows.length === 4;
+                tests.push({ name: 'FULL JOIN without OUTER', pass, actual: res.rows.length });
+            } catch (e) {
+                tests.push({ name: 'FULL JOIN without OUTER', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE left_tbl');
+            await v.exec('DROP TABLE right_tbl');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('CROSS JOIN operations', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE colors (name TEXT)');
+            await v.exec('CREATE TABLE sizes (name TEXT)');
+            await v.exec("INSERT INTO colors VALUES ('Red'), ('Blue')");
+            await v.exec("INSERT INTO sizes VALUES ('S'), ('M'), ('L')");
+
+            // CROSS JOIN - Cartesian product
+            try {
+                const res = await v.exec('SELECT c.name AS color, s.name AS size FROM colors c CROSS JOIN sizes s');
+                // Should have 2 * 3 = 6 rows
+                const pass = res.rows.length === 6;
+                tests.push({ name: 'CROSS JOIN Cartesian product', pass, actual: res.rows.length });
+            } catch (e) {
+                tests.push({ name: 'CROSS JOIN Cartesian product', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE colors');
+            await v.exec('DROP TABLE sizes');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('Compound JOIN conditions (AND/OR)', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE orders (id INT, customer_id INT, region TEXT)');
+            await v.exec('CREATE TABLE customers (id INT, region TEXT)');
+            await v.exec("INSERT INTO orders VALUES (1, 10, 'East'), (2, 20, 'West'), (3, 10, 'West')");
+            await v.exec("INSERT INTO customers VALUES (10, 'East'), (20, 'West')");
+
+            // JOIN with AND condition
+            try {
+                const res = await v.exec('SELECT o.id FROM orders o JOIN customers c ON o.customer_id = c.id AND o.region = c.region');
+                // Only orders 1 and 2 match (matching both id AND region)
+                const pass = res.rows.length === 2;
+                tests.push({ name: 'JOIN with AND condition', pass, actual: res.rows.length });
+            } catch (e) {
+                tests.push({ name: 'JOIN with AND condition', pass: false, error: e.message });
+            }
+
+            // JOIN with OR condition
+            try {
+                const res = await v.exec('SELECT o.id FROM orders o JOIN customers c ON o.customer_id = c.id OR o.region = c.region');
+                // All 3 orders match some customer
+                const pass = res.rows.length >= 3;
+                tests.push({ name: 'JOIN with OR condition', pass, actual: res.rows.length });
+            } catch (e) {
+                tests.push({ name: 'JOIN with OR condition', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE orders');
+            await v.exec('DROP TABLE customers');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('REGEXP functions', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE texts (id INT, content TEXT)');
+            await v.exec("INSERT INTO texts VALUES (1, 'Hello World 123'), (2, 'foo@example.com'), (3, 'abc-def-ghi')");
+
+            // REGEXP_MATCHES
+            try {
+                const res = await v.exec("SELECT id, REGEXP_MATCHES(content, '[0-9]+') AS has_numbers FROM texts WHERE id = 1");
+                const pass = res.rows[0].has_numbers === 1;
+                tests.push({ name: 'REGEXP_MATCHES', pass, actual: res.rows[0].has_numbers });
+            } catch (e) {
+                tests.push({ name: 'REGEXP_MATCHES', pass: false, error: e.message });
+            }
+
+            // REGEXP_REPLACE
+            try {
+                const res = await v.exec("SELECT REGEXP_REPLACE(content, '[0-9]+', 'XXX') AS replaced FROM texts WHERE id = 1");
+                const pass = res.rows[0].replaced === 'Hello World XXX';
+                tests.push({ name: 'REGEXP_REPLACE', pass, actual: res.rows[0].replaced });
+            } catch (e) {
+                tests.push({ name: 'REGEXP_REPLACE', pass: false, error: e.message });
+            }
+
+            // REGEXP_EXTRACT
+            try {
+                const res = await v.exec("SELECT REGEXP_EXTRACT(content, '([a-z]+)@([a-z.]+)', 1) AS username FROM texts WHERE id = 2");
+                const pass = res.rows[0].username === 'foo';
+                tests.push({ name: 'REGEXP_EXTRACT with group', pass, actual: res.rows[0].username });
+            } catch (e) {
+                tests.push({ name: 'REGEXP_EXTRACT with group', pass: false, error: e.message });
+            }
+
+            // REGEXP_COUNT
+            try {
+                const res = await v.exec("SELECT REGEXP_COUNT(content, '-') AS dash_count FROM texts WHERE id = 3");
+                const pass = res.rows[0].dash_count === 2;
+                tests.push({ name: 'REGEXP_COUNT', pass, actual: res.rows[0].dash_count });
+            } catch (e) {
+                tests.push({ name: 'REGEXP_COUNT', pass: false, error: e.message });
+            }
+
+            // REGEXP_SPLIT
+            try {
+                const res = await v.exec("SELECT REGEXP_SPLIT(content, '-') AS parts FROM texts WHERE id = 3");
+                const parts = JSON.parse(res.rows[0].parts);
+                const pass = parts.length === 3 && parts[0] === 'abc';
+                tests.push({ name: 'REGEXP_SPLIT', pass, actual: res.rows[0].parts });
+            } catch (e) {
+                tests.push({ name: 'REGEXP_SPLIT', pass: false, error: e.message });
+            }
+
+            // Case-insensitive matching
+            try {
+                const res = await v.exec("SELECT REGEXP_MATCHES('Hello', 'hello', 'i') AS case_insensitive");
+                const pass = res.rows[0].case_insensitive === 1;
+                tests.push({ name: 'REGEXP case-insensitive', pass, actual: res.rows[0].case_insensitive });
+            } catch (e) {
+                tests.push({ name: 'REGEXP case-insensitive', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE texts');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('JSON functions', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE json_data (id INT, data TEXT)');
+            await v.exec(`INSERT INTO json_data VALUES (1, '{"name": "Alice", "age": 30, "address": {"city": "NYC"}}')`);
+            await v.exec(`INSERT INTO json_data VALUES (2, '{"tags": ["a", "b", "c"], "count": 3}')`);
+
+            // JSON_EXTRACT with simple path
+            try {
+                const res = await v.exec("SELECT JSON_EXTRACT(data, '$.name') AS name FROM json_data WHERE id = 1");
+                const pass = res.rows[0].name === 'Alice';
+                tests.push({ name: 'JSON_EXTRACT simple', pass, actual: res.rows[0].name });
+            } catch (e) {
+                tests.push({ name: 'JSON_EXTRACT simple', pass: false, error: e.message });
+            }
+
+            // JSON_EXTRACT with nested path
+            try {
+                const res = await v.exec("SELECT JSON_EXTRACT(data, '$.address.city') AS city FROM json_data WHERE id = 1");
+                const pass = res.rows[0].city === 'NYC';
+                tests.push({ name: 'JSON_EXTRACT nested', pass, actual: res.rows[0].city });
+            } catch (e) {
+                tests.push({ name: 'JSON_EXTRACT nested', pass: false, error: e.message });
+            }
+
+            // JSON_EXTRACT with array index
+            try {
+                const res = await v.exec("SELECT JSON_EXTRACT(data, '$.tags[1]') AS tag FROM json_data WHERE id = 2");
+                const pass = res.rows[0].tag === 'b';
+                tests.push({ name: 'JSON_EXTRACT array', pass, actual: res.rows[0].tag });
+            } catch (e) {
+                tests.push({ name: 'JSON_EXTRACT array', pass: false, error: e.message });
+            }
+
+            // JSON_OBJECT
+            try {
+                const res = await v.exec("SELECT JSON_OBJECT('key1', 'val1', 'key2', 42) AS obj");
+                const obj = JSON.parse(res.rows[0].obj);
+                const pass = obj.key1 === 'val1' && obj.key2 === 42;
+                tests.push({ name: 'JSON_OBJECT', pass, actual: res.rows[0].obj });
+            } catch (e) {
+                tests.push({ name: 'JSON_OBJECT', pass: false, error: e.message });
+            }
+
+            // JSON_ARRAY
+            try {
+                const res = await v.exec("SELECT JSON_ARRAY(1, 2, 'three') AS arr");
+                const arr = JSON.parse(res.rows[0].arr);
+                const pass = arr.length === 3 && arr[2] === 'three';
+                tests.push({ name: 'JSON_ARRAY', pass, actual: res.rows[0].arr });
+            } catch (e) {
+                tests.push({ name: 'JSON_ARRAY', pass: false, error: e.message });
+            }
+
+            // JSON_KEYS
+            try {
+                const res = await v.exec("SELECT JSON_KEYS(data) AS keys FROM json_data WHERE id = 1");
+                const keys = JSON.parse(res.rows[0].keys);
+                const pass = keys.includes('name') && keys.includes('age');
+                tests.push({ name: 'JSON_KEYS', pass, actual: res.rows[0].keys });
+            } catch (e) {
+                tests.push({ name: 'JSON_KEYS', pass: false, error: e.message });
+            }
+
+            // JSON_LENGTH
+            try {
+                const res = await v.exec("SELECT JSON_LENGTH(data) AS len FROM json_data WHERE id = 1");
+                const pass = res.rows[0].len === 3;
+                tests.push({ name: 'JSON_LENGTH object', pass, actual: res.rows[0].len });
+            } catch (e) {
+                tests.push({ name: 'JSON_LENGTH object', pass: false, error: e.message });
+            }
+
+            // JSON_LENGTH on array
+            try {
+                const res = await v.exec(`SELECT JSON_LENGTH('["a","b","c"]') AS len`);
+                const pass = res.rows[0].len === 3;
+                tests.push({ name: 'JSON_LENGTH array', pass, actual: res.rows[0].len });
+            } catch (e) {
+                tests.push({ name: 'JSON_LENGTH array', pass: false, error: e.message });
+            }
+
+            // JSON_TYPE
+            try {
+                const res = await v.exec(`SELECT JSON_TYPE('{"a":1}') AS t1, JSON_TYPE('[1,2]') AS t2, JSON_TYPE('"hello"') AS t3`);
+                const pass = res.rows[0].t1 === 'OBJECT' && res.rows[0].t2 === 'ARRAY' && res.rows[0].t3 === 'STRING';
+                tests.push({ name: 'JSON_TYPE', pass, actual: `${res.rows[0].t1}, ${res.rows[0].t2}, ${res.rows[0].t3}` });
+            } catch (e) {
+                tests.push({ name: 'JSON_TYPE', pass: false, error: e.message });
+            }
+
+            // JSON_VALID
+            try {
+                const res = await v.exec(`SELECT JSON_VALID('{"a":1}') AS valid, JSON_VALID('not json') AS invalid`);
+                const pass = res.rows[0].valid === 1 && res.rows[0].invalid === 0;
+                tests.push({ name: 'JSON_VALID', pass, actual: `valid=${res.rows[0].valid}, invalid=${res.rows[0].invalid}` });
+            } catch (e) {
+                tests.push({ name: 'JSON_VALID', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE json_data');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('Scalar subqueries in SELECT', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE departments (id INT, name TEXT)');
+            await v.exec('CREATE TABLE employees (id INT, name TEXT, dept_id INT, salary REAL)');
+            await v.exec("INSERT INTO departments VALUES (1, 'Engineering'), (2, 'Sales'), (3, 'HR')");
+            await v.exec("INSERT INTO employees VALUES (1, 'Alice', 1, 80000), (2, 'Bob', 1, 70000), (3, 'Carol', 2, 60000), (4, 'Dave', 2, 55000)");
+
+            // Simple scalar subquery (non-correlated)
+            try {
+                const res = await v.exec('SELECT id, name, (SELECT MAX(salary) FROM employees) AS max_salary FROM departments WHERE id = 1');
+                const pass = res.rows[0].max_salary === 80000;
+                tests.push({ name: 'Non-correlated scalar subquery', pass, actual: res.rows[0].max_salary });
+            } catch (e) {
+                tests.push({ name: 'Non-correlated scalar subquery', pass: false, error: e.message });
+            }
+
+            // Correlated scalar subquery
+            try {
+                const res = await v.exec('SELECT d.id, d.name, (SELECT COUNT(*) FROM employees e WHERE e.dept_id = d.id) AS emp_count FROM departments d ORDER BY d.id');
+                const pass = res.rows[0].emp_count === 2 && res.rows[1].emp_count === 2 && res.rows[2].emp_count === 0;
+                tests.push({ name: 'Correlated scalar subquery COUNT', pass, actual: `${res.rows[0].emp_count}, ${res.rows[1].emp_count}, ${res.rows[2].emp_count}` });
+            } catch (e) {
+                tests.push({ name: 'Correlated scalar subquery COUNT', pass: false, error: e.message });
+            }
+
+            // Scalar subquery returning MAX per department
+            try {
+                const res = await v.exec('SELECT d.name, (SELECT MAX(salary) FROM employees e WHERE e.dept_id = d.id) AS max_salary FROM departments d WHERE d.id <= 2 ORDER BY d.id');
+                const pass = res.rows[0].max_salary === 80000 && res.rows[1].max_salary === 60000;
+                tests.push({ name: 'Correlated scalar subquery MAX', pass, actual: `${res.rows[0].max_salary}, ${res.rows[1].max_salary}` });
+            } catch (e) {
+                tests.push({ name: 'Correlated scalar subquery MAX', pass: false, error: e.message });
+            }
+
+            // Scalar subquery with alias
+            try {
+                const res = await v.exec('SELECT name, (SELECT 100) AS constant FROM departments WHERE id = 1');
+                const pass = res.rows[0].constant === 100;
+                tests.push({ name: 'Scalar subquery with alias', pass, actual: res.rows[0].constant });
+            } catch (e) {
+                tests.push({ name: 'Scalar subquery with alias', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE employees');
+            await v.exec('DROP TABLE departments');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('LEFT OUTER JOIN (with OUTER keyword)', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup
+            await v.exec('CREATE TABLE tbl_a (id INT, val TEXT)');
+            await v.exec('CREATE TABLE tbl_b (id INT, val TEXT)');
+            await v.exec("INSERT INTO tbl_a VALUES (1, 'A'), (2, 'B')");
+            await v.exec("INSERT INTO tbl_b VALUES (1, 'X')");
+
+            // LEFT OUTER JOIN
+            try {
+                const res = await v.exec('SELECT a.id, a.val, b.val FROM tbl_a a LEFT OUTER JOIN tbl_b b ON a.id = b.id ORDER BY a.id');
+                const pass = res.rows.length === 2;
+                tests.push({ name: 'LEFT OUTER JOIN', pass, actual: res.rows.length });
+            } catch (e) {
+                tests.push({ name: 'LEFT OUTER JOIN', pass: false, error: e.message });
+            }
+
+            // RIGHT OUTER JOIN
+            try {
+                await v.exec("INSERT INTO tbl_b VALUES (3, 'Y')");
+                const res = await v.exec('SELECT a.id, b.id, b.val FROM tbl_a a RIGHT OUTER JOIN tbl_b b ON a.id = b.id');
+                const pass = res.rows.length === 2; // id=1 match, id=3 no match on left
+                tests.push({ name: 'RIGHT OUTER JOIN', pass, actual: res.rows.length });
+            } catch (e) {
+                tests.push({ name: 'RIGHT OUTER JOIN', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE tbl_a');
+            await v.exec('DROP TABLE tbl_b');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    // ==================== PHASE 4: Data Type Operations ====================
+
+    test('ARRAY operations', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Test ARRAY constructor
+            try {
+                const res = await v.exec('SELECT ARRAY[1, 2, 3] AS arr');
+                const arr = res.rows[0]?.arr;
+                const pass = Array.isArray(arr) && arr.length === 3 && arr[0] === 1 && arr[1] === 2 && arr[2] === 3;
+                tests.push({ name: 'ARRAY[1, 2, 3] constructor', pass, actual: JSON.stringify(arr) });
+            } catch (e) {
+                tests.push({ name: 'ARRAY constructor', pass: false, error: e.message });
+            }
+
+            // Test bare bracket array
+            try {
+                const res = await v.exec('SELECT [10, 20, 30] AS arr');
+                const arr = res.rows[0]?.arr;
+                const pass = Array.isArray(arr) && arr.length === 3;
+                tests.push({ name: '[10, 20, 30] bare bracket array', pass, actual: JSON.stringify(arr) });
+            } catch (e) {
+                tests.push({ name: 'Bare bracket array', pass: false, error: e.message });
+            }
+
+            // Test array subscript (1-indexed)
+            try {
+                const res = await v.exec('SELECT ARRAY[10, 20, 30][2] AS val');
+                const pass = res.rows[0]?.val === 20;
+                tests.push({ name: 'ARRAY[10, 20, 30][2] subscript', pass, actual: res.rows[0]?.val });
+            } catch (e) {
+                tests.push({ name: 'Array subscript', pass: false, error: e.message });
+            }
+
+            // Test ARRAY_LENGTH
+            try {
+                const res = await v.exec('SELECT ARRAY_LENGTH(ARRAY[1, 2, 3, 4]) AS len');
+                const pass = res.rows[0]?.len === 4;
+                tests.push({ name: 'ARRAY_LENGTH', pass, actual: res.rows[0]?.len });
+            } catch (e) {
+                tests.push({ name: 'ARRAY_LENGTH', pass: false, error: e.message });
+            }
+
+            // Test ARRAY_CONTAINS
+            try {
+                const res = await v.exec('SELECT ARRAY_CONTAINS(ARRAY[1, 2, 3], 2) AS found');
+                const pass = res.rows[0]?.found === 1;
+                tests.push({ name: 'ARRAY_CONTAINS found', pass, actual: res.rows[0]?.found });
+            } catch (e) {
+                tests.push({ name: 'ARRAY_CONTAINS', pass: false, error: e.message });
+            }
+
+            // Test ARRAY_CONTAINS not found
+            try {
+                const res = await v.exec('SELECT ARRAY_CONTAINS(ARRAY[1, 2, 3], 5) AS found');
+                const pass = res.rows[0]?.found === 0;
+                tests.push({ name: 'ARRAY_CONTAINS not found', pass, actual: res.rows[0]?.found });
+            } catch (e) {
+                tests.push({ name: 'ARRAY_CONTAINS not found', pass: false, error: e.message });
+            }
+
+            // Test ARRAY_POSITION
+            try {
+                const res = await v.exec("SELECT ARRAY_POSITION(ARRAY['a', 'b', 'c'], 'b') AS pos");
+                const pass = res.rows[0]?.pos === 2;
+                tests.push({ name: 'ARRAY_POSITION', pass, actual: res.rows[0]?.pos });
+            } catch (e) {
+                tests.push({ name: 'ARRAY_POSITION', pass: false, error: e.message });
+            }
+
+            // Test ARRAY_APPEND
+            try {
+                const res = await v.exec('SELECT ARRAY_APPEND(ARRAY[1, 2], 3) AS arr');
+                const arr = res.rows[0]?.arr;
+                const pass = Array.isArray(arr) && arr.length === 3 && arr[2] === 3;
+                tests.push({ name: 'ARRAY_APPEND', pass, actual: JSON.stringify(arr) });
+            } catch (e) {
+                tests.push({ name: 'ARRAY_APPEND', pass: false, error: e.message });
+            }
+
+            // Test ARRAY_REMOVE
+            try {
+                const res = await v.exec('SELECT ARRAY_REMOVE(ARRAY[1, 2, 3, 2], 2) AS arr');
+                const arr = res.rows[0]?.arr;
+                const pass = Array.isArray(arr) && arr.length === 2 && !arr.includes(2);
+                tests.push({ name: 'ARRAY_REMOVE', pass, actual: JSON.stringify(arr) });
+            } catch (e) {
+                tests.push({ name: 'ARRAY_REMOVE', pass: false, error: e.message });
+            }
+
+            // Test ARRAY_SLICE
+            try {
+                const res = await v.exec('SELECT ARRAY_SLICE(ARRAY[1, 2, 3, 4, 5], 2, 4) AS arr');
+                const arr = res.rows[0]?.arr;
+                const pass = Array.isArray(arr) && JSON.stringify(arr) === '[2,3]';
+                tests.push({ name: 'ARRAY_SLICE(arr, 2, 4)', pass, actual: JSON.stringify(arr) });
+            } catch (e) {
+                tests.push({ name: 'ARRAY_SLICE', pass: false, error: e.message });
+            }
+
+            // Test ARRAY_CONCAT
+            try {
+                const res = await v.exec('SELECT ARRAY_CONCAT(ARRAY[1, 2], ARRAY[3, 4]) AS arr');
+                const arr = res.rows[0]?.arr;
+                const pass = Array.isArray(arr) && arr.length === 4;
+                tests.push({ name: 'ARRAY_CONCAT', pass, actual: JSON.stringify(arr) });
+            } catch (e) {
+                tests.push({ name: 'ARRAY_CONCAT', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('UUID functions', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+            const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+            // Test UUID() generates valid UUID
+            try {
+                const res = await v.exec('SELECT UUID() AS id');
+                const uuid = res.rows[0]?.id;
+                const pass = uuidRegex.test(uuid);
+                tests.push({ name: 'UUID() generates valid UUID', pass, actual: uuid });
+            } catch (e) {
+                tests.push({ name: 'UUID()', pass: false, error: e.message });
+            }
+
+            // Test GEN_RANDOM_UUID
+            try {
+                const res = await v.exec('SELECT GEN_RANDOM_UUID() AS id');
+                const uuid = res.rows[0]?.id;
+                const pass = uuidRegex.test(uuid);
+                tests.push({ name: 'GEN_RANDOM_UUID()', pass, actual: uuid });
+            } catch (e) {
+                tests.push({ name: 'GEN_RANDOM_UUID()', pass: false, error: e.message });
+            }
+
+            // Test IS_UUID valid
+            try {
+                const res = await v.exec("SELECT IS_UUID('550e8400-e29b-41d4-a716-446655440000') AS valid");
+                const pass = res.rows[0]?.valid === 1;
+                tests.push({ name: 'IS_UUID valid UUID', pass, actual: res.rows[0]?.valid });
+            } catch (e) {
+                tests.push({ name: 'IS_UUID valid', pass: false, error: e.message });
+            }
+
+            // Test IS_UUID invalid
+            try {
+                const res = await v.exec("SELECT IS_UUID('not-a-uuid') AS valid");
+                const pass = res.rows[0]?.valid === 0;
+                tests.push({ name: 'IS_UUID invalid string', pass, actual: res.rows[0]?.valid });
+            } catch (e) {
+                tests.push({ name: 'IS_UUID invalid', pass: false, error: e.message });
+            }
+
+            // Test UUID uniqueness
+            try {
+                const res = await v.exec('SELECT UUID() AS id1, UUID() AS id2');
+                const pass = res.rows[0]?.id1 !== res.rows[0]?.id2;
+                tests.push({ name: 'UUID uniqueness', pass, actual: `${res.rows[0]?.id1} vs ${res.rows[0]?.id2}` });
+            } catch (e) {
+                tests.push({ name: 'UUID uniqueness', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('DECIMAL precision - TRUNC and ROUND with scale', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Test ROUND with scale 2
+            try {
+                const res = await v.exec('SELECT ROUND(3.14159, 2) AS val');
+                const pass = res.rows[0]?.val === 3.14;
+                tests.push({ name: 'ROUND(3.14159, 2)', pass, actual: res.rows[0]?.val });
+            } catch (e) {
+                tests.push({ name: 'ROUND with scale', pass: false, error: e.message });
+            }
+
+            // Test ROUND with scale 3
+            try {
+                const res = await v.exec('SELECT ROUND(123.456789, 3) AS val');
+                const pass = res.rows[0]?.val === 123.457;
+                tests.push({ name: 'ROUND(123.456789, 3)', pass, actual: res.rows[0]?.val });
+            } catch (e) {
+                tests.push({ name: 'ROUND with scale 3', pass: false, error: e.message });
+            }
+
+            // Test ROUND with negative scale (round to tens)
+            try {
+                const res = await v.exec('SELECT ROUND(1234.5, -2) AS val');
+                const pass = res.rows[0]?.val === 1200;
+                tests.push({ name: 'ROUND(1234.5, -2) to hundreds', pass, actual: res.rows[0]?.val });
+            } catch (e) {
+                tests.push({ name: 'ROUND negative scale', pass: false, error: e.message });
+            }
+
+            // Test TRUNC with scale 2
+            try {
+                const res = await v.exec('SELECT TRUNC(3.14159, 2) AS val');
+                const pass = res.rows[0]?.val === 3.14;
+                tests.push({ name: 'TRUNC(3.14159, 2)', pass, actual: res.rows[0]?.val });
+            } catch (e) {
+                tests.push({ name: 'TRUNC with scale', pass: false, error: e.message });
+            }
+
+            // Test TRUNC with scale 3
+            try {
+                const res = await v.exec('SELECT TRUNC(123.456789, 3) AS val');
+                const pass = res.rows[0]?.val === 123.456;
+                tests.push({ name: 'TRUNC(123.456789, 3)', pass, actual: res.rows[0]?.val });
+            } catch (e) {
+                tests.push({ name: 'TRUNC with scale 3', pass: false, error: e.message });
+            }
+
+            // Test TRUNC without scale (default behavior)
+            try {
+                const res = await v.exec('SELECT TRUNC(3.9) AS val');
+                const pass = res.rows[0]?.val === 3;
+                tests.push({ name: 'TRUNC(3.9) no scale', pass, actual: res.rows[0]?.val });
+            } catch (e) {
+                tests.push({ name: 'TRUNC no scale', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('Binary/Bitwise operations', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Test bitwise AND
+            try {
+                const res = await v.exec('SELECT 12 & 10 AS val');
+                const pass = res.rows[0]?.val === 8; // 1100 & 1010 = 1000
+                tests.push({ name: 'Bitwise AND (12 & 10)', pass, actual: res.rows[0]?.val });
+            } catch (e) {
+                tests.push({ name: 'Bitwise AND', pass: false, error: e.message });
+            }
+
+            // Test bitwise OR
+            try {
+                const res = await v.exec('SELECT 12 | 10 AS val');
+                const pass = res.rows[0]?.val === 14; // 1100 | 1010 = 1110
+                tests.push({ name: 'Bitwise OR (12 | 10)', pass, actual: res.rows[0]?.val });
+            } catch (e) {
+                tests.push({ name: 'Bitwise OR', pass: false, error: e.message });
+            }
+
+            // Test bitwise XOR
+            try {
+                const res = await v.exec('SELECT 12 ^ 10 AS val');
+                const pass = res.rows[0]?.val === 6; // 1100 ^ 1010 = 0110
+                tests.push({ name: 'Bitwise XOR (12 ^ 10)', pass, actual: res.rows[0]?.val });
+            } catch (e) {
+                tests.push({ name: 'Bitwise XOR', pass: false, error: e.message });
+            }
+
+            // Test left shift
+            try {
+                const res = await v.exec('SELECT 1 << 4 AS val');
+                const pass = res.rows[0]?.val === 16;
+                tests.push({ name: 'Left shift (1 << 4)', pass, actual: res.rows[0]?.val });
+            } catch (e) {
+                tests.push({ name: 'Left shift', pass: false, error: e.message });
+            }
+
+            // Test right shift
+            try {
+                const res = await v.exec('SELECT 16 >> 2 AS val');
+                const pass = res.rows[0]?.val === 4;
+                tests.push({ name: 'Right shift (16 >> 2)', pass, actual: res.rows[0]?.val });
+            } catch (e) {
+                tests.push({ name: 'Right shift', pass: false, error: e.message });
+            }
+
+            // Test bitwise NOT
+            try {
+                const res = await v.exec('SELECT ~0 AS val');
+                const pass = res.rows[0]?.val === -1;
+                tests.push({ name: 'Bitwise NOT (~0)', pass, actual: res.rows[0]?.val });
+            } catch (e) {
+                tests.push({ name: 'Bitwise NOT', pass: false, error: e.message });
+            }
+
+            // Test BIT_COUNT
+            try {
+                const res = await v.exec('SELECT BIT_COUNT(15) AS cnt');
+                const pass = res.rows[0]?.cnt === 4; // 1111 has 4 bits set
+                tests.push({ name: 'BIT_COUNT(15)', pass, actual: res.rows[0]?.cnt });
+            } catch (e) {
+                tests.push({ name: 'BIT_COUNT', pass: false, error: e.message });
+            }
+
+            // Test BIT_COUNT with larger number
+            try {
+                const res = await v.exec('SELECT BIT_COUNT(255) AS cnt');
+                const pass = res.rows[0]?.cnt === 8; // 11111111 has 8 bits set
+                tests.push({ name: 'BIT_COUNT(255)', pass, actual: res.rows[0]?.cnt });
+            } catch (e) {
+                tests.push({ name: 'BIT_COUNT(255)', pass: false, error: e.message });
+            }
+
+            // Test HEX with number
+            try {
+                const res = await v.exec('SELECT HEX(255) AS hex');
+                const pass = res.rows[0]?.hex === 'FF';
+                tests.push({ name: 'HEX(255)', pass, actual: res.rows[0]?.hex });
+            } catch (e) {
+                tests.push({ name: 'HEX number', pass: false, error: e.message });
+            }
+
+            // Test HEX with string
+            try {
+                const res = await v.exec("SELECT HEX('AB') AS hex");
+                const pass = res.rows[0]?.hex === '4142'; // A=0x41, B=0x42
+                tests.push({ name: "HEX('AB')", pass, actual: res.rows[0]?.hex });
+            } catch (e) {
+                tests.push({ name: 'HEX string', pass: false, error: e.message });
+            }
+
+            // Test UNHEX
+            try {
+                const res = await v.exec("SELECT UNHEX('4142') AS str");
+                const pass = res.rows[0]?.str === 'AB';
+                tests.push({ name: "UNHEX('4142')", pass, actual: res.rows[0]?.str });
+            } catch (e) {
+                tests.push({ name: 'UNHEX', pass: false, error: e.message });
+            }
+
+            // Test ENCODE/DECODE base64
+            try {
+                const res = await v.exec("SELECT DECODE(ENCODE('Hello', 'base64'), 'base64') AS val");
+                const pass = res.rows[0]?.val === 'Hello';
+                tests.push({ name: 'ENCODE/DECODE base64', pass, actual: res.rows[0]?.val });
+            } catch (e) {
+                tests.push({ name: 'ENCODE/DECODE', pass: false, error: e.message });
+            }
+
+            // Test ENCODE base64
+            try {
+                const res = await v.exec("SELECT ENCODE('Hello', 'base64') AS encoded");
+                const pass = res.rows[0]?.encoded === 'SGVsbG8=';
+                tests.push({ name: "ENCODE('Hello', 'base64')", pass, actual: res.rows[0]?.encoded });
+            } catch (e) {
+                tests.push({ name: 'ENCODE base64', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    // ==================== PHASE 5: DML ENHANCEMENTS ====================
+
+    test('INSERT...SELECT copies data between tables', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Create source and destination tables
+            await v.exec('CREATE TABLE src (id INT, value TEXT)');
+            await v.exec('CREATE TABLE dst (id INT, value TEXT)');
+            await v.exec("INSERT INTO src VALUES (1, 'a'), (2, 'b'), (3, 'c')");
+
+            // Test INSERT...SELECT (all columns)
+            try {
+                await v.exec('INSERT INTO dst SELECT * FROM src');
+                const res = await v.exec('SELECT COUNT(*) AS cnt FROM dst');
+                const pass = res.rows[0]?.cnt === 3;
+                tests.push({ name: 'INSERT...SELECT all', pass, actual: res.rows[0]?.cnt });
+            } catch (e) {
+                tests.push({ name: 'INSERT...SELECT all', pass: false, error: e.message });
+            }
+
+            // Test INSERT...SELECT with WHERE filter
+            try {
+                await v.exec('CREATE TABLE dst2 (id INT, value TEXT)');
+                await v.exec('INSERT INTO dst2 SELECT * FROM src WHERE id > 1');
+                const res = await v.exec('SELECT COUNT(*) AS cnt FROM dst2');
+                const pass = res.rows[0]?.cnt === 2;
+                tests.push({ name: 'INSERT...SELECT with WHERE', pass, actual: res.rows[0]?.cnt });
+            } catch (e) {
+                tests.push({ name: 'INSERT...SELECT with WHERE', pass: false, error: e.message });
+            }
+
+            // Test INSERT...SELECT with column mapping
+            try {
+                await v.exec('CREATE TABLE dst3 (num INT, txt TEXT)');
+                await v.exec('INSERT INTO dst3 (num, txt) SELECT id, value FROM src WHERE id = 1');
+                const res = await v.exec('SELECT num, txt FROM dst3');
+                const pass = res.rows[0]?.num === 1 && res.rows[0]?.txt === 'a';
+                tests.push({ name: 'INSERT...SELECT column mapping', pass, actual: JSON.stringify(res.rows[0]) });
+            } catch (e) {
+                tests.push({ name: 'INSERT...SELECT column mapping', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('UPSERT with ON CONFLICT DO NOTHING and DO UPDATE', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Create table with data
+            await v.exec('CREATE TABLE items (id INT PRIMARY KEY, qty INT, name TEXT)');
+            await v.exec("INSERT INTO items VALUES (1, 10, 'apple'), (2, 20, 'banana')");
+
+            // Test ON CONFLICT DO NOTHING
+            try {
+                await v.exec("INSERT INTO items VALUES (1, 999, 'new') ON CONFLICT (id) DO NOTHING");
+                const res = await v.exec('SELECT qty FROM items WHERE id = 1');
+                const pass = res.rows[0]?.qty === 10;  // Should remain unchanged
+                tests.push({ name: 'ON CONFLICT DO NOTHING', pass, actual: res.rows[0]?.qty });
+            } catch (e) {
+                tests.push({ name: 'ON CONFLICT DO NOTHING', pass: false, error: e.message });
+            }
+
+            // Test ON CONFLICT DO UPDATE with EXCLUDED
+            try {
+                await v.exec("INSERT INTO items VALUES (1, 50, 'updated') ON CONFLICT (id) DO UPDATE SET qty = EXCLUDED.qty");
+                const res = await v.exec('SELECT qty FROM items WHERE id = 1');
+                const pass = res.rows[0]?.qty === 50;  // Should be updated
+                tests.push({ name: 'ON CONFLICT DO UPDATE EXCLUDED.qty', pass, actual: res.rows[0]?.qty });
+            } catch (e) {
+                tests.push({ name: 'ON CONFLICT DO UPDATE', pass: false, error: e.message });
+            }
+
+            // Test ON CONFLICT with multiple SET columns
+            try {
+                await v.exec("INSERT INTO items VALUES (2, 100, 'grape') ON CONFLICT (id) DO UPDATE SET qty = EXCLUDED.qty, name = EXCLUDED.name");
+                const res = await v.exec('SELECT qty, name FROM items WHERE id = 2');
+                const pass = res.rows[0]?.qty === 100 && res.rows[0]?.name === 'grape';
+                tests.push({ name: 'ON CONFLICT multi-column UPDATE', pass, actual: JSON.stringify(res.rows[0]) });
+            } catch (e) {
+                tests.push({ name: 'ON CONFLICT multi-column', pass: false, error: e.message });
+            }
+
+            // Test inserting new row with ON CONFLICT (no conflict)
+            try {
+                await v.exec("INSERT INTO items VALUES (3, 30, 'cherry') ON CONFLICT (id) DO NOTHING");
+                const res = await v.exec('SELECT COUNT(*) AS cnt FROM items');
+                const pass = res.rows[0]?.cnt === 3;  // Should have 3 rows now
+                tests.push({ name: 'INSERT with ON CONFLICT (no conflict)', pass, actual: res.rows[0]?.cnt });
+            } catch (e) {
+                tests.push({ name: 'INSERT no conflict', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('UPDATE with FROM clause (JOIN-based update)', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Create tables
+            await v.exec('CREATE TABLE orders (id INT, status TEXT, amount INT)');
+            await v.exec('CREATE TABLE status_updates (order_id INT, new_status TEXT)');
+            await v.exec("INSERT INTO orders VALUES (1, 'pending', 100), (2, 'pending', 200), (3, 'pending', 300)");
+            await v.exec("INSERT INTO status_updates VALUES (1, 'shipped'), (3, 'delivered')");
+
+            // Test UPDATE with FROM clause
+            try {
+                await v.exec('UPDATE orders o SET status = u.new_status FROM status_updates u WHERE o.id = u.order_id');
+                const res = await v.exec('SELECT id, status FROM orders ORDER BY id');
+                const pass = res.rows[0]?.status === 'shipped' &&
+                             res.rows[1]?.status === 'pending' &&
+                             res.rows[2]?.status === 'delivered';
+                tests.push({ name: 'UPDATE FROM basic', pass, actual: JSON.stringify(res.rows) });
+            } catch (e) {
+                tests.push({ name: 'UPDATE FROM basic', pass: false, error: e.message });
+            }
+
+            // Test UPDATE with FROM using expressions
+            try {
+                await v.exec('CREATE TABLE multipliers (order_id INT, factor INT)');
+                await v.exec('INSERT INTO multipliers VALUES (1, 2), (2, 3)');
+                await v.exec('UPDATE orders o SET amount = o.amount * m.factor FROM multipliers m WHERE o.id = m.order_id');
+                const res = await v.exec('SELECT id, amount FROM orders ORDER BY id');
+                const pass = res.rows[0]?.amount === 200 && res.rows[1]?.amount === 600 && res.rows[2]?.amount === 300;
+                tests.push({ name: 'UPDATE FROM with expression', pass, actual: JSON.stringify(res.rows) });
+            } catch (e) {
+                tests.push({ name: 'UPDATE FROM expression', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('DELETE with USING clause (JOIN-based delete)', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Create tables
+            await v.exec('CREATE TABLE products (id INT, name TEXT, active INT)');
+            await v.exec('CREATE TABLE to_delete (product_id INT)');
+            await v.exec("INSERT INTO products VALUES (1, 'apple', 1), (2, 'banana', 1), (3, 'cherry', 1), (4, 'date', 1)");
+            await v.exec('INSERT INTO to_delete VALUES (1), (3)');
+
+            // Test DELETE with USING
+            try {
+                await v.exec('DELETE FROM products p USING to_delete d WHERE p.id = d.product_id');
+                const res = await v.exec('SELECT id, name FROM products ORDER BY id');
+                const pass = res.rows.length === 2 && res.rows[0]?.id === 2 && res.rows[1]?.id === 4;
+                tests.push({ name: 'DELETE USING basic', pass, actual: JSON.stringify(res.rows) });
+            } catch (e) {
+                tests.push({ name: 'DELETE USING basic', pass: false, error: e.message });
+            }
+
+            // Test DELETE with USING and additional WHERE conditions
+            try {
+                await v.exec('CREATE TABLE items2 (id INT, category TEXT)');
+                await v.exec('CREATE TABLE blacklist (cat TEXT)');
+                await v.exec("INSERT INTO items2 VALUES (1, 'food'), (2, 'food'), (3, 'electronics'), (4, 'electronics')");
+                await v.exec("INSERT INTO blacklist VALUES ('electronics')");
+                await v.exec('DELETE FROM items2 i USING blacklist b WHERE i.category = b.cat');
+                const res = await v.exec('SELECT COUNT(*) AS cnt FROM items2');
+                const pass = res.rows[0]?.cnt === 2;  // Only food items remain
+                tests.push({ name: 'DELETE USING with category match', pass, actual: res.rows[0]?.cnt });
+            } catch (e) {
+                tests.push({ name: 'DELETE USING category', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
 });
