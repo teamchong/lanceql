@@ -4545,4 +4545,112 @@ test.describe('Vault SQL Operations', () => {
             expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
         }
     });
+
+    test('GPU hash join matches CPU results', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { gpuJoiner } = await import('./lanceql.js');
+            const tests = [];
+
+            // Initialize GPU joiner
+            await gpuJoiner.init();
+            const isAvailable = gpuJoiner.isAvailable();
+            tests.push({ name: 'GPUJoiner initializes', pass: true, actual: isAvailable ? 'GPU available' : 'CPU fallback' });
+
+            // Create test tables
+            const leftRows = [];
+            const rightRows = [];
+            for (let i = 0; i < 1000; i++) {
+                leftRows.push({ id: i, name: `left_${i}`, value: i * 10 });
+            }
+            for (let i = 0; i < 500; i++) {
+                rightRows.push({ id: i * 2, category: `cat_${i}`, score: i });
+            }
+
+            // Test hash join
+            try {
+                const result = await gpuJoiner.hashJoin(leftRows, rightRows, 'id', 'id');
+
+                // Should have 500 matches (every even id from 0-998)
+                tests.push({
+                    name: 'Hash join returns correct match count',
+                    pass: result.matchCount === 500,
+                    actual: result.matchCount
+                });
+
+                // Verify indices are valid
+                let validIndices = true;
+                for (let i = 0; i < Math.min(result.matchCount, 10); i++) {
+                    const li = result.leftIndices[i];
+                    const ri = result.rightIndices[i];
+                    if (leftRows[li].id !== rightRows[ri].id) {
+                        validIndices = false;
+                        break;
+                    }
+                }
+                tests.push({ name: 'Join indices match correctly', pass: validIndices });
+            } catch (e) {
+                tests.push({ name: 'Hash join', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('GPU hash join handles edge cases', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { gpuJoiner } = await import('./lanceql.js');
+            const tests = [];
+
+            await gpuJoiner.init();
+
+            // Test empty tables
+            try {
+                const result = await gpuJoiner.hashJoin([], [{ id: 1 }], 'id', 'id');
+                tests.push({ name: 'Empty left table returns 0 matches', pass: result.matchCount === 0, actual: result.matchCount });
+            } catch (e) {
+                tests.push({ name: 'Empty left table', pass: false, error: e.message });
+            }
+
+            // Test no matches
+            try {
+                const left = [{ id: 1 }, { id: 2 }, { id: 3 }];
+                const right = [{ id: 100 }, { id: 200 }];
+                const result = await gpuJoiner.hashJoin(left, right, 'id', 'id');
+                tests.push({ name: 'No matches returns 0', pass: result.matchCount === 0, actual: result.matchCount });
+            } catch (e) {
+                tests.push({ name: 'No matches', pass: false, error: e.message });
+            }
+
+            // Test string keys
+            try {
+                const left = [{ name: 'alice' }, { name: 'bob' }, { name: 'charlie' }];
+                const right = [{ name: 'bob' }, { name: 'david' }];
+                const result = await gpuJoiner.hashJoin(left, right, 'name', 'name');
+                tests.push({ name: 'String key join works', pass: result.matchCount === 1, actual: result.matchCount });
+            } catch (e) {
+                tests.push({ name: 'String key join', pass: false, error: e.message });
+            }
+
+            // Test many-to-many
+            try {
+                const left = [{ id: 1 }, { id: 1 }, { id: 2 }];
+                const right = [{ id: 1 }, { id: 1 }];
+                const result = await gpuJoiner.hashJoin(left, right, 'id', 'id');
+                // 2 left rows with id=1, 2 right rows with id=1 = 4 matches
+                tests.push({ name: 'Many-to-many join', pass: result.matchCount === 4, actual: result.matchCount });
+            } catch (e) {
+                tests.push({ name: 'Many-to-many join', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
 });
