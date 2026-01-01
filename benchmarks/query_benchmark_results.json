@@ -1,0 +1,86 @@
+{
+  "COUNT(*)": {
+    "csv": {
+      "duckdb_ms": 39.06531259417534,
+      "lanceql_ms": 49.64435399451759
+    },
+    "parquet": {
+      "duckdb_ms": 0.2413958980469033,
+      "lanceql_ms": 59.86788749578409
+    },
+    "lance": {
+      "duckdb_ms": 0.0,
+      "lanceql_ms": 55.11327080312185
+    }
+  },
+  "SELECT LIMIT 100": {
+    "csv": {
+      "duckdb_ms": 26.09888750303071,
+      "lanceql_ms": 45.09181650355458
+    },
+    "parquet": {
+      "duckdb_ms": 3.2252291013719514,
+      "lanceql_ms": 58.79101660393644
+    },
+    "lance": {
+      "duckdb_ms": 0.0,
+      "lanceql_ms": 46.63376660319045
+    }
+  },
+  "WHERE filter": {
+    "csv": {
+      "duckdb_ms": 64.15986670181155,
+      "lanceql_ms": 49.933124997187406
+    },
+    "parquet": {
+      "duckdb_ms": 21.418958192225546,
+      "lanceql_ms": 64.73519999708515
+    },
+    "lance": {
+      "duckdb_ms": 0.0,
+      "lanceql_ms": 46.731779095716774
+    }
+  },
+  "GROUP BY": {
+    "csv": {
+      "duckdb_ms": 43.14695419743657,
+      "lanceql_ms": 43.86746660456993
+    },
+    "parquet": {
+      "duckdb_ms": 2.0418457948835567,
+      "lanceql_ms": 73.53530420223251
+    },
+    "lance": {
+      "duckdb_ms": 0.0,
+      "lanceql_ms": 47.74983350071125
+    }
+  },
+  "ORDER BY": {
+    "csv": {
+      "duckdb_ms": 42.3577500943793,
+      "lanceql_ms": 41.710204107221216
+    },
+    "parquet": {
+      "duckdb_ms": 2.9901706060627475,
+      "lanceql_ms": 53.3827209030278
+    },
+    "lance": {
+      "duckdb_ms": 0.0,
+      "lanceql_ms": 51.48534999752883
+    }
+  },
+  "Complex": {
+    "csv": {
+      "duckdb_ms": 59.81060419289861,
+      "lanceql_ms": 55.55073749856092
+    },
+    "parquet": {
+      "duckdb_ms": 3.320533101214096,
+      "lanceql_ms": 56.409245904069394
+    },
+    "lance": {
+      "duckdb_ms": 0.0,
+      "lanceql_ms": 42.513445802615024
+    }
+  }
+}

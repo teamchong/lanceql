@@ -1,0 +1,50 @@
+{
+  "csv": {
+    "file_size_bytes": 72,
+    "duckdb_ms": 1.1853585951030254,
+    "duckdb_rows": 5,
+    "lanceql_ms": 8.947091602021828
+  },
+  "parquet": {
+    "file_size_bytes": 1107,
+    "duckdb_ms": 0.15707500861026347,
+    "duckdb_rows": 5,
+    "lanceql_ms": 10.219949798192829
+  },
+  "arrow": {
+    "file_size_bytes": 906,
+    "duckdb_ms": 0.0,
+    "duckdb_rows": 0,
+    "lanceql_ms": 3.4065666026435792
+  },
+  "avro": {
+    "file_size_bytes": 301,
+    "duckdb_ms": 0.0,
+    "duckdb_rows": 0,
+    "lanceql_ms": 3.373224998358637
+  },
+  "orc": {
+    "file_size_bytes": 484,
+    "duckdb_ms": 0.0,
+    "duckdb_rows": 0,
+    "lanceql_ms": 4.027499805670232
+  },
+  "xlsx": {
+    "file_size_bytes": 18271,
+    "duckdb_ms": 3.3769747940823436,
+    "duckdb_rows": 5,
+    "lanceql_ms": 4.481166799087077
+  },
+  "delta": {
+    "file_size_bytes": 2447,
+    "duckdb_ms": 1.6006416000891477,
+    "duckdb_rows": 5,
+    "lanceql_ms": 3.3196833916008472
+  },
+  "iceberg": {
+    "file_size_bytes": 537,
+    "duckdb_ms": 0.0,
+    "duckdb_rows": 0,
+    "lanceql_ms": 3.779267001664266
+  }
+}
