@@ -214,6 +214,139 @@ describe('LanceQL CLI', () => {
       assert.ok(result.exitCode === 0 || result.stderr.includes('not implemented'));
     });
   });
+
+  describe('Multi-Format Ingest', () => {
+    let tempDir;
+
+    before(() => {
+      tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lanceql-formats-'));
+    });
+
+    after(() => {
+      if (tempDir) {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('should ingest Arrow IPC file', () => {
+      if (!cliExists()) return;
+
+      const arrowFile = path.join(FIXTURES_PATH, 'simple.arrow');
+      const lancePath = path.join(tempDir, 'from_arrow.lance');
+
+      if (!fs.existsSync(arrowFile)) {
+        console.log('Skipping: simple.arrow not found');
+        return;
+      }
+
+      const result = runCli(`ingest "${arrowFile}" -o "${lancePath}"`);
+      assert.strictEqual(result.exitCode, 0, `stderr: ${result.stderr}`);
+      // Check that format was auto-detected as Arrow
+      assert.match(result.output, /Format: arrow|Arrow IPC/i);
+    });
+
+    it('should ingest Avro file', () => {
+      if (!cliExists()) return;
+
+      const avroFile = path.join(FIXTURES_PATH, 'simple.avro');
+      const lancePath = path.join(tempDir, 'from_avro.lance');
+
+      if (!fs.existsSync(avroFile)) {
+        console.log('Skipping: simple.avro not found');
+        return;
+      }
+
+      const result = runCli(`ingest "${avroFile}" -o "${lancePath}"`);
+      assert.strictEqual(result.exitCode, 0, `stderr: ${result.stderr}`);
+      // Check that format was auto-detected as Avro
+      assert.match(result.output, /Format: avro|Avro/i);
+    });
+
+    it('should ingest ORC file', () => {
+      if (!cliExists()) return;
+
+      const orcFile = path.join(FIXTURES_PATH, 'simple.orc');
+      const lancePath = path.join(tempDir, 'from_orc.lance');
+
+      if (!fs.existsSync(orcFile)) {
+        console.log('Skipping: simple.orc not found');
+        return;
+      }
+
+      const result = runCli(`ingest "${orcFile}" -o "${lancePath}"`);
+      assert.strictEqual(result.exitCode, 0, `stderr: ${result.stderr}`);
+      // Check that format was auto-detected as ORC
+      assert.match(result.output, /Format: orc|ORC/i);
+    });
+
+    it('should ingest XLSX file', () => {
+      if (!cliExists()) return;
+
+      const xlsxFile = path.join(FIXTURES_PATH, 'simple_uncompressed.xlsx');
+      const lancePath = path.join(tempDir, 'from_xlsx.lance');
+
+      if (!fs.existsSync(xlsxFile)) {
+        console.log('Skipping: simple_uncompressed.xlsx not found');
+        return;
+      }
+
+      const result = runCli(`ingest "${xlsxFile}" -o "${lancePath}"`);
+      assert.strictEqual(result.exitCode, 0, `stderr: ${result.stderr}`);
+      // Check that format was auto-detected as XLSX
+      assert.match(result.output, /Format: xlsx|XLSX/i);
+    });
+
+    it('should ingest Delta Lake table', () => {
+      if (!cliExists()) return;
+
+      const deltaPath = path.join(FIXTURES_PATH, 'simple.delta');
+      const lancePath = path.join(tempDir, 'from_delta.lance');
+
+      if (!fs.existsSync(deltaPath)) {
+        console.log('Skipping: simple.delta not found');
+        return;
+      }
+
+      const result = runCli(`ingest "${deltaPath}" -o "${lancePath}"`);
+      assert.strictEqual(result.exitCode, 0, `stderr: ${result.stderr}`);
+      // Check that format was auto-detected as Delta
+      assert.match(result.output, /Format: delta|Delta Lake/i);
+    });
+
+    it('should ingest Iceberg table', () => {
+      if (!cliExists()) return;
+
+      const icebergPath = path.join(FIXTURES_PATH, 'simple.iceberg');
+      const lancePath = path.join(tempDir, 'from_iceberg.lance');
+
+      if (!fs.existsSync(icebergPath)) {
+        console.log('Skipping: simple.iceberg not found');
+        return;
+      }
+
+      const result = runCli(`ingest "${icebergPath}" -o "${lancePath}"`);
+      assert.strictEqual(result.exitCode, 0, `stderr: ${result.stderr}`);
+      // Check that format was auto-detected as Iceberg
+      assert.match(result.output, /Format: iceberg|Iceberg/i);
+    });
+
+    it('should list all supported formats in help', () => {
+      if (!cliExists()) return;
+
+      const result = runCli('ingest --help');
+      assert.strictEqual(result.exitCode, 0);
+
+      // Check for all format mentions in help
+      const formats = ['csv', 'parquet', 'arrow', 'avro', 'orc', 'xlsx', 'delta', 'iceberg'];
+      for (const format of formats) {
+        assert.match(
+          result.output.toLowerCase(),
+          new RegExp(format),
+          `Help should mention ${format} format`
+        );
+      }
+    });
+  });
 });
 
 // Run tests if executed directly
