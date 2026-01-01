@@ -58,30 +58,35 @@ pub const BlockHeader = struct {
 
 /// Decompress a single zlib/deflate block
 pub fn decompressZlib(compressed: []const u8, estimated_size: usize, allocator: Allocator) DecompressError![]u8 {
-    // Create a fixed buffer stream for the compressed data
-    var fbs = std.io.fixedBufferStream(compressed);
+    _ = estimated_size; // Not needed with allocRemaining
 
-    // Use decompressor for raw deflate (no zlib/gzip headers)
-    var decomp = flate.decompressor(.raw, fbs.reader());
+    // Create input reader from compressed data using std.Io.Reader.fixed()
+    var input_reader = std.Io.Reader.fixed(compressed);
 
-    // Collect output into growing array
-    var output = std.ArrayListUnmanaged(u8){};
-    errdefer output.deinit(allocator);
+    // Create window buffer for decompression
+    var window_buf: [flate.max_window_len]u8 = undefined;
 
-    // Pre-allocate based on estimate
-    output.ensureTotalCapacity(allocator, estimated_size) catch return DecompressError.OutOfMemory;
+    // Initialize decompressor for raw deflate (no zlib/gzip headers)
+    var decomp = flate.Decompress.init(&input_reader, .raw, &window_buf);
 
-    // Read all decompressed data chunk by chunk
-    var chunk: [4096]u8 = undefined;
-    while (true) {
-        const bytes = decomp.read(&chunk) catch {
-            return DecompressError.DecompressionFailed;
+    // Read all decompressed data using allocRemaining
+    // Use a reasonable limit (10MB should be enough for ORC blocks)
+    const max_decompressed_size: usize = 10 * 1024 * 1024;
+    const result = decomp.reader.allocRemaining(allocator, std.Io.Limit.limited(max_decompressed_size)) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => DecompressError.OutOfMemory,
+            error.StreamTooLong => DecompressError.OutputOverflow,
+            else => DecompressError.DecompressionFailed,
         };
-        if (bytes == 0) break;
-        output.appendSlice(allocator, chunk[0..bytes]) catch return DecompressError.OutOfMemory;
+    };
+
+    // Check for decompression errors
+    if (decomp.err) |_| {
+        allocator.free(result);
+        return DecompressError.DecompressionFailed;
     }
 
-    return output.toOwnedSlice(allocator) catch return DecompressError.OutOfMemory;
+    return result;
 }
 
 /// Decompress ORC stream with block format

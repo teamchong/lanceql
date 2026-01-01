@@ -464,22 +464,24 @@ pub const OrcReader = struct {
 
         if (column_types.items.len > 0) {
             self.num_columns = column_types.items.len;
-            self.column_types = column_types.toOwnedSlice(self.allocator) catch &.{};
+            self.column_types = column_types.toOwnedSlice(self.allocator) catch null;
         } else {
             column_types.deinit(self.allocator);
             self.num_columns = 3; // Default for our test fixtures
         }
 
         if (column_names.items.len > 0) {
-            self.column_names = column_names.toOwnedSlice(self.allocator) catch &.{};
+            self.column_names = column_names.toOwnedSlice(self.allocator) catch null;
         } else {
             column_names.deinit(self.allocator);
         }
 
         // Sum up row count from stripes if not set
         if (self.num_rows == 0) {
-            for (self.stripes) |stripe| {
-                self.num_rows += stripe.number_of_rows;
+            if (self.stripes) |stripes| {
+                for (stripes) |stripe| {
+                    self.num_rows += stripe.number_of_rows;
+                }
             }
         }
     }
@@ -615,11 +617,12 @@ pub const OrcReader = struct {
 
     /// Read stripe footer for a given stripe
     pub fn readStripeFooter(self: *Self, stripe_idx: usize) !streams.StripeFooter {
-        if (stripe_idx >= self.stripes.len) {
+        const stripes = self.stripes orelse return error.InvalidStripeIndex;
+        if (stripe_idx >= stripes.len) {
             return error.InvalidStripeIndex;
         }
 
-        const stripe = self.stripes[stripe_idx];
+        const stripe = stripes[stripe_idx];
         const footer_offset = stripe.offset + stripe.index_length + stripe.data_length;
         const footer_len = stripe.footer_length;
 
@@ -660,9 +663,10 @@ pub const OrcReader = struct {
         var values = std.ArrayListUnmanaged(i64){};
         errdefer values.deinit(self.allocator);
 
+        const stripes = self.stripes orelse return values.toOwnedSlice(self.allocator);
         const rle_version = self.getRleVersion();
 
-        for (self.stripes, 0..) |stripe, stripe_idx| {
+        for (stripes, 0..) |stripe, stripe_idx| {
             var stripe_footer = try self.readStripeFooter(stripe_idx);
             defer stripe_footer.deinit();
 
@@ -690,7 +694,9 @@ pub const OrcReader = struct {
         var values = std.ArrayListUnmanaged(f64){};
         errdefer values.deinit(self.allocator);
 
-        for (self.stripes, 0..) |stripe, stripe_idx| {
+        const stripes = self.stripes orelse return values.toOwnedSlice(self.allocator);
+
+        for (stripes, 0..) |stripe, stripe_idx| {
             var stripe_footer = try self.readStripeFooter(stripe_idx);
             defer stripe_footer.deinit();
 
@@ -727,9 +733,10 @@ pub const OrcReader = struct {
             values.deinit(self.allocator);
         }
 
+        const stripes = self.stripes orelse return values.toOwnedSlice(self.allocator);
         const rle_version = self.getRleVersion();
 
-        for (self.stripes, 0..) |stripe, stripe_idx| {
+        for (stripes, 0..) |stripe, stripe_idx| {
             var stripe_footer = try self.readStripeFooter(stripe_idx);
             defer stripe_footer.deinit();
 
@@ -847,8 +854,9 @@ pub const OrcReader = struct {
 
     /// Get stripe data offset in file
     pub fn getStripeDataOffset(self: *const Self, stripe_idx: usize) ?u64 {
-        if (stripe_idx >= self.stripes.len) return null;
-        const stripe = self.stripes[stripe_idx];
+        const stripes = self.stripes orelse return null;
+        if (stripe_idx >= stripes.len) return null;
+        const stripe = stripes[stripe_idx];
         return stripe.offset + stripe.index_length;
     }
 };
@@ -983,7 +991,7 @@ test "orc: debug footer parsing" {
     std.debug.print("Stripes: {d}\n", .{reader.stripeCount()});
     std.debug.print("Rows: {d}\n", .{reader.rowCount()});
     std.debug.print("Columns: {d}\n", .{reader.columnCount()});
-    std.debug.print("Column types len: {d}\n", .{reader.column_types.len});
+    std.debug.print("Column types len: {d}\n", .{if (reader.column_types) |ct| ct.len else 0});
     
     try testing.expect(reader.stripeCount() > 0);
 }

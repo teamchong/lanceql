@@ -51,9 +51,10 @@ pub const OrcTable = struct {
         errdefer allocator.free(column_names);
 
         // Copy column names from reader
+        const reader_names = reader.column_names orelse &[_][]const u8{};
         for (0..num_cols) |i| {
-            const name = if (i < reader.column_names.len)
-                reader.column_names[i]
+            const name = if (i < reader_names.len)
+                reader_names[i]
             else
                 "unknown";
             column_names[i] = allocator.dupe(u8, name) catch {
@@ -111,8 +112,9 @@ pub const OrcTable = struct {
 
     /// Get column type (mapped to Parquet types)
     pub fn getColumnType(self: Self, col_idx: usize) ?Type {
-        if (col_idx >= self.reader.column_types.len) return null;
-        const orc_type = self.reader.column_types[col_idx];
+        const column_types = self.reader.column_types orelse return null;
+        if (col_idx >= column_types.len) return null;
+        const orc_type = column_types[col_idx];
         return mapOrcToParquetType(orc_type);
     }
 
