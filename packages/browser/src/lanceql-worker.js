@@ -902,6 +902,59 @@ class WorkerDatabase {
         return { success: true, updated: updatedCount };
     }
 
+    async updateWithExpr(tableName, updateExprs, predicateFn, evalExpr) {
+        if (!this.tables.has(tableName)) {
+            throw new Error(`Table '${tableName}' does not exist`);
+        }
+
+        const table = this.tables.get(tableName);
+        let updatedCount = 0;
+
+        // Update buffered rows
+        const buffer = this._writeBuffer.get(tableName);
+        if (buffer && buffer.length > 0) {
+            for (const row of buffer) {
+                if (predicateFn(row)) {
+                    for (const [col, expr] of Object.entries(updateExprs)) {
+                        row[col] = evalExpr(expr, row);
+                    }
+                    updatedCount++;
+                }
+            }
+        }
+
+        // Update persisted rows
+        const persistedUpdates = [];
+        for (const fragKey of table.fragments) {
+            const fragData = await opfsStorage.load(fragKey);
+            if (fragData) {
+                const rows = this._parseFragment(fragData, table.schema);
+                for (const row of rows) {
+                    if (!table.deletionVector.includes(row.__rowId) && predicateFn(row)) {
+                        table.deletionVector.push(row.__rowId);
+                        table.rowCount--;
+
+                        const newRow = { ...row };
+                        for (const [col, expr] of Object.entries(updateExprs)) {
+                            newRow[col] = evalExpr(expr, row);
+                        }
+                        delete newRow.__rowId;
+                        persistedUpdates.push(newRow);
+                        updatedCount++;
+                    }
+                }
+            }
+        }
+
+        if (persistedUpdates.length > 0) {
+            await this.insert(tableName, persistedUpdates);
+        } else {
+            await this._saveManifest();
+        }
+
+        return { success: true, updated: updatedCount };
+    }
+
     async select(tableName, options = {}) {
         if (!this.tables.has(tableName)) {
             throw new Error(`Table '${tableName}' does not exist`);
@@ -1150,6 +1203,7 @@ const TokenType = {
     NULL: 'NULL', TRUE: 'TRUE', FALSE: 'FALSE', LIKE: 'LIKE',
     // JOIN keywords
     JOIN: 'JOIN', LEFT: 'LEFT', RIGHT: 'RIGHT', INNER: 'INNER', ON: 'ON', AS: 'AS',
+    FULL: 'FULL', OUTER: 'OUTER', CROSS: 'CROSS',
     // GROUP BY / HAVING
     GROUP: 'GROUP', HAVING: 'HAVING',
     // Aggregate functions
@@ -1158,6 +1212,31 @@ const TokenType = {
     DISTINCT: 'DISTINCT', BETWEEN: 'BETWEEN', IN: 'IN',
     // Vector search
     NEAR: 'NEAR', TOPK: 'TOPK',
+    // CASE expression
+    CASE: 'CASE', WHEN: 'WHEN', THEN: 'THEN', ELSE: 'ELSE', END: 'END',
+    // Type casting and IS NULL
+    CAST: 'CAST', IS: 'IS',
+    // Set operations
+    UNION: 'UNION', INTERSECT: 'INTERSECT', EXCEPT: 'EXCEPT', ALL: 'ALL',
+    // CTEs
+    WITH: 'WITH',
+    // Window functions
+    OVER: 'OVER', PARTITION: 'PARTITION', ROW_NUMBER: 'ROW_NUMBER', RANK: 'RANK',
+    DENSE_RANK: 'DENSE_RANK', LAG: 'LAG', LEAD: 'LEAD',
+    NTILE: 'NTILE', PERCENT_RANK: 'PERCENT_RANK', CUME_DIST: 'CUME_DIST',
+    FIRST_VALUE: 'FIRST_VALUE', LAST_VALUE: 'LAST_VALUE', NTH_VALUE: 'NTH_VALUE',
+    // Window frame specifications
+    ROWS: 'ROWS', RANGE: 'RANGE', UNBOUNDED: 'UNBOUNDED',
+    PRECEDING: 'PRECEDING', FOLLOWING: 'FOLLOWING', CURRENT: 'CURRENT', ROW: 'ROW',
+    // NULLS FIRST/LAST for ORDER BY
+    NULLS: 'NULLS', FIRST: 'FIRST', LAST: 'LAST',
+    // Date/Time keywords (used in EXTRACT)
+    YEAR: 'YEAR', MONTH: 'MONTH', DAY: 'DAY',
+    HOUR: 'HOUR', MINUTE: 'MINUTE', SECOND: 'SECOND',
+    // Array keyword
+    ARRAY: 'ARRAY',
+    // DML enhancement keywords
+    CONFLICT: 'CONFLICT', DO: 'DO', NOTHING: 'NOTHING', EXCLUDED: 'EXCLUDED', USING: 'USING',
 
     // Literals
     IDENTIFIER: 'IDENTIFIER', STRING: 'STRING', NUMBER: 'NUMBER',
@@ -1166,6 +1245,10 @@ const TokenType = {
     EQ: '=', NE: '!=', LT: '<', LE: '<=', GT: '>', GE: '>=',
     STAR: '*', COMMA: ',', LPAREN: '(', RPAREN: ')',
     LBRACKET: '[', RBRACKET: ']', DOT: '.',
+    // Arithmetic operators
+    PLUS: '+', MINUS: '-', SLASH: '/',
+    // Bitwise operators
+    AMPERSAND: '&', PIPE: '|', CARET: '^', TILDE: '~', LSHIFT: '<<', RSHIFT: '>>',
 
     // Special
     EOF: 'EOF',
@@ -1213,6 +1296,12 @@ class SQLLexer {
             '<': TokenType.LT,
             '>': TokenType.GT,
             '.': TokenType.DOT,
+            '+': TokenType.PLUS,
+            '/': TokenType.SLASH,
+            '&': TokenType.AMPERSAND,
+            '|': TokenType.PIPE,
+            '^': TokenType.CARET,
+            '~': TokenType.TILDE,
         };
 
         if (singleChars[ch]) {
@@ -1223,9 +1312,17 @@ class SQLLexer {
                 this.pos++;
                 return { type: TokenType.LE };
             }
+            if (ch === '<' && this.sql[this.pos] === '<') {
+                this.pos++;
+                return { type: TokenType.LSHIFT };
+            }
             if (ch === '>' && this.sql[this.pos] === '=') {
                 this.pos++;
                 return { type: TokenType.GE };
+            }
+            if (ch === '>' && this.sql[this.pos] === '>') {
+                this.pos++;
+                return { type: TokenType.RSHIFT };
             }
             if (ch === '!' && this.sql[this.pos] === '=') {
                 this.pos++;
@@ -1253,8 +1350,22 @@ class SQLLexer {
             return this._readString(ch);
         }
 
+        // Minus sign: could be negative number or subtraction operator
+        if (ch === '-') {
+            // Check if it's a negative number (minus followed by digit)
+            // Only treat as negative number at start or after operator/open paren
+            const prevChar = this.pos > 0 ? this.sql[this.pos - 1] : ' ';
+            const isAfterOperand = /[a-zA-Z0-9_)\]]/.test(prevChar.trim() || ' ');
+            if (!isAfterOperand && /\d/.test(this.sql[this.pos + 1])) {
+                return this._readNumber();
+            }
+            // Otherwise treat as minus operator
+            this.pos++;
+            return { type: TokenType.MINUS };
+        }
+
         // Number
-        if (/\d/.test(ch) || (ch === '-' && /\d/.test(this.sql[this.pos + 1]))) {
+        if (/\d/.test(ch)) {
             return this._readNumber();
         }
 
@@ -1336,6 +1447,17 @@ class SQLParser {
         return null;
     }
 
+    check(type) {
+        return this.peek().type === type;
+    }
+
+    isKeyword(keyword) {
+        const token = this.peek();
+        const upper = keyword.toUpperCase();
+        return token.type === TokenType[upper] ||
+               (token.type === TokenType.IDENTIFIER && token.value.toUpperCase() === upper);
+    }
+
     expect(type) {
         const token = this.advance();
         if (token.type !== type) {
@@ -1360,9 +1482,35 @@ class SQLParser {
                 return this.parseDelete();
             case TokenType.SELECT:
                 return this.parseSelect();
+            case TokenType.WITH:
+                return this.parseWithClause();
             default:
                 throw new Error(`Unexpected token: ${token.type}`);
         }
+    }
+
+    parseWithClause() {
+        this.expect(TokenType.WITH);
+
+        // Parse CTEs
+        const ctes = [];
+        do {
+            const cteName = this.expect(TokenType.IDENTIFIER).value;
+            this.expect(TokenType.AS);
+            this.expect(TokenType.LPAREN);
+            const cteQuery = this.parseSelect();
+            this.expect(TokenType.RPAREN);
+            ctes.push({ name: cteName, query: cteQuery });
+        } while (this.match(TokenType.COMMA));
+
+        // Parse main SELECT
+        const mainQuery = this.parseSelect();
+
+        return {
+            type: 'WITH',
+            ctes,
+            query: mainQuery
+        };
     }
 
     parseCreate() {
@@ -1446,6 +1594,12 @@ class SQLParser {
             this.expect(TokenType.RPAREN);
         }
 
+        // Check for INSERT...SELECT vs INSERT...VALUES
+        if (this.check(TokenType.SELECT)) {
+            const selectQuery = this.parseSelect();
+            return { type: 'INSERT', table: tableName, columns, select: selectQuery };
+        }
+
         this.expect(TokenType.VALUES);
 
         const rows = [];
@@ -1466,7 +1620,38 @@ class SQLParser {
             }
         } while (this.match(TokenType.COMMA));
 
-        return { type: 'INSERT', table: tableName, columns, rows };
+        // Check for ON CONFLICT clause (UPSERT)
+        let onConflict = null;
+        if (this.match(TokenType.ON)) {
+            this.expect(TokenType.CONFLICT);
+
+            // Optional conflict target: (column1, column2)
+            let conflictColumns = null;
+            if (this.match(TokenType.LPAREN)) {
+                conflictColumns = [this.expect(TokenType.IDENTIFIER).value];
+                while (this.match(TokenType.COMMA)) {
+                    conflictColumns.push(this.expect(TokenType.IDENTIFIER).value);
+                }
+                this.expect(TokenType.RPAREN);
+            }
+
+            this.expect(TokenType.DO);
+
+            if (this.match(TokenType.NOTHING)) {
+                onConflict = { action: 'nothing', columns: conflictColumns };
+            } else if (this.match(TokenType.UPDATE)) {
+                this.expect(TokenType.SET);
+                const updates = {};
+                do {
+                    const col = this.expect(TokenType.IDENTIFIER).value;
+                    this.expect(TokenType.EQ);
+                    updates[col] = this.parseArithmeticExpr();
+                } while (this.match(TokenType.COMMA));
+                onConflict = { action: 'update', columns: conflictColumns, updates };
+            }
+        }
+
+        return { type: 'INSERT', table: tableName, columns, rows, onConflict };
     }
 
     parseValue() {
@@ -1509,21 +1694,46 @@ class SQLParser {
     parseUpdate() {
         this.expect(TokenType.UPDATE);
         const tableName = this.expect(TokenType.IDENTIFIER).value;
+
+        // Optional alias
+        let alias = null;
+        if (this.match(TokenType.AS)) {
+            alias = this.expect(TokenType.IDENTIFIER).value;
+        } else if (this.check(TokenType.IDENTIFIER) && !this.isKeyword('SET')) {
+            alias = this.expect(TokenType.IDENTIFIER).value;
+        }
+
         this.expect(TokenType.SET);
 
         const updates = {};
         do {
             const col = this.expect(TokenType.IDENTIFIER).value;
             this.expect(TokenType.EQ);
-            updates[col] = this.parseValue();
+            updates[col] = this.parseArithmeticExpr();
         } while (this.match(TokenType.COMMA));
+
+        // Optional FROM clause for JOINs
+        let from = null;
+        if (this.match(TokenType.FROM)) {
+            from = [];
+            do {
+                const tbl = this.expect(TokenType.IDENTIFIER).value;
+                let tblAlias = null;
+                if (this.match(TokenType.AS)) {
+                    tblAlias = this.expect(TokenType.IDENTIFIER).value;
+                } else if (this.check(TokenType.IDENTIFIER) && !this.isKeyword('WHERE')) {
+                    tblAlias = this.expect(TokenType.IDENTIFIER).value;
+                }
+                from.push({ name: tbl, alias: tblAlias });
+            } while (this.match(TokenType.COMMA));
+        }
 
         let where = null;
         if (this.match(TokenType.WHERE)) {
             where = this.parseWhereExpr();
         }
 
-        return { type: 'UPDATE', table: tableName, updates, where };
+        return { type: 'UPDATE', table: tableName, alias, updates, from, where };
     }
 
     parseDelete() {
@@ -1531,12 +1741,36 @@ class SQLParser {
         this.expect(TokenType.FROM);
         const tableName = this.expect(TokenType.IDENTIFIER).value;
 
+        // Optional alias
+        let alias = null;
+        if (this.match(TokenType.AS)) {
+            alias = this.expect(TokenType.IDENTIFIER).value;
+        } else if (this.check(TokenType.IDENTIFIER) && !this.isKeyword('USING') && !this.isKeyword('WHERE')) {
+            alias = this.expect(TokenType.IDENTIFIER).value;
+        }
+
+        // Optional USING clause for JOINs
+        let using = null;
+        if (this.match(TokenType.USING)) {
+            using = [];
+            do {
+                const tbl = this.expect(TokenType.IDENTIFIER).value;
+                let tblAlias = null;
+                if (this.match(TokenType.AS)) {
+                    tblAlias = this.expect(TokenType.IDENTIFIER).value;
+                } else if (this.check(TokenType.IDENTIFIER) && !this.isKeyword('WHERE')) {
+                    tblAlias = this.expect(TokenType.IDENTIFIER).value;
+                }
+                using.push({ name: tbl, alias: tblAlias });
+            } while (this.match(TokenType.COMMA));
+        }
+
         let where = null;
         if (this.match(TokenType.WHERE)) {
             where = this.parseWhereExpr();
         }
 
-        return { type: 'DELETE', table: tableName, where };
+        return { type: 'DELETE', table: tableName, alias, using, where };
     }
 
     parseSelect() {
@@ -1552,19 +1786,25 @@ class SQLParser {
             columns.push(this.parseSelectColumn());
         }
 
-        this.expect(TokenType.FROM);
-
-        // Parse table with optional alias
+        // FROM clause is optional (for SELECT without tables like SELECT 1+1, SELECT JSON_OBJECT(...))
         const tables = [];
-        tables.push(this.parseTableRef());
-
-        // Parse JOINs
         const joins = [];
-        while (this.peek().type === TokenType.JOIN ||
-               this.peek().type === TokenType.LEFT ||
-               this.peek().type === TokenType.RIGHT ||
-               this.peek().type === TokenType.INNER) {
-            joins.push(this.parseJoin());
+        let table = null;
+
+        if (this.match(TokenType.FROM)) {
+            // Parse table with optional alias
+            tables.push(this.parseTableRef());
+
+            // Parse JOINs
+            while (this.peek().type === TokenType.JOIN ||
+                   this.peek().type === TokenType.LEFT ||
+                   this.peek().type === TokenType.RIGHT ||
+                   this.peek().type === TokenType.INNER ||
+                   this.peek().type === TokenType.FULL ||
+                   this.peek().type === TokenType.CROSS) {
+                joins.push(this.parseJoin());
+            }
+            table = tables[0].name;
         }
 
         let where = null;
@@ -1596,7 +1836,16 @@ class SQLParser {
                 const column = this.parseColumnRef();
                 const desc = !!this.match(TokenType.DESC);
                 if (!desc) this.match(TokenType.ASC);
-                orderBy.push({ column, desc });
+                // Parse NULLS FIRST/LAST
+                let nullsFirst = null;
+                if (this.match(TokenType.NULLS)) {
+                    if (this.match(TokenType.FIRST)) {
+                        nullsFirst = true;
+                    } else if (this.match(TokenType.LAST)) {
+                        nullsFirst = false;
+                    }
+                }
+                orderBy.push({ column, desc, nullsFirst });
             } while (this.match(TokenType.COMMA));
         }
 
@@ -1610,10 +1859,10 @@ class SQLParser {
             offset = parseInt(this.expect(TokenType.NUMBER).value);
         }
 
-        // For backwards compatibility, use first table name as 'table'
-        const tableName = tables[0].name;
+        // For backwards compatibility, use first table name as 'table' (null if no FROM)
+        const tableName = tables.length > 0 ? tables[0].name : null;
 
-        return {
+        const selectAst = {
             type: 'SELECT',
             table: tableName,
             tables,
@@ -1627,6 +1876,25 @@ class SQLParser {
             limit,
             offset
         };
+
+        // Check for set operations (UNION, INTERSECT, EXCEPT)
+        if (this.match(TokenType.UNION)) {
+            const all = this.match(TokenType.ALL);
+            const right = this.parseSelect();
+            return { type: 'UNION', all: !!all, left: selectAst, right };
+        }
+        if (this.match(TokenType.INTERSECT)) {
+            const all = this.match(TokenType.ALL);
+            const right = this.parseSelect();
+            return { type: 'INTERSECT', all: !!all, left: selectAst, right };
+        }
+        if (this.match(TokenType.EXCEPT)) {
+            const all = this.match(TokenType.ALL);
+            const right = this.parseSelect();
+            return { type: 'EXCEPT', all: !!all, left: selectAst, right };
+        }
+
+        return selectAst;
     }
 
     // Parse a single column in SELECT clause
@@ -1634,6 +1902,81 @@ class SQLParser {
         // Check for * first
         if (this.match(TokenType.STAR)) {
             return { type: 'star', value: '*' };
+        }
+
+        // Check for scalar subquery: (SELECT ...)
+        if (this.check(TokenType.LPAREN)) {
+            const savedPos = this.pos;
+            this.advance(); // consume (
+            if (this.check(TokenType.SELECT)) {
+                const subquery = this.parseSelect();
+                this.expect(TokenType.RPAREN);
+                let alias = null;
+                if (this.match(TokenType.AS)) {
+                    alias = this.expect(TokenType.IDENTIFIER).value;
+                } else if (this.peek().type === TokenType.IDENTIFIER) {
+                    const nextType = this.peek().type;
+                    if (nextType !== TokenType.FROM && nextType !== TokenType.COMMA &&
+                        nextType !== TokenType.WHERE && nextType !== TokenType.ORDER &&
+                        nextType !== TokenType.GROUP && nextType !== TokenType.LIMIT) {
+                        alias = this.advance().value;
+                    }
+                }
+                return { type: 'scalar_subquery', subquery, alias };
+            }
+            // Not a subquery, restore position
+            this.pos = savedPos;
+        }
+
+        // Check for CASE expression
+        if (this.match(TokenType.CASE)) {
+            const caseExpr = this.parseCaseExpr();
+            let alias = null;
+            if (this.match(TokenType.AS)) {
+                alias = this.expect(TokenType.IDENTIFIER).value;
+            }
+            return { type: 'case', expr: caseExpr, alias };
+        }
+
+        // Check for window functions: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, NTILE, PERCENT_RANK, CUME_DIST, FIRST_VALUE, LAST_VALUE, NTH_VALUE
+        const windowFuncs = [TokenType.ROW_NUMBER, TokenType.RANK, TokenType.DENSE_RANK, TokenType.LAG, TokenType.LEAD,
+                             TokenType.NTILE, TokenType.PERCENT_RANK, TokenType.CUME_DIST, TokenType.FIRST_VALUE, TokenType.LAST_VALUE, TokenType.NTH_VALUE];
+        for (const funcType of windowFuncs) {
+            if (this.match(funcType)) {
+                const funcName = funcType.toLowerCase();
+                this.expect(TokenType.LPAREN);
+                let arg = null;
+                let args = [];
+                // Handle function arguments
+                if (funcName === 'lag' || funcName === 'lead' || funcName === 'first_value' || funcName === 'last_value') {
+                    if (!this.check(TokenType.RPAREN)) {
+                        arg = this.parseColumnRef();
+                    }
+                } else if (funcName === 'ntile') {
+                    // NTILE takes a number argument
+                    arg = parseInt(this.expect(TokenType.NUMBER).value, 10);
+                } else if (funcName === 'nth_value') {
+                    // NTH_VALUE(col, n)
+                    arg = this.parseColumnRef();
+                    if (this.match(TokenType.COMMA)) {
+                        args.push(arg);
+                        args.push(parseInt(this.expect(TokenType.NUMBER).value, 10));
+                    }
+                }
+                this.expect(TokenType.RPAREN);
+                this.expect(TokenType.OVER);
+                const windowSpec = this.parseOverSpec();
+
+                // Optional alias
+                let alias = null;
+                if (this.match(TokenType.AS)) {
+                    alias = this.expect(TokenType.IDENTIFIER).value;
+                } else if (this.peek().type === TokenType.IDENTIFIER) {
+                    alias = this.advance().value;
+                }
+
+                return { type: 'window', func: funcName, arg, args: args.length ? args : null, over: windowSpec, alias };
+            }
         }
 
         // Check for aggregate functions
@@ -1653,6 +1996,18 @@ class SQLParser {
                 }
                 this.expect(TokenType.RPAREN);
 
+                // Check for OVER (window function)
+                if (this.match(TokenType.OVER)) {
+                    const windowSpec = this.parseOverSpec();
+                    let alias = null;
+                    if (this.match(TokenType.AS)) {
+                        alias = this.expect(TokenType.IDENTIFIER).value;
+                    } else if (this.peek().type === TokenType.IDENTIFIER) {
+                        alias = this.advance().value;
+                    }
+                    return { type: 'window', func: funcName.toLowerCase(), arg, over: windowSpec, alias };
+                }
+
                 // Optional alias
                 let alias = null;
                 if (this.match(TokenType.AS)) {
@@ -1665,17 +2020,63 @@ class SQLParser {
             }
         }
 
-        // Regular column (may be table.column)
-        const col = this.parseColumnRef();
+        // Check for string-based aggregate functions (STDDEV, VARIANCE, MEDIAN, STRING_AGG)
+        const stringAggFuncs = ['STDDEV', 'STDDEV_SAMP', 'STDDEV_POP', 'VARIANCE', 'VAR_SAMP', 'VAR_POP', 'MEDIAN', 'STRING_AGG', 'GROUP_CONCAT'];
+        if (this.peek().type === TokenType.IDENTIFIER) {
+            const funcName = this.peek().value.toUpperCase();
+            if (stringAggFuncs.includes(funcName)) {
+                this.advance();
+                this.expect(TokenType.LPAREN);
+                let arg;
+                let separator = null;
+
+                if (this.match(TokenType.DISTINCT)) {
+                    const col = this.parseColumnRef();
+                    arg = { distinct: true, column: col };
+                } else {
+                    arg = this.parseColumnRef();
+                }
+
+                // STRING_AGG has a second argument for separator
+                if ((funcName === 'STRING_AGG' || funcName === 'GROUP_CONCAT') && this.match(TokenType.COMMA)) {
+                    separator = this.expect(TokenType.STRING).value;
+                    arg = { column: arg, separator };
+                }
+
+                this.expect(TokenType.RPAREN);
+
+                // Check for OVER (window function) - some aggregates can be windowed
+                if (this.match(TokenType.OVER)) {
+                    const windowSpec = this.parseOverSpec();
+                    let alias = null;
+                    if (this.match(TokenType.AS)) {
+                        alias = this.expect(TokenType.IDENTIFIER).value;
+                    } else if (this.peek().type === TokenType.IDENTIFIER) {
+                        alias = this.advance().value;
+                    }
+                    return { type: 'window', func: funcName.toLowerCase(), arg, over: windowSpec, alias };
+                }
+
+                // Optional alias
+                let alias = null;
+                if (this.match(TokenType.AS)) {
+                    alias = this.expect(TokenType.IDENTIFIER).value;
+                } else if (this.peek().type === TokenType.IDENTIFIER) {
+                    alias = this.advance().value;
+                }
+
+                return { type: 'aggregate', func: funcName.toLowerCase(), arg, alias };
+            }
+        }
+
+        // Parse arithmetic expression (handles columns, literals, functions, and arithmetic operators)
+        const expr = this.parseArithmeticExpr();
 
         // Optional alias
         let alias = null;
         if (this.match(TokenType.AS)) {
             alias = this.expect(TokenType.IDENTIFIER).value;
-        } else if (this.peek().type === TokenType.IDENTIFIER &&
-                   this.peek().type !== TokenType.FROM &&
-                   this.peek().type !== TokenType.COMMA) {
-            // Peek next to avoid consuming FROM as alias
+        } else if (this.peek().type === TokenType.IDENTIFIER) {
             const nextType = this.peek().type;
             if (nextType !== TokenType.FROM && nextType !== TokenType.COMMA &&
                 nextType !== TokenType.WHERE && nextType !== TokenType.ORDER &&
@@ -1684,7 +2085,447 @@ class SQLParser {
             }
         }
 
-        return { type: 'column', value: col, alias };
+        // Convert result to appropriate type for backward compatibility
+        if (expr.type === 'column') {
+            return { type: 'column', value: expr.value, alias };
+        } else if (expr.type === 'function') {
+            return { type: 'function', func: expr.func, args: expr.args, alias };
+        } else if (expr.type === 'literal') {
+            return { type: 'literal', value: expr.value, alias };
+        } else if (expr.type === 'arithmetic') {
+            return { type: 'arithmetic', expr, alias };
+        }
+
+        // Fallback
+        return { type: 'arithmetic', expr, alias };
+    }
+
+    // Parse function arguments (comma-separated expressions)
+    parseFunctionArgs() {
+        const args = [];
+        if (this.peek().type !== TokenType.RPAREN) {
+            args.push(this.parseFunctionArg());
+            while (this.match(TokenType.COMMA)) {
+                args.push(this.parseFunctionArg());
+            }
+        }
+        return args;
+    }
+
+    // Parse a single function argument (can be column, literal, or nested function)
+    parseFunctionArg() {
+        // Check for AS keyword (for CAST ... AS type)
+        if (this.peek().type === TokenType.AS) {
+            return null; // Will be handled by CAST specially
+        }
+
+        // Check for nested function call
+        const scalarFuncs = ['COALESCE', 'NULLIF', 'UPPER', 'LOWER', 'LENGTH', 'SUBSTR', 'SUBSTRING',
+                            'TRIM', 'LTRIM', 'RTRIM', 'CONCAT', 'REPLACE', 'ABS', 'ROUND', 'CEIL',
+                            'CEILING', 'FLOOR', 'MOD', 'POWER', 'POW', 'SQRT',
+                            // Date/Time functions
+                            'NOW', 'CURRENT_DATE', 'CURRENT_TIME', 'CURRENT_TIMESTAMP',
+                            'DATE', 'TIME', 'STRFTIME', 'DATE_DIFF', 'DATE_ADD', 'DATE_SUB',
+                            'EXTRACT', 'YEAR', 'MONTH', 'DAY', 'HOUR', 'MINUTE', 'SECOND',
+                            // Additional string functions
+                            'SPLIT', 'LEFT', 'RIGHT', 'LPAD', 'RPAD', 'POSITION', 'INSTR', 'REPEAT', 'REVERSE',
+                            // Conditional functions
+                            'GREATEST', 'LEAST', 'IIF', 'IF',
+                            // Additional math functions
+                            'LOG', 'LOG10', 'LN', 'EXP', 'SIN', 'COS', 'TAN', 'ASIN', 'ACOS', 'ATAN', 'ATAN2',
+                            'PI', 'RANDOM', 'RAND', 'SIGN', 'DEGREES', 'RADIANS', 'TRUNCATE', 'TRUNC',
+                            // REGEXP functions
+                            'REGEXP_MATCHES', 'REGEXP_REPLACE', 'REGEXP_EXTRACT', 'REGEXP_SUBSTR',
+                            'REGEXP_SPLIT', 'REGEXP_COUNT',
+                            // JSON functions
+                            'JSON_EXTRACT', 'JSON_VALUE', 'JSON_OBJECT', 'JSON_ARRAY',
+                            'JSON_KEYS', 'JSON_LENGTH', 'JSON_TYPE', 'JSON_VALID',
+                            // Array functions
+                            'ARRAY_LENGTH', 'ARRAY_CONTAINS', 'ARRAY_POSITION', 'ARRAY_APPEND',
+                            'ARRAY_REMOVE', 'ARRAY_SLICE', 'ARRAY_CONCAT', 'UNNEST',
+                            // UUID functions
+                            'UUID', 'GEN_RANDOM_UUID', 'UUID_STRING', 'IS_UUID',
+                            // Binary/Bit functions
+                            'BIT_COUNT', 'HEX', 'UNHEX', 'ENCODE', 'DECODE'];
+        if (this.peek().type === TokenType.IDENTIFIER) {
+            const funcName = this.peek().value.toUpperCase();
+            if (scalarFuncs.includes(funcName)) {
+                this.advance();
+                this.expect(TokenType.LPAREN);
+                const args = this.parseFunctionArgs();
+                this.expect(TokenType.RPAREN);
+                return { type: 'function', func: funcName.toLowerCase(), args };
+            }
+        }
+
+        // String literal
+        if (this.peek().type === TokenType.STRING) {
+            const left = { type: 'literal', value: this.advance().value };
+            return this.tryParseComparisonExpr(left);
+        }
+
+        // Number literal
+        if (this.peek().type === TokenType.NUMBER) {
+            const left = { type: 'literal', value: parseFloat(this.advance().value) };
+            return this.tryParseComparisonExpr(left);
+        }
+
+        // NULL
+        if (this.match(TokenType.NULL)) {
+            return { type: 'literal', value: null };
+        }
+
+        // ARRAY literal: ARRAY[1, 2, 3]
+        if (this.match(TokenType.ARRAY)) {
+            const elements = [];
+            if (this.match(TokenType.LBRACKET)) {
+                if (!this.check(TokenType.RBRACKET)) {
+                    elements.push(this.parseArithmeticExpr());
+                    while (this.match(TokenType.COMMA)) {
+                        elements.push(this.parseArithmeticExpr());
+                    }
+                }
+                this.expect(TokenType.RBRACKET);
+            }
+            let result = { type: 'array_literal', elements };
+            // Check for subscript
+            while (this.match(TokenType.LBRACKET)) {
+                const index = this.parseArithmeticExpr();
+                this.expect(TokenType.RBRACKET);
+                result = { type: 'subscript', array: result, index };
+            }
+            return result;
+        }
+
+        // Bare bracket array: [1, 2, 3]
+        if (this.match(TokenType.LBRACKET)) {
+            const elements = [];
+            if (!this.check(TokenType.RBRACKET)) {
+                elements.push(this.parseArithmeticExpr());
+                while (this.match(TokenType.COMMA)) {
+                    elements.push(this.parseArithmeticExpr());
+                }
+            }
+            this.expect(TokenType.RBRACKET);
+            let result = { type: 'array_literal', elements };
+            // Check for subscript
+            while (this.match(TokenType.LBRACKET)) {
+                const index = this.parseArithmeticExpr();
+                this.expect(TokenType.RBRACKET);
+                result = { type: 'subscript', array: result, index };
+            }
+            return result;
+        }
+
+        // Column reference
+        const col = this.parseColumnRef();
+        const left = { type: 'column', value: col };
+        return this.tryParseComparisonExpr(left);
+    }
+
+    // Check if there's a comparison operator and parse as comparison expression
+    tryParseComparisonExpr(left) {
+        // Check for comparison operators
+        let op = null;
+        if (this.match(TokenType.EQ)) op = '=';
+        else if (this.match(TokenType.NE)) op = '!=';
+        else if (this.match(TokenType.LT)) op = '<';
+        else if (this.match(TokenType.LE)) op = '<=';
+        else if (this.match(TokenType.GT)) op = '>';
+        else if (this.match(TokenType.GE)) op = '>=';
+
+        if (!op) return left;
+
+        // Parse right side of comparison
+        let right;
+        if (this.peek().type === TokenType.STRING) {
+            right = { type: 'literal', value: this.advance().value };
+        } else if (this.peek().type === TokenType.NUMBER) {
+            right = { type: 'literal', value: parseFloat(this.advance().value) };
+        } else if (this.match(TokenType.NULL)) {
+            right = { type: 'literal', value: null };
+        } else {
+            const col = this.parseColumnRef();
+            right = { type: 'column', value: col };
+        }
+
+        return { type: 'comparison', op, left, right };
+    }
+
+    // Parse CASE WHEN ... THEN ... ELSE ... END
+    parseCaseExpr() {
+        const branches = [];
+
+        // Simple CASE: CASE expr WHEN value THEN result
+        // Searched CASE: CASE WHEN condition THEN result
+        let caseExpr = null;
+        if (this.peek().type !== TokenType.WHEN) {
+            caseExpr = this.parseFunctionArg();
+        }
+
+        while (this.match(TokenType.WHEN)) {
+            const condition = this.parseFunctionArg();
+            this.expect(TokenType.THEN);
+            const result = this.parseFunctionArg();
+            branches.push({ condition, result });
+        }
+
+        let elseResult = null;
+        if (this.match(TokenType.ELSE)) {
+            elseResult = this.parseFunctionArg();
+        }
+
+        this.expect(TokenType.END);
+        return { caseExpr, branches, elseResult };
+    }
+
+    // ========== Arithmetic Expression Parsing ==========
+    // Parse arithmetic expression with proper precedence: () > * / > + -
+    parseArithmeticExpr() {
+        return this.parseAddSub();
+    }
+
+    parseAddSub() {
+        let left = this.parseMulDiv();
+        while (this.peek().type === TokenType.PLUS || this.peek().type === TokenType.MINUS) {
+            const op = this.advance().type === TokenType.PLUS ? '+' : '-';
+            const right = this.parseMulDiv();
+            left = { type: 'arithmetic', op, left, right };
+        }
+        return left;
+    }
+
+    parseMulDiv() {
+        let left = this.parseBitwise();
+        while (this.peek().type === TokenType.STAR || this.peek().type === TokenType.SLASH) {
+            const op = this.advance().type === TokenType.STAR ? '*' : '/';
+            const right = this.parseBitwise();
+            left = { type: 'arithmetic', op, left, right };
+        }
+        return left;
+    }
+
+    parseBitwise() {
+        let left = this.parseUnary();
+        const bitwiseOps = [TokenType.AMPERSAND, TokenType.PIPE, TokenType.CARET, TokenType.LSHIFT, TokenType.RSHIFT];
+        while (bitwiseOps.includes(this.peek().type)) {
+            const token = this.advance();
+            let op;
+            switch (token.type) {
+                case TokenType.AMPERSAND: op = '&'; break;
+                case TokenType.PIPE: op = '|'; break;
+                case TokenType.CARET: op = '^'; break;
+                case TokenType.LSHIFT: op = '<<'; break;
+                case TokenType.RSHIFT: op = '>>'; break;
+            }
+            const right = this.parseUnary();
+            left = { type: 'arithmetic', op, left, right };
+        }
+        return left;
+    }
+
+    parseUnary() {
+        // Handle unary minus
+        if (this.match(TokenType.MINUS)) {
+            const operand = this.parseUnary();
+            return { type: 'arithmetic', op: 'unary-', operand };
+        }
+        // Handle bitwise NOT
+        if (this.match(TokenType.TILDE)) {
+            const operand = this.parseUnary();
+            return { type: 'arithmetic', op: 'unary~', operand };
+        }
+        return this.parseArithmeticPrimary();
+    }
+
+    parseArithmeticPrimary() {
+        // Parenthesized expression
+        if (this.match(TokenType.LPAREN)) {
+            const expr = this.parseArithmeticExpr();
+            this.expect(TokenType.RPAREN);
+            return expr;
+        }
+
+        // Number literal
+        if (this.peek().type === TokenType.NUMBER) {
+            return { type: 'literal', value: parseFloat(this.advance().value) };
+        }
+
+        // String literal
+        if (this.peek().type === TokenType.STRING) {
+            return { type: 'literal', value: this.advance().value };
+        }
+
+        // NULL literal
+        if (this.match(TokenType.NULL)) {
+            return { type: 'literal', value: null };
+        }
+
+        // ARRAY constructor: ARRAY[1, 2, 3] with optional subscript ARRAY[1,2,3][1]
+        if (this.match(TokenType.ARRAY)) {
+            const elements = [];
+            if (this.match(TokenType.LBRACKET)) {
+                if (!this.check(TokenType.RBRACKET)) {
+                    elements.push(this.parseArithmeticExpr());
+                    while (this.match(TokenType.COMMA)) {
+                        elements.push(this.parseArithmeticExpr());
+                    }
+                }
+                this.expect(TokenType.RBRACKET);
+            }
+            let result = { type: 'array_literal', elements };
+            // Check for subscript
+            while (this.match(TokenType.LBRACKET)) {
+                const index = this.parseArithmeticExpr();
+                this.expect(TokenType.RBRACKET);
+                result = { type: 'subscript', array: result, index };
+            }
+            return result;
+        }
+
+        // Bare bracket array: [1, 2, 3] with optional subscript
+        if (this.match(TokenType.LBRACKET)) {
+            const elements = [];
+            if (!this.check(TokenType.RBRACKET)) {
+                elements.push(this.parseArithmeticExpr());
+                while (this.match(TokenType.COMMA)) {
+                    elements.push(this.parseArithmeticExpr());
+                }
+            }
+            this.expect(TokenType.RBRACKET);
+            let result = { type: 'array_literal', elements };
+            // Check for subscript
+            while (this.match(TokenType.LBRACKET)) {
+                const index = this.parseArithmeticExpr();
+                this.expect(TokenType.RBRACKET);
+                result = { type: 'subscript', array: result, index };
+            }
+            return result;
+        }
+
+        // EXCLUDED.column for UPSERT
+        if (this.match(TokenType.EXCLUDED)) {
+            this.expect(TokenType.DOT);
+            const col = this.expect(TokenType.IDENTIFIER).value;
+            return { type: 'column', value: `EXCLUDED.${col}` };
+        }
+
+        // CAST function has special syntax: CAST(value AS type)
+        if (this.match(TokenType.CAST)) {
+            this.expect(TokenType.LPAREN);
+            const value = this.parseArithmeticExpr();
+            this.expect(TokenType.AS);
+            const targetType = this.parseDataType();
+            this.expect(TokenType.RPAREN);
+            return { type: 'function', func: 'cast', args: [value, { type: 'literal', value: targetType }] };
+        }
+
+        // Tokens that can also be function names (Date/Time: YEAR, MONTH, etc.; String: LEFT, RIGHT)
+        const funcTokens = [TokenType.YEAR, TokenType.MONTH, TokenType.DAY, TokenType.HOUR, TokenType.MINUTE, TokenType.SECOND,
+                           TokenType.LEFT, TokenType.RIGHT];
+        for (const funcType of funcTokens) {
+            if (this.peek().type === funcType) {
+                const funcName = this.advance().type.toLowerCase();
+                this.expect(TokenType.LPAREN);
+                const args = this.parseFunctionArgs();
+                this.expect(TokenType.RPAREN);
+                return { type: 'function', func: funcName, args };
+            }
+        }
+
+        // Check for function call (identifier followed by LPAREN)
+        if (this.peek().type === TokenType.IDENTIFIER) {
+            const nextPos = this.pos + 1;
+            if (nextPos < this.tokens.length && this.tokens[nextPos].type === TokenType.LPAREN) {
+                // It's a function call - use parseFunctionArg's logic
+                const funcName = this.advance().value.toUpperCase();
+                this.expect(TokenType.LPAREN);
+                const args = this.parseFunctionArgs();
+                this.expect(TokenType.RPAREN);
+                return { type: 'function', func: funcName.toLowerCase(), args };
+            }
+        }
+
+        // Column reference (possibly table.column) with optional array subscript
+        if (this.peek().type === TokenType.IDENTIFIER) {
+            const col = this.parseColumnRef();
+            let result = { type: 'column', value: col };
+            // Check for array subscript: col[index]
+            while (this.match(TokenType.LBRACKET)) {
+                const index = this.parseArithmeticExpr();
+                this.expect(TokenType.RBRACKET);
+                result = { type: 'subscript', array: result, index };
+            }
+            return result;
+        }
+
+        throw new Error(`Unexpected token in arithmetic expression: ${this.peek().type}`);
+    }
+
+    // Parse window specification: (PARTITION BY ... ORDER BY ...) - OVER already consumed
+    parseOverSpec() {
+        this.expect(TokenType.LPAREN);
+
+        let partitionBy = null;
+        let orderBy = null;
+
+        // Parse PARTITION BY
+        if (this.match(TokenType.PARTITION)) {
+            this.expect(TokenType.BY);
+            partitionBy = [this.parseColumnRef()];
+            while (this.match(TokenType.COMMA)) {
+                partitionBy.push(this.parseColumnRef());
+            }
+        }
+
+        // Parse ORDER BY
+        if (this.match(TokenType.ORDER)) {
+            this.expect(TokenType.BY);
+            orderBy = [];
+            do {
+                const column = this.parseColumnRef();
+                const desc = !!this.match(TokenType.DESC);
+                if (!desc) this.match(TokenType.ASC);
+                orderBy.push({ column, desc });
+            } while (this.match(TokenType.COMMA));
+        }
+
+        // Parse window frame specification (ROWS/RANGE BETWEEN ... AND ...)
+        let frame = null;
+        let frameType = null;
+        if (this.match(TokenType.ROWS)) {
+            frameType = 'rows';
+        } else if (this.match(TokenType.RANGE)) {
+            frameType = 'range';
+        }
+        if (frameType) {
+            this.expect(TokenType.BETWEEN);
+            const start = this.parseFrameBound();
+            this.expect(TokenType.AND);
+            const end = this.parseFrameBound();
+            frame = { type: frameType, start, end };
+        }
+
+        this.expect(TokenType.RPAREN);
+        return { partitionBy, orderBy, frame };
+    }
+
+    // Parse window frame bound (UNBOUNDED PRECEDING, CURRENT ROW, N PRECEDING, etc.)
+    parseFrameBound() {
+        if (this.match(TokenType.UNBOUNDED)) {
+            if (this.match(TokenType.PRECEDING)) return { type: 'unbounded', direction: 'preceding' };
+            if (this.match(TokenType.FOLLOWING)) return { type: 'unbounded', direction: 'following' };
+            throw new Error('Expected PRECEDING or FOLLOWING after UNBOUNDED');
+        }
+        if (this.match(TokenType.CURRENT)) {
+            this.expect(TokenType.ROW);
+            return { type: 'current' };
+        }
+        // N PRECEDING or N FOLLOWING
+        const n = parseInt(this.expect(TokenType.NUMBER).value, 10);
+        if (this.match(TokenType.PRECEDING)) return { type: 'offset', value: n, direction: 'preceding' };
+        if (this.match(TokenType.FOLLOWING)) return { type: 'offset', value: n, direction: 'following' };
+        throw new Error('Expected PRECEDING or FOLLOWING after number');
     }
 
     // Parse column reference (may be table.column or just column)
@@ -1697,8 +2538,26 @@ class SQLParser {
         return first;
     }
 
-    // Parse table reference with optional alias
+    // Parse table reference with optional alias (supports subqueries)
     parseTableRef() {
+        // Check for subquery: (SELECT ...)
+        if (this.match(TokenType.LPAREN)) {
+            if (this.peek().type === TokenType.SELECT) {
+                const subquery = this.parseSelect();
+                this.expect(TokenType.RPAREN);
+                // Alias is required for derived tables
+                let alias = null;
+                if (this.match(TokenType.AS)) {
+                    alias = this.expect(TokenType.IDENTIFIER).value;
+                } else if (this.peek().type === TokenType.IDENTIFIER) {
+                    alias = this.advance().value;
+                }
+                return { type: 'subquery', query: subquery, alias: alias || '__derived' };
+            }
+            // Not a subquery, put back the LPAREN
+            this.pos--;
+        }
+
         const name = this.expect(TokenType.IDENTIFIER).value;
         let alias = null;
         if (this.match(TokenType.AS)) {
@@ -1710,7 +2569,8 @@ class SQLParser {
                 nextType !== TokenType.GROUP && nextType !== TokenType.LIMIT &&
                 nextType !== TokenType.JOIN && nextType !== TokenType.LEFT &&
                 nextType !== TokenType.RIGHT && nextType !== TokenType.INNER &&
-                nextType !== TokenType.ON) {
+                nextType !== TokenType.FULL && nextType !== TokenType.OUTER &&
+                nextType !== TokenType.CROSS && nextType !== TokenType.ON) {
                 alias = this.advance().value;
             }
         }
@@ -1720,32 +2580,82 @@ class SQLParser {
     // Parse JOIN clause
     parseJoin() {
         let joinType = 'INNER';
-        if (this.match(TokenType.LEFT)) {
+
+        if (this.match(TokenType.FULL)) {
+            this.match(TokenType.OUTER); // OUTER is optional
+            this.expect(TokenType.JOIN);
+            joinType = 'FULL';
+        } else if (this.match(TokenType.CROSS)) {
+            this.expect(TokenType.JOIN);
+            joinType = 'CROSS';
+        } else if (this.match(TokenType.LEFT)) {
+            this.match(TokenType.OUTER); // OUTER is optional
+            this.expect(TokenType.JOIN);
             joinType = 'LEFT';
-            this.match(TokenType.JOIN); // LEFT JOIN
         } else if (this.match(TokenType.RIGHT)) {
+            this.match(TokenType.OUTER); // OUTER is optional
+            this.expect(TokenType.JOIN);
             joinType = 'RIGHT';
-            this.match(TokenType.JOIN); // RIGHT JOIN
         } else if (this.match(TokenType.INNER)) {
+            this.expect(TokenType.JOIN);
             joinType = 'INNER';
-            this.match(TokenType.JOIN); // INNER JOIN
         } else {
             this.expect(TokenType.JOIN); // Just JOIN
         }
 
         const table = this.parseTableRef();
-        this.expect(TokenType.ON);
-        const on = this.parseJoinCondition();
+
+        // CROSS JOIN has no ON clause
+        let on = null;
+        if (joinType !== 'CROSS') {
+            this.expect(TokenType.ON);
+            on = this.parseJoinCondition();
+        }
 
         return { type: joinType, table, on };
     }
 
-    // Parse JOIN ON condition (left.col = right.col)
+    // Parse JOIN ON condition with compound expressions (AND/OR)
     parseJoinCondition() {
+        return this.parseJoinOrExpr();
+    }
+
+    parseJoinOrExpr() {
+        let left = this.parseJoinAndExpr();
+        while (this.match(TokenType.OR)) {
+            left = { op: 'OR', left, right: this.parseJoinAndExpr() };
+        }
+        return left;
+    }
+
+    parseJoinAndExpr() {
+        let left = this.parseJoinComparison();
+        while (this.match(TokenType.AND)) {
+            left = { op: 'AND', left, right: this.parseJoinComparison() };
+        }
+        return left;
+    }
+
+    parseJoinComparison() {
+        // Handle parenthesized expressions
+        if (this.match(TokenType.LPAREN)) {
+            const expr = this.parseJoinOrExpr();
+            this.expect(TokenType.RPAREN);
+            return expr;
+        }
+
         const left = this.parseColumnRef();
-        this.expect(TokenType.EQ);
+        let op;
+        if (this.match(TokenType.EQ)) op = '=';
+        else if (this.match(TokenType.NE)) op = '!=';
+        else if (this.match(TokenType.LT)) op = '<';
+        else if (this.match(TokenType.LE)) op = '<=';
+        else if (this.match(TokenType.GT)) op = '>';
+        else if (this.match(TokenType.GE)) op = '>=';
+        else throw new Error('Expected comparison operator in JOIN condition');
+
         const right = this.parseColumnRef();
-        return { left, right };
+        return { op, left, right };
     }
 
     parseWhereExpr() {
@@ -1771,6 +2681,26 @@ class SQLParser {
     }
 
     parseComparison() {
+        // Handle NOT EXISTS first
+        if (this.match(TokenType.NOT)) {
+            if (this.match(TokenType.EXISTS)) {
+                this.expect(TokenType.LPAREN);
+                const subquery = this.parseSelect();
+                this.expect(TokenType.RPAREN);
+                return { op: 'NOT EXISTS', subquery };
+            }
+            // Put back NOT - it might be part of NOT IN, NOT LIKE, etc.
+            this.pos--;
+        }
+
+        // Handle EXISTS
+        if (this.match(TokenType.EXISTS)) {
+            this.expect(TokenType.LPAREN);
+            const subquery = this.parseSelect();
+            this.expect(TokenType.RPAREN);
+            return { op: 'EXISTS', subquery };
+        }
+
         // Handle parenthesized expressions
         if (this.match(TokenType.LPAREN)) {
             const expr = this.parseOrExpr();
@@ -1806,23 +2736,51 @@ class SQLParser {
             column = this.parseColumnRef();
         }
 
-        // Handle BETWEEN
+        // Handle IS NULL / IS NOT NULL
+        if (this.match(TokenType.IS)) {
+            const isNot = this.match(TokenType.NOT);
+            this.expect(TokenType.NULL);
+            return { op: isNot ? 'IS NOT NULL' : 'IS NULL', column };
+        }
+
+        // Handle NOT BETWEEN, NOT IN, NOT LIKE
+        const isNot = this.match(TokenType.NOT);
+
+        // Handle BETWEEN / NOT BETWEEN
         if (this.match(TokenType.BETWEEN)) {
             const low = this.parseValue();
             this.expect(TokenType.AND);
             const high = this.parseValue();
-            return { op: 'BETWEEN', column, low, high };
+            return { op: isNot ? 'NOT BETWEEN' : 'BETWEEN', column, low, high };
         }
 
-        // Handle IN
+        // Handle IN / NOT IN (with subquery support)
         if (this.match(TokenType.IN)) {
             this.expect(TokenType.LPAREN);
+            // Check if it's a subquery
+            if (this.check(TokenType.SELECT)) {
+                const subquery = this.parseSelect();
+                this.expect(TokenType.RPAREN);
+                return { op: isNot ? 'NOT IN SUBQUERY' : 'IN SUBQUERY', column, subquery };
+            }
+            // Otherwise it's a list of values
             const values = [this.parseValue()];
             while (this.match(TokenType.COMMA)) {
                 values.push(this.parseValue());
             }
             this.expect(TokenType.RPAREN);
-            return { op: 'IN', column, values };
+            return { op: isNot ? 'NOT IN' : 'IN', column, values };
+        }
+
+        // Handle LIKE / NOT LIKE (move before other operators)
+        if (this.match(TokenType.LIKE)) {
+            const value = this.parseValue();
+            return { op: isNot ? 'NOT LIKE' : 'LIKE', column, value };
+        }
+
+        // If we consumed NOT but didn't match BETWEEN/IN/LIKE, error
+        if (isNot) {
+            throw new Error('Expected BETWEEN, IN, or LIKE after NOT');
         }
 
         // Handle NEAR (vector similarity search)
@@ -1843,10 +2801,17 @@ class SQLParser {
         else if (this.match(TokenType.LE)) op = '<=';
         else if (this.match(TokenType.GT)) op = '>';
         else if (this.match(TokenType.GE)) op = '>=';
-        else if (this.match(TokenType.LIKE)) op = 'LIKE';
         else throw new Error(`Expected comparison operator`);
 
-        const value = this.parseValue();
+        // Parse value - can be literal value OR column reference (for correlated subqueries)
+        let value;
+        const nextToken = this.peek();
+        if (nextToken.type === TokenType.IDENTIFIER) {
+            // Could be a column reference (e.g., d.id in correlated subquery)
+            value = this.parseColumnRef();
+        } else {
+            value = this.parseValue();
+        }
         return { op, column, value };
     }
 }
@@ -1870,8 +2835,63 @@ function getColumnValue(row, column, tableAliases = {}) {
     return undefined;
 }
 
+// Flatten joined row for DML with JOIN support (UPDATE...FROM, DELETE...USING)
+function flattenJoinedRow(jr) {
+    const flat = {};
+    for (const [alias, row] of Object.entries(jr)) {
+        if (alias === '__idx') continue;
+        if (typeof row === 'object' && row !== null) {
+            for (const [col, val] of Object.entries(row)) {
+                flat[`${alias}.${col}`] = val;
+                if (!(col in flat)) flat[col] = val;
+            }
+        }
+    }
+    return flat;
+}
+
+// Evaluate compound JOIN condition (supports AND/OR and multiple comparison operators)
+function evalJoinCondition(condition, leftRow, rightRow, tableAliases) {
+    if (!condition) return true;
+
+    // Handle AND/OR compound conditions
+    if (condition.op === 'AND') {
+        return evalJoinCondition(condition.left, leftRow, rightRow, tableAliases) &&
+               evalJoinCondition(condition.right, leftRow, rightRow, tableAliases);
+    }
+    if (condition.op === 'OR') {
+        return evalJoinCondition(condition.left, leftRow, rightRow, tableAliases) ||
+               evalJoinCondition(condition.right, leftRow, rightRow, tableAliases);
+    }
+
+    // Handle comparison - try both orderings since we don't know which row has which column
+    const leftVal = getColumnValue(leftRow, condition.left, tableAliases) ??
+                    getColumnValue(rightRow, condition.left, tableAliases);
+    const rightVal = getColumnValue(rightRow, condition.right, tableAliases) ??
+                     getColumnValue(leftRow, condition.right, tableAliases);
+
+    switch (condition.op) {
+        case '=': return leftVal === rightVal;
+        case '!=': return leftVal !== rightVal;
+        case '<': return leftVal < rightVal;
+        case '<=': return leftVal <= rightVal;
+        case '>': return leftVal > rightVal;
+        case '>=': return leftVal >= rightVal;
+        default: return false;
+    }
+}
+
 function evalWhere(where, row, tableAliases = {}) {
     if (!where) return true;
+
+    // Helper to resolve value - could be literal or column reference
+    const resolveValue = (val) => {
+        if (val && typeof val === 'object' && (val.table || val.column)) {
+            // It's a column reference
+            return getColumnValue(row, val, tableAliases);
+        }
+        return val;
+    };
 
     switch (where.op) {
         case 'AND':
@@ -1880,28 +2900,34 @@ function evalWhere(where, row, tableAliases = {}) {
             return evalWhere(where.left, row, tableAliases) || evalWhere(where.right, row, tableAliases);
         case '=': {
             const val = getColumnValue(row, where.column, tableAliases);
-            return val === where.value;
+            const compareVal = resolveValue(where.value);
+            return val === compareVal;
         }
         case '!=':
         case '<>': {
             const val = getColumnValue(row, where.column, tableAliases);
-            return val !== where.value;
+            const compareVal = resolveValue(where.value);
+            return val !== compareVal;
         }
         case '<': {
             const val = getColumnValue(row, where.column, tableAliases);
-            return val < where.value;
+            const compareVal = resolveValue(where.value);
+            return val < compareVal;
         }
         case '<=': {
             const val = getColumnValue(row, where.column, tableAliases);
-            return val <= where.value;
+            const compareVal = resolveValue(where.value);
+            return val <= compareVal;
         }
         case '>': {
             const val = getColumnValue(row, where.column, tableAliases);
-            return val > where.value;
+            const compareVal = resolveValue(where.value);
+            return val > compareVal;
         }
         case '>=': {
             const val = getColumnValue(row, where.column, tableAliases);
-            return val >= where.value;
+            const compareVal = resolveValue(where.value);
+            return val >= compareVal;
         }
         case 'LIKE': {
             const val = getColumnValue(row, where.column, tableAliases);
@@ -1916,8 +2942,76 @@ function evalWhere(where, row, tableAliases = {}) {
             const val = getColumnValue(row, where.column, tableAliases);
             return where.values.includes(val);
         }
+        case 'NOT IN': {
+            const val = getColumnValue(row, where.column, tableAliases);
+            return !where.values.includes(val);
+        }
+        case 'NOT BETWEEN': {
+            const val = getColumnValue(row, where.column, tableAliases);
+            return val < where.low || val > where.high;
+        }
+        case 'NOT LIKE': {
+            const val = getColumnValue(row, where.column, tableAliases);
+            const pattern = where.value.replace(/%/g, '.*').replace(/_/g, '.');
+            return !new RegExp(`^${pattern}$`, 'i').test(val);
+        }
+        case 'IS NULL': {
+            const val = getColumnValue(row, where.column, tableAliases);
+            return val === null || val === undefined;
+        }
+        case 'IS NOT NULL': {
+            const val = getColumnValue(row, where.column, tableAliases);
+            return val !== null && val !== undefined;
+        }
+        case 'IN SUBQUERY': {
+            const val = getColumnValue(row, where.column, tableAliases);
+            // subqueryValues should be pre-populated before eval
+            return where.subqueryValues ? where.subqueryValues.includes(val) : false;
+        }
+        case 'NOT IN SUBQUERY': {
+            const val = getColumnValue(row, where.column, tableAliases);
+            return where.subqueryValues ? !where.subqueryValues.includes(val) : true;
+        }
+        case 'EXISTS': {
+            // existsResult should be pre-populated before eval
+            return where.existsResult === true;
+        }
+        case 'NOT EXISTS': {
+            return where.existsResult === false;
+        }
         default:
             return true;
+    }
+}
+
+// Pre-execute subqueries in WHERE clause and populate subqueryValues
+async function preExecuteSubqueries(where, db) {
+    if (!where) return;
+
+    if (where.op === 'AND' || where.op === 'OR') {
+        await preExecuteSubqueries(where.left, db);
+        await preExecuteSubqueries(where.right, db);
+        return;
+    }
+
+    if (where.op === 'IN SUBQUERY' || where.op === 'NOT IN SUBQUERY') {
+        // Execute the subquery and extract values
+        const subAst = where.subquery;
+        const subRows = await db.select(subAst.table);
+
+        // Get the first column from each row
+        const firstCol = subAst.columns[0];
+        const colName = firstCol.type === 'column'
+            ? (firstCol.value.column || firstCol.value)
+            : (typeof firstCol === 'string' ? firstCol : firstCol.value);
+
+        where.subqueryValues = subRows.map(row => row[colName]);
+    }
+
+    if (where.op === 'EXISTS' || where.op === 'NOT EXISTS') {
+        // Execute the subquery and check if any rows exist
+        const result = await executeAST(db, where.subquery);
+        where.existsResult = result.rows.length > 0;
     }
 }
 
@@ -1966,9 +3060,1134 @@ function calculateAggregate(func, arg, rows) {
             }
             return max === -Infinity ? null : max;
         }
+        case 'stddev': case 'stddev_samp': {
+            const vals = rows.map(r => r[colName]).filter(v => v != null && typeof v === 'number');
+            if (vals.length < 2) return null;
+            const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+            const variance = vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / (vals.length - 1);
+            return Math.sqrt(variance);
+        }
+        case 'stddev_pop': {
+            const vals = rows.map(r => r[colName]).filter(v => v != null && typeof v === 'number');
+            if (vals.length === 0) return null;
+            const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+            const variance = vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / vals.length;
+            return Math.sqrt(variance);
+        }
+        case 'variance': case 'var_samp': {
+            const vals = rows.map(r => r[colName]).filter(v => v != null && typeof v === 'number');
+            if (vals.length < 2) return null;
+            const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+            return vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / (vals.length - 1);
+        }
+        case 'var_pop': {
+            const vals = rows.map(r => r[colName]).filter(v => v != null && typeof v === 'number');
+            if (vals.length === 0) return null;
+            const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+            return vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / vals.length;
+        }
+        case 'median': {
+            const vals = rows.map(r => r[colName]).filter(v => v != null && typeof v === 'number').sort((a, b) => a - b);
+            if (vals.length === 0) return null;
+            const mid = Math.floor(vals.length / 2);
+            return vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
+        }
+        case 'string_agg': case 'group_concat': {
+            const actualCol = typeof arg === 'object' && arg.column ? arg.column : colName;
+            const separator = typeof arg === 'object' && arg.separator != null ? arg.separator : ',';
+            const vals = rows.map(r => r[actualCol]).filter(v => v != null).map(String);
+            return vals.join(separator);
+        }
         default:
             return null;
     }
+}
+
+// Evaluate arithmetic expression for a single row
+function evaluateArithmeticExpr(expr, row, tableAliases = {}, excluded = null) {
+    if (!expr) return null;
+
+    switch (expr.type) {
+        case 'literal':
+            return expr.value;
+        case 'column': {
+            // Handle EXCLUDED.column for UPSERT
+            const colName = typeof expr.value === 'string' ? expr.value : expr.value?.column;
+            if (colName && colName.toUpperCase().startsWith('EXCLUDED.')) {
+                const field = colName.substring(9);
+                return excluded?.[field] ?? null;
+            }
+            return getColumnValue(row, expr.value, tableAliases);
+        }
+        case 'function':
+            return evaluateScalarFunction(expr.func, expr.args, row, tableAliases);
+        case 'array_literal':
+            return expr.elements.map(el => evaluateArithmeticExpr(el, row, tableAliases));
+        case 'subscript': {
+            const arr = evaluateArithmeticExpr(expr.array, row, tableAliases);
+            const idx = evaluateArithmeticExpr(expr.index, row, tableAliases);
+            if (!Array.isArray(arr) || idx == null) return null;
+            return arr[idx - 1] ?? null; // SQL uses 1-based indexing
+        }
+        case 'arithmetic':
+            if (expr.op === 'unary-') {
+                const operand = evaluateArithmeticExpr(expr.operand, row, tableAliases);
+                return operand != null ? -operand : null;
+            }
+            if (expr.op === 'unary~') {
+                const operand = evaluateArithmeticExpr(expr.operand, row, tableAliases);
+                return operand != null ? ~(operand | 0) : null;
+            }
+            const left = evaluateArithmeticExpr(expr.left, row, tableAliases);
+            const right = evaluateArithmeticExpr(expr.right, row, tableAliases);
+            if (left == null || right == null) return null;
+            switch (expr.op) {
+                case '+': return left + right;
+                case '-': return left - right;
+                case '*': return left * right;
+                case '/': return right !== 0 ? left / right : null;
+                // Bitwise operators
+                case '&': return (left | 0) & (right | 0);
+                case '|': return (left | 0) | (right | 0);
+                case '^': return (left | 0) ^ (right | 0);
+                case '<<': return (left | 0) << (right | 0);
+                case '>>': return (left | 0) >> (right | 0);
+                default: return null;
+            }
+        default:
+            return null;
+    }
+}
+
+// Evaluate scalar function for a single row
+function evaluateScalarFunction(func, args, row, tableAliases = {}) {
+    const evalArg = (arg) => {
+        if (!arg) return null;
+        if (arg.type === 'literal') return arg.value;
+        if (arg.type === 'column') return getColumnValue(row, arg.value, tableAliases);
+        if (arg.type === 'function') return evaluateScalarFunction(arg.func, arg.args, row, tableAliases);
+        if (arg.type === 'array_literal') return arg.elements.map(el => evalArg(el));
+        if (arg.type === 'subscript') {
+            const arr = evalArg(arg.array);
+            const idx = evalArg(arg.index);
+            if (!Array.isArray(arr) || idx == null) return null;
+            return arr[idx - 1] ?? null; // SQL 1-indexed
+        }
+        if (arg.type === 'arithmetic') {
+            if (arg.op === 'unary-') return -evalArg(arg.operand);
+            if (arg.op === 'unary~') return ~(evalArg(arg.operand) | 0);
+            const left = evalArg(arg.left);
+            const right = evalArg(arg.right);
+            switch (arg.op) {
+                case '+': return left + right;
+                case '-': return left - right;
+                case '*': return left * right;
+                case '/': return right !== 0 ? left / right : null;
+                case '&': return (left | 0) & (right | 0);
+                case '|': return (left | 0) | (right | 0);
+                case '^': return (left | 0) ^ (right | 0);
+                case '<<': return (left | 0) << (right | 0);
+                case '>>': return (left | 0) >> (right | 0);
+                default: return null;
+            }
+        }
+        if (arg.type === 'comparison') {
+            const left = evalArg(arg.left);
+            const right = evalArg(arg.right);
+            switch (arg.op) {
+                case '=': return left === right;
+                case '!=': case '<>': return left !== right;
+                case '<': return left < right;
+                case '<=': return left <= right;
+                case '>': return left > right;
+                case '>=': return left >= right;
+                default: return false;
+            }
+        }
+        return null;
+    };
+
+    switch (func) {
+        // COALESCE - return first non-null
+        case 'coalesce': {
+            for (const arg of args) {
+                const val = evalArg(arg);
+                if (val !== null && val !== undefined) return val;
+            }
+            return null;
+        }
+        // NULLIF - return null if args are equal
+        case 'nullif': {
+            const a = evalArg(args[0]);
+            const b = evalArg(args[1]);
+            return a === b ? null : a;
+        }
+        // String functions
+        case 'upper':
+            return String(evalArg(args[0]) ?? '').toUpperCase();
+        case 'lower':
+            return String(evalArg(args[0]) ?? '').toLowerCase();
+        case 'length':
+            return String(evalArg(args[0]) ?? '').length;
+        case 'substr':
+        case 'substring': {
+            const str = String(evalArg(args[0]) ?? '');
+            const start = (evalArg(args[1]) ?? 1) - 1; // SQL is 1-indexed
+            const len = args[2] ? evalArg(args[2]) : undefined;
+            return len !== undefined ? str.substr(start, len) : str.substr(start);
+        }
+        case 'trim':
+            return String(evalArg(args[0]) ?? '').trim();
+        case 'ltrim':
+            return String(evalArg(args[0]) ?? '').trimStart();
+        case 'rtrim':
+            return String(evalArg(args[0]) ?? '').trimEnd();
+        case 'concat':
+            return args.map(a => String(evalArg(a) ?? '')).join('');
+        case 'replace': {
+            const str = String(evalArg(args[0]) ?? '');
+            const from = String(evalArg(args[1]) ?? '');
+            const to = String(evalArg(args[2]) ?? '');
+            return str.split(from).join(to);
+        }
+        // Math functions
+        case 'abs':
+            return Math.abs(evalArg(args[0]) ?? 0);
+        case 'round': {
+            const val = evalArg(args[0]) ?? 0;
+            const decimals = args[1] ? evalArg(args[1]) : 0;
+            const factor = Math.pow(10, decimals);
+            return Math.round(val * factor) / factor;
+        }
+        case 'ceil':
+        case 'ceiling':
+            return Math.ceil(evalArg(args[0]) ?? 0);
+        case 'floor':
+            return Math.floor(evalArg(args[0]) ?? 0);
+        case 'mod':
+            return (evalArg(args[0]) ?? 0) % (evalArg(args[1]) ?? 1);
+        case 'power':
+        case 'pow':
+            return Math.pow(evalArg(args[0]) ?? 0, evalArg(args[1]) ?? 1);
+        case 'sqrt':
+            return Math.sqrt(evalArg(args[0]) ?? 0);
+        case 'truncate':
+        case 'trunc': {
+            const val = evalArg(args[0]) ?? 0;
+            const scale = args[1] ? evalArg(args[1]) : 0;
+            if (scale === 0) return Math.trunc(val);
+            const factor = Math.pow(10, scale);
+            return Math.trunc(val * factor) / factor;
+        }
+        case 'sign': {
+            const v = evalArg(args[0]);
+            if (v == null) return null;
+            return v > 0 ? 1 : v < 0 ? -1 : 0;
+        }
+        case 'log':
+        case 'ln':
+            return Math.log(evalArg(args[0]) ?? 0);
+        case 'log10':
+            return Math.log10(evalArg(args[0]) ?? 0);
+        case 'exp':
+            return Math.exp(evalArg(args[0]) ?? 0);
+        case 'sin':
+            return Math.sin(evalArg(args[0]) ?? 0);
+        case 'cos':
+            return Math.cos(evalArg(args[0]) ?? 0);
+        case 'tan':
+            return Math.tan(evalArg(args[0]) ?? 0);
+        case 'asin':
+            return Math.asin(evalArg(args[0]) ?? 0);
+        case 'acos':
+            return Math.acos(evalArg(args[0]) ?? 0);
+        case 'atan':
+            return Math.atan(evalArg(args[0]) ?? 0);
+        case 'atan2':
+            return Math.atan2(evalArg(args[0]) ?? 0, evalArg(args[1]) ?? 0);
+        case 'pi':
+            return Math.PI;
+        case 'random':
+        case 'rand':
+            return Math.random();
+        case 'degrees':
+            return (evalArg(args[0]) ?? 0) * (180 / Math.PI);
+        case 'radians':
+            return (evalArg(args[0]) ?? 0) * (Math.PI / 180);
+
+        // ========== Conditional Functions ==========
+        case 'greatest': {
+            const values = args.map(evalArg).filter(v => v != null);
+            return values.length ? Math.max(...values) : null;
+        }
+        case 'least': {
+            const values = args.map(evalArg).filter(v => v != null);
+            return values.length ? Math.min(...values) : null;
+        }
+        case 'iif':
+        case 'if': {
+            const condition = evalArg(args[0]);
+            return condition ? evalArg(args[1]) : evalArg(args[2]);
+        }
+
+        // ========== Type Casting ==========
+        case 'cast': {
+            const value = evalArg(args[0]);
+            const targetType = String(args[1]?.value || args[1] || '').toUpperCase();
+            if (value == null) return null;
+            switch (targetType) {
+                case 'INTEGER': case 'INT': case 'BIGINT': return Math.trunc(Number(value));
+                case 'REAL': case 'FLOAT': case 'DOUBLE': return Number(value);
+                case 'TEXT': case 'VARCHAR': case 'STRING': return String(value);
+                case 'BOOLEAN': case 'BOOL': return Boolean(value);
+                default: return value;
+            }
+        }
+
+        // ========== Date/Time Functions ==========
+        case 'now':
+        case 'current_timestamp':
+            return new Date().toISOString();
+        case 'current_date':
+            return new Date().toISOString().split('T')[0];
+        case 'current_time':
+            return new Date().toISOString().split('T')[1].split('.')[0];
+        case 'date': {
+            const val = evalArg(args[0]);
+            if (!val) return null;
+            const d = new Date(val);
+            return isNaN(d.getTime()) ? null : d.toISOString().split('T')[0];
+        }
+        case 'time': {
+            const val = evalArg(args[0]);
+            if (!val) return null;
+            const d = new Date(val);
+            return isNaN(d.getTime()) ? null : d.toISOString().split('T')[1].split('.')[0];
+        }
+        case 'strftime': {
+            const format = String(evalArg(args[0]) ?? '');
+            const dateVal = evalArg(args[1]);
+            if (!dateVal) return null;
+            const d = new Date(dateVal);
+            if (isNaN(d.getTime())) return null;
+            // Use UTC methods for consistency with date-only strings
+            return format
+                .replace(/%Y/g, d.getUTCFullYear())
+                .replace(/%m/g, String(d.getUTCMonth() + 1).padStart(2, '0'))
+                .replace(/%d/g, String(d.getUTCDate()).padStart(2, '0'))
+                .replace(/%H/g, String(d.getUTCHours()).padStart(2, '0'))
+                .replace(/%M/g, String(d.getUTCMinutes()).padStart(2, '0'))
+                .replace(/%S/g, String(d.getUTCSeconds()).padStart(2, '0'))
+                .replace(/%w/g, d.getUTCDay())
+                .replace(/%j/g, Math.floor((d - new Date(Date.UTC(d.getUTCFullYear(), 0, 0))) / 86400000));
+        }
+        case 'date_diff': {
+            const unit = String(evalArg(args[0]) ?? 'day').toLowerCase();
+            const d1 = new Date(evalArg(args[1]));
+            const d2 = new Date(evalArg(args[2]));
+            if (isNaN(d1.getTime()) || isNaN(d2.getTime())) return null;
+            const diffMs = d2.getTime() - d1.getTime();
+            switch (unit) {
+                case 'second': case 'seconds': return Math.floor(diffMs / 1000);
+                case 'minute': case 'minutes': return Math.floor(diffMs / 60000);
+                case 'hour': case 'hours': return Math.floor(diffMs / 3600000);
+                case 'day': case 'days': return Math.floor(diffMs / 86400000);
+                case 'week': case 'weeks': return Math.floor(diffMs / 604800000);
+                case 'month': case 'months':
+                    return (d2.getFullYear() - d1.getFullYear()) * 12 + (d2.getMonth() - d1.getMonth());
+                case 'year': case 'years':
+                    return d2.getFullYear() - d1.getFullYear();
+                default: return Math.floor(diffMs / 86400000);
+            }
+        }
+        case 'date_add':
+        case 'date_sub': {
+            const dateVal = evalArg(args[0]);
+            const amount = evalArg(args[1]) ?? 0;
+            const unit = String(evalArg(args[2]) ?? 'day').toLowerCase();
+            if (!dateVal) return null;
+            const d = new Date(dateVal);
+            if (isNaN(d.getTime())) return null;
+            const sign = func === 'date_add' ? 1 : -1;
+            switch (unit) {
+                case 'second': case 'seconds': d.setSeconds(d.getSeconds() + sign * amount); break;
+                case 'minute': case 'minutes': d.setMinutes(d.getMinutes() + sign * amount); break;
+                case 'hour': case 'hours': d.setHours(d.getHours() + sign * amount); break;
+                case 'day': case 'days': d.setDate(d.getDate() + sign * amount); break;
+                case 'week': case 'weeks': d.setDate(d.getDate() + sign * amount * 7); break;
+                case 'month': case 'months': d.setMonth(d.getMonth() + sign * amount); break;
+                case 'year': case 'years': d.setFullYear(d.getFullYear() + sign * amount); break;
+            }
+            return d.toISOString();
+        }
+        case 'extract': {
+            const unit = String(evalArg(args[0]) ?? '').toUpperCase();
+            const dateVal = evalArg(args[1]);
+            if (!dateVal) return null;
+            const d = new Date(dateVal);
+            if (isNaN(d.getTime())) return null;
+            switch (unit) {
+                case 'YEAR': return d.getFullYear();
+                case 'MONTH': return d.getMonth() + 1;
+                case 'DAY': return d.getDate();
+                case 'HOUR': return d.getHours();
+                case 'MINUTE': return d.getMinutes();
+                case 'SECOND': return d.getSeconds();
+                case 'DOW': case 'DAYOFWEEK': return d.getDay();
+                case 'DOY': case 'DAYOFYEAR':
+                    return Math.floor((d - new Date(d.getFullYear(), 0, 0)) / 86400000);
+                default: return null;
+            }
+        }
+        // Shorthand date extractors (use UTC to avoid timezone issues with date-only strings)
+        case 'year': {
+            const dateVal = evalArg(args[0]);
+            if (!dateVal) return null;
+            const d = new Date(dateVal);
+            return isNaN(d.getTime()) ? null : d.getUTCFullYear();
+        }
+        case 'month': {
+            const dateVal = evalArg(args[0]);
+            if (!dateVal) return null;
+            const d = new Date(dateVal);
+            return isNaN(d.getTime()) ? null : d.getUTCMonth() + 1;
+        }
+        case 'day': {
+            const dateVal = evalArg(args[0]);
+            if (!dateVal) return null;
+            const d = new Date(dateVal);
+            return isNaN(d.getTime()) ? null : d.getUTCDate();
+        }
+        case 'hour': {
+            const dateVal = evalArg(args[0]);
+            if (!dateVal) return null;
+            const d = new Date(dateVal);
+            return isNaN(d.getTime()) ? null : d.getUTCHours();
+        }
+        case 'minute': {
+            const dateVal = evalArg(args[0]);
+            if (!dateVal) return null;
+            const d = new Date(dateVal);
+            return isNaN(d.getTime()) ? null : d.getUTCMinutes();
+        }
+        case 'second': {
+            const dateVal = evalArg(args[0]);
+            if (!dateVal) return null;
+            const d = new Date(dateVal);
+            return isNaN(d.getTime()) ? null : d.getUTCSeconds();
+        }
+
+        // ========== Additional String Functions ==========
+        case 'split': {
+            const str = String(evalArg(args[0]) ?? '');
+            const delimiter = String(evalArg(args[1]) ?? ',');
+            return str.split(delimiter);
+        }
+        case 'left': {
+            const str = String(evalArg(args[0]) ?? '');
+            const n = evalArg(args[1]) ?? 0;
+            return str.substring(0, n);
+        }
+        case 'right': {
+            const str = String(evalArg(args[0]) ?? '');
+            const n = evalArg(args[1]) ?? 0;
+            return str.substring(Math.max(0, str.length - n));
+        }
+        case 'lpad': {
+            const str = String(evalArg(args[0]) ?? '');
+            const len = evalArg(args[1]) ?? 0;
+            const pad = String(evalArg(args[2]) ?? ' ');
+            return str.padStart(len, pad);
+        }
+        case 'rpad': {
+            const str = String(evalArg(args[0]) ?? '');
+            const len = evalArg(args[1]) ?? 0;
+            const pad = String(evalArg(args[2]) ?? ' ');
+            return str.padEnd(len, pad);
+        }
+        case 'position':
+        case 'instr': {
+            const str = String(evalArg(args[0]) ?? '');
+            const substr = String(evalArg(args[1]) ?? '');
+            const pos = str.indexOf(substr);
+            return pos === -1 ? 0 : pos + 1; // SQL uses 1-based indexing
+        }
+        case 'repeat': {
+            const str = String(evalArg(args[0]) ?? '');
+            const n = evalArg(args[1]) ?? 0;
+            return str.repeat(Math.max(0, n));
+        }
+        case 'reverse': {
+            const str = String(evalArg(args[0]) ?? '');
+            return str.split('').reverse().join('');
+        }
+
+        // ========== REGEXP Functions ==========
+        case 'regexp_matches': {
+            const str = String(evalArg(args[0]) ?? '');
+            const pattern = String(evalArg(args[1]) ?? '');
+            const flags = args[2] ? String(evalArg(args[2])) : '';
+            try {
+                return new RegExp(pattern, flags).test(str) ? 1 : 0;
+            } catch (e) {
+                return 0;
+            }
+        }
+        case 'regexp_replace': {
+            const str = String(evalArg(args[0]) ?? '');
+            const pattern = String(evalArg(args[1]) ?? '');
+            const replacement = String(evalArg(args[2]) ?? '');
+            const flags = args[3] ? String(evalArg(args[3])) : 'g';
+            try {
+                return str.replace(new RegExp(pattern, flags), replacement);
+            } catch (e) {
+                return str;
+            }
+        }
+        case 'regexp_extract':
+        case 'regexp_substr': {
+            const str = String(evalArg(args[0]) ?? '');
+            const pattern = String(evalArg(args[1]) ?? '');
+            const groupIndex = args[2] ? parseInt(evalArg(args[2]), 10) : 0;
+            try {
+                const match = str.match(new RegExp(pattern));
+                return match ? (match[groupIndex] ?? null) : null;
+            } catch (e) {
+                return null;
+            }
+        }
+        case 'regexp_count': {
+            const str = String(evalArg(args[0]) ?? '');
+            const pattern = String(evalArg(args[1]) ?? '');
+            const flags = (args[2] ? String(evalArg(args[2])) : '') + 'g';
+            try {
+                const matches = str.match(new RegExp(pattern, flags));
+                return matches ? matches.length : 0;
+            } catch (e) {
+                return 0;
+            }
+        }
+        case 'regexp_split': {
+            const str = String(evalArg(args[0]) ?? '');
+            const pattern = String(evalArg(args[1]) ?? '');
+            try {
+                return JSON.stringify(str.split(new RegExp(pattern)));
+            } catch (e) {
+                return JSON.stringify([str]);
+            }
+        }
+
+        // ========== JSON Functions ==========
+        case 'json_extract':
+        case 'json_value': {
+            const jsonStr = String(evalArg(args[0]) ?? '{}');
+            const path = String(evalArg(args[1]) ?? '$');
+            try {
+                const obj = JSON.parse(jsonStr);
+                return navigateJsonPath(obj, path);
+            } catch (e) {
+                return null;
+            }
+        }
+        case 'json_object': {
+            const result = {};
+            for (let i = 0; i < args.length; i += 2) {
+                const key = String(evalArg(args[i]) ?? '');
+                const value = evalArg(args[i + 1]);
+                result[key] = value;
+            }
+            return JSON.stringify(result);
+        }
+        case 'json_array': {
+            const result = args.map(evalArg);
+            return JSON.stringify(result);
+        }
+        case 'json_keys': {
+            const jsonStr = String(evalArg(args[0]) ?? '{}');
+            try {
+                const obj = JSON.parse(jsonStr);
+                if (typeof obj === 'object' && obj !== null && !Array.isArray(obj)) {
+                    return JSON.stringify(Object.keys(obj));
+                }
+                return null;
+            } catch (e) {
+                return null;
+            }
+        }
+        case 'json_length': {
+            const jsonStr = String(evalArg(args[0]) ?? '{}');
+            try {
+                const obj = JSON.parse(jsonStr);
+                if (Array.isArray(obj)) return obj.length;
+                if (typeof obj === 'object' && obj !== null) return Object.keys(obj).length;
+                return null;
+            } catch (e) {
+                return null;
+            }
+        }
+        case 'json_type': {
+            const jsonStr = String(evalArg(args[0]) ?? 'null');
+            try {
+                const obj = JSON.parse(jsonStr);
+                if (obj === null) return 'NULL';
+                if (Array.isArray(obj)) return 'ARRAY';
+                if (typeof obj === 'object') return 'OBJECT';
+                if (typeof obj === 'string') return 'STRING';
+                if (typeof obj === 'number') return 'NUMBER';
+                if (typeof obj === 'boolean') return 'BOOLEAN';
+                return null;
+            } catch (e) {
+                return null;
+            }
+        }
+        case 'json_valid': {
+            const jsonStr = String(evalArg(args[0]) ?? '');
+            try {
+                JSON.parse(jsonStr);
+                return 1;
+            } catch (e) {
+                return 0;
+            }
+        }
+
+        // ========== Array Functions ==========
+        case 'array_length': {
+            const arr = evalArg(args[0]);
+            return Array.isArray(arr) ? arr.length : null;
+        }
+        case 'array_contains': {
+            const arr = evalArg(args[0]);
+            const value = evalArg(args[1]);
+            if (!Array.isArray(arr)) return null;
+            return arr.includes(value) ? 1 : 0;
+        }
+        case 'array_position': {
+            const arr = evalArg(args[0]);
+            const value = evalArg(args[1]);
+            if (!Array.isArray(arr)) return null;
+            const idx = arr.indexOf(value);
+            return idx === -1 ? null : idx + 1; // SQL 1-based indexing
+        }
+        case 'array_append': {
+            const arr = evalArg(args[0]);
+            const value = evalArg(args[1]);
+            if (!Array.isArray(arr)) return null;
+            return [...arr, value];
+        }
+        case 'array_remove': {
+            const arr = evalArg(args[0]);
+            const value = evalArg(args[1]);
+            if (!Array.isArray(arr)) return null;
+            return arr.filter(el => el !== value);
+        }
+        case 'array_slice': {
+            const arr = evalArg(args[0]);
+            const start = (evalArg(args[1]) ?? 1) - 1; // SQL 1-based to JS 0-based
+            const end = args[2] ? evalArg(args[2]) - 1 : arr?.length; // SQL 1-based to JS 0-based (exclusive)
+            if (!Array.isArray(arr)) return null;
+            return arr.slice(start, end);
+        }
+        case 'array_concat': {
+            const arr1 = evalArg(args[0]);
+            const arr2 = evalArg(args[1]);
+            if (!Array.isArray(arr1) || !Array.isArray(arr2)) return null;
+            return [...arr1, ...arr2];
+        }
+        case 'unnest': {
+            // UNNEST typically expands array to rows - in scalar context, return first element
+            const arr = evalArg(args[0]);
+            return Array.isArray(arr) && arr.length > 0 ? arr[0] : null;
+        }
+
+        // ========== UUID Functions ==========
+        case 'uuid':
+        case 'gen_random_uuid': {
+            // Generate UUID v4
+            if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+                return crypto.randomUUID();
+            }
+            // Fallback for environments without crypto.randomUUID
+            return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+                const r = Math.random() * 16 | 0;
+                return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+            });
+        }
+        case 'uuid_string': {
+            const val = evalArg(args[0]);
+            if (val == null) return null;
+            return String(val);
+        }
+        case 'is_uuid': {
+            const val = evalArg(args[0]);
+            if (val == null) return 0;
+            const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+            return uuidRegex.test(String(val)) ? 1 : 0;
+        }
+
+        // ========== Binary/Bit Functions ==========
+        case 'bit_count': {
+            const val = evalArg(args[0]);
+            if (val == null) return null;
+            let n = val | 0;
+            let count = 0;
+            // Handle negative numbers by using unsigned right shift
+            n = n >>> 0;
+            while (n) {
+                count += n & 1;
+                n >>>= 1;
+            }
+            return count;
+        }
+        case 'hex': {
+            const val = evalArg(args[0]);
+            if (val == null) return null;
+            if (typeof val === 'number') {
+                return (val >>> 0).toString(16).toUpperCase();
+            }
+            // String to hex
+            return String(val).split('').map(c => c.charCodeAt(0).toString(16).padStart(2, '0')).join('').toUpperCase();
+        }
+        case 'unhex': {
+            const val = evalArg(args[0]);
+            if (val == null) return null;
+            const hex = String(val);
+            let result = '';
+            for (let i = 0; i < hex.length; i += 2) {
+                result += String.fromCharCode(parseInt(hex.substr(i, 2), 16));
+            }
+            return result;
+        }
+        case 'encode': {
+            const val = evalArg(args[0]);
+            const encoding = String(evalArg(args[1]) ?? 'base64').toLowerCase();
+            if (val == null) return null;
+            if (encoding === 'base64') {
+                return btoa(String(val));
+            }
+            if (encoding === 'hex') {
+                return String(val).split('').map(c => c.charCodeAt(0).toString(16).padStart(2, '0')).join('');
+            }
+            return val;
+        }
+        case 'decode': {
+            const val = evalArg(args[0]);
+            const encoding = String(evalArg(args[1]) ?? 'base64').toLowerCase();
+            if (val == null) return null;
+            if (encoding === 'base64') {
+                try {
+                    return atob(String(val));
+                } catch (e) {
+                    return null;
+                }
+            }
+            if (encoding === 'hex') {
+                const hex = String(val);
+                let result = '';
+                for (let i = 0; i < hex.length; i += 2) {
+                    result += String.fromCharCode(parseInt(hex.substr(i, 2), 16));
+                }
+                return result;
+            }
+            return val;
+        }
+
+        default:
+            return null;
+    }
+}
+
+// JSON path navigation helper (supports $.key.subkey and $.array[0])
+function parseJsonPath(path) {
+    if (!path || !path.startsWith('$')) return [];
+    const segments = [];
+    let remaining = path.substring(1);
+    while (remaining.length > 0) {
+        if (remaining.startsWith('.')) {
+            remaining = remaining.substring(1);
+            const match = remaining.match(/^([a-zA-Z_][a-zA-Z0-9_]*)/);
+            if (match) {
+                segments.push({ type: 'key', value: match[1] });
+                remaining = remaining.substring(match[1].length);
+            }
+        } else if (remaining.startsWith('[')) {
+            const endBracket = remaining.indexOf(']');
+            if (endBracket === -1) break;
+            const content = remaining.substring(1, endBracket);
+            if (/^\d+$/.test(content)) {
+                segments.push({ type: 'index', value: parseInt(content, 10) });
+            } else if (content.startsWith("'") || content.startsWith('"')) {
+                segments.push({ type: 'key', value: content.slice(1, -1) });
+            }
+            remaining = remaining.substring(endBracket + 1);
+        } else {
+            break;
+        }
+    }
+    return segments;
+}
+
+function navigateJsonPath(obj, path) {
+    let current = obj;
+    for (const seg of parseJsonPath(path)) {
+        if (current == null) return null;
+        current = seg.type === 'key' ? current[seg.value] :
+                  (Array.isArray(current) ? current[seg.value] : null);
+    }
+    return typeof current === 'object' ? JSON.stringify(current) : current;
+}
+
+// Evaluate scalar subquery for a single outer row (correlated subquery support)
+async function evaluateScalarSubquery(subquery, outerRow, db, tableAliases) {
+    // Bind outer row references into the subquery's WHERE clause
+    const boundSubquery = JSON.parse(JSON.stringify(subquery)); // Deep clone
+    if (boundSubquery.where) {
+        bindOuterReferences(boundSubquery.where, outerRow, tableAliases);
+    }
+
+    const result = await executeAST(db, boundSubquery);
+    if (result.rows.length === 0) return null;
+    if (result.rows.length > 1) throw new Error('Scalar subquery returned more than one row');
+
+    // Return the first (and only) column value of the first row
+    const keys = Object.keys(result.rows[0]);
+    return keys.length > 0 ? result.rows[0][keys[0]] : null;
+}
+
+// Bind outer row references in WHERE clause for correlated subqueries
+function bindOuterReferences(where, outerRow, tableAliases) {
+    if (!where) return;
+
+    if (where.op === 'AND' || where.op === 'OR') {
+        bindOuterReferences(where.left, outerRow, tableAliases);
+        bindOuterReferences(where.right, outerRow, tableAliases);
+        return;
+    }
+
+    // Check if the value references an outer table column
+    if (where.value && typeof where.value === 'object' && where.value.table) {
+        const val = getColumnValue(outerRow, where.value, tableAliases);
+        if (val !== undefined) {
+            where.value = val; // Replace with actual value
+        }
+    }
+
+    // Also check the column side for cases like outer.col = inner.col
+    if (where.column && typeof where.column === 'object' && where.column.table) {
+        const val = getColumnValue(outerRow, where.column, tableAliases);
+        if (val !== undefined && where.value !== undefined) {
+            // Swap: column becomes the inner column, value becomes the outer value
+            where.column = where.value;
+            where.value = val;
+        }
+    }
+}
+
+// Evaluate CASE WHEN expression for a single row
+function evaluateCaseExpr(caseExpr, row, tableAliases = {}) {
+    const evalArg = (arg) => {
+        if (!arg) return null;
+        if (arg.type === 'literal') return arg.value;
+        if (arg.type === 'column') return getColumnValue(row, arg.value, tableAliases);
+        if (arg.type === 'function') return evaluateScalarFunction(arg.func, arg.args, row, tableAliases);
+        if (arg.type === 'array_literal') return arg.elements.map(el => evalArg(el));
+        if (arg.type === 'subscript') {
+            const arr = evalArg(arg.array);
+            const idx = evalArg(arg.index);
+            if (!Array.isArray(arr) || idx == null) return null;
+            return arr[idx - 1] ?? null;
+        }
+        if (arg.type === 'arithmetic') {
+            if (arg.op === 'unary-') return -evalArg(arg.operand);
+            if (arg.op === 'unary~') return ~(evalArg(arg.operand) | 0);
+            const left = evalArg(arg.left);
+            const right = evalArg(arg.right);
+            switch (arg.op) {
+                case '+': return left + right;
+                case '-': return left - right;
+                case '*': return left * right;
+                case '/': return right !== 0 ? left / right : null;
+                case '&': return (left | 0) & (right | 0);
+                case '|': return (left | 0) | (right | 0);
+                case '^': return (left | 0) ^ (right | 0);
+                case '<<': return (left | 0) << (right | 0);
+                case '>>': return (left | 0) >> (right | 0);
+                default: return null;
+            }
+        }
+        if (arg.type === 'comparison') {
+            const left = evalArg(arg.left);
+            const right = evalArg(arg.right);
+            switch (arg.op) {
+                case '=': return left === right;
+                case '!=': case '<>': return left !== right;
+                case '<': return left < right;
+                case '<=': return left <= right;
+                case '>': return left > right;
+                case '>=': return left >= right;
+                default: return false;
+            }
+        }
+        return null;
+    };
+
+    // Simple CASE: CASE expr WHEN value THEN result
+    if (caseExpr.caseExpr) {
+        const caseVal = evalArg(caseExpr.caseExpr);
+        for (const branch of caseExpr.branches) {
+            const whenVal = evalArg(branch.condition);
+            if (caseVal === whenVal) {
+                return evalArg(branch.result);
+            }
+        }
+    } else {
+        // Searched CASE: CASE WHEN condition THEN result
+        for (const branch of caseExpr.branches) {
+            const cond = evalArg(branch.condition);
+            if (cond) {
+                return evalArg(branch.result);
+            }
+        }
+    }
+
+    // ELSE clause
+    return caseExpr.elseResult ? evalArg(caseExpr.elseResult) : null;
+}
+
+// Compute window functions for all rows
+function computeWindowFunctions(rows, windowCols, tableAliases = {}) {
+    if (rows.length === 0) return rows;
+
+    for (const col of windowCols) {
+        const alias = col.alias || `${col.func}(...)`;
+        const windowKey = `__window_${alias}`;
+        const { partitionBy, orderBy } = col.over;
+
+        // Group rows into partitions
+        const partitions = new Map();
+        for (let i = 0; i < rows.length; i++) {
+            const row = rows[i];
+            const partKey = partitionBy
+                ? partitionBy.map(p => {
+                    const colName = typeof p === 'string' ? p : p.column;
+                    return String(row[colName]);
+                }).join('|')
+                : '__all__';
+            if (!partitions.has(partKey)) {
+                partitions.set(partKey, []);
+            }
+            partitions.get(partKey).push({ index: i, row });
+        }
+
+        // Process each partition
+        for (const [, partRows] of partitions) {
+            // Sort partition by ORDER BY if specified
+            if (orderBy && orderBy.length > 0) {
+                partRows.sort((a, b) => {
+                    for (const order of orderBy) {
+                        const colName = typeof order.column === 'string' ? order.column : order.column.column;
+                        const aVal = a.row[colName];
+                        const bVal = b.row[colName];
+                        if (aVal < bVal) return order.desc ? 1 : -1;
+                        if (aVal > bVal) return order.desc ? -1 : 1;
+                    }
+                    return 0;
+                });
+            }
+
+            // Helper to get frame bounds
+            const getFrameBounds = (i, frame) => {
+                if (!frame) {
+                    // Default: if ORDER BY exists, UNBOUNDED PRECEDING to CURRENT ROW
+                    // Otherwise, entire partition
+                    return orderBy && orderBy.length > 0 ? [0, i] : [0, partRows.length - 1];
+                }
+                let start = 0, end = partRows.length - 1;
+                // Calculate start
+                if (frame.start.type === 'unbounded' && frame.start.direction === 'preceding') {
+                    start = 0;
+                } else if (frame.start.type === 'current') {
+                    start = i;
+                } else if (frame.start.type === 'offset') {
+                    start = frame.start.direction === 'preceding' ? i - frame.start.value : i + frame.start.value;
+                }
+                // Calculate end
+                if (frame.end.type === 'unbounded' && frame.end.direction === 'following') {
+                    end = partRows.length - 1;
+                } else if (frame.end.type === 'current') {
+                    end = i;
+                } else if (frame.end.type === 'offset') {
+                    end = frame.end.direction === 'preceding' ? i - frame.end.value : i + frame.end.value;
+                }
+                return [Math.max(0, start), Math.min(partRows.length - 1, end)];
+            };
+
+            // Compute window function for each row in partition
+            for (let i = 0; i < partRows.length; i++) {
+                const { index, row } = partRows[i];
+                let value;
+                const frame = col.over.frame;
+
+                switch (col.func) {
+                    case 'row_number':
+                        value = i + 1;
+                        break;
+                    case 'rank': {
+                        // Same rank for same ORDER BY values
+                        if (i === 0) {
+                            value = 1;
+                        } else {
+                            const prevRow = partRows[i - 1].row;
+                            const sameAsPrev = orderBy ? orderBy.every(order => {
+                                const colName = typeof order.column === 'string' ? order.column : order.column.column;
+                                return row[colName] === prevRow[colName];
+                            }) : false;
+                            value = sameAsPrev ? rows[partRows[i - 1].index][windowKey] : i + 1;
+                        }
+                        break;
+                    }
+                    case 'dense_rank': {
+                        if (i === 0) {
+                            value = 1;
+                        } else {
+                            const prevRow = partRows[i - 1].row;
+                            const sameAsPrev = orderBy ? orderBy.every(order => {
+                                const colName = typeof order.column === 'string' ? order.column : order.column.column;
+                                return row[colName] === prevRow[colName];
+                            }) : false;
+                            value = sameAsPrev ? rows[partRows[i - 1].index][windowKey] : rows[partRows[i - 1].index][windowKey] + 1;
+                        }
+                        break;
+                    }
+                    case 'sum': {
+                        const argCol = typeof col.arg === 'string' ? col.arg : col.arg?.column;
+                        const [frameStart, frameEnd] = getFrameBounds(i, frame);
+                        const windowRows = partRows.slice(frameStart, frameEnd + 1);
+                        value = windowRows.reduce((acc, p) => {
+                            const v = p.row[argCol];
+                            return acc + (typeof v === 'number' ? v : 0);
+                        }, 0);
+                        break;
+                    }
+                    case 'count': {
+                        const [frameStart, frameEnd] = getFrameBounds(i, frame);
+                        value = frameEnd - frameStart + 1;
+                        break;
+                    }
+                    case 'avg': {
+                        const argCol = typeof col.arg === 'string' ? col.arg : col.arg?.column;
+                        const [frameStart, frameEnd] = getFrameBounds(i, frame);
+                        const windowRows = partRows.slice(frameStart, frameEnd + 1);
+                        const vals = windowRows.map(p => p.row[argCol]).filter(v => typeof v === 'number');
+                        value = vals.length > 0 ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+                        break;
+                    }
+                    case 'min': {
+                        const argCol = typeof col.arg === 'string' ? col.arg : col.arg?.column;
+                        const [frameStart, frameEnd] = getFrameBounds(i, frame);
+                        const windowRows = partRows.slice(frameStart, frameEnd + 1);
+                        const vals = windowRows.map(p => p.row[argCol]).filter(v => v != null);
+                        value = vals.length > 0 ? Math.min(...vals) : null;
+                        break;
+                    }
+                    case 'max': {
+                        const argCol = typeof col.arg === 'string' ? col.arg : col.arg?.column;
+                        const [frameStart, frameEnd] = getFrameBounds(i, frame);
+                        const windowRows = partRows.slice(frameStart, frameEnd + 1);
+                        const vals = windowRows.map(p => p.row[argCol]).filter(v => v != null);
+                        value = vals.length > 0 ? Math.max(...vals) : null;
+                        break;
+                    }
+                    case 'lag': {
+                        const argCol = typeof col.arg === 'string' ? col.arg : col.arg?.column;
+                        value = i > 0 ? partRows[i - 1].row[argCol] : null;
+                        break;
+                    }
+                    case 'lead': {
+                        const argCol = typeof col.arg === 'string' ? col.arg : col.arg?.column;
+                        value = i < partRows.length - 1 ? partRows[i + 1].row[argCol] : null;
+                        break;
+                    }
+                    case 'ntile': {
+                        // NTILE(n) divides partition into n buckets
+                        const n = col.arg || 1;
+                        const bucketSize = Math.ceil(partRows.length / n);
+                        value = Math.min(Math.floor(i / bucketSize) + 1, n);
+                        break;
+                    }
+                    case 'percent_rank': {
+                        // (rank - 1) / (partition_size - 1)
+                        if (partRows.length <= 1) {
+                            value = 0;
+                        } else {
+                            // Calculate rank first
+                            let rank = 1;
+                            if (i > 0 && orderBy) {
+                                for (let j = 0; j < i; j++) {
+                                    const jRow = partRows[j].row;
+                                    const isSame = orderBy.every(order => {
+                                        const colName = typeof order.column === 'string' ? order.column : order.column.column;
+                                        return row[colName] === jRow[colName];
+                                    });
+                                    if (!isSame) rank = j + 2;
+                                }
+                            }
+                            value = (rank - 1) / (partRows.length - 1);
+                        }
+                        break;
+                    }
+                    case 'cume_dist': {
+                        // count of rows <= current / partition_size
+                        let count = i + 1;
+                        if (orderBy) {
+                            // Count rows with same or lower order value
+                            for (let j = i + 1; j < partRows.length; j++) {
+                                const jRow = partRows[j].row;
+                                const isSame = orderBy.every(order => {
+                                    const colName = typeof order.column === 'string' ? order.column : order.column.column;
+                                    return row[colName] === jRow[colName];
+                                });
+                                if (isSame) count++;
+                                else break;
+                            }
+                        }
+                        value = count / partRows.length;
+                        break;
+                    }
+                    case 'first_value': {
+                        const argCol = typeof col.arg === 'string' ? col.arg : col.arg?.column;
+                        value = partRows[0].row[argCol];
+                        break;
+                    }
+                    case 'last_value': {
+                        const argCol = typeof col.arg === 'string' ? col.arg : col.arg?.column;
+                        // Default frame is UNBOUNDED PRECEDING to CURRENT ROW, so last_value = current row
+                        // With explicit UNBOUNDED FOLLOWING, it's partition last
+                        const frame = col.over.frame;
+                        if (frame && frame.end.type === 'unbounded' && frame.end.direction === 'following') {
+                            value = partRows[partRows.length - 1].row[argCol];
+                        } else {
+                            // Default: current row
+                            value = row[argCol];
+                        }
+                        break;
+                    }
+                    case 'nth_value': {
+                        // NTH_VALUE(col, n) - returns nth value in partition
+                        const argCol = col.args ? (typeof col.args[0] === 'string' ? col.args[0] : col.args[0]?.column) : (typeof col.arg === 'string' ? col.arg : col.arg?.column);
+                        const n = col.args ? col.args[1] : 1;
+                        value = n > 0 && n <= partRows.length ? partRows[n - 1].row[argCol] : null;
+                        break;
+                    }
+                    default:
+                        value = null;
+                }
+
+                rows[index][windowKey] = value;
+            }
+        }
+    }
+
+    return rows;
 }
 
 // Evaluate HAVING clause (similar to WHERE but works on aggregated values)
@@ -2104,7 +4323,10 @@ async function executeSQL(db, sql) {
     const tokens = lexer.tokenize();
     const parser = new SQLParser(tokens);
     const ast = parser.parse();
+    return executeAST(db, ast);
+}
 
+async function executeAST(db, ast) {
     const type = ast.type.toUpperCase();
 
     switch (type) {
@@ -2115,9 +4337,26 @@ async function executeSQL(db, sql) {
             return db.dropTable(ast.table, ast.ifExists);
 
         case 'INSERT': {
-            // If rows are arrays (no column names in INSERT), convert to objects using table schema
-            let rows = ast.rows;
-            if (rows.length > 0 && Array.isArray(rows[0])) {
+            let rows = ast.rows || [];
+
+            // Handle INSERT...SELECT
+            if (ast.select) {
+                const selectResult = await executeAST(db, ast.select);
+                rows = selectResult.rows;
+
+                // Map select columns to insert columns if specified
+                if (ast.columns && rows.length > 0) {
+                    const selectCols = Object.keys(rows[0]);
+                    rows = rows.map(row => {
+                        const newRow = {};
+                        ast.columns.forEach((col, i) => {
+                            newRow[col] = row[selectCols[i]];
+                        });
+                        return newRow;
+                    });
+                }
+            } else if (rows.length > 0 && Array.isArray(rows[0])) {
+                // If rows are arrays (no column names in INSERT), convert to objects using table schema
                 const tableState = db.tables.get(ast.table);
                 if (tableState && tableState.schema) {
                     rows = rows.map(valueArray => {
@@ -2129,10 +4368,88 @@ async function executeSQL(db, sql) {
                     });
                 }
             }
+
+            // Handle ON CONFLICT (UPSERT)
+            if (ast.onConflict) {
+                const tableState = db.tables.get(ast.table);
+                const existingRows = await db.select(ast.table, {});
+                const conflictCols = ast.onConflict.columns ||
+                    tableState?.schema?.filter(c => c.primaryKey).map(c => c.name) || ['id'];
+
+                const insertedRows = [];
+                const updatedRows = [];
+
+                for (const row of rows) {
+                    const existingRow = existingRows.find(existing =>
+                        conflictCols.every(col => existing[col] === row[col])
+                    );
+
+                    if (existingRow) {
+                        if (ast.onConflict.action === 'update') {
+                            // Evaluate update expressions
+                            const updates = {};
+                            for (const [col, expr] of Object.entries(ast.onConflict.updates)) {
+                                updates[col] = evaluateArithmeticExpr(expr, existingRow, {}, row);
+                            }
+                            // Apply updates to existing row
+                            await db.updateWithExpr(ast.table, ast.onConflict.updates,
+                                (r) => conflictCols.every(col => r[col] === row[col]),
+                                (expr, r) => evaluateArithmeticExpr(expr, r, {}, row));
+                        }
+                        // 'nothing': skip insertion
+                    } else {
+                        insertedRows.push(row);
+                    }
+                }
+                if (insertedRows.length > 0) {
+                    return db.insert(ast.table, insertedRows);
+                }
+                return { success: true };
+            }
+
             return db.insert(ast.table, rows);
         }
 
         case 'DELETE': {
+            // Handle DELETE with USING clause (JOIN-based delete)
+            if (ast.using) {
+                const mainRows = await db.select(ast.table, {});
+                const tableAliases = { [ast.alias || ast.table]: ast.table };
+
+                // Build joined rows
+                let joinedRows = mainRows.map((r) => ({ [ast.alias || ast.table]: { ...r } }));
+                for (const t of ast.using) {
+                    const rightRows = await db.select(t.name, {});
+                    tableAliases[t.alias || t.name] = t.name;
+                    const newJoined = [];
+                    for (const left of joinedRows) {
+                        for (const right of rightRows) {
+                            newJoined.push({ ...left, [t.alias || t.name]: right });
+                        }
+                    }
+                    joinedRows = newJoined;
+                }
+
+                // Filter with WHERE to find matching rows
+                if (ast.where) {
+                    joinedRows = joinedRows.filter(jr => {
+                        const flatRow = flattenJoinedRow(jr);
+                        return evalWhere(ast.where, flatRow);
+                    });
+                }
+
+                // Collect main table rows to delete
+                const rowsToDelete = joinedRows.map(jr => jr[ast.alias || ast.table]);
+                const tableSchema = db.tables.get(ast.table)?.schema || [];
+
+                // Delete matching rows by comparing all columns
+                return db.delete(ast.table, (row) => {
+                    return rowsToDelete.some(delRow =>
+                        tableSchema.every(col => row[col.name] === delRow[col.name])
+                    );
+                });
+            }
+
             const predicate = ast.where
                 ? (row) => evalWhere(ast.where, row)
                 : () => true;
@@ -2140,28 +4457,117 @@ async function executeSQL(db, sql) {
         }
 
         case 'UPDATE': {
+            // Handle UPDATE with FROM clause (JOIN-based update)
+            if (ast.from) {
+                const mainRows = await db.select(ast.table, {});
+                const tableAliases = { [ast.alias || ast.table]: ast.table };
+
+                // Build joined rows
+                let joinedRows = mainRows.map((r) => ({ [ast.alias || ast.table]: { ...r } }));
+                for (const t of ast.from) {
+                    const rightRows = await db.select(t.name, {});
+                    tableAliases[t.alias || t.name] = t.name;
+                    const newJoined = [];
+                    for (const left of joinedRows) {
+                        for (const right of rightRows) {
+                            newJoined.push({ ...left, [t.alias || t.name]: right });
+                        }
+                    }
+                    joinedRows = newJoined;
+                }
+
+                // Filter with WHERE
+                if (ast.where) {
+                    joinedRows = joinedRows.filter(jr => {
+                        const flatRow = flattenJoinedRow(jr);
+                        return evalWhere(ast.where, flatRow);
+                    });
+                }
+
+                // Collect matched rows and their update contexts
+                const matchedContexts = [];
+                for (const jr of joinedRows) {
+                    const mainRow = jr[ast.alias || ast.table];
+                    matchedContexts.push({
+                        mainRow,
+                        context: flattenJoinedRow(jr)
+                    });
+                }
+
+                // Use updateWithExpr - check if row matches any in matchedContexts
+                const seen = new Set();
+                return db.updateWithExpr(ast.table, ast.updates,
+                    (row) => {
+                        // Check if this row matches any of the main rows
+                        const tableSchema = db.tables.get(ast.table)?.schema || [];
+                        for (const m of matchedContexts) {
+                            const matches = tableSchema.every(col =>
+                                row[col.name] === m.mainRow[col.name]
+                            );
+                            if (matches && !seen.has(JSON.stringify(m.mainRow))) {
+                                seen.add(JSON.stringify(m.mainRow));
+                                row.__updateContext = m.context;
+                                return true;
+                            }
+                        }
+                        return false;
+                    },
+                    (expr, row) => {
+                        const context = row.__updateContext || row;
+                        delete row.__updateContext;
+                        return evaluateArithmeticExpr(expr, context, tableAliases);
+                    });
+            }
+
+            // Simple UPDATE (no FROM) - use updateWithExpr which handles expressions
             const predicate = ast.where
                 ? (row) => evalWhere(ast.where, row)
                 : () => true;
-            return db.update(ast.table, ast.updates, predicate);
+
+            return db.updateWithExpr(ast.table, ast.updates, predicate, (expr, row) => evaluateArithmeticExpr(expr, row, {}));
         }
 
         case 'SELECT': {
-            // Build table alias mapping
+            // Build table alias mapping and handle derived tables (subqueries)
             const tableAliases = {};
+            const derivedTables = new Map();
+
             if (ast.tables) {
                 for (const t of ast.tables) {
-                    if (t.alias) tableAliases[t.alias] = t.name;
+                    if (t.type === 'subquery') {
+                        // Execute subquery and store as derived table
+                        const subResult = await executeAST(db, t.query);
+                        derivedTables.set(t.alias, subResult.rows);
+                        tableAliases[t.alias] = t.alias;
+                    } else if (t.alias) {
+                        tableAliases[t.alias] = t.name;
+                    }
                 }
             }
             if (ast.joins) {
                 for (const j of ast.joins) {
-                    if (j.table.alias) tableAliases[j.table.alias] = j.table.name;
+                    if (j.table.type === 'subquery') {
+                        const subResult = await executeAST(db, j.table.query);
+                        derivedTables.set(j.table.alias, subResult.rows);
+                        tableAliases[j.table.alias] = j.table.alias;
+                    } else if (j.table.alias) {
+                        tableAliases[j.table.alias] = j.table.name;
+                    }
                 }
             }
 
-            // Fetch data from main table
-            let rows = await db.select(ast.table, {});
+            // Fetch data from main table (or derived table)
+            // SELECT without FROM (e.g., SELECT 1+1, SELECT JSON_OBJECT(...)) returns single row
+            let rows;
+            const mainTable = ast.tables?.[0];
+            if (!mainTable) {
+                // No FROM clause - create a single empty row for expression evaluation
+                rows = [{}];
+            } else if (mainTable.type === 'subquery') {
+                rows = derivedTables.get(mainTable.alias) || [];
+            } else {
+                rows = await db.select(ast.table, {});
+            }
 
             // Process JOINs
             if (ast.joins && ast.joins.length > 0) {
@@ -2176,56 +4582,77 @@ async function executeSQL(db, sql) {
                 });
 
                 for (const join of ast.joins) {
-                    const rightTable = join.table.name;
-                    const rightRows = await db.select(rightTable, {});
+                    // Get right table rows (from database or derived table)
+                    let rightRows;
+                    if (join.table.type === 'subquery') {
+                        rightRows = derivedTables.get(join.table.alias) || [];
+                    } else {
+                        rightRows = await db.select(join.table.name, {});
+                    }
                     const newRows = [];
                     const matchedRightIndices = new Set();
 
                     // Get right table info for namespacing
                     const rightTableName = join.table.alias || join.table.name;
 
-                    for (const leftRow of rows) {
-                        let matched = false;
-                        for (let ri = 0; ri < rightRows.length; ri++) {
-                            const rightRow = rightRows[ri];
-                            // Evaluate ON condition
-                            const leftVal = getColumnValue(leftRow, join.on.left, tableAliases);
-                            const rightVal = getColumnValue(rightRow, join.on.right, tableAliases);
-                            if (leftVal === rightVal) {
-                                matched = true;
-                                matchedRightIndices.add(ri);
-                                // Merge rows - keep left row as-is, add right row with prefix
+                    // CROSS JOIN: Cartesian product (no ON condition)
+                    if (join.type === 'CROSS') {
+                        for (const leftRow of rows) {
+                            for (const rightRow of rightRows) {
                                 const merged = { ...leftRow };
-                                // Add right row columns with table prefix
                                 for (const key of Object.keys(rightRow)) {
-                                    // Don't overwrite with plain key if it already exists
                                     if (!(key in merged)) merged[key] = rightRow[key];
                                     merged[`${rightTableName}.${key}`] = rightRow[key];
                                 }
                                 newRows.push(merged);
                             }
                         }
-                        // LEFT JOIN: include left row even if no match
-                        if (!matched && join.type === 'LEFT') {
-                            newRows.push({ ...leftRow });
-                        }
-                    }
-
-                    // RIGHT JOIN: include unmatched right rows
-                    if (join.type === 'RIGHT') {
-                        for (let ri = 0; ri < rightRows.length; ri++) {
-                            if (!matchedRightIndices.has(ri)) {
-                                const merged = {};
-                                for (const key of Object.keys(rightRows[ri])) {
-                                    merged[key] = rightRows[ri][key];
-                                    merged[`${rightTableName}.${key}`] = rightRows[ri][key];
+                    } else {
+                        // INNER, LEFT, RIGHT, FULL JOINs with ON condition
+                        for (const leftRow of rows) {
+                            let matched = false;
+                            for (let ri = 0; ri < rightRows.length; ri++) {
+                                const rightRow = rightRows[ri];
+                                // Evaluate ON condition (supports compound AND/OR conditions)
+                                if (evalJoinCondition(join.on, leftRow, rightRow, tableAliases)) {
+                                    matched = true;
+                                    matchedRightIndices.add(ri);
+                                    // Merge rows - keep left row as-is, add right row with prefix
+                                    const merged = { ...leftRow };
+                                    for (const key of Object.keys(rightRow)) {
+                                        if (!(key in merged)) merged[key] = rightRow[key];
+                                        merged[`${rightTableName}.${key}`] = rightRow[key];
+                                    }
+                                    newRows.push(merged);
                                 }
-                                newRows.push(merged);
+                            }
+                            // LEFT JOIN or FULL OUTER JOIN: include left row even if no match
+                            if (!matched && (join.type === 'LEFT' || join.type === 'FULL')) {
+                                newRows.push({ ...leftRow });
+                            }
+                        }
+
+                        // RIGHT JOIN or FULL OUTER JOIN: include unmatched right rows
+                        if (join.type === 'RIGHT' || join.type === 'FULL') {
+                            for (let ri = 0; ri < rightRows.length; ri++) {
+                                if (!matchedRightIndices.has(ri)) {
+                                    const merged = {};
+                                    for (const key of Object.keys(rightRows[ri])) {
+                                        merged[key] = rightRows[ri][key];
+                                        merged[`${rightTableName}.${key}`] = rightRows[ri][key];
+                                    }
+                                    newRows.push(merged);
+                                }
                             }
                         }
                     }
                     rows = newRows;
                 }
+            }
+
+            // Pre-execute any subqueries in WHERE clause
+            if (ast.where) {
+                await preExecuteSubqueries(ast.where, db);
             }
 
             // Check for NEAR condition in WHERE clause
@@ -2299,9 +4726,24 @@ async function executeSQL(db, sql) {
                     } else if (col.type === 'column') {
                         const colName = typeof col.value === 'string' ? col.value : col.value.column;
                         if (rows.length > 0) resultRow[colName] = rows[0][colName];
+                    } else if (col.type === 'function') {
+                        const alias = col.alias || `${col.func}(...)`;
+                        if (rows.length > 0) resultRow[alias] = evaluateScalarFunction(col.func, col.args, rows[0], tableAliases);
+                    } else if (col.type === 'arithmetic') {
+                        const alias = col.alias || 'expr';
+                        if (rows.length > 0) resultRow[alias] = evaluateArithmeticExpr(col.expr, rows[0], tableAliases);
+                    } else if (col.type === 'literal') {
+                        const alias = col.alias || 'value';
+                        resultRow[alias] = col.value;
                     }
                 }
                 rows = [resultRow];
+            }
+
+            // Compute window functions (before ORDER BY but after all data is collected)
+            const windowCols = ast.columns.filter(c => c.type === 'window');
+            if (windowCols.length > 0) {
+                rows = computeWindowFunctions(rows, windowCols, tableAliases);
             }
 
             // Apply ORDER BY first (before projection, using original column values)
@@ -2311,6 +4753,18 @@ async function executeSQL(db, sql) {
                         const col = typeof order.column === 'string' ? order.column : order.column.column;
                         const aVal = a[col];
                         const bVal = b[col];
+                        const aNull = aVal == null;
+                        const bNull = bVal == null;
+
+                        // Handle NULL values
+                        if (aNull || bNull) {
+                            if (aNull && bNull) continue; // Both null, move to next column
+                            // Determine nulls ordering: explicit setting or default (ASC=NULLS LAST, DESC=NULLS FIRST)
+                            const nullsFirst = order.nullsFirst ?? order.desc;
+                            if (aNull) return nullsFirst ? -1 : 1;
+                            if (bNull) return nullsFirst ? 1 : -1;
+                        }
+
                         if (aVal < bVal) return order.desc ? 1 : -1;
                         if (aVal > bVal) return order.desc ? -1 : 1;
                     }
@@ -2330,24 +4784,92 @@ async function executeSQL(db, sql) {
 
             // Project columns (after ORDER BY, OFFSET, LIMIT)
             let columnNames = [];
+            const hasScalarSubquery = ast.columns.some(c => c.type === 'scalar_subquery');
+
             if (!ast.columns.some(c => c.type === 'star') && !ast.groupBy) {
-                rows = rows.map(row => {
+                // Use async projection if there are scalar subqueries
+                const projectRow = async (row) => {
                     const result = {};
                     for (const col of ast.columns) {
                         if (col.type === 'column') {
                             const colName = typeof col.value === 'string' ? col.value : col.value.column;
                             const alias = col.alias || colName;
-                            // Use getColumnValue to properly resolve table-prefixed columns
                             result[alias] = getColumnValue(row, col.value, tableAliases);
                             if (!columnNames.includes(alias)) columnNames.push(alias);
                         } else if (col.type === 'aggregate') {
                             const aggName = col.alias || `${col.func}(${col.arg === '*' ? '*' : (typeof col.arg === 'string' ? col.arg : col.arg.column)})`;
                             result[aggName] = row[aggName];
                             if (!columnNames.includes(aggName)) columnNames.push(aggName);
+                        } else if (col.type === 'function') {
+                            const alias = col.alias || `${col.func}(...)`;
+                            result[alias] = evaluateScalarFunction(col.func, col.args, row, tableAliases);
+                            if (!columnNames.includes(alias)) columnNames.push(alias);
+                        } else if (col.type === 'case') {
+                            const alias = col.alias || 'case';
+                            result[alias] = evaluateCaseExpr(col.expr, row, tableAliases);
+                            if (!columnNames.includes(alias)) columnNames.push(alias);
+                        } else if (col.type === 'window') {
+                            const alias = col.alias || `${col.func}(...)`;
+                            result[alias] = row[`__window_${alias}`];
+                            if (!columnNames.includes(alias)) columnNames.push(alias);
+                        } else if (col.type === 'arithmetic') {
+                            const alias = col.alias || 'expr';
+                            result[alias] = evaluateArithmeticExpr(col.expr, row, tableAliases);
+                            if (!columnNames.includes(alias)) columnNames.push(alias);
+                        } else if (col.type === 'literal') {
+                            const alias = col.alias || 'value';
+                            result[alias] = col.value;
+                            if (!columnNames.includes(alias)) columnNames.push(alias);
+                        } else if (col.type === 'scalar_subquery') {
+                            // Correlated scalar subquery - execute for each row
+                            const alias = col.alias || 'subquery';
+                            result[alias] = await evaluateScalarSubquery(col.subquery, row, db, tableAliases);
+                            if (!columnNames.includes(alias)) columnNames.push(alias);
                         }
                     }
                     return result;
-                });
+                };
+
+                if (hasScalarSubquery) {
+                    rows = await Promise.all(rows.map(projectRow));
+                } else {
+                    rows = rows.map(row => {
+                        const result = {};
+                        for (const col of ast.columns) {
+                            if (col.type === 'column') {
+                                const colName = typeof col.value === 'string' ? col.value : col.value.column;
+                                const alias = col.alias || colName;
+                                result[alias] = getColumnValue(row, col.value, tableAliases);
+                                if (!columnNames.includes(alias)) columnNames.push(alias);
+                            } else if (col.type === 'aggregate') {
+                                const aggName = col.alias || `${col.func}(${col.arg === '*' ? '*' : (typeof col.arg === 'string' ? col.arg : col.arg.column)})`;
+                                result[aggName] = row[aggName];
+                                if (!columnNames.includes(aggName)) columnNames.push(aggName);
+                            } else if (col.type === 'function') {
+                                const alias = col.alias || `${col.func}(...)`;
+                                result[alias] = evaluateScalarFunction(col.func, col.args, row, tableAliases);
+                                if (!columnNames.includes(alias)) columnNames.push(alias);
+                            } else if (col.type === 'case') {
+                                const alias = col.alias || 'case';
+                                result[alias] = evaluateCaseExpr(col.expr, row, tableAliases);
+                                if (!columnNames.includes(alias)) columnNames.push(alias);
+                            } else if (col.type === 'window') {
+                                const alias = col.alias || `${col.func}(...)`;
+                                result[alias] = row[`__window_${alias}`];
+                                if (!columnNames.includes(alias)) columnNames.push(alias);
+                            } else if (col.type === 'arithmetic') {
+                                const alias = col.alias || 'expr';
+                                result[alias] = evaluateArithmeticExpr(col.expr, row, tableAliases);
+                                if (!columnNames.includes(alias)) columnNames.push(alias);
+                            } else if (col.type === 'literal') {
+                                const alias = col.alias || 'value';
+                                result[alias] = col.value;
+                                if (!columnNames.includes(alias)) columnNames.push(alias);
+                            }
+                        }
+                        return result;
+                    });
+                }
             } else if (rows.length > 0) {
                 columnNames = Object.keys(rows[0]);
             }
@@ -2364,6 +4886,102 @@ async function executeSQL(db, sql) {
             }
 
             return { rows, columns: columnNames };
+        }
+
+        case 'UNION': {
+            // Execute both sides recursively
+            const leftResult = await executeAST(db, ast.left);
+            const rightResult = await executeAST(db, ast.right);
+            let rows = [...leftResult.rows, ...rightResult.rows];
+
+            // UNION (without ALL) removes duplicates
+            if (!ast.all) {
+                const seen = new Set();
+                rows = rows.filter(row => {
+                    const key = JSON.stringify(row);
+                    if (seen.has(key)) return false;
+                    seen.add(key);
+                    return true;
+                });
+            }
+
+            return { rows, columns: leftResult.columns };
+        }
+
+        case 'INTERSECT': {
+            const leftResult = await executeAST(db, ast.left);
+            const rightResult = await executeAST(db, ast.right);
+            const rightKeys = new Set(rightResult.rows.map(r => JSON.stringify(r)));
+            let rows = leftResult.rows.filter(row => rightKeys.has(JSON.stringify(row)));
+
+            // INTERSECT (without ALL) removes duplicates
+            if (!ast.all) {
+                const seen = new Set();
+                rows = rows.filter(row => {
+                    const key = JSON.stringify(row);
+                    if (seen.has(key)) return false;
+                    seen.add(key);
+                    return true;
+                });
+            }
+
+            return { rows, columns: leftResult.columns };
+        }
+
+        case 'EXCEPT': {
+            const leftResult = await executeAST(db, ast.left);
+            const rightResult = await executeAST(db, ast.right);
+            const rightKeys = new Set(rightResult.rows.map(r => JSON.stringify(r)));
+            let rows = leftResult.rows.filter(row => !rightKeys.has(JSON.stringify(row)));
+
+            // EXCEPT (without ALL) removes duplicates
+            if (!ast.all) {
+                const seen = new Set();
+                rows = rows.filter(row => {
+                    const key = JSON.stringify(row);
+                    if (seen.has(key)) return false;
+                    seen.add(key);
+                    return true;
+                });
+            }
+
+            return { rows, columns: leftResult.columns };
+        }
+
+        case 'WITH': {
+            // Execute CTEs and create temporary tables
+            const cteNames = [];
+            for (const cte of ast.ctes) {
+                const cteResult = await executeAST(db, cte.query);
+                // Create a temporary table with CTE results
+                const schema = cteResult.columns.map(col => ({ name: col, type: 'TEXT' }));
+                // Add __rowId to each row for compatibility
+                const rows = cteResult.rows.map((row, i) => ({ ...row, __rowId: i }));
+                db.tables.set(cte.name, {
+                    name: cte.name,
+                    schema,
+                    fragments: [],
+                    deletionVector: [],
+                    rowCount: rows.length,
+                    nextRowId: rows.length,
+                    isCTE: true
+                });
+                // Store rows in write buffer for compatibility
+                db._writeBuffer.set(cte.name, rows);
+                cteNames.push(cte.name);
+            }
+
+            try {
+                // Execute main query
+                const result = await executeAST(db, ast.query);
+                return result;
+            } finally {
+                // Clean up CTE tables
+                for (const name of cteNames) {
+                    db.tables.delete(name);
+                    db._writeBuffer.delete(name);
+                }
+            }
         }
 
         default:

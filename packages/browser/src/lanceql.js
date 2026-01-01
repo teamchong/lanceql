@@ -9992,6 +9992,11 @@ const TokenType = {
     PLUS: 'PLUS',
     MINUS: 'MINUS',
     SLASH: 'SLASH',
+    LBRACKET: 'LBRACKET',
+    RBRACKET: 'RBRACKET',
+
+    // Array keyword
+    ARRAY: 'ARRAY',
 
     // Special
     EOF: 'EOF',
@@ -10103,6 +10108,7 @@ const KEYWORDS = {
     'ROW': TokenType.ROW,
     // Query optimization
     'EXPLAIN': TokenType.EXPLAIN,
+    'ARRAY': TokenType.ARRAY,
 };
 
 /**
@@ -10223,6 +10229,8 @@ export class SQLLexer {
             case '+': return { type: TokenType.PLUS, value: '+' };
             case '-': return { type: TokenType.MINUS, value: '-' };
             case '/': return { type: TokenType.SLASH, value: '/' };
+            case '[': return { type: TokenType.LBRACKET, value: '[' };
+            case ']': return { type: TokenType.RBRACKET, value: ']' };
             case '=': return { type: TokenType.EQ, value: '=' };
             case '<':
                 if (this.peek() === '=') {
@@ -10725,19 +10733,28 @@ export class SQLParser {
         }
         // Vector literal: [1.0, 2.0, 3.0]
         if (this.check(TokenType.LBRACKET)) {
-            return this.parseVectorLiteral();
+            return this.parseArrayLiteral();
         }
 
         throw new Error(`Expected value, got ${this.current().type}`);
     }
 
     /**
-     * Parse vector literal: [1.0, 2.0, 3.0]
+     * Parse array literal: [1, 2, 3] or ARRAY[1, 2, 3]
      */
-    parseVectorLiteral() {
-        // Note: This requires adding LBRACKET/RBRACKET tokens
-        // For now, we'll handle arrays as strings that start with '['
-        throw new Error('Vector literals not yet supported. Use INSERT with individual columns.');
+    parseArrayLiteral() {
+        this.expect(TokenType.LBRACKET);
+        const elements = [];
+
+        if (!this.check(TokenType.RBRACKET)) {
+            elements.push(this.parseExpr());
+            while (this.match(TokenType.COMMA)) {
+                elements.push(this.parseExpr());
+            }
+        }
+
+        this.expect(TokenType.RBRACKET);
+        return { type: 'array', elements };
     }
 
     /**
@@ -11301,6 +11318,32 @@ export class SQLParser {
             return { type: 'literal', value: false };
         }
 
+        // ARRAY[...] literal
+        if (this.match(TokenType.ARRAY)) {
+            let result = this.parseArrayLiteral();
+            // Check for subscript: ARRAY[1,2,3][2]
+            while (this.check(TokenType.LBRACKET)) {
+                this.advance();
+                const index = this.parseExpr();
+                this.expect(TokenType.RBRACKET);
+                result = { type: 'subscript', array: result, index };
+            }
+            return result;
+        }
+
+        // Bare bracket array [...]
+        if (this.check(TokenType.LBRACKET)) {
+            let result = this.parseArrayLiteral();
+            // Check for subscript: [1,2,3][2]
+            while (this.check(TokenType.LBRACKET)) {
+                this.advance();
+                const index = this.parseExpr();
+                this.expect(TokenType.RBRACKET);
+                result = { type: 'subscript', array: result, index };
+            }
+            return result;
+        }
+
         // Number
         if (this.check(TokenType.NUMBER)) {
             const value = this.advance().value;
@@ -11380,7 +11423,17 @@ export class SQLParser {
             }
 
             // Simple column reference
-            return { type: 'column', column: name };
+            let result = { type: 'column', column: name };
+
+            // Check for array subscript: column[index]
+            if (this.check(TokenType.LBRACKET)) {
+                this.advance();  // consume [
+                const index = this.parseExpr();
+                this.expect(TokenType.RBRACKET);
+                result = { type: 'subscript', array: result, index };
+            }
+
+            return result;
         }
 
         // Parenthesized expression or subquery
@@ -12207,6 +12260,20 @@ export class SQLExecutor {
                 return this._executeSubquery(expr.query, columnData, rowIdx);
             }
 
+            case 'array': {
+                // Evaluate each element to build the array
+                return expr.elements.map(el => this.evaluateExpr(el, columnData, rowIdx));
+            }
+
+            case 'subscript': {
+                // Array subscript access with 1-based indexing (SQL standard)
+                const arr = this.evaluateExpr(expr.array, columnData, rowIdx);
+                const idx = this.evaluateExpr(expr.index, columnData, rowIdx);
+                if (!Array.isArray(arr)) return null;
+                // SQL uses 1-based indexing
+                return arr[idx - 1] ?? null;
+            }
+
             default:
                 return null;
         }
@@ -12813,6 +12880,20 @@ export class SQLExecutor {
                 const pattern = this._evaluateInMemoryExpr(expr.pattern, columnData, rowIdx);
                 const regex = new RegExp('^' + String(pattern).replace(/%/g, '.*').replace(/_/g, '.') + '$', 'i');
                 return regex.test(val);
+            }
+
+            case 'array': {
+                // Evaluate each element to build the array
+                return expr.elements.map(el => this._evaluateInMemoryExpr(el, columnData, rowIdx));
+            }
+
+            case 'subscript': {
+                // Array subscript access with 1-based indexing (SQL standard)
+                const arr = this._evaluateInMemoryExpr(expr.array, columnData, rowIdx);
+                const idx = this._evaluateInMemoryExpr(expr.index, columnData, rowIdx);
+                if (!Array.isArray(arr)) return null;
+                // SQL uses 1-based indexing
+                return arr[idx - 1] ?? null;
             }
 
             default:
