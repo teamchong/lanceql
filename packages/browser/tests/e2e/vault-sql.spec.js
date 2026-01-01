@@ -4413,4 +4413,136 @@ test.describe('Vault SQL Operations', () => {
             expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
         }
     });
+
+    test('GPU aggregations match CPU results', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { gpuAggregator } = await import('./lanceql.js');
+            const tests = [];
+
+            // Initialize GPU aggregator
+            await gpuAggregator.init();
+            const isAvailable = gpuAggregator.isAvailable();
+            tests.push({ name: 'GPUAggregator initializes', pass: true, actual: isAvailable ? 'GPU available' : 'CPU fallback' });
+
+            // Generate test data - 10,000 values to trigger GPU path
+            const size = 10000;
+            const values = new Float32Array(size);
+            for (let i = 0; i < size; i++) {
+                values[i] = Math.random() * 1000 - 500; // -500 to 500
+            }
+
+            // CPU reference values
+            let cpuSum = 0, cpuMin = values[0], cpuMax = values[0];
+            for (let i = 0; i < size; i++) {
+                cpuSum += values[i];
+                if (values[i] < cpuMin) cpuMin = values[i];
+                if (values[i] > cpuMax) cpuMax = values[i];
+            }
+            const cpuAvg = cpuSum / size;
+
+            // Test SUM
+            try {
+                const gpuSum = await gpuAggregator.sum(values);
+                const error = Math.abs(gpuSum - cpuSum);
+                const pass = error < 0.01 * Math.abs(cpuSum) || error < 1; // 1% tolerance or absolute 1
+                tests.push({ name: 'SUM matches CPU', pass, actual: `GPU=${gpuSum.toFixed(2)}, CPU=${cpuSum.toFixed(2)}` });
+            } catch (e) {
+                tests.push({ name: 'SUM matches CPU', pass: false, error: e.message });
+            }
+
+            // Test MIN
+            try {
+                const gpuMin = await gpuAggregator.min(values);
+                const pass = Math.abs(gpuMin - cpuMin) < 0.001;
+                tests.push({ name: 'MIN matches CPU', pass, actual: `GPU=${gpuMin.toFixed(4)}, CPU=${cpuMin.toFixed(4)}` });
+            } catch (e) {
+                tests.push({ name: 'MIN matches CPU', pass: false, error: e.message });
+            }
+
+            // Test MAX
+            try {
+                const gpuMax = await gpuAggregator.max(values);
+                const pass = Math.abs(gpuMax - cpuMax) < 0.001;
+                tests.push({ name: 'MAX matches CPU', pass, actual: `GPU=${gpuMax.toFixed(4)}, CPU=${cpuMax.toFixed(4)}` });
+            } catch (e) {
+                tests.push({ name: 'MAX matches CPU', pass: false, error: e.message });
+            }
+
+            // Test AVG
+            try {
+                const gpuAvg = await gpuAggregator.avg(values);
+                const error = Math.abs(gpuAvg - cpuAvg);
+                const pass = error < 0.01 * Math.abs(cpuAvg) || error < 0.01;
+                tests.push({ name: 'AVG matches CPU', pass, actual: `GPU=${gpuAvg.toFixed(4)}, CPU=${cpuAvg.toFixed(4)}` });
+            } catch (e) {
+                tests.push({ name: 'AVG matches CPU', pass: false, error: e.message });
+            }
+
+            // Test COUNT
+            try {
+                const gpuCount = gpuAggregator.count(values);
+                const pass = gpuCount === size;
+                tests.push({ name: 'COUNT returns correct length', pass, actual: gpuCount });
+            } catch (e) {
+                tests.push({ name: 'COUNT', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('GPU aggregations handle edge cases', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { gpuAggregator } = await import('./lanceql.js');
+            const tests = [];
+
+            await gpuAggregator.init();
+
+            // Test empty array
+            try {
+                const result = await gpuAggregator.avg([]);
+                tests.push({ name: 'AVG of empty array returns null', pass: result === null, actual: result });
+            } catch (e) {
+                tests.push({ name: 'AVG of empty array', pass: false, error: e.message });
+            }
+
+            // Test small array (CPU fallback)
+            try {
+                const smallValues = [1, 2, 3, 4, 5];
+                const sum = await gpuAggregator.sum(smallValues);
+                tests.push({ name: 'Small array uses CPU fallback', pass: sum === 15, actual: sum });
+            } catch (e) {
+                tests.push({ name: 'Small array fallback', pass: false, error: e.message });
+            }
+
+            // Test with negative values
+            try {
+                const negValues = new Float32Array(2000);
+                for (let i = 0; i < 2000; i++) negValues[i] = -i;
+                const min = await gpuAggregator.min(negValues);
+                tests.push({ name: 'MIN with negatives', pass: min === -1999, actual: min });
+            } catch (e) {
+                tests.push({ name: 'MIN with negatives', pass: false, error: e.message });
+            }
+
+            // Test all zeros
+            try {
+                const zeros = new Float32Array(5000);
+                const sum = await gpuAggregator.sum(zeros);
+                tests.push({ name: 'SUM of zeros', pass: sum === 0, actual: sum });
+            } catch (e) {
+                tests.push({ name: 'SUM of zeros', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
 });

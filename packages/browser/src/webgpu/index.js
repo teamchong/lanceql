@@ -2,6 +2,7 @@
  * LanceQL WebGPU Module
  *
  * GPU-accelerated text and image encoding for semantic search.
+ * GPU-accelerated SQL aggregations (SUM, COUNT, AVG, MIN, MAX).
  */
 
 export { GPUBufferManager, ModelWeightCache } from './gpu-buffers.js';
@@ -12,6 +13,11 @@ export {
     encodeText,
     encodeImage,
 } from './gpu-transformer.js';
+export {
+    GPUAggregator,
+    getGPUAggregator,
+    shouldUseGPU,
+} from './gpu-aggregations.js';
 
 // Shader sources (for advanced users)
 export const SHADERS = {
@@ -20,6 +26,7 @@ export const SHADERS = {
     GELU: './shaders/gelu.wgsl',
     EMBEDDING: './shaders/embedding.wgsl',
     ATTENTION: './shaders/attention.wgsl',
+    REDUCE: './shaders/reduce.wgsl',
 };
 
 /**
