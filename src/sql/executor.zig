@@ -9,6 +9,10 @@ const Table = @import("lanceql.table").Table;
 const ParquetTable = @import("lanceql.parquet_table").ParquetTable;
 const DeltaTable = @import("lanceql.delta_table").DeltaTable;
 const IcebergTable = @import("lanceql.iceberg_table").IcebergTable;
+const ArrowTable = @import("lanceql.arrow_table").ArrowTable;
+const AvroTable = @import("lanceql.avro_table").AvroTable;
+const OrcTable = @import("lanceql.orc_table").OrcTable;
+const XlsxTable = @import("lanceql.xlsx_table").XlsxTable;
 const hash = @import("lanceql.hash");
 pub const logic_table_dispatch = @import("logic_table_dispatch.zig");
 
@@ -350,6 +354,14 @@ pub const Executor = struct {
     delta_table: ?*DeltaTable = null,
     /// Iceberg table (alternative to Lance table)
     iceberg_table: ?*IcebergTable = null,
+    /// Arrow IPC table (alternative to Lance table)
+    arrow_table: ?*ArrowTable = null,
+    /// Avro table (alternative to Lance table)
+    avro_table: ?*AvroTable = null,
+    /// ORC table (alternative to Lance table)
+    orc_table: ?*OrcTable = null,
+    /// XLSX table (alternative to Lance table)
+    xlsx_table: ?*XlsxTable = null,
     allocator: std.mem.Allocator,
     column_cache: std.StringHashMap(CachedColumn),
     /// Optional dispatcher for @logic_table method calls
@@ -372,6 +384,10 @@ pub const Executor = struct {
             .parquet_table = null,
             .delta_table = null,
             .iceberg_table = null,
+            .arrow_table = null,
+            .avro_table = null,
+            .orc_table = null,
+            .xlsx_table = null,
             .allocator = allocator,
             .column_cache = std.StringHashMap(CachedColumn).init(allocator),
             .dispatcher = null,
@@ -389,6 +405,10 @@ pub const Executor = struct {
             .parquet_table = parquet_table,
             .delta_table = null,
             .iceberg_table = null,
+            .arrow_table = null,
+            .avro_table = null,
+            .orc_table = null,
+            .xlsx_table = null,
             .allocator = allocator,
             .column_cache = std.StringHashMap(CachedColumn).init(allocator),
             .dispatcher = null,
@@ -406,6 +426,10 @@ pub const Executor = struct {
             .parquet_table = null,
             .delta_table = delta_table,
             .iceberg_table = null,
+            .arrow_table = null,
+            .avro_table = null,
+            .orc_table = null,
+            .xlsx_table = null,
             .allocator = allocator,
             .column_cache = std.StringHashMap(CachedColumn).init(allocator),
             .dispatcher = null,
@@ -423,6 +447,94 @@ pub const Executor = struct {
             .parquet_table = null,
             .delta_table = null,
             .iceberg_table = iceberg_table,
+            .arrow_table = null,
+            .avro_table = null,
+            .orc_table = null,
+            .xlsx_table = null,
+            .allocator = allocator,
+            .column_cache = std.StringHashMap(CachedColumn).init(allocator),
+            .dispatcher = null,
+            .logic_table_aliases = std.StringHashMap([]const u8).init(allocator),
+            .active_source = null,
+            .tables = std.StringHashMap(*Table).init(allocator),
+            .method_results_cache = std.StringHashMap([]const f64).init(allocator),
+        };
+    }
+
+    /// Initialize executor with an Arrow IPC table
+    pub fn initWithArrow(arrow_table: *ArrowTable, allocator: std.mem.Allocator) Self {
+        return .{
+            .table = null,
+            .parquet_table = null,
+            .delta_table = null,
+            .iceberg_table = null,
+            .arrow_table = arrow_table,
+            .avro_table = null,
+            .orc_table = null,
+            .xlsx_table = null,
+            .allocator = allocator,
+            .column_cache = std.StringHashMap(CachedColumn).init(allocator),
+            .dispatcher = null,
+            .logic_table_aliases = std.StringHashMap([]const u8).init(allocator),
+            .active_source = null,
+            .tables = std.StringHashMap(*Table).init(allocator),
+            .method_results_cache = std.StringHashMap([]const f64).init(allocator),
+        };
+    }
+
+    /// Initialize executor with an Avro table
+    pub fn initWithAvro(avro_table: *AvroTable, allocator: std.mem.Allocator) Self {
+        return .{
+            .table = null,
+            .parquet_table = null,
+            .delta_table = null,
+            .iceberg_table = null,
+            .arrow_table = null,
+            .avro_table = avro_table,
+            .orc_table = null,
+            .xlsx_table = null,
+            .allocator = allocator,
+            .column_cache = std.StringHashMap(CachedColumn).init(allocator),
+            .dispatcher = null,
+            .logic_table_aliases = std.StringHashMap([]const u8).init(allocator),
+            .active_source = null,
+            .tables = std.StringHashMap(*Table).init(allocator),
+            .method_results_cache = std.StringHashMap([]const f64).init(allocator),
+        };
+    }
+
+    /// Initialize executor with an ORC table
+    pub fn initWithOrc(orc_table: *OrcTable, allocator: std.mem.Allocator) Self {
+        return .{
+            .table = null,
+            .parquet_table = null,
+            .delta_table = null,
+            .iceberg_table = null,
+            .arrow_table = null,
+            .avro_table = null,
+            .orc_table = orc_table,
+            .xlsx_table = null,
+            .allocator = allocator,
+            .column_cache = std.StringHashMap(CachedColumn).init(allocator),
+            .dispatcher = null,
+            .logic_table_aliases = std.StringHashMap([]const u8).init(allocator),
+            .active_source = null,
+            .tables = std.StringHashMap(*Table).init(allocator),
+            .method_results_cache = std.StringHashMap([]const f64).init(allocator),
+        };
+    }
+
+    /// Initialize executor with an XLSX table
+    pub fn initWithXlsx(xlsx_table: *XlsxTable, allocator: std.mem.Allocator) Self {
+        return .{
+            .table = null,
+            .parquet_table = null,
+            .delta_table = null,
+            .iceberg_table = null,
+            .arrow_table = null,
+            .avro_table = null,
+            .orc_table = null,
+            .xlsx_table = xlsx_table,
             .allocator = allocator,
             .column_cache = std.StringHashMap(CachedColumn).init(allocator),
             .dispatcher = null,
@@ -469,7 +581,27 @@ pub const Executor = struct {
         return self.iceberg_table != null;
     }
 
-    /// Get row count (works with Lance, Parquet, Delta, or Iceberg)
+    /// Check if operating in Arrow mode
+    inline fn isArrowMode(self: *Self) bool {
+        return self.arrow_table != null;
+    }
+
+    /// Check if operating in Avro mode
+    inline fn isAvroMode(self: *Self) bool {
+        return self.avro_table != null;
+    }
+
+    /// Check if operating in ORC mode
+    inline fn isOrcMode(self: *Self) bool {
+        return self.orc_table != null;
+    }
+
+    /// Check if operating in XLSX mode
+    inline fn isXlsxMode(self: *Self) bool {
+        return self.xlsx_table != null;
+    }
+
+    /// Get row count (works with Lance, Parquet, Delta, Iceberg, Arrow, Avro, ORC, or XLSX)
     fn getRowCount(self: *Self) !usize {
         if (self.parquet_table) |pq| {
             return pq.numRows();
@@ -480,10 +612,22 @@ pub const Executor = struct {
         if (self.iceberg_table) |it| {
             return it.numRows();
         }
+        if (self.arrow_table) |at| {
+            return at.numRows();
+        }
+        if (self.avro_table) |av| {
+            return av.numRows();
+        }
+        if (self.orc_table) |ot| {
+            return ot.numRows();
+        }
+        if (self.xlsx_table) |xt| {
+            return xt.numRows();
+        }
         return try self.tbl().rowCount(0);
     }
 
-    /// Get column names (works with Lance, Parquet, Delta, or Iceberg)
+    /// Get column names (works with Lance, Parquet, Delta, Iceberg, Arrow, Avro, ORC, or XLSX)
     fn getColumnNames(self: *Self) ![][]const u8 {
         if (self.parquet_table) |pq| {
             return pq.getColumnNames();
@@ -494,10 +638,22 @@ pub const Executor = struct {
         if (self.iceberg_table) |it| {
             return it.getColumnNames();
         }
+        if (self.arrow_table) |at| {
+            return at.getColumnNames();
+        }
+        if (self.avro_table) |av| {
+            return av.getColumnNames();
+        }
+        if (self.orc_table) |ot| {
+            return ot.getColumnNames();
+        }
+        if (self.xlsx_table) |xt| {
+            return xt.getColumnNames();
+        }
         return try self.tbl().columnNames();
     }
 
-    /// Get physical column ID by name (works with Lance, Parquet, Delta, or Iceberg)
+    /// Get physical column ID by name (works with Lance, Parquet, Delta, Iceberg, Arrow, Avro, ORC, or XLSX)
     fn getPhysicalColumnId(self: *Self, name: []const u8) ?u32 {
         if (self.parquet_table) |pq| {
             return if (pq.columnIndex(name)) |idx| @intCast(idx) else null;
@@ -507,6 +663,18 @@ pub const Executor = struct {
         }
         if (self.iceberg_table) |it| {
             return if (it.columnIndex(name)) |idx| @intCast(idx) else null;
+        }
+        if (self.arrow_table) |at| {
+            return if (at.columnIndex(name)) |idx| @intCast(idx) else null;
+        }
+        if (self.avro_table) |av| {
+            return if (av.columnIndex(name)) |idx| @intCast(idx) else null;
+        }
+        if (self.orc_table) |ot| {
+            return if (ot.columnIndex(name)) |idx| @intCast(idx) else null;
+        }
+        if (self.xlsx_table) |xt| {
+            return if (xt.columnIndex(name)) |idx| @intCast(idx) else null;
         }
         return self.tbl().physicalColumnId(name);
     }
@@ -610,6 +778,26 @@ pub const Executor = struct {
         // Use Iceberg-specific preloading if in Iceberg mode
         if (self.iceberg_table) |it| {
             return self.preloadIcebergColumns(it, col_names);
+        }
+
+        // Use Arrow-specific preloading if in Arrow mode
+        if (self.arrow_table) |at| {
+            return self.preloadArrowColumns(at, col_names);
+        }
+
+        // Use Avro-specific preloading if in Avro mode
+        if (self.avro_table) |av| {
+            return self.preloadAvroColumns(av, col_names);
+        }
+
+        // Use ORC-specific preloading if in ORC mode
+        if (self.orc_table) |ot| {
+            return self.preloadOrcColumns(ot, col_names);
+        }
+
+        // Use XLSX-specific preloading if in XLSX mode
+        if (self.xlsx_table) |xt| {
+            return self.preloadXlsxColumns(xt, col_names);
         }
 
         for (col_names) |name| {
@@ -794,6 +982,150 @@ pub const Executor = struct {
                     try self.column_cache.put(name, CachedColumn{ .string = data });
                 },
                 else => return error.UnsupportedColumnType,
+            }
+        }
+    }
+
+    /// Preload columns into cache from Arrow table
+    fn preloadArrowColumns(self: *Self, at: *ArrowTable, col_names: []const []const u8) !void {
+        for (col_names) |name| {
+            if (self.column_cache.contains(name)) continue;
+
+            const col_idx = at.columnIndex(name) orelse return error.ColumnNotFound;
+            const col_type = at.getColumnType(col_idx) orelse return error.InvalidColumn;
+
+            switch (col_type) {
+                .int64 => {
+                    const data = at.readInt64Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .int64 = data });
+                },
+                .int32 => {
+                    const data = at.readInt32Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .int32 = data });
+                },
+                .double => {
+                    const data = at.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .float64 = data });
+                },
+                .float => {
+                    const data = at.readFloat32Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .float32 = data });
+                },
+                .boolean => {
+                    const data = at.readBoolColumn(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .bool_ = data });
+                },
+                .byte_array, .fixed_len_byte_array => {
+                    const data = at.readStringColumn(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .string = data });
+                },
+                else => return error.UnsupportedColumnType,
+            }
+        }
+    }
+
+    /// Preload columns into cache from Avro table
+    fn preloadAvroColumns(self: *Self, av: *AvroTable, col_names: []const []const u8) !void {
+        for (col_names) |name| {
+            if (self.column_cache.contains(name)) continue;
+
+            const col_idx = av.columnIndex(name) orelse return error.ColumnNotFound;
+            const col_type = av.getColumnType(col_idx) orelse return error.InvalidColumn;
+
+            switch (col_type) {
+                .int64 => {
+                    const data = av.readInt64Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .int64 = data });
+                },
+                .int32 => {
+                    const data = av.readInt32Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .int32 = data });
+                },
+                .double => {
+                    const data = av.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .float64 = data });
+                },
+                .float => {
+                    const data = av.readFloat32Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .float32 = data });
+                },
+                .boolean => {
+                    const data = av.readBoolColumn(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .bool_ = data });
+                },
+                .byte_array, .fixed_len_byte_array => {
+                    const data = av.readStringColumn(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .string = data });
+                },
+                else => return error.UnsupportedColumnType,
+            }
+        }
+    }
+
+    /// Preload columns into cache from ORC table
+    fn preloadOrcColumns(self: *Self, ot: *OrcTable, col_names: []const []const u8) !void {
+        for (col_names) |name| {
+            if (self.column_cache.contains(name)) continue;
+
+            const col_idx = ot.columnIndex(name) orelse return error.ColumnNotFound;
+            const col_type = ot.getColumnType(col_idx) orelse return error.InvalidColumn;
+
+            switch (col_type) {
+                .int64 => {
+                    const data = ot.readInt64Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .int64 = data });
+                },
+                .int32 => {
+                    const data = ot.readInt32Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .int32 = data });
+                },
+                .double => {
+                    const data = ot.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .float64 = data });
+                },
+                .float => {
+                    const data = ot.readFloat32Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .float32 = data });
+                },
+                .boolean => {
+                    const data = ot.readBoolColumn(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .bool_ = data });
+                },
+                .byte_array, .fixed_len_byte_array => {
+                    const data = ot.readStringColumn(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .string = data });
+                },
+                else => return error.UnsupportedColumnType,
+            }
+        }
+    }
+
+    /// Preload columns into cache from XLSX table
+    fn preloadXlsxColumns(self: *Self, xt: *XlsxTable, col_names: []const []const u8) !void {
+        for (col_names) |name| {
+            if (self.column_cache.contains(name)) continue;
+
+            const col_idx = xt.columnIndex(name) orelse return error.ColumnNotFound;
+            const col_type = xt.getColumnType(col_idx) orelse return error.InvalidColumn;
+
+            switch (col_type) {
+                .double => {
+                    const data = xt.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .float64 = data });
+                },
+                .boolean => {
+                    const data = xt.readBoolColumn(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .bool_ = data });
+                },
+                .byte_array, .fixed_len_byte_array => {
+                    const data = xt.readStringColumn(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .string = data });
+                },
+                else => {
+                    // Default to float64 for XLSX since numbers are stored as f64
+                    const data = xt.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                    try self.column_cache.put(name, CachedColumn{ .float64 = data });
+                },
             }
         }
     }
@@ -1255,6 +1587,26 @@ pub const Executor = struct {
             return self.executeIceberg(stmt, params);
         }
 
+        // For Arrow mode, skip table source resolution - we already have the table
+        if (self.arrow_table != null) {
+            return self.executeArrow(stmt, params);
+        }
+
+        // For Avro mode, skip table source resolution - we already have the table
+        if (self.avro_table != null) {
+            return self.executeAvro(stmt, params);
+        }
+
+        // For ORC mode, skip table source resolution - we already have the table
+        if (self.orc_table != null) {
+            return self.executeOrc(stmt, params);
+        }
+
+        // For XLSX mode, skip table source resolution - we already have the table
+        if (self.xlsx_table != null) {
+            return self.executeXlsx(stmt, params);
+        }
+
         // 0. Resolve FROM clause to get table source
         var source = try self.resolveTableSource(&stmt.from);
         defer self.releaseTableSource(&source);
@@ -1531,6 +1883,178 @@ pub const Executor = struct {
             .row_count = row_count,
             .allocator = self.allocator,
         };
+    }
+
+    /// Execute query in Arrow mode
+    fn executeArrow(self: *Self, stmt: *const SelectStmt, params: []const Value) !Result {
+        _ = self.arrow_table.?; // Ensure we're in Arrow mode
+
+        if (stmt.where) |where_expr| {
+            var col_names = std.ArrayList([]const u8){};
+            defer col_names.deinit(self.allocator);
+            try self.extractColumnNames(&where_expr, &col_names);
+            try self.preloadColumns(col_names.items);
+        }
+
+        const indices = if (stmt.where) |where_expr|
+            try self.evaluateWhere(&where_expr, params)
+        else
+            try self.getAllIndices();
+        defer self.allocator.free(indices);
+
+        const has_group_by = stmt.group_by != null;
+        const has_aggregates = self.hasAggregates(stmt.columns);
+
+        if (has_group_by or has_aggregates) {
+            return self.executeWithGroupBy(stmt, indices);
+        }
+
+        const base_columns = try self.readColumns(stmt.columns, indices);
+        defer self.allocator.free(base_columns);
+
+        var columns_list = std.ArrayList(Result.Column){};
+        errdefer {
+            for (columns_list.items) |*col| self.freeColumnData(&col.data);
+            columns_list.deinit(self.allocator);
+        }
+        try columns_list.appendSlice(self.allocator, base_columns);
+
+        const columns = try columns_list.toOwnedSlice(self.allocator);
+        var row_count = indices.len;
+
+        if (stmt.order_by) |order_by| try self.applyOrderBy(columns, order_by);
+        row_count = self.applyLimitOffset(columns, stmt.limit, stmt.offset);
+
+        return Result{ .columns = columns, .row_count = row_count, .allocator = self.allocator };
+    }
+
+    /// Execute query in Avro mode
+    fn executeAvro(self: *Self, stmt: *const SelectStmt, params: []const Value) !Result {
+        _ = self.avro_table.?;
+
+        if (stmt.where) |where_expr| {
+            var col_names = std.ArrayList([]const u8){};
+            defer col_names.deinit(self.allocator);
+            try self.extractColumnNames(&where_expr, &col_names);
+            try self.preloadColumns(col_names.items);
+        }
+
+        const indices = if (stmt.where) |where_expr|
+            try self.evaluateWhere(&where_expr, params)
+        else
+            try self.getAllIndices();
+        defer self.allocator.free(indices);
+
+        const has_group_by = stmt.group_by != null;
+        const has_aggregates = self.hasAggregates(stmt.columns);
+
+        if (has_group_by or has_aggregates) {
+            return self.executeWithGroupBy(stmt, indices);
+        }
+
+        const base_columns = try self.readColumns(stmt.columns, indices);
+        defer self.allocator.free(base_columns);
+
+        var columns_list = std.ArrayList(Result.Column){};
+        errdefer {
+            for (columns_list.items) |*col| self.freeColumnData(&col.data);
+            columns_list.deinit(self.allocator);
+        }
+        try columns_list.appendSlice(self.allocator, base_columns);
+
+        const columns = try columns_list.toOwnedSlice(self.allocator);
+        var row_count = indices.len;
+
+        if (stmt.order_by) |order_by| try self.applyOrderBy(columns, order_by);
+        row_count = self.applyLimitOffset(columns, stmt.limit, stmt.offset);
+
+        return Result{ .columns = columns, .row_count = row_count, .allocator = self.allocator };
+    }
+
+    /// Execute query in ORC mode
+    fn executeOrc(self: *Self, stmt: *const SelectStmt, params: []const Value) !Result {
+        _ = self.orc_table.?;
+
+        if (stmt.where) |where_expr| {
+            var col_names = std.ArrayList([]const u8){};
+            defer col_names.deinit(self.allocator);
+            try self.extractColumnNames(&where_expr, &col_names);
+            try self.preloadColumns(col_names.items);
+        }
+
+        const indices = if (stmt.where) |where_expr|
+            try self.evaluateWhere(&where_expr, params)
+        else
+            try self.getAllIndices();
+        defer self.allocator.free(indices);
+
+        const has_group_by = stmt.group_by != null;
+        const has_aggregates = self.hasAggregates(stmt.columns);
+
+        if (has_group_by or has_aggregates) {
+            return self.executeWithGroupBy(stmt, indices);
+        }
+
+        const base_columns = try self.readColumns(stmt.columns, indices);
+        defer self.allocator.free(base_columns);
+
+        var columns_list = std.ArrayList(Result.Column){};
+        errdefer {
+            for (columns_list.items) |*col| self.freeColumnData(&col.data);
+            columns_list.deinit(self.allocator);
+        }
+        try columns_list.appendSlice(self.allocator, base_columns);
+
+        const columns = try columns_list.toOwnedSlice(self.allocator);
+        var row_count = indices.len;
+
+        if (stmt.order_by) |order_by| try self.applyOrderBy(columns, order_by);
+        row_count = self.applyLimitOffset(columns, stmt.limit, stmt.offset);
+
+        return Result{ .columns = columns, .row_count = row_count, .allocator = self.allocator };
+    }
+
+    /// Execute query in XLSX mode
+    fn executeXlsx(self: *Self, stmt: *const SelectStmt, params: []const Value) !Result {
+        _ = self.xlsx_table.?;
+
+        if (stmt.where) |where_expr| {
+            var col_names = std.ArrayList([]const u8){};
+            defer col_names.deinit(self.allocator);
+            try self.extractColumnNames(&where_expr, &col_names);
+            try self.preloadColumns(col_names.items);
+        }
+
+        const indices = if (stmt.where) |where_expr|
+            try self.evaluateWhere(&where_expr, params)
+        else
+            try self.getAllIndices();
+        defer self.allocator.free(indices);
+
+        const has_group_by = stmt.group_by != null;
+        const has_aggregates = self.hasAggregates(stmt.columns);
+
+        if (has_group_by or has_aggregates) {
+            return self.executeWithGroupBy(stmt, indices);
+        }
+
+        const base_columns = try self.readColumns(stmt.columns, indices);
+        defer self.allocator.free(base_columns);
+
+        var columns_list = std.ArrayList(Result.Column){};
+        errdefer {
+            for (columns_list.items) |*col| self.freeColumnData(&col.data);
+            columns_list.deinit(self.allocator);
+        }
+        try columns_list.appendSlice(self.allocator, base_columns);
+
+        const columns = try columns_list.toOwnedSlice(self.allocator);
+        var row_count = indices.len;
+
+        if (stmt.order_by) |order_by| try self.applyOrderBy(columns, order_by);
+        row_count = self.applyLimitOffset(columns, stmt.limit, stmt.offset);
+
+        return Result{ .columns = columns, .row_count = row_count, .allocator = self.allocator };
     }
 
     // ========================================================================
@@ -4687,6 +5211,26 @@ pub const Executor = struct {
             return self.readIcebergColumnAtIndices(it, col_idx, indices);
         }
 
+        // Use Arrow-specific reading if in Arrow mode
+        if (self.arrow_table) |at| {
+            return self.readArrowColumnAtIndices(at, col_idx, indices);
+        }
+
+        // Use Avro-specific reading if in Avro mode
+        if (self.avro_table) |av| {
+            return self.readAvroColumnAtIndices(av, col_idx, indices);
+        }
+
+        // Use ORC-specific reading if in ORC mode
+        if (self.orc_table) |ot| {
+            return self.readOrcColumnAtIndices(ot, col_idx, indices);
+        }
+
+        // Use XLSX-specific reading if in XLSX mode
+        if (self.xlsx_table) |xt| {
+            return self.readXlsxColumnAtIndices(xt, col_idx, indices);
+        }
+
         const field = self.tbl().getFieldById(col_idx) orelse return error.InvalidColumn;
 
         // Phase 2: Table API now has readAtIndices() methods
@@ -5055,6 +5599,158 @@ pub const Executor = struct {
                 return Result.ColumnData{ .string = filtered };
             },
             else => return error.UnsupportedColumnType,
+        }
+    }
+
+    /// Read Arrow column data at specific indices (filtered access)
+    fn readArrowColumnAtIndices(
+        self: *Self,
+        at: *ArrowTable,
+        col_idx: u32,
+        indices: []const u32,
+    ) !Result.ColumnData {
+        const col_type = at.getColumnType(col_idx) orelse return error.InvalidColumn;
+
+        switch (col_type) {
+            .int64 => {
+                const all_data = at.readInt64Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+                const filtered = try self.allocator.alloc(i64, indices.len);
+                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
+                return Result.ColumnData{ .int64 = filtered };
+            },
+            .double => {
+                const all_data = at.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+                const filtered = try self.allocator.alloc(f64, indices.len);
+                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
+                return Result.ColumnData{ .float64 = filtered };
+            },
+            .byte_array, .fixed_len_byte_array => {
+                const all_data = at.readStringColumn(col_idx) catch return error.ColumnReadError;
+                defer {
+                    for (all_data) |str| self.allocator.free(str);
+                    self.allocator.free(all_data);
+                }
+                const filtered = try self.allocator.alloc([]const u8, indices.len);
+                for (indices, 0..) |idx, i| filtered[i] = try self.allocator.dupe(u8, all_data[idx]);
+                return Result.ColumnData{ .string = filtered };
+            },
+            else => return error.UnsupportedColumnType,
+        }
+    }
+
+    /// Read Avro column data at specific indices (filtered access)
+    fn readAvroColumnAtIndices(
+        self: *Self,
+        av: *AvroTable,
+        col_idx: u32,
+        indices: []const u32,
+    ) !Result.ColumnData {
+        const col_type = av.getColumnType(col_idx) orelse return error.InvalidColumn;
+
+        switch (col_type) {
+            .int64 => {
+                const all_data = av.readInt64Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+                const filtered = try self.allocator.alloc(i64, indices.len);
+                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
+                return Result.ColumnData{ .int64 = filtered };
+            },
+            .double => {
+                const all_data = av.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+                const filtered = try self.allocator.alloc(f64, indices.len);
+                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
+                return Result.ColumnData{ .float64 = filtered };
+            },
+            .byte_array, .fixed_len_byte_array => {
+                const all_data = av.readStringColumn(col_idx) catch return error.ColumnReadError;
+                defer {
+                    for (all_data) |str| self.allocator.free(str);
+                    self.allocator.free(all_data);
+                }
+                const filtered = try self.allocator.alloc([]const u8, indices.len);
+                for (indices, 0..) |idx, i| filtered[i] = try self.allocator.dupe(u8, all_data[idx]);
+                return Result.ColumnData{ .string = filtered };
+            },
+            else => return error.UnsupportedColumnType,
+        }
+    }
+
+    /// Read ORC column data at specific indices (filtered access)
+    fn readOrcColumnAtIndices(
+        self: *Self,
+        ot: *OrcTable,
+        col_idx: u32,
+        indices: []const u32,
+    ) !Result.ColumnData {
+        const col_type = ot.getColumnType(col_idx) orelse return error.InvalidColumn;
+
+        switch (col_type) {
+            .int64 => {
+                const all_data = ot.readInt64Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+                const filtered = try self.allocator.alloc(i64, indices.len);
+                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
+                return Result.ColumnData{ .int64 = filtered };
+            },
+            .double => {
+                const all_data = ot.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+                const filtered = try self.allocator.alloc(f64, indices.len);
+                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
+                return Result.ColumnData{ .float64 = filtered };
+            },
+            .byte_array, .fixed_len_byte_array => {
+                const all_data = ot.readStringColumn(col_idx) catch return error.ColumnReadError;
+                defer {
+                    for (all_data) |str| self.allocator.free(str);
+                    self.allocator.free(all_data);
+                }
+                const filtered = try self.allocator.alloc([]const u8, indices.len);
+                for (indices, 0..) |idx, i| filtered[i] = try self.allocator.dupe(u8, all_data[idx]);
+                return Result.ColumnData{ .string = filtered };
+            },
+            else => return error.UnsupportedColumnType,
+        }
+    }
+
+    /// Read XLSX column data at specific indices (filtered access)
+    fn readXlsxColumnAtIndices(
+        self: *Self,
+        xt: *XlsxTable,
+        col_idx: u32,
+        indices: []const u32,
+    ) !Result.ColumnData {
+        const col_type = xt.getColumnType(col_idx) orelse return error.InvalidColumn;
+
+        switch (col_type) {
+            .double => {
+                const all_data = xt.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+                const filtered = try self.allocator.alloc(f64, indices.len);
+                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
+                return Result.ColumnData{ .float64 = filtered };
+            },
+            .byte_array, .fixed_len_byte_array => {
+                const all_data = xt.readStringColumn(col_idx) catch return error.ColumnReadError;
+                defer {
+                    for (all_data) |str| self.allocator.free(str);
+                    self.allocator.free(all_data);
+                }
+                const filtered = try self.allocator.alloc([]const u8, indices.len);
+                for (indices, 0..) |idx, i| filtered[i] = try self.allocator.dupe(u8, all_data[idx]);
+                return Result.ColumnData{ .string = filtered };
+            },
+            else => {
+                // Default to float64 for XLSX since numbers are stored as f64
+                const all_data = xt.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                defer self.allocator.free(all_data);
+                const filtered = try self.allocator.alloc(f64, indices.len);
+                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
+                return Result.ColumnData{ .float64 = filtered };
+            },
         }
     }
 

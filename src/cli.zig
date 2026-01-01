@@ -21,6 +21,10 @@ const Table = @import("lanceql.table").Table;
 const ParquetTable = @import("lanceql.parquet_table").ParquetTable;
 const DeltaTable = @import("lanceql.delta_table").DeltaTable;
 const IcebergTable = @import("lanceql.iceberg_table").IcebergTable;
+const ArrowTable = @import("lanceql.arrow_table").ArrowTable;
+const AvroTable = @import("lanceql.avro_table").AvroTable;
+const OrcTable = @import("lanceql.orc_table").OrcTable;
+const XlsxTable = @import("lanceql.xlsx_table").XlsxTable;
 const executor = @import("lanceql.sql.executor");
 const lexer = @import("lanceql.sql.lexer");
 const parser = @import("lanceql.sql.parser");
@@ -32,6 +36,10 @@ const FileType = enum {
     parquet,
     delta,
     iceberg,
+    arrow,
+    avro,
+    orc,
+    xlsx,
     unknown,
 };
 
@@ -39,6 +47,10 @@ fn detectFileType(path: []const u8, data: []const u8) FileType {
     // Check by extension first
     if (std.mem.endsWith(u8, path, ".parquet")) return .parquet;
     if (std.mem.endsWith(u8, path, ".lance")) return .lance;
+    if (std.mem.endsWith(u8, path, ".arrow") or std.mem.endsWith(u8, path, ".arrows") or std.mem.endsWith(u8, path, ".feather")) return .arrow;
+    if (std.mem.endsWith(u8, path, ".avro")) return .avro;
+    if (std.mem.endsWith(u8, path, ".orc")) return .orc;
+    if (std.mem.endsWith(u8, path, ".xlsx")) return .xlsx;
 
     // Check for Delta directory (has _delta_log/ subdirectory)
     if (std.mem.endsWith(u8, path, ".delta") or isDeltaDirectory(path)) {
@@ -51,9 +63,17 @@ fn detectFileType(path: []const u8, data: []const u8) FileType {
     }
 
     // Check magic bytes
+    if (data.len >= 6) {
+        if (std.mem.eql(u8, data[0..6], "ARROW1")) return .arrow;
+    }
     if (data.len >= 4) {
         if (std.mem.eql(u8, data[0..4], "PAR1")) return .parquet;
+        if (std.mem.eql(u8, data[0..4], "Obj\x01")) return .avro;
+        if (std.mem.eql(u8, data[0..4], "PK\x03\x04")) return .xlsx;
         if (data.len >= 40 and std.mem.eql(u8, data[data.len - 4 ..], "LANC")) return .lance;
+    }
+    if (data.len >= 3) {
+        if (std.mem.eql(u8, data[0..3], "ORC")) return .orc;
     }
 
     return .unknown;
@@ -444,6 +464,26 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, legacy_args: Legacy
                 std.debug.print("Iceberg query error: {}\n", .{err});
             };
         },
+        .arrow => {
+            runArrowQuery(allocator, data, query, legacy_args) catch |err| {
+                std.debug.print("Arrow query error: {}\n", .{err});
+            };
+        },
+        .avro => {
+            runAvroQuery(allocator, data, query, legacy_args) catch |err| {
+                std.debug.print("Avro query error: {}\n", .{err});
+            };
+        },
+        .orc => {
+            runOrcQuery(allocator, data, query, legacy_args) catch |err| {
+                std.debug.print("ORC query error: {}\n", .{err});
+            };
+        },
+        .xlsx => {
+            runXlsxQuery(allocator, data, query, legacy_args) catch |err| {
+                std.debug.print("XLSX query error: {}\n", .{err});
+            };
+        },
         .unknown => {
             // Try Lance first, then Parquet
             runLanceQuery(allocator, data, query, legacy_args) catch {
@@ -602,6 +642,162 @@ fn runIcebergQuery(allocator: std.mem.Allocator, path: []const u8, query: []cons
 
     // Execute using Iceberg-aware executor
     var exec = executor.Executor.initWithIceberg(&iceberg_table, allocator);
+    defer exec.deinit();
+
+    var result = try exec.execute(&stmt.select, &[_]ast.Value{});
+    defer result.deinit();
+
+    // Output results
+    if (legacy_args.json) {
+        printResultsJson(&result);
+    } else if (legacy_args.csv) {
+        printResultsCsv(&result);
+    } else {
+        printResultsTable(&result);
+    }
+}
+
+fn runArrowQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
+    // Initialize Arrow Table
+    var arrow_table = ArrowTable.init(allocator, data) catch |err| {
+        return err;
+    };
+    defer arrow_table.deinit();
+
+    // Tokenize
+    var lex = lexer.Lexer.init(query);
+    var tokens = std.ArrayList(lexer.Token){};
+    defer tokens.deinit(allocator);
+
+    while (true) {
+        const tok = try lex.nextToken();
+        try tokens.append(allocator, tok);
+        if (tok.type == .EOF) break;
+    }
+
+    // Parse
+    var parse = parser.Parser.init(tokens.items, allocator);
+    const stmt = try parse.parseStatement();
+
+    // Execute using Arrow-aware executor
+    var exec = executor.Executor.initWithArrow(&arrow_table, allocator);
+    defer exec.deinit();
+
+    var result = try exec.execute(&stmt.select, &[_]ast.Value{});
+    defer result.deinit();
+
+    // Output results
+    if (legacy_args.json) {
+        printResultsJson(&result);
+    } else if (legacy_args.csv) {
+        printResultsCsv(&result);
+    } else {
+        printResultsTable(&result);
+    }
+}
+
+fn runAvroQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
+    // Initialize Avro Table
+    var avro_table = AvroTable.init(allocator, data) catch |err| {
+        return err;
+    };
+    defer avro_table.deinit();
+
+    // Tokenize
+    var lex = lexer.Lexer.init(query);
+    var tokens = std.ArrayList(lexer.Token){};
+    defer tokens.deinit(allocator);
+
+    while (true) {
+        const tok = try lex.nextToken();
+        try tokens.append(allocator, tok);
+        if (tok.type == .EOF) break;
+    }
+
+    // Parse
+    var parse = parser.Parser.init(tokens.items, allocator);
+    const stmt = try parse.parseStatement();
+
+    // Execute using Avro-aware executor
+    var exec = executor.Executor.initWithAvro(&avro_table, allocator);
+    defer exec.deinit();
+
+    var result = try exec.execute(&stmt.select, &[_]ast.Value{});
+    defer result.deinit();
+
+    // Output results
+    if (legacy_args.json) {
+        printResultsJson(&result);
+    } else if (legacy_args.csv) {
+        printResultsCsv(&result);
+    } else {
+        printResultsTable(&result);
+    }
+}
+
+fn runOrcQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
+    // Initialize ORC Table
+    var orc_table = OrcTable.init(allocator, data) catch |err| {
+        return err;
+    };
+    defer orc_table.deinit();
+
+    // Tokenize
+    var lex = lexer.Lexer.init(query);
+    var tokens = std.ArrayList(lexer.Token){};
+    defer tokens.deinit(allocator);
+
+    while (true) {
+        const tok = try lex.nextToken();
+        try tokens.append(allocator, tok);
+        if (tok.type == .EOF) break;
+    }
+
+    // Parse
+    var parse = parser.Parser.init(tokens.items, allocator);
+    const stmt = try parse.parseStatement();
+
+    // Execute using ORC-aware executor
+    var exec = executor.Executor.initWithOrc(&orc_table, allocator);
+    defer exec.deinit();
+
+    var result = try exec.execute(&stmt.select, &[_]ast.Value{});
+    defer result.deinit();
+
+    // Output results
+    if (legacy_args.json) {
+        printResultsJson(&result);
+    } else if (legacy_args.csv) {
+        printResultsCsv(&result);
+    } else {
+        printResultsTable(&result);
+    }
+}
+
+fn runXlsxQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
+    // Initialize XLSX Table
+    var xlsx_table = XlsxTable.init(allocator, data) catch |err| {
+        return err;
+    };
+    defer xlsx_table.deinit();
+
+    // Tokenize
+    var lex = lexer.Lexer.init(query);
+    var tokens = std.ArrayList(lexer.Token){};
+    defer tokens.deinit(allocator);
+
+    while (true) {
+        const tok = try lex.nextToken();
+        try tokens.append(allocator, tok);
+        if (tok.type == .EOF) break;
+    }
+
+    // Parse
+    var parse = parser.Parser.init(tokens.items, allocator);
+    const stmt = try parse.parseStatement();
+
+    // Execute using XLSX-aware executor
+    var exec = executor.Executor.initWithXlsx(&xlsx_table, allocator);
     defer exec.deinit();
 
     var result = try exec.execute(&stmt.select, &[_]ast.Value{});
