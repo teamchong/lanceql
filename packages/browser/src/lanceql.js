@@ -4281,6 +4281,149 @@ class Vault {
     async tables() {
         return workerRPC('vault:tables', {});
     }
+
+    // =========================================================================
+    // Export Operations
+    // =========================================================================
+
+    /**
+     * Export a table to Lance format bytes.
+     * @param {string} tableName - Name of the table to export
+     * @returns {Promise<Uint8Array>} Lance file bytes
+     */
+    async exportToLance(tableName) {
+        // Get table schema
+        const schemaResult = await this.exec(`SELECT * FROM ${tableName} LIMIT 0`);
+        if (!schemaResult || !schemaResult.columns) {
+            throw new Error(`Table '${tableName}' not found or empty`);
+        }
+
+        // Get all data
+        const dataResult = await this.exec(`SELECT * FROM ${tableName}`);
+        if (!dataResult || !dataResult.rows || dataResult.rows.length === 0) {
+            throw new Error(`Table '${tableName}' is empty`);
+        }
+
+        // Create Lance writer
+        const writer = new PureLanceWriter();
+
+        // Infer column types and add to writer
+        const columns = dataResult.columns;
+        const rows = dataResult.rows;
+
+        for (let colIdx = 0; colIdx < columns.length; colIdx++) {
+            const colName = columns[colIdx];
+            const values = rows.map(row => row[colName] !== undefined ? row[colName] : row[colIdx]);
+
+            // Infer type from first non-null value
+            const firstValue = values.find(v => v !== null && v !== undefined);
+
+            if (firstValue === undefined) {
+                // All nulls - default to string
+                writer.addStringColumn(colName, values.map(v => v === null ? '' : String(v)));
+            } else if (typeof firstValue === 'bigint') {
+                writer.addInt64Column(colName, BigInt64Array.from(values.map(v => v === null ? 0n : BigInt(v))));
+            } else if (typeof firstValue === 'number') {
+                if (Number.isInteger(firstValue) && firstValue <= 2147483647 && firstValue >= -2147483648) {
+                    writer.addInt32Column(colName, Int32Array.from(values.map(v => v === null ? 0 : v)));
+                } else {
+                    writer.addFloat64Column(colName, Float64Array.from(values.map(v => v === null ? 0 : v)));
+                }
+            } else if (typeof firstValue === 'boolean') {
+                writer.addBoolColumn(colName, values.map(v => v === null ? false : v));
+            } else if (Array.isArray(firstValue)) {
+                // Vector column
+                const dim = firstValue.length;
+                const flat = new Float32Array(values.length * dim);
+                for (let i = 0; i < values.length; i++) {
+                    const vec = values[i] || new Array(dim).fill(0);
+                    for (let j = 0; j < dim; j++) {
+                        flat[i * dim + j] = vec[j] || 0;
+                    }
+                }
+                writer.addVectorColumn(colName, flat, dim);
+            } else {
+                // String column
+                writer.addStringColumn(colName, values.map(v => v === null ? '' : String(v)));
+            }
+        }
+
+        return writer.finalize();
+    }
+
+    /**
+     * Upload binary data to a URL using PUT.
+     * @param {Uint8Array} data - Binary data to upload
+     * @param {string} url - Signed URL for upload
+     * @param {Object} [options] - Upload options
+     * @param {Function} [options.onProgress] - Progress callback (loaded, total)
+     * @returns {Promise<Response>} Fetch response
+     */
+    async uploadToUrl(data, url, options = {}) {
+        const { onProgress } = options;
+
+        if (onProgress && typeof XMLHttpRequest !== 'undefined') {
+            // Use XHR for progress support
+            return new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest();
+                xhr.open('PUT', url, true);
+                xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+
+                xhr.upload.onprogress = (e) => {
+                    if (e.lengthComputable) {
+                        onProgress(e.loaded, e.total);
+                    }
+                };
+
+                xhr.onload = () => {
+                    if (xhr.status >= 200 && xhr.status < 300) {
+                        resolve({ ok: true, status: xhr.status });
+                    } else {
+                        reject(new Error(`Upload failed: ${xhr.status} ${xhr.statusText}`));
+                    }
+                };
+
+                xhr.onerror = () => reject(new Error('Upload failed: network error'));
+                xhr.send(data);
+            });
+        }
+
+        // Simple fetch for no progress
+        const response = await fetch(url, {
+            method: 'PUT',
+            body: data,
+            headers: {
+                'Content-Type': 'application/octet-stream',
+            },
+        });
+
+        if (!response.ok) {
+            throw new Error(`Upload failed: ${response.status} ${response.statusText}`);
+        }
+
+        return response;
+    }
+
+    /**
+     * Export a table to Lance format and upload to a signed URL.
+     * @param {string} tableName - Name of the table to export
+     * @param {string} signedUrl - Pre-signed URL for upload (S3/R2/GCS)
+     * @param {Object} [options] - Export options
+     * @param {Function} [options.onProgress] - Progress callback (loaded, total)
+     * @returns {Promise<{size: number, url: string}>} Upload result
+     */
+    async exportToRemote(tableName, signedUrl, options = {}) {
+        // Export to Lance bytes
+        const lanceBytes = await this.exportToLance(tableName);
+
+        // Upload to signed URL
+        await this.uploadToUrl(lanceBytes, signedUrl, options);
+
+        return {
+            size: lanceBytes.length,
+            url: signedUrl.split('?')[0], // Return URL without query params
+        };
+    }
 }
 
 /**

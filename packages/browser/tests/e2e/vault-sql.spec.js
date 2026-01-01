@@ -4328,4 +4328,89 @@ test.describe('Vault SQL Operations', () => {
             expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
         }
     });
+
+    test('exportToLance creates valid Lance bytes', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup table
+            await v.exec('CREATE TABLE export_test (id INT, name TEXT, score FLOAT)');
+            await v.exec("INSERT INTO export_test VALUES (1, 'Alice', 95.5)");
+            await v.exec("INSERT INTO export_test VALUES (2, 'Bob', 87.3)");
+            await v.exec("INSERT INTO export_test VALUES (3, 'Charlie', 92.1)");
+
+            // Test exportToLance
+            try {
+                const lanceBytes = await v.exportToLance('export_test');
+
+                // Check it's a Uint8Array
+                const isUint8 = lanceBytes instanceof Uint8Array;
+                tests.push({ name: 'returns Uint8Array', pass: isUint8 });
+
+                // Check minimum size (at least footer)
+                const hasSize = lanceBytes.length >= 40;
+                tests.push({ name: 'has minimum size', pass: hasSize, actual: lanceBytes.length });
+
+                // Check magic bytes "LANC" at end
+                const magic = String.fromCharCode(
+                    lanceBytes[lanceBytes.length - 4],
+                    lanceBytes[lanceBytes.length - 3],
+                    lanceBytes[lanceBytes.length - 2],
+                    lanceBytes[lanceBytes.length - 1]
+                );
+                tests.push({ name: 'has LANC magic', pass: magic === 'LANC', actual: magic });
+            } catch (e) {
+                tests.push({ name: 'exportToLance', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE export_test');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('exportToLance handles various column types', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup table with various types
+            await v.exec('CREATE TABLE types_test (i INT, f FLOAT, s TEXT, b BOOLEAN)');
+            await v.exec("INSERT INTO types_test VALUES (42, 3.14, 'hello', true)");
+            await v.exec("INSERT INTO types_test VALUES (-1, 2.718, 'world', false)");
+
+            // Test export
+            try {
+                const lanceBytes = await v.exportToLance('types_test');
+                const magic = String.fromCharCode(
+                    lanceBytes[lanceBytes.length - 4],
+                    lanceBytes[lanceBytes.length - 3],
+                    lanceBytes[lanceBytes.length - 2],
+                    lanceBytes[lanceBytes.length - 1]
+                );
+                tests.push({
+                    name: 'exports multiple types',
+                    pass: magic === 'LANC' && lanceBytes.length > 100,
+                    actual: `size=${lanceBytes.length}`
+                });
+            } catch (e) {
+                tests.push({ name: 'exports multiple types', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            await v.exec('DROP TABLE types_test');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
 });
