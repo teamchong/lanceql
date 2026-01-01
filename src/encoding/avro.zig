@@ -64,9 +64,9 @@ pub const AvroReader = struct {
     num_fields: usize,
     num_rows: usize,
 
-    // Field names and types (parsed from schema)
-    field_names: [][]const u8,
-    field_types: []AvroType,
+    // Field names and types (parsed from schema) - use optional for proper tracking
+    field_names: ?[][]const u8,
+    field_types: ?[]AvroType,
 
     const Self = @This();
 
@@ -80,8 +80,8 @@ pub const AvroReader = struct {
             .data_start = 0,
             .num_fields = 0,
             .num_rows = 0,
-            .field_names = &.{},
-            .field_types = &.{},
+            .field_names = null,
+            .field_types = null,
         };
 
         try self.parseFile();
@@ -90,12 +90,14 @@ pub const AvroReader = struct {
 
     pub fn deinit(self: *Self) void {
         // Free field names
-        for (self.field_names) |name| {
-            self.allocator.free(name);
+        if (self.field_names) |fn_slice| {
+            for (fn_slice) |name| {
+                self.allocator.free(name);
+            }
+            self.allocator.free(fn_slice);
         }
-        if (self.field_names.len > 0) {
-            self.allocator.free(self.field_names);
-            self.allocator.free(self.field_types);
+        if (self.field_types) |ft_slice| {
+            self.allocator.free(ft_slice);
         }
     }
 
@@ -272,9 +274,11 @@ pub const AvroReader = struct {
             pos = obj_end.? + 1;
         }
 
-        self.field_names = try field_names.toOwnedSlice(self.allocator);
-        self.field_types = try field_types.toOwnedSlice(self.allocator);
-        self.num_fields = self.field_names.len;
+        const names = try field_names.toOwnedSlice(self.allocator);
+        const types = try field_types.toOwnedSlice(self.allocator);
+        self.field_names = names;
+        self.field_types = types;
+        self.num_fields = names.len;
     }
 
     /// Parse Avro type string
@@ -345,20 +349,24 @@ pub const AvroReader = struct {
 
     /// Get field name by index
     pub fn getFieldName(self: *const Self, idx: usize) ?[]const u8 {
-        if (idx >= self.field_names.len) return null;
-        return self.field_names[idx];
+        const fn_slice = self.field_names orelse return null;
+        if (idx >= fn_slice.len) return null;
+        return fn_slice[idx];
     }
 
     /// Get field type by index
     pub fn getFieldType(self: *const Self, idx: usize) ?AvroType {
-        if (idx >= self.field_types.len) return null;
-        return self.field_types[idx];
+        const ft_slice = self.field_types orelse return null;
+        if (idx >= ft_slice.len) return null;
+        return ft_slice[idx];
     }
 
     /// Read long (int64) values from a column
     pub fn readLongColumn(self: *Self, col_idx: usize) ![]i64 {
         var values = std.ArrayList(i64){};
         errdefer values.deinit(self.allocator);
+
+        const ft_slice = self.field_types orelse return values.toOwnedSlice(self.allocator);
 
         if (self.codec != .null) {
             // Compressed data not yet supported
@@ -389,7 +397,7 @@ pub const AvroReader = struct {
                 // Read each field in order
                 var field_idx: usize = 0;
                 while (field_idx < self.num_fields and pos < block_end) : (field_idx += 1) {
-                    const field_type = self.field_types[field_idx];
+                    const field_type = ft_slice[field_idx];
 
                     if (field_idx == col_idx and field_type == .long_type) {
                         const val_result = readVarint(self.data, pos) catch break;
@@ -420,6 +428,8 @@ pub const AvroReader = struct {
         var values = std.ArrayList(f64){};
         errdefer values.deinit(self.allocator);
 
+        const ft_slice = self.field_types orelse return values.toOwnedSlice(self.allocator);
+
         if (self.codec != .null) {
             return values.toOwnedSlice(self.allocator);
         }
@@ -444,7 +454,7 @@ pub const AvroReader = struct {
             while (i < count and pos < block_end) : (i += 1) {
                 var field_idx: usize = 0;
                 while (field_idx < self.num_fields and pos < block_end) : (field_idx += 1) {
-                    const field_type = self.field_types[field_idx];
+                    const field_type = ft_slice[field_idx];
 
                     if (field_idx == col_idx and field_type == .double_type) {
                         if (pos + 8 > self.data.len) break;
@@ -476,6 +486,8 @@ pub const AvroReader = struct {
             values.deinit(self.allocator);
         }
 
+        const ft_slice = self.field_types orelse return values.toOwnedSlice(self.allocator);
+
         if (self.codec != .null) {
             return values.toOwnedSlice(self.allocator);
         }
@@ -500,7 +512,7 @@ pub const AvroReader = struct {
             while (i < count and pos < block_end) : (i += 1) {
                 var field_idx: usize = 0;
                 while (field_idx < self.num_fields and pos < block_end) : (field_idx += 1) {
-                    const field_type = self.field_types[field_idx];
+                    const field_type = ft_slice[field_idx];
 
                     if (field_idx == col_idx and field_type == .string) {
                         const len_result = readVarint(self.data, pos) catch break;
