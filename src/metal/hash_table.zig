@@ -201,6 +201,33 @@ pub const GPUHashTable = struct {
         return null;
     }
 
+    /// Update the value for an existing key (for MIN/MAX aggregations)
+    /// Returns true if the key was found and updated
+    pub fn updateValue(self: *Self, key: u64, new_value: u64) bool {
+        const mask = self.capacity - 1;
+        var slot = @as(usize, @truncate(hashKey(key))) & mask;
+
+        var probes: usize = 0;
+        while (probes < @min(self.capacity, 1024)) : (probes += 1) {
+            const slot_base = slot * SLOT_UINTS;
+            const occupied = self.table[slot_base + (16 / 4)];
+
+            if (occupied == 0) return false; // Key not found
+
+            const slot_key = @as(*const u64, @ptrCast(@alignCast(&self.table[slot_base]))).*;
+            if (slot_key == key) {
+                // Found the key - update the value
+                const slot_val = @as(*u64, @ptrCast(@alignCast(&self.table[slot_base + 2])));
+                slot_val.* = new_value;
+                return true;
+            }
+
+            slot = (slot + 1) & mask;
+        }
+
+        return false;
+    }
+
     // =========================================================================
     // GPU implementations
     // =========================================================================

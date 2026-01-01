@@ -58,14 +58,11 @@ pub const BlockHeader = struct {
 
 /// Decompress a single zlib/deflate block
 pub fn decompressZlib(compressed: []const u8, estimated_size: usize, allocator: Allocator) DecompressError![]u8 {
-    // DEFLATE requires window buffer of at least max_window_len (65536 bytes)
-    var window_buf: [flate.max_window_len]u8 = undefined;
+    // Create a fixed buffer stream for the compressed data
+    var fbs = std.io.fixedBufferStream(compressed);
 
-    // Create a fixed buffer reader for the compressed data
-    var reader: std.Io.Reader = .fixed(compressed);
-
-    // Use raw deflate (no zlib/gzip headers) with separate window buffer
-    var decomp = flate.Decompress.init(&reader, .raw, &window_buf);
+    // Use decompressor for raw deflate (no zlib/gzip headers)
+    var decomp = flate.decompressor(.raw, fbs.reader());
 
     // Collect output into growing array
     var output = std.ArrayListUnmanaged(u8){};
@@ -77,18 +74,11 @@ pub fn decompressZlib(compressed: []const u8, estimated_size: usize, allocator: 
     // Read all decompressed data chunk by chunk
     var chunk: [4096]u8 = undefined;
     while (true) {
-        const bytes = decomp.reader.readSliceShort(&chunk) catch {
-            if (decomp.err) |_| {
-                return DecompressError.DecompressionFailed;
-            }
-            break;
+        const bytes = decomp.read(&chunk) catch {
+            return DecompressError.DecompressionFailed;
         };
         if (bytes == 0) break;
         output.appendSlice(allocator, chunk[0..bytes]) catch return DecompressError.OutOfMemory;
-    }
-
-    if (decomp.err) |_| {
-        return DecompressError.DecompressionFailed;
     }
 
     return output.toOwnedSlice(allocator) catch return DecompressError.OutOfMemory;

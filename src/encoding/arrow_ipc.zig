@@ -86,13 +86,13 @@ pub const ArrowIpcReader = struct {
     // Data buffer locations (for each column: validity, offsets/data)
     data_start: usize,
 
-    // Column metadata (detected from schema)
-    column_types: []ArrowType,
-    column_names: [][]const u8,
-    buffer_offsets: []usize, // Offset for each buffer in data section
+    // Column metadata (detected from schema) - use optional for proper tracking
+    column_types: ?[]ArrowType,
+    column_names: ?[][]const u8,
+    buffer_offsets: ?[]usize, // Offset for each buffer in data section
 
     // Buffer descriptors from RecordBatch (parsed)
-    buffers: []BufferDesc,
+    buffers: ?[]BufferDesc,
 
     const Self = @This();
 
@@ -106,10 +106,10 @@ pub const ArrowIpcReader = struct {
             .num_columns = 0,
             .num_rows = 0,
             .data_start = 0,
-            .column_types = &.{},
-            .column_names = &.{},
-            .buffer_offsets = &.{},
-            .buffers = &.{},
+            .column_types = null,
+            .column_names = null,
+            .buffer_offsets = null,
+            .buffers = null,
         };
 
         try self.parseFile();
@@ -117,20 +117,20 @@ pub const ArrowIpcReader = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        if (self.column_types.len > 0) {
-            self.allocator.free(self.column_types);
+        if (self.column_types) |ct| {
+            self.allocator.free(ct);
         }
-        for (self.column_names) |name| {
-            self.allocator.free(name);
+        if (self.column_names) |cn| {
+            for (cn) |name| {
+                self.allocator.free(name);
+            }
+            self.allocator.free(cn);
         }
-        if (self.column_names.len > 0) {
-            self.allocator.free(self.column_names);
+        if (self.buffer_offsets) |bo| {
+            self.allocator.free(bo);
         }
-        if (self.buffer_offsets.len > 0) {
-            self.allocator.free(self.buffer_offsets);
-        }
-        if (self.buffers.len > 0) {
-            self.allocator.free(self.buffers);
+        if (self.buffers) |bufs| {
+            self.allocator.free(bufs);
         }
     }
 
@@ -277,7 +277,7 @@ pub const ArrowIpcReader = struct {
             self.num_rows = parseRecordBatchLength(msg_data);
 
             // Parse buffer descriptors from RecordBatch
-            self.buffers = self.parseRecordBatchBuffers(msg_data) catch &.{};
+            self.buffers = self.parseRecordBatchBuffers(msg_data);
 
             // Data starts after message, aligned to 8 bytes
             self.data_start = (msg_end + 7) & ~@as(usize, 7);
@@ -368,72 +368,73 @@ pub const ArrowIpcReader = struct {
     }
 
     /// Parse buffer descriptors from RecordBatch Flatbuffers message
-    fn parseRecordBatchBuffers(self: *Self, msg_data: []const u8) ![]BufferDesc {
-        if (msg_data.len < 8) return &.{};
+    /// Returns null if parsing fails, otherwise returns allocated buffer array
+    fn parseRecordBatchBuffers(self: *Self, msg_data: []const u8) ?[]BufferDesc {
+        if (msg_data.len < 8) return null;
 
         // Navigate to RecordBatch table (same as parseRecordBatchLength)
         const root_off = std.mem.readInt(i32, msg_data[0..4], .little);
-        if (root_off < 0) return &.{};
+        if (root_off < 0) return null;
 
         const root_pos: usize = @intCast(root_off);
-        if (root_pos + 4 > msg_data.len) return &.{};
+        if (root_pos + 4 > msg_data.len) return null;
 
         const vt_rel = std.mem.readInt(i32, msg_data[root_pos..][0..4], .little);
-        if (vt_rel <= 0) return &.{};
+        if (vt_rel <= 0) return null;
 
         const vt_pos = root_pos -% @as(usize, @intCast(vt_rel));
-        if (vt_pos + 10 > msg_data.len) return &.{};
+        if (vt_pos + 10 > msg_data.len) return null;
 
         const vt_size = std.mem.readInt(u16, msg_data[vt_pos..][0..2], .little);
-        if (vt_size < 10) return &.{};
+        if (vt_size < 10) return null;
 
         // Get header field offset (Message.header at vtable offset 8)
         const header_field_off = std.mem.readInt(u16, msg_data[vt_pos + 8 ..][0..2], .little);
-        if (header_field_off == 0) return &.{};
+        if (header_field_off == 0) return null;
 
         const header_pos = root_pos + header_field_off;
-        if (header_pos + 4 > msg_data.len) return &.{};
+        if (header_pos + 4 > msg_data.len) return null;
 
         const header_off = std.mem.readInt(i32, msg_data[header_pos..][0..4], .little);
-        if (header_off <= 0) return &.{};
+        if (header_off <= 0) return null;
 
         const rb_pos = header_pos + @as(usize, @intCast(header_off));
-        if (rb_pos + 4 > msg_data.len) return &.{};
+        if (rb_pos + 4 > msg_data.len) return null;
 
         // Now at RecordBatch table - get its vtable
         const rb_vt_rel = std.mem.readInt(i32, msg_data[rb_pos..][0..4], .little);
-        if (rb_vt_rel <= 0) return &.{};
+        if (rb_vt_rel <= 0) return null;
 
         const rb_vt_pos = rb_pos -% @as(usize, @intCast(rb_vt_rel));
-        if (rb_vt_pos + 10 > msg_data.len) return &.{};
+        if (rb_vt_pos + 10 > msg_data.len) return null;
 
         const rb_vt_size = std.mem.readInt(u16, msg_data[rb_vt_pos..][0..2], .little);
-        if (rb_vt_size < 10) return &.{};
+        if (rb_vt_size < 10) return null;
 
         // RecordBatch vtable: [size(2), obj_size(2), length(2), nodes(2), buffers(2), ...]
         // Buffers vector offset is at vtable position 8 (after length at 4 and nodes at 6)
         const buffers_field_off = std.mem.readInt(u16, msg_data[rb_vt_pos + 8 ..][0..2], .little);
-        if (buffers_field_off == 0) return &.{};
+        if (buffers_field_off == 0) return null;
 
         const buffers_ptr_pos = rb_pos + buffers_field_off;
-        if (buffers_ptr_pos + 4 > msg_data.len) return &.{};
+        if (buffers_ptr_pos + 4 > msg_data.len) return null;
 
         // Read offset to buffers vector
         const buffers_vec_off = std.mem.readInt(i32, msg_data[buffers_ptr_pos..][0..4], .little);
-        if (buffers_vec_off <= 0) return &.{};
+        if (buffers_vec_off <= 0) return null;
 
         const buffers_vec_pos = buffers_ptr_pos + @as(usize, @intCast(buffers_vec_off));
-        if (buffers_vec_pos + 4 > msg_data.len) return &.{};
+        if (buffers_vec_pos + 4 > msg_data.len) return null;
 
         // Read number of buffers
         const num_buffers = std.mem.readInt(u32, msg_data[buffers_vec_pos..][0..4], .little);
-        if (num_buffers == 0 or num_buffers > 100) return &.{};
+        if (num_buffers == 0 or num_buffers > 100) return null;
 
         // Each Buffer is 16 bytes: offset(i64) + length(i64)
         const buffer_data_start = buffers_vec_pos + 4;
-        if (buffer_data_start + num_buffers * 16 > msg_data.len) return &.{};
+        if (buffer_data_start + num_buffers * 16 > msg_data.len) return null;
 
-        var buffers = self.allocator.alloc(BufferDesc, num_buffers) catch return &.{};
+        const buffers = self.allocator.alloc(BufferDesc, num_buffers) catch return null;
 
         for (0..num_buffers) |i| {
             const buf_pos = buffer_data_start + i * 16;
@@ -458,8 +459,10 @@ pub const ArrowIpcReader = struct {
 
     /// Get column type at index
     pub fn getColumnType(self: *const Self, col_idx: usize) ArrowType {
-        if (col_idx < self.column_types.len) {
-            return self.column_types[col_idx];
+        if (self.column_types) |ct| {
+            if (col_idx < ct.len) {
+                return ct[col_idx];
+            }
         }
         // Default heuristic based on column position
         // For our test fixture: id(int64), name(string), value(double)
@@ -473,8 +476,10 @@ pub const ArrowIpcReader = struct {
 
     /// Get column name at index
     pub fn getColumnName(self: *const Self, col_idx: usize) []const u8 {
-        if (col_idx < self.column_names.len) {
-            return self.column_names[col_idx];
+        if (self.column_names) |cn| {
+            if (col_idx < cn.len) {
+                return cn[col_idx];
+            }
         }
         // Default names based on column position
         return switch (col_idx) {
@@ -581,13 +586,18 @@ pub const ArrowIpcReader = struct {
         const offsets_buf_idx = buffer_idx + 1;
         const data_buf_idx = buffer_idx + 2;
 
-        if (self.buffers.len <= data_buf_idx) {
+        const bufs = self.buffers orelse {
+            // Fall back to scanning for string data in the data section
+            return try self.readStringColumnFallback();
+        };
+
+        if (bufs.len <= data_buf_idx) {
             // Fall back to scanning for string data in the data section
             return try self.readStringColumnFallback();
         }
 
-        const offsets_buf = self.buffers[offsets_buf_idx];
-        const data_buf = self.buffers[data_buf_idx];
+        const offsets_buf = bufs[offsets_buf_idx];
+        const data_buf = bufs[data_buf_idx];
 
         // Read offsets array (N+1 int32 values for N rows)
         const offsets_start = self.data_start + @as(usize, @intCast(offsets_buf.offset));

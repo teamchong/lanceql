@@ -634,7 +634,9 @@ pub const Table = struct {
             // Lance stores string columns with TWO separate buffers per page:
             // - Buffer 0: offsets array (uint32 or uint64, marking END positions)
             // - Buffer 1: string data (concatenated UTF-8 bytes)
-            if (page.buffer_offsets.len < 2) return TableError.InvalidMetadata;
+            if (page.buffer_offsets.len < 2) {
+                return TableError.InvalidMetadata;
+            }
 
             // Buffer 0 = offsets array
             const offsets_offset = page.buffer_offsets[0];

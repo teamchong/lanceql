@@ -91,12 +91,12 @@ pub const OrcReader = struct {
     num_columns: usize,
     num_stripes: usize,
 
-    // Column names and types
-    column_names: [][]const u8,
-    column_types: []OrcType,
+    // Column names and types (use optional for proper tracking)
+    column_names: ?[][]const u8,
+    column_types: ?[]OrcType,
 
     // Stripe information
-    stripes: []StripeInfo,
+    stripes: ?[]StripeInfo,
 
     // Decompressed footer for parsing
     decompressed_footer: ?[]u8,
@@ -116,9 +116,9 @@ pub const OrcReader = struct {
             .num_rows = 0,
             .num_columns = 0,
             .num_stripes = 0,
-            .column_names = &.{},
-            .column_types = &.{},
-            .stripes = &.{},
+            .column_names = null,
+            .column_types = null,
+            .stripes = null,
             .decompressed_footer = null,
         };
 
@@ -127,15 +127,17 @@ pub const OrcReader = struct {
     }
 
     pub fn deinit(self: *Self) void {
-        for (self.column_names) |name| {
-            self.allocator.free(name);
+        if (self.column_names) |cn| {
+            for (cn) |name| {
+                self.allocator.free(name);
+            }
+            self.allocator.free(cn);
         }
-        if (self.column_names.len > 0) {
-            self.allocator.free(self.column_names);
-            self.allocator.free(self.column_types);
+        if (self.column_types) |ct| {
+            self.allocator.free(ct);
         }
-        if (self.stripes.len > 0) {
-            self.allocator.free(self.stripes);
+        if (self.stripes) |s| {
+            self.allocator.free(s);
         }
         if (self.decompressed_footer) |footer| {
             self.allocator.free(footer);
@@ -161,7 +163,12 @@ pub const OrcReader = struct {
         // Read PostScript length (last byte of file)
         self.postscript_len = self.data[self.data.len - 1];
 
-        // Calculate PostScript position
+        // Validate PostScript length to prevent underflow
+        if (self.postscript_len >= self.data.len - 1) {
+            return error.InvalidOrcFile;
+        }
+
+        // Calculate PostScript position (now safe from underflow)
         const ps_start = self.data.len - 1 - self.postscript_len;
         const ps_end = self.data.len - 1;
 
@@ -174,6 +181,10 @@ pub const OrcReader = struct {
         try self.parsePostScript(postscript);
 
         // Read Footer (protobuf) - positioned before PostScript
+        // Validate footer length to prevent underflow
+        if (self.footer_len >= ps_start) {
+            return error.InvalidOrcFile;
+        }
         const footer_start = ps_start - self.footer_len;
         if (footer_start < ORC_MAGIC_SIZE) {
             return error.InvalidOrcFile;
@@ -448,8 +459,8 @@ pub const OrcReader = struct {
         }
 
         // Store parsed results
-        self.stripes = stripe_list.toOwnedSlice(self.allocator) catch &.{};
-        self.num_stripes = self.stripes.len;
+        self.stripes = stripe_list.toOwnedSlice(self.allocator) catch null;
+        self.num_stripes = if (self.stripes) |s| s.len else 0;
 
         if (column_types.items.len > 0) {
             self.num_columns = column_types.items.len;

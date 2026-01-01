@@ -81,8 +81,15 @@ pub const OrcRleDecoder = struct {
     /// Decode unsigned integers (for LENGTH streams)
     pub fn decodeUnsigned(self: *Self, count: usize, allocator: Allocator) RleError![]u64 {
         const signed = try self.decodeIntegers(count, allocator);
-        // Reinterpret as unsigned
-        return @ptrCast(signed);
+        defer allocator.free(signed);
+
+        // Allocate new array for unsigned values to avoid pointer aliasing issues
+        const unsigned = allocator.alloc(u64, count) catch return RleError.OutOfMemory;
+        for (signed, 0..) |val, i| {
+            // Reinterpret each value as unsigned
+            unsigned[i] = @bitCast(val);
+        }
+        return unsigned;
     }
 
     /// Decode booleans (for PRESENT streams)

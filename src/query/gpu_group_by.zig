@@ -97,13 +97,8 @@ pub const GPUGroupBy = struct {
                     else => false,
                 };
                 if (update) {
-                    // Need to update - rebuild with new value
-                    // This is inefficient but correct for now
-                    const keys = [_]u64{key};
-                    const vals = [_]u64{value};
-                    // TODO: Add update operation to hash table
-                    _ = keys;
-                    _ = vals;
+                    // Update the existing value with the new min/max
+                    _ = self.hash_table.updateValue(key, value);
                 }
             } else {
                 // First occurrence - insert
@@ -336,4 +331,93 @@ test "GPUGroupByF64 basic" {
             try std.testing.expectApproxEqAbs(@as(f64, 2.5), v, 0.001);
         }
     }
+}
+
+test "GPUGroupBy MIN basic" {
+    const allocator = std.testing.allocator;
+
+    var group_by = try GPUGroupBy.init(allocator, .min);
+    defer group_by.deinit();
+
+    // Group 1: values 50, 10, 30 -> min = 10
+    // Group 2: values 20, 40 -> min = 20
+    const keys = [_]u64{ 1, 2, 1, 2, 1 };
+    const values = [_]u64{ 50, 20, 10, 40, 30 };
+
+    try group_by.process(&keys, &values);
+
+    try std.testing.expectEqual(@as(?u64, 10), group_by.getGroup(1));
+    try std.testing.expectEqual(@as(?u64, 20), group_by.getGroup(2));
+}
+
+test "GPUGroupBy MAX basic" {
+    const allocator = std.testing.allocator;
+
+    var group_by = try GPUGroupBy.init(allocator, .max);
+    defer group_by.deinit();
+
+    // Group 1: values 10, 50, 30 -> max = 50
+    // Group 2: values 40, 20 -> max = 40
+    const keys = [_]u64{ 1, 2, 1, 2, 1 };
+    const values = [_]u64{ 10, 40, 50, 20, 30 };
+
+    try group_by.process(&keys, &values);
+
+    try std.testing.expectEqual(@as(?u64, 50), group_by.getGroup(1));
+    try std.testing.expectEqual(@as(?u64, 40), group_by.getGroup(2));
+}
+
+test "GPUGroupBy MIN multiple batches" {
+    const allocator = std.testing.allocator;
+
+    var group_by = try GPUGroupBy.init(allocator, .min);
+    defer group_by.deinit();
+
+    // First batch
+    const keys1 = [_]u64{ 1, 2 };
+    const values1 = [_]u64{ 100, 200 };
+    try group_by.process(&keys1, &values1);
+
+    // Second batch with smaller values
+    const keys2 = [_]u64{ 1, 2 };
+    const values2 = [_]u64{ 50, 150 };
+    try group_by.process(&keys2, &values2);
+
+    // Third batch - group 1 gets even smaller
+    const keys3 = [_]u64{ 1 };
+    const values3 = [_]u64{ 25 };
+    try group_by.process(&keys3, &values3);
+
+    try std.testing.expectEqual(@as(?u64, 25), group_by.getGroup(1));
+    try std.testing.expectEqual(@as(?u64, 150), group_by.getGroup(2));
+}
+
+test "GPUGroupBy MAX getResults" {
+    const allocator = std.testing.allocator;
+
+    var group_by = try GPUGroupBy.init(allocator, .max);
+    defer group_by.deinit();
+
+    const keys = [_]u64{ 100, 200, 100, 200, 100 };
+    const values = [_]u64{ 5, 10, 15, 8, 12 };
+
+    try group_by.process(&keys, &values);
+
+    const results = try group_by.getResults();
+    defer allocator.free(results.keys);
+    defer allocator.free(results.aggregates);
+
+    try std.testing.expectEqual(@as(usize, 2), results.count);
+
+    // Find results (order may vary)
+    var max_100: ?u64 = null;
+    var max_200: ?u64 = null;
+
+    for (results.keys[0..results.count], results.aggregates[0..results.count]) |k, v| {
+        if (k == 100) max_100 = v;
+        if (k == 200) max_200 = v;
+    }
+
+    try std.testing.expectEqual(@as(?u64, 15), max_100); // max(5, 15, 12)
+    try std.testing.expectEqual(@as(?u64, 10), max_200); // max(10, 8)
 }
