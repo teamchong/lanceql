@@ -417,19 +417,26 @@ pub const OrcReader = struct {
                     const msg_end = len_result.end_pos + msg_len;
                     if (msg_end > data.len) break;
 
-                    const type_info = self.parseTypeInfo(data[len_result.end_pos..msg_end]) catch {
+                    const type_msg = data[len_result.end_pos..msg_end];
+                    const type_info = self.parseTypeInfo(type_msg) catch {
                         pos = msg_end;
                         continue;
                     };
 
                     // Store type information
                     column_types.append(self.allocator, type_info.orc_type) catch break;
-                    if (type_info.name) |name| {
-                        const name_copy = self.allocator.dupe(u8, name) catch break;
-                        column_names.append(self.allocator, name_copy) catch {
-                            self.allocator.free(name_copy);
-                            break;
-                        };
+
+                    // For struct types, extract all child field names
+                    if (type_info.orc_type == .struct_type) {
+                        if (self.parseStructFieldNames(type_msg)) |names| {
+                            defer self.allocator.free(names);
+                            for (names) |name| {
+                                // parseStructFieldNames already duped the names, so just append
+                                column_names.append(self.allocator, name) catch break;
+                            }
+                        } else |_| {
+                            // Failed to parse field names, continue without them
+                        }
                     }
                     pos = msg_end;
                 },
@@ -462,8 +469,9 @@ pub const OrcReader = struct {
         self.stripes = stripe_list.toOwnedSlice(self.allocator) catch null;
         self.num_stripes = if (self.stripes) |s| s.len else 0;
 
-        if (column_types.items.len > 0) {
-            self.num_columns = column_types.items.len;
+        if (column_types.items.len > 1) {
+            // Exclude root struct (column 0) from count - data columns start at 1
+            self.num_columns = column_types.items.len - 1;
             self.column_types = column_types.toOwnedSlice(self.allocator) catch null;
         } else {
             column_types.deinit(self.allocator);
@@ -526,6 +534,8 @@ pub const OrcReader = struct {
         var pos: usize = 0;
         var name: ?[]const u8 = null;
         var orc_type: OrcType = .unknown;
+        var has_subtypes: bool = false;
+        var has_field_names: bool = false;
 
         while (pos < data.len) {
             const tag_result = readVarint(data, pos) catch break;
@@ -562,8 +572,13 @@ pub const OrcReader = struct {
                     };
                     pos = val_result.end_pos;
                 },
-                3 => { // fieldNames (string)
+                2 => { // subtypes (packed repeated uint32)
+                    has_subtypes = true;
+                    pos = skipField(data, pos, wire_type) catch break;
+                },
+                3 => { // fieldNames (repeated string)
                     if (wire_type != 2) break;
+                    has_field_names = true;
                     const len_result = readVarint(data, pos) catch break;
                     const str_len = @as(usize, @intCast(len_result.value));
                     if (len_result.end_pos + str_len <= data.len) {
@@ -577,7 +592,49 @@ pub const OrcReader = struct {
             }
         }
 
+        // If this type has subtypes and field names, it's a struct regardless of kind field
+        // (Some ORC writers encode struct types with a different kind value)
+        if (has_subtypes and has_field_names) {
+            orc_type = .struct_type;
+        }
+
         return .{ .name = name, .orc_type = orc_type };
+    }
+
+    /// Parse all field names from a struct Type message (repeated string field 3)
+    fn parseStructFieldNames(self: *Self, data: []const u8) ![][]const u8 {
+        var names = std.ArrayListUnmanaged([]const u8){};
+        errdefer {
+            for (names.items) |n| self.allocator.free(n);
+            names.deinit(self.allocator);
+        }
+
+        var pos: usize = 0;
+        while (pos < data.len) {
+            const tag_result = readVarint(data, pos) catch break;
+            const tag = tag_result.value;
+            pos = tag_result.end_pos;
+
+            const field_num = tag >> 3;
+            const wire_type = @as(u3, @truncate(tag));
+
+            if (field_num == 3 and wire_type == 2) {
+                // fieldNames - repeated string
+                const len_result = readVarint(data, pos) catch break;
+                const str_len = @as(usize, @intCast(len_result.value));
+                pos = len_result.end_pos;
+
+                if (pos + str_len <= data.len) {
+                    const name = try self.allocator.dupe(u8, data[pos..][0..str_len]);
+                    try names.append(self.allocator, name);
+                }
+                pos += str_len;
+            } else {
+                pos = skipField(data, pos, wire_type) catch break;
+            }
+        }
+
+        return names.toOwnedSlice(self.allocator);
     }
 
     /// Get number of columns
@@ -588,6 +645,23 @@ pub const OrcReader = struct {
     /// Get number of rows
     pub fn rowCount(self: *const Self) usize {
         return self.num_rows;
+    }
+
+    /// Get column name by index (safe accessor)
+    /// column_names contains the field names from the struct type, directly 0-indexed
+    pub fn getColumnName(self: *const Self, col_idx: usize) ?[]const u8 {
+        const names = self.column_names orelse return null;
+        if (col_idx >= names.len) return null;
+        return names[col_idx];
+    }
+
+    /// Get column type by index (safe accessor)
+    pub fn getColumnType(self: *const Self, col_idx: usize) ?OrcType {
+        const types = self.column_types orelse return null;
+        // Skip root struct (index 0) - data column types start at index 1
+        const adjusted_idx = col_idx + 1;
+        if (adjusted_idx >= types.len) return null;
+        return types[adjusted_idx];
     }
 
     /// Get compression kind
