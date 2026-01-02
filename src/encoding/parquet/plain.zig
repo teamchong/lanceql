@@ -81,20 +81,19 @@ pub const PlainDecoder = struct {
     }
 
     // ========================================================================
-    // Integer decoding
+    // Generic numeric decoding helper
     // ========================================================================
 
-    /// Read INT32 values (4 bytes each, little-endian)
-    pub fn readInt32(self: *Self, count: usize, allocator: std.mem.Allocator) PlainError![]i32 {
-        const bytes_needed = count * 4;
+    /// Generic helper to read fixed-size numeric values (little-endian, direct memcpy)
+    fn readNumericValues(self: *Self, comptime T: type, count: usize, allocator: std.mem.Allocator) PlainError![]T {
+        const bytes_needed = count * @sizeOf(T);
         if (self.pos + bytes_needed > self.data.len) {
             return PlainError.UnexpectedEndOfData;
         }
 
-        const values = try allocator.alloc(i32, count);
+        const values = try allocator.alloc(T, count);
         errdefer allocator.free(values);
 
-        // Direct memcpy - Parquet uses little-endian, same as x86/ARM
         const src = self.data[self.pos..][0..bytes_needed];
         @memcpy(std.mem.sliceAsBytes(values), src);
 
@@ -102,22 +101,18 @@ pub const PlainDecoder = struct {
         return values;
     }
 
+    // ========================================================================
+    // Integer decoding
+    // ========================================================================
+
+    /// Read INT32 values (4 bytes each, little-endian)
+    pub fn readInt32(self: *Self, count: usize, allocator: std.mem.Allocator) PlainError![]i32 {
+        return self.readNumericValues(i32, count, allocator);
+    }
+
     /// Read INT64 values (8 bytes each, little-endian)
     pub fn readInt64(self: *Self, count: usize, allocator: std.mem.Allocator) PlainError![]i64 {
-        const bytes_needed = count * 8;
-        if (self.pos + bytes_needed > self.data.len) {
-            return PlainError.UnexpectedEndOfData;
-        }
-
-        const values = try allocator.alloc(i64, count);
-        errdefer allocator.free(values);
-
-        // Direct memcpy - Parquet uses little-endian, same as x86/ARM
-        const src = self.data[self.pos..][0..bytes_needed];
-        @memcpy(std.mem.sliceAsBytes(values), src);
-
-        self.pos += bytes_needed;
-        return values;
+        return self.readNumericValues(i64, count, allocator);
     }
 
     /// Read INT96 values (12 bytes each, deprecated timestamp format)
@@ -145,38 +140,12 @@ pub const PlainDecoder = struct {
 
     /// Read FLOAT values (4 bytes each, IEEE 754)
     pub fn readFloat(self: *Self, count: usize, allocator: std.mem.Allocator) PlainError![]f32 {
-        const bytes_needed = count * 4;
-        if (self.pos + bytes_needed > self.data.len) {
-            return PlainError.UnexpectedEndOfData;
-        }
-
-        const values = try allocator.alloc(f32, count);
-        errdefer allocator.free(values);
-
-        // Direct memcpy - IEEE 754 little-endian same as x86/ARM
-        const src = self.data[self.pos..][0..bytes_needed];
-        @memcpy(std.mem.sliceAsBytes(values), src);
-
-        self.pos += bytes_needed;
-        return values;
+        return self.readNumericValues(f32, count, allocator);
     }
 
     /// Read DOUBLE values (8 bytes each, IEEE 754)
     pub fn readDouble(self: *Self, count: usize, allocator: std.mem.Allocator) PlainError![]f64 {
-        const bytes_needed = count * 8;
-        if (self.pos + bytes_needed > self.data.len) {
-            return PlainError.UnexpectedEndOfData;
-        }
-
-        const values = try allocator.alloc(f64, count);
-        errdefer allocator.free(values);
-
-        // Direct memcpy - IEEE 754 little-endian same as x86/ARM
-        const src = self.data[self.pos..][0..bytes_needed];
-        @memcpy(std.mem.sliceAsBytes(values), src);
-
-        self.pos += bytes_needed;
-        return values;
+        return self.readNumericValues(f64, count, allocator);
     }
 
     // ========================================================================
