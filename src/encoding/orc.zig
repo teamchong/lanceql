@@ -20,8 +20,8 @@ const zlib = @import("orc/zlib.zig");
 const rle = @import("orc/rle.zig");
 const streams = @import("orc/streams.zig");
 
-// ORC snappy decompressor
-const snappy = @import("orc/snappy.zig");
+// Snappy decompressor (shared with Parquet)
+const snappy = @import("lanceql.encoding.snappy");
 
 // Re-export types
 pub const StreamKind = streams.StreamKind;

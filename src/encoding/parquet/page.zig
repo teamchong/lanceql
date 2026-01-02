@@ -18,7 +18,7 @@ const PlainDecoder = plain.PlainDecoder;
 const dictionary = @import("dictionary.zig");
 const rle = @import("rle.zig");
 const RleDecoder = rle.RleDecoder;
-const snappy = @import("snappy.zig");
+const snappy = @import("lanceql.encoding.snappy");
 
 /// Comptime-specialized bit unpacking for a single group of 8 values
 /// All bit offsets and masks computed at compile time

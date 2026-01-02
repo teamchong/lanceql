@@ -22,8 +22,15 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/io/io.zig"),
     });
 
+    const snappy_mod = b.addModule("lanceql.encoding.snappy", .{
+        .root_source_file = b.path("src/encoding/snappy.zig"),
+    });
+
     const encoding_mod = b.addModule("lanceql.encoding", .{
         .root_source_file = b.path("src/encoding/encoding.zig"),
+        .imports = &.{
+            .{ .name = "lanceql.encoding.snappy", .module = snappy_mod },
+        },
     });
 
     const value_mod = b.addModule("lanceql.value", .{
@@ -57,6 +64,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "lanceql.proto", .module = proto_mod },
             .{ .name = "lanceql.format", .module = format_mod },
+            .{ .name = "lanceql.encoding.snappy", .module = snappy_mod },
         },
     });
 

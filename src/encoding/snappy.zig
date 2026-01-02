@@ -1,4 +1,4 @@
-//! Snappy decompression for Parquet files.
+//! Snappy decompression for columnar file formats (Parquet, ORC).
 //!
 //! Snappy is a fast compression algorithm developed by Google.
 //! See: https://github.com/google/snappy/blob/main/format_description.txt
