@@ -516,31 +516,25 @@ pub const Executor = struct {
 
     /// Execute a JOIN operation using hash join algorithm
     fn executeJoin(self: *Self, left_ref: *const ast.TableRef, join_clause: *const ast.JoinClause) !TableSource {
-        // 1. Resolve left table
         var left_source = try self.resolveTableSource(left_ref);
         errdefer self.releaseTableSource(&left_source);
         const left_table = left_source.getTable();
 
-        // 2. Resolve right table
         var right_source = try self.resolveTableSource(join_clause.table);
         defer self.releaseTableSource(&right_source);
         const right_table = right_source.getTable();
 
-        // 3. Extract join key column names from ON condition
         const join_keys = try self.extractJoinKeys(join_clause.on_condition orelse return error.JoinRequiresOnCondition);
 
-        // 4. Get join key columns from both tables
         const left_key_col_idx = left_table.physicalColumnId(join_keys.left_col) orelse return error.JoinColumnNotFound;
         const right_key_col_idx = right_table.physicalColumnId(join_keys.right_col) orelse return error.JoinColumnNotFound;
 
-        // 5. Read join key data
         const left_key_data = try self.readJoinKeyColumn(left_table, left_key_col_idx);
         defer self.freeJoinKeyData(left_key_data);
 
         const right_key_data = try self.readJoinKeyColumn(right_table, right_key_col_idx);
         defer self.freeJoinKeyData(right_key_data);
 
-        // 6. Build hash table from right table (build phase)
         var hash_table = std.StringHashMap(std.ArrayListUnmanaged(usize)).init(self.allocator);
         defer {
             var iter = hash_table.iterator();
@@ -566,7 +560,6 @@ pub const Executor = struct {
             try result.value_ptr.append(self.allocator, idx);
         }
 
-        // 7. Probe phase - find matching rows
         var left_indices = std.ArrayListUnmanaged(usize){};
         defer left_indices.deinit(self.allocator);
         var right_indices = std.ArrayListUnmanaged(usize){};
@@ -603,7 +596,6 @@ pub const Executor = struct {
             }
         }
 
-        // 8. Build joined result with all columns from both tables
         const joined_data = try self.allocator.create(JoinedData);
         errdefer self.allocator.destroy(joined_data);
 
@@ -846,10 +838,8 @@ pub const Executor = struct {
 
     /// Execute a SELECT statement
     pub fn execute(self: *Self, stmt: *const SelectStmt, params: []const Value) !Result {
-        // Check if we have a typed table (skip FROM clause resolution)
         const has_typed_table = self.hasTypedTable();
 
-        // 0. Resolve FROM clause to get table source (only for Lance tables)
         var source: ?TableSource = null;
         var original_table: ?*Table = null;
         if (!has_typed_table) {
@@ -866,7 +856,6 @@ pub const Executor = struct {
             }
         }
 
-        // 1. Preload columns referenced in WHERE clause
         if (stmt.where) |where_expr| {
             var col_names = std.ArrayList([]const u8){};
             defer col_names.deinit(self.allocator);
@@ -875,7 +864,6 @@ pub const Executor = struct {
             try self.preloadColumns(col_names.items);
         }
 
-        // 2. Apply WHERE clause to get filtered row indices
         const indices = if (stmt.where) |where_expr|
             try self.evaluateWhere(&where_expr, params)
         else
@@ -883,7 +871,6 @@ pub const Executor = struct {
 
         defer self.allocator.free(indices);
 
-        // 3. Check if we need GROUP BY processing
         const has_group_by = stmt.group_by != null;
         const has_aggregates = self.hasAggregates(stmt.columns);
 
@@ -892,8 +879,6 @@ pub const Executor = struct {
             return self.executeWithGroupBy(stmt, indices);
         }
 
-        // 4. Read columns based on SELECT list (non-aggregate path)
-        // Window function columns are handled separately
         var columns_list = std.ArrayList(Result.Column){};
         errdefer {
             for (columns_list.items) |*col| {
@@ -906,7 +891,6 @@ pub const Executor = struct {
         defer self.allocator.free(base_columns);
         try columns_list.appendSlice(self.allocator, base_columns);
 
-        // 4.5. Evaluate window functions if present
         if (self.hasWindowFunctions(stmt.columns)) {
             try self.evaluateWindowFunctions(&columns_list, stmt.columns, indices);
         }
@@ -914,19 +898,16 @@ pub const Executor = struct {
         var columns = try columns_list.toOwnedSlice(self.allocator);
         var row_count = indices.len;
 
-        // 5. Apply DISTINCT if specified
         if (stmt.distinct) {
             const distinct_result = try result_ops.applyDistinct(self.allocator, columns);
             columns = distinct_result.columns;
             row_count = distinct_result.row_count;
         }
 
-        // 6. Apply ORDER BY (in-memory sorting)
         if (stmt.order_by) |order_by| {
             try result_ops.applyOrderBy(self.allocator, columns, order_by);
         }
 
-        // 7. Apply LIMIT and OFFSET
         const final_row_count = result_ops.applyLimitOffset(self.allocator, columns, stmt.limit, stmt.offset);
 
         var result = Result{
@@ -935,7 +916,6 @@ pub const Executor = struct {
             .allocator = self.allocator,
         };
 
-        // 8. Apply set operation (UNION/INTERSECT/EXCEPT) if present
         if (stmt.set_operation) |set_op| {
             result = try self.executeSetOperation(result, set_op, params);
         }
@@ -1282,8 +1262,6 @@ pub const Executor = struct {
                 return error.OutOfMemory;
             errdefer output.deinit(self.allocator);
 
-            // TODO (Phase 3): Get method dependencies and load column data
-            // For now, pass empty inputs - methods that don't need column data will work
             const inputs = &[_]logic_table_dispatch.ColumnBinding{};
 
             // Call batch dispatch

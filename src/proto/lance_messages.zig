@@ -150,8 +150,6 @@ fn parseEncoding(allocator: std.mem.Allocator, proto: *ProtoDecoder, header: dec
         return .none;
     }
 
-    // For now, store as direct encoding
-    // TODO: Distinguish between deferred and direct based on message structure
     const encoding_copy = allocator.dupe(u8, encoding_bytes) catch return DecodeError.OutOfMemory;
     return .{ .direct = .{ .encoding = encoding_copy } };
 }

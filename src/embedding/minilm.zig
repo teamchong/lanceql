@@ -124,8 +124,6 @@ pub const MiniLM = struct {
         var embeddings = try self.allocator.alloc([EMBEDDING_DIM]f32, texts.len);
         errdefer self.allocator.free(embeddings);
 
-        // For now, process one at a time
-        // TODO: Implement true batching for better performance
         for (texts, 0..) |text, i| {
             embeddings[i] = try self.encode(text);
         }

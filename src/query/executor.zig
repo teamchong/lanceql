@@ -151,7 +151,6 @@ pub const Executor = struct {
             try col_map.put(name, i);
         }
 
-        // Step 1: Determine which columns we need to read
         var needed_cols = std.AutoHashMap(usize, void).init(self.allocator);
         defer needed_cols.deinit();
 
@@ -182,7 +181,6 @@ pub const Executor = struct {
             }
         }
 
-        // Step 2: Read column data into memory
         var columns_data: std.ArrayListUnmanaged([]Value) = .empty;
         defer {
             for (columns_data.items) |col_data| {
@@ -201,7 +199,6 @@ pub const Executor = struct {
             }
         }
 
-        // Step 3: Build rows and apply WHERE filter
         var filtered_rows: std.ArrayListUnmanaged([]Value) = .empty;
         defer filtered_rows.deinit(self.allocator);
 
@@ -230,7 +227,6 @@ pub const Executor = struct {
             }
         }
 
-        // Step 4: Handle GROUP BY or simple projection
         var result_rows: [][]Value = undefined;
         var result_cols: [][]const u8 = undefined;
 
@@ -257,14 +253,10 @@ pub const Executor = struct {
             }
         }
 
-        // Step 5: Apply HAVING (already done in executeGroupBy if needed)
-
-        // Step 6: ORDER BY
         if (self.stmt.order_by.len > 0) {
             try self.applyOrderBy(&result_rows, result_cols);
         }
 
-        // Step 7: OFFSET and LIMIT
         var final_rows = result_rows;
         if (self.stmt.offset) |offset| {
             if (offset < final_rows.len) {
@@ -524,7 +516,6 @@ pub const Executor = struct {
             };
         }
 
-        // Step 1: Get indices for GROUP BY columns
         var group_col_indices = try self.allocator.alloc(usize, self.stmt.group_by.len);
         defer self.allocator.free(group_col_indices);
 
@@ -532,7 +523,6 @@ pub const Executor = struct {
             group_col_indices[i] = col_map.get(col_name) orelse return error.ColumnNotFound;
         }
 
-        // Step 2: Determine output columns and aggregate info
         var result_cols: std.ArrayListUnmanaged([]const u8) = .empty;
         var agg_infos: std.ArrayListUnmanaged(AggInfo) = .empty;
         defer agg_infos.deinit(self.allocator);
@@ -599,7 +589,6 @@ pub const Executor = struct {
             }
         }
 
-        // Step 3: Group rows using HashMap
         const GroupData = struct {
             key_values: []Value,
             aggregates: []Aggregate,
@@ -662,7 +651,6 @@ pub const Executor = struct {
             }
         }
 
-        // Step 4: Build result rows from groups
         var result_rows: std.ArrayListUnmanaged([]Value) = .empty;
         defer result_rows.deinit(self.allocator);
 
