@@ -1204,8 +1204,8 @@ const TokenType = {
     // JOIN keywords
     JOIN: 'JOIN', LEFT: 'LEFT', RIGHT: 'RIGHT', INNER: 'INNER', ON: 'ON', AS: 'AS',
     FULL: 'FULL', OUTER: 'OUTER', CROSS: 'CROSS',
-    // GROUP BY / HAVING
-    GROUP: 'GROUP', HAVING: 'HAVING',
+    // GROUP BY / HAVING / QUALIFY
+    GROUP: 'GROUP', HAVING: 'HAVING', QUALIFY: 'QUALIFY',
     // Aggregate functions
     COUNT: 'COUNT', SUM: 'SUM', AVG: 'AVG', MIN: 'MIN', MAX: 'MAX',
     // Additional operators
@@ -1828,6 +1828,12 @@ class SQLParser {
             having = this.parseWhereExpr();
         }
 
+        // Parse QUALIFY (filter on window function results)
+        let qualify = null;
+        if (this.match(TokenType.QUALIFY)) {
+            qualify = this.parseWhereExpr();
+        }
+
         let orderBy = null;
         if (this.match(TokenType.ORDER)) {
             this.expect(TokenType.BY);
@@ -1872,6 +1878,7 @@ class SQLParser {
             where,
             groupBy,
             having,
+            qualify,
             orderBy,
             limit,
             offset
@@ -4744,6 +4751,23 @@ async function executeAST(db, ast) {
             const windowCols = ast.columns.filter(c => c.type === 'window');
             if (windowCols.length > 0) {
                 rows = computeWindowFunctions(rows, windowCols, tableAliases);
+            }
+
+            // Apply QUALIFY (filter on window function results)
+            if (ast.qualify) {
+                rows = rows.filter(row => {
+                    // QUALIFY can reference window function results by their alias
+                    // The window function values are stored with __window_alias prefix
+                    // Create a row view that maps aliases to window values
+                    const rowWithWindowCols = { ...row };
+                    for (const col of windowCols) {
+                        const alias = col.alias || `${col.func}(...)`;
+                        if (row[`__window_${alias}`] !== undefined) {
+                            rowWithWindowCols[alias] = row[`__window_${alias}`];
+                        }
+                    }
+                    return evalWhere(ast.qualify, rowWithWindowCols, tableAliases);
+                });
             }
 
             // Apply ORDER BY first (before projection, using original column values)
