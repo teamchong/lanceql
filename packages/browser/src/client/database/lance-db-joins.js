@@ -17,9 +17,6 @@ import { opfsStorage } from '../storage/opfs.js';
  * @returns {Promise<Object>} Query result
  */
 export async function executeJoin(db, ast) {
-    console.log('[LanceDatabase] Executing JOIN query:', ast);
-
-    // Extract table references
     const leftTableName = ast.from.name || ast.from.table;
     const leftAlias = ast.from.alias || leftTableName;
 
@@ -27,9 +24,6 @@ export async function executeJoin(db, ast) {
     if (ast.from.alias) {
         db.aliases.set(ast.from.alias, leftTableName);
     }
-
-    // Process joins iteratively: (A JOIN B) JOIN C
-    console.log(`[LanceDatabase] Processing ${ast.joins.length} JOIN(s)`);
 
     let currentResult = null;
     let currentAlias = leftAlias;
@@ -45,8 +39,6 @@ export async function executeJoin(db, ast) {
         if (join.alias) {
             db.aliases.set(join.alias, rightTableName);
         }
-
-        console.log(`[LanceDatabase] JOIN ${i + 1}/${ast.joins.length}: ${currentTableName} (${currentAlias}) ${join.type} ${rightTableName} (${rightAlias})`);
 
         // Get right dataset
         const rightDataset = db.getTable(rightTableName);
@@ -107,7 +99,6 @@ export async function hashJoin(db, leftDataset, rightDataset, ast, context) {
         rightKey = null;
         leftSQL = `SELECT * FROM ${leftTableName}`;
         rightSQL = `SELECT * FROM ${rightTableName}`;
-        console.log('[LanceDatabase] CROSS JOIN - no keys, cartesian product');
     } else {
         const planner = new QueryPlanner();
         plan = planner.plan(ast, context);
@@ -140,9 +131,6 @@ export async function hashJoin(db, leftDataset, rightDataset, ast, context) {
         rightSQL = `SELECT ${rightColsWithKey.join(', ')} FROM ${rightTableName}${rightWhereClause}`;
     }
 
-    console.log('[LanceDatabase] OPFS-backed hash join starting...');
-    console.log('[LanceDatabase] Left query:', leftSQL);
-
     await opfsStorage.open();
 
     const joinExecutor = new OPFSJoinExecutor(opfsStorage);
@@ -151,7 +139,6 @@ export async function hashJoin(db, leftDataset, rightDataset, ast, context) {
 
     const leftStream = leftExecutor.executeStream(leftSQL);
     const leftMeta = await joinExecutor._partitionToOPFS(leftStream, leftKey, 'left', true);
-    console.log(`[LanceDatabase] Left partitioned: ${leftMeta.totalRows} rows, ${leftMeta.collectedKeys?.size || 0} unique keys`);
 
     let optimizedRightSQL = rightSQL;
     const maxKeysForInClause = 1000;
@@ -159,9 +146,7 @@ export async function hashJoin(db, leftDataset, rightDataset, ast, context) {
         leftMeta.collectedKeys.size <= maxKeysForInClause) {
         const inClause = buildInClause(rightKey, leftMeta.collectedKeys);
         optimizedRightSQL = appendWhereClause(rightSQL, inClause);
-        console.log(`[LanceDatabase] Semi-join optimization: added IN clause with ${leftMeta.collectedKeys.size} keys`);
     }
-    console.log('[LanceDatabase] Right query:', optimizedRightSQL);
 
     const rightStream = rightExecutor.executeStream(optimizedRightSQL);
 
@@ -197,7 +182,6 @@ export async function hashJoin(db, leftDataset, rightDataset, ast, context) {
     }
 
     const stats = joinExecutor.getStats();
-    console.log('[LanceDatabase] OPFS Join Stats:', stats);
 
     if (!resultColumns || results.length === 0) {
         return { columns: [], rows: [], total: 0, opfsStats: stats };
@@ -262,8 +246,6 @@ export async function hashJoinWithInMemoryLeft(db, leftResult, rightDataset, ast
         }
     }
 
-    console.log(`[LanceDatabase] Multi-JOIN: left in-memory (${leftResult.rows.length} rows), right: ${rightTableName}`);
-
     let rightSQL = `SELECT * FROM ${rightTableName}`;
 
     const maxKeysForInClause = 1000;
@@ -280,7 +262,6 @@ export async function hashJoinWithInMemoryLeft(db, leftResult, rightDataset, ast
             if (leftKeys.size > 0 && leftKeys.size <= maxKeysForInClause) {
                 const inClause = buildInClause(rightKey, leftKeys);
                 rightSQL = appendWhereClause(rightSQL, inClause);
-                console.log(`[LanceDatabase] Multi-JOIN semi-join: ${leftKeys.size} keys`);
             }
         }
     }
@@ -417,7 +398,6 @@ export function filterToSQL(expr) {
         return `${expr.op}${operand}`;
     }
 
-    console.warn('[LanceDB] Unknown filter expression type:', expr.type);
     return '';
 }
 

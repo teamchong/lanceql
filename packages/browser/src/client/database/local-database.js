@@ -38,29 +38,16 @@ class OPFSJoinExecutor {
             prePartitionedLeft = null  // Optional: pre-partitioned left metadata for semi-join optimization
         } = options;
 
-        console.log(`[OPFSJoin] Starting OPFS-backed hash join (${joinType})`);
-        console.log(`[OPFSJoin] Session: ${this.sessionId}`);
-        console.log(`[OPFSJoin] Partitions: ${this.numPartitions}`);
-
         try {
-            // Phase 1: Partition left table to OPFS (skip if pre-partitioned)
             let leftMeta;
             if (prePartitionedLeft) {
-                console.log(`[OPFSJoin] Phase 1: Using pre-partitioned left table (semi-join optimization)`);
                 leftMeta = prePartitionedLeft;
             } else {
-                console.log(`[OPFSJoin] Phase 1: Partitioning left table...`);
                 leftMeta = await this._partitionToOPFS(leftStream, leftKey, 'left');
             }
-            console.log(`[OPFSJoin] Left table: ${leftMeta.totalRows} rows in ${leftMeta.partitionsUsed.size} partitions`);
 
-            // Phase 2: Partition right table to OPFS
-            console.log(`[OPFSJoin] Phase 2: Partitioning right table...`);
             const rightMeta = await this._partitionToOPFS(rightStream, rightKey, 'right');
-            console.log(`[OPFSJoin] Right table: ${rightMeta.totalRows} rows in ${rightMeta.partitionsUsed.size} partitions`);
 
-            // Phase 3: Join partition by partition
-            console.log(`[OPFSJoin] Phase 3: Joining partitions (${joinType})...`);
             let totalYielded = 0;
 
             // Create NULL padding arrays for outer joins
@@ -80,9 +67,7 @@ class OPFSJoinExecutor {
                 }
             };
 
-            // For CROSS JOIN: cartesian product without partitioning
             if (joinType === 'CROSS') {
-                console.log(`[OPFSJoin] CROSS JOIN: computing cartesian product`);
                 const chunk = [];
 
                 // Load all partitions for both tables
@@ -108,7 +93,6 @@ class OPFSJoinExecutor {
                 if (chunk.length > 0) {
                     yield { columns: resultColumns, rows: chunk };
                 }
-                console.log(`[OPFSJoin] CROSS JOIN complete: ${totalYielded} result rows`);
                 return;
             }
 
@@ -127,7 +111,6 @@ class OPFSJoinExecutor {
             const bothSidesPartitions = new Set(
                 [...leftMeta.partitionsUsed].filter(p => rightMeta.partitionsUsed.has(p))
             );
-            console.log(`[OPFSJoin] Partitions with both sides: ${bothSidesPartitions.size}`);
 
             for (const partitionId of bothSidesPartitions) {
                 if (totalYielded >= limit) break;
@@ -253,9 +236,6 @@ class OPFSJoinExecutor {
                     }
                 }
             }
-
-            console.log(`[OPFSJoin] ${joinType} JOIN complete: ${totalYielded} result rows`);
-            console.log(`[OPFSJoin] Stats:`, this.getStats());
 
         } finally {
             // Cleanup temp files
@@ -410,9 +390,8 @@ class OPFSJoinExecutor {
     async cleanup() {
         try {
             await this.storage.deleteDir(this.basePath);
-            console.log(`[OPFSJoin] Cleaned up temp files: ${this.basePath}`);
-        } catch (e) {
-            console.warn(`[OPFSJoin] Cleanup failed:`, e);
+        } catch {
+            // Cleanup failures are non-fatal
         }
     }
 }
