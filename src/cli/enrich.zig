@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const args = @import("args.zig");
+const file_detect = @import("file_detect.zig");
 
 // Index building module
 const index_builder = @import("enrich/index_builder.zig");
@@ -42,14 +43,6 @@ pub const EnrichError = error{
     OutOfMemory,
     QueryError,
     EmptyResult,
-};
-
-/// File types for detection
-const FileType = enum {
-    lance,
-    parquet,
-    arrow,
-    unknown,
 };
 
 pub fn run(allocator: std.mem.Allocator, opts: args.EnrichOptions) !void {
@@ -99,7 +92,7 @@ pub fn run(allocator: std.mem.Allocator, opts: args.EnrichOptions) !void {
     };
     defer allocator.free(data);
 
-    const file_type = detectFileType(input_path, data);
+    const file_type = file_detect.detect(input_path, data);
     const sql = try std.fmt.allocPrint(allocator, "SELECT * FROM '{s}'", .{input_path});
     defer allocator.free(sql);
 
@@ -176,22 +169,8 @@ pub fn run(allocator: std.mem.Allocator, opts: args.EnrichOptions) !void {
     }
 }
 
-/// Detect file type from extension and magic bytes
-fn detectFileType(path: []const u8, data: []const u8) FileType {
-    if (std.mem.endsWith(u8, path, ".lance")) return .lance;
-    if (std.mem.endsWith(u8, path, ".parquet")) return .parquet;
-    if (std.mem.endsWith(u8, path, ".arrow") or std.mem.endsWith(u8, path, ".feather")) return .arrow;
-
-    // Check magic bytes
-    if (data.len >= 4 and std.mem.eql(u8, data[0..4], "PAR1")) return .parquet;
-    if (data.len >= 6 and std.mem.eql(u8, data[0..6], "ARROW1")) return .arrow;
-    if (data.len >= 40 and std.mem.eql(u8, data[data.len - 4 ..], "LANC")) return .lance;
-
-    return .unknown;
-}
-
 /// Execute SQL query on data
-fn executeQuery(allocator: std.mem.Allocator, data: []const u8, sql: []const u8, file_type: FileType) !Result {
+fn executeQuery(allocator: std.mem.Allocator, data: []const u8, sql: []const u8, file_type: file_detect.FileType) !Result {
     // Tokenize
     var lex = lexer.Lexer.init(sql);
     var tokens = std.ArrayList(lexer.Token){};
@@ -236,8 +215,9 @@ fn executeQuery(allocator: std.mem.Allocator, data: []const u8, sql: []const u8,
 
             return try exec.execute(&stmt.select, &[_]ast.Value{});
         },
-        .unknown => {
-            // Try Lance first, then Parquet
+        else => {
+            // Unsupported formats (avro, orc, xlsx, csv, json, delta, iceberg, unknown)
+            // Try Lance first, then Parquet as fallback
             if (Table.init(allocator, data)) |table_result| {
                 var table = table_result;
                 defer table.deinit();
@@ -460,6 +440,6 @@ test "enrich error types" {
 }
 
 test "detect file type" {
-    try std.testing.expectEqual(FileType.parquet, detectFileType("test.parquet", "PAR1...."));
-    try std.testing.expectEqual(FileType.lance, detectFileType("test.lance", "...."));
+    try std.testing.expectEqual(file_detect.FileType.parquet, file_detect.detect("test.parquet", "PAR1...."));
+    try std.testing.expectEqual(file_detect.FileType.lance, file_detect.detect("test.lance", "...."));
 }

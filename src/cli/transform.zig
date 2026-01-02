@@ -22,6 +22,7 @@ const executor = @import("lanceql.sql.executor");
 const ast = @import("lanceql.sql.ast");
 const Result = executor.Result;
 const args = @import("args.zig");
+const file_detect = @import("file_detect.zig");
 
 pub const TransformError = error{
     NoInputFile,
@@ -31,17 +32,6 @@ pub const TransformError = error{
     QueryError,
     WriteError,
     OutOfMemory,
-};
-
-/// File types for detection
-const FileType = enum {
-    lance,
-    parquet,
-    arrow,
-    avro,
-    orc,
-    xlsx,
-    unknown,
 };
 
 /// Run the transform command
@@ -73,7 +63,7 @@ pub fn run(allocator: std.mem.Allocator, opts: args.TransformOptions) !void {
     defer allocator.free(data);
 
     // Detect file type and execute query
-    const file_type = detectFileType(input_path, data);
+    const file_type = file_detect.detect(input_path, data);
     var result = try executeQuery(allocator, data, sql, file_type);
     defer result.deinit();
 
@@ -162,32 +152,8 @@ fn findRename(rename_spec: []const u8, col_name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Detect file type from extension and magic bytes
-fn detectFileType(path: []const u8, data: []const u8) FileType {
-    // Check extension first
-    if (std.mem.endsWith(u8, path, ".lance")) return .lance;
-    if (std.mem.endsWith(u8, path, ".parquet")) return .parquet;
-    if (std.mem.endsWith(u8, path, ".arrow") or std.mem.endsWith(u8, path, ".feather") or std.mem.endsWith(u8, path, ".arrows")) return .arrow;
-    if (std.mem.endsWith(u8, path, ".avro")) return .avro;
-    if (std.mem.endsWith(u8, path, ".orc")) return .orc;
-    if (std.mem.endsWith(u8, path, ".xlsx")) return .xlsx;
-
-    // Check magic bytes
-    if (data.len >= 4) {
-        if (std.mem.eql(u8, data[0..4], "PAR1")) return .parquet;
-        if (std.mem.eql(u8, data[0..4], "ORC\x00") or std.mem.eql(u8, data[0..3], "ORC")) return .orc;
-        if (std.mem.eql(u8, data[0..4], "Obj\x01")) return .avro;
-    }
-    if (data.len >= 6 and std.mem.eql(u8, data[0..6], "ARROW1")) return .arrow;
-
-    // Check for Lance magic at end
-    if (data.len >= 40 and std.mem.eql(u8, data[data.len - 4 ..], "LANC")) return .lance;
-
-    return .unknown;
-}
-
 /// Execute SQL query on data
-fn executeQuery(allocator: std.mem.Allocator, data: []const u8, sql: []const u8, file_type: FileType) !Result {
+fn executeQuery(allocator: std.mem.Allocator, data: []const u8, sql: []const u8, file_type: file_detect.FileType) !Result {
     // Tokenize
     var lex = lexer.Lexer.init(sql);
     var tokens = std.ArrayList(lexer.Token){};
@@ -259,8 +225,9 @@ fn executeQuery(allocator: std.mem.Allocator, data: []const u8, sql: []const u8,
 
             return try exec.execute(&stmt.select, &[_]ast.Value{});
         },
-        .unknown => {
-            // Try Lance first, then Parquet
+        else => {
+            // Unsupported formats (csv, json, delta, iceberg, unknown)
+            // Try Lance first, then Parquet as fallback
             if (Table.init(allocator, data)) |table_result| {
                 var table = table_result;
                 defer table.deinit();

@@ -22,6 +22,7 @@ const output = @import("cli/output.zig");
 const benchmark = @import("cli/benchmark.zig");
 const file_utils = @import("cli/file_utils.zig");
 const yaml = @import("cli/yaml.zig");
+const file_detect = @import("cli/file_detect.zig");
 const lanceql = @import("lanceql");
 const metal = @import("lanceql.metal");
 const Table = @import("lanceql.table").Table;
@@ -37,75 +38,6 @@ const executor = @import("lanceql.sql.executor");
 const lexer = @import("lanceql.sql.lexer");
 const parser = @import("lanceql.sql.parser");
 const ast = @import("lanceql.sql.ast");
-
-/// File type detection
-const FileType = enum {
-    lance,
-    parquet,
-    delta,
-    iceberg,
-    arrow,
-    avro,
-    orc,
-    xlsx,
-    unknown,
-};
-
-fn detectFileType(path: []const u8, data: []const u8) FileType {
-    // Check by extension first
-    if (std.mem.endsWith(u8, path, ".parquet")) return .parquet;
-    if (std.mem.endsWith(u8, path, ".lance")) return .lance;
-    if (std.mem.endsWith(u8, path, ".arrow") or std.mem.endsWith(u8, path, ".arrows") or std.mem.endsWith(u8, path, ".feather")) return .arrow;
-    if (std.mem.endsWith(u8, path, ".avro")) return .avro;
-    if (std.mem.endsWith(u8, path, ".orc")) return .orc;
-    if (std.mem.endsWith(u8, path, ".xlsx")) return .xlsx;
-
-    // Check for Delta directory (has _delta_log/ subdirectory)
-    if (std.mem.endsWith(u8, path, ".delta") or isDeltaDirectory(path)) {
-        return .delta;
-    }
-
-    // Check for Iceberg directory (has metadata/ subdirectory)
-    if (std.mem.endsWith(u8, path, ".iceberg") or isIcebergDirectory(path)) {
-        return .iceberg;
-    }
-
-    // Check magic bytes
-    if (data.len >= 6) {
-        if (std.mem.eql(u8, data[0..6], "ARROW1")) return .arrow;
-    }
-    if (data.len >= 4) {
-        if (std.mem.eql(u8, data[0..4], "PAR1")) return .parquet;
-        if (std.mem.eql(u8, data[0..4], "Obj\x01")) return .avro;
-        if (std.mem.eql(u8, data[0..4], "PK\x03\x04")) return .xlsx;
-        if (data.len >= 40 and std.mem.eql(u8, data[data.len - 4 ..], "LANC")) return .lance;
-    }
-    if (data.len >= 3) {
-        if (std.mem.eql(u8, data[0..3], "ORC")) return .orc;
-    }
-
-    return .unknown;
-}
-
-/// Check if path is a Delta Lake table (directory with _delta_log/)
-fn isDeltaDirectory(path: []const u8) bool {
-    var path_buf: [4096]u8 = undefined;
-    const delta_log_path = std.fmt.bufPrint(&path_buf, "{s}/_delta_log", .{path}) catch return false;
-
-    // Try to stat the _delta_log directory
-    const stat = std.fs.cwd().statFile(delta_log_path) catch return false;
-    return stat.kind == .directory;
-}
-
-/// Check if path is an Iceberg table (directory with metadata/)
-fn isIcebergDirectory(path: []const u8) bool {
-    var path_buf: [4096]u8 = undefined;
-    const metadata_path = std.fmt.bufPrint(&path_buf, "{s}/metadata", .{path}) catch return false;
-
-    // Try to stat the metadata directory
-    const stat = std.fs.cwd().statFile(metadata_path) catch return false;
-    return stat.kind == .directory;
-}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -427,7 +359,7 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, legacy_args: Legacy
     };
 
     // Check for Delta first (directory-based, doesn't need to read file data)
-    if (isDeltaDirectory(table_path) or std.mem.endsWith(u8, table_path, ".delta")) {
+    if (file_detect.isDeltaDirectory(table_path) or std.mem.endsWith(u8, table_path, ".delta")) {
         runQueryWithFormat(allocator, .delta, .{ .path = table_path }, query, legacy_args) catch |err| {
             std.debug.print("Delta query error: {}\n", .{err});
         };
@@ -435,7 +367,7 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, legacy_args: Legacy
     }
 
     // Check for Iceberg (directory-based, doesn't need to read file data)
-    if (isIcebergDirectory(table_path) or std.mem.endsWith(u8, table_path, ".iceberg")) {
+    if (file_detect.isIcebergDirectory(table_path) or std.mem.endsWith(u8, table_path, ".iceberg")) {
         runQueryWithFormat(allocator, .iceberg, .{ .path = table_path }, query, legacy_args) catch |err| {
             std.debug.print("Iceberg query error: {}\n", .{err});
         };
@@ -450,7 +382,7 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, legacy_args: Legacy
     defer allocator.free(data);
 
     // Detect file type
-    const file_type = detectFileType(table_path, data);
+    const file_type = file_detect.detect(table_path, data);
 
     const format: AnyTable.Format = switch (file_type) {
         .parquet => .parquet,
@@ -461,7 +393,7 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, legacy_args: Legacy
         .avro => .avro,
         .orc => .orc,
         .xlsx => .xlsx,
-        .unknown => .lance, // Try Lance first for unknown formats
+        else => .lance, // Try Lance first for unknown/text formats
     };
 
     const input: AnyTable.InitInput = switch (format) {
@@ -470,8 +402,8 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, legacy_args: Legacy
     };
 
     runQueryWithFormat(allocator, format, input, query, legacy_args) catch |err| {
-        if (file_type == .unknown) {
-            // Fallback to Parquet for unknown formats
+        if (file_type == .unknown or file_type == .csv or file_type == .json or file_type == .jsonl or file_type == .tsv) {
+            // Fallback to Parquet for unknown/text formats
             runQueryWithFormat(allocator, .parquet, .{ .data = data }, query, legacy_args) catch |e| {
                 std.debug.print("Query error: {}\n", .{e});
             };
