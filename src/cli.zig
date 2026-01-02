@@ -659,10 +659,10 @@ fn runXlsxQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u
     outputResults(&result, legacy_args);
 }
 
-fn printResultsTable(result: *executor.Result) void {
+fn printResultsDelimited(result: *executor.Result, comptime delimiter: []const u8) void {
     // Print header
     for (result.columns, 0..) |col, i| {
-        if (i > 0) std.debug.print("\t", .{});
+        if (i > 0) std.debug.print(delimiter, .{});
         std.debug.print("{s}", .{col.name});
     }
     std.debug.print("\n", .{});
@@ -670,29 +670,19 @@ fn printResultsTable(result: *executor.Result) void {
     // Print rows
     for (0..result.row_count) |row| {
         for (result.columns, 0..) |col, i| {
-            if (i > 0) std.debug.print("\t", .{});
+            if (i > 0) std.debug.print(delimiter, .{});
             printValue(col.data, row);
         }
         std.debug.print("\n", .{});
     }
 }
 
-fn printResultsCsv(result: *executor.Result) void {
-    // Print header
-    for (result.columns, 0..) |col, i| {
-        if (i > 0) std.debug.print(",", .{});
-        std.debug.print("{s}", .{col.name});
-    }
-    std.debug.print("\n", .{});
+fn printResultsTable(result: *executor.Result) void {
+    printResultsDelimited(result, "\t");
+}
 
-    // Print rows
-    for (0..result.row_count) |row| {
-        for (result.columns, 0..) |col, i| {
-            if (i > 0) std.debug.print(",", .{});
-            printValue(col.data, row);
-        }
-        std.debug.print("\n", .{});
-    }
+fn printResultsCsv(result: *executor.Result) void {
+    printResultsDelimited(result, ",");
 }
 
 fn printResultsJson(result: *executor.Result) void {
