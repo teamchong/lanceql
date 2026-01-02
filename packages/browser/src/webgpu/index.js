@@ -4,6 +4,7 @@
  * GPU-accelerated text and image encoding for semantic search.
  * GPU-accelerated SQL aggregations (SUM, COUNT, AVG, MIN, MAX).
  * GPU-accelerated SQL JOINs (hash join for large tables).
+ * GPU-accelerated SQL ORDER BY (bitonic sort for large result sets).
  */
 
 export { GPUBufferManager, ModelWeightCache } from './gpu-buffers.js';
@@ -24,6 +25,11 @@ export {
     getGPUJoiner,
     shouldUseGPUJoin,
 } from './gpu-joins.js';
+export {
+    GPUSorter,
+    getGPUSorter,
+    shouldUseGPUSort,
+} from './gpu-sort.js';
 
 // Shader sources (for advanced users)
 export const SHADERS = {
@@ -34,6 +40,7 @@ export const SHADERS = {
     ATTENTION: './shaders/attention.wgsl',
     REDUCE: './shaders/reduce.wgsl',
     JOIN: './shaders/join.wgsl',
+    SORT: './shaders/sort.wgsl',
 };
 
 /**

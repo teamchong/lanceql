@@ -4653,4 +4653,148 @@ test.describe('Vault SQL Operations', () => {
             expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
         }
     });
+
+    test('GPU bitonic sort matches CPU results', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { gpuSorter } = await import('./lanceql.js');
+            const tests = [];
+
+            // Initialize GPU sorter
+            await gpuSorter.init();
+            const isAvailable = gpuSorter.isAvailable();
+            tests.push({ name: 'GPUSorter initializes', pass: true, actual: isAvailable ? 'GPU available' : 'CPU fallback' });
+
+            // Test ascending sort
+            try {
+                const values = new Float32Array([5, 2, 8, 1, 9, 3, 7, 4, 6, 0]);
+                const sortedIdx = await gpuSorter.sort(values, true);
+                const sorted = Array.from(sortedIdx).map(i => values[i]);
+                const expected = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+                const match = sorted.every((v, i) => v === expected[i]);
+                tests.push({ name: 'Ascending sort', pass: match, actual: sorted.join(',') });
+            } catch (e) {
+                tests.push({ name: 'Ascending sort', pass: false, error: e.message });
+            }
+
+            // Test descending sort
+            try {
+                const values = new Float32Array([5, 2, 8, 1, 9, 3, 7, 4, 6, 0]);
+                const sortedIdx = await gpuSorter.sort(values, false);
+                const sorted = Array.from(sortedIdx).map(i => values[i]);
+                const expected = [9, 8, 7, 6, 5, 4, 3, 2, 1, 0];
+                const match = sorted.every((v, i) => v === expected[i]);
+                tests.push({ name: 'Descending sort', pass: match, actual: sorted.join(',') });
+            } catch (e) {
+                tests.push({ name: 'Descending sort', pass: false, error: e.message });
+            }
+
+            // Test already sorted array
+            try {
+                const values = new Float32Array([0, 1, 2, 3, 4]);
+                const sortedIdx = await gpuSorter.sort(values, true);
+                const sorted = Array.from(sortedIdx).map(i => values[i]);
+                const match = sorted.every((v, i) => v === i);
+                tests.push({ name: 'Already sorted', pass: match, actual: sorted.join(',') });
+            } catch (e) {
+                tests.push({ name: 'Already sorted', pass: false, error: e.message });
+            }
+
+            // Test reverse sorted array
+            try {
+                const values = new Float32Array([4, 3, 2, 1, 0]);
+                const sortedIdx = await gpuSorter.sort(values, true);
+                const sorted = Array.from(sortedIdx).map(i => values[i]);
+                const expected = [0, 1, 2, 3, 4];
+                const match = sorted.every((v, i) => v === expected[i]);
+                tests.push({ name: 'Reverse sorted', pass: match, actual: sorted.join(',') });
+            } catch (e) {
+                tests.push({ name: 'Reverse sorted', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('GPU sort handles edge cases', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { gpuSorter } = await import('./lanceql.js');
+            const tests = [];
+
+            await gpuSorter.init();
+
+            // Test empty array
+            try {
+                const result = await gpuSorter.sort(new Float32Array([]), true);
+                tests.push({ name: 'Empty array', pass: result.length === 0, actual: result.length });
+            } catch (e) {
+                tests.push({ name: 'Empty array', pass: false, error: e.message });
+            }
+
+            // Test single element
+            try {
+                const result = await gpuSorter.sort(new Float32Array([42]), true);
+                tests.push({ name: 'Single element', pass: result.length === 1 && result[0] === 0, actual: result.length });
+            } catch (e) {
+                tests.push({ name: 'Single element', pass: false, error: e.message });
+            }
+
+            // Test duplicate values
+            try {
+                const values = new Float32Array([3, 1, 2, 1, 3]);
+                const sortedIdx = await gpuSorter.sort(values, true);
+                const sorted = Array.from(sortedIdx).map(i => values[i]);
+                // Should be [1, 1, 2, 3, 3]
+                const match = sorted[0] === 1 && sorted[1] === 1 && sorted[2] === 2 && sorted[3] === 3 && sorted[4] === 3;
+                tests.push({ name: 'Duplicate values', pass: match, actual: sorted.join(',') });
+            } catch (e) {
+                tests.push({ name: 'Duplicate values', pass: false, error: e.message });
+            }
+
+            // Test negative numbers
+            try {
+                const values = new Float32Array([-5, 3, -1, 0, 2]);
+                const sortedIdx = await gpuSorter.sort(values, true);
+                const sorted = Array.from(sortedIdx).map(i => values[i]);
+                const expected = [-5, -1, 0, 2, 3];
+                const match = sorted.every((v, i) => v === expected[i]);
+                tests.push({ name: 'Negative numbers', pass: match, actual: sorted.join(',') });
+            } catch (e) {
+                tests.push({ name: 'Negative numbers', pass: false, error: e.message });
+            }
+
+            // Test larger array (power of 2)
+            try {
+                const values = new Float32Array(64);
+                for (let i = 0; i < 64; i++) values[i] = 63 - i;  // Reverse order
+                const sortedIdx = await gpuSorter.sort(values, true);
+                const sorted = Array.from(sortedIdx).map(i => values[i]);
+                const match = sorted.every((v, i) => v === i);
+                tests.push({ name: 'Power of 2 size', pass: match, actual: match ? '64 elements sorted' : sorted.slice(0, 5).join(',') + '...' });
+            } catch (e) {
+                tests.push({ name: 'Power of 2 size', pass: false, error: e.message });
+            }
+
+            // Test non-power of 2 size
+            try {
+                const values = new Float32Array(100);
+                for (let i = 0; i < 100; i++) values[i] = 99 - i;  // Reverse order
+                const sortedIdx = await gpuSorter.sort(values, true);
+                const sorted = Array.from(sortedIdx).map(i => values[i]);
+                const match = sorted.every((v, i) => v === i);
+                tests.push({ name: 'Non-power of 2 size', pass: match, actual: match ? '100 elements sorted' : sorted.slice(0, 5).join(',') + '...' });
+            } catch (e) {
+                tests.push({ name: 'Non-power of 2 size', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
 });
