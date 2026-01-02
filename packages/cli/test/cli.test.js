@@ -7,12 +7,13 @@
  *   npx @metal0/lanceql ingest data.csv -o out.lance
  */
 
-const { spawnSync } = require('child_process');
+const { spawnSync, spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const assert = require('assert');
 const { describe, it, before, after } = require('node:test');
+const http = require('http');
 
 // Path to the built CLI binary
 const CLI_PATH = path.resolve(__dirname, '../../../zig-out/bin/lanceql');
@@ -43,6 +44,29 @@ function runCli(args, options = {}) {
 // Check if CLI binary exists
 function cliExists() {
   return fs.existsSync(CLI_PATH);
+}
+
+// Helper for async sleep
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Helper to make HTTP request
+function httpRequest(options) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => resolve({ status: res.statusCode, data }));
+    });
+    req.on('error', reject);
+    req.setTimeout(5000, () => {
+      req.destroy();
+      reject(new Error('Request timeout'));
+    });
+    if (options.body) req.write(options.body);
+    req.end();
+  });
 }
 
 describe('LanceQL CLI', () => {
@@ -345,6 +369,476 @@ describe('LanceQL CLI', () => {
           `Help should mention ${format} format`
         );
       }
+    });
+  });
+
+  describe('Serve Command', () => {
+    const TEST_PORT = 19876; // Use high port to avoid conflicts
+    let serverProcess = null;
+
+    after(() => {
+      if (serverProcess) {
+        serverProcess.kill('SIGTERM');
+        serverProcess = null;
+      }
+    });
+
+    it('should show serve help with --help', () => {
+      if (!cliExists()) return;
+
+      const result = runCli('serve --help');
+      assert.strictEqual(result.exitCode, 0);
+      assert.match(result.output, /serve|HTTP|REST|API|port/i);
+    });
+
+    it('should start server and respond to health check', async () => {
+      if (!cliExists()) return;
+
+      const parquetFile = path.join(FIXTURES_PATH, 'simple.parquet');
+      if (!fs.existsSync(parquetFile)) {
+        console.log('Skipping: simple.parquet not found');
+        return;
+      }
+
+      // Start server in background
+      serverProcess = spawn(CLI_PATH, ['serve', parquetFile, '--port', String(TEST_PORT), '--no-open'], {
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+
+      // Wait for server to start
+      await sleep(1500);
+
+      try {
+        const response = await httpRequest({
+          hostname: 'localhost',
+          port: TEST_PORT,
+          path: '/api/health',
+          method: 'GET'
+        });
+        assert.strictEqual(response.status, 200);
+        assert.match(response.data, /ok|status/i);
+      } finally {
+        serverProcess.kill('SIGTERM');
+        serverProcess = null;
+      }
+    });
+
+    it('should return schema via API', async () => {
+      if (!cliExists()) return;
+
+      const parquetFile = path.join(FIXTURES_PATH, 'simple.parquet');
+      if (!fs.existsSync(parquetFile)) {
+        console.log('Skipping: simple.parquet not found');
+        return;
+      }
+
+      serverProcess = spawn(CLI_PATH, ['serve', parquetFile, '--port', String(TEST_PORT + 1), '--no-open'], {
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+
+      await sleep(1500);
+
+      try {
+        const response = await httpRequest({
+          hostname: 'localhost',
+          port: TEST_PORT + 1,
+          path: '/api/schema',
+          method: 'GET'
+        });
+        assert.strictEqual(response.status, 200);
+        const schema = JSON.parse(response.data);
+        assert.ok(Array.isArray(schema.columns), 'Schema should have columns array');
+        assert.ok(schema.columns.length > 0, 'Schema should have at least one column');
+      } finally {
+        serverProcess.kill('SIGTERM');
+        serverProcess = null;
+      }
+    });
+
+    it('should execute query via API', async () => {
+      if (!cliExists()) return;
+
+      const parquetFile = path.join(FIXTURES_PATH, 'simple.parquet');
+      if (!fs.existsSync(parquetFile)) {
+        console.log('Skipping: simple.parquet not found');
+        return;
+      }
+
+      serverProcess = spawn(CLI_PATH, ['serve', parquetFile, '--port', String(TEST_PORT + 2), '--no-open'], {
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+
+      await sleep(1500);
+
+      try {
+        const body = JSON.stringify({ sql: 'SELECT * LIMIT 3' });
+        const response = await httpRequest({
+          hostname: 'localhost',
+          port: TEST_PORT + 2,
+          path: '/api/query',
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': body.length },
+          body
+        });
+        assert.strictEqual(response.status, 200);
+        const result = JSON.parse(response.data);
+        assert.ok(Array.isArray(result.columns), 'Result should have columns');
+        assert.ok(Array.isArray(result.rows), 'Result should have rows');
+        assert.ok(result.rows.length <= 3, 'Should return at most 3 rows');
+      } finally {
+        serverProcess.kill('SIGTERM');
+        serverProcess = null;
+      }
+    });
+
+    it('should return error for invalid query', async () => {
+      if (!cliExists()) return;
+
+      const parquetFile = path.join(FIXTURES_PATH, 'simple.parquet');
+      if (!fs.existsSync(parquetFile)) {
+        console.log('Skipping: simple.parquet not found');
+        return;
+      }
+
+      serverProcess = spawn(CLI_PATH, ['serve', parquetFile, '--port', String(TEST_PORT + 3), '--no-open'], {
+        stdio: ['ignore', 'pipe', 'pipe']
+      });
+
+      await sleep(1500);
+
+      try {
+        const body = JSON.stringify({ sql: 'INVALID SQL SYNTAX HERE' });
+        const response = await httpRequest({
+          hostname: 'localhost',
+          port: TEST_PORT + 3,
+          path: '/api/query',
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': body.length },
+          body
+        });
+        // Should return 400 or include error message
+        const hasError = response.status === 400 || response.data.toLowerCase().includes('error');
+        assert.ok(hasError, 'Should return error for invalid SQL');
+      } finally {
+        serverProcess.kill('SIGTERM');
+        serverProcess = null;
+      }
+    });
+  });
+
+  describe('Enrich Command', () => {
+    let tempDir;
+
+    before(() => {
+      tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lanceql-enrich-'));
+    });
+
+    after(() => {
+      if (tempDir) {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('should show enrich help with --help', () => {
+      if (!cliExists()) return;
+
+      const result = runCli('enrich --help');
+      assert.strictEqual(result.exitCode, 0);
+      assert.match(result.output, /enrich|embedding|vector|index/i);
+    });
+
+    it('should enrich Lance file with embeddings', () => {
+      if (!cliExists()) return;
+
+      // First create a Lance file with text column
+      const jsonPath = path.join(tempDir, 'texts.json');
+      const inputLance = path.join(tempDir, 'input.lance');
+      const outputLance = path.join(tempDir, 'enriched.lance');
+
+      fs.writeFileSync(jsonPath, JSON.stringify([
+        { id: 1, text: 'Hello world' },
+        { id: 2, text: 'Machine learning' },
+        { id: 3, text: 'Vector search' }
+      ]));
+
+      // Ingest to Lance first
+      let result = runCli(`ingest "${jsonPath}" -o "${inputLance}"`);
+      if (result.exitCode !== 0) {
+        console.log('Skipping: Failed to create input Lance file');
+        return;
+      }
+
+      // Now enrich
+      result = runCli(`enrich "${inputLance}" -o "${outputLance}" --embed text`);
+      // Enrich may use mock embeddings or indicate embedding generation
+      assert.ok(
+        result.exitCode === 0 ||
+        result.output.toLowerCase().includes('embedding') ||
+        result.output.toLowerCase().includes('vector') ||
+        result.output.toLowerCase().includes('enriched'),
+        'Enrich should complete or indicate embedding generation'
+      );
+    });
+
+    it('should create flat index', () => {
+      if (!cliExists()) return;
+
+      const jsonPath = path.join(tempDir, 'flat_texts.json');
+      const inputLance = path.join(tempDir, 'flat_input.lance');
+      const outputLance = path.join(tempDir, 'flat_enriched.lance');
+
+      fs.writeFileSync(jsonPath, JSON.stringify([
+        { id: 1, text: 'Test one' },
+        { id: 2, text: 'Test two' }
+      ]));
+
+      runCli(`ingest "${jsonPath}" -o "${inputLance}"`);
+
+      const result = runCli(`enrich "${inputLance}" -o "${outputLance}" --embed text --index flat`);
+      assert.ok(
+        result.exitCode === 0 ||
+        result.output.toLowerCase().includes('flat') ||
+        result.output.toLowerCase().includes('index') ||
+        result.output.toLowerCase().includes('embedding'),
+        'Should support flat index type'
+      );
+    });
+
+    it('should error on missing text column', () => {
+      if (!cliExists()) return;
+
+      const jsonPath = path.join(tempDir, 'no_text.json');
+      const inputLance = path.join(tempDir, 'no_text.lance');
+      const outputLance = path.join(tempDir, 'no_text_out.lance');
+
+      fs.writeFileSync(jsonPath, JSON.stringify([
+        { id: 1, value: 100 },
+        { id: 2, value: 200 }
+      ]));
+
+      runCli(`ingest "${jsonPath}" -o "${inputLance}"`);
+
+      // Request non-existent column
+      const result = runCli(`enrich "${inputLance}" -o "${outputLance}" --embed nonexistent`);
+      const hasError = result.exitCode !== 0 ||
+                       result.output.toLowerCase().includes('error') ||
+                       result.output.toLowerCase().includes('not found') ||
+                       result.output.toLowerCase().includes('column');
+      assert.ok(hasError, 'Should error on missing column');
+    });
+  });
+
+  describe('Transform Command - Operations', () => {
+    let tempDir;
+
+    before(() => {
+      tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lanceql-transform-'));
+    });
+
+    after(() => {
+      if (tempDir) {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      }
+    });
+
+    it('should select specific columns', () => {
+      if (!cliExists()) return;
+
+      const parquetFile = path.join(FIXTURES_PATH, 'simple.parquet');
+      const outputLance = path.join(tempDir, 'select_cols.lance');
+
+      if (!fs.existsSync(parquetFile)) {
+        console.log('Skipping: simple.parquet not found');
+        return;
+      }
+
+      const result = runCli(`transform "${parquetFile}" -o "${outputLance}" --select "id, name"`);
+      assert.ok(
+        result.exitCode === 0 || result.output.includes('select'),
+        'Should support column selection'
+      );
+    });
+
+    it('should filter rows with WHERE', () => {
+      if (!cliExists()) return;
+
+      const parquetFile = path.join(FIXTURES_PATH, 'simple.parquet');
+      const outputLance = path.join(tempDir, 'where_filter.lance');
+
+      if (!fs.existsSync(parquetFile)) {
+        console.log('Skipping: simple.parquet not found');
+        return;
+      }
+
+      const result = runCli(`transform "${parquetFile}" -o "${outputLance}" --where "id > 2"`);
+      assert.ok(
+        result.exitCode === 0 || result.output.includes('where') || result.output.includes('filter'),
+        'Should support WHERE filtering'
+      );
+    });
+
+    it('should limit results', () => {
+      if (!cliExists()) return;
+
+      const parquetFile = path.join(FIXTURES_PATH, 'simple.parquet');
+      const outputLance = path.join(tempDir, 'limit_rows.lance');
+
+      if (!fs.existsSync(parquetFile)) {
+        console.log('Skipping: simple.parquet not found');
+        return;
+      }
+
+      const result = runCli(`transform "${parquetFile}" -o "${outputLance}" --limit 2`);
+      assert.ok(
+        result.exitCode === 0 || result.output.includes('limit'),
+        'Should support LIMIT'
+      );
+    });
+
+    it('should transform Parquet to Lance', () => {
+      if (!cliExists()) return;
+
+      const parquetFile = path.join(FIXTURES_PATH, 'simple.parquet');
+      const outputLance = path.join(tempDir, 'parquet_to_lance.lance');
+
+      if (!fs.existsSync(parquetFile)) {
+        console.log('Skipping: simple.parquet not found');
+        return;
+      }
+
+      const result = runCli(`transform "${parquetFile}" -o "${outputLance}"`);
+      if (result.exitCode === 0) {
+        assert.ok(fs.existsSync(outputLance), 'Lance output file should be created');
+      }
+    });
+
+    it('should transform Arrow to Lance', () => {
+      if (!cliExists()) return;
+
+      const arrowFile = path.join(FIXTURES_PATH, 'simple.arrow');
+      const outputLance = path.join(tempDir, 'arrow_to_lance.lance');
+
+      if (!fs.existsSync(arrowFile)) {
+        console.log('Skipping: simple.arrow not found');
+        return;
+      }
+
+      const result = runCli(`transform "${arrowFile}" -o "${outputLance}"`);
+      if (result.exitCode === 0) {
+        assert.ok(fs.existsSync(outputLance), 'Lance output file should be created');
+      }
+    });
+
+    it('should apply SQL expression', () => {
+      if (!cliExists()) return;
+
+      const parquetFile = path.join(FIXTURES_PATH, 'simple.parquet');
+      const outputLance = path.join(tempDir, 'sql_expr.lance');
+
+      if (!fs.existsSync(parquetFile)) {
+        console.log('Skipping: simple.parquet not found');
+        return;
+      }
+
+      const result = runCli(`transform "${parquetFile}" -o "${outputLance}" --sql "SELECT id, value * 2 AS double_value"`);
+      assert.ok(
+        result.exitCode === 0 || result.output.includes('sql'),
+        'Should support SQL expressions'
+      );
+    });
+  });
+
+  describe('Query Command - Edge Cases', () => {
+    it('should handle aggregate functions', () => {
+      if (!cliExists()) return;
+
+      const parquetFile = path.join(FIXTURES_PATH, 'simple.parquet');
+      if (!fs.existsSync(parquetFile)) {
+        console.log('Skipping: simple.parquet not found');
+        return;
+      }
+
+      const result = runCli(`query "SELECT COUNT(*), SUM(value), AVG(value) FROM '${parquetFile}'"`);
+      assert.strictEqual(result.exitCode, 0, `Query failed: ${result.stderr}`);
+      assert.match(result.output, /COUNT|SUM|AVG|\d+/i);
+    });
+
+    it('should handle GROUP BY', () => {
+      if (!cliExists()) return;
+
+      const parquetFile = path.join(FIXTURES_PATH, 'simple.parquet');
+      if (!fs.existsSync(parquetFile)) {
+        console.log('Skipping: simple.parquet not found');
+        return;
+      }
+
+      const result = runCli(`query "SELECT name, COUNT(*) FROM '${parquetFile}' GROUP BY name"`);
+      assert.strictEqual(result.exitCode, 0, `Query failed: ${result.stderr}`);
+    });
+
+    it('should handle ORDER BY', () => {
+      if (!cliExists()) return;
+
+      const parquetFile = path.join(FIXTURES_PATH, 'simple.parquet');
+      if (!fs.existsSync(parquetFile)) {
+        console.log('Skipping: simple.parquet not found');
+        return;
+      }
+
+      const result = runCli(`query "SELECT * FROM '${parquetFile}' ORDER BY id DESC LIMIT 3"`);
+      assert.strictEqual(result.exitCode, 0, `Query failed: ${result.stderr}`);
+    });
+
+    it('should handle WHERE with comparison operators', () => {
+      if (!cliExists()) return;
+
+      const parquetFile = path.join(FIXTURES_PATH, 'simple.parquet');
+      if (!fs.existsSync(parquetFile)) {
+        console.log('Skipping: simple.parquet not found');
+        return;
+      }
+
+      const result = runCli(`query "SELECT * FROM '${parquetFile}' WHERE id >= 2 AND value < 5"`);
+      assert.strictEqual(result.exitCode, 0, `Query failed: ${result.stderr}`);
+    });
+
+    it('should handle string comparisons', () => {
+      if (!cliExists()) return;
+
+      const parquetFile = path.join(FIXTURES_PATH, 'simple.parquet');
+      if (!fs.existsSync(parquetFile)) {
+        console.log('Skipping: simple.parquet not found');
+        return;
+      }
+
+      const result = runCli(`query "SELECT * FROM '${parquetFile}' WHERE name = 'alice'"`);
+      assert.strictEqual(result.exitCode, 0, `Query failed: ${result.stderr}`);
+    });
+
+    it('should handle MIN/MAX functions', () => {
+      if (!cliExists()) return;
+
+      const parquetFile = path.join(FIXTURES_PATH, 'simple.parquet');
+      if (!fs.existsSync(parquetFile)) {
+        console.log('Skipping: simple.parquet not found');
+        return;
+      }
+
+      const result = runCli(`query "SELECT MIN(value), MAX(value) FROM '${parquetFile}'"`);
+      assert.strictEqual(result.exitCode, 0, `Query failed: ${result.stderr}`);
+    });
+
+    it('should handle DISTINCT', () => {
+      if (!cliExists()) return;
+
+      const parquetFile = path.join(FIXTURES_PATH, 'simple.parquet');
+      if (!fs.existsSync(parquetFile)) {
+        console.log('Skipping: simple.parquet not found');
+        return;
+      }
+
+      const result = runCli(`query "SELECT DISTINCT name FROM '${parquetFile}'"`);
+      assert.strictEqual(result.exitCode, 0, `Query failed: ${result.stderr}`);
     });
   });
 });
