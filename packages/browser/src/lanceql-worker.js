@@ -1240,6 +1240,8 @@ const TokenType = {
     CONFLICT: 'CONFLICT', DO: 'DO', NOTHING: 'NOTHING', EXCLUDED: 'EXCLUDED', USING: 'USING',
     // EXPLAIN
     EXPLAIN: 'EXPLAIN', ANALYZE: 'ANALYZE',
+    // PIVOT/UNPIVOT
+    PIVOT: 'PIVOT', UNPIVOT: 'UNPIVOT', FOR: 'FOR',
 
     // Literals
     IDENTIFIER: 'IDENTIFIER', STRING: 'STRING', NUMBER: 'NUMBER',
@@ -1980,7 +1982,73 @@ class SQLParser {
             return { type: 'EXCEPT', all: !!all, left: selectAst, right };
         }
 
+        // Check for PIVOT/UNPIVOT transformations
+        if (this.match(TokenType.PIVOT)) {
+            return this.parsePivot(selectAst);
+        }
+        if (this.match(TokenType.UNPIVOT)) {
+            return this.parseUnpivot(selectAst);
+        }
+
         return selectAst;
+    }
+
+    parsePivot(selectAst) {
+        this.expect(TokenType.LPAREN);
+        const aggToken = this.advance();
+        const aggFunc = (aggToken.value || aggToken.type).toUpperCase();
+        this.expect(TokenType.LPAREN);
+        const valueColumn = this.parseColumnRef();
+        this.expect(TokenType.RPAREN);
+        this.expect(TokenType.FOR);
+        const pivotColumn = this.parseColumnRef();
+        this.expect(TokenType.IN);
+        this.expect(TokenType.LPAREN);
+        const pivotValues = [];
+        do {
+            pivotValues.push(this.expect(TokenType.STRING).value);
+        } while (this.match(TokenType.COMMA));
+        this.expect(TokenType.RPAREN);
+        this.expect(TokenType.RPAREN);
+
+        return {
+            type: 'PIVOT',
+            select: selectAst,
+            aggFunc,
+            valueColumn: typeof valueColumn === 'string' ? valueColumn : valueColumn.column,
+            pivotColumn: typeof pivotColumn === 'string' ? pivotColumn : pivotColumn.column,
+            pivotValues
+        };
+    }
+
+    parseUnpivot(selectAst) {
+        // Helper to get identifier (allows keywords to be used as column names)
+        const getIdentifier = () => {
+            const token = this.advance();
+            // Accept IDENTIFIER or any keyword that has a value (keywords store their value)
+            return token.value || token.type;
+        };
+
+        this.expect(TokenType.LPAREN);
+        const valueColumn = getIdentifier();
+        this.expect(TokenType.FOR);
+        const nameColumn = getIdentifier();
+        this.expect(TokenType.IN);
+        this.expect(TokenType.LPAREN);
+        const unpivotColumns = [];
+        do {
+            unpivotColumns.push(getIdentifier());
+        } while (this.match(TokenType.COMMA));
+        this.expect(TokenType.RPAREN);
+        this.expect(TokenType.RPAREN);
+
+        return {
+            type: 'UNPIVOT',
+            select: selectAst,
+            valueColumn,
+            nameColumn,
+            unpivotColumns
+        };
     }
 
     // Parse a single column in SELECT clause
@@ -5262,6 +5330,96 @@ async function executeAST(db, ast) {
                 columns: ['plan_with_execution'],
                 rows: [[JSON.stringify({ plan, execution })]]
             };
+        }
+
+        case 'PIVOT': {
+            // Execute the SELECT first
+            const selectResult = await executeAST(db, ast.select);
+            const rows = selectResult.rows;
+
+            // Determine grouping columns (all SELECT columns except pivot and value columns)
+            const selectCols = ast.select.columns
+                .filter(c => c.type === 'column')
+                .map(c => typeof c.value === 'string' ? c.value : c.value.column);
+            const groupCols = selectCols.filter(
+                c => c !== ast.pivotColumn && c !== ast.valueColumn
+            );
+
+            // Group rows by grouping columns
+            const groups = new Map();
+            for (const row of rows) {
+                const keyParts = groupCols.map(c => String(row[c]));
+                const key = keyParts.join('|');
+                if (!groups.has(key)) {
+                    groups.set(key, { keyRow: row, pivotData: {} });
+                }
+                const pivotVal = row[ast.pivotColumn];
+                const dataVal = row[ast.valueColumn];
+                if (!groups.get(key).pivotData[pivotVal]) {
+                    groups.get(key).pivotData[pivotVal] = [];
+                }
+                groups.get(key).pivotData[pivotVal].push(dataVal);
+            }
+
+            // Aggregate function helper
+            const aggregate = (func, values) => {
+                if (!values || values.length === 0) return 0;
+                const nums = values.filter(v => v != null).map(v => Number(v));
+                switch (func) {
+                    case 'SUM': return nums.reduce((a, b) => a + b, 0);
+                    case 'COUNT': return nums.length;
+                    case 'AVG': return nums.length > 0 ? nums.reduce((a, b) => a + b, 0) / nums.length : 0;
+                    case 'MIN': return Math.min(...nums);
+                    case 'MAX': return Math.max(...nums);
+                    default: return nums[0];
+                }
+            };
+
+            // Build result rows
+            const resultRows = [];
+            for (const [, { keyRow, pivotData }] of groups) {
+                const newRow = {};
+                for (const col of groupCols) {
+                    newRow[col] = keyRow[col];
+                }
+                for (const pv of ast.pivotValues) {
+                    newRow[pv] = aggregate(ast.aggFunc, pivotData[pv] || []);
+                }
+                resultRows.push(newRow);
+            }
+
+            return { columns: [...groupCols, ...ast.pivotValues], rows: resultRows };
+        }
+
+        case 'UNPIVOT': {
+            // Execute the SELECT first
+            const selectResult = await executeAST(db, ast.select);
+            const rows = selectResult.rows;
+
+            // Determine preserved columns (all SELECT columns except unpivot columns)
+            const selectCols = ast.select.columns
+                .filter(c => c.type === 'column')
+                .map(c => typeof c.value === 'string' ? c.value : c.value.column);
+            const preservedCols = selectCols.filter(c => !ast.unpivotColumns.includes(c));
+
+            // Build result rows
+            const resultRows = [];
+            for (const row of rows) {
+                for (const col of ast.unpivotColumns) {
+                    const val = row[col];
+                    if (val != null) { // Skip NULL values
+                        const newRow = {};
+                        for (const pc of preservedCols) {
+                            newRow[pc] = row[pc];
+                        }
+                        newRow[ast.nameColumn] = col;
+                        newRow[ast.valueColumn] = val;
+                        resultRows.push(newRow);
+                    }
+                }
+            }
+
+            return { columns: [...preservedCols, ast.nameColumn, ast.valueColumn], rows: resultRows };
         }
 
         default:

@@ -5636,10 +5636,10 @@ test.describe('Vault SQL Operations', () => {
                 `);
                 // East has 1 entry per quarter
                 const eastRow = res.rows.find(r => r.region === 'East');
-                const eastQ1Count = eastRow?.Q1 || eastRow?.[1];
-                // North only has Q1 and Q2
+                const eastQ1Count = eastRow?.Q1 ?? eastRow?.[1];
+                // North only has Q1 and Q2 - Q3 should be 0, use ?? to handle falsy 0
                 const northRow = res.rows.find(r => r.region === 'North');
-                const northQ3Count = northRow?.Q3 || northRow?.[3];
+                const northQ3Count = northRow?.Q3 ?? northRow?.[3];
                 tests.push({
                     name: 'PIVOT COUNT',
                     pass: eastQ1Count === 1 && northQ3Count === 0,
