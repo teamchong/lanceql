@@ -290,6 +290,34 @@ const LegacyArgs = struct {
     csv: bool = false,
 };
 
+/// Tokenize and parse a SQL query, returning the parsed statement
+fn tokenizeAndParse(allocator: std.mem.Allocator, query: []const u8) !struct { stmt: parser.Statement, tokens: std.ArrayList(lexer.Token) } {
+    var lex = lexer.Lexer.init(query);
+    var tokens = std.ArrayList(lexer.Token){};
+    errdefer tokens.deinit(allocator);
+
+    while (true) {
+        const tok = try lex.nextToken();
+        try tokens.append(allocator, tok);
+        if (tok.type == .EOF) break;
+    }
+
+    var parse = parser.Parser.init(tokens.items, allocator);
+    const stmt = try parse.parseStatement();
+    return .{ .stmt = stmt, .tokens = tokens };
+}
+
+/// Output query results in the format specified by legacy_args
+fn outputResults(result: *executor.Result, legacy_args: LegacyArgs) void {
+    if (legacy_args.json) {
+        printResultsJson(result);
+    } else if (legacy_args.csv) {
+        printResultsCsv(result);
+    } else {
+        printResultsTable(result);
+    }
+}
+
 
 /// Extract table path from SQL query (finds 'path' in FROM clause)
 fn extractTablePath(query: []const u8) ?[]const u8 {
@@ -491,321 +519,144 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, legacy_args: Legacy
 }
 
 fn runParquetQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
-    // Initialize Parquet Table
-    var pq_table = ParquetTable.init(allocator, data) catch |err| {
-        return err;
-    };
+    var pq_table = try ParquetTable.init(allocator, data);
     defer pq_table.deinit();
 
-    // Tokenize
-    var lex = lexer.Lexer.init(query);
-    var tokens = std.ArrayList(lexer.Token){};
+    const parsed = try tokenizeAndParse(allocator, query);
+    var tokens = parsed.tokens;
     defer tokens.deinit(allocator);
 
-    while (true) {
-        const tok = try lex.nextToken();
-        try tokens.append(allocator, tok);
-        if (tok.type == .EOF) break;
-    }
-
-    // Parse
-    var parse = parser.Parser.init(tokens.items, allocator);
-    const stmt = try parse.parseStatement();
-
-    // Execute using Parquet-aware executor
     var exec = executor.Executor.initWithParquet(&pq_table, allocator);
     defer exec.deinit();
 
-    var result = try exec.execute(&stmt.select, &[_]ast.Value{});
+    var result = try exec.execute(&parsed.stmt.select, &[_]ast.Value{});
     defer result.deinit();
 
-    // Output results
-    if (legacy_args.json) {
-        printResultsJson(&result);
-    } else if (legacy_args.csv) {
-        printResultsCsv(&result);
-    } else {
-        printResultsTable(&result);
-    }
+    outputResults(&result, legacy_args);
 }
 
 fn runLanceQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
-    // Initialize Lance Table
-    var table = Table.init(allocator, data) catch |err| {
-        return err;
-    };
+    var table = try Table.init(allocator, data);
     defer table.deinit();
 
-    // Tokenize
-    var lex = lexer.Lexer.init(query);
-    var tokens = std.ArrayList(lexer.Token){};
+    const parsed = try tokenizeAndParse(allocator, query);
+    var tokens = parsed.tokens;
     defer tokens.deinit(allocator);
 
-    while (true) {
-        const tok = try lex.nextToken();
-        try tokens.append(allocator, tok);
-        if (tok.type == .EOF) break;
-    }
-
-    // Parse
-    var parse = parser.Parser.init(tokens.items, allocator);
-    const stmt = try parse.parseStatement();
-
-    // Execute
     var exec = executor.Executor.init(&table, allocator);
     defer exec.deinit();
 
-    var result = try exec.execute(&stmt.select, &[_]ast.Value{});
+    var result = try exec.execute(&parsed.stmt.select, &[_]ast.Value{});
     defer result.deinit();
 
-    // Output results
-    if (legacy_args.json) {
-        printResultsJson(&result);
-    } else if (legacy_args.csv) {
-        printResultsCsv(&result);
-    } else {
-        printResultsTable(&result);
-    }
+    outputResults(&result, legacy_args);
 }
 
 fn runDeltaQuery(allocator: std.mem.Allocator, path: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
-    // Initialize Delta Table (takes directory path, not file data)
-    var delta_table = DeltaTable.init(allocator, path) catch |err| {
-        return err;
-    };
+    var delta_table = try DeltaTable.init(allocator, path);
     defer delta_table.deinit();
 
-    // Tokenize
-    var lex = lexer.Lexer.init(query);
-    var tokens = std.ArrayList(lexer.Token){};
+    const parsed = try tokenizeAndParse(allocator, query);
+    var tokens = parsed.tokens;
     defer tokens.deinit(allocator);
 
-    while (true) {
-        const tok = try lex.nextToken();
-        try tokens.append(allocator, tok);
-        if (tok.type == .EOF) break;
-    }
-
-    // Parse
-    var parse = parser.Parser.init(tokens.items, allocator);
-    const stmt = try parse.parseStatement();
-
-    // Execute using Delta-aware executor
     var exec = executor.Executor.initWithDelta(&delta_table, allocator);
     defer exec.deinit();
 
-    var result = try exec.execute(&stmt.select, &[_]ast.Value{});
+    var result = try exec.execute(&parsed.stmt.select, &[_]ast.Value{});
     defer result.deinit();
 
-    // Output results
-    if (legacy_args.json) {
-        printResultsJson(&result);
-    } else if (legacy_args.csv) {
-        printResultsCsv(&result);
-    } else {
-        printResultsTable(&result);
-    }
+    outputResults(&result, legacy_args);
 }
 
 fn runIcebergQuery(allocator: std.mem.Allocator, path: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
-    // Initialize Iceberg Table (takes directory path, not file data)
-    var iceberg_table = IcebergTable.init(allocator, path) catch |err| {
-        return err;
-    };
+    var iceberg_table = try IcebergTable.init(allocator, path);
     defer iceberg_table.deinit();
 
-    // Check if table has data
     if (iceberg_table.numRows() == 0) {
         std.debug.print("Warning: Iceberg table has no data files\n", .{});
         return;
     }
 
-    // Tokenize
-    var lex = lexer.Lexer.init(query);
-    var tokens = std.ArrayList(lexer.Token){};
+    const parsed = try tokenizeAndParse(allocator, query);
+    var tokens = parsed.tokens;
     defer tokens.deinit(allocator);
 
-    while (true) {
-        const tok = try lex.nextToken();
-        try tokens.append(allocator, tok);
-        if (tok.type == .EOF) break;
-    }
-
-    // Parse
-    var parse = parser.Parser.init(tokens.items, allocator);
-    const stmt = try parse.parseStatement();
-
-    // Execute using Iceberg-aware executor
     var exec = executor.Executor.initWithIceberg(&iceberg_table, allocator);
     defer exec.deinit();
 
-    var result = try exec.execute(&stmt.select, &[_]ast.Value{});
+    var result = try exec.execute(&parsed.stmt.select, &[_]ast.Value{});
     defer result.deinit();
 
-    // Output results
-    if (legacy_args.json) {
-        printResultsJson(&result);
-    } else if (legacy_args.csv) {
-        printResultsCsv(&result);
-    } else {
-        printResultsTable(&result);
-    }
+    outputResults(&result, legacy_args);
 }
 
 fn runArrowQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
-    // Initialize Arrow Table
-    var arrow_table = ArrowTable.init(allocator, data) catch |err| {
-        return err;
-    };
+    var arrow_table = try ArrowTable.init(allocator, data);
     defer arrow_table.deinit();
 
-    // Tokenize
-    var lex = lexer.Lexer.init(query);
-    var tokens = std.ArrayList(lexer.Token){};
+    const parsed = try tokenizeAndParse(allocator, query);
+    var tokens = parsed.tokens;
     defer tokens.deinit(allocator);
 
-    while (true) {
-        const tok = try lex.nextToken();
-        try tokens.append(allocator, tok);
-        if (tok.type == .EOF) break;
-    }
-
-    // Parse
-    var parse = parser.Parser.init(tokens.items, allocator);
-    const stmt = try parse.parseStatement();
-
-    // Execute using Arrow-aware executor
     var exec = executor.Executor.initWithArrow(&arrow_table, allocator);
     defer exec.deinit();
 
-    var result = try exec.execute(&stmt.select, &[_]ast.Value{});
+    var result = try exec.execute(&parsed.stmt.select, &[_]ast.Value{});
     defer result.deinit();
 
-    // Output results
-    if (legacy_args.json) {
-        printResultsJson(&result);
-    } else if (legacy_args.csv) {
-        printResultsCsv(&result);
-    } else {
-        printResultsTable(&result);
-    }
+    outputResults(&result, legacy_args);
 }
 
 fn runAvroQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
-    // Initialize Avro Table
-    var avro_table = AvroTable.init(allocator, data) catch |err| {
-        return err;
-    };
+    var avro_table = try AvroTable.init(allocator, data);
     defer avro_table.deinit();
 
-    // Tokenize
-    var lex = lexer.Lexer.init(query);
-    var tokens = std.ArrayList(lexer.Token){};
+    const parsed = try tokenizeAndParse(allocator, query);
+    var tokens = parsed.tokens;
     defer tokens.deinit(allocator);
 
-    while (true) {
-        const tok = try lex.nextToken();
-        try tokens.append(allocator, tok);
-        if (tok.type == .EOF) break;
-    }
-
-    // Parse
-    var parse = parser.Parser.init(tokens.items, allocator);
-    const stmt = try parse.parseStatement();
-
-    // Execute using Avro-aware executor
     var exec = executor.Executor.initWithAvro(&avro_table, allocator);
     defer exec.deinit();
 
-    var result = try exec.execute(&stmt.select, &[_]ast.Value{});
+    var result = try exec.execute(&parsed.stmt.select, &[_]ast.Value{});
     defer result.deinit();
 
-    // Output results
-    if (legacy_args.json) {
-        printResultsJson(&result);
-    } else if (legacy_args.csv) {
-        printResultsCsv(&result);
-    } else {
-        printResultsTable(&result);
-    }
+    outputResults(&result, legacy_args);
 }
 
 fn runOrcQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
-    // Initialize ORC Table
-    var orc_table = OrcTable.init(allocator, data) catch |err| {
-        return err;
-    };
+    var orc_table = try OrcTable.init(allocator, data);
     defer orc_table.deinit();
 
-    // Tokenize
-    var lex = lexer.Lexer.init(query);
-    var tokens = std.ArrayList(lexer.Token){};
+    const parsed = try tokenizeAndParse(allocator, query);
+    var tokens = parsed.tokens;
     defer tokens.deinit(allocator);
 
-    while (true) {
-        const tok = try lex.nextToken();
-        try tokens.append(allocator, tok);
-        if (tok.type == .EOF) break;
-    }
-
-    // Parse
-    var parse = parser.Parser.init(tokens.items, allocator);
-    const stmt = try parse.parseStatement();
-
-    // Execute using ORC-aware executor
     var exec = executor.Executor.initWithOrc(&orc_table, allocator);
     defer exec.deinit();
 
-    var result = try exec.execute(&stmt.select, &[_]ast.Value{});
+    var result = try exec.execute(&parsed.stmt.select, &[_]ast.Value{});
     defer result.deinit();
 
-    // Output results
-    if (legacy_args.json) {
-        printResultsJson(&result);
-    } else if (legacy_args.csv) {
-        printResultsCsv(&result);
-    } else {
-        printResultsTable(&result);
-    }
+    outputResults(&result, legacy_args);
 }
 
 fn runXlsxQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
-    // Initialize XLSX Table
-    var xlsx_table = XlsxTable.init(allocator, data) catch |err| {
-        return err;
-    };
+    var xlsx_table = try XlsxTable.init(allocator, data);
     defer xlsx_table.deinit();
 
-    // Tokenize
-    var lex = lexer.Lexer.init(query);
-    var tokens = std.ArrayList(lexer.Token){};
+    const parsed = try tokenizeAndParse(allocator, query);
+    var tokens = parsed.tokens;
     defer tokens.deinit(allocator);
 
-    while (true) {
-        const tok = try lex.nextToken();
-        try tokens.append(allocator, tok);
-        if (tok.type == .EOF) break;
-    }
-
-    // Parse
-    var parse = parser.Parser.init(tokens.items, allocator);
-    const stmt = try parse.parseStatement();
-
-    // Execute using XLSX-aware executor
     var exec = executor.Executor.initWithXlsx(&xlsx_table, allocator);
     defer exec.deinit();
 
-    var result = try exec.execute(&stmt.select, &[_]ast.Value{});
+    var result = try exec.execute(&parsed.stmt.select, &[_]ast.Value{});
     defer result.deinit();
 
-    // Output results
-    if (legacy_args.json) {
-        printResultsJson(&result);
-    } else if (legacy_args.csv) {
-        printResultsCsv(&result);
-    } else {
-        printResultsTable(&result);
-    }
+    outputResults(&result, legacy_args);
 }
 
 fn printResultsTable(result: *executor.Result) void {
