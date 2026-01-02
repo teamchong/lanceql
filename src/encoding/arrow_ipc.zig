@@ -491,46 +491,9 @@ pub const ArrowIpcReader = struct {
         };
     }
 
-    /// Read int64 column data (column 0 is first int64 column)
-    pub fn readInt64Column(self: *Self, col_idx: usize) ![]i64 {
-        var values = std.ArrayList(i64){};
-        errdefer values.deinit(self.allocator);
-
-        if (self.data_start == 0 or self.num_rows == 0) {
-            return values.toOwnedSlice(self.allocator);
-        }
-
-        // In Arrow IPC, buffers are laid out sequentially
-        // For simple numeric columns: [validity bitmap (optional)][data]
-        // Calculate offset based on column index
-
-        // Simple layout assumption: each column has 8 bytes per row (int64/float64)
-        const col_size = self.num_rows * 8;
-        var data_pos = self.data_start;
-
-        // Skip to the requested column
-        // Note: This assumes all columns are same size and no validity bitmaps
-        data_pos += col_idx * col_size;
-
-        // Ensure we have enough data
-        if (data_pos + col_size > self.footer_offset) {
-            return values.toOwnedSlice(self.allocator);
-        }
-
-        // Read values
-        var i: usize = 0;
-        while (i < self.num_rows) : (i += 1) {
-            const val = std.mem.readInt(i64, self.data[data_pos..][0..8], .little);
-            try values.append(self.allocator, val);
-            data_pos += 8;
-        }
-
-        return values.toOwnedSlice(self.allocator);
-    }
-
-    /// Read float64 column data
-    pub fn readFloat64Column(self: *Self, col_idx: usize) ![]f64 {
-        var values = std.ArrayList(f64){};
+    /// Generic helper to read 8-byte numeric column data
+    fn readNumeric8Column(self: *Self, comptime T: type, col_idx: usize) ![]T {
+        var values = std.ArrayList(T){};
         errdefer values.deinit(self.allocator);
 
         if (self.data_start == 0 or self.num_rows == 0) {
@@ -547,12 +510,25 @@ pub const ArrowIpcReader = struct {
         var i: usize = 0;
         while (i < self.num_rows) : (i += 1) {
             const bytes = self.data[data_pos..][0..8];
-            const val: f64 = @bitCast(std.mem.readInt(u64, bytes, .little));
+            const val: T = if (T == i64)
+                std.mem.readInt(i64, bytes, .little)
+            else
+                @bitCast(std.mem.readInt(u64, bytes, .little));
             try values.append(self.allocator, val);
             data_pos += 8;
         }
 
         return values.toOwnedSlice(self.allocator);
+    }
+
+    /// Read int64 column data (column 0 is first int64 column)
+    pub fn readInt64Column(self: *Self, col_idx: usize) ![]i64 {
+        return self.readNumeric8Column(i64, col_idx);
+    }
+
+    /// Read float64 column data
+    pub fn readFloat64Column(self: *Self, col_idx: usize) ![]f64 {
+        return self.readNumeric8Column(f64, col_idx);
     }
 
     /// Read string column data
