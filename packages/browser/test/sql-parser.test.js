@@ -134,7 +134,9 @@ describe('SQL Parser', () => {
                 WITH active_users AS (SELECT * FROM users WHERE active = true)
                 SELECT * FROM active_users
             `);
-            assert.ok(ast.with);
+            assert.ok(ast.ctes); // Parser stores CTEs in ctes array
+            assert.strictEqual(ast.ctes.length, 1);
+            assert.strictEqual(ast.ctes[0].name, 'active_users');
         });
     });
 
@@ -148,7 +150,11 @@ describe('SQL Parser', () => {
     describe('UNION', () => {
         test('parses UNION', () => {
             const ast = parse('SELECT id FROM users UNION SELECT id FROM admins');
-            assert.ok(ast.union);
+            // Parser returns SET_OPERATION type for UNION/INTERSECT/EXCEPT
+            assert.strictEqual(ast.type, 'SET_OPERATION');
+            assert.strictEqual(ast.operator, 'UNION');
+            assert.ok(ast.left);
+            assert.ok(ast.right);
         });
     });
 
