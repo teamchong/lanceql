@@ -1204,8 +1204,9 @@ const TokenType = {
     // JOIN keywords
     JOIN: 'JOIN', LEFT: 'LEFT', RIGHT: 'RIGHT', INNER: 'INNER', ON: 'ON', AS: 'AS',
     FULL: 'FULL', OUTER: 'OUTER', CROSS: 'CROSS',
-    // GROUP BY / HAVING / QUALIFY
+    // GROUP BY / HAVING / QUALIFY / ROLLUP / CUBE / GROUPING SETS
     GROUP: 'GROUP', HAVING: 'HAVING', QUALIFY: 'QUALIFY',
+    ROLLUP: 'ROLLUP', CUBE: 'CUBE', GROUPING: 'GROUPING', SETS: 'SETS',
     // Aggregate functions
     COUNT: 'COUNT', SUM: 'SUM', AVG: 'AVG', MIN: 'MIN', MAX: 'MAX',
     // Additional operators
@@ -1812,13 +1813,57 @@ class SQLParser {
             where = this.parseWhereExpr();
         }
 
-        // Parse GROUP BY
+        // Parse GROUP BY (with ROLLUP/CUBE/GROUPING SETS support)
         let groupBy = null;
         if (this.match(TokenType.GROUP)) {
             this.expect(TokenType.BY);
-            groupBy = [this.parseColumnRef()];
-            while (this.match(TokenType.COMMA)) {
-                groupBy.push(this.parseColumnRef());
+
+            // Check for ROLLUP
+            if (this.match(TokenType.ROLLUP)) {
+                this.expect(TokenType.LPAREN);
+                const columns = [this.parseColumnRef()];
+                while (this.match(TokenType.COMMA)) {
+                    columns.push(this.parseColumnRef());
+                }
+                this.expect(TokenType.RPAREN);
+                groupBy = { type: 'ROLLUP', columns };
+            }
+            // Check for CUBE
+            else if (this.match(TokenType.CUBE)) {
+                this.expect(TokenType.LPAREN);
+                const columns = [this.parseColumnRef()];
+                while (this.match(TokenType.COMMA)) {
+                    columns.push(this.parseColumnRef());
+                }
+                this.expect(TokenType.RPAREN);
+                groupBy = { type: 'CUBE', columns };
+            }
+            // Check for GROUPING SETS
+            else if (this.match(TokenType.GROUPING)) {
+                this.expect(TokenType.SETS);
+                this.expect(TokenType.LPAREN);
+                const sets = [];
+                do {
+                    this.expect(TokenType.LPAREN);
+                    const setCols = [];
+                    if (!this.check(TokenType.RPAREN)) {
+                        setCols.push(this.parseColumnRef());
+                        while (this.match(TokenType.COMMA)) {
+                            setCols.push(this.parseColumnRef());
+                        }
+                    }
+                    this.expect(TokenType.RPAREN);
+                    sets.push(setCols);
+                } while (this.match(TokenType.COMMA));
+                this.expect(TokenType.RPAREN);
+                groupBy = { type: 'GROUPING_SETS', sets };
+            }
+            // Standard GROUP BY
+            else {
+                groupBy = [this.parseColumnRef()];
+                while (this.match(TokenType.COMMA)) {
+                    groupBy.push(this.parseColumnRef());
+                }
             }
         }
 
@@ -3798,6 +3843,17 @@ function evaluateScalarFunction(func, args, row, tableAliases = {}) {
             return val;
         }
 
+        // GROUPING function for ROLLUP/CUBE/GROUPING SETS
+        case 'grouping': {
+            // GROUPING(column) returns 1 if column is a super-aggregate (rolled up), 0 otherwise
+            const arg = args[0];
+            if (arg && arg.type === 'column') {
+                const colName = typeof arg.value === 'string' ? arg.value : arg.value.column;
+                return row[`__grouping_${colName}`] ?? 0;
+            }
+            return 0;
+        }
+
         default:
             return null;
     }
@@ -4677,46 +4733,87 @@ async function executeAST(db, ast) {
                 rows = rows.filter(row => evalWhere(ast.where, row, tableAliases));
             }
 
-            // Apply GROUP BY with aggregations
-            if (ast.groupBy && ast.groupBy.length > 0) {
-                const groups = new Map();
-                for (const row of rows) {
-                    const keyParts = ast.groupBy.map(col => {
-                        const colName = typeof col === 'string' ? col : col.column;
-                        return String(row[colName]);
-                    });
-                    const key = keyParts.join('|');
-                    if (!groups.has(key)) {
-                        groups.set(key, []);
+            // Apply GROUP BY with aggregations (supports ROLLUP/CUBE/GROUPING SETS)
+            if (ast.groupBy && (Array.isArray(ast.groupBy) ? ast.groupBy.length > 0 : ast.groupBy.type)) {
+                // Determine grouping sets based on type
+                let groupingSets = [];
+                let allColumns = [];
+
+                if (Array.isArray(ast.groupBy)) {
+                    // Standard GROUP BY: single grouping set with all columns
+                    allColumns = ast.groupBy.map(col => typeof col === 'string' ? col : col.column);
+                    groupingSets = [allColumns];
+                } else if (ast.groupBy.type === 'ROLLUP') {
+                    // ROLLUP(a, b, c) generates: (a,b,c), (a,b), (a), ()
+                    allColumns = ast.groupBy.columns.map(col => typeof col === 'string' ? col : col.column);
+                    for (let i = allColumns.length; i >= 0; i--) {
+                        groupingSets.push(allColumns.slice(0, i));
                     }
-                    groups.get(key).push(row);
+                } else if (ast.groupBy.type === 'CUBE') {
+                    // CUBE(a, b) generates all 2^n combinations: (a,b), (a), (b), ()
+                    allColumns = ast.groupBy.columns.map(col => typeof col === 'string' ? col : col.column);
+                    const n = allColumns.length;
+                    for (let mask = (1 << n) - 1; mask >= 0; mask--) {
+                        const set = [];
+                        for (let i = 0; i < n; i++) {
+                            if (mask & (1 << i)) set.push(allColumns[i]);
+                        }
+                        groupingSets.push(set);
+                    }
+                } else if (ast.groupBy.type === 'GROUPING_SETS') {
+                    // Explicit grouping sets
+                    groupingSets = ast.groupBy.sets.map(set =>
+                        set.map(col => typeof col === 'string' ? col : col.column)
+                    );
+                    // Collect all unique columns
+                    const colSet = new Set();
+                    for (const set of groupingSets) {
+                        for (const col of set) colSet.add(col);
+                    }
+                    allColumns = [...colSet];
                 }
 
-                // Process each group
-                const groupedRows = [];
-                for (const [, groupRows] of groups) {
-                    const resultRow = {};
-                    // Add GROUP BY columns
-                    for (const col of ast.groupBy) {
-                        const colName = typeof col === 'string' ? col : col.column;
-                        resultRow[colName] = groupRows[0][colName];
+                // Execute aggregation for each grouping set
+                const allGroupedRows = [];
+                for (const groupingSet of groupingSets) {
+                    const groups = new Map();
+                    for (const row of rows) {
+                        const keyParts = groupingSet.map(col => String(row[col]));
+                        const key = keyParts.join('|');
+                        if (!groups.has(key)) {
+                            groups.set(key, []);
+                        }
+                        groups.get(key).push(row);
                     }
-                    // Calculate aggregates
-                    for (const col of ast.columns) {
-                        if (col.type === 'aggregate') {
-                            const rawName = `${col.func}(${col.arg === '*' ? '*' : (typeof col.arg === 'string' ? col.arg : col.arg.column)})`;
-                            const aggValue = calculateAggregate(col.func, col.arg, groupRows);
-                            // Store with raw name for HAVING clause lookups
-                            resultRow[rawName] = aggValue;
-                            // Also store with alias if different
-                            if (col.alias && col.alias !== rawName) {
-                                resultRow[col.alias] = aggValue;
+
+                    // Process each group for this grouping set
+                    for (const [, groupRows] of groups) {
+                        const resultRow = {};
+                        // Add all columns (null for rolled-up columns)
+                        for (const col of allColumns) {
+                            if (groupingSet.includes(col)) {
+                                resultRow[col] = groupRows[0][col];
+                                resultRow[`__grouping_${col}`] = 0; // Not rolled up
+                            } else {
+                                resultRow[col] = null;
+                                resultRow[`__grouping_${col}`] = 1; // Rolled up (super-aggregate)
                             }
                         }
+                        // Calculate aggregates
+                        for (const col of ast.columns) {
+                            if (col.type === 'aggregate') {
+                                const rawName = `${col.func}(${col.arg === '*' ? '*' : (typeof col.arg === 'string' ? col.arg : col.arg.column)})`;
+                                const aggValue = calculateAggregate(col.func, col.arg, groupRows);
+                                resultRow[rawName] = aggValue;
+                                if (col.alias && col.alias !== rawName) {
+                                    resultRow[col.alias] = aggValue;
+                                }
+                            }
+                        }
+                        allGroupedRows.push(resultRow);
                     }
-                    groupedRows.push(resultRow);
                 }
-                rows = groupedRows;
+                rows = allGroupedRows;
 
                 // Apply HAVING
                 if (ast.having) {
