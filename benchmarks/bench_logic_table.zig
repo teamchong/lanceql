@@ -1,23 +1,21 @@
-//! @logic_table Benchmark - HONEST End-to-End Comparison
+//! @logic_table Benchmark - End-to-End Comparison
 //!
 //! What we're comparing (all read from files, same 15-second duration):
-//!   1. LanceQL @logic_table  - Read Lance file → compute with library SIMD
-//!   2. DuckDB + Python loop  - Read Parquet → row-by-row Python calls
-//!   3. DuckDB → NumPy batch  - Read Parquet → pull to Python → NumPy compute
-//!   4. Polars + Python loop  - Read Parquet → row-by-row Python calls
-//!   5. Polars → NumPy batch  - Read Parquet → pull to Python → NumPy compute
+//!   1. LanceQL native SIMD - Built-in Zig SIMD dot product
+//!   2. DuckDB + Python loop - Read Parquet → row-by-row Python calls
+//!   3. DuckDB → NumPy batch - Read Parquet → pull to Python → NumPy compute
+//!   4. Polars + Python loop - Read Parquet → row-by-row Python calls
+//!   5. Polars → NumPy batch - Read Parquet → pull to Python → NumPy compute
 //!
-//! FAIR COMPARISON:
-//!   - All methods read from disk (Lance or Parquet)
-//!   - All methods run for exactly 15 seconds
-//!   - Throughput measured as rows processed per second
-//!   - LanceQL uses library simd.batchDotProductF32 for batch processing
+//! NOTE: @logic_table JIT infrastructure exists (metal0 --emit-logic-table-shared)
+//!       but the current codegen uses runtime.eval() for list subscripts instead
+//!       of generating direct array indexing, causing type mismatches.
 //!
-//! NOTE: LanceQL uses the library's SIMD+parallel compute functions from src/simd.zig
-//!       No benchmark-specific optimizations - this measures real library performance.
+//!       For now, this benchmark uses native Zig SIMD as a placeholder for what
+//!       the @logic_table JIT performance SHOULD be once codegen is fixed.
 //!
 //! Setup:
-//!   python3 benchmarks/generate_benchmark_data.py  # Creates test data
+//!   python3 benchmarks/generate_benchmark_data.py
 //!   zig build bench-logic-table
 
 const std = @import("std");
@@ -29,6 +27,19 @@ const BENCHMARK_SECONDS = 15;
 const LANCE_PATH = "benchmarks/benchmark_e2e.lance";
 const PARQUET_PATH = "benchmarks/benchmark_e2e.parquet";
 const EMBEDDING_DIM = 384;
+
+// Python @logic_table source code for JIT compilation
+const PYTHON_SOURCE =
+    \\from logic_table import logic_table
+    \\
+    \\@logic_table
+    \\class VectorOps:
+    \\    def dot_product(self, a: list, b: list) -> float:
+    \\        result = 0.0
+    \\        for i in range(len(a)):
+    \\            result = result + a[i] * b[i]
+    \\        return result
+;
 
 var has_duckdb: bool = false;
 var has_polars: bool = false;
@@ -120,12 +131,90 @@ fn readLanceFile(allocator: std.mem.Allocator) ![]const u8 {
     return file_data;
 }
 
+/// JIT compile Python @logic_table using metal0 subprocess
+/// Returns the compiled shared library path and function pointer
+fn jitCompile(allocator: std.mem.Allocator) !struct { lib_path: []const u8, fn_ptr: ?*const fn ([*]f64, [*]f64, usize) callconv(.c) f64 } {
+    // Write Python source to temp file
+    const timestamp = @as(u64, @intCast(std.time.milliTimestamp()));
+    var py_path_buf: [256]u8 = undefined;
+    const py_path = std.fmt.bufPrint(&py_path_buf, "/tmp/lanceql_bench_{d}.py", .{timestamp}) catch return error.PathTooLong;
+
+    const py_file = std.fs.cwd().createFile(py_path, .{}) catch return error.CannotWriteSource;
+    py_file.writeAll(PYTHON_SOURCE) catch {
+        py_file.close();
+        return error.CannotWriteSource;
+    };
+    py_file.close();
+    defer std.fs.cwd().deleteFile(py_path) catch {};
+
+    // Output library path
+    const lib_ext = switch (@import("builtin").os.tag) {
+        .macos => ".dylib",
+        .windows => ".dll",
+        else => ".so",
+    };
+
+    var lib_path_buf: [256]u8 = undefined;
+    const lib_path = std.fmt.bufPrint(&lib_path_buf, "/tmp/lanceql_bench_{d}{s}", .{ timestamp, lib_ext }) catch return error.PathTooLong;
+
+    // Find metal0 binary path relative to lanceql
+    const metal0_dir = "deps/metal0";
+    const metal0_bin = "zig-out/bin/metal0";
+
+    // Build command: metal0 build --emit-logic-table-shared <py_file> -o <lib_path>
+    const argv = [_][]const u8{
+        metal0_bin,
+        "build",
+        "--emit-logic-table-shared",
+        py_path,
+        "-o",
+        lib_path,
+    };
+
+    var child = std.process.Child.init(&argv, allocator);
+    child.cwd = metal0_dir;
+    child.stderr_behavior = .Pipe;
+    child.stdout_behavior = .Pipe;
+
+    child.spawn() catch return error.CannotSpawnCompiler;
+
+    // Wait for completion
+    const result = child.wait() catch return error.CompilerFailed;
+
+    // Check exit code
+    switch (result) {
+        .Exited => |code| {
+            if (code != 0) {
+                std.log.err("metal0 compile failed with exit code {d}", .{code});
+                return error.CompilationFailed;
+            }
+        },
+        else => return error.CompilerFailed,
+    }
+
+    // Load the compiled library
+    const lib_path_z = std.fmt.bufPrintZ(&lib_path_buf, "{s}", .{lib_path}) catch return error.PathTooLong;
+
+    var lib = std.DynLib.open(lib_path_z) catch return error.CannotLoadLibrary;
+
+    // Look up the function symbol: VectorOps_dot_product
+    const fn_ptr = lib.lookup(*const fn ([*]f64, [*]f64, usize) callconv(.c) f64, "VectorOps_dot_product");
+
+    // Copy lib_path for return
+    const lib_path_copy = allocator.dupe(u8, lib_path) catch return error.OutOfMemory;
+
+    return .{
+        .lib_path = lib_path_copy,
+        .fn_ptr = fn_ptr,
+    };
+}
+
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
     std.debug.print("\n", .{});
     std.debug.print("===============================================================================\n", .{});
-    std.debug.print("@logic_table Benchmark: End-to-End (File I/O → Parse → Compute)\n", .{});
+    std.debug.print("@logic_table Benchmark: REAL JIT End-to-End (Python → metal0 → Execute)\n", .{});
     std.debug.print("===============================================================================\n", .{});
     std.debug.print("\n", .{});
     std.debug.print("Each method runs for {d} seconds. Measuring throughput (rows/sec).\n", .{BENCHMARK_SECONDS});
@@ -150,7 +239,7 @@ pub fn main() !void {
     std.debug.print("  Parquet: {s} ✓\n", .{PARQUET_PATH});
     std.debug.print("\n", .{});
     std.debug.print("Engines:\n", .{});
-    std.debug.print("  LanceQL @logic_table: yes\n", .{});
+    std.debug.print("  LanceQL @logic_table: yes (JIT via metal0)\n", .{});
     std.debug.print("  DuckDB:               {s}\n", .{if (has_duckdb) "yes" else "no (pip install duckdb)"});
     std.debug.print("  Polars:               {s}\n", .{if (has_polars) "yes" else "no (pip install polars)"});
     std.debug.print("\n", .{});
@@ -161,83 +250,122 @@ pub fn main() !void {
 
     var lanceql_throughput: f64 = 0;
 
-    // 1. LanceQL @logic_table BATCH (read Lance file → compute with COMPILED Python batch function)
-    // Uses VectorOps_batch_dot_product_f32 - processes ALL rows at once with SIMD
+    // 1. LanceQL @logic_table JIT - REAL flow: Python → metal0 compile → execute
     {
-        const warmup_end = std.time.nanoTimestamp() + WARMUP_SECONDS * std.time.ns_per_s;
-        const benchmark_end_time = warmup_end + BENCHMARK_SECONDS * std.time.ns_per_s;
+        // Step 1: JIT compile (measure separately)
+        std.debug.print("\nJIT compiling Python @logic_table via metal0...\n", .{});
+        const jit_start = std.time.nanoTimestamp();
 
-        var iterations: u64 = 0;
-        var total_rows: u64 = 0;
+        const jit_result = jitCompile(allocator) catch |err| {
+            std.debug.print("{s:<32} {s:>14} {s:>10} {s:>10}\n", .{
+                "LanceQL @logic_table JIT", "JIT failed", "-", "-",
+            });
+            std.debug.print("  Error: {}\n", .{err});
+            std.debug.print("  Make sure metal0 is built: cd deps/metal0 && zig build\n", .{});
+            // Fall through to Python benchmarks
+            lanceql_throughput = 0;
+            return;
+        };
+        defer allocator.free(jit_result.lib_path);
+        defer std.fs.cwd().deleteFile(jit_result.lib_path) catch {};
 
-        // Query vector as f64 (batch function accepts f64 query)
-        var query_vec: [EMBEDDING_DIM]f64 = undefined;
-        for (&query_vec) |*v| v.* = 0.1;
+        const jit_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - jit_start);
+        const jit_elapsed_ms = @as(f64, @floatFromInt(jit_elapsed_ns)) / 1_000_000.0;
+        std.debug.print("  JIT compile time: {d:.1}ms\n", .{jit_elapsed_ms});
 
-        // Dynamic output buffer (will be allocated per-iteration)
-        var scores: []f64 = &.{};
+        if (jit_result.fn_ptr == null) {
+            std.debug.print("{s:<32} {s:>14} {s:>10} {s:>10}\n", .{
+                "LanceQL @logic_table JIT", "symbol missing", "-", "-",
+            });
+            std.debug.print("  VectorOps_dot_product not found in compiled library\n", .{});
+            lanceql_throughput = 0;
+        } else {
+            const dot_product_fn = jit_result.fn_ptr.?;
 
-        // Warmup
-        while (std.time.nanoTimestamp() < warmup_end) {
-            const file_data = readLanceFile(allocator) catch break;
-            defer allocator.free(file_data);
+            // Step 2: Benchmark the compiled function
+            const warmup_end = std.time.nanoTimestamp() + WARMUP_SECONDS * std.time.ns_per_s;
+            const benchmark_end_time = warmup_end + BENCHMARK_SECONDS * std.time.ns_per_s;
 
-            var table = Table.init(allocator, file_data) catch break;
-            defer table.deinit();
+            var iterations: u64 = 0;
+            var total_rows: u64 = 0;
 
-            const embeddings = table.readFloat32Column(3) catch break; // embedding column
-            defer allocator.free(embeddings);
+            // Query vector as f64 (JIT compiled function expects f64)
+            var query_vec: [EMBEDDING_DIM]f64 = undefined;
+            for (&query_vec) |*v| v.* = 0.1;
 
-            const num_rows = embeddings.len / EMBEDDING_DIM;
+            // Warmup
+            while (std.time.nanoTimestamp() < warmup_end) {
+                const file_data = readLanceFile(allocator) catch break;
+                defer allocator.free(file_data);
 
-            // Allocate output buffer if needed
-            if (scores.len < num_rows) {
-                if (scores.len > 0) allocator.free(scores);
-                scores = allocator.alloc(f64, num_rows) catch break;
+                var table = Table.init(allocator, file_data) catch break;
+                defer table.deinit();
+
+                const embeddings = table.readFloat32Column(3) catch break; // embedding column
+                defer allocator.free(embeddings);
+
+                const num_rows = embeddings.len / EMBEDDING_DIM;
+
+                // Convert embeddings to f64 for the JIT function
+                const embeddings_f64 = allocator.alloc(f64, embeddings.len) catch break;
+                defer allocator.free(embeddings_f64);
+                for (embeddings, 0..) |v, i| embeddings_f64[i] = @floatCast(v);
+
+                // Call JIT-compiled function for each row
+                for (0..num_rows) |row| {
+                    const row_start = row * EMBEDDING_DIM;
+                    const score = dot_product_fn(
+                        embeddings_f64.ptr + row_start,
+                        &query_vec,
+                        EMBEDDING_DIM,
+                    );
+                    std.mem.doNotOptimizeAway(score);
+                }
             }
 
-            // BATCH: Use library SIMD function (auto-dispatches scalar/SIMD/parallel)
-            simd.batchDotProductF32(embeddings, &query_vec, EMBEDDING_DIM, scores);
-            std.mem.doNotOptimizeAway(scores.ptr);
-        }
+            // Benchmark
+            const start_time = std.time.nanoTimestamp();
+            while (std.time.nanoTimestamp() < benchmark_end_time) {
+                const file_data = readLanceFile(allocator) catch break;
+                defer allocator.free(file_data);
 
-        // Benchmark
-        const start_time = std.time.nanoTimestamp();
-        while (std.time.nanoTimestamp() < benchmark_end_time) {
-            const file_data = readLanceFile(allocator) catch break;
-            defer allocator.free(file_data);
+                var table = Table.init(allocator, file_data) catch break;
+                defer table.deinit();
 
-            var table = Table.init(allocator, file_data) catch break;
-            defer table.deinit();
+                const embeddings = table.readFloat32Column(3) catch break; // embedding column
+                defer allocator.free(embeddings);
 
-            const embeddings = table.readFloat32Column(3) catch break; // embedding column
-            defer allocator.free(embeddings);
+                const num_rows = embeddings.len / EMBEDDING_DIM;
 
-            const num_rows = embeddings.len / EMBEDDING_DIM;
+                // Convert embeddings to f64 for the JIT function
+                const embeddings_f64 = allocator.alloc(f64, embeddings.len) catch break;
+                defer allocator.free(embeddings_f64);
+                for (embeddings, 0..) |v, i| embeddings_f64[i] = @floatCast(v);
 
-            // Allocate output buffer if needed
-            if (scores.len < num_rows) {
-                if (scores.len > 0) allocator.free(scores);
-                scores = allocator.alloc(f64, num_rows) catch break;
+                // Call JIT-compiled function for each row
+                for (0..num_rows) |row| {
+                    const row_start = row * EMBEDDING_DIM;
+                    const score = dot_product_fn(
+                        embeddings_f64.ptr + row_start,
+                        &query_vec,
+                        EMBEDDING_DIM,
+                    );
+                    std.mem.doNotOptimizeAway(score);
+                }
+
+                iterations += 1;
+                total_rows += num_rows;
             }
+            const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start_time);
 
-            // BATCH: Use library SIMD function (auto-dispatches scalar/SIMD/parallel)
-            simd.batchDotProductF32(embeddings, &query_vec, EMBEDDING_DIM, scores);
-            std.mem.doNotOptimizeAway(scores.ptr);
-
-            iterations += 1;
-            total_rows += num_rows;
+            lanceql_throughput = @as(f64, @floatFromInt(total_rows)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0);
+            std.debug.print("{s:<32} {d:>14.0} {d:>10} {s:>10}\n", .{
+                "LanceQL @logic_table JIT", lanceql_throughput, iterations, "1.0x",
+            });
         }
-        const elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - start_time);
-
-        // Cleanup scores buffer
-        if (scores.len > 0) allocator.free(scores);
-
-        lanceql_throughput = @as(f64, @floatFromInt(total_rows)) / (@as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0);
-        std.debug.print("{s:<32} {d:>14.0} {d:>10} {s:>10}\n", .{
-            "LanceQL @logic_table BATCH", lanceql_throughput, iterations, "1.0x",
-        });
     }
+
+    std.debug.print("\n", .{});
 
     // 2. DuckDB + Python loop (per-row Python calls on 384-dim embeddings)
     if (has_duckdb) duckdb_udf: {
@@ -328,9 +456,9 @@ pub fn main() !void {
 
         if (iterations > 0 and total_ns > 0 and total_rows > 0) {
             const throughput = @as(f64, @floatFromInt(total_rows)) / (@as(f64, @floatFromInt(total_ns)) / 1_000_000_000.0);
-            const speedup = lanceql_throughput / throughput;
+            const speedup = if (lanceql_throughput > 0) lanceql_throughput / throughput else 0;
             var speedup_buf: [16]u8 = undefined;
-            const speedup_str = std.fmt.bufPrint(&speedup_buf, "{d:.1}x", .{speedup}) catch "N/A";
+            const speedup_str = if (lanceql_throughput > 0) std.fmt.bufPrint(&speedup_buf, "{d:.1}x", .{speedup}) catch "N/A" else "N/A";
             std.debug.print("{s:<32} {d:>14.0} {d:>10} {s:>10}\n", .{
                 "DuckDB + Python loop", throughput, iterations, speedup_str,
             });
@@ -423,9 +551,9 @@ pub fn main() !void {
 
         if (iterations > 0 and total_ns > 0) {
             const throughput = @as(f64, @floatFromInt(total_rows)) / (@as(f64, @floatFromInt(total_ns)) / 1_000_000_000.0);
-            const speedup = lanceql_throughput / throughput;
+            const speedup = if (lanceql_throughput > 0) lanceql_throughput / throughput else 0;
             var speedup_buf: [16]u8 = undefined;
-            const speedup_str = std.fmt.bufPrint(&speedup_buf, "{d:.1}x", .{speedup}) catch "N/A";
+            const speedup_str = if (lanceql_throughput > 0) std.fmt.bufPrint(&speedup_buf, "{d:.1}x", .{speedup}) catch "N/A" else "N/A";
             std.debug.print("{s:<32} {d:>14.0} {d:>10} {s:>10}\n", .{
                 "DuckDB → NumPy batch", throughput, iterations, speedup_str,
             });
@@ -516,9 +644,9 @@ pub fn main() !void {
 
         if (iterations > 0 and total_ns > 0) {
             const throughput = @as(f64, @floatFromInt(total_rows)) / (@as(f64, @floatFromInt(total_ns)) / 1_000_000_000.0);
-            const speedup = lanceql_throughput / throughput;
+            const speedup = if (lanceql_throughput > 0) lanceql_throughput / throughput else 0;
             var speedup_buf: [16]u8 = undefined;
-            const speedup_str = std.fmt.bufPrint(&speedup_buf, "{d:.1}x", .{speedup}) catch "N/A";
+            const speedup_str = if (lanceql_throughput > 0) std.fmt.bufPrint(&speedup_buf, "{d:.1}x", .{speedup}) catch "N/A" else "N/A";
             std.debug.print("{s:<32} {d:>14.0} {d:>10} {s:>10}\n", .{
                 "Polars + Python UDF", throughput, iterations, speedup_str,
             });
@@ -609,9 +737,9 @@ pub fn main() !void {
 
         if (iterations > 0 and total_ns > 0) {
             const throughput = @as(f64, @floatFromInt(total_rows)) / (@as(f64, @floatFromInt(total_ns)) / 1_000_000_000.0);
-            const speedup = lanceql_throughput / throughput;
+            const speedup = if (lanceql_throughput > 0) lanceql_throughput / throughput else 0;
             var speedup_buf: [16]u8 = undefined;
-            const speedup_str = std.fmt.bufPrint(&speedup_buf, "{d:.1}x", .{speedup}) catch "N/A";
+            const speedup_str = if (lanceql_throughput > 0) std.fmt.bufPrint(&speedup_buf, "{d:.1}x", .{speedup}) catch "N/A" else "N/A";
             std.debug.print("{s:<32} {d:>14.0} {d:>10} {s:>10}\n", .{
                 "Polars → NumPy batch", throughput, iterations, speedup_str,
             });
@@ -622,8 +750,9 @@ pub fn main() !void {
     std.debug.print("\n", .{});
     std.debug.print("Notes:\n", .{});
     std.debug.print("  - All methods read from disk (Lance or Parquet files)\n", .{});
-    std.debug.print("  - All methods run for exactly {d} seconds\n", .{BENCHMARK_SECONDS});
+    std.debug.print("  - LanceQL JIT compiles Python @logic_table at runtime via metal0\n", .{});
+    std.debug.print("  - JIT compilation time is measured separately from execution\n", .{});
+    std.debug.print("  - All methods run for exactly {d} seconds after warmup\n", .{BENCHMARK_SECONDS});
     std.debug.print("  - Throughput = total rows processed / elapsed time\n", .{});
-    std.debug.print("  - LanceQL reads Lance format, DuckDB/Polars read Parquet format\n", .{});
     std.debug.print("\n", .{});
 }
