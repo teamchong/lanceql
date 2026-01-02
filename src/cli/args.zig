@@ -551,3 +551,160 @@ pub fn printEnrichHelp() void {
         \\
     , .{});
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "args: QueryOptions defaults" {
+    const opts = QueryOptions{};
+    try std.testing.expectEqual(@as(?[]const u8, null), opts.query);
+    try std.testing.expectEqual(@as(?[]const u8, null), opts.file);
+    try std.testing.expect(!opts.benchmark);
+    try std.testing.expectEqual(@as(usize, 10), opts.iterations);
+    try std.testing.expectEqual(@as(usize, 3), opts.warmup);
+    try std.testing.expect(!opts.json);
+    try std.testing.expect(!opts.csv);
+}
+
+test "args: parseQueryOptions with positional query" {
+    var opts = QueryOptions{};
+    const argv = [_][]const u8{ "SELECT * FROM t", "--json" };
+    var i: usize = 0;
+    try parseQueryOptions(&opts, &argv, &i);
+
+    try std.testing.expectEqualStrings("SELECT * FROM t", opts.query.?);
+    try std.testing.expect(opts.json);
+    try std.testing.expect(!opts.csv);
+}
+
+test "args: parseQueryOptions with benchmark flags" {
+    var opts = QueryOptions{};
+    const argv = [_][]const u8{ "-b", "-i", "20", "-w", "5", "SELECT 1" };
+    var i: usize = 0;
+    try parseQueryOptions(&opts, &argv, &i);
+
+    try std.testing.expect(opts.benchmark);
+    try std.testing.expectEqual(@as(usize, 20), opts.iterations);
+    try std.testing.expectEqual(@as(usize, 5), opts.warmup);
+    try std.testing.expectEqualStrings("SELECT 1", opts.query.?);
+}
+
+test "args: parseQueryOptions with file flag" {
+    var opts = QueryOptions{};
+    const argv = [_][]const u8{ "-f", "query.sql", "--csv" };
+    var i: usize = 0;
+    try parseQueryOptions(&opts, &argv, &i);
+
+    try std.testing.expectEqualStrings("query.sql", opts.file.?);
+    try std.testing.expect(opts.csv);
+}
+
+test "args: IngestOptions defaults" {
+    const opts = IngestOptions{};
+    try std.testing.expectEqual(@as(?[]const u8, null), opts.input);
+    try std.testing.expectEqual(@as(?[]const u8, null), opts.output);
+    try std.testing.expectEqual(IngestOptions.Format.auto, opts.format);
+    try std.testing.expect(opts.header);
+}
+
+test "args: parseIngestOptions with format" {
+    var opts = IngestOptions{};
+    const argv = [_][]const u8{ "data.csv", "-o", "out.lance", "--format", "csv" };
+    var i: usize = 0;
+    try parseIngestOptions(&opts, &argv, &i);
+
+    try std.testing.expectEqualStrings("data.csv", opts.input.?);
+    try std.testing.expectEqualStrings("out.lance", opts.output.?);
+    try std.testing.expectEqual(IngestOptions.Format.csv, opts.format);
+}
+
+test "args: parseIngestOptions format variants" {
+    const formats = [_]struct { str: []const u8, expected: IngestOptions.Format }{
+        .{ .str = "csv", .expected = .csv },
+        .{ .str = "tsv", .expected = .tsv },
+        .{ .str = "json", .expected = .json },
+        .{ .str = "jsonl", .expected = .jsonl },
+        .{ .str = "parquet", .expected = .parquet },
+        .{ .str = "arrow", .expected = .arrow },
+        .{ .str = "avro", .expected = .avro },
+        .{ .str = "orc", .expected = .orc },
+        .{ .str = "xlsx", .expected = .xlsx },
+        .{ .str = "excel", .expected = .xlsx },
+        .{ .str = "delta", .expected = .delta },
+        .{ .str = "iceberg", .expected = .iceberg },
+    };
+
+    for (formats) |f| {
+        var opts = IngestOptions{};
+        const argv = [_][]const u8{ "--format", f.str };
+        var i: usize = 0;
+        try parseIngestOptions(&opts, &argv, &i);
+        try std.testing.expectEqual(f.expected, opts.format);
+    }
+}
+
+test "args: parseIngestOptions with delimiter and no-header" {
+    var opts = IngestOptions{};
+    const argv = [_][]const u8{ "data.txt", "-d", "|", "--no-header" };
+    var i: usize = 0;
+    try parseIngestOptions(&opts, &argv, &i);
+
+    try std.testing.expectEqual(@as(?u8, '|'), opts.delimiter);
+    try std.testing.expect(!opts.header);
+}
+
+test "args: parseServeOptions with port" {
+    var opts = ServeOptions{};
+    const argv = [_][]const u8{ "dataset.lance", "-p", "8080", "--no-open" };
+    var i: usize = 0;
+    try parseServeOptions(&opts, &argv, &i);
+
+    try std.testing.expectEqualStrings("dataset.lance", opts.input.?);
+    try std.testing.expectEqual(@as(u16, 8080), opts.port);
+    try std.testing.expect(!opts.open);
+}
+
+test "args: parseServeOptions with host" {
+    var opts = ServeOptions{};
+    const argv = [_][]const u8{ "--host", "0.0.0.0", "-p", "3001" };
+    var i: usize = 0;
+    try parseServeOptions(&opts, &argv, &i);
+
+    try std.testing.expectEqualStrings("0.0.0.0", opts.host);
+    try std.testing.expectEqual(@as(u16, 3001), opts.port);
+}
+
+test "args: parseTransformOptions" {
+    var opts = TransformOptions{};
+    const argv = [_][]const u8{ "input.lance", "-o", "output.lance", "--select", "a,b,c", "--filter", "x > 10", "--limit", "100" };
+    var i: usize = 0;
+    try parseTransformOptions(&opts, &argv, &i);
+
+    try std.testing.expectEqualStrings("input.lance", opts.input.?);
+    try std.testing.expectEqualStrings("output.lance", opts.output.?);
+    try std.testing.expectEqualStrings("a,b,c", opts.select.?);
+    try std.testing.expectEqualStrings("x > 10", opts.filter.?);
+    try std.testing.expectEqual(@as(?usize, 100), opts.limit);
+}
+
+test "args: parseEnrichOptions with model and index" {
+    var opts = EnrichOptions{};
+    const argv = [_][]const u8{ "data.lance", "--embed", "text", "--model", "clip", "--index-type", "flat", "--partitions", "128" };
+    var i: usize = 0;
+    try parseEnrichOptions(&opts, &argv, &i);
+
+    try std.testing.expectEqualStrings("data.lance", opts.input.?);
+    try std.testing.expectEqualStrings("text", opts.embed.?);
+    try std.testing.expectEqual(EnrichOptions.Model.clip, opts.model);
+    try std.testing.expectEqual(EnrichOptions.IndexType.flat, opts.index_type);
+    try std.testing.expectEqual(@as(usize, 128), opts.partitions);
+}
+
+test "args: GlobalOptions defaults" {
+    const opts = GlobalOptions{};
+    try std.testing.expect(!opts.help);
+    try std.testing.expect(!opts.show_version);
+    try std.testing.expect(!opts.verbose);
+    try std.testing.expectEqual(@as(?[]const u8, null), opts.config);
+}
