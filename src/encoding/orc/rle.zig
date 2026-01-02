@@ -226,19 +226,20 @@ pub const OrcRleDecoder = struct {
     }
 
     /// DIRECT encoding: raw values with bit-packing
-    /// Header: 0b01WWWWW + length byte(s)
+    /// Header: 0b01WWWWWB + LEN where W=width code (5 bits), B=high bit of count
     fn decodeDirect(self: *Self, output: []i64, max_count: usize, header: u8) RleError!usize {
         self.pos += 1; // consume header
 
-        // Width is encoded in 5 bits (0-31 maps to specific bit widths)
-        const width_code = header & 0x1F;
+        // Width code is in bits 5-1 (5 bits)
+        const width_code = (header >> 1) & 0x1F;
         const bit_width = decodeBitWidth(width_code);
 
-        // Read length (9 bits: high bit from header would be 0, so just next byte + 1)
+        // Length is 9 bits: high bit from header bit 0, low 8 bits from next byte
         if (self.pos >= self.data.len) return RleError.UnexpectedEof;
         const length_byte = self.data[self.pos];
         self.pos += 1;
-        const count = @min(@as(usize, length_byte) + 1, max_count);
+        const high_bit: usize = header & 1;
+        const count = @min((high_bit << 8) | @as(usize, length_byte) + 1, max_count);
 
         // Read values with bit-packing
         var bit_pos: usize = 0;
@@ -294,17 +295,22 @@ pub const OrcRleDecoder = struct {
     }
 
     /// DELTA encoding: base + deltas
+    /// Header: 0b11WWWWWB + LEN where W=width code (5 bits), B=high bit of count
     fn decodeDelta(self: *Self, output: []i64, max_count: usize, header: u8) RleError!usize {
         self.pos += 1; // consume header
 
-        // Header: 0b11WWWWW + length byte
-        const width_code = header & 0x1F;
-        const bit_width = decodeBitWidth(width_code);
+        // Width code is in bits 5-1 (5 bits)
+        const width_code = (header >> 1) & 0x1F;
+        // DELTA encoding: width_code=0 means constant delta (bit_width=0)
+        // This is different from DIRECT where decodeBitWidth(0)=1
+        const bit_width = if (width_code == 0) 0 else decodeBitWidth(width_code);
 
+        // Length is 9 bits: high bit from header bit 0, low 8 bits from next byte
         if (self.pos >= self.data.len) return RleError.UnexpectedEof;
         const length_byte = self.data[self.pos];
         self.pos += 1;
-        const count = @min(@as(usize, length_byte) + 1, max_count);
+        const high_bit: usize = header & 1;
+        const count = @min((high_bit << 8) | @as(usize, length_byte) + 1, max_count);
 
         if (count == 0) return 0;
 

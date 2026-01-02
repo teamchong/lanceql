@@ -115,8 +115,8 @@ pub fn decompressOrcStream(
         pos += 3;
 
         if (header.is_original) {
-            // Uncompressed block - length is (original_size - 1), so add 1
-            const chunk_size = header.length + 1;
+            // Uncompressed block - length IS the actual uncompressed size
+            const chunk_size = header.length;
             if (pos + chunk_size > data.len) {
                 return DecompressError.InvalidBlockHeader;
             }

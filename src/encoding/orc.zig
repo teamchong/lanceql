@@ -313,18 +313,20 @@ pub const OrcReader = struct {
 
             // Validate header - if length seems invalid, data is uncompressed without header
             const remaining = data.len - pos - 3;
-            if (is_original and length + 1 > remaining) {
+            if (length > remaining) {
                 break;
             }
-            if (!is_original and length > remaining) {
-                break;
+            // Empty blocks would cause infinite loop - skip them
+            if (length == 0) {
+                pos += 3;
+                continue;
             }
 
             pos += 3;
 
             if (is_original) {
-                // Uncompressed block - length is (original_size - 1)
-                const chunk_size = length + 1;
+                // Uncompressed block - length IS the actual uncompressed size
+                const chunk_size = length;
                 try output.appendSlice(self.allocator, data[pos..][0..chunk_size]);
                 pos += chunk_size;
             } else {
@@ -546,7 +548,7 @@ pub const OrcReader = struct {
             const wire_type = @as(u3, @truncate(tag));
 
             switch (field_num) {
-                1 => { // kind (enum)
+                1 => { // kind (enum) - matches ORC spec
                     if (wire_type != 0) break;
                     const val_result = readVarint(data, pos) catch break;
                     orc_type = switch (val_result.value) {
@@ -558,16 +560,16 @@ pub const OrcReader = struct {
                         5 => .float,
                         6 => .double,
                         7 => .string,
-                        8 => .date,
+                        8 => .binary,
                         9 => .timestamp,
-                        10 => .binary,
-                        11 => .decimal,
-                        12 => .varchar,
-                        13 => .char,
-                        14 => .list,
-                        15 => .map,
-                        16 => .struct_type,
-                        17 => .union_type,
+                        10 => .list,
+                        11 => .map,
+                        12 => .struct_type,
+                        13 => .union_type,
+                        14 => .decimal,
+                        15 => .date,
+                        16 => .varchar,
+                        17 => .char,
                         else => .unknown,
                     };
                     pos = val_result.end_pos;
@@ -1015,8 +1017,8 @@ test "orc: read simple fixture" {
     // Should detect zlib compression (default for pyorc)
     try testing.expectEqual(CompressionKind.zlib, reader.getCompression());
 
-    // ORC schema includes root struct as column 0, so 4 total (root + id, name, value)
-    try testing.expectEqual(@as(usize, 4), reader.columnCount());
+    // columnCount() returns data columns only (excluding root struct)
+    try testing.expectEqual(@as(usize, 3), reader.columnCount());
 
     // Note: Row count detection requires zlib decompression of footer
     // For now just verify initialization succeeded
@@ -1041,8 +1043,8 @@ test "orc: read snappy fixture" {
     // Should detect Snappy compression
     try testing.expectEqual(CompressionKind.snappy, reader.getCompression());
 
-    // ORC schema includes root struct as column 0, so 4 total
-    try testing.expectEqual(@as(usize, 4), reader.columnCount());
+    // columnCount() returns data columns only (excluding root struct)
+    try testing.expectEqual(@as(usize, 3), reader.columnCount());
 }
 
 test "orc: debug footer parsing" {

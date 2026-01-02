@@ -198,6 +198,8 @@ pub const Result = struct {
     columns: []Column,
     row_count: usize,
     allocator: std.mem.Allocator,
+    /// If false, column data is owned by executor's cache and should not be freed here
+    owns_data: bool = true,
 
     pub const Column = struct {
         name: []const u8,
@@ -245,8 +247,10 @@ pub const Result = struct {
     };
 
     pub fn deinit(self: *Result) void {
-        for (self.columns) |col| {
-            col.data.free(self.allocator);
+        if (self.owns_data) {
+            for (self.columns) |col| {
+                col.data.free(self.allocator);
+            }
         }
         self.allocator.free(self.columns);
     }
@@ -5152,8 +5156,15 @@ pub const Executor = struct {
             // Handle SELECT *
             if (item.expr == .column and std.mem.eql(u8, item.expr.column.name, "*")) {
                 const col_names = try self.getColumnNames();
-                // Note: Parquet returns stored slice, Lance allocates - handle both cases
-                const should_free = !self.isParquetMode();
+                // Only Lance allocates column names, other table types return stored slices
+                // Check if we're in a mode that returns stored slices (don't free)
+                const should_free = self.parquet_table == null and
+                    self.delta_table == null and
+                    self.iceberg_table == null and
+                    self.arrow_table == null and
+                    self.avro_table == null and
+                    self.orc_table == null and
+                    self.xlsx_table == null;
                 defer if (should_free) self.allocator.free(col_names);
 
                 for (col_names) |col_name| {
