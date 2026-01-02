@@ -258,7 +258,8 @@ pub const JitContext = struct {
         return self.parseSchemaBytes(schema_bytes);
     }
 
-    /// Compile @logic_table Python source using metal0 subprocess
+    /// Compile @logic_table Python source using metal0 API directly
+    /// Falls back to subprocess if direct API fails
     /// Uses caching to avoid recompiling the same source
     pub fn compileLogicTable(
         self: *JitContext,
@@ -271,18 +272,25 @@ pub const JitContext = struct {
             return cached;
         }
 
-        // Compile using metal0 subprocess (generates real computation, not stubs)
-        const compile_result = compileLogicTableSubprocess(self.allocator, python_source) catch |err| {
-            std.log.warn("metal0 subprocess compilation failed: {}, using stub", .{err});
-            // Fallback to stub generation
-            const stub_source = try generatePlaceholderZig(self.allocator, python_source, method_name);
-            return CompiledFunction{
-                .ptr = null,
-                .source = stub_source,
-                .name = method_name,
-                .lib = null,
-                .lib_path = null,
-                .allocator = self.allocator,
+        // Try direct API first (no subprocess overhead), fall back to subprocess
+        const compile_result = blk: {
+            break :blk compileLogicTableDirect(self.allocator, python_source, self.schema) catch |direct_err| {
+                std.log.warn("metal0 direct API failed: {}, trying subprocess", .{direct_err});
+
+                // Fallback to subprocess
+                break :blk compileLogicTableSubprocess(self.allocator, python_source) catch |err| {
+                    std.log.warn("metal0 subprocess compilation failed: {}, using stub", .{err});
+                    // Fallback to stub generation
+                    const stub_source = try generatePlaceholderZig(self.allocator, python_source, method_name);
+                    return CompiledFunction{
+                        .ptr = null,
+                        .source = stub_source,
+                        .name = method_name,
+                        .lib = null,
+                        .lib_path = null,
+                        .allocator = self.allocator,
+                    };
+                };
             };
         };
 
@@ -649,6 +657,51 @@ pub fn compileLogicTableAPI(
         .zig_source = result.zig_source,
         .exported_functions = result.exported_functions,
         .allocator = allocator,
+    };
+}
+
+/// Compile @logic_table Python source to shared library using metal0 API directly
+/// Returns a result compatible with SubprocessCompileResult for easy integration.
+pub fn compileLogicTableDirect(
+    allocator: std.mem.Allocator,
+    python_source: []const u8,
+    schema: ?LanceSchema,
+) !SubprocessCompileResult {
+    // Convert Lance schema to metal0 format
+    const metal0_schema = if (schema) |s|
+        try lanceSchemaToMetal0(allocator, s)
+    else
+        metal0.SchemaTypeHints{};
+    defer if (schema != null) allocator.free(metal0_schema.columns);
+
+    // Call metal0 API directly with shared_library output
+    var result = try metal0.compileWithSchema(
+        allocator,
+        python_source,
+        metal0_schema,
+        .{ .output = .shared_library },
+    );
+    errdefer result.deinit(allocator);
+
+    // Load the compiled library
+    const lib_path = result.output_path orelse return error.NoOutputPath;
+
+    // Create null-terminated path for DynLib.open
+    const lib_path_z = try allocator.allocSentinel(u8, lib_path.len, 0);
+    defer allocator.free(lib_path_z);
+    @memcpy(lib_path_z, lib_path);
+
+    var lib = std.DynLib.open(lib_path_z) catch return error.CannotLoadLibrary;
+    errdefer lib.close();
+
+    // Extract class name from Python source
+    const class_name = extractClassName(allocator, python_source) catch "LogicTable";
+
+    return SubprocessCompileResult{
+        .lib = lib,
+        .lib_path = result.output_path.?,
+        .zig_source = result.zig_source,
+        .class_name = class_name,
     };
 }
 

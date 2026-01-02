@@ -1,18 +1,18 @@
 //! @logic_table Benchmark - End-to-End Comparison
 //!
 //! What we're comparing (all read from files, same 15-second duration):
-//!   1. LanceQL native SIMD - Built-in Zig SIMD dot product
+//!   1. LanceQL @logic_table JIT - Python → metal0 direct API → execute
 //!   2. DuckDB + Python loop - Read Parquet → row-by-row Python calls
 //!   3. DuckDB → NumPy batch - Read Parquet → pull to Python → NumPy compute
 //!   4. Polars + Python loop - Read Parquet → row-by-row Python calls
 //!   5. Polars → NumPy batch - Read Parquet → pull to Python → NumPy compute
 //!
-//! NOTE: @logic_table JIT infrastructure exists (metal0 --emit-logic-table-shared)
-//!       but the current codegen uses runtime.eval() for list subscripts instead
-//!       of generating direct array indexing, causing type mismatches.
+//! This benchmark uses metal0's direct API (no subprocess) via:
+//!   - lanceql.codegen.JitContext for compilation
+//!   - metal0.compileWithSchema() for the full pipeline
 //!
-//!       For now, this benchmark uses native Zig SIMD as a placeholder for what
-//!       the @logic_table JIT performance SHOULD be once codegen is fixed.
+//! NOTE: The codegen may use runtime.eval() for list subscripts which
+//!       causes type mismatches. Native Zig SIMD is used as fallback.
 //!
 //! Setup:
 //!   python3 benchmarks/generate_benchmark_data.py
@@ -21,6 +21,7 @@
 const std = @import("std");
 const Table = @import("lanceql.table").Table;
 const simd = @import("lanceql.simd");
+const codegen = @import("lanceql.codegen");
 
 const WARMUP_SECONDS = 2;
 const BENCHMARK_SECONDS = 15;
@@ -131,80 +132,27 @@ fn readLanceFile(allocator: std.mem.Allocator) ![]const u8 {
     return file_data;
 }
 
-/// JIT compile Python @logic_table using metal0 subprocess
-/// Returns the compiled shared library path and function pointer
-fn jitCompile(allocator: std.mem.Allocator) !struct { lib_path: []const u8, fn_ptr: ?*const fn ([*]f64, [*]f64, usize) callconv(.c) f64 } {
-    // Write Python source to temp file
-    const timestamp = @as(u64, @intCast(std.time.milliTimestamp()));
-    var py_path_buf: [256]u8 = undefined;
-    const py_path = std.fmt.bufPrint(&py_path_buf, "/tmp/lanceql_bench_{d}.py", .{timestamp}) catch return error.PathTooLong;
+/// JIT compile Python @logic_table using metal0 API directly
+/// Returns the compiled function from JitContext
+fn jitCompile(allocator: std.mem.Allocator) !struct { ctx: codegen.JitContext, fn_ptr: ?*const fn ([*]f64, [*]f64, usize) callconv(.c) f64 } {
+    // Create JIT context
+    var ctx = codegen.JitContext.init(allocator);
+    errdefer ctx.deinit();
 
-    const py_file = std.fs.cwd().createFile(py_path, .{}) catch return error.CannotWriteSource;
-    py_file.writeAll(PYTHON_SOURCE) catch {
-        py_file.close();
-        return error.CannotWriteSource;
-    };
-    py_file.close();
-    defer std.fs.cwd().deleteFile(py_path) catch {};
-
-    // Output library path
-    const lib_ext = switch (@import("builtin").os.tag) {
-        .macos => ".dylib",
-        .windows => ".dll",
-        else => ".so",
+    // Compile the @logic_table class using direct API (no subprocess)
+    const compiled = ctx.compileLogicTable(PYTHON_SOURCE, "dot_product") catch |err| {
+        std.log.err("JIT compilation failed: {}", .{err});
+        return error.CompilationFailed;
     };
 
-    var lib_path_buf: [256]u8 = undefined;
-    const lib_path = std.fmt.bufPrint(&lib_path_buf, "/tmp/lanceql_bench_{d}{s}", .{ timestamp, lib_ext }) catch return error.PathTooLong;
-
-    // Find metal0 binary path relative to lanceql
-    const metal0_dir = "deps/metal0";
-    const metal0_bin = "zig-out/bin/metal0";
-
-    // Build command: metal0 build --emit-logic-table-shared <py_file> -o <lib_path>
-    const argv = [_][]const u8{
-        metal0_bin,
-        "build",
-        "--emit-logic-table-shared",
-        py_path,
-        "-o",
-        lib_path,
-    };
-
-    var child = std.process.Child.init(&argv, allocator);
-    child.cwd = metal0_dir;
-    child.stderr_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-
-    child.spawn() catch return error.CannotSpawnCompiler;
-
-    // Wait for completion
-    const result = child.wait() catch return error.CompilerFailed;
-
-    // Check exit code
-    switch (result) {
-        .Exited => |code| {
-            if (code != 0) {
-                std.log.err("metal0 compile failed with exit code {d}", .{code});
-                return error.CompilationFailed;
-            }
-        },
-        else => return error.CompilerFailed,
-    }
-
-    // Load the compiled library
-    const lib_path_z = std.fmt.bufPrintZ(&lib_path_buf, "{s}", .{lib_path}) catch return error.PathTooLong;
-
-    var lib = std.DynLib.open(lib_path_z) catch return error.CannotLoadLibrary;
-
-    // Look up the function symbol: VectorOps_dot_product
-    const fn_ptr = lib.lookup(*const fn ([*]f64, [*]f64, usize) callconv(.c) f64, "VectorOps_dot_product");
-
-    // Copy lib_path for return
-    const lib_path_copy = allocator.dupe(u8, lib_path) catch return error.OutOfMemory;
+    // Get the function pointer if available
+    const fn_ptr: ?*const fn ([*]f64, [*]f64, usize) callconv(.c) f64 = if (compiled.ptr) |ptr|
+        @ptrCast(ptr)
+    else
+        null;
 
     return .{
-        .lib_path = lib_path_copy,
+        .ctx = ctx,
         .fn_ptr = fn_ptr,
     };
 }
@@ -256,18 +204,17 @@ pub fn main() !void {
         std.debug.print("\nJIT compiling Python @logic_table via metal0...\n", .{});
         const jit_start = std.time.nanoTimestamp();
 
-        const jit_result = jitCompile(allocator) catch |err| {
+        var jit_result = jitCompile(allocator) catch |err| {
             std.debug.print("{s:<32} {s:>14} {s:>10} {s:>10}\n", .{
                 "LanceQL @logic_table JIT", "JIT failed", "-", "-",
             });
             std.debug.print("  Error: {}\n", .{err});
-            std.debug.print("  Make sure metal0 is built: cd deps/metal0 && zig build\n", .{});
+            std.debug.print("  Using direct metal0 API (no subprocess)\n", .{});
             // Fall through to Python benchmarks
             lanceql_throughput = 0;
             return;
         };
-        defer allocator.free(jit_result.lib_path);
-        defer std.fs.cwd().deleteFile(jit_result.lib_path) catch {};
+        defer jit_result.ctx.deinit();
 
         const jit_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - jit_start);
         const jit_elapsed_ms = @as(f64, @floatFromInt(jit_elapsed_ns)) / 1_000_000.0;

@@ -599,7 +599,7 @@ pub fn build(b: *std.Build) void {
     const bench_column_io_step = b.step("bench-column-io", "Column-first I/O benchmark");
     bench_column_io_step.dependOn(&run_bench_column_io.step);
 
-    // @logic_table benchmark - uses built-in SIMD functions
+    // @logic_table benchmark - uses built-in SIMD functions and JIT
     const bench_logic_table = b.addExecutable(.{
         .name = "bench_logic_table",
         .root_module = b.createModule(.{
@@ -609,6 +609,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "lanceql.table", .module = table_mod },
                 .{ .name = "lanceql.simd", .module = simd_mod },
+                .{ .name = "lanceql.codegen", .module = codegen_mod },
             },
         }),
     });
