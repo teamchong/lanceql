@@ -3,10 +3,11 @@
  */
 
 class LRUCache {
-    constructor(maxSize = 50 * 1024 * 1024) { // 50MB default
-        this.maxSize = maxSize;
+    constructor(options = {}) {
+        this.maxSize = options.maxSize ?? 50 * 1024 * 1024; // 50MB default
         this.currentSize = 0;
         this.cache = new Map(); // key -> { data, size, lastAccess }
+        this._accessCounter = 0; // Monotonic counter for LRU tracking
     }
 
     /**
@@ -17,10 +18,20 @@ class LRUCache {
     get(key) {
         const entry = this.cache.get(key);
         if (entry) {
-            entry.lastAccess = Date.now();
+            entry.lastAccess = ++this._accessCounter;
             return entry.data;
         }
-        return null;
+        return undefined;
+    }
+
+    delete(key) {
+        const entry = this.cache.get(key);
+        if (entry) {
+            this.currentSize -= entry.size;
+            this.cache.delete(key);
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -35,7 +46,19 @@ class LRUCache {
             this.cache.delete(key);
         }
 
-        const size = data.byteLength;
+        // Calculate size based on data type
+        let size = 0;
+        if (data === null || data === undefined) {
+            size = 0;
+        } else if (data.byteLength !== undefined) {
+            size = data.byteLength;
+        } else if (typeof data === 'string') {
+            size = data.length * 2; // UTF-16
+        } else if (typeof data === 'object') {
+            size = JSON.stringify(data).length * 2;
+        } else {
+            size = 8; // primitive
+        }
 
         // Evict if needed
         while (this.currentSize + size > this.maxSize && this.cache.size > 0) {
@@ -50,7 +73,7 @@ class LRUCache {
         this.cache.set(key, {
             data,
             size,
-            lastAccess: Date.now()
+            lastAccess: ++this._accessCounter
         });
         this.currentSize += size;
     }

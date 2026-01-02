@@ -73,7 +73,6 @@
     "node": ">=18.0.0"
   },
   "devDependencies": {
-    "@duckdb/duckdb-wasm": "^1.29.0",
     "@playwright/test": "^1.57.0",
     "esbuild": "^0.24.0"
   }
