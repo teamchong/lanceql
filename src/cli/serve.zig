@@ -42,6 +42,12 @@ const FileType = enum {
     unknown,
 };
 
+/// Serve mode
+const ServeMode = enum {
+    single_file,
+    folder,
+};
+
 /// Server state
 pub const Server = struct {
     allocator: std.mem.Allocator,
@@ -50,6 +56,8 @@ pub const Server = struct {
     file_data: ?[]const u8,
     host: []const u8,
     port: u16,
+    mode: ServeMode,
+    folder_path: ?[]const u8,
 
     const Self = @This();
 
@@ -66,22 +74,39 @@ pub const Server = struct {
             return ServeError.BindFailed;
         };
 
-        // Load data file if provided
+        // Detect folder vs file mode
+        var mode: ServeMode = .single_file;
+        var folder_path: ?[]const u8 = null;
         var file_data: ?[]const u8 = null;
+        var data_path: ?[]const u8 = opts.input;
+
         if (opts.input) |path| {
-            file_data = std.fs.cwd().readFileAlloc(allocator, path, 500 * 1024 * 1024) catch |err| {
-                std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
+            const stat = std.fs.cwd().statFile(path) catch |err| {
+                std.debug.print("Error accessing '{s}': {}\n", .{ path, err });
                 return ServeError.FileNotFound;
             };
+
+            if (stat.kind == .directory) {
+                mode = .folder;
+                folder_path = path;
+                data_path = null;
+            } else {
+                file_data = std.fs.cwd().readFileAlloc(allocator, path, 500 * 1024 * 1024) catch |err| {
+                    std.debug.print("Error reading file '{s}': {}\n", .{ path, err });
+                    return ServeError.FileNotFound;
+                };
+            }
         }
 
         return Self{
             .allocator = allocator,
             .listener = listener,
-            .data_path = opts.input,
+            .data_path = data_path,
             .file_data = file_data,
             .host = opts.host,
             .port = opts.port,
+            .mode = mode,
+            .folder_path = folder_path,
         };
     }
 
@@ -99,8 +124,18 @@ pub const Server = struct {
     /// Run the server loop
     pub fn run(self: *Self) !void {
         std.debug.print("\nLanceQL Server running at http://{s}:{}\n", .{ self.host, self.port });
-        if (self.data_path) |path| {
-            std.debug.print("Serving: {s}\n", .{path});
+        switch (self.mode) {
+            .folder => {
+                std.debug.print("Mode: folder browser\n", .{});
+                if (self.folder_path) |path| {
+                    std.debug.print("Folder: {s}\n", .{path});
+                }
+            },
+            .single_file => {
+                if (self.data_path) |path| {
+                    std.debug.print("Serving: {s}\n", .{path});
+                }
+            },
         }
         std.debug.print("Press Ctrl+C to stop\n\n", .{});
 
@@ -162,23 +197,142 @@ pub const Server = struct {
     }
 
     fn route(self: *Self, request: *http.Request) !http.Response {
-        // Handle CORS preflight
         if (request.method == .OPTIONS) {
             return http.corsPreflightResponse(self.allocator);
         }
 
-        // Route by path
         if (std.mem.eql(u8, request.path, "/")) {
             return self.handleIndex();
         } else if (std.mem.eql(u8, request.path, "/api/query")) {
             return self.handleQuery(request);
         } else if (std.mem.eql(u8, request.path, "/api/schema")) {
             return self.handleSchema();
+        } else if (std.mem.eql(u8, request.path, "/api/files")) {
+            return self.handleFiles();
         } else if (std.mem.eql(u8, request.path, "/api/health")) {
             return http.jsonResponse(self.allocator, "{\"status\":\"ok\"}");
+        } else if (std.mem.startsWith(u8, request.path, "/api/schema/")) {
+            const file_path = request.path["/api/schema/".len..];
+            return self.handleSchemaForFile(file_path);
         } else {
             return http.errorResponse(self.allocator, 404, "Not found");
         }
+    }
+
+    fn handleFiles(self: *Self) !http.Response {
+        if (self.mode != .folder or self.folder_path == null) {
+            return http.jsonResponse(self.allocator, "{\"files\":[],\"mode\":\"single_file\"}");
+        }
+
+        const folder = self.folder_path.?;
+        var json = std.ArrayListUnmanaged(u8){};
+        defer json.deinit(self.allocator);
+
+        try json.appendSlice(self.allocator, "{\"files\":[");
+
+        var dir = std.fs.cwd().openDir(folder, .{ .iterate = true }) catch {
+            return http.errorResponse(self.allocator, 500, "Cannot open folder");
+        };
+        defer dir.close();
+
+        var first = true;
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            const is_data_file = isDataFile(entry.name);
+            if (!is_data_file and entry.kind != .directory) continue;
+
+            if (!first) try json.appendSlice(self.allocator, ",");
+            first = false;
+
+            const kind_str = if (entry.kind == .directory) "folder" else "file";
+            const file_type = if (entry.kind == .directory)
+                detectFolderType(self.allocator, folder, entry.name)
+            else
+                getFileTypeFromName(entry.name);
+
+            try json.writer(self.allocator).print("{{\"name\":\"{s}\",\"kind\":\"{s}\",\"type\":\"{s}\"}}", .{
+                entry.name,
+                kind_str,
+                file_type,
+            });
+        }
+
+        try json.appendSlice(self.allocator, "],\"mode\":\"folder\"}");
+        const json_str = try self.allocator.dupe(u8, json.items);
+        return http.jsonResponse(self.allocator, json_str);
+    }
+
+    fn handleSchemaForFile(self: *Self, file_path: []const u8) !http.Response {
+        if (self.folder_path == null) {
+            return http.errorResponse(self.allocator, 400, "Not in folder mode");
+        }
+
+        const full_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.folder_path.?, file_path });
+        defer self.allocator.free(full_path);
+
+        const data = std.fs.cwd().readFileAlloc(self.allocator, full_path, 500 * 1024 * 1024) catch {
+            return http.errorResponse(self.allocator, 404, "File not found");
+        };
+        defer self.allocator.free(data);
+
+        const file_type = detectFileType(file_path, data);
+        return self.buildSchemaResponse(file_path, data, file_type);
+    }
+
+    fn buildSchemaResponse(self: *Self, path: []const u8, data: []const u8, file_type: FileType) !http.Response {
+        var json = std.ArrayListUnmanaged(u8){};
+        defer json.deinit(self.allocator);
+
+        try json.appendSlice(self.allocator, "{\"columns\":[");
+
+        switch (file_type) {
+            .parquet => {
+                var table = ParquetTable.init(self.allocator, data) catch {
+                    return http.errorResponse(self.allocator, 500, "Failed to parse file");
+                };
+                defer table.deinit();
+
+                for (table.getColumnNames(), 0..) |col_name, i| {
+                    if (i > 0) try json.appendSlice(self.allocator, ",");
+                    const col_type = if (table.getColumnType(i)) |t| @tagName(t) else "unknown";
+                    try json.writer(self.allocator).print("{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{ col_name, col_type });
+                }
+                try json.writer(self.allocator).print("],\"row_count\":{},\"path\":\"{s}\"}}", .{ table.numRows(), path });
+            },
+            .lance => {
+                var table = Table.init(self.allocator, data) catch {
+                    return http.errorResponse(self.allocator, 500, "Failed to parse file");
+                };
+                defer table.deinit();
+
+                if (table.schema) |schema| {
+                    for (schema.fields, 0..) |field, i| {
+                        if (i > 0) try json.appendSlice(self.allocator, ",");
+                        try json.writer(self.allocator).print("{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{ field.name, field.logical_type });
+                    }
+                }
+                try json.writer(self.allocator).print("],\"row_count\":0,\"path\":\"{s}\"}}", .{path});
+            },
+            .arrow => {
+                var table = ArrowTable.init(self.allocator, data) catch {
+                    return http.errorResponse(self.allocator, 500, "Failed to parse file");
+                };
+                defer table.deinit();
+
+                for (table.getColumnNames(), 0..) |col_name, i| {
+                    if (i > 0) try json.appendSlice(self.allocator, ",");
+                    const col_type = if (table.getColumnType(i)) |t| @tagName(t) else "unknown";
+                    try json.writer(self.allocator).print("{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{ col_name, col_type });
+                }
+                try json.writer(self.allocator).print("],\"row_count\":{},\"path\":\"{s}\"}}", .{ table.numRows(), path });
+            },
+            .unknown => {
+                return http.errorResponse(self.allocator, 400, "Unknown file format");
+            },
+        }
+
+        const json_str = try self.allocator.dupe(u8, json.items);
+        return http.jsonResponse(self.allocator, json_str);
     }
 
     fn handleIndex(self: *Self) !http.Response {
@@ -380,12 +534,47 @@ fn detectFileType(path: []const u8, data: []const u8) FileType {
     if (std.mem.endsWith(u8, path, ".parquet")) return .parquet;
     if (std.mem.endsWith(u8, path, ".arrow") or std.mem.endsWith(u8, path, ".feather")) return .arrow;
 
-    // Check magic bytes
     if (data.len >= 4 and std.mem.eql(u8, data[0..4], "PAR1")) return .parquet;
     if (data.len >= 6 and std.mem.eql(u8, data[0..6], "ARROW1")) return .arrow;
     if (data.len >= 40 and std.mem.eql(u8, data[data.len - 4 ..], "LANC")) return .lance;
 
     return .unknown;
+}
+
+/// Check if filename is a supported data file
+fn isDataFile(name: []const u8) bool {
+    const extensions = [_][]const u8{ ".lance", ".parquet", ".arrow", ".feather", ".csv", ".json", ".jsonl" };
+    for (extensions) |ext| {
+        if (std.mem.endsWith(u8, name, ext)) return true;
+    }
+    return false;
+}
+
+/// Get file type string from filename
+fn getFileTypeFromName(name: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, name, ".lance")) return "lance";
+    if (std.mem.endsWith(u8, name, ".parquet")) return "parquet";
+    if (std.mem.endsWith(u8, name, ".arrow") or std.mem.endsWith(u8, name, ".feather")) return "arrow";
+    if (std.mem.endsWith(u8, name, ".csv")) return "csv";
+    if (std.mem.endsWith(u8, name, ".json") or std.mem.endsWith(u8, name, ".jsonl")) return "json";
+    return "unknown";
+}
+
+/// Detect folder type (Delta Lake, Iceberg, or Lance)
+fn detectFolderType(allocator: std.mem.Allocator, parent: []const u8, name: []const u8) []const u8 {
+    const full_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ parent, name }) catch return "folder";
+    defer allocator.free(full_path);
+
+    var dir = std.fs.cwd().openDir(full_path, .{ .iterate = true }) catch return "folder";
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (std.mem.eql(u8, entry.name, "_delta_log")) return "delta";
+        if (std.mem.eql(u8, entry.name, "metadata")) return "iceberg";
+        if (std.mem.endsWith(u8, entry.name, ".lance")) return "lance";
+    }
+    return "folder";
 }
 
 /// Extract SQL from JSON body: {"sql": "..."}
