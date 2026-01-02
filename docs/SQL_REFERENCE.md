@@ -1,7 +1,5 @@
 # LanceQL SQL Reference
 
-Complete reference for LanceQL's SQL dialect. LanceQL supports querying Lance, Parquet, Delta Lake, Iceberg, Arrow, Avro, ORC, and XLSX files.
-
 ## Table of Contents
 
 - [Data Sources](#data-sources)
@@ -148,8 +146,6 @@ SELECT UPPER(name), ROUND(price, 2) FROM read_lance('products.lance')
 
 ## WHERE
 
-Filter rows based on conditions.
-
 ### Comparison Operators
 
 ```sql
@@ -226,8 +222,6 @@ GROUP BY category, region
 
 ### ORDER BY
 
-Sort results.
-
 ```sql
 -- Ascending (default)
 SELECT * FROM read_lance('data.lance') ORDER BY created_at
@@ -260,11 +254,7 @@ SELECT * FROM read_lance('data.lance') LIMIT 20 OFFSET 10
 
 ## JOINs
 
-Combine rows from multiple tables.
-
 ### INNER JOIN
-
-Returns rows with matches in both tables.
 
 ```sql
 SELECT o.id, o.amount, c.name
@@ -274,8 +264,6 @@ INNER JOIN read_lance('customers.lance') c ON o.customer_id = c.id
 
 ### LEFT JOIN
 
-Returns all rows from left table, matched rows from right.
-
 ```sql
 SELECT o.id, o.amount, c.name
 FROM read_lance('orders.lance') o
@@ -284,8 +272,6 @@ LEFT JOIN read_lance('customers.lance') c ON o.customer_id = c.id
 
 ### RIGHT JOIN
 
-Returns all rows from right table, matched rows from left.
-
 ```sql
 SELECT o.id, o.amount, c.name
 FROM read_lance('orders.lance') o
@@ -293,8 +279,6 @@ RIGHT JOIN read_lance('customers.lance') c ON o.customer_id = c.id
 ```
 
 ### CROSS JOIN
-
-Returns Cartesian product of both tables.
 
 ```sql
 SELECT *
@@ -349,8 +333,6 @@ SELECT email FROM read_lance('unsubscribed.lance')
 ---
 
 ## Window Functions
-
-Compute values across rows related to current row.
 
 ### Syntax
 

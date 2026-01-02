@@ -1,11 +1,8 @@
-# LanceQL Vector Search Guide
-
-This guide covers semantic search in LanceQL using the `NEAR` clause. Query datasets using natural language to find semantically similar items.
+# Vector Search
 
 ## Table of Contents
 
 - [Quick Start](#quick-start)
-- [Understanding Vector Search](#understanding-vector-search)
 - [NEAR Clause Syntax](#near-clause-syntax)
 - [Text Encoders](#text-encoders)
 - [IVF-PQ Index Explained](#ivf-pq-index-explained)
@@ -43,36 +40,6 @@ WHERE aesthetic > 0.7
 NEAR 'mountain landscape'
 TOPK 50
 ```
-
----
-
-## Understanding Vector Search
-
-### How It Works
-
-1. **Text to Vector**: Your search query is converted to a vector (embedding) using a text encoder
-2. **Similarity Search**: The vector is compared against pre-computed embeddings in the dataset
-3. **Ranking**: Results are ranked by cosine similarity (higher = more similar)
-4. **Return**: Top K most similar items are returned
-
-### Embeddings
-
-Embeddings are high-dimensional vectors that capture semantic meaning:
-
-- Similar concepts have vectors that point in similar directions
-- "cat" and "kitten" have similar embeddings
-- "sunset beach" and "ocean waves at dusk" have similar embeddings
-
-### Similarity Metrics
-
-LanceQL uses **cosine similarity** for vector comparison:
-
-```
-similarity = dot(A, B) / (|A| * |B|)
-```
-
-- Range: -1 to 1 (1 = identical, 0 = unrelated, -1 = opposite)
-- Pre-normalized vectors (L2) simplify to dot product
 
 ---
 
@@ -140,7 +107,7 @@ SELECT * FROM read_lance(FILE) NEAR 'machine learning tutorial'
 ```
 
 **Characteristics**:
-- Fast inference (~10ms per query)
+- Fast inference
 - Optimized for semantic textual similarity
 - Works well with short to medium text (up to 256 tokens)
 - L2-normalized embeddings
@@ -152,14 +119,8 @@ SELECT * FROM read_lance(FILE) NEAR 'machine learning tutorial'
 - **Best for**: Text-to-image search
 - **Use case**: Finding images from text descriptions
 
-```sql
--- Specify CLIP encoder
-SELECT * FROM read_lance(FILE) NEAR 'a cat sleeping on a couch' USING clip
-```
-
 **Characteristics**:
 - Trained on image-text pairs
-- Better for visual concepts
 - Works with any image dataset that has CLIP embeddings
 - L2-normalized embeddings
 
@@ -168,8 +129,6 @@ SELECT * FROM read_lance(FILE) NEAR 'a cat sleeping on a couch' USING clip
 | Feature | MiniLM | CLIP |
 |---------|--------|------|
 | Dimensions | 384 | 512 |
-| Model Size | 87 MB | 122 MB |
-| Speed | ~10ms | ~15ms |
 | Best For | Text similarity | Image search |
 | Vocab | WordPiece (30k) | BPE (49k) |
 
@@ -215,15 +174,9 @@ Speed: Compare compressed codes instead of full vectors
 
 ### Accuracy vs Speed Trade-off
 
-| nprobe (partitions searched) | Recall@10 | Search Time |
-|------------------------------|-----------|-------------|
-| 1 | ~40% | Fastest |
-| 10 | ~85% | Fast |
-| 20 | ~92% | Default |
-| 50 | ~97% | Slower |
-| 256 (all) | 100% | Slowest |
+Higher nprobe = more partitions searched = better recall but slower.
 
-**Default nprobe**: 20 (good balance of accuracy and speed)
+**Default nprobe**: 20
 
 ---
 
@@ -271,19 +224,6 @@ SELECT * FROM read_lance(FILE) NEAR 'query' TOPK 1000 LIMIT 10
 ```
 
 3. **Use appropriate encoder**: Match encoder to your data
-
-### HTTP Range Request Optimization
-
-When querying remote datasets, LanceQL uses HTTP Range requests:
-
-| Operation | Data Transfer | Time |
-|-----------|--------------|------|
-| Load metadata | ~50 KB | <1s |
-| Load first 50 rows | ~200 KB | <2s |
-| Vector search (20 partitions) | ~100 MB | ~5s |
-| Full dataset scan | 1.5+ GB | N/A |
-
-**Key insight**: Only searched partitions are downloaded, not the entire dataset.
 
 ---
 
