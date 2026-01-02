@@ -5342,7 +5342,8 @@ test.describe('Vault SQL Operations', () => {
     test('SEARCH + Aggregations (COUNT, SUM, AVG with NEAR)', async ({ page }) => {
         // This test verifies that vector search can be combined with aggregate functions
         const results = await page.evaluate(async () => {
-            const v = window.vault;
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
             const tests = [];
 
             // Create test table with text and numeric data
@@ -5414,7 +5415,8 @@ test.describe('Vault SQL Operations', () => {
     test('SEARCH + GROUP BY Aggregations', async ({ page }) => {
         // This test verifies that vector search can be combined with GROUP BY
         const results = await page.evaluate(async () => {
-            const v = window.vault;
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
             const tests = [];
 
             // Create test table with categories
@@ -5476,7 +5478,8 @@ test.describe('Vault SQL Operations', () => {
     test('BM25 Full-Text Search (NEAR without vector column)', async ({ page }) => {
         // This test verifies BM25 text search works when no vector/embedding column exists
         const results = await page.evaluate(async () => {
-            const v = window.vault;
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
             const tests = [];
 
             // Create test table WITHOUT embedding column (pure text)
