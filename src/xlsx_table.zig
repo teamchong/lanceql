@@ -202,20 +202,22 @@ pub const XlsxTable = struct {
         return values;
     }
 
+    /// Generic helper to convert array from one type to another
+    fn convertArray(self: *Self, comptime From: type, comptime To: type, values: []const From) XlsxTableError![]To {
+        var result = self.allocator.alloc(To, values.len) catch {
+            return XlsxTableError.OutOfMemory;
+        };
+        for (values, 0..) |v, i| {
+            result[i] = if (To == bool) (v != 0) else if (@typeInfo(To) == .float) @floatCast(v) else @intCast(v);
+        }
+        return result;
+    }
+
     /// Read int32 column data
     pub fn readInt32Column(self: *Self, col_idx: usize) XlsxTableError![]i32 {
         const values64 = try self.readInt64Column(col_idx);
         defer self.allocator.free(values64);
-
-        var values32 = self.allocator.alloc(i32, values64.len) catch {
-            return XlsxTableError.OutOfMemory;
-        };
-
-        for (values64, 0..) |v, i| {
-            values32[i] = @intCast(v);
-        }
-
-        return values32;
+        return self.convertArray(i64, i32, values64);
     }
 
     /// Read float64 column data
@@ -247,16 +249,7 @@ pub const XlsxTable = struct {
     pub fn readFloat32Column(self: *Self, col_idx: usize) XlsxTableError![]f32 {
         const values64 = try self.readFloat64Column(col_idx);
         defer self.allocator.free(values64);
-
-        var values32 = self.allocator.alloc(f32, values64.len) catch {
-            return XlsxTableError.OutOfMemory;
-        };
-
-        for (values64, 0..) |v, i| {
-            values32[i] = @floatCast(v);
-        }
-
-        return values32;
+        return self.convertArray(f64, f32, values64);
     }
 
     /// Read string column data

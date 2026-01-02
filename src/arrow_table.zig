@@ -109,6 +109,17 @@ pub const ArrowTable = struct {
         return mapArrowToParquetType(arrow_type);
     }
 
+    /// Generic helper to convert array from one type to another
+    fn convertArray(self: *Self, comptime From: type, comptime To: type, values: []const From) ArrowTableError![]To {
+        var result = self.allocator.alloc(To, values.len) catch {
+            return ArrowTableError.OutOfMemory;
+        };
+        for (values, 0..) |v, i| {
+            result[i] = if (To == bool) (v != 0) else if (@typeInfo(To) == .float) @floatCast(v) else @intCast(v);
+        }
+        return result;
+    }
+
     /// Read int64 column data
     pub fn readInt64Column(self: *Self, col_idx: usize) ArrowTableError![]i64 {
         return self.reader.readInt64Column(col_idx) catch {
@@ -122,16 +133,7 @@ pub const ArrowTable = struct {
             return ArrowTableError.ReadFailed;
         };
         defer self.allocator.free(values64);
-
-        var values32 = self.allocator.alloc(i32, values64.len) catch {
-            return ArrowTableError.OutOfMemory;
-        };
-
-        for (values64, 0..) |v, i| {
-            values32[i] = @intCast(v);
-        }
-
-        return values32;
+        return self.convertArray(i64, i32, values64);
     }
 
     /// Read float64 column data
@@ -147,16 +149,7 @@ pub const ArrowTable = struct {
             return ArrowTableError.ReadFailed;
         };
         defer self.allocator.free(values64);
-
-        var values32 = self.allocator.alloc(f32, values64.len) catch {
-            return ArrowTableError.OutOfMemory;
-        };
-
-        for (values64, 0..) |v, i| {
-            values32[i] = @floatCast(v);
-        }
-
-        return values32;
+        return self.convertArray(f64, f32, values64);
     }
 
     /// Read string column data
@@ -168,21 +161,11 @@ pub const ArrowTable = struct {
 
     /// Read bool column data
     pub fn readBoolColumn(self: *Self, col_idx: usize) ArrowTableError![]bool {
-        // Arrow stores bools packed, but for now read as int64 and convert
         const values64 = self.reader.readInt64Column(col_idx) catch {
             return ArrowTableError.ReadFailed;
         };
         defer self.allocator.free(values64);
-
-        var bools = self.allocator.alloc(bool, values64.len) catch {
-            return ArrowTableError.OutOfMemory;
-        };
-
-        for (values64, 0..) |v, i| {
-            bools[i] = v != 0;
-        }
-
-        return bools;
+        return self.convertArray(i64, bool, values64);
     }
 
     /// Check if path is a valid Arrow IPC file
