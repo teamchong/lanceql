@@ -11,12 +11,18 @@ const std = @import("std");
 
 const memory = @import("wasm/memory.zig");
 const format = @import("wasm/format.zig");
+const string_column = @import("wasm/string_column.zig");
+const vector_column = @import("wasm/vector_column.zig");
+const compression = @import("wasm/compression.zig");
 
 // Module exports are automatic via `pub export fn` in each module.
 // Force reference to ensure they're included in WASM binary:
 comptime {
     _ = memory;
     _ = format;
+    _ = string_column;
+    _ = vector_column;
+    _ = compression;
 }
 
 // ============================================================================
@@ -56,6 +62,16 @@ var file_data: ?[]const u8 = null;
 var num_columns: u32 = 0;
 var column_meta_offsets_start: u64 = 0;
 
+/// Sync global state to all modules that need it
+fn syncStateToModules() void {
+    string_column.file_data = file_data;
+    string_column.num_columns = num_columns;
+    string_column.column_meta_offsets_start = column_meta_offsets_start;
+    vector_column.file_data = file_data;
+    vector_column.num_columns = num_columns;
+    vector_column.column_meta_offsets_start = column_meta_offsets_start;
+}
+
 // ============================================================================
 // Exported Memory Management
 // ============================================================================
@@ -64,6 +80,8 @@ export fn resetHeap() void {
     wasmReset();
     file_data = null;
     num_columns = 0;
+    column_meta_offsets_start = 0;
+    syncStateToModules();
 }
 
 // ============================================================================
@@ -79,6 +97,7 @@ export fn openFile(data: [*]const u8, len: usize) u32 {
     num_columns = readU32LE(data[0..len], footer_start + 28);
     column_meta_offsets_start = readU64LE(data[0..len], footer_start + 8);
 
+    syncStateToModules();
     return 1;
 }
 
@@ -86,6 +105,7 @@ export fn closeFile() void {
     file_data = null;
     num_columns = 0;
     column_meta_offsets_start = 0;
+    syncStateToModules();
 }
 
 export fn getNumColumns() u32 {
@@ -669,341 +689,6 @@ export fn avgFloat64Column(col_idx: u32) f64 {
     var sum: f64 = 0;
     for (0..row_count) |i| sum += readF64LE(buf.data, buf.start + i * 8);
     return sum / @as(f64, @floatFromInt(row_count));
-}
-
-// ============================================================================
-// String Column Support
-// ============================================================================
-
-/// Get string buffer info from column metadata (for variable-length data)
-/// Lance stores strings with:
-///   - buffer[0]: offsets (int32 or int64)
-///   - buffer[1]: data (UTF-8 bytes)
-fn getStringBufferInfo(col_meta: []const u8) struct {
-    offsets_start: u64,
-    offsets_size: u64,
-    data_start: u64,
-    data_size: u64,
-    rows: u64,
-} {
-    var pos: usize = 0;
-    var buffer_offsets: [2]u64 = .{ 0, 0 };
-    var buffer_sizes: [2]u64 = .{ 0, 0 };
-    var page_rows: u64 = 0;
-    var buf_idx: usize = 0;
-
-    while (pos < col_meta.len) {
-        const tag = readVarint(col_meta, &pos);
-        const field_num = tag >> 3;
-        const wire_type: u3 = @truncate(tag);
-
-        switch (field_num) {
-            1 => { // encoding (length-delimited) - skip it
-                if (wire_type == 2) {
-                    const skip_len = readVarint(col_meta, &pos);
-                    pos += @as(usize, @intCast(skip_len));
-                }
-            },
-            2 => { // pages (length-delimited)
-                if (wire_type != 2) break;
-                const page_len = readVarint(col_meta, &pos);
-                const page_end = pos + @as(usize, @intCast(page_len));
-
-                // Parse page message
-                while (pos < page_end and pos < col_meta.len) {
-                    const page_tag = readVarint(col_meta, &pos);
-                    const page_field = page_tag >> 3;
-                    const page_wire: u3 = @truncate(page_tag);
-
-                    switch (page_field) {
-                        1 => { // buffer_offsets (packed repeated uint64)
-                            if (page_wire == 2) {
-                                const packed_len = readVarint(col_meta, &pos);
-                                const packed_end = pos + @as(usize, @intCast(packed_len));
-                                buf_idx = 0;
-                                while (pos < packed_end and buf_idx < 2) {
-                                    buffer_offsets[buf_idx] = readVarint(col_meta, &pos);
-                                    buf_idx += 1;
-                                }
-                                pos = packed_end;
-                            } else {
-                                if (buf_idx < 2) {
-                                    buffer_offsets[buf_idx] = readVarint(col_meta, &pos);
-                                    buf_idx += 1;
-                                }
-                            }
-                        },
-                        2 => { // buffer_sizes (packed repeated uint64)
-                            if (page_wire == 2) {
-                                const packed_len = readVarint(col_meta, &pos);
-                                const packed_end = pos + @as(usize, @intCast(packed_len));
-                                buf_idx = 0;
-                                while (pos < packed_end and buf_idx < 2) {
-                                    buffer_sizes[buf_idx] = readVarint(col_meta, &pos);
-                                    buf_idx += 1;
-                                }
-                                pos = packed_end;
-                            } else {
-                                if (buf_idx < 2) {
-                                    buffer_sizes[buf_idx] = readVarint(col_meta, &pos);
-                                    buf_idx += 1;
-                                }
-                            }
-                        },
-                        3 => { // length (rows)
-                            page_rows = readVarint(col_meta, &pos);
-                        },
-                        else => {
-                            if (page_wire == 0) {
-                                _ = readVarint(col_meta, &pos);
-                            } else if (page_wire == 2) {
-                                const skip_len = readVarint(col_meta, &pos);
-                                pos += @as(usize, @intCast(skip_len));
-                            } else if (page_wire == 5) {
-                                pos += 4;
-                            } else if (page_wire == 1) {
-                                pos += 8;
-                            }
-                        },
-                    }
-                }
-                return .{
-                    .offsets_start = buffer_offsets[0],
-                    .offsets_size = buffer_sizes[0],
-                    .data_start = buffer_offsets[1],
-                    .data_size = buffer_sizes[1],
-                    .rows = page_rows,
-                };
-            },
-            else => {
-                if (wire_type == 0) {
-                    _ = readVarint(col_meta, &pos);
-                } else if (wire_type == 2) {
-                    const skip_len = readVarint(col_meta, &pos);
-                    pos += @as(usize, @intCast(skip_len));
-                } else if (wire_type == 5) {
-                    pos += 4;
-                } else if (wire_type == 1) {
-                    pos += 8;
-                }
-            },
-        }
-    }
-
-    return .{
-        .offsets_start = 0,
-        .offsets_size = 0,
-        .data_start = 0,
-        .data_size = 0,
-        .rows = 0,
-    };
-}
-
-/// Helper to get string column buffer info
-const StringBuffer = struct {
-    data: []const u8,
-    offsets_start: usize,
-    offsets_size: usize,
-    data_start: usize,
-    data_size: usize,
-    rows: usize,
-};
-fn getStringBuffer(col_idx: u32) ?StringBuffer {
-    const data = file_data orelse return null;
-    const entry = getColumnOffsetEntry(col_idx);
-    if (entry.len == 0) return null;
-
-    const col_meta_start: usize = @intCast(entry.pos);
-    const col_meta_len: usize = @intCast(entry.len);
-    if (col_meta_start + col_meta_len > data.len) return null;
-
-    const col_meta = data[col_meta_start..][0..col_meta_len];
-    const info = getStringBufferInfo(col_meta);
-
-    return .{
-        .data = data,
-        .offsets_start = @intCast(info.offsets_start),
-        .offsets_size = @intCast(info.offsets_size),
-        .data_start = @intCast(info.data_start),
-        .data_size = @intCast(info.data_size),
-        .rows = @intCast(info.rows),
-    };
-}
-
-/// Debug: Get string column buffer info
-/// Returns packed: high32=offsets_size, low32=data_size (both 0 if not a string column)
-export fn debugStringColInfo(col_idx: u32) u64 {
-    const buf = getStringBuffer(col_idx) orelse return 0;
-    return (@as(u64, @intCast(buf.offsets_size)) << 32) | @as(u64, @intCast(buf.data_size));
-}
-
-/// Get number of strings in column
-/// Returns 0 if not a string column (string columns have 2 buffers: offsets + data)
-export fn getStringCount(col_idx: u32) u64 {
-    const buf = getStringBuffer(col_idx) orelse return 0;
-    if (buf.data_size == 0) return 0;
-    return buf.rows;
-}
-
-/// Debug: Get detailed string read info for a specific row
-/// Returns packed debug info for troubleshooting
-export fn debugReadStringInfo(col_idx: u32, row_idx: u32) u64 {
-    const buf = getStringBuffer(col_idx) orelse return 0xDEAD0001;
-    if (buf.offsets_size == 0 or buf.data_size == 0) return 0xDEAD0004;
-    if (row_idx >= buf.rows) return 0xDEAD0005;
-
-    const offset_size = buf.offsets_size / buf.rows;
-    if (offset_size != 4 and offset_size != 8) return 0xDEAD0006;
-
-    var str_start: usize = 0;
-    var str_end: usize = 0;
-
-    if (offset_size == 4) {
-        str_end = readU32LE(buf.data, buf.offsets_start + row_idx * 4);
-        if (row_idx > 0) str_start = readU32LE(buf.data, buf.offsets_start + (row_idx - 1) * 4);
-    } else {
-        str_end = @intCast(readU64LE(buf.data, buf.offsets_start + row_idx * 8));
-        if (row_idx > 0) str_start = @intCast(readU64LE(buf.data, buf.offsets_start + (row_idx - 1) * 8));
-    }
-
-    const str_len = if (str_end >= str_start) str_end - str_start else 0;
-    return (@as(u64, @intCast(str_start)) << 32) | @as(u64, @intCast(str_len));
-}
-
-/// Debug: Get data_start position for string column
-export fn debugStringDataStart(col_idx: u32) u64 {
-    const buf = getStringBuffer(col_idx) orelse return 0;
-    const ds: u32 = @intCast(@min(buf.data_start, 0xFFFFFFFF));
-    const fl: u32 = @intCast(@min(buf.data.len, 0xFFFFFFFF));
-    return (@as(u64, ds) << 32) | @as(u64, fl);
-}
-
-/// Read a single string at index into output buffer
-/// Returns actual string length (may exceed out_max if truncated)
-export fn readStringAt(col_idx: u32, row_idx: u32, out_ptr: [*]u8, out_max: usize) usize {
-    const buf = getStringBuffer(col_idx) orelse return 0;
-    if (buf.offsets_size == 0 or buf.data_size == 0) return 0;
-    if (row_idx >= buf.rows) return 0;
-
-    // Lance v2 uses N offsets for N strings (end positions, not N+1 start/end pairs)
-    const offset_size = buf.offsets_size / buf.rows;
-    if (offset_size != 4 and offset_size != 8) return 0;
-
-    var str_start: usize = 0;
-    var str_end: usize = 0;
-
-    if (offset_size == 4) {
-        str_end = readU32LE(buf.data, buf.offsets_start + row_idx * 4);
-        if (row_idx > 0) str_start = readU32LE(buf.data, buf.offsets_start + (row_idx - 1) * 4);
-    } else {
-        str_end = @intCast(readU64LE(buf.data, buf.offsets_start + row_idx * 8));
-        if (row_idx > 0) str_start = @intCast(readU64LE(buf.data, buf.offsets_start + (row_idx - 1) * 8));
-    }
-
-    if (str_end < str_start) return 0;
-    const str_len = str_end - str_start;
-    if (buf.data_start + str_end > buf.data.len) return 0;
-
-    const copy_len = @min(str_len, out_max);
-    @memcpy(out_ptr[0..copy_len], buf.data[buf.data_start + str_start ..][0..copy_len]);
-    return str_len;
-}
-
-/// Read multiple strings at indices
-/// Returns total bytes written to out_ptr
-/// out_lengths receives the length of each string
-export fn readStringsAtIndices(
-    col_idx: u32,
-    indices: [*]const u32,
-    num_indices: usize,
-    out_ptr: [*]u8,
-    out_max: usize,
-    out_lengths: [*]u32,
-) usize {
-    var total_written: usize = 0;
-
-    for (0..num_indices) |i| {
-        const remaining = if (total_written < out_max) out_max - total_written else 0;
-        const len = readStringAt(col_idx, indices[i], out_ptr + total_written, remaining);
-        out_lengths[i] = @intCast(len);
-        total_written += @min(len, remaining);
-    }
-
-    return total_written;
-}
-
-/// Allocate string buffer
-export fn allocStringBuffer(size: usize) ?[*]u8 {
-    return wasmAlloc(size);
-}
-
-/// Allocate u32 buffer for lengths
-export fn allocU32Buffer(count: usize) ?[*]u32 {
-    const ptr = wasmAlloc(count * 4) orelse return null;
-    return @ptrCast(@alignCast(ptr));
-}
-
-// ============================================================================
-// Vector Column Support (Fixed-size float arrays for embeddings)
-// ============================================================================
-
-/// Get vector info from column: dimension and count
-/// Vectors are stored as fixed-size arrays of float32
-export fn getVectorInfo(col_idx: u32) u64 {
-    const buf = getColumnBuffer(col_idx) orelse return 0;
-    if (buf.rows == 0) return 0;
-    const dim = buf.size / (buf.rows * 4);
-    return (@as(u64, buf.rows) << 32) | dim;
-}
-
-/// Read a single vector at index
-/// Returns number of floats written
-export fn readVectorAt(
-    col_idx: u32,
-    row_idx: u32,
-    out_ptr: [*]f32,
-    max_dim: usize,
-) usize {
-    const buf = getColumnBuffer(col_idx) orelse return 0;
-    if (buf.rows == 0 or row_idx >= buf.rows) return 0;
-
-    const dim = buf.size / (buf.rows * 4);
-    if (dim == 0) return 0;
-
-    const vec_start = buf.start + @as(usize, row_idx) * dim * 4;
-    const actual_dim = @min(dim, max_dim);
-    for (0..actual_dim) |i| out_ptr[i] = readF32LE(buf.data, vec_start + i * 4);
-    return actual_dim;
-}
-
-/// Allocate float32 buffer for vectors
-export fn allocFloat32Buffer(count: usize) ?[*]f32 {
-    const ptr = wasmAlloc(count * 4) orelse return null;
-    return @ptrCast(@alignCast(ptr));
-}
-
-/// Compute cosine similarity between two vectors
-/// Returns similarity score (-1 to 1, higher is more similar)
-export fn cosineSimilarity(
-    vec_a: [*]const f32,
-    vec_b: [*]const f32,
-    dim: usize,
-) f32 {
-    var dot: f32 = 0;
-    var norm_a: f32 = 0;
-    var norm_b: f32 = 0;
-
-    for (0..dim) |i| {
-        const a = vec_a[i];
-        const b = vec_b[i];
-        dot += a * b;
-        norm_a += a * a;
-        norm_b += b * b;
-    }
-
-    const denom = @sqrt(norm_a) * @sqrt(norm_b);
-    if (denom == 0) return 0;
-    return dot / denom;
 }
 
 // ============================================================================
@@ -2590,41 +2275,6 @@ export fn clip_debug_get_pre_norm_norm() f32 {
 }
 
 // ============================================================================
-// Zstd Decompression
-// ============================================================================
-
-/// Decompresses zstd-compressed data in place or to a destination buffer.
-/// compressed_ptr: pointer to compressed data
-/// compressed_len: length of compressed data
-/// decompressed_ptr: pointer to output buffer (must be pre-allocated with enough space)
-/// decompressed_capacity: capacity of output buffer
-/// Returns: decompressed size on success, 0 on error
-export fn zstd_decompress(
-    compressed_ptr: [*]const u8,
-    compressed_len: usize,
-    decompressed_ptr: [*]u8,
-    decompressed_capacity: usize,
-) usize {
-    const compressed = compressed_ptr[0..compressed_len];
-
-    // Use std.io.Reader.fixed for the new Zig 0.15 Reader API
-    var reader = std.io.Reader.fixed(compressed);
-
-    // Use fixed Writer for output buffer
-    var writer = std.io.Writer.fixed(decompressed_ptr[0..decompressed_capacity]);
-
-    // Initialize zstd decompressor (empty buffer = direct streaming mode)
-    var zstd_stream = std.compress.zstd.Decompress.init(&reader, &.{}, .{});
-
-    // Stream all decompressed data to writer
-    const bytes_written = zstd_stream.reader.streamRemaining(&writer) catch {
-        return 0;
-    };
-
-    return bytes_written;
-}
-
-// ============================================================================
 // MiniLM Text Encoder (all-MiniLM-L6-v2)
 // ============================================================================
 
@@ -3404,67 +3054,6 @@ export fn minilm_encode_text(text_len: usize) i32 {
     const norm = @sqrt(norm_sq);
     if (norm > 0) {
         for (&minilm_output_buffer) |*v| v.* /= norm;
-    }
-
-    return 0;
-}
-
-// ============================================================================
-// Zstd Decompression
-// ============================================================================
-
-/// Returns the decompressed size from zstd frame header (if available).
-/// This allows JS to know how much memory to allocate before decompression.
-/// Returns 0 if size is unknown or error.
-export fn zstd_get_decompressed_size(compressed_ptr: [*]const u8, compressed_len: usize) usize {
-    if (compressed_len < 18) return 0; // Minimum frame header size
-
-    const compressed = compressed_ptr[0..compressed_len];
-
-    // Check magic number (0xFD2FB528 little endian)
-    if (compressed[0] != 0x28 or compressed[1] != 0xB5 or
-        compressed[2] != 0x2F or compressed[3] != 0xFD)
-    {
-        return 0;
-    }
-
-    // Frame header descriptor
-    const fhd = compressed[4];
-    const fcs_flag = (fhd >> 6) & 0x03; // Frame content size flag
-    const single_segment = (fhd >> 5) & 0x01;
-    const dict_id_flag = fhd & 0x03;
-
-    // Calculate header size
-    var offset: usize = 5;
-
-    // Window descriptor (if not single segment)
-    if (single_segment == 0) {
-        offset += 1;
-    }
-
-    // Dictionary ID
-    const dict_id_sizes = [_]usize{ 0, 1, 2, 4 };
-    offset += dict_id_sizes[dict_id_flag];
-
-    // Frame content size
-    if (fcs_flag == 0 and single_segment == 1) {
-        // 1 byte
-        if (offset >= compressed_len) return 0;
-        return compressed[offset];
-    } else if (fcs_flag == 1) {
-        // 2 bytes
-        if (offset + 2 > compressed_len) return 0;
-        return @as(usize, std.mem.readInt(u16, compressed[offset..][0..2], .little)) + 256;
-    } else if (fcs_flag == 2) {
-        // 4 bytes
-        if (offset + 4 > compressed_len) return 0;
-        return std.mem.readInt(u32, compressed[offset..][0..4], .little);
-    } else if (fcs_flag == 3) {
-        // 8 bytes
-        if (offset + 8 > compressed_len) return 0;
-        const size = std.mem.readInt(u64, compressed[offset..][0..8], .little);
-        if (size > std.math.maxInt(usize)) return 0;
-        return @intCast(size);
     }
 
     return 0;
