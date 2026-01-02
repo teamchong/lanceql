@@ -19,6 +19,7 @@ pub const scalar_functions = @import("scalar_functions.zig");
 pub const aggregate_functions = @import("aggregate_functions.zig");
 pub const window_functions = @import("window_functions.zig");
 pub const result_types = @import("result_types.zig");
+pub const result_ops = @import("result_ops.zig");
 
 const Expr = ast.Expr;
 const SelectStmt = ast.SelectStmt;
@@ -881,18 +882,18 @@ pub const Executor = struct {
 
         // 5. Apply DISTINCT if specified
         if (stmt.distinct) {
-            const distinct_result = try self.applyDistinct(columns);
+            const distinct_result = try result_ops.applyDistinct(self.allocator, columns);
             columns = distinct_result.columns;
             row_count = distinct_result.row_count;
         }
 
         // 6. Apply ORDER BY (in-memory sorting)
         if (stmt.order_by) |order_by| {
-            try self.applyOrderBy(columns, order_by);
+            try result_ops.applyOrderBy(self.allocator, columns, order_by);
         }
 
         // 7. Apply LIMIT and OFFSET
-        const final_row_count = self.applyLimitOffset(columns, stmt.limit, stmt.offset);
+        const final_row_count = result_ops.applyLimitOffset(self.allocator, columns, stmt.limit, stmt.offset);
 
         var result = Result{
             .columns = columns,
@@ -970,7 +971,7 @@ pub const Executor = struct {
         var union_all = try self.executeUnionAll(left, right);
         errdefer union_all.deinit();
 
-        const distinct_result = try self.applyDistinct(union_all.columns);
+        const distinct_result = try result_ops.applyDistinct(self.allocator, union_all.columns);
         union_all.columns = distinct_result.columns;
         union_all.row_count = distinct_result.row_count;
 
@@ -984,7 +985,7 @@ pub const Executor = struct {
         defer right_rows.deinit();
 
         for (0..right.row_count) |i| {
-            const key = try self.buildRowKey(right.columns, i);
+            const key = try result_ops.buildRowKey(self.allocator, right.columns, i);
             defer self.allocator.free(key);
             try right_rows.put(try self.allocator.dupe(u8, key), {});
         }
@@ -1009,7 +1010,7 @@ pub const Executor = struct {
         }
 
         for (0..left.row_count) |i| {
-            const key = try self.buildRowKey(left.columns, i);
+            const key = try result_ops.buildRowKey(self.allocator, left.columns, i);
             defer self.allocator.free(key);
 
             // Only include if in right AND not already included (for distinct)
@@ -1029,7 +1030,7 @@ pub const Executor = struct {
         defer right_rows.deinit();
 
         for (0..right.row_count) |i| {
-            const key = try self.buildRowKey(right.columns, i);
+            const key = try result_ops.buildRowKey(self.allocator, right.columns, i);
             defer self.allocator.free(key);
             try right_rows.put(try self.allocator.dupe(u8, key), {});
         }
@@ -1054,7 +1055,7 @@ pub const Executor = struct {
         }
 
         for (0..left.row_count) |i| {
-            const key = try self.buildRowKey(left.columns, i);
+            const key = try result_ops.buildRowKey(self.allocator, left.columns, i);
             defer self.allocator.free(key);
 
             // Include if NOT in right AND not already included (for distinct)
@@ -1065,49 +1066,6 @@ pub const Executor = struct {
         }
 
         return try self.projectRows(left.columns, non_matching_indices.items);
-    }
-
-    /// Build a string key representing a row for hashing
-    fn buildRowKey(self: *Self, columns: []const Result.Column, row_idx: usize) ![]u8 {
-        var key_parts = std.ArrayList(u8){};
-        errdefer key_parts.deinit(self.allocator);
-
-        for (columns, 0..) |col, col_idx| {
-            if (col_idx > 0) {
-                try key_parts.append(self.allocator, '|');
-            }
-
-            switch (col.data) {
-                .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| {
-                    var buf: [32]u8 = undefined;
-                    const s = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch "?";
-                    try key_parts.appendSlice(self.allocator, s);
-                },
-                .int32, .date32 => |data| {
-                    var buf: [24]u8 = undefined;
-                    const s = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch "?";
-                    try key_parts.appendSlice(self.allocator, s);
-                },
-                .float64 => |data| {
-                    var buf: [64]u8 = undefined;
-                    const s = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch "?";
-                    try key_parts.appendSlice(self.allocator, s);
-                },
-                .float32 => |data| {
-                    var buf: [48]u8 = undefined;
-                    const s = std.fmt.bufPrint(&buf, "{d}", .{data[row_idx]}) catch "?";
-                    try key_parts.appendSlice(self.allocator, s);
-                },
-                .bool_ => |data| {
-                    try key_parts.appendSlice(self.allocator, if (data[row_idx]) "T" else "F");
-                },
-                .string => |data| {
-                    try key_parts.appendSlice(self.allocator, data[row_idx]);
-                },
-            }
-        }
-
-        return try key_parts.toOwnedSlice(self.allocator);
     }
 
     /// Concatenate two column data arrays
@@ -1802,11 +1760,11 @@ pub const Executor = struct {
 
         // Apply ORDER BY
         if (stmt.order_by) |order_by| {
-            try self.applyOrderBy(result.columns, order_by);
+            try result_ops.applyOrderBy(self.allocator, result.columns, order_by);
         }
 
         // Apply LIMIT/OFFSET
-        result.row_count = self.applyLimitOffset(result.columns, stmt.limit, stmt.offset);
+        result.row_count = result_ops.applyLimitOffset(self.allocator, result.columns, stmt.limit, stmt.offset);
 
         return result;
     }
@@ -3545,345 +3503,6 @@ pub const Executor = struct {
         }
     }
 
-    // ========================================================================
-    // DISTINCT Implementation
-    // ========================================================================
-
-    /// Apply DISTINCT - remove duplicate rows from result columns
-    fn applyDistinct(self: *Self, columns: []Result.Column) !struct {
-        columns: []Result.Column,
-        row_count: usize,
-    } {
-        if (columns.len == 0) {
-            return .{ .columns = columns, .row_count = 0 };
-        }
-
-        const total_rows = columns[0].data.len();
-        if (total_rows == 0) {
-            return .{ .columns = columns, .row_count = 0 };
-        }
-
-        // Track unique row keys using StringHashMap
-        var seen = std.StringHashMap(void).init(self.allocator);
-        defer {
-            // Free all keys stored in the map
-            var key_iter = seen.keyIterator();
-            while (key_iter.next()) |key| {
-                self.allocator.free(key.*);
-            }
-            seen.deinit();
-        }
-
-        // Track which row indices to keep
-        var keep_indices = std.ArrayList(usize){};
-        defer keep_indices.deinit(self.allocator);
-
-        // Build row keys and identify unique rows
-        for (0..total_rows) |row_idx| {
-            const row_key = try self.buildDistinctRowKey(columns, row_idx);
-
-            if (!seen.contains(row_key)) {
-                // Store owned copy of key in map
-                try seen.put(row_key, {});
-                try keep_indices.append(self.allocator, row_idx);
-            } else {
-                // Key already exists, free the duplicate
-                self.allocator.free(row_key);
-            }
-        }
-
-        // If all rows are unique, return original columns
-        if (keep_indices.items.len == total_rows) {
-            return .{ .columns = columns, .row_count = total_rows };
-        }
-
-        // Build new columns with only unique rows
-        const unique_count = keep_indices.items.len;
-        const new_columns = try self.allocator.alloc(Result.Column, columns.len);
-        errdefer self.allocator.free(new_columns);
-
-        for (columns, 0..) |col, col_idx| {
-            new_columns[col_idx] = try self.filterColumnByIndices(col, keep_indices.items);
-        }
-
-        // Free original column data
-        for (columns) |col| {
-            col.data.free(self.allocator);
-        }
-        self.allocator.free(columns);
-
-        return .{ .columns = new_columns, .row_count = unique_count };
-    }
-
-    /// Build a unique key string for a row across all columns (for DISTINCT)
-    fn buildDistinctRowKey(self: *Self, columns: []const Result.Column, row_idx: usize) ![]u8 {
-        var key = std.ArrayList(u8){};
-        errdefer key.deinit(self.allocator);
-
-        for (columns) |col| {
-            try key.append(self.allocator, '|'); // Column separator
-            switch (col.data) {
-                .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |vals| {
-                    var buf: [64]u8 = undefined;
-                    const str = std.fmt.bufPrint(&buf, "{d}", .{vals[row_idx]}) catch |err| return err;
-                    try key.appendSlice(self.allocator, str);
-                },
-                .int32, .date32 => |vals| {
-                    var buf: [32]u8 = undefined;
-                    const str = std.fmt.bufPrint(&buf, "{d}", .{vals[row_idx]}) catch |err| return err;
-                    try key.appendSlice(self.allocator, str);
-                },
-                .float64 => |vals| {
-                    var buf: [64]u8 = undefined;
-                    const str = std.fmt.bufPrint(&buf, "{d}", .{vals[row_idx]}) catch |err| return err;
-                    try key.appendSlice(self.allocator, str);
-                },
-                .float32 => |vals| {
-                    var buf: [32]u8 = undefined;
-                    const str = std.fmt.bufPrint(&buf, "{d}", .{vals[row_idx]}) catch |err| return err;
-                    try key.appendSlice(self.allocator, str);
-                },
-                .bool_ => |vals| {
-                    try key.appendSlice(self.allocator, if (vals[row_idx]) "true" else "false");
-                },
-                .string => |vals| {
-                    try key.appendSlice(self.allocator, vals[row_idx]);
-                },
-            }
-        }
-
-        return key.toOwnedSlice(self.allocator);
-    }
-
-    /// Filter a column to keep only specified row indices
-    fn filterColumnByIndices(self: *Self, col: Result.Column, indices: []const usize) !Result.Column {
-        const count = indices.len;
-
-        return Result.Column{
-            .name = col.name,
-            .data = switch (col.data) {
-                .string => |vals| blk: {
-                    const new_vals = try self.allocator.alloc([]const u8, count);
-                    for (indices, 0..) |idx, i| {
-                        new_vals[i] = try self.allocator.dupe(u8, vals[idx]);
-                    }
-                    break :blk Result.ColumnData{ .string = new_vals };
-                },
-                inline else => |vals, tag| blk: {
-                    const new_vals = try self.allocator.alloc(@TypeOf(vals[0]), count);
-                    for (indices, 0..) |idx, i| {
-                        new_vals[i] = vals[idx];
-                    }
-                    break :blk @unionInit(Result.ColumnData, @tagName(tag), new_vals);
-                },
-            },
-        };
-    }
-
-    // ========================================================================
-    // ORDER BY Implementation
-    // ========================================================================
-
-    fn applyOrderBy(
-        self: *Self,
-        columns: []Result.Column,
-        order_by: []const ast.OrderBy,
-    ) !void {
-        if (columns.len == 0) return;
-
-        const row_count = columns[0].data.len();
-        if (row_count == 0) return;
-
-        // Create array of indices [0, 1, 2, ..., n-1]
-        const indices = try self.allocator.alloc(usize, row_count);
-        defer self.allocator.free(indices);
-
-        for (indices, 0..) |*idx, i| {
-            idx.* = i;
-        }
-
-        // Sort indices based on order_by columns
-        for (order_by) |order| {
-            const sort_col_idx = self.findColumnIndex(columns, order.column) orelse continue;
-            const sort_col = &columns[sort_col_idx];
-
-            // Sort using comparison function
-            const context = SortContext{
-                .column = sort_col,
-                .direction = order.direction,
-            };
-
-            std.mem.sort(usize, indices, context, sortCompare);
-        }
-
-        // Reorder all columns based on sorted indices
-        for (columns) |*col| {
-            try self.reorderColumn(col, indices);
-        }
-    }
-
-    const SortContext = struct {
-        column: *const Result.Column,
-        direction: ast.OrderDirection,
-    };
-
-    fn sortCompare(context: SortContext, a_idx: usize, b_idx: usize) bool {
-        const ascending = context.direction == .asc;
-
-        const cmp = switch (context.column.data) {
-            .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| blk: {
-                const a = data[a_idx];
-                const b = data[b_idx];
-                if (a < b) break :blk std.math.Order.lt;
-                if (a > b) break :blk std.math.Order.gt;
-                break :blk std.math.Order.eq;
-            },
-            .int32, .date32 => |data| blk: {
-                const a = data[a_idx];
-                const b = data[b_idx];
-                if (a < b) break :blk std.math.Order.lt;
-                if (a > b) break :blk std.math.Order.gt;
-                break :blk std.math.Order.eq;
-            },
-            .float64 => |data| blk: {
-                const a = data[a_idx];
-                const b = data[b_idx];
-                if (a < b) break :blk std.math.Order.lt;
-                if (a > b) break :blk std.math.Order.gt;
-                break :blk std.math.Order.eq;
-            },
-            .float32 => |data| blk: {
-                const a = data[a_idx];
-                const b = data[b_idx];
-                if (a < b) break :blk std.math.Order.lt;
-                if (a > b) break :blk std.math.Order.gt;
-                break :blk std.math.Order.eq;
-            },
-            .bool_ => |data| blk: {
-                const a: u8 = if (data[a_idx]) 1 else 0;
-                const b: u8 = if (data[b_idx]) 1 else 0;
-                if (a < b) break :blk std.math.Order.lt;
-                if (a > b) break :blk std.math.Order.gt;
-                break :blk std.math.Order.eq;
-            },
-            .string => |data| std.mem.order(u8, data[a_idx], data[b_idx]),
-        };
-
-        return if (ascending)
-            cmp == .lt
-        else
-            cmp == .gt;
-    }
-
-    fn findColumnIndex(self: *Self, columns: []const Result.Column, name: []const u8) ?usize {
-        _ = self;
-        for (columns, 0..) |col, i| {
-            if (std.mem.eql(u8, col.name, name)) {
-                return i;
-            }
-        }
-        return null;
-    }
-
-    fn reorderColumn(self: *Self, col: *Result.Column, indices: []const usize) !void {
-        switch (col.data) {
-            .string => |data| {
-                const reordered = try self.allocator.alloc([]const u8, data.len);
-                for (indices, 0..) |idx, i| {
-                    reordered[i] = try self.allocator.dupe(u8, data[idx]);
-                }
-                // Free old strings and array
-                for (data) |str| {
-                    self.allocator.free(str);
-                }
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .string = reordered };
-            },
-            inline else => |data, tag| {
-                const reordered = try self.allocator.alloc(@TypeOf(data[0]), data.len);
-                for (indices, 0..) |idx, i| {
-                    reordered[i] = data[idx];
-                }
-                self.allocator.free(data);
-                col.data = @unionInit(Result.ColumnData, @tagName(tag), reordered);
-            },
-        }
-    }
-
-    // ========================================================================
-    // LIMIT/OFFSET Implementation
-    // ========================================================================
-
-    fn applyLimitOffset(
-        self: *Self,
-        columns: []Result.Column,
-        limit: ?u32,
-        offset: ?u32,
-    ) usize {
-        if (columns.len == 0) return 0;
-
-        const row_count = columns[0].data.len();
-        const start = offset orelse 0;
-        if (start >= row_count) {
-            // Free all data and return 0
-            for (columns) |*col| {
-                self.freeColumnData(&col.data);
-                col.data = switch (col.data) {
-                    .int64 => Result.ColumnData{ .int64 = &[_]i64{} },
-                    .timestamp_s => Result.ColumnData{ .timestamp_s = &[_]i64{} },
-                    .timestamp_ms => Result.ColumnData{ .timestamp_ms = &[_]i64{} },
-                    .timestamp_us => Result.ColumnData{ .timestamp_us = &[_]i64{} },
-                    .timestamp_ns => Result.ColumnData{ .timestamp_ns = &[_]i64{} },
-                    .date64 => Result.ColumnData{ .date64 = &[_]i64{} },
-                    .int32 => Result.ColumnData{ .int32 = &[_]i32{} },
-                    .date32 => Result.ColumnData{ .date32 = &[_]i32{} },
-                    .float64 => Result.ColumnData{ .float64 = &[_]f64{} },
-                    .float32 => Result.ColumnData{ .float32 = &[_]f32{} },
-                    .bool_ => Result.ColumnData{ .bool_ = &[_]bool{} },
-                    .string => Result.ColumnData{ .string = &[_][]const u8{} },
-                };
-            }
-            return 0;
-        }
-
-        const end = if (limit) |l|
-            @min(start + l, row_count)
-        else
-            row_count;
-
-        // Slice each column
-        for (columns) |*col| {
-            self.sliceColumn(col, start, end) catch {};
-        }
-
-        return end - start;
-    }
-
-    fn sliceColumn(self: *Self, col: *Result.Column, start: usize, end: usize) !void {
-        const new_len = end - start;
-
-        switch (col.data) {
-            .string => |data| {
-                const sliced = try self.allocator.alloc([]const u8, new_len);
-                for (data[start..end], 0..) |str, i| {
-                    sliced[i] = try self.allocator.dupe(u8, str);
-                }
-                // Free old strings
-                for (data) |str| {
-                    self.allocator.free(str);
-                }
-                self.allocator.free(data);
-                col.data = Result.ColumnData{ .string = sliced };
-            },
-            inline else => |data, tag| {
-                const sliced = try self.allocator.alloc(@TypeOf(data[0]), new_len);
-                @memcpy(sliced, data[start..end]);
-                self.allocator.free(data);
-                col.data = @unionInit(Result.ColumnData, @tagName(tag), sliced);
-            },
-        }
-    }
-
     fn freeColumnData(self: *Self, data: *Result.ColumnData) void {
         data.free(self.allocator);
     }
@@ -3921,7 +3540,7 @@ pub const Executor = struct {
         errdefer self.allocator.free(new_columns);
 
         for (result.columns, 0..) |col, i| {
-            new_columns[i] = try self.filterColumnByIndices(col, indices);
+            new_columns[i] = try result_ops.filterColumnByIndices(self.allocator, col, indices);
         }
 
         // Free old column data
@@ -4035,7 +3654,7 @@ pub const Executor = struct {
             .value => expr.value,
             .column => |col| blk: {
                 // Look up column by name in result columns
-                const col_idx = self.findColumnIndex(columns, col.name) orelse
+                const col_idx = result_ops.findColumnIndex(columns, col.name) orelse
                     return error.ColumnNotFound;
                 break :blk self.getResultColumnValue(columns[col_idx], row_idx);
             },
