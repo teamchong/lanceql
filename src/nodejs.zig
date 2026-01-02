@@ -69,6 +69,23 @@ fn handleToResult(handle: *ResultHandle) *executor.Result {
     return @ptrCast(@alignCast(handle));
 }
 
+/// Helper to read numeric column data with common lock/lookup/copy pattern
+fn readNumericColumn(comptime T: type, comptime field: []const u8, result: *ResultHandle, col_idx: u32, out: [*]T, max_count: usize) usize {
+    results_lock.lock();
+    defer results_lock.unlock();
+
+    const result_ptr = results.get(result) orelse return 0;
+    if (col_idx >= result_ptr.columns.len) return 0;
+
+    const col = result_ptr.columns[col_idx];
+    if (col.data != @field(executor.Result.ColumnData, field)) return 0;
+
+    const data = @field(col.data, field);
+    const count = @min(data.len, max_count);
+    @memcpy(out[0..count], data[0..count]);
+    return count;
+}
+
 // ============================================================================
 // File & Table Management
 // ============================================================================
@@ -540,40 +557,12 @@ export fn lance_result_column_type(result: *ResultHandle, col_idx: u32) u32 {
 
 /// Read int64 column data
 export fn lance_result_read_int64(result: *ResultHandle, col_idx: u32, out: [*]i64, max_count: usize) usize {
-    results_lock.lock();
-    defer results_lock.unlock();
-
-    const result_ptr = results.get(result) orelse return 0;
-    if (col_idx >= result_ptr.columns.len) return 0;
-
-    const col = result_ptr.columns[col_idx];
-    if (col.data != .int64) return 0;
-
-    const data = col.data.int64;
-    const count = @min(data.len, max_count);
-    const out_buf = out[0..count];
-    @memcpy(out_buf, data[0..count]);
-
-    return count;
+    return readNumericColumn(i64, "int64", result, col_idx, out, max_count);
 }
 
 /// Read float64 column data
 export fn lance_result_read_float64(result: *ResultHandle, col_idx: u32, out: [*]f64, max_count: usize) usize {
-    results_lock.lock();
-    defer results_lock.unlock();
-
-    const result_ptr = results.get(result) orelse return 0;
-    if (col_idx >= result_ptr.columns.len) return 0;
-
-    const col = result_ptr.columns[col_idx];
-    if (col.data != .float64) return 0;
-
-    const data = col.data.float64;
-    const count = @min(data.len, max_count);
-    const out_buf = out[0..count];
-    @memcpy(out_buf, data[0..count]);
-
-    return count;
+    return readNumericColumn(f64, "float64", result, col_idx, out, max_count);
 }
 
 /// Read string column data (parallel arrays of pointers and lengths)
@@ -606,40 +595,12 @@ export fn lance_result_read_string(
 
 /// Read int32 column data
 export fn lance_result_read_int32(result: *ResultHandle, col_idx: u32, out: [*]i32, max_count: usize) usize {
-    results_lock.lock();
-    defer results_lock.unlock();
-
-    const result_ptr = results.get(result) orelse return 0;
-    if (col_idx >= result_ptr.columns.len) return 0;
-
-    const col = result_ptr.columns[col_idx];
-    if (col.data != .int32) return 0;
-
-    const data = col.data.int32;
-    const count = @min(data.len, max_count);
-    const out_buf = out[0..count];
-    @memcpy(out_buf, data[0..count]);
-
-    return count;
+    return readNumericColumn(i32, "int32", result, col_idx, out, max_count);
 }
 
 /// Read float32 column data
 export fn lance_result_read_float32(result: *ResultHandle, col_idx: u32, out: [*]f32, max_count: usize) usize {
-    results_lock.lock();
-    defer results_lock.unlock();
-
-    const result_ptr = results.get(result) orelse return 0;
-    if (col_idx >= result_ptr.columns.len) return 0;
-
-    const col = result_ptr.columns[col_idx];
-    if (col.data != .float32) return 0;
-
-    const data = col.data.float32;
-    const count = @min(data.len, max_count);
-    const out_buf = out[0..count];
-    @memcpy(out_buf, data[0..count]);
-
-    return count;
+    return readNumericColumn(f32, "float32", result, col_idx, out, max_count);
 }
 
 /// Read bool column data (as u8: 0=false, 1=true)
