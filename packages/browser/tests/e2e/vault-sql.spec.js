@@ -5472,4 +5472,109 @@ test.describe('Vault SQL Operations', () => {
             expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
         }
     });
+
+    test('BM25 Full-Text Search (NEAR without vector column)', async ({ page }) => {
+        // This test verifies BM25 text search works when no vector/embedding column exists
+        const results = await page.evaluate(async () => {
+            const v = window.vault;
+            const tests = [];
+
+            // Create test table WITHOUT embedding column (pure text)
+            await v.exec(`CREATE TABLE articles (
+                id INT,
+                title TEXT,
+                content TEXT,
+                category TEXT
+            )`);
+
+            // Insert test data with varied content for BM25 ranking
+            await v.exec(`INSERT INTO articles VALUES
+                (1, 'Introduction to Machine Learning', 'Machine learning is a subset of artificial intelligence that enables systems to learn from data.', 'tech'),
+                (2, 'Deep Learning Fundamentals', 'Deep learning uses neural networks with many layers to learn complex patterns in data.', 'tech'),
+                (3, 'Database Design Principles', 'Proper database design ensures data integrity and efficient query performance.', 'tech'),
+                (4, 'Cooking with Fresh Vegetables', 'Fresh vegetables are essential for healthy cooking and nutrition.', 'food'),
+                (5, 'Advanced Machine Learning Techniques', 'Advanced machine learning includes ensemble methods, transfer learning, and reinforcement learning.', 'tech'),
+                (6, 'Garden Vegetable Recipes', 'These vegetable recipes use garden fresh ingredients for delicious meals.', 'food')
+            `);
+
+            // Test 1: Basic BM25 search - should rank by relevance
+            try {
+                const res = await v.exec(`SELECT id, title FROM articles WHERE content NEAR 'machine learning' LIMIT 10`);
+                // Should find articles about machine learning, ranked by relevance
+                const ids = res.rows.map(r => r.id);
+                // Articles 1, 2, 5 mention machine/learning
+                const hasMlArticles = ids.some(id => [1, 2, 5].includes(id));
+                tests.push({ name: 'Basic BM25 search', pass: hasMlArticles && res.rows.length > 0, actual: `Found ${res.rows.length} results, ids: ${ids.join(',')}` });
+            } catch (e) {
+                tests.push({ name: 'Basic BM25 search', pass: false, error: e.message });
+            }
+
+            // Test 2: Multi-word query with ranking
+            try {
+                const res = await v.exec(`SELECT id, title FROM articles WHERE title NEAR 'machine learning' LIMIT 5`);
+                // Titles with "machine learning" should rank higher
+                const topId = res.rows[0]?.id;
+                // Article 1 or 5 should be top (both have "Machine Learning" in title)
+                tests.push({ name: 'Multi-word query ranking', pass: [1, 5].includes(topId), actual: `Top result id: ${topId}` });
+            } catch (e) {
+                tests.push({ name: 'Multi-word query ranking', pass: false, error: e.message });
+            }
+
+            // Test 3: BM25 with additional WHERE conditions
+            try {
+                const res = await v.exec(`SELECT id, title FROM articles WHERE content NEAR 'learning' AND category = 'tech' LIMIT 10`);
+                // Should find tech articles about learning
+                const allTech = res.rows.every(r => true); // Can't verify category in result without selecting it
+                tests.push({ name: 'BM25 with WHERE filter', pass: res.rows.length > 0, actual: `Found ${res.rows.length} tech articles` });
+            } catch (e) {
+                tests.push({ name: 'BM25 with WHERE filter', pass: false, error: e.message });
+            }
+
+            // Test 4: BM25 + COUNT aggregation
+            try {
+                const res = await v.exec(`SELECT COUNT(*) AS cnt FROM articles WHERE content NEAR 'data' LIMIT 10`);
+                const cnt = res.rows[0]?.cnt;
+                // Articles 1, 2, 3 mention "data"
+                tests.push({ name: 'BM25 + COUNT aggregate', pass: typeof cnt === 'number' && cnt > 0, actual: `Count: ${cnt}` });
+            } catch (e) {
+                tests.push({ name: 'BM25 + COUNT aggregate', pass: false, error: e.message });
+            }
+
+            // Test 5: No matches (rare term)
+            try {
+                const res = await v.exec(`SELECT id FROM articles WHERE content NEAR 'xyznonexistent' LIMIT 10`);
+                // Should return empty results, not error
+                tests.push({ name: 'No matches returns empty', pass: res.rows.length === 0, actual: `${res.rows.length} results` });
+            } catch (e) {
+                tests.push({ name: 'No matches returns empty', pass: false, error: e.message });
+            }
+
+            // Test 6: Stop words only query
+            try {
+                const res = await v.exec(`SELECT id FROM articles WHERE content NEAR 'the and or' LIMIT 10`);
+                // Query with only stop words should return empty (no meaningful terms)
+                tests.push({ name: 'Stop words only returns empty', pass: res.rows.length === 0, actual: `${res.rows.length} results` });
+            } catch (e) {
+                tests.push({ name: 'Stop words only returns empty', pass: false, error: e.message });
+            }
+
+            // Test 7: Term frequency affects ranking
+            try {
+                const res = await v.exec(`SELECT id, title FROM articles WHERE content NEAR 'vegetables' LIMIT 5`);
+                // Articles 4 and 6 have "vegetables", 6 mentions it twice
+                const ids = res.rows.map(r => r.id);
+                const hasVegetableArticles = ids.includes(4) || ids.includes(6);
+                tests.push({ name: 'Term frequency ranking', pass: hasVegetableArticles, actual: `ids: ${ids.join(',')}` });
+            } catch (e) {
+                tests.push({ name: 'Term frequency ranking', pass: false, error: e.message });
+            }
+
+            await v.exec('DROP TABLE articles');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
 });

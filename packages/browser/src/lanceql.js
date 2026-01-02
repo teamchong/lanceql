@@ -13192,9 +13192,8 @@ export class SQLExecutor {
         );
 
         if (!vectorColName) {
-            // No vector column found, fall back to text-based search
-            // For now, throw an error - full text search not implemented yet
-            throw new Error(`NEAR requires a vector column. Add 'embedding' column or use LIKE for text patterns.`);
+            // No vector column found, fall back to BM25 text search
+            return await this._executeBM25Search(nearInfo, totalRows);
         }
 
         // Use existing vector search infrastructure
@@ -13208,6 +13207,174 @@ export class SQLExecutor {
             console.error('[SQLExecutor] Vector search failed:', e);
             throw new Error(`NEAR search failed: ${e.message}`);
         }
+    }
+
+    /**
+     * Execute BM25 full-text search when no vector column exists.
+     * @private
+     */
+    async _executeBM25Search(nearInfo, totalRows) {
+        const { column, text, limit } = nearInfo;
+        const colIdx = this.columnMap[column.toLowerCase()];
+
+        if (colIdx === undefined) {
+            throw new Error(`Column '${column}' not found for text search`);
+        }
+
+        // Step 1: Tokenize query
+        const queryTokens = this._tokenize(text);
+        if (queryTokens.length === 0) return [];
+
+        // Step 2: Get or build inverted index for this column
+        const index = await this._getOrBuildFTSIndex(colIdx, totalRows);
+
+        // Step 3: Compute BM25 scores
+        const scores = this._computeBM25Scores(queryTokens, index);
+
+        // Step 4: Return top-K indices
+        return this._topKByScore(scores, limit);
+    }
+
+    /**
+     * Tokenize text for BM25 search.
+     * @private
+     */
+    _tokenize(text) {
+        if (!text || typeof text !== 'string') return [];
+
+        return text
+            .toLowerCase()
+            .replace(/[^\w\s]/g, ' ')  // Remove punctuation
+            .split(/\s+/)              // Split on whitespace
+            .filter(t => t.length > 1) // Remove single chars
+            .filter(t => !this._isStopWord(t)); // Remove stop words
+    }
+
+    /**
+     * Check if word is a stop word.
+     * @private
+     */
+    _isStopWord(word) {
+        const stopWords = new Set([
+            'a', 'an', 'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+            'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been',
+            'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+            'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'need',
+            'it', 'its', 'this', 'that', 'these', 'those', 'i', 'you', 'he', 'she',
+            'we', 'they', 'what', 'which', 'who', 'whom', 'where', 'when', 'why', 'how'
+        ]);
+        return stopWords.has(word);
+    }
+
+    /**
+     * Get or build inverted index for a text column.
+     * @private
+     */
+    async _getOrBuildFTSIndex(colIdx, totalRows) {
+        const cacheKey = `fts_${colIdx}`;
+        if (this._ftsIndexCache?.has(cacheKey)) {
+            return this._ftsIndexCache.get(cacheKey);
+        }
+
+        // Build index
+        const index = {
+            termDocs: new Map(),    // term -> Set of docIds
+            termFreqs: new Map(),   // term -> Map(docId -> freq)
+            docLengths: new Map(),  // docId -> word count
+            totalDocs: 0,
+            avgDocLength: 0,
+        };
+
+        // Read all text from column in batches
+        const batchSize = 1000;
+        let totalLength = 0;
+
+        for (let start = 0; start < totalRows; start += batchSize) {
+            const end = Math.min(start + batchSize, totalRows);
+            const indices = Array.from({ length: end - start }, (_, i) => start + i);
+            const texts = await this.readColumnData(colIdx, indices);
+
+            for (let i = 0; i < texts.length; i++) {
+                const docId = start + i;
+                const text = texts[i];
+                if (!text || typeof text !== 'string') continue;
+
+                const tokens = this._tokenize(text);
+                index.docLengths.set(docId, tokens.length);
+                totalLength += tokens.length;
+                index.totalDocs++;
+
+                // Count term frequencies
+                const termCounts = new Map();
+                for (const token of tokens) {
+                    termCounts.set(token, (termCounts.get(token) || 0) + 1);
+                }
+
+                // Update inverted index
+                for (const [term, freq] of termCounts) {
+                    if (!index.termDocs.has(term)) {
+                        index.termDocs.set(term, new Set());
+                        index.termFreqs.set(term, new Map());
+                    }
+                    index.termDocs.get(term).add(docId);
+                    index.termFreqs.get(term).set(docId, freq);
+                }
+            }
+        }
+
+        index.avgDocLength = index.totalDocs > 0 ? totalLength / index.totalDocs : 0;
+
+        // Cache the index
+        if (!this._ftsIndexCache) this._ftsIndexCache = new Map();
+        this._ftsIndexCache.set(cacheKey, index);
+
+        return index;
+    }
+
+    /**
+     * Compute BM25 scores for query tokens against indexed documents.
+     * @private
+     */
+    _computeBM25Scores(queryTokens, index) {
+        const k1 = 1.2;
+        const b = 0.75;
+        const scores = new Map();
+
+        for (const term of queryTokens) {
+            const docIds = index.termDocs.get(term);
+            if (!docIds) continue;
+
+            // IDF: log((N - n + 0.5) / (n + 0.5) + 1)
+            const n = docIds.size;
+            const N = index.totalDocs;
+            const idf = Math.log((N - n + 0.5) / (n + 0.5) + 1);
+
+            for (const docId of docIds) {
+                const tf = index.termFreqs.get(term).get(docId);
+                const docLen = index.docLengths.get(docId);
+                const avgDL = index.avgDocLength;
+
+                // BM25 term score
+                const numerator = tf * (k1 + 1);
+                const denominator = tf + k1 * (1 - b + b * docLen / avgDL);
+                const termScore = idf * (numerator / denominator);
+
+                scores.set(docId, (scores.get(docId) || 0) + termScore);
+            }
+        }
+
+        return scores;
+    }
+
+    /**
+     * Get top-K documents by score.
+     * @private
+     */
+    _topKByScore(scores, k) {
+        return Array.from(scores.entries())
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, k)
+            .map(([docId]) => docId);
     }
 
     /**
