@@ -127,10 +127,8 @@ pub const Args = struct {
     remaining: []const []const u8, // Unparsed args
 };
 
-/// Parse command line arguments
 pub fn parse(allocator: std.mem.Allocator) !Args {
     const argv = try std.process.argsAlloc(allocator);
-    // Note: Don't free argv - strings are referenced by Args
 
     var args = Args{
         .command = .none,

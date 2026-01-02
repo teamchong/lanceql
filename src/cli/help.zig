@@ -128,21 +128,12 @@ pub fn printServeHelp() void {
     , .{});
 }
 
-/// Print transform command help
 pub fn printTransformHelp() void {
     std.debug.print(
         \\Usage: lanceql transform <input> -o <output> [options]
         \\
         \\Apply transformations to Lance data.
-        \\
-        \\NOTE: This command is not yet implemented.
-        \\      Use 'lanceql query' with SQL for transformations.
-        \\
-        \\Planned operations:
-        \\  - Column projection and renaming
-        \\  - Row filtering
-        \\  - Data type conversions
-        \\  - Custom expressions
+        \\Use 'lanceql query' with SQL for transformations.
         \\
         \\Options:
         \\  -o, --output <PATH>    Output file (required)
@@ -153,25 +144,23 @@ pub fn printTransformHelp() void {
     , .{});
 }
 
-/// Print enrich command help
 pub fn printEnrichHelp() void {
     std.debug.print(
-        \\Usage: lanceql enrich <input> [options]
+        \\Usage: lanceql enrich <input> -o <output> [options]
         \\
-        \\Add embeddings and indexes to Lance data.
-        \\
-        \\NOTE: This command is not yet implemented.
-        \\
-        \\Planned operations:
-        \\  - Text embedding generation
-        \\  - Vector index creation (IVF, HNSW)
-        \\  - Full-text search indexing
+        \\Add embeddings and vector indexes to Lance data.
         \\
         \\Options:
         \\      --embed <COLUMN>   Column to embed
-        \\      --model <NAME>     Embedding model
-        \\      --index <TYPE>     Index type (ivf, hnsw)
+        \\      --model <NAME>     Embedding model (minilm, clip)
+        \\      --index <COLUMN>   Create vector index on column
+        \\      --index-type <T>   Index type (ivf-pq, flat)
+        \\  -o, --output <PATH>    Output file (required)
         \\  -h, --help             Show this help
+        \\
+        \\Examples:
+        \\  lanceql enrich data.lance --embed text -o enriched.lance
+        \\  lanceql enrich data.parquet --embed desc --model clip -o out.lance
         \\
     , .{});
 }

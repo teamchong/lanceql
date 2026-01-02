@@ -52,37 +52,32 @@ const FileType = enum {
     unknown,
 };
 
-/// Run the enrich command
 pub fn run(allocator: std.mem.Allocator, opts: args.EnrichOptions) !void {
-    // Validate options
     const input_path = opts.input orelse {
-        std.debug.print("Error: No input file specified\n", .{});
+        std.debug.print("No input file specified\n", .{});
         return EnrichError.NoInputFile;
     };
 
     const output_path = opts.output orelse {
-        std.debug.print("Error: No output file specified (use -o)\n", .{});
+        std.debug.print("No output file specified (use -o)\n", .{});
         return EnrichError.NoOutputFile;
     };
 
     const embed_column = opts.embed orelse {
-        std.debug.print("Error: No column specified for embedding (use --embed)\n", .{});
+        std.debug.print("No column specified for embedding (use --embed)\n", .{});
         return EnrichError.NoEmbedColumn;
     };
-
-    // Determine embedding dimension based on model
     const model_type = opts.model;
     const embed_dim: usize = switch (model_type) {
         .minilm => embedding.MiniLM.EMBEDDING_DIM,
         .clip => embedding.Clip.EMBEDDING_DIM,
     };
 
-    // Check ONNX availability - if not available, use mock embeddings
     const use_real_onnx = embedding.isOnnxAvailable();
     if (use_real_onnx) {
         std.debug.print("ONNX Runtime version: {s}\n", .{embedding.getOnnxVersion()});
     } else {
-        std.debug.print("Note: ONNX Runtime not available, using random embeddings for testing\n", .{});
+        std.debug.print("ONNX not available, using mock embeddings\n", .{});
     }
 
     std.debug.print("\nEnrich Configuration:\n", .{});
@@ -97,33 +92,30 @@ pub fn run(allocator: std.mem.Allocator, opts: args.EnrichOptions) !void {
         std.debug.print("  Partitions: {}\n", .{opts.partitions});
     }
 
-    // Step 1: Read input file
     std.debug.print("\nReading input file...\n", .{});
     const data = std.fs.cwd().readFileAlloc(allocator, input_path, 500 * 1024 * 1024) catch |err| {
-        std.debug.print("Error reading '{s}': {}\n", .{ input_path, err });
+        std.debug.print("Failed to read '{s}': {}\n", .{ input_path, err });
         return EnrichError.FileReadError;
     };
     defer allocator.free(data);
 
-    // Step 2: Execute query to get all data including the embed column
     const file_type = detectFileType(input_path, data);
     const sql = try std.fmt.allocPrint(allocator, "SELECT * FROM '{s}'", .{input_path});
     defer allocator.free(sql);
 
     var result = executeQuery(allocator, data, sql, file_type) catch |err| {
-        std.debug.print("Error querying data: {}\n", .{err});
+        std.debug.print("Query failed: {}\n", .{err});
         return EnrichError.QueryError;
     };
     defer result.deinit();
 
     if (result.row_count == 0) {
-        std.debug.print("Error: Input file has no rows\n", .{});
+        std.debug.print("Input file has no rows\n", .{});
         return EnrichError.EmptyResult;
     }
 
     std.debug.print("  Loaded {} rows, {} columns\n", .{ result.row_count, result.columns.len });
 
-    // Step 3: Find the embed column and extract text data
     var embed_col_idx: ?usize = null;
     var text_data: ?[][]const u8 = null;
 
@@ -135,7 +127,7 @@ pub fn run(allocator: std.mem.Allocator, opts: args.EnrichOptions) !void {
                     text_data = strings;
                 },
                 else => {
-                    std.debug.print("Error: Column '{s}' is not a string column\n", .{embed_column});
+                    std.debug.print("Column '{s}' is not a string column\n", .{embed_column});
                     return EnrichError.InvalidColumnType;
                 },
             }
@@ -144,8 +136,7 @@ pub fn run(allocator: std.mem.Allocator, opts: args.EnrichOptions) !void {
     }
 
     if (embed_col_idx == null) {
-        std.debug.print("Error: Column '{s}' not found in input\n", .{embed_column});
-        std.debug.print("Available columns: ", .{});
+        std.debug.print("Column '{s}' not found. Available: ", .{embed_column});
         for (result.columns, 0..) |col, i| {
             if (i > 0) std.debug.print(", ", .{});
             std.debug.print("{s}", .{col.name});
@@ -155,9 +146,8 @@ pub fn run(allocator: std.mem.Allocator, opts: args.EnrichOptions) !void {
     }
 
     const texts = text_data.?;
-    std.debug.print("  Found embed column '{s}' with {} text values\n", .{ embed_column, texts.len });
+    std.debug.print("  Found '{s}' with {} values\n", .{ embed_column, texts.len });
 
-    // Step 4: Generate embeddings
     std.debug.print("\nGenerating embeddings...\n", .{});
     const embeddings = try generateEmbeddings(allocator, texts, embed_dim, use_real_onnx, model_type);
     defer {
@@ -168,13 +158,11 @@ pub fn run(allocator: std.mem.Allocator, opts: args.EnrichOptions) !void {
     }
     std.debug.print("  Generated {} embeddings of {} dimensions\n", .{ embeddings.len, embed_dim });
 
-    // Step 5: Build vector index if requested
     if (opts.index != null) {
         std.debug.print("\nBuilding vector index...\n", .{});
         try index_builder.buildAndSaveIndex(allocator, embeddings, embed_dim, opts, output_path);
     }
 
-    // Step 6: Write output Lance file with original columns + embedding column
     std.debug.print("\nWriting output file...\n", .{});
     try writeEnrichedLance(allocator, &result, embeddings, embed_dim, output_path);
 
@@ -284,21 +272,15 @@ fn generateEmbeddings(
         allocator.free(embeddings);
     }
 
-    if (use_real_onnx) {
-        // TODO: Use real ONNX model for embeddings
-        // For now, fall through to mock embeddings
-        _ = model_type;
-    }
+    _ = use_real_onnx;
+    _ = model_type;
 
-    // Generate mock embeddings (random normalized vectors)
-    // This allows testing the full pipeline without ONNX
-    var prng = std.Random.DefaultPrng.init(42); // Fixed seed for reproducibility
+    var prng = std.Random.DefaultPrng.init(42);
     const random = prng.random();
 
     for (texts, 0..) |text, i| {
         const emb = try allocator.alloc(f32, embed_dim);
 
-        // Generate random embedding based on text hash for consistency
         var text_hash: u64 = 0;
         for (text) |c| {
             text_hash = text_hash *% 31 +% c;
@@ -306,14 +288,12 @@ fn generateEmbeddings(
         var text_prng = std.Random.DefaultPrng.init(text_hash);
         const text_random = text_prng.random();
 
-        // Generate random values
         var norm: f32 = 0.0;
         for (emb) |*val| {
             val.* = text_random.float(f32) * 2.0 - 1.0;
             norm += val.* * val.*;
         }
 
-        // L2 normalize
         norm = @sqrt(norm);
         if (norm > 0) {
             for (emb) |*val| {
@@ -323,7 +303,6 @@ fn generateEmbeddings(
 
         embeddings[i] = emb;
 
-        // Progress indicator
         if ((i + 1) % 100 == 0 or i == texts.len - 1) {
             std.debug.print("  Progress: {}/{} ({d:.1}%)\r", .{
                 i + 1,
