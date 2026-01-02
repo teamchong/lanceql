@@ -332,6 +332,39 @@ fn simdL2DistanceSquared(a: []const f32, b: []const f32) f32 {
 // Batch Arithmetic Operations (for @logic_table compiled methods)
 // =============================================================================
 
+/// Binary operation type for array operations
+const BinaryOp = enum { add, sub, mul, div };
+
+/// Helper for GPU batch binary array operations
+fn gpuBatchBinaryArrays(a: []const f32, b: []const f32, out: []f32, comptime op: BinaryOp) void {
+    const len = a.len;
+    std.debug.assert(b.len == len);
+    std.debug.assert(out.len >= len);
+
+    if (comptime is_apple_silicon) {
+        if (len >= GPU_THRESHOLD and isGPUReady()) {
+            const metal_fn = switch (op) {
+                .add => metal_c.lanceql_metal_batch_add_arrays,
+                .sub => metal_c.lanceql_metal_batch_sub_arrays,
+                .mul => metal_c.lanceql_metal_batch_mul_arrays,
+                .div => metal_c.lanceql_metal_batch_div_arrays,
+            };
+            const result = metal_fn(a.ptr, b.ptr, out.ptr, @intCast(len));
+            if (result == 0) return;
+        }
+    }
+
+    // CPU fallback
+    for (0..len) |i| {
+        out[i] = switch (op) {
+            .add => a[i] + b[i],
+            .sub => a[i] - b[i],
+            .mul => a[i] * b[i],
+            .div => a[i] / b[i],
+        };
+    }
+}
+
 /// GPU batch multiply by scalar: out[i] = a[i] * scalar
 /// Falls back to CPU SIMD if GPU not available or for small batches
 pub fn gpuBatchMulScalar(a: []const f32, scalar: f32, out: []f32) void {
@@ -358,26 +391,7 @@ pub fn gpuBatchMulScalar(a: []const f32, scalar: f32, out: []f32) void {
 
 /// GPU batch multiply two arrays: out[i] = a[i] * b[i]
 pub fn gpuBatchMulArrays(a: []const f32, b: []const f32, out: []f32) void {
-    const len = a.len;
-    std.debug.assert(b.len == len);
-    std.debug.assert(out.len >= len);
-
-    if (comptime is_apple_silicon) {
-        if (len >= GPU_THRESHOLD and isGPUReady()) {
-            const result = metal_c.lanceql_metal_batch_mul_arrays(
-                a.ptr,
-                b.ptr,
-                out.ptr,
-                @intCast(len),
-            );
-            if (result == 0) return;
-        }
-    }
-
-    // CPU SIMD fallback
-    for (0..len) |i| {
-        out[i] = a[i] * b[i];
-    }
+    gpuBatchBinaryArrays(a, b, out, .mul);
 }
 
 /// GPU batch multiply two arrays with scalar: out[i] = a[i] * b[i] * scalar
@@ -407,74 +421,17 @@ pub fn gpuBatchMulArraysScalar(a: []const f32, b: []const f32, scalar: f32, out:
 
 /// GPU batch add: out[i] = a[i] + b[i]
 pub fn gpuBatchAddArrays(a: []const f32, b: []const f32, out: []f32) void {
-    const len = a.len;
-    std.debug.assert(b.len == len);
-    std.debug.assert(out.len >= len);
-
-    if (comptime is_apple_silicon) {
-        if (len >= GPU_THRESHOLD and isGPUReady()) {
-            const result = metal_c.lanceql_metal_batch_add_arrays(
-                a.ptr,
-                b.ptr,
-                out.ptr,
-                @intCast(len),
-            );
-            if (result == 0) return;
-        }
-    }
-
-    // CPU SIMD fallback
-    for (0..len) |i| {
-        out[i] = a[i] + b[i];
-    }
+    gpuBatchBinaryArrays(a, b, out, .add);
 }
 
 /// GPU batch subtract: out[i] = a[i] - b[i]
 pub fn gpuBatchSubArrays(a: []const f32, b: []const f32, out: []f32) void {
-    const len = a.len;
-    std.debug.assert(b.len == len);
-    std.debug.assert(out.len >= len);
-
-    if (comptime is_apple_silicon) {
-        if (len >= GPU_THRESHOLD and isGPUReady()) {
-            const result = metal_c.lanceql_metal_batch_sub_arrays(
-                a.ptr,
-                b.ptr,
-                out.ptr,
-                @intCast(len),
-            );
-            if (result == 0) return;
-        }
-    }
-
-    // CPU SIMD fallback
-    for (0..len) |i| {
-        out[i] = a[i] - b[i];
-    }
+    gpuBatchBinaryArrays(a, b, out, .sub);
 }
 
 /// GPU batch divide: out[i] = a[i] / b[i]
 pub fn gpuBatchDivArrays(a: []const f32, b: []const f32, out: []f32) void {
-    const len = a.len;
-    std.debug.assert(b.len == len);
-    std.debug.assert(out.len >= len);
-
-    if (comptime is_apple_silicon) {
-        if (len >= GPU_THRESHOLD and isGPUReady()) {
-            const result = metal_c.lanceql_metal_batch_div_arrays(
-                a.ptr,
-                b.ptr,
-                out.ptr,
-                @intCast(len),
-            );
-            if (result == 0) return;
-        }
-    }
-
-    // CPU SIMD fallback
-    for (0..len) |i| {
-        out[i] = a[i] / b[i];
-    }
+    gpuBatchBinaryArrays(a, b, out, .div);
 }
 
 // =============================================================================
