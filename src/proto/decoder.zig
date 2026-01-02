@@ -148,26 +148,21 @@ pub const ProtoDecoder = struct {
         return result;
     }
 
-    /// Read a fixed 64-bit value (little-endian).
-    pub fn readFixed64(self: *Self) DecodeError!u64 {
-        if (self.pos + 8 > self.data.len) {
-            return DecodeError.UnexpectedEndOfData;
-        }
-
-        const result = std.mem.readInt(u64, self.data[self.pos..][0..8], .little);
-        self.pos += 8;
+    /// Generic fixed-width integer reader
+    fn readFixed(self: *Self, comptime T: type) DecodeError!T {
+        const size = @sizeOf(T);
+        if (self.pos + size > self.data.len) return DecodeError.UnexpectedEndOfData;
+        const result = std.mem.readInt(T, self.data[self.pos..][0..size], .little);
+        self.pos += size;
         return result;
     }
 
-    /// Read a fixed 32-bit value (little-endian).
-    pub fn readFixed32(self: *Self) DecodeError!u32 {
-        if (self.pos + 4 > self.data.len) {
-            return DecodeError.UnexpectedEndOfData;
-        }
+    pub fn readFixed64(self: *Self) DecodeError!u64 {
+        return self.readFixed(u64);
+    }
 
-        const result = std.mem.readInt(u32, self.data[self.pos..][0..4], .little);
-        self.pos += 4;
-        return result;
+    pub fn readFixed32(self: *Self) DecodeError!u32 {
+        return self.readFixed(u32);
     }
 
     /// Read a double (64-bit IEEE 754 float, little-endian).
