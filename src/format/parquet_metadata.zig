@@ -632,3 +632,106 @@ comptime {
     if (@alignOf(DictionaryPageHeader) < @alignOf(i32)) @compileError("DictionaryPageHeader alignment too small");
     if (@alignOf(DataPageHeaderV2) < @alignOf(i32)) @compileError("DataPageHeaderV2 alignment too small");
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "Type.fromI32" {
+    try std.testing.expectEqual(Type.boolean, Type.fromI32(0));
+    try std.testing.expectEqual(Type.int32, Type.fromI32(1));
+    try std.testing.expectEqual(Type.int64, Type.fromI32(2));
+    try std.testing.expectEqual(Type.int96, Type.fromI32(3));
+    try std.testing.expectEqual(Type.float, Type.fromI32(4));
+    try std.testing.expectEqual(Type.double, Type.fromI32(5));
+    try std.testing.expectEqual(Type.byte_array, Type.fromI32(6));
+    try std.testing.expectEqual(Type.fixed_len_byte_array, Type.fromI32(7));
+}
+
+test "ConvertedType.fromI32" {
+    try std.testing.expectEqual(ConvertedType.utf8, ConvertedType.fromI32(0));
+    try std.testing.expectEqual(ConvertedType.date, ConvertedType.fromI32(6));
+    try std.testing.expectEqual(ConvertedType.timestamp_millis, ConvertedType.fromI32(9));
+    try std.testing.expectEqual(ConvertedType.timestamp_micros, ConvertedType.fromI32(10));
+    try std.testing.expectEqual(ConvertedType.uint_64, ConvertedType.fromI32(14));
+    try std.testing.expectEqual(ConvertedType.int_64, ConvertedType.fromI32(18));
+}
+
+test "FieldRepetitionType.fromI32" {
+    try std.testing.expectEqual(FieldRepetitionType.required, FieldRepetitionType.fromI32(0));
+    try std.testing.expectEqual(FieldRepetitionType.optional, FieldRepetitionType.fromI32(1));
+    try std.testing.expectEqual(FieldRepetitionType.repeated, FieldRepetitionType.fromI32(2));
+}
+
+test "Encoding.fromI32" {
+    try std.testing.expectEqual(Encoding.plain, Encoding.fromI32(0));
+    try std.testing.expectEqual(Encoding.plain_dictionary, Encoding.fromI32(2));
+    try std.testing.expectEqual(Encoding.rle, Encoding.fromI32(3));
+    try std.testing.expectEqual(Encoding.delta_binary_packed, Encoding.fromI32(5));
+    try std.testing.expectEqual(Encoding.rle_dictionary, Encoding.fromI32(8));
+}
+
+test "CompressionCodec.fromI32" {
+    try std.testing.expectEqual(CompressionCodec.uncompressed, CompressionCodec.fromI32(0));
+    try std.testing.expectEqual(CompressionCodec.snappy, CompressionCodec.fromI32(1));
+    try std.testing.expectEqual(CompressionCodec.gzip, CompressionCodec.fromI32(2));
+    try std.testing.expectEqual(CompressionCodec.zstd, CompressionCodec.fromI32(6));
+    try std.testing.expectEqual(CompressionCodec.lz4_raw, CompressionCodec.fromI32(7));
+}
+
+test "PageType.fromI32" {
+    try std.testing.expectEqual(PageType.data_page, PageType.fromI32(0));
+    try std.testing.expectEqual(PageType.index_page, PageType.fromI32(1));
+    try std.testing.expectEqual(PageType.dictionary_page, PageType.fromI32(2));
+    try std.testing.expectEqual(PageType.data_page_v2, PageType.fromI32(3));
+}
+
+test "ColumnDescriptor.getName" {
+    // Single element path
+    const path1 = [_][]const u8{"column_name"};
+    const desc1 = ColumnDescriptor{
+        .path = &path1,
+        .type_ = .int64,
+        .type_length = null,
+        .repetition_type = .required,
+        .converted_type = null,
+        .scale = null,
+        .precision = null,
+    };
+    try std.testing.expectEqualStrings("column_name", desc1.getName());
+
+    // Multi-element path (nested column)
+    const path2 = [_][]const u8{ "parent", "child", "leaf" };
+    const desc2 = ColumnDescriptor{
+        .path = &path2,
+        .type_ = .byte_array,
+        .type_length = null,
+        .repetition_type = .optional,
+        .converted_type = .utf8,
+        .scale = null,
+        .precision = null,
+    };
+    try std.testing.expectEqualStrings("leaf", desc2.getName());
+
+    // Empty path
+    const empty_path: [][]const u8 = &.{};
+    const desc3 = ColumnDescriptor{
+        .path = empty_path,
+        .type_ = .int32,
+        .type_length = null,
+        .repetition_type = .required,
+        .converted_type = null,
+        .scale = null,
+        .precision = null,
+    };
+    try std.testing.expectEqualStrings("", desc3.getName());
+}
+
+test "SchemaElement default values" {
+    const elem = SchemaElement{};
+    try std.testing.expectEqual(@as(?Type, null), elem.type_);
+    try std.testing.expectEqual(@as(?i32, null), elem.type_length);
+    try std.testing.expectEqual(@as(?FieldRepetitionType, null), elem.repetition_type);
+    try std.testing.expectEqualStrings("", elem.name);
+    try std.testing.expectEqual(@as(?i32, null), elem.num_children);
+}
