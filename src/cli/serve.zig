@@ -289,56 +289,59 @@ pub const Server = struct {
         return self.buildSchemaResponse(file_path, data, file_type);
     }
 
-    fn buildSchemaResponse(self: *Self, path: []const u8, data: []const u8, file_type: FileType) !http.Response {
+    fn buildSchemaResponse(self: *Self, path: ?[]const u8, data: []const u8, file_type: FileType) !http.Response {
         var json = std.ArrayListUnmanaged(u8){};
         defer json.deinit(self.allocator);
 
         try json.appendSlice(self.allocator, "{\"columns\":[");
 
+        var row_count: usize = 0;
         switch (file_type) {
             .parquet => {
                 var table = ParquetTable.init(self.allocator, data) catch {
                     return http.errorResponse(self.allocator, 500, "Failed to parse file");
                 };
                 defer table.deinit();
-
+                row_count = table.numRows();
                 for (table.getColumnNames(), 0..) |col_name, i| {
                     if (i > 0) try json.appendSlice(self.allocator, ",");
                     const col_type = if (table.getColumnType(i)) |t| @tagName(t) else "unknown";
                     try json.writer(self.allocator).print("{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{ col_name, col_type });
                 }
-                try json.writer(self.allocator).print("],\"row_count\":{},\"path\":\"{s}\"}}", .{ table.numRows(), path });
             },
             .lance => {
                 var table = Table.init(self.allocator, data) catch {
                     return http.errorResponse(self.allocator, 500, "Failed to parse file");
                 };
                 defer table.deinit();
-
                 if (table.schema) |schema| {
                     for (schema.fields, 0..) |field, i| {
                         if (i > 0) try json.appendSlice(self.allocator, ",");
                         try json.writer(self.allocator).print("{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{ field.name, field.logical_type });
                     }
                 }
-                try json.writer(self.allocator).print("],\"row_count\":0,\"path\":\"{s}\"}}", .{path});
             },
             .arrow => {
                 var table = ArrowTable.init(self.allocator, data) catch {
                     return http.errorResponse(self.allocator, 500, "Failed to parse file");
                 };
                 defer table.deinit();
-
+                row_count = table.numRows();
                 for (table.getColumnNames(), 0..) |col_name, i| {
                     if (i > 0) try json.appendSlice(self.allocator, ",");
                     const col_type = if (table.getColumnType(i)) |t| @tagName(t) else "unknown";
                     try json.writer(self.allocator).print("{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{ col_name, col_type });
                 }
-                try json.writer(self.allocator).print("],\"row_count\":{},\"path\":\"{s}\"}}", .{ table.numRows(), path });
             },
             .unknown => {
                 return http.errorResponse(self.allocator, 400, "Unknown file format");
             },
+        }
+
+        if (path) |p| {
+            try json.writer(self.allocator).print("],\"row_count\":{},\"path\":\"{s}\"}}", .{ row_count, p });
+        } else {
+            try json.writer(self.allocator).print("],\"row_count\":{}}}", .{row_count});
         }
 
         const json_str = try self.allocator.dupe(u8, json.items);
@@ -374,9 +377,8 @@ pub const Server = struct {
                 opts.format = parseFormat(fmt);
             }
             ingest.run(self.allocator, opts) catch |err| {
-                const msg = std.fmt.allocPrint(self.allocator, "{{\"error\":\"{}\"}}", .{err}) catch
-                    return http.jsonResponse(self.allocator, "{\"error\":\"execution failed\"}");
-                return http.jsonResponse(self.allocator, msg);
+                const msg = std.fmt.allocPrint(self.allocator, "{}", .{err}) catch "execution failed";
+                return http.errorResponse(self.allocator, 500, msg);
             };
             return http.jsonResponse(self.allocator, "{\"success\":true}");
         } else if (std.mem.eql(u8, command, "transform")) {
@@ -387,9 +389,8 @@ pub const Server = struct {
                 .filter = extractJsonField(request.body, "filter"),
             };
             transform.run(self.allocator, opts) catch |err| {
-                const msg = std.fmt.allocPrint(self.allocator, "{{\"error\":\"{}\"}}", .{err}) catch
-                    return http.jsonResponse(self.allocator, "{\"error\":\"execution failed\"}");
-                return http.jsonResponse(self.allocator, msg);
+                const msg = std.fmt.allocPrint(self.allocator, "{}", .{err}) catch "execution failed";
+                return http.errorResponse(self.allocator, 500, msg);
             };
             return http.jsonResponse(self.allocator, "{\"success\":true}");
         } else if (std.mem.eql(u8, command, "enrich")) {
@@ -402,9 +403,8 @@ pub const Server = struct {
                 if (std.mem.eql(u8, m, "clip")) opts.model = .clip;
             }
             enrich.run(self.allocator, opts) catch |err| {
-                const msg = std.fmt.allocPrint(self.allocator, "{{\"error\":\"{}\"}}", .{err}) catch
-                    return http.jsonResponse(self.allocator, "{\"error\":\"execution failed\"}");
-                return http.jsonResponse(self.allocator, msg);
+                const msg = std.fmt.allocPrint(self.allocator, "{}", .{err}) catch "execution failed";
+                return http.errorResponse(self.allocator, 500, msg);
             };
             return http.jsonResponse(self.allocator, "{\"success\":true}");
         }
@@ -421,70 +421,7 @@ pub const Server = struct {
         const data = self.file_data.?;
         const file_type = detectFileType(path, data);
 
-        // Get schema based on file type
-        var json = std.ArrayListUnmanaged(u8){};
-        defer json.deinit(self.allocator);
-
-        try json.appendSlice(self.allocator, "{\"columns\":[");
-
-        switch (file_type) {
-            .parquet => {
-                var table = ParquetTable.init(self.allocator, data) catch {
-                    return http.errorResponse(self.allocator, 500, "Failed to parse file");
-                };
-                defer table.deinit();
-
-                for (table.getColumnNames(), 0..) |col_name, i| {
-                    if (i > 0) try json.appendSlice(self.allocator, ",");
-                    const col_type = if (table.getColumnType(i)) |t| @tagName(t) else "unknown";
-                    try json.writer(self.allocator).print("{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{
-                        col_name,
-                        col_type,
-                    });
-                }
-                try json.writer(self.allocator).print("],\"row_count\":{}}}", .{table.numRows()});
-            },
-            .lance => {
-                var table = Table.init(self.allocator, data) catch {
-                    return http.errorResponse(self.allocator, 500, "Failed to parse file");
-                };
-                defer table.deinit();
-
-                if (table.schema) |schema| {
-                    for (schema.fields, 0..) |field, i| {
-                        if (i > 0) try json.appendSlice(self.allocator, ",");
-                        try json.writer(self.allocator).print("{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{
-                            field.name,
-                            field.logical_type,
-                        });
-                    }
-                }
-                // Row count not easily accessible for Lance format - use 0 as placeholder
-                try json.writer(self.allocator).print("],\"row_count\":0}}", .{});
-            },
-            .arrow => {
-                var table = ArrowTable.init(self.allocator, data) catch {
-                    return http.errorResponse(self.allocator, 500, "Failed to parse file");
-                };
-                defer table.deinit();
-
-                for (table.getColumnNames(), 0..) |col_name, i| {
-                    if (i > 0) try json.appendSlice(self.allocator, ",");
-                    const col_type = if (table.getColumnType(i)) |t| @tagName(t) else "unknown";
-                    try json.writer(self.allocator).print("{{\"name\":\"{s}\",\"type\":\"{s}\"}}", .{
-                        col_name,
-                        col_type,
-                    });
-                }
-                try json.writer(self.allocator).print("],\"row_count\":{}}}", .{table.numRows()});
-            },
-            .unknown => {
-                return http.errorResponse(self.allocator, 400, "Unknown file format");
-            },
-        }
-
-        const json_str = try self.allocator.dupe(u8, json.items);
-        return http.jsonResponse(self.allocator, json_str);
+        return self.buildSchemaResponse(null, data, file_type);
     }
 
     fn handleQuery(self: *Self, request: *http.Request) !http.Response {

@@ -166,17 +166,6 @@ pub fn run(allocator: std.mem.Allocator, opts: args.IngestOptions) !void {
     }
 }
 
-// Re-export for backward compatibility
-pub const ingestCsv = formats.ingestCsv;
-pub const ingestJson = formats.ingestJson;
-pub const ingestParquet = formats.ingestParquet;
-pub const ingestArrow = binary_formats.ingestArrow;
-pub const ingestAvro = binary_formats.ingestAvro;
-pub const ingestOrc = binary_formats.ingestOrc;
-pub const ingestXlsx = binary_formats.ingestXlsx;
-pub const ingestDelta = lakehouse.ingestDelta;
-pub const ingestIceberg = lakehouse.ingestIceberg;
-
 test "detect format by extension" {
     const allocator = std.testing.allocator;
     try std.testing.expectEqual(args.IngestOptions.Format.csv, detectFormat(allocator, "data.csv"));
