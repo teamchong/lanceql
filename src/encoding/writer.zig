@@ -346,7 +346,7 @@ pub const LanceWriter = struct {
     /// Encode schema as protobuf (global buffer 0)
     fn encodeSchema(self: *Self) ![]const u8 {
         var schema_proto = ProtobufEncoder.init(self.allocator);
-        errdefer schema_proto.deinit();
+        defer schema_proto.deinit();
 
         // Encode each column as a Field message
         for (self.schema, 0..) |col, i| {
@@ -410,7 +410,7 @@ pub const LanceWriter = struct {
     /// Encode a Page protobuf message
     fn encodePage(self: *Self, buf_info: ColumnBufferInfo) ![]const u8 {
         var page = ProtobufEncoder.init(self.allocator);
-        errdefer page.deinit();
+        defer page.deinit();
 
         // Field 1: buffer_offsets (packed repeated uint64)
         // For strings: [offsets_offset, data_offset], else: [data_offset]
