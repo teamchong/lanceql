@@ -3681,30 +3681,13 @@ pub const Executor = struct {
     /// Compare two numbers
     fn compareNumbers(self: *Self, op: BinaryOp, left: f64, right: f64) bool {
         _ = self;
-        return switch (op) {
-            .eq => left == right,
-            .ne => left != right,
-            .lt => left < right,
-            .le => left <= right,
-            .gt => left > right,
-            .ge => left >= right,
-            else => unreachable,
-        };
+        return scalar_functions.compareNumbers(op, left, right);
     }
 
     /// Compare two strings
     fn compareStrings(self: *Self, op: BinaryOp, left: []const u8, right: []const u8) bool {
         _ = self;
-        const cmp = std.mem.order(u8, left, right);
-        return switch (op) {
-            .eq => cmp == .eq,
-            .ne => cmp != .eq,
-            .lt => cmp == .lt,
-            .le => cmp == .lt or cmp == .eq,
-            .gt => cmp == .gt,
-            .ge => cmp == .gt or cmp == .eq,
-            else => unreachable,
-        };
+        return scalar_functions.compareStrings(op, left, right);
     }
 
     /// Evaluate unary operation

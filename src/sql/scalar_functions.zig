@@ -420,3 +420,36 @@ pub fn inferFunctionReturnType(name: []const u8) ResultType {
     // For simplicity, return float64 for all math functions
     return .float64;
 }
+
+// ============================================================================
+// Comparison Functions
+// ============================================================================
+
+const BinaryOp = @import("ast").BinaryOp;
+
+/// Compare two numbers
+pub fn compareNumbers(op: BinaryOp, left: f64, right: f64) bool {
+    return switch (op) {
+        .eq => left == right,
+        .ne => left != right,
+        .lt => left < right,
+        .le => left <= right,
+        .gt => left > right,
+        .ge => left >= right,
+        else => unreachable,
+    };
+}
+
+/// Compare two strings
+pub fn compareStrings(op: BinaryOp, left: []const u8, right: []const u8) bool {
+    const cmp = std.mem.order(u8, left, right);
+    return switch (op) {
+        .eq => cmp == .eq,
+        .ne => cmp != .eq,
+        .lt => cmp == .lt,
+        .le => cmp == .lt or cmp == .eq,
+        .gt => cmp == .gt,
+        .ge => cmp == .gt or cmp == .eq,
+        else => unreachable,
+    };
+}
