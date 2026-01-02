@@ -5058,4 +5058,149 @@ test.describe('Vault SQL Operations', () => {
             expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
         }
     });
+
+    test('GPU vector search top-K selection', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { gpuVectorSearch, DistanceMetric } = await import('./lanceql.js');
+            const tests = [];
+
+            // Initialize GPU vector search
+            await gpuVectorSearch.init();
+            const isAvailable = gpuVectorSearch.isAvailable();
+            tests.push({ name: 'GPUVectorSearch initializes', pass: true, actual: isAvailable ? 'GPU available' : 'CPU fallback' });
+
+            // Test CPU top-K (small dataset)
+            try {
+                const scores = new Float32Array([0.1, 0.5, 0.3, 0.9, 0.2, 0.7, 0.4, 0.8]);
+                const result = await gpuVectorSearch.topK(scores, null, 3, true);
+                // Top 3 descending should be indices 3(0.9), 7(0.8), 5(0.7)
+                const pass = result.indices[0] === 3 && result.indices[1] === 7 && result.indices[2] === 5;
+                tests.push({ name: 'CPU top-K descending', pass, actual: Array.from(result.indices).join(',') });
+            } catch (e) {
+                tests.push({ name: 'CPU top-K descending', pass: false, error: e.message });
+            }
+
+            // Test ascending top-K (for L2 distance)
+            try {
+                const scores = new Float32Array([0.1, 0.5, 0.3, 0.9, 0.2, 0.7, 0.4, 0.8]);
+                const result = await gpuVectorSearch.topK(scores, null, 3, false);
+                // Top 3 ascending should be indices 0(0.1), 4(0.2), 2(0.3)
+                const pass = result.indices[0] === 0 && result.indices[1] === 4 && result.indices[2] === 2;
+                tests.push({ name: 'CPU top-K ascending', pass, actual: Array.from(result.indices).join(',') });
+            } catch (e) {
+                tests.push({ name: 'CPU top-K ascending', pass: false, error: e.message });
+            }
+
+            // Test distance computation (cosine)
+            try {
+                const query = new Float32Array([1, 0, 0, 0]);
+                const vectors = [
+                    new Float32Array([1, 0, 0, 0]),    // cos=1.0 (same direction)
+                    new Float32Array([0, 1, 0, 0]),    // cos=0.0 (perpendicular)
+                    new Float32Array([-1, 0, 0, 0]),   // cos=-1.0 (opposite)
+                ];
+                const scores = await gpuVectorSearch.computeDistances(query, vectors, 1, DistanceMetric.COSINE);
+                const pass = Math.abs(scores[0] - 1.0) < 0.001 && Math.abs(scores[1]) < 0.001;
+                tests.push({ name: 'Distance computation (cosine)', pass, actual: Array.from(scores).map(s => s.toFixed(2)).join(',') });
+            } catch (e) {
+                tests.push({ name: 'Distance computation (cosine)', pass: false, error: e.message });
+            }
+
+            // Test full search
+            try {
+                const query = new Float32Array([1, 0, 0, 0]);
+                const vectors = [
+                    new Float32Array([0.5, 0.5, 0, 0]),   // cos=0.707
+                    new Float32Array([1, 0, 0, 0]),       // cos=1.0 (best)
+                    new Float32Array([0, 1, 0, 0]),       // cos=0.0
+                    new Float32Array([0.9, 0.1, 0, 0]),   // cos=0.994 (second best)
+                ];
+                const result = await gpuVectorSearch.search(query, vectors, 2, { metric: DistanceMetric.COSINE });
+                // Best match should be index 1, second best index 3
+                const pass = result.indices[0] === 1 && result.indices[1] === 3;
+                tests.push({ name: 'Full vector search', pass, actual: Array.from(result.indices).join(',') });
+            } catch (e) {
+                tests.push({ name: 'Full vector search', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('GPU vector search handles edge cases', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { gpuVectorSearch, DistanceMetric } = await import('./lanceql.js');
+            const tests = [];
+
+            await gpuVectorSearch.init();
+
+            // Test empty input
+            try {
+                const scores = new Float32Array([]);
+                const result = await gpuVectorSearch.topK(scores, null, 5, true);
+                tests.push({ name: 'Empty input', pass: result.indices.length === 0, actual: result.indices.length });
+            } catch (e) {
+                tests.push({ name: 'Empty input', pass: false, error: e.message });
+            }
+
+            // Test k > n
+            try {
+                const scores = new Float32Array([0.5, 0.3]);
+                const result = await gpuVectorSearch.topK(scores, null, 10, true);
+                tests.push({ name: 'K > N', pass: result.indices.length === 2, actual: result.indices.length });
+            } catch (e) {
+                tests.push({ name: 'K > N', pass: false, error: e.message });
+            }
+
+            // Test single element
+            try {
+                const scores = new Float32Array([0.42]);
+                const result = await gpuVectorSearch.topK(scores, null, 1, true);
+                const pass = result.indices[0] === 0 && Math.abs(result.scores[0] - 0.42) < 0.001;
+                tests.push({ name: 'Single element', pass, actual: `idx=${result.indices[0]}, score=${result.scores[0]}` });
+            } catch (e) {
+                tests.push({ name: 'Single element', pass: false, error: e.message });
+            }
+
+            // Test L2 distance
+            try {
+                const query = new Float32Array([0, 0, 0, 0]);
+                const vectors = [
+                    new Float32Array([1, 0, 0, 0]),   // L2=1.0
+                    new Float32Array([3, 0, 0, 0]),   // L2=3.0
+                    new Float32Array([2, 0, 0, 0]),   // L2=2.0
+                ];
+                const scores = await gpuVectorSearch.computeDistances(query, vectors, 1, DistanceMetric.L2);
+                // For L2, lower is better, so we'd use ascending
+                const result = await gpuVectorSearch.topK(scores, null, 2, false);
+                // Closest should be index 0 (L2=1.0), then index 2 (L2=2.0)
+                const pass = result.indices[0] === 0 && result.indices[1] === 2;
+                tests.push({ name: 'L2 distance search', pass, actual: Array.from(result.indices).join(',') });
+            } catch (e) {
+                tests.push({ name: 'L2 distance search', pass: false, error: e.message });
+            }
+
+            // Test with custom indices
+            try {
+                const scores = new Float32Array([0.1, 0.9, 0.5]);
+                const indices = new Uint32Array([100, 200, 300]);  // Custom row IDs
+                const result = await gpuVectorSearch.topK(scores, indices, 2, true);
+                // Best is scores[1]=0.9 which maps to indices[1]=200
+                const pass = result.indices[0] === 200 && result.indices[1] === 300;
+                tests.push({ name: 'Custom indices', pass, actual: Array.from(result.indices).join(',') });
+            } catch (e) {
+                tests.push({ name: 'Custom indices', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
 });

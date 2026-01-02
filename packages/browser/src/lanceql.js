@@ -1120,6 +1120,267 @@ fn f2s(f: f32) -> u32 { let b = bitcast<u32>(f); return select(b ^ 0x80000000u, 
 // Global GPU grouper instance
 const gpuGrouper = new GPUGrouper();
 
+// ============================================================================
+// GPU Vector Search - GPU-accelerated distance computation and top-K selection
+// ============================================================================
+
+const GPU_DISTANCE_THRESHOLD = 5000;
+const GPU_TOPK_THRESHOLD = 10000;
+
+const DistanceMetric = { COSINE: 0, L2: 1, DOT_PRODUCT: 2 };
+
+const VECTOR_DISTANCE_SHADER = `
+struct DistanceParams { dim: u32, num_vectors: u32, num_queries: u32, metric: u32, }
+@group(0) @binding(0) var<uniform> params: DistanceParams;
+@group(0) @binding(1) var<storage, read> queries: array<f32>;
+@group(0) @binding(2) var<storage, read> vectors: array<f32>;
+@group(0) @binding(3) var<storage, read_write> distances: array<f32>;
+var<workgroup> shared_query: array<f32, 512>;
+fn compute_dot(vec_offset: u32, dim: u32) -> f32 {
+    var sum: f32 = 0.0;
+    for (var i = 0u; i < dim; i++) { sum += shared_query[i] * vectors[vec_offset + i]; }
+    return sum;
+}
+fn compute_l2(vec_offset: u32, dim: u32) -> f32 {
+    var sum: f32 = 0.0;
+    for (var i = 0u; i < dim; i++) { let d = shared_query[i] - vectors[vec_offset + i]; sum += d * d; }
+    return sqrt(sum);
+}
+@compute @workgroup_size(256)
+fn compute_distances(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+    let query_idx = wid.y; let vec_idx = gid.x;
+    if (vec_idx >= params.num_vectors || query_idx >= params.num_queries) { return; }
+    let dim = params.dim; let tid = lid.x;
+    for (var i = tid; i < dim && i < 512u; i += 256u) { shared_query[i] = queries[query_idx * dim + i]; }
+    workgroupBarrier();
+    let vec_offset = vec_idx * dim;
+    var result: f32 = 0.0;
+    switch params.metric {
+        case 0u, 2u: { result = compute_dot(vec_offset, dim); }
+        case 1u: { result = compute_l2(vec_offset, dim); }
+        default: { result = compute_dot(vec_offset, dim); }
+    }
+    distances[query_idx * params.num_vectors + vec_idx] = result;
+}`;
+
+const TOPK_SHADER = `
+struct TopKParams { size: u32, k: u32, descending: u32, num_workgroups: u32, }
+@group(0) @binding(0) var<uniform> params: TopKParams;
+@group(0) @binding(1) var<storage, read> input_scores: array<f32>;
+@group(0) @binding(2) var<storage, read> input_indices: array<u32>;
+@group(0) @binding(3) var<storage, read_write> output_scores: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output_indices: array<u32>;
+var<workgroup> local_scores: array<f32, 512>;
+var<workgroup> local_indices: array<u32, 512>;
+fn should_swap(a: f32, b: f32, descending: bool) -> bool { if (descending) { return a < b; } else { return a > b; } }
+fn get_sentinel(descending: bool) -> f32 { if (descending) { return -3.4028235e+38; } else { return 3.4028235e+38; } }
+@compute @workgroup_size(256)
+fn local_topk(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+    let chunk_size = 512u; let base = wid.x * chunk_size; let tid = lid.x;
+    let descending = params.descending == 1u; let sentinel = get_sentinel(descending);
+    let idx1 = base + tid; let idx2 = base + tid + 256u;
+    if (idx1 < params.size) { local_scores[tid] = input_scores[idx1]; local_indices[tid] = input_indices[idx1]; } else { local_scores[tid] = sentinel; local_indices[tid] = 0xFFFFFFFFu; }
+    if (idx2 < params.size) { local_scores[tid + 256u] = input_scores[idx2]; local_indices[tid + 256u] = input_indices[idx2]; } else { local_scores[tid + 256u] = sentinel; local_indices[tid + 256u] = 0xFFFFFFFFu; }
+    workgroupBarrier();
+    for (var k = 2u; k <= chunk_size; k = k << 1u) {
+        for (var j = k >> 1u; j > 0u; j = j >> 1u) {
+            for (var t = 0u; t < 2u; t++) {
+                let i = tid + t * 256u; let ixj = i ^ j;
+                if (ixj > i && ixj < chunk_size) {
+                    let direction = ((i & k) == 0u) == descending;
+                    if (should_swap(local_scores[i], local_scores[ixj], direction)) {
+                        let tmp_score = local_scores[i]; local_scores[i] = local_scores[ixj]; local_scores[ixj] = tmp_score;
+                        let tmp_idx = local_indices[i]; local_indices[i] = local_indices[ixj]; local_indices[ixj] = tmp_idx;
+                    }
+                }
+            }
+            workgroupBarrier();
+        }
+    }
+    let k_per_wg = min(params.k, chunk_size);
+    if (tid < k_per_wg) { let out_base = wid.x * params.k; output_scores[out_base + tid] = local_scores[tid]; output_indices[out_base + tid] = local_indices[tid]; }
+    if (tid + 256u < k_per_wg) { let out_base = wid.x * params.k; output_scores[out_base + tid + 256u] = local_scores[tid + 256u]; output_indices[out_base + tid + 256u] = local_indices[tid + 256u]; }
+}
+struct MergeParams { num_candidates: u32, k: u32, descending: u32, _pad: u32, }
+@group(0) @binding(0) var<uniform> merge_params: MergeParams;
+@group(0) @binding(1) var<storage, read> merge_scores: array<f32>;
+@group(0) @binding(2) var<storage, read> merge_indices: array<u32>;
+@group(0) @binding(3) var<storage, read_write> final_scores: array<f32>;
+@group(0) @binding(4) var<storage, read_write> final_indices: array<u32>;
+@compute @workgroup_size(256)
+fn merge_topk(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x; let n = merge_params.num_candidates; let k = merge_params.k;
+    let descending = merge_params.descending == 1u; let sentinel = get_sentinel(descending);
+    let n_local = min(n, 512u);
+    if (tid < n_local) { local_scores[tid] = merge_scores[tid]; local_indices[tid] = merge_indices[tid]; } else if (tid < 512u) { local_scores[tid] = sentinel; local_indices[tid] = 0xFFFFFFFFu; }
+    if (tid + 256u < n_local) { local_scores[tid + 256u] = merge_scores[tid + 256u]; local_indices[tid + 256u] = merge_indices[tid + 256u]; } else if (tid + 256u < 512u) { local_scores[tid + 256u] = sentinel; local_indices[tid + 256u] = 0xFFFFFFFFu; }
+    workgroupBarrier();
+    let chunk_size = 512u;
+    for (var ks = 2u; ks <= chunk_size; ks = ks << 1u) {
+        for (var j = ks >> 1u; j > 0u; j = j >> 1u) {
+            for (var t = 0u; t < 2u; t++) {
+                let i = tid + t * 256u; let ixj = i ^ j;
+                if (ixj > i && ixj < chunk_size) {
+                    let direction = ((i & ks) == 0u) == descending;
+                    if (should_swap(local_scores[i], local_scores[ixj], direction)) {
+                        let tmp_score = local_scores[i]; local_scores[i] = local_scores[ixj]; local_scores[ixj] = tmp_score;
+                        let tmp_idx = local_indices[i]; local_indices[i] = local_indices[ixj]; local_indices[ixj] = tmp_idx;
+                    }
+                }
+            }
+            workgroupBarrier();
+        }
+    }
+    if (tid < k) { final_scores[tid] = local_scores[tid]; final_indices[tid] = local_indices[tid]; }
+}`;
+
+class GPUVectorSearch {
+    constructor() { this.device = null; this.pipelines = new Map(); this.available = false; this._initPromise = null; }
+    async init() { if (this._initPromise) return this._initPromise; this._initPromise = this._doInit(); return this._initPromise; }
+    async _doInit() {
+        if (typeof navigator === 'undefined' || !navigator.gpu) return false;
+        try {
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) return false;
+            this.device = await adapter.requestDevice({ requiredLimits: { maxStorageBufferBindingSize: 256 * 1024 * 1024, maxBufferSize: 256 * 1024 * 1024 } });
+            await this._compileShaders();
+            this.available = true;
+            return true;
+        } catch (e) { return false; }
+    }
+    async _compileShaders() {
+        const distMod = this.device.createShaderModule({ code: VECTOR_DISTANCE_SHADER });
+        this.pipelines.set('distance', this.device.createComputePipeline({ layout: 'auto', compute: { module: distMod, entryPoint: 'compute_distances' } }));
+        const topkMod = this.device.createShaderModule({ code: TOPK_SHADER });
+        this.pipelines.set('local_topk', this.device.createComputePipeline({ layout: 'auto', compute: { module: topkMod, entryPoint: 'local_topk' } }));
+        this.pipelines.set('merge_topk', this.device.createComputePipeline({ layout: 'auto', compute: { module: topkMod, entryPoint: 'merge_topk' } }));
+    }
+    isAvailable() { return this.available; }
+
+    async computeDistances(queryVec, vectors, numQueries = 1, metric = 0) {
+        const numVectors = vectors.length;
+        const dim = queryVec.length / numQueries;
+        if (!this.available || numVectors < GPU_DISTANCE_THRESHOLD) return this._cpuDistances(queryVec, vectors, numQueries, metric);
+        const flatVectors = new Float32Array(numVectors * dim);
+        for (let i = 0; i < numVectors; i++) flatVectors.set(vectors[i], i * dim);
+        const paramsBuffer = this._createUniform(new Uint32Array([dim, numVectors, numQueries, metric]));
+        const queryBuffer = this._createStorage(queryVec);
+        const vectorsBuffer = this._createStorage(flatVectors);
+        const distanceBuffer = this.device.createBuffer({ size: numQueries * numVectors * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const readBuffer = this.device.createBuffer({ size: numQueries * numVectors * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        const bindGroup = this.device.createBindGroup({ layout: this.pipelines.get('distance').getBindGroupLayout(0), entries: [
+            { binding: 0, resource: { buffer: paramsBuffer } }, { binding: 1, resource: { buffer: queryBuffer } },
+            { binding: 2, resource: { buffer: vectorsBuffer } }, { binding: 3, resource: { buffer: distanceBuffer } }
+        ]});
+        const encoder = this.device.createCommandEncoder();
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(this.pipelines.get('distance'));
+        pass.setBindGroup(0, bindGroup);
+        pass.dispatchWorkgroups(Math.ceil(numVectors / 256), numQueries, 1);
+        pass.end();
+        encoder.copyBufferToBuffer(distanceBuffer, 0, readBuffer, 0, numQueries * numVectors * 4);
+        this.device.queue.submit([encoder.finish()]);
+        await readBuffer.mapAsync(GPUMapMode.READ);
+        const distances = new Float32Array(readBuffer.getMappedRange().slice(0));
+        readBuffer.unmap();
+        [paramsBuffer, queryBuffer, vectorsBuffer, distanceBuffer, readBuffer].forEach(b => b.destroy());
+        return distances;
+    }
+
+    async topK(scores, indices = null, k = 10, descending = true) {
+        const n = scores.length;
+        if (!this.available || n < GPU_TOPK_THRESHOLD) return this._cpuTopK(scores, indices, k, descending);
+        if (!indices) { indices = new Uint32Array(n); for (let i = 0; i < n; i++) indices[i] = i; }
+        const numWorkgroups = Math.ceil(n / 512);
+        const kPerWg = Math.min(k, 512);
+        const numCandidates = numWorkgroups * kPerWg;
+        // Phase 1
+        const paramsBuffer = this._createUniform(new Uint32Array([n, k, descending ? 1 : 0, numWorkgroups]));
+        const inputScoresBuffer = this._createStorage(scores);
+        const inputIndicesBuffer = this._createStorage(indices);
+        const intermediateScoresBuffer = this.device.createBuffer({ size: numCandidates * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const intermediateIndicesBuffer = this.device.createBuffer({ size: numCandidates * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const localBG = this.device.createBindGroup({ layout: this.pipelines.get('local_topk').getBindGroupLayout(0), entries: [
+            { binding: 0, resource: { buffer: paramsBuffer } }, { binding: 1, resource: { buffer: inputScoresBuffer } },
+            { binding: 2, resource: { buffer: inputIndicesBuffer } }, { binding: 3, resource: { buffer: intermediateScoresBuffer } },
+            { binding: 4, resource: { buffer: intermediateIndicesBuffer } }
+        ]});
+        let encoder = this.device.createCommandEncoder();
+        let pass = encoder.beginComputePass();
+        pass.setPipeline(this.pipelines.get('local_topk'));
+        pass.setBindGroup(0, localBG);
+        pass.dispatchWorkgroups(numWorkgroups, 1, 1);
+        pass.end();
+        this.device.queue.submit([encoder.finish()]);
+        // Phase 2
+        const mergeParamsBuffer = this._createUniform(new Uint32Array([numCandidates, k, descending ? 1 : 0, 0]));
+        const finalScoresBuffer = this.device.createBuffer({ size: k * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const finalIndicesBuffer = this.device.createBuffer({ size: k * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const readScoresBuffer = this.device.createBuffer({ size: k * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        const readIndicesBuffer = this.device.createBuffer({ size: k * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        const mergeBG = this.device.createBindGroup({ layout: this.pipelines.get('merge_topk').getBindGroupLayout(0), entries: [
+            { binding: 0, resource: { buffer: mergeParamsBuffer } }, { binding: 1, resource: { buffer: intermediateScoresBuffer } },
+            { binding: 2, resource: { buffer: intermediateIndicesBuffer } }, { binding: 3, resource: { buffer: finalScoresBuffer } },
+            { binding: 4, resource: { buffer: finalIndicesBuffer } }
+        ]});
+        encoder = this.device.createCommandEncoder();
+        pass = encoder.beginComputePass();
+        pass.setPipeline(this.pipelines.get('merge_topk'));
+        pass.setBindGroup(0, mergeBG);
+        pass.dispatchWorkgroups(1, 1, 1);
+        pass.end();
+        encoder.copyBufferToBuffer(finalScoresBuffer, 0, readScoresBuffer, 0, k * 4);
+        encoder.copyBufferToBuffer(finalIndicesBuffer, 0, readIndicesBuffer, 0, k * 4);
+        this.device.queue.submit([encoder.finish()]);
+        await Promise.all([readScoresBuffer.mapAsync(GPUMapMode.READ), readIndicesBuffer.mapAsync(GPUMapMode.READ)]);
+        const resultScores = new Float32Array(readScoresBuffer.getMappedRange().slice(0));
+        const resultIndices = new Uint32Array(readIndicesBuffer.getMappedRange().slice(0));
+        readScoresBuffer.unmap(); readIndicesBuffer.unmap();
+        [paramsBuffer, inputScoresBuffer, inputIndicesBuffer, intermediateScoresBuffer, intermediateIndicesBuffer,
+         mergeParamsBuffer, finalScoresBuffer, finalIndicesBuffer, readScoresBuffer, readIndicesBuffer].forEach(b => b.destroy());
+        return { indices: resultIndices, scores: resultScores };
+    }
+
+    async search(queryVec, vectors, k = 10, options = {}) {
+        const { metric = 0 } = options;
+        const scores = await this.computeDistances(queryVec, vectors, 1, metric);
+        const descending = metric === 0 || metric === 2;
+        return await this.topK(scores, null, k, descending);
+    }
+
+    _cpuDistances(queryVec, vectors, numQueries, metric) {
+        const dim = queryVec.length / numQueries;
+        const numVectors = vectors.length;
+        const distances = new Float32Array(numQueries * numVectors);
+        for (let q = 0; q < numQueries; q++) {
+            const qOff = q * dim;
+            for (let v = 0; v < numVectors; v++) {
+                const vec = vectors[v];
+                let result = 0;
+                if (metric === 1) { for (let i = 0; i < dim; i++) { const d = queryVec[qOff + i] - vec[i]; result += d * d; } result = Math.sqrt(result); }
+                else { for (let i = 0; i < dim; i++) result += queryVec[qOff + i] * vec[i]; }
+                distances[q * numVectors + v] = result;
+            }
+        }
+        return distances;
+    }
+
+    _cpuTopK(scores, indices, k, descending) {
+        const n = scores.length;
+        if (!indices) { indices = new Uint32Array(n); for (let i = 0; i < n; i++) indices[i] = i; }
+        const indexed = Array.from(scores).map((score, i) => ({ score, idx: indices[i] }));
+        if (descending) indexed.sort((a, b) => b.score - a.score);
+        else indexed.sort((a, b) => a.score - b.score);
+        const topK = indexed.slice(0, k);
+        return { indices: new Uint32Array(topK.map(x => x.idx)), scores: new Float32Array(topK.map(x => x.score)) };
+    }
+
+    _createStorage(data) { const buf = this.device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }); this.device.queue.writeBuffer(buf, 0, data); return buf; }
+    _createUniform(data) { const buf = this.device.createBuffer({ size: Math.max(data.byteLength, 16), usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }); this.device.queue.writeBuffer(buf, 0, data); return buf; }
+}
+
+const gpuVectorSearch = new GPUVectorSearch();
+
 /**
  * Statistics Manager - computes and caches column statistics for query optimization.
  *
@@ -7325,6 +7586,7 @@ export class LanceFile {
     /**
      * Find top-k most similar vectors to query.
      * Uses WebGPU if available, otherwise falls back to WASM SIMD.
+     * GPU-accelerated top-K selection for large result sets.
      * @param {number} colIdx - Column index with vectors
      * @param {Float32Array} queryVec - Query vector
      * @param {number} topK - Number of results to return
@@ -7351,15 +7613,8 @@ export class LanceFile {
             // Batch compute with WebGPU
             const scores = await webgpuAccelerator.batchCosineSimilarity(queryVec, allVectors, true);
 
-            // Find top-k
-            const indexedScores = Array.from(scores).map((score, idx) => ({ idx, score }));
-            indexedScores.sort((a, b) => b.score - a.score);
-
-            const topResults = indexedScores.slice(0, topK);
-            const indices = new Uint32Array(topResults.map(r => r.idx));
-            const topScores = new Float32Array(topResults.map(r => r.score));
-
-            return { indices, scores: topScores };
+            // GPU-accelerated top-K selection for large result sets
+            return await gpuVectorSearch.topK(scores, null, topK, true);
         }
 
         // Fall back to WASM SIMD (uses batchCosineSimilarity internally)
@@ -7375,15 +7630,8 @@ export class LanceFile {
         // Use WASM batch cosine similarity
         const scores = this.lanceql.batchCosineSimilarity(queryVec, allVectors, true);
 
-        // Find top-k
-        const indexedScores = Array.from(scores).map((score, idx) => ({ idx, score }));
-        indexedScores.sort((a, b) => b.score - a.score);
-
-        const topResults = indexedScores.slice(0, topK);
-        const indices = new Uint32Array(topResults.map(r => r.idx));
-        const topScores = new Float32Array(topResults.map(r => r.score));
-
-        return { indices, scores: topScores };
+        // GPU-accelerated top-K selection for large result sets
+        return await gpuVectorSearch.topK(scores, null, topK, true);
     }
 
     // ========================================================================
@@ -20319,6 +20567,7 @@ export async function initSqlJs(config = {}) {
         await gpuJoiner.init();
         await gpuSorter.init();
         await gpuGrouper.init();
+        await gpuVectorSearch.init();
     } catch (e) {
         console.warn('[LanceQL] WebGPU not available:', e.message);
     }
@@ -20333,7 +20582,7 @@ export async function initSqlJs(config = {}) {
 export { Database as SqlJsDatabase, Statement as SqlJsStatement };
 
 // Export WebGPU accelerator, GPU aggregator, GPU joiner, GPU sorter, and GPU grouper for direct access
-export { webgpuAccelerator, gpuAggregator, gpuJoiner, gpuSorter, gpuGrouper };
+export { webgpuAccelerator, gpuAggregator, gpuJoiner, gpuSorter, gpuGrouper, gpuVectorSearch, DistanceMetric };
 
 // LogicTable exports (disabled - LanceDataset API not yet implemented)
 // export { Table, logicTable, LogicTableQuery, loadLogicTable } from './logic-table.js';

@@ -6,6 +6,7 @@
  * GPU-accelerated SQL JOINs (hash join for large tables).
  * GPU-accelerated SQL ORDER BY (bitonic sort for large result sets).
  * GPU-accelerated SQL GROUP BY (hash-based grouping for large datasets).
+ * GPU-accelerated vector search (distance computation and top-K selection).
  */
 
 export { GPUBufferManager, ModelWeightCache } from './gpu-buffers.js';
@@ -36,6 +37,12 @@ export {
     getGPUGrouper,
     shouldUseGPUGroup,
 } from './gpu-group-by.js';
+export {
+    GPUVectorSearch,
+    getGPUVectorSearch,
+    shouldUseGPUVectorSearch,
+    DistanceMetric,
+} from './gpu-vector-search.js';
 
 // Shader sources (for advanced users)
 export const SHADERS = {
@@ -48,6 +55,8 @@ export const SHADERS = {
     JOIN: './shaders/join.wgsl',
     SORT: './shaders/sort.wgsl',
     GROUP_BY: './shaders/group_by.wgsl',
+    VECTOR_DISTANCE: './shaders/vector_distance.wgsl',
+    TOPK_SELECT: './shaders/topk_select.wgsl',
 };
 
 /**
