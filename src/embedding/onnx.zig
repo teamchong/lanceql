@@ -211,17 +211,24 @@ pub const OrtApi = extern struct {
 // C API Entry Point
 // =============================================================================
 
-// ONNX runtime is optional - stub out if not available
-// When built with -Donnx=/path, the library will be linked and this will work
-// When built without ONNX, these functions return null/false
+// ONNX runtime is optional - linked when built with -Donnx=/path
+// When ONNX is not linked, OrtGetApiBase returns null
 
-// Stub: Always return null/unavailable for now
-// To enable ONNX support:
-// 1. Install ONNX Runtime
-// 2. Build with: zig build -Donnx=/path/to/onnxruntime
+// Check if we have ONNX runtime linked via build options
+const build_options = @import("build_options");
+const has_onnx = if (@hasDecl(build_options, "use_onnx")) build_options.use_onnx else false;
+
+// Extern declaration for ONNX runtime C API entry point
+extern "c" fn OrtGetApiBase_extern() callconv(.c) ?*const OrtApiBase;
+
+/// Get the ONNX Runtime API base
+/// Returns null if ONNX runtime is not linked
 pub fn OrtGetApiBase() ?*const OrtApiBase {
-    // ONNX runtime not linked - return null
-    return null;
+    if (has_onnx) {
+        return OrtGetApiBase_extern();
+    } else {
+        return null;
+    }
 }
 
 // =============================================================================

@@ -284,11 +284,13 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Pass build options to metal module
+    // Pass build options to modules
     const build_options = b.addOptions();
     build_options.addOption(bool, "use_metal", use_metal);
     build_options.addOption(bool, "use_accelerate", use_accelerate);
+    build_options.addOption(bool, "use_onnx", onnx_path != null);
     metal_mod.addOptions("build_options", build_options);
+    lanceql_mod.addOptions("build_options", build_options);
 
     // === Tests ===
     const test_footer = b.addTest(.{
@@ -829,6 +831,8 @@ pub fn build(b: *std.Build) void {
         cli.root_module.linkSystemLibrary("onnxruntime", .{});
         cli.linkLibC();
     }
+    // Pass build options to CLI (for ONNX availability check)
+    cli.root_module.addOptions("build_options", build_options);
     b.installArtifact(cli);
     const run_cli = b.addRunArtifact(cli);
     run_cli.step.dependOn(b.getInstallStep());

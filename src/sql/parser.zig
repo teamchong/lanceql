@@ -11,7 +11,9 @@ const Token = lexer.Token;
 const TokenType = lexer.TokenType;
 const Expr = ast.Expr;
 const SelectStmt = ast.SelectStmt;
-const Statement = ast.Statement;
+
+// Re-export Statement for external use
+pub const Statement = ast.Statement;
 
 /// SQL Parser
 pub const Parser = struct {
