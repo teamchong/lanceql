@@ -13721,7 +13721,7 @@ export class SQLExecutor {
      * Check if SELECT columns contain aggregate functions
      */
     _hasAggregatesInSelect(columns) {
-        const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'VARIANCE'];
+        const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'STDDEV_SAMP', 'STDDEV_POP', 'VARIANCE', 'VAR_SAMP', 'VAR_POP', 'MEDIAN', 'STRING_AGG', 'GROUP_CONCAT'];
         for (const col of columns) {
             if (col.expr?.type === 'call') {
                 // Skip window functions (those with OVER clause)
@@ -13737,7 +13737,7 @@ export class SQLExecutor {
      * Execute GROUP BY with aggregation on in-memory data
      */
     _executeGroupByAggregation(ast, data, columnData, filteredIndices) {
-        const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'VARIANCE'];
+        const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'STDDEV_SAMP', 'STDDEV_POP', 'VARIANCE', 'VAR_SAMP', 'VAR_POP', 'MEDIAN', 'STRING_AGG', 'GROUP_CONCAT'];
         const hasGroupBy = ast.groupBy && ast.groupBy.length > 0;
 
         // Group rows by GROUP BY columns
@@ -13834,6 +13834,94 @@ export class SQLExecutor {
                                 if (v != null && (max === null || v > max)) max = v;
                             }
                             result = max;
+                            break;
+                        }
+                        case 'STDDEV':
+                        case 'STDDEV_SAMP': {
+                            const vals = [];
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && typeof v === 'number' && !isNaN(v)) vals.push(v);
+                            }
+                            if (vals.length < 2) {
+                                result = null;
+                            } else {
+                                const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                                const variance = vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / (vals.length - 1);
+                                result = Math.sqrt(variance);
+                            }
+                            break;
+                        }
+                        case 'STDDEV_POP': {
+                            const vals = [];
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && typeof v === 'number' && !isNaN(v)) vals.push(v);
+                            }
+                            if (vals.length === 0) {
+                                result = null;
+                            } else {
+                                const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                                const variance = vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / vals.length;
+                                result = Math.sqrt(variance);
+                            }
+                            break;
+                        }
+                        case 'VARIANCE':
+                        case 'VAR_SAMP': {
+                            const vals = [];
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && typeof v === 'number' && !isNaN(v)) vals.push(v);
+                            }
+                            if (vals.length < 2) {
+                                result = null;
+                            } else {
+                                const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                                result = vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / (vals.length - 1);
+                            }
+                            break;
+                        }
+                        case 'VAR_POP': {
+                            const vals = [];
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && typeof v === 'number' && !isNaN(v)) vals.push(v);
+                            }
+                            if (vals.length === 0) {
+                                result = null;
+                            } else {
+                                const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                                result = vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / vals.length;
+                            }
+                            break;
+                        }
+                        case 'MEDIAN': {
+                            const vals = [];
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && typeof v === 'number' && !isNaN(v)) vals.push(v);
+                            }
+                            if (vals.length === 0) {
+                                result = null;
+                            } else {
+                                vals.sort((a, b) => a - b);
+                                const mid = Math.floor(vals.length / 2);
+                                result = vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
+                            }
+                            break;
+                        }
+                        case 'STRING_AGG':
+                        case 'GROUP_CONCAT': {
+                            // STRING_AGG(col, separator) or GROUP_CONCAT(col)
+                            const separatorArg = expr.args?.[1];
+                            const separator = separatorArg?.value ?? ',';
+                            const vals = [];
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null) vals.push(String(v));
+                            }
+                            result = vals.join(separator);
                             break;
                         }
                     }
@@ -14643,7 +14731,7 @@ export class SQLExecutor {
      * Check if the query contains aggregate functions
      */
     hasAggregates(ast) {
-        const aggFunctions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'];
+        const aggFunctions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'STDDEV_SAMP', 'STDDEV_POP', 'VARIANCE', 'VAR_SAMP', 'VAR_POP', 'MEDIAN', 'STRING_AGG', 'GROUP_CONCAT'];
         for (const col of ast.columns) {
             if (col.type === 'expr' && col.expr.type === 'call') {
                 if (aggFunctions.includes(col.expr.name.toUpperCase())) {
@@ -14658,7 +14746,7 @@ export class SQLExecutor {
      * Execute an aggregation query
      */
     async executeAggregateQuery(ast, totalRows, onProgress) {
-        const aggFunctions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'];
+        const aggFunctions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'STDDEV_SAMP', 'STDDEV_POP', 'VARIANCE', 'VAR_SAMP', 'VAR_POP', 'MEDIAN', 'STRING_AGG', 'GROUP_CONCAT'];
 
         // Initialize aggregators for each column
         const aggregators = [];
@@ -17228,7 +17316,7 @@ export class QueryPlanner {
             // Check for aggregation
             if (expr.type === 'call') {
                 const funcName = expr.name.toUpperCase();
-                const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'VARIANCE'];
+                const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'STDDEV_SAMP', 'STDDEV_POP', 'VARIANCE', 'VAR_SAMP', 'VAR_POP', 'MEDIAN', 'STRING_AGG', 'GROUP_CONCAT'];
 
                 if (aggFuncs.includes(funcName)) {
                     const agg = {

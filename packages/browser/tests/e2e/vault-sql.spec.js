@@ -5203,4 +5203,139 @@ test.describe('Vault SQL Operations', () => {
             expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
         }
     });
+
+    test('String aggregates (STRING_AGG, GROUP_CONCAT, MEDIAN)', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const tests = [];
+
+            const v = await vault();
+
+            // Create test table
+            await v.exec('CREATE TABLE test_agg (category TEXT, name TEXT, value FLOAT)');
+            await v.exec("INSERT INTO test_agg VALUES ('A', 'Alice', 10), ('A', 'Bob', 20), ('A', 'Charlie', 30), ('B', 'Dave', 5), ('B', 'Eve', 15)");
+
+            // Test STRING_AGG with separator
+            try {
+                const res = await v.exec("SELECT category, STRING_AGG(name, '; ') AS names FROM test_agg GROUP BY category ORDER BY category");
+                const aNames = res.rows.find(r => r.category === 'A')?.names;
+                const pass = aNames && aNames.includes('Alice') && aNames.includes('Bob') && aNames.includes('Charlie') && aNames.includes('; ');
+                tests.push({ name: 'STRING_AGG with separator', pass, actual: aNames });
+            } catch (e) {
+                tests.push({ name: 'STRING_AGG with separator', pass: false, error: e.message });
+            }
+
+            // Test GROUP_CONCAT (default comma)
+            try {
+                const res = await v.exec('SELECT category, GROUP_CONCAT(name) AS names FROM test_agg GROUP BY category ORDER BY category');
+                const aNames = res.rows.find(r => r.category === 'A')?.names;
+                const pass = aNames && aNames.includes(',') && aNames.includes('Alice');
+                tests.push({ name: 'GROUP_CONCAT', pass, actual: aNames });
+            } catch (e) {
+                tests.push({ name: 'GROUP_CONCAT', pass: false, error: e.message });
+            }
+
+            // Test MEDIAN with odd count
+            try {
+                const res = await v.exec('SELECT category, MEDIAN(value) AS med FROM test_agg GROUP BY category ORDER BY category');
+                const aMed = res.rows.find(r => r.category === 'A')?.med;
+                // A has 10, 20, 30 -> median = 20
+                tests.push({ name: 'MEDIAN odd count', pass: aMed === 20, actual: aMed });
+            } catch (e) {
+                tests.push({ name: 'MEDIAN odd count', pass: false, error: e.message });
+            }
+
+            // Test MEDIAN with even count
+            await v.exec("INSERT INTO test_agg VALUES ('A', 'Frank', 40)");
+            try {
+                const res = await v.exec('SELECT category, MEDIAN(value) AS med FROM test_agg WHERE category = \'A\' GROUP BY category');
+                const aMed = res.rows[0]?.med;
+                // A has 10, 20, 30, 40 -> median = (20+30)/2 = 25
+                tests.push({ name: 'MEDIAN even count', pass: aMed === 25, actual: aMed });
+            } catch (e) {
+                tests.push({ name: 'MEDIAN even count', pass: false, error: e.message });
+            }
+
+            await v.exec('DROP TABLE test_agg');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('STDDEV and VARIANCE aggregates', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const tests = [];
+
+            const v = await vault();
+
+            // Create test table with known values
+            await v.exec('CREATE TABLE test_stats (grp TEXT, value FLOAT)');
+            // Group A: values 2, 4, 6, 8, 10 -> mean=6, sample_var=10, pop_var=8
+            await v.exec("INSERT INTO test_stats VALUES ('A', 2), ('A', 4), ('A', 6), ('A', 8), ('A', 10)");
+            // Group B: values 1, 1 -> mean=1, variance=0
+            await v.exec("INSERT INTO test_stats VALUES ('B', 1), ('B', 1)");
+
+            // Test STDDEV (sample)
+            try {
+                const res = await v.exec('SELECT grp, STDDEV(value) AS sd FROM test_stats GROUP BY grp ORDER BY grp');
+                const aSd = res.rows.find(r => r.grp === 'A')?.sd;
+                // sample variance = 10, sample stddev = sqrt(10) ≈ 3.162
+                const pass = Math.abs(aSd - Math.sqrt(10)) < 0.01;
+                tests.push({ name: 'STDDEV (sample)', pass, actual: aSd?.toFixed(3) });
+            } catch (e) {
+                tests.push({ name: 'STDDEV (sample)', pass: false, error: e.message });
+            }
+
+            // Test STDDEV_POP
+            try {
+                const res = await v.exec('SELECT grp, STDDEV_POP(value) AS sd FROM test_stats GROUP BY grp ORDER BY grp');
+                const aSd = res.rows.find(r => r.grp === 'A')?.sd;
+                // population variance = 8, population stddev = sqrt(8) ≈ 2.828
+                const pass = Math.abs(aSd - Math.sqrt(8)) < 0.01;
+                tests.push({ name: 'STDDEV_POP', pass, actual: aSd?.toFixed(3) });
+            } catch (e) {
+                tests.push({ name: 'STDDEV_POP', pass: false, error: e.message });
+            }
+
+            // Test VARIANCE (sample)
+            try {
+                const res = await v.exec('SELECT grp, VARIANCE(value) AS var FROM test_stats GROUP BY grp ORDER BY grp');
+                const aVar = res.rows.find(r => r.grp === 'A')?.var;
+                // sample variance = 10
+                tests.push({ name: 'VARIANCE (sample)', pass: Math.abs(aVar - 10) < 0.01, actual: aVar });
+            } catch (e) {
+                tests.push({ name: 'VARIANCE (sample)', pass: false, error: e.message });
+            }
+
+            // Test VAR_POP
+            try {
+                const res = await v.exec('SELECT grp, VAR_POP(value) AS var FROM test_stats GROUP BY grp ORDER BY grp');
+                const aVar = res.rows.find(r => r.grp === 'A')?.var;
+                // population variance = 8
+                tests.push({ name: 'VAR_POP', pass: Math.abs(aVar - 8) < 0.01, actual: aVar });
+            } catch (e) {
+                tests.push({ name: 'VAR_POP', pass: false, error: e.message });
+            }
+
+            // Test with identical values (variance = 0)
+            try {
+                const res = await v.exec("SELECT STDDEV(value) AS sd FROM test_stats WHERE grp = 'B'");
+                const bSd = res.rows[0]?.sd;
+                tests.push({ name: 'STDDEV with identical values', pass: bSd === 0, actual: bSd });
+            } catch (e) {
+                tests.push({ name: 'STDDEV with identical values', pass: false, error: e.message });
+            }
+
+            await v.exec('DROP TABLE test_stats');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
 });
