@@ -228,11 +228,27 @@ fn cmdQuery(allocator: std.mem.Allocator, opts: args.QueryOptions) !void {
 
 /// Ingest command - convert CSV/JSON/Parquet to Lance
 fn cmdIngest(allocator: std.mem.Allocator, opts: args.IngestOptions) !void {
+    if (opts.input == null) {
+        if (std.posix.isatty(std.posix.STDIN_FILENO)) {
+            try serve.runConfigMode(allocator, "ingest");
+            return;
+        }
+        args.printIngestHelp();
+        return;
+    }
     try ingest.run(allocator, opts);
 }
 
 /// Transform command - apply transformations to data files
 fn cmdTransform(allocator: std.mem.Allocator, opts: args.TransformOptions) !void {
+    if (opts.input == null) {
+        if (std.posix.isatty(std.posix.STDIN_FILENO)) {
+            try serve.runConfigMode(allocator, "transform");
+            return;
+        }
+        args.printTransformHelp();
+        return;
+    }
     transform.run(allocator, opts) catch |err| {
         std.debug.print("Transform command failed: {}\n", .{err});
         return err;
@@ -241,6 +257,14 @@ fn cmdTransform(allocator: std.mem.Allocator, opts: args.TransformOptions) !void
 
 /// Enrich command - add embeddings and indexes
 fn cmdEnrich(allocator: std.mem.Allocator, opts: args.EnrichOptions) !void {
+    if (opts.input == null) {
+        if (std.posix.isatty(std.posix.STDIN_FILENO)) {
+            try serve.runConfigMode(allocator, "enrich");
+            return;
+        }
+        args.printEnrichHelp();
+        return;
+    }
     enrich.run(allocator, opts) catch |err| {
         std.debug.print("Enrich command failed: {}\n", .{err});
         return err;

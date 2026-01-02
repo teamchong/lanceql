@@ -33,6 +33,7 @@ pub const ServeError = error{
 
 /// Embedded HTML UI
 const INDEX_HTML = @embedFile("serve_ui.html");
+const CONFIG_HTML = @embedFile("config_ui.html");
 
 /// File types for detection
 const FileType = enum {
@@ -46,6 +47,7 @@ const FileType = enum {
 const ServeMode = enum {
     single_file,
     folder,
+    config,
 };
 
 /// Server state
@@ -135,6 +137,9 @@ pub const Server = struct {
                 if (self.data_path) |path| {
                     std.debug.print("Serving: {s}\n", .{path});
                 }
+            },
+            .config => {
+                std.debug.print("Mode: config builder\n", .{});
             },
         }
         std.debug.print("Press Ctrl+C to stop\n\n", .{});
@@ -336,6 +341,9 @@ pub const Server = struct {
     }
 
     fn handleIndex(self: *Self) !http.Response {
+        if (self.mode == .config) {
+            return http.htmlResponse(self.allocator, CONFIG_HTML);
+        }
         return http.htmlResponse(self.allocator, INDEX_HTML);
     }
 
@@ -690,12 +698,42 @@ pub fn run(allocator: std.mem.Allocator, opts: args.ServeOptions) !void {
     var server = try Server.init(allocator, opts);
     defer server.deinit();
 
-    // Open browser if requested
     if (opts.open) {
         const url = try std.fmt.allocPrint(allocator, "http://{s}:{}", .{ opts.host, opts.port });
         defer allocator.free(url);
         openBrowser(allocator, url);
     }
+
+    try server.run();
+}
+
+/// Run config builder mode - opens browser with config UI
+pub fn runConfigMode(allocator: std.mem.Allocator, command: []const u8) !void {
+    const address = std.net.Address.parseIp4("127.0.0.1", 0) catch return;
+    const listener = std.net.Address.listen(address, .{ .reuse_address = true }) catch return;
+
+    const port = listener.listen_address.getPort();
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{}", .{port});
+    defer allocator.free(url);
+
+    std.debug.print("\nLanceQL Config Builder\n", .{});
+    std.debug.print("Command: {s}\n", .{command});
+    std.debug.print("Opening: {s}\n", .{url});
+    std.debug.print("Press Ctrl+C to cancel\n\n", .{});
+
+    openBrowser(allocator, url);
+
+    var server = Server{
+        .allocator = allocator,
+        .listener = listener,
+        .data_path = null,
+        .file_data = null,
+        .host = "127.0.0.1",
+        .port = port,
+        .mode = .config,
+        .folder_path = null,
+    };
+    defer server.deinit();
 
     try server.run();
 }
