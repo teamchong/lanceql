@@ -258,3 +258,44 @@ pub fn parseAggregateType(name: []const u8) ?AggregateType {
 
     return null;
 }
+
+/// Parse aggregate function name to AggregateType with args (distinguishes COUNT(*) from COUNT(col))
+pub fn parseAggregateTypeWithArgs(name: []const u8, args: []const Expr) AggregateType {
+    var upper_buf: [16]u8 = undefined;
+    const len = @min(name.len, upper_buf.len);
+    const upper_name = std.ascii.upperString(upper_buf[0..len], name[0..len]);
+
+    if (std.mem.eql(u8, upper_name, "COUNT")) {
+        // COUNT(*) vs COUNT(col)
+        if (args.len == 1 and args[0] == .column and
+            std.mem.eql(u8, args[0].column.name, "*"))
+        {
+            return .count_star;
+        }
+        return .count;
+    } else if (std.mem.eql(u8, upper_name, "SUM")) {
+        return .sum;
+    } else if (std.mem.eql(u8, upper_name, "AVG")) {
+        return .avg;
+    } else if (std.mem.eql(u8, upper_name, "MIN")) {
+        return .min;
+    } else if (std.mem.eql(u8, upper_name, "MAX")) {
+        return .max;
+    } else if (std.mem.eql(u8, upper_name, "STDDEV") or std.mem.eql(u8, upper_name, "STDDEV_SAMP")) {
+        return .stddev;
+    } else if (std.mem.eql(u8, upper_name, "STDDEV_POP")) {
+        return .stddev_pop;
+    } else if (std.mem.eql(u8, upper_name, "VARIANCE") or std.mem.eql(u8, upper_name, "VAR_SAMP")) {
+        return .variance;
+    } else if (std.mem.eql(u8, upper_name, "VAR_POP")) {
+        return .var_pop;
+    } else if (std.mem.eql(u8, upper_name, "MEDIAN")) {
+        return .median;
+    } else if (std.mem.eql(u8, upper_name, "PERCENTILE") or
+        std.mem.eql(u8, upper_name, "PERCENTILE_CONT") or
+        std.mem.eql(u8, upper_name, "QUANTILE"))
+    {
+        return .percentile;
+    }
+    return .count; // Default fallback
+}
