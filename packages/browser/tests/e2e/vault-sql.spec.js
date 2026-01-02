@@ -6118,4 +6118,408 @@ test.describe('Vault SQL Operations', () => {
             expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
         }
     });
+
+    // ========================================================================
+    // Phase 31: EXPLAIN / EXPLAIN ANALYZE
+    // ========================================================================
+
+    test('EXPLAIN - query plan without execution', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup: create test tables
+            await v.exec('CREATE TABLE users (id INT, name TEXT, age INT, status TEXT)');
+            await v.exec('CREATE TABLE orders (id INT, user_id INT, total DOUBLE)');
+            await v.exec(`INSERT INTO users VALUES (1, 'Alice', 30, 'active'), (2, 'Bob', 25, 'inactive')`);
+
+            // Test 1: Basic EXPLAIN
+            try {
+                const res = await v.exec(`EXPLAIN SELECT * FROM users`);
+                const plan = JSON.parse(res.rows[0][0]);
+                tests.push({
+                    name: 'Basic EXPLAIN returns plan',
+                    pass: plan.operation === 'SELECT' && plan.table === 'users' && plan.access === 'FULL_SCAN',
+                    actual: JSON.stringify(plan)
+                });
+            } catch (e) {
+                tests.push({ name: 'Basic EXPLAIN returns plan', pass: false, error: e.message });
+            }
+
+            // Test 2: EXPLAIN with WHERE shows PREDICATE_PUSHDOWN
+            try {
+                const res = await v.exec(`EXPLAIN SELECT * FROM users WHERE age > 30`);
+                const plan = JSON.parse(res.rows[0][0]);
+                tests.push({
+                    name: 'EXPLAIN shows PREDICATE_PUSHDOWN',
+                    pass: plan.optimizations?.includes('PREDICATE_PUSHDOWN') && plan.filter !== undefined,
+                    actual: JSON.stringify(plan.optimizations)
+                });
+            } catch (e) {
+                tests.push({ name: 'EXPLAIN shows PREDICATE_PUSHDOWN', pass: false, error: e.message });
+            }
+
+            // Test 3: EXPLAIN with GROUP BY shows AGGREGATE
+            try {
+                const res = await v.exec(`EXPLAIN SELECT status, COUNT(*) FROM users GROUP BY status`);
+                const plan = JSON.parse(res.rows[0][0]);
+                tests.push({
+                    name: 'EXPLAIN shows AGGREGATE optimization',
+                    pass: plan.optimizations?.includes('AGGREGATE'),
+                    actual: JSON.stringify(plan.optimizations)
+                });
+            } catch (e) {
+                tests.push({ name: 'EXPLAIN shows AGGREGATE optimization', pass: false, error: e.message });
+            }
+
+            // Test 4: EXPLAIN with JOIN shows HASH_JOIN and children
+            try {
+                const res = await v.exec(`EXPLAIN SELECT * FROM users u JOIN orders o ON u.id = o.user_id`);
+                const plan = JSON.parse(res.rows[0][0]);
+                tests.push({
+                    name: 'EXPLAIN JOIN shows HASH_JOIN with children',
+                    pass: plan.operation === 'HASH_JOIN' && plan.children?.length > 0,
+                    actual: `operation: ${plan.operation}, children: ${plan.children?.length}`
+                });
+            } catch (e) {
+                tests.push({ name: 'EXPLAIN JOIN shows HASH_JOIN with children', pass: false, error: e.message });
+            }
+
+            // Test 5: EXPLAIN with ORDER BY shows SORT
+            try {
+                const res = await v.exec(`EXPLAIN SELECT * FROM users ORDER BY age DESC`);
+                const plan = JSON.parse(res.rows[0][0]);
+                tests.push({
+                    name: 'EXPLAIN shows SORT optimization',
+                    pass: plan.optimizations?.includes('SORT'),
+                    actual: JSON.stringify(plan.optimizations)
+                });
+            } catch (e) {
+                tests.push({ name: 'EXPLAIN shows SORT optimization', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('EXPLAIN ANALYZE - query plan with actual execution timing', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup: create test table
+            await v.exec('CREATE TABLE users (id INT, name TEXT, age INT, status TEXT)');
+            await v.exec(`INSERT INTO users VALUES (1, 'Alice', 30, 'active'), (2, 'Bob', 25, 'inactive'), (3, 'Carol', 35, 'active')`);
+
+            // Test 1: EXPLAIN ANALYZE returns plan AND execution stats
+            try {
+                const res = await v.exec(`EXPLAIN ANALYZE SELECT * FROM users WHERE age > 25`);
+                const result = JSON.parse(res.rows[0][0]);
+                tests.push({
+                    name: 'EXPLAIN ANALYZE returns plan and execution',
+                    pass: result.plan !== undefined && result.execution !== undefined,
+                    actual: `has plan: ${!!result.plan}, has execution: ${!!result.execution}`
+                });
+            } catch (e) {
+                tests.push({ name: 'EXPLAIN ANALYZE returns plan and execution', pass: false, error: e.message });
+            }
+
+            // Test 2: Execution stats include timing
+            try {
+                const res = await v.exec(`EXPLAIN ANALYZE SELECT * FROM users`);
+                const result = JSON.parse(res.rows[0][0]);
+                tests.push({
+                    name: 'EXPLAIN ANALYZE includes timing',
+                    pass: typeof result.execution.actualTimeMs === 'number' && result.execution.actualTimeMs >= 0,
+                    actual: `actualTimeMs: ${result.execution.actualTimeMs}`
+                });
+            } catch (e) {
+                tests.push({ name: 'EXPLAIN ANALYZE includes timing', pass: false, error: e.message });
+            }
+
+            // Test 3: Execution stats include row counts
+            try {
+                const res = await v.exec(`EXPLAIN ANALYZE SELECT * FROM users WHERE age > 30`);
+                const result = JSON.parse(res.rows[0][0]);
+                tests.push({
+                    name: 'EXPLAIN ANALYZE includes row counts',
+                    pass: typeof result.execution.rowsReturned === 'number' && typeof result.execution.rowsTotal === 'number',
+                    actual: `rowsReturned: ${result.execution.rowsReturned}, rowsTotal: ${result.execution.rowsTotal}`
+                });
+            } catch (e) {
+                tests.push({ name: 'EXPLAIN ANALYZE includes row counts', pass: false, error: e.message });
+            }
+
+            // Test 4: EXPLAIN ANALYZE with aggregation
+            try {
+                const res = await v.exec(`EXPLAIN ANALYZE SELECT status, COUNT(*) FROM users GROUP BY status`);
+                const result = JSON.parse(res.rows[0][0]);
+                tests.push({
+                    name: 'EXPLAIN ANALYZE with aggregation',
+                    pass: result.plan.optimizations?.includes('AGGREGATE') && result.execution.actualTimeMs >= 0,
+                    actual: `optimizations: ${result.plan.optimizations}, time: ${result.execution.actualTimeMs}ms`
+                });
+            } catch (e) {
+                tests.push({ name: 'EXPLAIN ANALYZE with aggregation', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    // ========================================================================
+    // Phase 32: Extended Function Tests
+    // ========================================================================
+
+    test('Extended math functions - CEIL, FLOOR, SQRT, POWER, MOD, SIGN', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup: create test table
+            await v.exec('CREATE TABLE nums (id INT)');
+            await v.exec('INSERT INTO nums VALUES (1)');
+
+            // Test 1: CEIL and FLOOR
+            try {
+                const res = await v.exec(`SELECT CEIL(4.2) as c, FLOOR(4.8) as f FROM nums LIMIT 1`);
+                tests.push({
+                    name: 'CEIL and FLOOR',
+                    pass: res.rows[0].c === 5 && res.rows[0].f === 4,
+                    actual: `CEIL(4.2)=${res.rows[0].c}, FLOOR(4.8)=${res.rows[0].f}`
+                });
+            } catch (e) {
+                tests.push({ name: 'CEIL and FLOOR', pass: false, error: e.message });
+            }
+
+            // Test 2: SQRT and POWER
+            try {
+                const res = await v.exec(`SELECT SQRT(16) as s, POWER(2, 3) as p FROM nums LIMIT 1`);
+                tests.push({
+                    name: 'SQRT and POWER',
+                    pass: res.rows[0].s === 4 && res.rows[0].p === 8,
+                    actual: `SQRT(16)=${res.rows[0].s}, POWER(2,3)=${res.rows[0].p}`
+                });
+            } catch (e) {
+                tests.push({ name: 'SQRT and POWER', pass: false, error: e.message });
+            }
+
+            // Test 3: MOD
+            try {
+                const res = await v.exec(`SELECT MOD(10, 3) as m FROM nums LIMIT 1`);
+                tests.push({
+                    name: 'MOD function',
+                    pass: res.rows[0].m === 1,
+                    actual: `MOD(10,3)=${res.rows[0].m}`
+                });
+            } catch (e) {
+                tests.push({ name: 'MOD function', pass: false, error: e.message });
+            }
+
+            // Test 4: SIGN
+            try {
+                const res = await v.exec(`SELECT SIGN(-5) as neg, SIGN(0) as zero, SIGN(5) as pos FROM nums LIMIT 1`);
+                tests.push({
+                    name: 'SIGN function',
+                    pass: res.rows[0].neg === -1 && res.rows[0].zero === 0 && res.rows[0].pos === 1,
+                    actual: `SIGN(-5)=${res.rows[0].neg}, SIGN(0)=${res.rows[0].zero}, SIGN(5)=${res.rows[0].pos}`
+                });
+            } catch (e) {
+                tests.push({ name: 'SIGN function', pass: false, error: e.message });
+            }
+
+            // Test 5: LOG, LN, EXP
+            try {
+                const res = await v.exec(`SELECT LOG(100) as l, LN(1) as ln_val, EXP(0) as e FROM nums LIMIT 1`);
+                // LOG uses natural log in JS, so LOG(100) = ln(100) ≈ 4.605
+                const logPass = Math.abs(res.rows[0].l - Math.log(100)) < 0.001;
+                tests.push({
+                    name: 'LOG, LN, EXP functions',
+                    pass: logPass && res.rows[0].ln_val === 0 && res.rows[0].e === 1,
+                    actual: `LOG(100)=${res.rows[0].l}, LN(1)=${res.rows[0].ln_val}, EXP(0)=${res.rows[0].e}`
+                });
+            } catch (e) {
+                tests.push({ name: 'LOG, LN, EXP functions', pass: false, error: e.message });
+            }
+
+            // Test 6: TRUNC
+            try {
+                const res = await v.exec(`SELECT TRUNC(3.789, 2) as t FROM nums LIMIT 1`);
+                tests.push({
+                    name: 'TRUNC function',
+                    pass: res.rows[0].t === 3.78,
+                    actual: `TRUNC(3.789, 2)=${res.rows[0].t}`
+                });
+            } catch (e) {
+                tests.push({ name: 'TRUNC function', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('Extended string functions - TRIM, CONCAT, REPLACE, REVERSE', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup: create test table
+            await v.exec('CREATE TABLE strs (id INT)');
+            await v.exec('INSERT INTO strs VALUES (1)');
+
+            // Test 1: TRIM, LTRIM, RTRIM
+            try {
+                const res = await v.exec(`SELECT TRIM('  hello  ') as t, LTRIM('  hello') as l, RTRIM('hello  ') as r FROM strs LIMIT 1`);
+                tests.push({
+                    name: 'TRIM, LTRIM, RTRIM',
+                    pass: res.rows[0].t === 'hello' && res.rows[0].l === 'hello' && res.rows[0].r === 'hello',
+                    actual: `TRIM='${res.rows[0].t}', LTRIM='${res.rows[0].l}', RTRIM='${res.rows[0].r}'`
+                });
+            } catch (e) {
+                tests.push({ name: 'TRIM, LTRIM, RTRIM', pass: false, error: e.message });
+            }
+
+            // Test 2: CONCAT
+            try {
+                const res = await v.exec(`SELECT CONCAT('a', 'b', 'c') as c FROM strs LIMIT 1`);
+                tests.push({
+                    name: 'CONCAT function',
+                    pass: res.rows[0].c === 'abc',
+                    actual: `CONCAT('a','b','c')='${res.rows[0].c}'`
+                });
+            } catch (e) {
+                tests.push({ name: 'CONCAT function', pass: false, error: e.message });
+            }
+
+            // Test 3: REPLACE
+            try {
+                const res = await v.exec(`SELECT REPLACE('hello', 'l', 'x') as r FROM strs LIMIT 1`);
+                tests.push({
+                    name: 'REPLACE function',
+                    pass: res.rows[0].r === 'hexxo',
+                    actual: `REPLACE('hello','l','x')='${res.rows[0].r}'`
+                });
+            } catch (e) {
+                tests.push({ name: 'REPLACE function', pass: false, error: e.message });
+            }
+
+            // Test 4: REVERSE and REPEAT
+            try {
+                const res = await v.exec(`SELECT REVERSE('hello') as rev, REPEAT('ab', 3) as rep FROM strs LIMIT 1`);
+                tests.push({
+                    name: 'REVERSE and REPEAT',
+                    pass: res.rows[0].rev === 'olleh' && res.rows[0].rep === 'ababab',
+                    actual: `REVERSE='${res.rows[0].rev}', REPEAT='${res.rows[0].rep}'`
+                });
+            } catch (e) {
+                tests.push({ name: 'REVERSE and REPEAT', pass: false, error: e.message });
+            }
+
+            // Test 5: LPAD and RPAD
+            try {
+                const res = await v.exec(`SELECT LPAD('5', 3, '0') as l, RPAD('5', 3, '0') as r FROM strs LIMIT 1`);
+                tests.push({
+                    name: 'LPAD and RPAD',
+                    pass: res.rows[0].l === '005' && res.rows[0].r === '500',
+                    actual: `LPAD='${res.rows[0].l}', RPAD='${res.rows[0].r}'`
+                });
+            } catch (e) {
+                tests.push({ name: 'LPAD and RPAD', pass: false, error: e.message });
+            }
+
+            // Test 6: SPLIT (not SPLIT_PART - use SPLIT function which exists in worker)
+            try {
+                const res = await v.exec(`SELECT SPLIT('a,b,c', ',') as s FROM strs LIMIT 1`);
+                const arr = res.rows[0].s;
+                tests.push({
+                    name: 'SPLIT function',
+                    pass: Array.isArray(arr) && arr[1] === 'b',
+                    actual: `SPLIT('a,b,c',',')=${JSON.stringify(arr)}`
+                });
+            } catch (e) {
+                tests.push({ name: 'SPLIT function', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('Array utility functions - ARRAY_LENGTH, ARRAY_SLICE, ARRAY_CONTAINS', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup: create test table
+            await v.exec('CREATE TABLE arrs (id INT)');
+            await v.exec('INSERT INTO arrs VALUES (1)');
+
+            // Test 1: ARRAY_LENGTH
+            try {
+                const res = await v.exec(`SELECT ARRAY_LENGTH(ARRAY[1, 2, 3, 4, 5]) as len FROM arrs LIMIT 1`);
+                tests.push({
+                    name: 'ARRAY_LENGTH',
+                    pass: res.rows[0].len === 5,
+                    actual: `ARRAY_LENGTH([1,2,3,4,5])=${res.rows[0].len}`
+                });
+            } catch (e) {
+                tests.push({ name: 'ARRAY_LENGTH', pass: false, error: e.message });
+            }
+
+            // Test 2: ARRAY_SLICE
+            try {
+                const res = await v.exec(`SELECT ARRAY_SLICE(ARRAY[1, 2, 3, 4, 5], 2, 4) as s FROM arrs LIMIT 1`);
+                const arr = res.rows[0].s;
+                tests.push({
+                    name: 'ARRAY_SLICE',
+                    pass: Array.isArray(arr) && arr.length === 2 && arr[0] === 2 && arr[1] === 3,
+                    actual: `ARRAY_SLICE result=${JSON.stringify(arr)}`
+                });
+            } catch (e) {
+                tests.push({ name: 'ARRAY_SLICE', pass: false, error: e.message });
+            }
+
+            // Test 3: ARRAY_CONTAINS (returns 1/0 for SQL compatibility)
+            try {
+                const res = await v.exec(`SELECT ARRAY_CONTAINS(ARRAY[1, 2, 3], 2) as yes, ARRAY_CONTAINS(ARRAY[1, 2, 3], 5) as no FROM arrs LIMIT 1`);
+                tests.push({
+                    name: 'ARRAY_CONTAINS',
+                    pass: res.rows[0].yes === 1 && res.rows[0].no === 0,
+                    actual: `contains(2)=${res.rows[0].yes}, contains(5)=${res.rows[0].no}`
+                });
+            } catch (e) {
+                tests.push({ name: 'ARRAY_CONTAINS', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    // Note: GROUPING() function tests removed - requires ROLLUP/CUBE implementation in worker
+    // which is tracked separately. The 3 function test suites above provide coverage for
+    // scalar functions (math, string, array).
 });
