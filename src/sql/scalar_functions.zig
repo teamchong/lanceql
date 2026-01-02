@@ -550,3 +550,141 @@ pub fn moduloValues(left: Value, right: Value) Value {
         else => Value{ .null = {} },
     };
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "scalar: parseDatePart" {
+    try std.testing.expectEqual(DatePart.year, parseDatePart(Value{ .string = "YEAR" }).?);
+    try std.testing.expectEqual(DatePart.month, parseDatePart(Value{ .string = "MONTH" }).?);
+    try std.testing.expectEqual(DatePart.day, parseDatePart(Value{ .string = "DAY" }).?);
+    try std.testing.expectEqual(DatePart.hour, parseDatePart(Value{ .string = "HOUR" }).?);
+    try std.testing.expectEqual(DatePart.minute, parseDatePart(Value{ .string = "MINUTE" }).?);
+    try std.testing.expectEqual(DatePart.second, parseDatePart(Value{ .string = "SECOND" }).?);
+    try std.testing.expectEqual(@as(?DatePart, null), parseDatePart(Value{ .string = "INVALID" }));
+    try std.testing.expectEqual(@as(?DatePart, null), parseDatePart(Value{ .integer = 42 }));
+}
+
+test "scalar: daysToDate and dateToDays roundtrip" {
+    // Known date: 2024-01-15 = 19737 days since epoch (1970-01-01)
+    const days: i64 = 19737;
+    const date = daysToDate(days);
+    try std.testing.expectEqual(@as(i64, 2024), date.year);
+    try std.testing.expectEqual(@as(i64, 1), date.month);
+    try std.testing.expectEqual(@as(i64, 15), date.day);
+
+    // Roundtrip
+    const back = dateToDays(date.year, date.month, date.day);
+    try std.testing.expectEqual(days, back);
+
+    // Test epoch (1970-01-01)
+    const epoch = daysToDate(0);
+    try std.testing.expectEqual(@as(i64, 1970), epoch.year);
+    try std.testing.expectEqual(@as(i64, 1), epoch.month);
+    try std.testing.expectEqual(@as(i64, 1), epoch.day);
+}
+
+test "scalar: funcUpper" {
+    const allocator = std.testing.allocator;
+    const result = funcUpper(allocator, Value{ .string = "hello" });
+    defer if (result == .string) allocator.free(result.string);
+    try std.testing.expectEqualStrings("HELLO", result.string);
+
+    // Test null handling
+    try std.testing.expect(funcUpper(allocator, Value{ .null = {} }) == .null);
+    try std.testing.expect(funcUpper(allocator, Value{ .integer = 42 }) == .null);
+}
+
+test "scalar: funcLower" {
+    const allocator = std.testing.allocator;
+    const result = funcLower(allocator, Value{ .string = "HELLO" });
+    defer if (result == .string) allocator.free(result.string);
+    try std.testing.expectEqualStrings("hello", result.string);
+
+    // Test mixed case
+    const mixed = funcLower(allocator, Value{ .string = "HeLLo WoRLd" });
+    defer if (mixed == .string) allocator.free(mixed.string);
+    try std.testing.expectEqualStrings("hello world", mixed.string);
+}
+
+test "scalar: funcLength" {
+    try std.testing.expectEqual(@as(i64, 5), funcLength(Value{ .string = "hello" }).integer);
+    try std.testing.expectEqual(@as(i64, 0), funcLength(Value{ .string = "" }).integer);
+    try std.testing.expectEqual(@as(i64, 11), funcLength(Value{ .string = "hello world" }).integer);
+    try std.testing.expect(funcLength(Value{ .integer = 42 }) == .null);
+    try std.testing.expect(funcLength(Value{ .null = {} }) == .null);
+}
+
+test "scalar: funcTrim" {
+    const allocator = std.testing.allocator;
+
+    const result1 = funcTrim(allocator, Value{ .string = "  hello  " });
+    defer if (result1 == .string) allocator.free(result1.string);
+    try std.testing.expectEqualStrings("hello", result1.string);
+
+    const result2 = funcTrim(allocator, Value{ .string = "\t\nhello\r\n" });
+    defer if (result2 == .string) allocator.free(result2.string);
+    try std.testing.expectEqualStrings("hello", result2.string);
+
+    try std.testing.expect(funcTrim(allocator, Value{ .null = {} }) == .null);
+}
+
+test "scalar: funcAbs" {
+    try std.testing.expectEqual(@as(i64, 5), funcAbs(Value{ .integer = -5 }).integer);
+    try std.testing.expectEqual(@as(i64, 5), funcAbs(Value{ .integer = 5 }).integer);
+    try std.testing.expectEqual(@as(i64, 0), funcAbs(Value{ .integer = 0 }).integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.14), funcAbs(Value{ .float = -3.14 }).float, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.14), funcAbs(Value{ .float = 3.14 }).float, 0.001);
+    try std.testing.expect(funcAbs(Value{ .null = {} }) == .null);
+}
+
+test "scalar: funcRound" {
+    try std.testing.expectApproxEqAbs(@as(f64, 3.14), funcRound(Value{ .float = 3.14159 }, 2).float, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), funcRound(Value{ .float = 3.14159 }, 0).float, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.1), funcRound(Value{ .float = 3.14159 }, 1).float, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 5.0), funcRound(Value{ .integer = 5 }, 2).float, 0.001);
+    try std.testing.expect(funcRound(Value{ .null = {} }, 2) == .null);
+}
+
+test "scalar: funcFloor and funcCeil" {
+    // Floor tests
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), funcFloor(Value{ .float = 3.7 }).float, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), funcFloor(Value{ .float = 3.2 }).float, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, -4.0), funcFloor(Value{ .float = -3.2 }).float, 0.001);
+    try std.testing.expectEqual(@as(i64, 5), funcFloor(Value{ .integer = 5 }).integer);
+
+    // Ceil tests
+    try std.testing.expectApproxEqAbs(@as(f64, 4.0), funcCeil(Value{ .float = 3.2 }).float, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.0), funcCeil(Value{ .float = 3.7 }).float, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, -3.0), funcCeil(Value{ .float = -3.2 }).float, 0.001);
+    try std.testing.expectEqual(@as(i64, 5), funcCeil(Value{ .integer = 5 }).integer);
+}
+
+test "scalar: arithmetic operations" {
+    // Addition
+    try std.testing.expectEqual(@as(i64, 5), addValues(Value{ .integer = 2 }, Value{ .integer = 3 }).integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 5.5), addValues(Value{ .float = 2.5 }, Value{ .float = 3.0 }).float, 0.001);
+
+    // Subtraction
+    try std.testing.expectEqual(@as(i64, 2), subtractValues(Value{ .integer = 5 }, Value{ .integer = 3 }).integer);
+
+    // Multiplication
+    try std.testing.expectEqual(@as(i64, 6), multiplyValues(Value{ .integer = 2 }, Value{ .integer = 3 }).integer);
+
+    // Division
+    try std.testing.expectApproxEqAbs(@as(f64, 2.5), divideValues(Value{ .integer = 5 }, Value{ .integer = 2 }).float, 0.001);
+    try std.testing.expect(divideValues(Value{ .integer = 5 }, Value{ .integer = 0 }) == .null);
+
+    // Modulo
+    try std.testing.expectEqual(@as(i64, 1), moduloValues(Value{ .integer = 5 }, Value{ .integer = 2 }).integer);
+}
+
+test "scalar: null handling" {
+    try std.testing.expect(funcLength(Value{ .null = {} }) == .null);
+    try std.testing.expect(funcAbs(Value{ .null = {} }) == .null);
+    try std.testing.expect(funcFloor(Value{ .null = {} }) == .null);
+    try std.testing.expect(funcCeil(Value{ .null = {} }) == .null);
+    try std.testing.expect(addValues(Value{ .null = {} }, Value{ .integer = 5 }) == .null);
+    try std.testing.expect(addValues(Value{ .integer = 5 }, Value{ .null = {} }) == .null);
+}

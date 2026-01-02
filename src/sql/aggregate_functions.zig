@@ -338,3 +338,158 @@ pub fn exprEquals(a: *const Expr, b: *const Expr) bool {
         else => false,
     };
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "aggregate: Accumulator SUM" {
+    var acc = Accumulator.init(.sum);
+    acc.addInt(1);
+    acc.addInt(2);
+    acc.addInt(3);
+    try std.testing.expectEqual(@as(f64, 6.0), acc.getResult());
+
+    // Test with floats
+    var acc_f = Accumulator.init(.sum);
+    acc_f.addFloat(1.5);
+    acc_f.addFloat(2.5);
+    acc_f.addFloat(3.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 7.0), acc_f.getResult(), 0.001);
+}
+
+test "aggregate: Accumulator AVG" {
+    var acc = Accumulator.init(.avg);
+    acc.addFloat(1.0);
+    acc.addFloat(2.0);
+    acc.addFloat(3.0);
+    try std.testing.expectEqual(@as(f64, 2.0), acc.getResult());
+
+    // Empty accumulator
+    var empty = Accumulator.init(.avg);
+    try std.testing.expectEqual(@as(f64, 0.0), empty.getResult());
+}
+
+test "aggregate: Accumulator MIN/MAX" {
+    var acc_min = Accumulator.init(.min);
+    var acc_max = Accumulator.init(.max);
+
+    acc_min.addInt(5);
+    acc_min.addInt(2);
+    acc_min.addInt(8);
+    acc_min.addInt(1);
+
+    acc_max.addInt(5);
+    acc_max.addInt(2);
+    acc_max.addInt(8);
+    acc_max.addInt(1);
+
+    try std.testing.expectEqual(@as(i64, 1), acc_min.getIntResult());
+    try std.testing.expectEqual(@as(i64, 8), acc_max.getIntResult());
+
+    // Test with floats
+    var acc_min_f = Accumulator.init(.min);
+    acc_min_f.addFloat(5.5);
+    acc_min_f.addFloat(2.2);
+    acc_min_f.addFloat(8.8);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.2), acc_min_f.getResult(), 0.001);
+}
+
+test "aggregate: Accumulator COUNT" {
+    var acc = Accumulator.init(.count);
+    acc.addCount();
+    acc.addCount();
+    acc.addCount();
+    try std.testing.expectEqual(@as(i64, 3), acc.count);
+    try std.testing.expectEqual(@as(f64, 3.0), acc.getResult());
+
+    var acc_star = Accumulator.init(.count_star);
+    acc_star.addCount();
+    acc_star.addCount();
+    try std.testing.expectEqual(@as(i64, 2), acc_star.count);
+}
+
+test "aggregate: Accumulator STDDEV and VARIANCE" {
+    // Values: 2, 4, 4, 4, 5, 5, 7, 9
+    // Mean = 5, Sample variance = 4.571, Sample stddev = 2.138
+    var acc_var = Accumulator.init(.variance);
+    var acc_std = Accumulator.init(.stddev);
+
+    const values = [_]f64{ 2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0 };
+    for (values) |v| {
+        acc_var.addFloat(v);
+        acc_std.addFloat(v);
+    }
+
+    try std.testing.expectApproxEqAbs(@as(f64, 4.571), acc_var.getResult(), 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.138), acc_std.getResult(), 0.01);
+
+    // Population variance/stddev
+    var acc_var_pop = Accumulator.init(.var_pop);
+    var acc_std_pop = Accumulator.init(.stddev_pop);
+    for (values) |v| {
+        acc_var_pop.addFloat(v);
+        acc_std_pop.addFloat(v);
+    }
+    try std.testing.expectApproxEqAbs(@as(f64, 4.0), acc_var_pop.getResult(), 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), acc_std_pop.getResult(), 0.01);
+}
+
+test "aggregate: PercentileAccumulator median" {
+    const allocator = std.testing.allocator;
+
+    // Odd number of values - median is middle value
+    var acc = PercentileAccumulator.init(allocator, 0.5);
+    defer acc.deinit();
+    try acc.addFloat(1.0);
+    try acc.addFloat(5.0);
+    try acc.addFloat(3.0);
+    try std.testing.expectEqual(@as(f64, 3.0), acc.getResult());
+
+    // Even number of values - median is average of two middle values
+    var acc2 = PercentileAccumulator.init(allocator, 0.5);
+    defer acc2.deinit();
+    try acc2.addFloat(1.0);
+    try acc2.addFloat(2.0);
+    try acc2.addFloat(3.0);
+    try acc2.addFloat(4.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.5), acc2.getResult(), 0.001);
+}
+
+test "aggregate: isAggregateFunction" {
+    // Positive cases
+    try std.testing.expect(isAggregateFunction("COUNT"));
+    try std.testing.expect(isAggregateFunction("count"));
+    try std.testing.expect(isAggregateFunction("SUM"));
+    try std.testing.expect(isAggregateFunction("sum"));
+    try std.testing.expect(isAggregateFunction("AVG"));
+    try std.testing.expect(isAggregateFunction("MIN"));
+    try std.testing.expect(isAggregateFunction("MAX"));
+    try std.testing.expect(isAggregateFunction("STDDEV"));
+    try std.testing.expect(isAggregateFunction("VARIANCE"));
+    try std.testing.expect(isAggregateFunction("MEDIAN"));
+
+    // Negative cases
+    try std.testing.expect(!isAggregateFunction("UPPER"));
+    try std.testing.expect(!isAggregateFunction("LOWER"));
+    try std.testing.expect(!isAggregateFunction("LENGTH"));
+    try std.testing.expect(!isAggregateFunction("TRIM"));
+    try std.testing.expect(!isAggregateFunction("AB")); // Too short
+}
+
+test "aggregate: parseAggregateType" {
+    try std.testing.expectEqual(AggregateType.count, parseAggregateType("COUNT").?);
+    try std.testing.expectEqual(AggregateType.sum, parseAggregateType("SUM").?);
+    try std.testing.expectEqual(AggregateType.sum, parseAggregateType("sum").?);
+    try std.testing.expectEqual(AggregateType.avg, parseAggregateType("AVG").?);
+    try std.testing.expectEqual(AggregateType.min, parseAggregateType("MIN").?);
+    try std.testing.expectEqual(AggregateType.max, parseAggregateType("MAX").?);
+    try std.testing.expectEqual(AggregateType.stddev, parseAggregateType("STDDEV").?);
+    try std.testing.expectEqual(AggregateType.stddev, parseAggregateType("STDDEV_SAMP").?);
+    try std.testing.expectEqual(AggregateType.stddev_pop, parseAggregateType("STDDEV_POP").?);
+    try std.testing.expectEqual(AggregateType.variance, parseAggregateType("VARIANCE").?);
+    try std.testing.expectEqual(AggregateType.median, parseAggregateType("MEDIAN").?);
+    try std.testing.expectEqual(AggregateType.percentile, parseAggregateType("PERCENTILE").?);
+    try std.testing.expectEqual(@as(?AggregateType, null), parseAggregateType("UPPER"));
+    try std.testing.expectEqual(@as(?AggregateType, null), parseAggregateType("INVALID"));
+}
