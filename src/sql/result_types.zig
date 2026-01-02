@@ -1,10 +1,53 @@
 //! Result Types - Data structures for SQL query results
 //!
 //! Contains Result, CachedColumn, JoinedData types used by the SQL executor.
+//! Also includes LanceColumnType for unified type detection across Lance tables.
 
 const std = @import("std");
 const Table = @import("lanceql.table").Table;
 pub const logic_table_dispatch = @import("logic_table_dispatch.zig");
+
+/// Lance column types - unified type detection for Lance table logical types
+pub const LanceColumnType = enum {
+    timestamp_ns,
+    timestamp_us,
+    timestamp_ms,
+    timestamp_s,
+    date32,
+    date64,
+    int32,
+    float32,
+    bool_,
+    int64,
+    float64,
+    string,
+    unsupported,
+
+    /// Detect column type from Lance logical_type string
+    /// Precise type detection (order matters - check specific before general)
+    pub fn fromLogicalType(logical_type: []const u8) LanceColumnType {
+        // Timestamp types (check before generic "int" matches)
+        if (std.mem.indexOf(u8, logical_type, "timestamp[ns") != null) return .timestamp_ns;
+        if (std.mem.indexOf(u8, logical_type, "timestamp[us") != null) return .timestamp_us;
+        if (std.mem.indexOf(u8, logical_type, "timestamp[ms") != null) return .timestamp_ms;
+        if (std.mem.indexOf(u8, logical_type, "timestamp[s") != null) return .timestamp_s;
+        if (std.mem.indexOf(u8, logical_type, "date32") != null) return .date32;
+        if (std.mem.indexOf(u8, logical_type, "date64") != null) return .date64;
+        // Explicit int32
+        if (std.mem.eql(u8, logical_type, "int32")) return .int32;
+        // float or float32
+        if (std.mem.eql(u8, logical_type, "float") or std.mem.indexOf(u8, logical_type, "float32") != null) return .float32;
+        // bool or boolean
+        if (std.mem.eql(u8, logical_type, "bool") or std.mem.indexOf(u8, logical_type, "boolean") != null) return .bool_;
+        // Default integers (int, int64, integer)
+        if (std.mem.indexOf(u8, logical_type, "int") != null) return .int64;
+        // double
+        if (std.mem.indexOf(u8, logical_type, "double") != null) return .float64;
+        // Strings (utf8 or string)
+        if (std.mem.indexOf(u8, logical_type, "utf8") != null or std.mem.indexOf(u8, logical_type, "string") != null) return .string;
+        return .unsupported;
+    }
+};
 
 /// Query result in columnar format
 pub const Result = struct {

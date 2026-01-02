@@ -35,6 +35,7 @@ pub const Result = result_types.Result;
 pub const CachedColumn = result_types.CachedColumn;
 pub const JoinedData = result_types.JoinedData;
 pub const TableSource = result_types.TableSource;
+pub const LanceColumnType = result_types.LanceColumnType;
 
 /// SQL Query Executor
 pub const Executor = struct {
@@ -331,68 +332,28 @@ pub const Executor = struct {
         }
 
         for (col_names) |name| {
-            // Skip if already cached
             if (self.column_cache.contains(name)) continue;
 
-            // Use physical column ID (not array index) for column metadata access
             const physical_col_id = self.tbl().physicalColumnId(name) orelse return error.ColumnNotFound;
-            const field = self.tbl().getFieldById(physical_col_id) orelse return error.InvalidColumn;
+            const fld = self.tbl().getFieldById(physical_col_id) orelse return error.InvalidColumn;
+            const col_type = LanceColumnType.fromLogicalType(fld.logical_type);
 
-            // Read and cache column based on type
-            // Precise type detection (order matters - check specific before general)
-            const logical_type = field.logical_type;
-
-            // Timestamp types (check before generic "int" matches)
-            if (std.mem.indexOf(u8, logical_type, "timestamp[ns") != null) {
-                const data = try self.tbl().readInt64Column(physical_col_id);
-                try self.column_cache.put(name, CachedColumn{ .timestamp_ns = data });
-            } else if (std.mem.indexOf(u8, logical_type, "timestamp[us") != null) {
-                const data = try self.tbl().readInt64Column(physical_col_id);
-                try self.column_cache.put(name, CachedColumn{ .timestamp_us = data });
-            } else if (std.mem.indexOf(u8, logical_type, "timestamp[ms") != null) {
-                const data = try self.tbl().readInt64Column(physical_col_id);
-                try self.column_cache.put(name, CachedColumn{ .timestamp_ms = data });
-            } else if (std.mem.indexOf(u8, logical_type, "timestamp[s") != null) {
-                const data = try self.tbl().readInt64Column(physical_col_id);
-                try self.column_cache.put(name, CachedColumn{ .timestamp_s = data });
-            } else if (std.mem.indexOf(u8, logical_type, "date32") != null) {
-                const data = try self.tbl().readInt32Column(physical_col_id);
-                try self.column_cache.put(name, CachedColumn{ .date32 = data });
-            } else if (std.mem.indexOf(u8, logical_type, "date64") != null) {
-                const data = try self.tbl().readInt64Column(physical_col_id);
-                try self.column_cache.put(name, CachedColumn{ .date64 = data });
-            } else if (std.mem.eql(u8, logical_type, "int32")) {
-                // Explicit int32 type
-                const data = try self.tbl().readInt32Column(physical_col_id);
-                try self.column_cache.put(name, CachedColumn{ .int32 = data });
-            } else if (std.mem.eql(u8, logical_type, "float") or
-                std.mem.indexOf(u8, logical_type, "float32") != null)
-            {
-                // float or float32 → f32
-                const data = try self.tbl().readFloat32Column(physical_col_id);
-                try self.column_cache.put(name, CachedColumn{ .float32 = data });
-            } else if (std.mem.eql(u8, logical_type, "bool") or
-                std.mem.indexOf(u8, logical_type, "boolean") != null)
-            {
-                // bool or boolean → bool
-                const data = try self.tbl().readBoolColumn(physical_col_id);
-                try self.column_cache.put(name, CachedColumn{ .bool_ = data });
-            } else if (std.mem.indexOf(u8, logical_type, "int") != null) {
-                // Default integers (int, int64, integer) to int64
-                const data = try self.tbl().readInt64Column(physical_col_id);
-                try self.column_cache.put(name, CachedColumn{ .int64 = data });
-            } else if (std.mem.indexOf(u8, logical_type, "double") != null) {
-                // double → float64
-                const data = try self.tbl().readFloat64Column(physical_col_id);
-                try self.column_cache.put(name, CachedColumn{ .float64 = data });
-            } else if (std.mem.indexOf(u8, logical_type, "utf8") != null or
-                std.mem.indexOf(u8, logical_type, "string") != null)
-            {
-                const data = try self.tbl().readStringColumn(physical_col_id);
-                try self.column_cache.put(name, CachedColumn{ .string = data });
-            } else {
-                return error.UnsupportedColumnType;
-            }
+            const cached = switch (col_type) {
+                .timestamp_ns => CachedColumn{ .timestamp_ns = try self.tbl().readInt64Column(physical_col_id) },
+                .timestamp_us => CachedColumn{ .timestamp_us = try self.tbl().readInt64Column(physical_col_id) },
+                .timestamp_ms => CachedColumn{ .timestamp_ms = try self.tbl().readInt64Column(physical_col_id) },
+                .timestamp_s => CachedColumn{ .timestamp_s = try self.tbl().readInt64Column(physical_col_id) },
+                .date32 => CachedColumn{ .date32 = try self.tbl().readInt32Column(physical_col_id) },
+                .date64 => CachedColumn{ .date64 = try self.tbl().readInt64Column(physical_col_id) },
+                .int32 => CachedColumn{ .int32 = try self.tbl().readInt32Column(physical_col_id) },
+                .float32 => CachedColumn{ .float32 = try self.tbl().readFloat32Column(physical_col_id) },
+                .bool_ => CachedColumn{ .bool_ = try self.tbl().readBoolColumn(physical_col_id) },
+                .int64 => CachedColumn{ .int64 = try self.tbl().readInt64Column(physical_col_id) },
+                .float64 => CachedColumn{ .float64 = try self.tbl().readFloat64Column(physical_col_id) },
+                .string => CachedColumn{ .string = try self.tbl().readStringColumn(physical_col_id) },
+                .unsupported => return error.UnsupportedColumnType,
+            };
+            try self.column_cache.put(name, cached);
         }
     }
 
@@ -722,29 +683,16 @@ pub const Executor = struct {
     /// Read join key column data
     fn readJoinKeyColumn(self: *Self, table: *Table, col_idx: u32) !JoinKeyData {
         _ = self;
-        const field = table.getFieldById(col_idx) orelse return error.InvalidColumn;
-        const logical_type = field.logical_type;
+        const fld = table.getFieldById(col_idx) orelse return error.InvalidColumn;
+        const col_type = LanceColumnType.fromLogicalType(fld.logical_type);
 
-        if (std.mem.indexOf(u8, logical_type, "int64") != null or
-            std.mem.indexOf(u8, logical_type, "int") != null)
-        {
-            const data = try table.readInt64Column(col_idx);
-            return .{ .int64 = data };
-        } else if (std.mem.indexOf(u8, logical_type, "int32") != null) {
-            const data = try table.readInt32Column(col_idx);
-            return .{ .int32 = data };
-        } else if (std.mem.indexOf(u8, logical_type, "float") != null or
-            std.mem.indexOf(u8, logical_type, "double") != null)
-        {
-            const data = try table.readFloat64Column(col_idx);
-            return .{ .float64 = data };
-        } else if (std.mem.indexOf(u8, logical_type, "string") != null or
-            std.mem.indexOf(u8, logical_type, "utf8") != null)
-        {
-            const data = try table.readStringColumn(col_idx);
-            return .{ .string = data };
-        }
-        return error.UnsupportedJoinKeyType;
+        return switch (col_type) {
+            .int64, .timestamp_ns, .timestamp_us, .timestamp_ms, .timestamp_s, .date64 => .{ .int64 = try table.readInt64Column(col_idx) },
+            .int32, .date32 => .{ .int32 = try table.readInt32Column(col_idx) },
+            .float32, .float64 => .{ .float64 = try table.readFloat64Column(col_idx) },
+            .string => .{ .string = try table.readStringColumn(col_idx) },
+            .bool_, .unsupported => error.UnsupportedJoinKeyType,
+        };
     }
 
     /// Free join key data
@@ -809,61 +757,37 @@ pub const Executor = struct {
         is_right_side: bool,
     ) !CachedColumn {
         _ = is_right_side;
-        const field = table.getFieldById(col_idx) orelse return error.InvalidColumn;
-        const logical_type = field.logical_type;
+        const fld = table.getFieldById(col_idx) orelse return error.InvalidColumn;
+        const col_type = LanceColumnType.fromLogicalType(fld.logical_type);
+        const null_idx = std.math.maxInt(usize);
 
-        // Determine column type and read full data
-        if (std.mem.indexOf(u8, logical_type, "int64") != null or
-            std.mem.indexOf(u8, logical_type, "int") != null)
-        {
-            const all_data = try table.readInt64Column(col_idx);
-            defer self.allocator.free(all_data);
-
-            const result = try self.allocator.alloc(i64, row_indices.len);
-            for (row_indices, 0..) |idx, i| {
-                if (idx == std.math.maxInt(usize)) {
-                    result[i] = 0; // NULL represented as 0 for now
-                } else {
-                    result[i] = all_data[idx];
+        return switch (col_type) {
+            .int64, .int32, .timestamp_ns, .timestamp_us, .timestamp_ms, .timestamp_s, .date32, .date64 => blk: {
+                const all_data = try table.readInt64Column(col_idx);
+                defer self.allocator.free(all_data);
+                const result = try self.allocator.alloc(i64, row_indices.len);
+                for (row_indices, 0..) |idx, i| result[i] = if (idx == null_idx) 0 else all_data[idx];
+                break :blk .{ .int64 = result };
+            },
+            .float32, .float64 => blk: {
+                const all_data = try table.readFloat64Column(col_idx);
+                defer self.allocator.free(all_data);
+                const result = try self.allocator.alloc(f64, row_indices.len);
+                for (row_indices, 0..) |idx, i| result[i] = if (idx == null_idx) std.math.nan(f64) else all_data[idx];
+                break :blk .{ .float64 = result };
+            },
+            .string => blk: {
+                const all_data = try table.readStringColumn(col_idx);
+                defer {
+                    for (all_data) |s| self.allocator.free(s);
+                    self.allocator.free(all_data);
                 }
-            }
-            return .{ .int64 = result };
-        } else if (std.mem.indexOf(u8, logical_type, "float") != null or
-            std.mem.indexOf(u8, logical_type, "double") != null)
-        {
-            const all_data = try table.readFloat64Column(col_idx);
-            defer self.allocator.free(all_data);
-
-            const result = try self.allocator.alloc(f64, row_indices.len);
-            for (row_indices, 0..) |idx, i| {
-                if (idx == std.math.maxInt(usize)) {
-                    result[i] = std.math.nan(f64); // NULL as NaN
-                } else {
-                    result[i] = all_data[idx];
-                }
-            }
-            return .{ .float64 = result };
-        } else if (std.mem.indexOf(u8, logical_type, "string") != null or
-            std.mem.indexOf(u8, logical_type, "utf8") != null)
-        {
-            const all_data = try table.readStringColumn(col_idx);
-            defer {
-                for (all_data) |s| self.allocator.free(s);
-                self.allocator.free(all_data);
-            }
-
-            const result = try self.allocator.alloc([]const u8, row_indices.len);
-            for (row_indices, 0..) |idx, i| {
-                if (idx == std.math.maxInt(usize)) {
-                    result[i] = try self.allocator.dupe(u8, ""); // NULL as empty string
-                } else {
-                    result[i] = try self.allocator.dupe(u8, all_data[idx]);
-                }
-            }
-            return .{ .string = result };
-        }
-
-        return error.UnsupportedColumnType;
+                const result = try self.allocator.alloc([]const u8, row_indices.len);
+                for (row_indices, 0..) |idx, i| result[i] = try self.allocator.dupe(u8, if (idx == null_idx) "" else all_data[idx]);
+                break :blk .{ .string = result };
+            },
+            .bool_, .unsupported => error.UnsupportedColumnType,
+        };
     }
 
     /// Release resources associated with a table source
@@ -3521,81 +3445,79 @@ pub const Executor = struct {
         }
 
         const fld = self.tbl().getFieldById(col_idx) orelse return error.InvalidColumn;
+        const col_type = LanceColumnType.fromLogicalType(fld.logical_type);
 
-        // Phase 2: Table API now has readAtIndices() methods
-        // Current implementation still uses inline filtering for type-specific handling
-        // Future: refactor to use Table.readInt64AtIndices() etc. for cleaner code
-
-        const logical_type = fld.logical_type;
-
-        // Precise type detection (order matters - check specific before general)
-        // Timestamp types (check before generic "int" matches)
-        if (std.mem.indexOf(u8, logical_type, "timestamp[ns") != null) {
-            const all_data = try self.tbl().readInt64Column(col_idx);
-            defer self.allocator.free(all_data);
-            return Result.ColumnData{ .timestamp_ns = try self.filterByIndices(i64, all_data, indices) };
-        } else if (std.mem.indexOf(u8, logical_type, "timestamp[us") != null) {
-            const all_data = try self.tbl().readInt64Column(col_idx);
-            defer self.allocator.free(all_data);
-            return Result.ColumnData{ .timestamp_us = try self.filterByIndices(i64, all_data, indices) };
-        } else if (std.mem.indexOf(u8, logical_type, "timestamp[ms") != null) {
-            const all_data = try self.tbl().readInt64Column(col_idx);
-            defer self.allocator.free(all_data);
-            return Result.ColumnData{ .timestamp_ms = try self.filterByIndices(i64, all_data, indices) };
-        } else if (std.mem.indexOf(u8, logical_type, "timestamp[s") != null) {
-            const all_data = try self.tbl().readInt64Column(col_idx);
-            defer self.allocator.free(all_data);
-            return Result.ColumnData{ .timestamp_s = try self.filterByIndices(i64, all_data, indices) };
-        } else if (std.mem.indexOf(u8, logical_type, "date32") != null) {
-            const all_data = try self.tbl().readInt32Column(col_idx);
-            defer self.allocator.free(all_data);
-            return Result.ColumnData{ .date32 = try self.filterByIndices(i32, all_data, indices) };
-        } else if (std.mem.indexOf(u8, logical_type, "date64") != null) {
-            const all_data = try self.tbl().readInt64Column(col_idx);
-            defer self.allocator.free(all_data);
-            return Result.ColumnData{ .date64 = try self.filterByIndices(i64, all_data, indices) };
-        } else if (std.mem.eql(u8, logical_type, "int32")) {
-            const all_data = try self.tbl().readInt32Column(col_idx);
-            defer self.allocator.free(all_data);
-            return Result.ColumnData{ .int32 = try self.filterByIndices(i32, all_data, indices) };
-        } else if (std.mem.eql(u8, logical_type, "float") or
-            std.mem.indexOf(u8, logical_type, "float32") != null) {
-            const all_data = try self.tbl().readFloat32Column(col_idx);
-            defer self.allocator.free(all_data);
-            return Result.ColumnData{ .float32 = try self.filterByIndices(f32, all_data, indices) };
-        } else if (std.mem.eql(u8, logical_type, "bool") or
-            std.mem.indexOf(u8, logical_type, "boolean") != null) {
-            const all_data = try self.tbl().readBoolColumn(col_idx);
-            defer self.allocator.free(all_data);
-            return Result.ColumnData{ .bool_ = try self.filterByIndices(bool, all_data, indices) };
-        } else if (std.mem.indexOf(u8, logical_type, "int") != null) {
-            const all_data = try self.tbl().readInt64Column(col_idx);
-            defer self.allocator.free(all_data);
-            return Result.ColumnData{ .int64 = try self.filterByIndices(i64, all_data, indices) };
-        } else if (std.mem.indexOf(u8, logical_type, "double") != null) {
-            const all_data = try self.tbl().readFloat64Column(col_idx);
-            defer self.allocator.free(all_data);
-            return Result.ColumnData{ .float64 = try self.filterByIndices(f64, all_data, indices) };
-        } else if (std.mem.indexOf(u8, logical_type, "utf8") != null or
-            std.mem.indexOf(u8, logical_type, "string") != null) {
+        // String requires special handling for ownership
+        if (col_type == .string) {
             const all_data = try self.tbl().readStringColumn(col_idx);
-            // all_data contains owned strings - must free both array and individual strings
             defer {
-                for (all_data) |str| {
-                    self.allocator.free(str);
-                }
+                for (all_data) |str| self.allocator.free(str);
                 self.allocator.free(all_data);
             }
-
             const filtered = try self.allocator.alloc([]const u8, indices.len);
-            for (indices, 0..) |idx, i| {
-                // Duplicate string for the filtered result
-                filtered[i] = try self.allocator.dupe(u8, all_data[idx]);
-            }
+            for (indices, 0..) |idx, i| filtered[i] = try self.allocator.dupe(u8, all_data[idx]);
             return Result.ColumnData{ .string = filtered };
-        } else {
-            return error.UnsupportedColumnType;
         }
+
+        return switch (col_type) {
+            .timestamp_ns => blk: {
+                const all_data = try self.tbl().readInt64Column(col_idx);
+                defer self.allocator.free(all_data);
+                break :blk Result.ColumnData{ .timestamp_ns = try self.filterByIndices(i64, all_data, indices) };
+            },
+            .timestamp_us => blk: {
+                const all_data = try self.tbl().readInt64Column(col_idx);
+                defer self.allocator.free(all_data);
+                break :blk Result.ColumnData{ .timestamp_us = try self.filterByIndices(i64, all_data, indices) };
+            },
+            .timestamp_ms => blk: {
+                const all_data = try self.tbl().readInt64Column(col_idx);
+                defer self.allocator.free(all_data);
+                break :blk Result.ColumnData{ .timestamp_ms = try self.filterByIndices(i64, all_data, indices) };
+            },
+            .timestamp_s => blk: {
+                const all_data = try self.tbl().readInt64Column(col_idx);
+                defer self.allocator.free(all_data);
+                break :blk Result.ColumnData{ .timestamp_s = try self.filterByIndices(i64, all_data, indices) };
+            },
+            .date32 => blk: {
+                const all_data = try self.tbl().readInt32Column(col_idx);
+                defer self.allocator.free(all_data);
+                break :blk Result.ColumnData{ .date32 = try self.filterByIndices(i32, all_data, indices) };
+            },
+            .date64 => blk: {
+                const all_data = try self.tbl().readInt64Column(col_idx);
+                defer self.allocator.free(all_data);
+                break :blk Result.ColumnData{ .date64 = try self.filterByIndices(i64, all_data, indices) };
+            },
+            .int32 => blk: {
+                const all_data = try self.tbl().readInt32Column(col_idx);
+                defer self.allocator.free(all_data);
+                break :blk Result.ColumnData{ .int32 = try self.filterByIndices(i32, all_data, indices) };
+            },
+            .float32 => blk: {
+                const all_data = try self.tbl().readFloat32Column(col_idx);
+                defer self.allocator.free(all_data);
+                break :blk Result.ColumnData{ .float32 = try self.filterByIndices(f32, all_data, indices) };
+            },
+            .bool_ => blk: {
+                const all_data = try self.tbl().readBoolColumn(col_idx);
+                defer self.allocator.free(all_data);
+                break :blk Result.ColumnData{ .bool_ = try self.filterByIndices(bool, all_data, indices) };
+            },
+            .int64 => blk: {
+                const all_data = try self.tbl().readInt64Column(col_idx);
+                defer self.allocator.free(all_data);
+                break :blk Result.ColumnData{ .int64 = try self.filterByIndices(i64, all_data, indices) };
+            },
+            .float64 => blk: {
+                const all_data = try self.tbl().readFloat64Column(col_idx);
+                defer self.allocator.free(all_data);
+                break :blk Result.ColumnData{ .float64 = try self.filterByIndices(f64, all_data, indices) };
+            },
+            .string => unreachable, // Handled above
+            .unsupported => error.UnsupportedColumnType,
+        };
     }
 
     /// Generic column reader for any table type with standard interface
