@@ -15,6 +15,7 @@
 const std = @import("std");
 const args = @import("cli/args.zig");
 const ingest = @import("cli/ingest.zig");
+const enrich = @import("cli/enrich.zig");
 const lanceql = @import("lanceql");
 const metal = @import("lanceql.metal");
 const Table = @import("lanceql.table").Table;
@@ -235,13 +236,10 @@ fn cmdTransform(allocator: std.mem.Allocator, opts: args.TransformOptions) !void
 
 /// Enrich command - add embeddings and indexes
 fn cmdEnrich(allocator: std.mem.Allocator, opts: args.EnrichOptions) !void {
-    _ = allocator;
-    _ = opts;
-    std.debug.print("Error: Enrich command not yet implemented.\n", .{});
-    std.debug.print("\nEnrich will support operations like:\n", .{});
-    std.debug.print("  - Text embedding generation\n", .{});
-    std.debug.print("  - Vector index creation (IVF, HNSW)\n", .{});
-    std.debug.print("  - Full-text search indexing\n", .{});
+    enrich.run(allocator, opts) catch |err| {
+        std.debug.print("Enrich command failed: {}\n", .{err});
+        return err;
+    };
 }
 
 /// Serve command - start interactive web server

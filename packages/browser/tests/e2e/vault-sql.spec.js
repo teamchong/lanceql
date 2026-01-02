@@ -5338,4 +5338,138 @@ test.describe('Vault SQL Operations', () => {
             expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
         }
     });
+
+    test('SEARCH + Aggregations (COUNT, SUM, AVG with NEAR)', async ({ page }) => {
+        // This test verifies that vector search can be combined with aggregate functions
+        const results = await page.evaluate(async () => {
+            const v = window.vault;
+            const tests = [];
+
+            // Create test table with text and numeric data
+            await v.exec(`CREATE TABLE search_agg (
+                id INT,
+                category TEXT,
+                description TEXT,
+                price REAL,
+                quantity INT
+            )`);
+
+            // Insert test data with semantically similar descriptions
+            await v.exec(`INSERT INTO search_agg VALUES
+                (1, 'electronics', 'laptop computer for work', 999.99, 5),
+                (2, 'electronics', 'gaming laptop with graphics', 1499.99, 3),
+                (3, 'electronics', 'desktop computer workstation', 1299.99, 2),
+                (4, 'furniture', 'office desk wooden', 299.99, 10),
+                (5, 'furniture', 'ergonomic chair', 399.99, 8),
+                (6, 'electronics', 'notebook computer portable', 799.99, 7)
+            `);
+
+            // Test 1: COUNT(*) with NEAR search
+            try {
+                const res = await v.exec(`SELECT COUNT(*) AS cnt FROM search_agg WHERE description NEAR 'computer laptop' LIMIT 10`);
+                // Should find rows with similar descriptions
+                const cnt = res.rows[0]?.cnt;
+                tests.push({ name: 'COUNT with NEAR', pass: typeof cnt === 'number' && cnt > 0, actual: cnt });
+            } catch (e) {
+                tests.push({ name: 'COUNT with NEAR', pass: false, error: e.message });
+            }
+
+            // Test 2: SUM with NEAR search
+            try {
+                const res = await v.exec(`SELECT SUM(quantity) AS total FROM search_agg WHERE description NEAR 'laptop' LIMIT 10`);
+                const total = res.rows[0]?.total;
+                tests.push({ name: 'SUM with NEAR', pass: typeof total === 'number', actual: total });
+            } catch (e) {
+                tests.push({ name: 'SUM with NEAR', pass: false, error: e.message });
+            }
+
+            // Test 3: AVG with NEAR search
+            try {
+                const res = await v.exec(`SELECT AVG(price) AS avg_price FROM search_agg WHERE description NEAR 'computer' LIMIT 10`);
+                const avg = res.rows[0]?.avg_price;
+                tests.push({ name: 'AVG with NEAR', pass: typeof avg === 'number' && avg > 0, actual: avg?.toFixed(2) });
+            } catch (e) {
+                tests.push({ name: 'AVG with NEAR', pass: false, error: e.message });
+            }
+
+            // Test 4: Multiple aggregates with NEAR
+            try {
+                const res = await v.exec(`SELECT COUNT(*) AS cnt, MIN(price) AS min_p, MAX(price) AS max_p FROM search_agg WHERE description NEAR 'laptop computer' LIMIT 10`);
+                const row = res.rows[0];
+                const pass = typeof row?.cnt === 'number' && typeof row?.min_p === 'number' && typeof row?.max_p === 'number';
+                tests.push({ name: 'Multiple aggregates with NEAR', pass, actual: `cnt=${row?.cnt}, min=${row?.min_p}, max=${row?.max_p}` });
+            } catch (e) {
+                tests.push({ name: 'Multiple aggregates with NEAR', pass: false, error: e.message });
+            }
+
+            await v.exec('DROP TABLE search_agg');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('SEARCH + GROUP BY Aggregations', async ({ page }) => {
+        // This test verifies that vector search can be combined with GROUP BY
+        const results = await page.evaluate(async () => {
+            const v = window.vault;
+            const tests = [];
+
+            // Create test table with categories
+            await v.exec(`CREATE TABLE search_group (
+                id INT,
+                category TEXT,
+                name TEXT,
+                score REAL
+            )`);
+
+            // Insert test data
+            await v.exec(`INSERT INTO search_group VALUES
+                (1, 'A', 'apple fruit fresh', 85.5),
+                (2, 'A', 'apple juice drink', 78.0),
+                (3, 'B', 'banana yellow fruit', 92.0),
+                (4, 'B', 'banana smoothie blend', 88.5),
+                (5, 'A', 'apple pie dessert', 95.0),
+                (6, 'B', 'banana bread baked', 82.0)
+            `);
+
+            // Test 1: GROUP BY with NEAR search
+            try {
+                const res = await v.exec(`SELECT category, COUNT(*) AS cnt FROM search_group WHERE name NEAR 'fruit' GROUP BY category LIMIT 10`);
+                // Should group search results by category
+                const pass = res.rows.length > 0 && res.rows.every(r => typeof r.cnt === 'number');
+                tests.push({ name: 'GROUP BY with NEAR', pass, actual: JSON.stringify(res.rows) });
+            } catch (e) {
+                tests.push({ name: 'GROUP BY with NEAR', pass: false, error: e.message });
+            }
+
+            // Test 2: GROUP BY with aggregate functions
+            try {
+                const res = await v.exec(`SELECT category, AVG(score) AS avg_score, SUM(score) AS total FROM search_group WHERE name NEAR 'apple banana' GROUP BY category LIMIT 10`);
+                const pass = res.rows.length > 0 && res.rows.every(r => typeof r.avg_score === 'number');
+                tests.push({ name: 'GROUP BY with multiple aggregates', pass, actual: JSON.stringify(res.rows.map(r => ({ cat: r.category, avg: r.avg_score?.toFixed(1) }))) });
+            } catch (e) {
+                tests.push({ name: 'GROUP BY with multiple aggregates', pass: false, error: e.message });
+            }
+
+            // Test 3: Empty search results should return empty GROUP BY
+            try {
+                const res = await v.exec(`SELECT category, COUNT(*) AS cnt FROM search_group WHERE name NEAR 'xyz_nonexistent_term' GROUP BY category LIMIT 5`);
+                // With vector search, it may still return results based on similarity
+                // The key is it should not error
+                tests.push({ name: 'GROUP BY with no exact matches', pass: true, actual: `${res.rows.length} groups` });
+            } catch (e) {
+                tests.push({ name: 'GROUP BY with no exact matches', pass: false, error: e.message });
+            }
+
+            await v.exec('DROP TABLE search_group');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
 });

@@ -9,6 +9,10 @@ pub fn build(b: *std.Build) void {
     const use_metal = target.result.os.tag == .macos;
     const use_accelerate = target.result.os.tag == .macos;
 
+    // === Optional ONNX Runtime Support ===
+    // Enable with: zig build -Donnx=/path/to/onnxruntime
+    const onnx_path = b.option([]const u8, "onnx", "Path to ONNX Runtime installation (enables embedding support)");
+
     // === Core Modules ===
     const proto_mod = b.addModule("lanceql.proto", .{
         .root_source_file = b.path("src/proto/proto.zig"),
@@ -815,6 +819,15 @@ pub fn build(b: *std.Build) void {
     }
     if (use_accelerate) {
         cli.root_module.linkFramework("Accelerate", .{});
+    }
+    // ONNX Runtime for embedding support
+    if (onnx_path) |path| {
+        const lib_path = std.fmt.allocPrint(b.allocator, "{s}/lib", .{path}) catch @panic("OOM");
+        const include_path = std.fmt.allocPrint(b.allocator, "{s}/include", .{path}) catch @panic("OOM");
+        cli.root_module.addLibraryPath(.{ .cwd_relative = lib_path });
+        cli.root_module.addIncludePath(.{ .cwd_relative = include_path });
+        cli.root_module.linkSystemLibrary("onnxruntime", .{});
+        cli.linkLibC();
     }
     b.installArtifact(cli);
     const run_cli = b.addRunArtifact(cli);

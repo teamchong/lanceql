@@ -12825,8 +12825,8 @@ export class SQLExecutor {
                     queryPlan: plan,  // Include plan in result
                 };
             }
-            // For aggregations with SEARCH, we need to run search first
-            if (ast.search) {
+            // For aggregations with SEARCH/NEAR, we need to run search first
+            if (ast.search || this._extractNearCondition(ast.where)) {
                 return await this.executeAggregateWithSearch(ast, totalRows, onProgress);
             }
             return await this.executeAggregateQuery(ast, totalRows, onProgress);
@@ -14717,13 +14717,497 @@ export class SQLExecutor {
      * Execute aggregation query after running vector search
      */
     async executeAggregateWithSearch(ast, totalRows, onProgress) {
-        // This is a simplified version - aggregate over search results
-        // For now, just return an error/notice that this combination isn't fully supported
+        // Step 1: Extract NEAR info from WHERE
+        const nearInfo = this._extractNearCondition(ast.where);
+        if (!nearInfo) {
+            throw new Error('SEARCH aggregation requires NEAR clause');
+        }
+
+        // Step 2: Execute vector search to get candidate indices
+        if (onProgress) onProgress('Executing vector search...', 0, 100);
+        const searchIndices = await this._executeNearSearch(nearInfo, totalRows);
+
+        if (searchIndices.length === 0) {
+            return this._emptyAggregateResult(ast);
+        }
+
+        // Step 3: Apply remaining WHERE conditions (non-NEAR)
+        const remainingWhere = this._removeNearCondition(ast.where);
+        let filteredIndices = searchIndices;
+
+        if (remainingWhere) {
+            if (onProgress) onProgress('Applying filters...', 30, 100);
+            filteredIndices = await this._filterIndicesByWhere(searchIndices, remainingWhere);
+        }
+
+        if (filteredIndices.length === 0) {
+            return this._emptyAggregateResult(ast);
+        }
+
+        // Step 4: Route to appropriate aggregation path
+        if (onProgress) onProgress('Aggregating results...', 60, 100);
+
+        if (ast.groupBy && ast.groupBy.length > 0) {
+            // GROUP BY aggregation on filtered indices
+            return await this._executeGroupByOnIndices(ast, filteredIndices, onProgress);
+        } else {
+            // Simple aggregation on filtered indices
+            return await this._executeSimpleAggregateOnIndices(ast, filteredIndices, onProgress);
+        }
+    }
+
+    /**
+     * Filter indices by WHERE expression
+     * @private
+     */
+    async _filterIndicesByWhere(indices, whereExpr) {
+        const neededCols = new Set();
+        this.collectColumnsFromExpr(whereExpr, neededCols);
+
+        const columnData = {};
+        for (const colName of neededCols) {
+            const colIdx = this.columnMap[colName.toLowerCase()];
+            if (colIdx !== undefined) {
+                columnData[colName.toLowerCase()] = await this.readColumnData(colIdx, indices);
+            }
+        }
+
+        return indices.filter((_, i) => this.evaluateExpr(whereExpr, columnData, i));
+    }
+
+    /**
+     * Execute simple aggregation on specific indices (no GROUP BY)
+     * @private
+     */
+    async _executeSimpleAggregateOnIndices(ast, indices, onProgress) {
+        const aggFunctions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'STDDEV_SAMP', 'STDDEV_POP', 'VARIANCE', 'VAR_SAMP', 'VAR_POP', 'MEDIAN', 'STRING_AGG', 'GROUP_CONCAT'];
+
+        // Initialize aggregators
+        const aggregators = [];
+        const colNames = [];
+
+        for (const col of ast.columns) {
+            if (col.type === 'star') {
+                aggregators.push({ type: 'COUNT', column: null, isStar: true, count: 0 });
+                colNames.push('COUNT(*)');
+            } else if (col.expr?.type === 'call' && aggFunctions.includes(col.expr.name.toUpperCase())) {
+                const aggType = col.expr.name.toUpperCase();
+                const argExpr = col.expr.args?.[0];
+                const colName = argExpr?.type === 'column' ? (argExpr.name || argExpr.column) : null;
+                const isStar = argExpr?.type === 'star';
+
+                aggregators.push({
+                    type: aggType,
+                    column: colName,
+                    isStar,
+                    expr: col.expr,
+                    sum: 0,
+                    count: 0,
+                    min: null,
+                    max: null,
+                    values: [],
+                });
+
+                const displayName = col.alias || this.exprToName(col.expr);
+                colNames.push(displayName);
+            } else {
+                aggregators.push({
+                    type: 'FIRST',
+                    column: col.expr?.type === 'column' ? (col.expr.name || col.expr.column) : null,
+                    value: null,
+                });
+                colNames.push(col.alias || this.exprToName(col.expr));
+            }
+        }
+
+        // Collect needed columns
+        const neededCols = new Set();
+        for (const agg of aggregators) {
+            if (agg.column) neededCols.add(agg.column.toLowerCase());
+        }
+
+        // Fetch column data for the indices
+        const columnData = {};
+        for (const colName of neededCols) {
+            const colIdx = this.columnMap[colName.toLowerCase()];
+            if (colIdx !== undefined) {
+                columnData[colName.toLowerCase()] = await this.readColumnData(colIdx, indices);
+            }
+        }
+
+        // Process all rows
+        for (let i = 0; i < indices.length; i++) {
+            for (const agg of aggregators) {
+                if (agg.type === 'COUNT' && agg.isStar) {
+                    agg.count++;
+                } else if (agg.type === 'FIRST' && agg.value === null) {
+                    const data = agg.column ? columnData[agg.column.toLowerCase()] : null;
+                    agg.value = data ? data[i] : null;
+                } else if (agg.column) {
+                    const data = columnData[agg.column.toLowerCase()];
+                    const val = data ? data[i] : null;
+
+                    if (val !== null && val !== undefined) {
+                        if (agg.type === 'COUNT') {
+                            agg.count++;
+                        } else if (typeof val === 'number' && !isNaN(val)) {
+                            agg.count++;
+                            if (agg.type === 'SUM' || agg.type === 'AVG' || agg.type.startsWith('STDDEV') || agg.type.startsWith('VAR')) {
+                                agg.sum += val;
+                                agg.values.push(val);
+                            }
+                            if (agg.type === 'MIN') {
+                                agg.min = agg.min === null ? val : Math.min(agg.min, val);
+                            }
+                            if (agg.type === 'MAX') {
+                                agg.max = agg.max === null ? val : Math.max(agg.max, val);
+                            }
+                            if (agg.type === 'MEDIAN') {
+                                agg.values.push(val);
+                            }
+                        }
+                        if (agg.type === 'STRING_AGG' || agg.type === 'GROUP_CONCAT') {
+                            agg.values.push(String(val));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Compute final results
+        const resultRow = [];
+        for (const agg of aggregators) {
+            switch (agg.type) {
+                case 'COUNT':
+                    resultRow.push(agg.count);
+                    break;
+                case 'SUM':
+                    resultRow.push(agg.sum);
+                    break;
+                case 'AVG':
+                    resultRow.push(agg.count > 0 ? agg.sum / agg.count : null);
+                    break;
+                case 'MIN':
+                    resultRow.push(agg.min);
+                    break;
+                case 'MAX':
+                    resultRow.push(agg.max);
+                    break;
+                case 'STDDEV':
+                case 'STDDEV_SAMP': {
+                    if (agg.values.length < 2) {
+                        resultRow.push(null);
+                    } else {
+                        const mean = agg.sum / agg.values.length;
+                        const variance = agg.values.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / (agg.values.length - 1);
+                        resultRow.push(Math.sqrt(variance));
+                    }
+                    break;
+                }
+                case 'STDDEV_POP': {
+                    if (agg.values.length === 0) {
+                        resultRow.push(null);
+                    } else {
+                        const mean = agg.sum / agg.values.length;
+                        const variance = agg.values.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / agg.values.length;
+                        resultRow.push(Math.sqrt(variance));
+                    }
+                    break;
+                }
+                case 'VARIANCE':
+                case 'VAR_SAMP': {
+                    if (agg.values.length < 2) {
+                        resultRow.push(null);
+                    } else {
+                        const mean = agg.sum / agg.values.length;
+                        resultRow.push(agg.values.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / (agg.values.length - 1));
+                    }
+                    break;
+                }
+                case 'VAR_POP': {
+                    if (agg.values.length === 0) {
+                        resultRow.push(null);
+                    } else {
+                        const mean = agg.sum / agg.values.length;
+                        resultRow.push(agg.values.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / agg.values.length);
+                    }
+                    break;
+                }
+                case 'MEDIAN': {
+                    if (agg.values.length === 0) {
+                        resultRow.push(null);
+                    } else {
+                        agg.values.sort((a, b) => a - b);
+                        const mid = Math.floor(agg.values.length / 2);
+                        resultRow.push(agg.values.length % 2 ? agg.values[mid] : (agg.values[mid - 1] + agg.values[mid]) / 2);
+                    }
+                    break;
+                }
+                case 'STRING_AGG': {
+                    const separator = agg.expr?.args?.[1]?.value ?? ',';
+                    resultRow.push(agg.values.join(separator));
+                    break;
+                }
+                case 'GROUP_CONCAT': {
+                    resultRow.push(agg.values.join(','));
+                    break;
+                }
+                case 'FIRST':
+                    resultRow.push(agg.value);
+                    break;
+                default:
+                    resultRow.push(null);
+            }
+        }
+
         return {
-            columns: ['error'],
-            rows: [['Aggregations with SEARCH not yet supported. Use SEARCH without aggregations, or aggregations without SEARCH.']],
+            columns: colNames,
+            rows: [resultRow],
             total: 1,
-            aggregationStats: null,
+            aggregationStats: {
+                scannedRows: indices.length,
+                totalRows: indices.length,
+                coveragePercent: '100.00',
+                isPartialScan: false,
+                fromSearch: true,
+            },
+        };
+    }
+
+    /**
+     * Execute GROUP BY aggregation on specific indices
+     * @private
+     */
+    async _executeGroupByOnIndices(ast, indices, onProgress) {
+        const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'STDDEV_SAMP', 'STDDEV_POP', 'VARIANCE', 'VAR_SAMP', 'VAR_POP', 'MEDIAN', 'STRING_AGG', 'GROUP_CONCAT'];
+
+        // Collect all needed columns
+        const neededCols = new Set();
+        for (const expr of ast.groupBy) {
+            const colName = expr.column || expr.name;
+            if (colName) neededCols.add(colName.toLowerCase());
+        }
+        for (const col of ast.columns) {
+            if (col.expr?.type === 'column') {
+                neededCols.add((col.expr.name || col.expr.column).toLowerCase());
+            } else if (col.expr?.type === 'call' && col.expr.args?.[0]?.type === 'column') {
+                neededCols.add((col.expr.args[0].name || col.expr.args[0].column).toLowerCase());
+            }
+        }
+
+        // Fetch column data for the indices
+        const columnData = {};
+        for (const colName of neededCols) {
+            const colIdx = this.columnMap[colName.toLowerCase()];
+            if (colIdx !== undefined) {
+                columnData[colName.toLowerCase()] = await this.readColumnData(colIdx, indices);
+            }
+        }
+
+        // Group rows by GROUP BY columns
+        const groups = new Map();
+        for (let i = 0; i < indices.length; i++) {
+            const groupKey = ast.groupBy.map(expr => {
+                const colName = (expr.column || expr.name || '').toLowerCase();
+                return JSON.stringify(columnData[colName]?.[i]);
+            }).join('|');
+
+            if (!groups.has(groupKey)) {
+                groups.set(groupKey, []);
+            }
+            groups.get(groupKey).push(i);
+        }
+
+        // Build column names
+        const colNames = ast.columns.map(col => col.alias || this.exprToName(col.expr || col));
+
+        // Compute aggregates per group
+        const resultRows = [];
+        for (const [, groupLocalIndices] of groups) {
+            const row = [];
+            for (const col of ast.columns) {
+                const expr = col.expr || col;
+                if (expr.type === 'call' && aggFuncs.includes(expr.name.toUpperCase())) {
+                    const funcName = expr.name.toUpperCase();
+                    const argExpr = expr.args?.[0];
+                    const colName = argExpr?.type === 'column' ? (argExpr.name || argExpr.column)?.toLowerCase() : null;
+                    const isStar = argExpr?.type === 'star';
+
+                    let result = null;
+                    if (funcName === 'COUNT') {
+                        if (isStar) {
+                            result = groupLocalIndices.length;
+                        } else {
+                            result = 0;
+                            for (const i of groupLocalIndices) {
+                                if (columnData[colName]?.[i] != null) result++;
+                            }
+                        }
+                    } else if (funcName === 'SUM') {
+                        result = 0;
+                        for (const i of groupLocalIndices) {
+                            const v = columnData[colName]?.[i];
+                            if (v != null && typeof v === 'number' && !isNaN(v)) result += v;
+                        }
+                    } else if (funcName === 'AVG') {
+                        let sum = 0, count = 0;
+                        for (const i of groupLocalIndices) {
+                            const v = columnData[colName]?.[i];
+                            if (v != null && typeof v === 'number' && !isNaN(v)) { sum += v; count++; }
+                        }
+                        result = count > 0 ? sum / count : null;
+                    } else if (funcName === 'MIN') {
+                        for (const i of groupLocalIndices) {
+                            const v = columnData[colName]?.[i];
+                            if (v != null && (result === null || v < result)) result = v;
+                        }
+                    } else if (funcName === 'MAX') {
+                        for (const i of groupLocalIndices) {
+                            const v = columnData[colName]?.[i];
+                            if (v != null && (result === null || v > result)) result = v;
+                        }
+                    } else if (funcName === 'MEDIAN') {
+                        const vals = [];
+                        for (const i of groupLocalIndices) {
+                            const v = columnData[colName]?.[i];
+                            if (v != null && typeof v === 'number' && !isNaN(v)) vals.push(v);
+                        }
+                        if (vals.length > 0) {
+                            vals.sort((a, b) => a - b);
+                            const mid = Math.floor(vals.length / 2);
+                            result = vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
+                        }
+                    } else if (funcName === 'STRING_AGG' || funcName === 'GROUP_CONCAT') {
+                        const separator = funcName === 'STRING_AGG' ? (expr.args?.[1]?.value ?? ',') : ',';
+                        const vals = [];
+                        for (const i of groupLocalIndices) {
+                            const v = columnData[colName]?.[i];
+                            if (v != null) vals.push(String(v));
+                        }
+                        result = vals.join(separator);
+                    } else if (funcName === 'STDDEV' || funcName === 'STDDEV_SAMP' || funcName === 'STDDEV_POP') {
+                        const vals = [];
+                        for (const i of groupLocalIndices) {
+                            const v = columnData[colName]?.[i];
+                            if (v != null && typeof v === 'number' && !isNaN(v)) vals.push(v);
+                        }
+                        if (vals.length >= (funcName === 'STDDEV_POP' ? 1 : 2)) {
+                            const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                            const divisor = funcName === 'STDDEV_POP' ? vals.length : (vals.length - 1);
+                            const variance = vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / divisor;
+                            result = Math.sqrt(variance);
+                        }
+                    } else if (funcName === 'VARIANCE' || funcName === 'VAR_SAMP' || funcName === 'VAR_POP') {
+                        const vals = [];
+                        for (const i of groupLocalIndices) {
+                            const v = columnData[colName]?.[i];
+                            if (v != null && typeof v === 'number' && !isNaN(v)) vals.push(v);
+                        }
+                        if (vals.length >= (funcName === 'VAR_POP' ? 1 : 2)) {
+                            const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                            const divisor = funcName === 'VAR_POP' ? vals.length : (vals.length - 1);
+                            result = vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / divisor;
+                        }
+                    }
+                    row.push(result);
+                } else if (expr.type === 'column') {
+                    const colName = (expr.name || expr.column)?.toLowerCase();
+                    row.push(columnData[colName]?.[groupLocalIndices[0]] ?? null);
+                } else {
+                    row.push(null);
+                }
+            }
+            resultRows.push(row);
+        }
+
+        // Apply ORDER BY
+        if (ast.orderBy && ast.orderBy.length > 0) {
+            const colNameToIdx = {};
+            colNames.forEach((name, idx) => { colNameToIdx[name.toLowerCase()] = idx; });
+
+            resultRows.sort((a, b) => {
+                for (const order of ast.orderBy) {
+                    const colName = (order.column || order.expr?.name || order.expr?.column || '').toLowerCase();
+                    const colIdx = colNameToIdx[colName] ?? -1;
+                    if (colIdx === -1) continue;
+
+                    const aVal = a[colIdx];
+                    const bVal = b[colIdx];
+                    const dir = order.direction === 'DESC' ? -1 : 1;
+
+                    if (aVal === null && bVal === null) continue;
+                    if (aVal === null) return dir;
+                    if (bVal === null) return -dir;
+                    if (aVal < bVal) return -dir;
+                    if (aVal > bVal) return dir;
+                }
+                return 0;
+            });
+        }
+
+        // Apply LIMIT/OFFSET
+        const offset = ast.offset || 0;
+        let rows = resultRows;
+        if (offset > 0) rows = rows.slice(offset);
+        if (ast.limit) rows = rows.slice(0, ast.limit);
+
+        return {
+            columns: colNames,
+            rows,
+            total: rows.length,
+            aggregationStats: {
+                scannedRows: indices.length,
+                totalRows: indices.length,
+                groups: groups.size,
+                coveragePercent: '100.00',
+                isPartialScan: false,
+                fromSearch: true,
+            },
+        };
+    }
+
+    /**
+     * Return empty aggregate result with proper column names
+     * @private
+     */
+    _emptyAggregateResult(ast) {
+        const colNames = ast.columns.map(col => col.alias || this.exprToName(col.expr || col));
+        const emptyRow = ast.columns.map(col => {
+            const expr = col.expr || col;
+            if (expr.type === 'call' && expr.name.toUpperCase() === 'COUNT') {
+                return 0;
+            }
+            return null;
+        });
+
+        // For GROUP BY with no matches, return empty rows (no groups)
+        if (ast.groupBy && ast.groupBy.length > 0) {
+            return {
+                columns: colNames,
+                rows: [],
+                total: 0,
+                aggregationStats: {
+                    scannedRows: 0,
+                    totalRows: 0,
+                    coveragePercent: '100.00',
+                    isPartialScan: false,
+                    fromSearch: true,
+                },
+            };
+        }
+
+        // For simple aggregates, return single row with COUNT=0, others NULL
+        return {
+            columns: colNames,
+            rows: [emptyRow],
+            total: 1,
+            aggregationStats: {
+                scannedRows: 0,
+                totalRows: 0,
+                coveragePercent: '100.00',
+                isPartialScan: false,
+                fromSearch: true,
+            },
         };
     }
 
