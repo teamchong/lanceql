@@ -1238,6 +1238,8 @@ const TokenType = {
     ARRAY: 'ARRAY',
     // DML enhancement keywords
     CONFLICT: 'CONFLICT', DO: 'DO', NOTHING: 'NOTHING', EXCLUDED: 'EXCLUDED', USING: 'USING',
+    // EXPLAIN
+    EXPLAIN: 'EXPLAIN', ANALYZE: 'ANALYZE',
 
     // Literals
     IDENTIFIER: 'IDENTIFIER', STRING: 'STRING', NUMBER: 'NUMBER',
@@ -1471,6 +1473,8 @@ class SQLParser {
         const token = this.peek();
 
         switch (token.type) {
+            case TokenType.EXPLAIN:
+                return this.parseExplain();
             case TokenType.CREATE:
                 return this.parseCreate();
             case TokenType.DROP:
@@ -1488,6 +1492,36 @@ class SQLParser {
             default:
                 throw new Error(`Unexpected token: ${token.type}`);
         }
+    }
+
+    parseExplain() {
+        this.expect(TokenType.EXPLAIN);
+        const analyze = !!this.match(TokenType.ANALYZE);
+
+        // Parse the statement to explain (SELECT, UPDATE, DELETE, INSERT)
+        const stmtToken = this.peek();
+        let statement;
+        switch (stmtToken.type) {
+            case TokenType.SELECT:
+                statement = this.parseSelect();
+                break;
+            case TokenType.WITH:
+                statement = this.parseWithClause();
+                break;
+            case TokenType.UPDATE:
+                statement = this.parseUpdate();
+                break;
+            case TokenType.DELETE:
+                statement = this.parseDelete();
+                break;
+            case TokenType.INSERT:
+                statement = this.parseInsert();
+                break;
+            default:
+                throw new Error(`EXPLAIN not supported for: ${stmtToken.type}`);
+        }
+
+        return { type: 'EXPLAIN', analyze, statement };
     }
 
     parseWithClause() {
@@ -4381,6 +4415,106 @@ async function executeNearSearch(rows, nearCondition, limit) {
     return scored.slice(0, topK).map(s => ({ ...s.row, _score: s.score }));
 }
 
+// Generate query plan from AST for EXPLAIN
+function generateQueryPlan(ast) {
+    const type = ast.type?.toUpperCase() || 'SELECT';
+
+    // Handle JOINs - they become HASH_JOIN operations
+    if (type === 'SELECT' && ast.joins && ast.joins.length > 0) {
+        const children = [];
+
+        // Main table scan
+        const mainTable = ast.tables?.[0];
+        children.push({
+            operation: 'SELECT',
+            table: typeof mainTable === 'string' ? mainTable : (mainTable?.name || mainTable?.alias || 'unknown'),
+            access: 'FULL_SCAN'
+        });
+
+        // Join tables
+        for (const join of ast.joins) {
+            const joinTable = join.table;
+            children.push({
+                operation: 'SELECT',
+                table: typeof joinTable === 'string' ? joinTable : (joinTable?.name || joinTable?.alias || 'unknown'),
+                access: 'FULL_SCAN'
+            });
+        }
+
+        return {
+            operation: 'HASH_JOIN',
+            joinType: ast.joins[0].type || 'INNER',
+            children
+        };
+    }
+
+    // Standard SELECT/UPDATE/DELETE/INSERT
+    const plan = {
+        operation: type,
+        table: getTableName(ast),
+        access: 'FULL_SCAN'
+    };
+
+    // Detect optimizations
+    const optimizations = [];
+
+    if (ast.where) {
+        optimizations.push('PREDICATE_PUSHDOWN');
+        plan.filter = stringifyWhereClause(ast.where);
+    }
+
+    if (ast.groupBy) {
+        optimizations.push('AGGREGATE');
+    }
+
+    if (ast.orderBy && ast.orderBy.length > 0) {
+        optimizations.push('SORT');
+    }
+
+    if (ast.limit !== undefined) {
+        optimizations.push('LIMIT');
+    }
+
+    if (optimizations.length > 0) {
+        plan.optimizations = optimizations;
+    }
+
+    return plan;
+}
+
+function getTableName(ast) {
+    if (ast.table) return ast.table;
+    if (ast.tables && ast.tables.length > 0) {
+        const t = ast.tables[0];
+        return typeof t === 'string' ? t : (t.name || t.alias || 'unknown');
+    }
+    return 'unknown';
+}
+
+function stringifyWhereClause(where) {
+    if (!where) return '';
+    if (where.type === 'comparison') {
+        const left = stringifyExpr(where.left);
+        const right = stringifyExpr(where.right);
+        return `${left} ${where.op} ${right}`;
+    }
+    if (where.type === 'logical') {
+        const left = stringifyWhereClause(where.left);
+        const right = stringifyWhereClause(where.right);
+        return `(${left} ${where.op} ${right})`;
+    }
+    return JSON.stringify(where);
+}
+
+function stringifyExpr(expr) {
+    if (!expr) return 'null';
+    if (expr.type === 'literal') return String(expr.value);
+    if (expr.type === 'column') {
+        return typeof expr.value === 'string' ? expr.value : expr.value.column;
+    }
+    return JSON.stringify(expr);
+}
+
 async function executeSQL(db, sql) {
     const lexer = new SQLLexer(sql);
     const tokens = lexer.tokenize();
@@ -5103,6 +5237,31 @@ async function executeAST(db, ast) {
                     db._writeBuffer.delete(name);
                 }
             }
+        }
+
+        case 'EXPLAIN': {
+            const plan = generateQueryPlan(ast.statement);
+
+            if (!ast.analyze) {
+                // EXPLAIN without ANALYZE - just return the plan
+                return { columns: ['plan'], rows: [[JSON.stringify(plan)]] };
+            }
+
+            // EXPLAIN ANALYZE - execute and measure timing
+            const startTime = performance.now();
+            const result = await executeAST(db, ast.statement);
+            const elapsed = performance.now() - startTime;
+
+            const execution = {
+                actualTimeMs: Math.round(elapsed * 1000) / 1000, // Round to 3 decimal places
+                rowsReturned: result.rows ? result.rows.length : 0,
+                rowsTotal: result.rows ? result.rows.length : 0
+            };
+
+            return {
+                columns: ['plan_with_execution'],
+                rows: [[JSON.stringify({ plan, execution })]]
+            };
         }
 
         default:
