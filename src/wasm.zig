@@ -6,38 +6,47 @@
 const std = @import("std");
 
 // ============================================================================
-// Constants
+// Module imports
 // ============================================================================
 
-const FOOTER_SIZE: usize = 40;
-const LANCE_MAGIC = "LANC";
+const memory = @import("wasm/memory.zig");
+const format = @import("wasm/format.zig");
 
-// ============================================================================
-// Simple bump allocator for WASM (no std.heap.wasm_allocator dependency)
-// ============================================================================
-
-var heap: [1024 * 1024]u8 = undefined; // 1MB heap
-var heap_offset: usize = 0;
-
-fn wasmAlloc(len: usize) ?[*]u8 {
-    // Get current address and align it to 8 bytes
-    const heap_base = @intFromPtr(&heap[0]);
-    const current_addr = heap_base + heap_offset;
-    const aligned_addr = (current_addr + 7) & ~@as(usize, 7);
-    const padding = aligned_addr - current_addr;
-
-    heap_offset += padding;
-
-    const aligned_len = (len + 7) & ~@as(usize, 7); // 8-byte align length too
-    if (heap_offset + aligned_len > heap.len) return null;
-    const ptr: [*]u8 = @ptrCast(&heap[heap_offset]);
-    heap_offset += aligned_len;
-    return ptr;
+// Module exports are automatic via `pub export fn` in each module.
+// Force reference to ensure they're included in WASM binary:
+comptime {
+    _ = memory;
+    _ = format;
 }
 
-fn wasmReset() void {
-    heap_offset = 0;
-}
+// ============================================================================
+// Constants (from format module)
+// ============================================================================
+
+const FOOTER_SIZE = format.FOOTER_SIZE;
+
+// ============================================================================
+// Internal memory functions (from memory module)
+// ============================================================================
+
+const wasmAlloc = memory.wasmAlloc;
+const wasmReset = memory.wasmReset;
+
+// ============================================================================
+// Internal format functions (from format module)
+// ============================================================================
+
+const readU64LE = format.readU64LE;
+const readU32LE = format.readU32LE;
+const readU16LE = format.readU16LE;
+const readI64LE = format.readI64LE;
+const readI32LE = format.readI32LE;
+const readI16LE = format.readI16LE;
+const readI8 = format.readI8;
+const readU8 = format.readU8;
+const readF64LE = format.readF64LE;
+const readF32LE = format.readF32LE;
+const isValidLanceFile = format.isValidLanceFile;
 
 // ============================================================================
 // Global state
@@ -51,125 +60,10 @@ var column_meta_offsets_start: u64 = 0;
 // Exported Memory Management
 // ============================================================================
 
-export fn alloc(len: usize) ?[*]u8 {
-    return wasmAlloc(len);
-}
-
-export fn free(ptr: [*]u8, len: usize) void {
-    _ = ptr;
-    _ = len;
-    // Bump allocator doesn't support individual frees
-}
-
 export fn resetHeap() void {
     wasmReset();
     file_data = null;
     num_columns = 0;
-}
-
-// ============================================================================
-// Footer Parsing Helpers
-// ============================================================================
-
-fn readU64LE(data: []const u8, offset: usize) u64 {
-    if (offset + 8 > data.len) return 0;
-    return std.mem.readInt(u64, data[offset..][0..8], .little);
-}
-
-fn readU32LE(data: []const u8, offset: usize) u32 {
-    if (offset + 4 > data.len) return 0;
-    return std.mem.readInt(u32, data[offset..][0..4], .little);
-}
-
-fn readU16LE(data: []const u8, offset: usize) u16 {
-    if (offset + 2 > data.len) return 0;
-    return std.mem.readInt(u16, data[offset..][0..2], .little);
-}
-
-fn readI64LE(data: []const u8, offset: usize) i64 {
-    if (offset + 8 > data.len) return 0;
-    return std.mem.readInt(i64, data[offset..][0..8], .little);
-}
-
-fn readI32LE(data: []const u8, offset: usize) i32 {
-    if (offset + 4 > data.len) return 0;
-    return std.mem.readInt(i32, data[offset..][0..4], .little);
-}
-
-fn readI16LE(data: []const u8, offset: usize) i16 {
-    if (offset + 2 > data.len) return 0;
-    return std.mem.readInt(i16, data[offset..][0..2], .little);
-}
-
-fn readI8(data: []const u8, offset: usize) i8 {
-    if (offset >= data.len) return 0;
-    return @bitCast(data[offset]);
-}
-
-fn readU8(data: []const u8, offset: usize) u8 {
-    if (offset >= data.len) return 0;
-    return data[offset];
-}
-
-fn readF64LE(data: []const u8, offset: usize) f64 {
-    const bits = readU64LE(data, offset);
-    return @bitCast(bits);
-}
-
-fn readF32LE(data: []const u8, offset: usize) f32 {
-    const bits = readU32LE(data, offset);
-    return @bitCast(bits);
-}
-
-// ============================================================================
-// Footer Parsing
-// ============================================================================
-
-export fn isValidLanceFile(data: [*]const u8, len: usize) u32 {
-    if (len < FOOTER_SIZE) return 0;
-
-    // Check magic at end
-    const magic_offset = len - 4;
-    if (data[magic_offset] != 'L' or data[magic_offset + 1] != 'A' or
-        data[magic_offset + 2] != 'N' or data[magic_offset + 3] != 'C')
-    {
-        return 0;
-    }
-    return 1;
-}
-
-export fn parseFooterGetColumns(data: [*]const u8, len: usize) u32 {
-    if (isValidLanceFile(data, len) == 0) return 0;
-    const footer_start = len - FOOTER_SIZE;
-    return readU32LE(data[0..len], footer_start + 28);
-}
-
-export fn parseFooterGetMajorVersion(data: [*]const u8, len: usize) u16 {
-    if (isValidLanceFile(data, len) == 0) return 0;
-    const footer_start = len - FOOTER_SIZE;
-    return readU16LE(data[0..len], footer_start + 32);
-}
-
-export fn parseFooterGetMinorVersion(data: [*]const u8, len: usize) u16 {
-    if (isValidLanceFile(data, len) == 0) return 0;
-    const footer_start = len - FOOTER_SIZE;
-    return readU16LE(data[0..len], footer_start + 34);
-}
-
-export fn getColumnMetaStart(data: [*]const u8, len: usize) u64 {
-    if (isValidLanceFile(data, len) == 0) return 0;
-    const footer_start = len - FOOTER_SIZE;
-    return readU64LE(data[0..len], footer_start + 0);
-}
-
-export fn getColumnMetaOffsetsStart(data: [*]const u8, len: usize) u64 {
-    if (isValidLanceFile(data, len) == 0) return 0;
-    const footer_start = len - FOOTER_SIZE;
-    return readU64LE(data[0..len], footer_start + 8);
-}
-
-export fn getVersion() u32 {
-    return 0x000100; // v0.1.0
 }
 
 // ============================================================================
