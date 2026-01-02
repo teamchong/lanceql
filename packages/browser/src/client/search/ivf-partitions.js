@@ -44,9 +44,20 @@ export async function fetchPartitionData(index, partitionIndices, dim = 384, onP
         return assembleResults(partitionIndices, cachedResults, dim, onProgress);
     }
 
-    const PARALLEL_LIMIT = 6;
-    for (let i = 0; i < uncachedPartitions.length; i += PARALLEL_LIMIT) {
-        const batch = uncachedPartitions.slice(i, i + PARALLEL_LIMIT);
+    // Initialize adaptive fetch stats if not present
+    if (!index._fetchStats) {
+        index._fetchStats = {
+            concurrency: 6,
+            recentLatencies: [],  // Rolling window of last 10 batches
+            minConcurrency: 2,
+            maxConcurrency: 12
+        };
+    }
+
+    const stats = index._fetchStats;
+    for (let i = 0; i < uncachedPartitions.length; i += stats.concurrency) {
+        const batch = uncachedPartitions.slice(i, i + stats.concurrency);
+        const batchStart = performance.now();
 
         const results = await Promise.all(batch.map(async (p) => {
             const startOffset = index.partitionOffsets[p];
@@ -87,6 +98,18 @@ export async function fetchPartitionData(index, partitionIndices, dim = 384, onP
             const size = result.rowIds.length * 4 + (result.vectors.byteLength || result.vectors.length * 4);
             index._partitionCache.set(result.p, data, size);
             cachedResults.set(result.p, data);
+        }
+
+        // Adaptive concurrency adjustment based on batch latency
+        const batchLatency = performance.now() - batchStart;
+        stats.recentLatencies.push(batchLatency);
+        if (stats.recentLatencies.length > 10) stats.recentLatencies.shift();
+
+        const avgLatency = stats.recentLatencies.reduce((a, b) => a + b, 0) / stats.recentLatencies.length;
+        if (avgLatency < 50 && stats.concurrency < stats.maxConcurrency) {
+            stats.concurrency++;
+        } else if (avgLatency > 200 && stats.concurrency > stats.minConcurrency) {
+            stats.concurrency--;
         }
     }
 

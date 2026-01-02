@@ -60,6 +60,7 @@ class IVFIndex {
         this.hasPartitionIndex = false;
         this._rowIdCache = null;
         this._rowIdCacheReady = false;
+        this._accessCounts = new Map();  // partition -> access count for prefetching
     }
 
     static async tryLoad(datasetBaseUrl) {
@@ -157,7 +158,48 @@ class IVFIndex {
 
         // Use O(n) quickselect instead of O(n log n) sort
         const topK = quickselectTopK(distances, nprobe);
-        return topK.map(d => d.idx);
+        const partitionIndices = topK.map(d => d.idx);
+
+        // Track partition access counts for prefetching
+        for (const idx of partitionIndices) {
+            this._accessCounts.set(idx, (this._accessCounts.get(idx) || 0) + 1);
+        }
+
+        return partitionIndices;
+    }
+
+    /**
+     * Prefetch frequently accessed partitions into cache.
+     * Call after several searches to warm the cache with hot partitions.
+     * @param {number} topN - Number of top partitions to prefetch (default 10)
+     * @param {number} minAccesses - Minimum access count to be considered hot (default 3)
+     */
+    async prefetchHotPartitions(topN = 10, minAccesses = 3) {
+        if (!this._accessCounts || this._accessCounts.size === 0) return;
+
+        const hotPartitions = [...this._accessCounts.entries()]
+            .filter(([_, count]) => count >= minAccesses)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, topN)
+            .map(([p]) => p);
+
+        if (hotPartitions.length === 0) return;
+
+        // Prefetch partitions into LRU cache
+        await this.fetchPartitionData(hotPartitions, this.dimension);
+    }
+
+    /**
+     * Get access statistics for debugging/monitoring.
+     */
+    getAccessStats() {
+        return {
+            totalPartitions: this.numPartitions,
+            accessedPartitions: this._accessCounts.size,
+            topPartitions: [...this._accessCounts.entries()]
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 10)
+        };
     }
 }
 
