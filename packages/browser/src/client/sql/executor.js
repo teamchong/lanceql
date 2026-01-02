@@ -17,13 +17,14 @@ import * as SubqueryModule from './executor-subquery.js';
 import * as UtilsModule from './executor-utils.js';
 
 class SQLExecutor {
-    constructor(file) {
+    constructor(file, options = {}) {
         this.file = file;
         this.columnMap = {};
         this.columnTypes = [];
         this._cteResults = new Map();
         this._database = null;
         this._ftsIndexCache = null;
+        this._debug = options.debug ?? false;
 
         // Build column name -> index map
         if (file.columnNames) {
@@ -231,10 +232,15 @@ class SQLExecutor {
             } else if (type === 'vector') {
                 return indices.map(() => '[vector]');
             } else {
-                try { return await this.file.readStringsAtIndices(colIdx, indices); }
-                catch { return indices.map(() => null); }
+                try {
+                    return await this.file.readStringsAtIndices(colIdx, indices);
+                } catch (e) {
+                    if (this._debug) console.warn(`[SQLExecutor] readColumnData col ${colIdx} fallback failed:`, e.message);
+                    return indices.map(() => null);
+                }
             }
-        } catch {
+        } catch (e) {
+            if (this._debug) console.warn(`[SQLExecutor] readColumnData col ${colIdx} failed:`, e.message);
             return indices.map(() => null);
         }
     }

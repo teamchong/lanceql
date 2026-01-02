@@ -17,6 +17,27 @@ class HotTierCache {
         };
         // In-memory cache for metadata to avoid OPFS reads on every getRange call
         this._metaCache = new Map();  // url -> { meta, fullFileData }
+        this._metaCacheOrder = [];    // Track insertion order for LRU eviction
+        this.maxMetaCacheEntries = options.maxMetaCacheEntries || 100;
+    }
+
+    /**
+     * Add to metadata cache with LRU eviction
+     * @private
+     */
+    _setMetaCache(url, data) {
+        // Remove if already exists (will re-add at end)
+        const existingIdx = this._metaCacheOrder.indexOf(url);
+        if (existingIdx !== -1) {
+            this._metaCacheOrder.splice(existingIdx, 1);
+        }
+        // Evict oldest entries if at capacity
+        while (this._metaCacheOrder.length >= this.maxMetaCacheEntries) {
+            const oldestUrl = this._metaCacheOrder.shift();
+            this._metaCache.delete(oldestUrl);
+        }
+        this._metaCache.set(url, data);
+        this._metaCacheOrder.push(url);
     }
 
     /**
@@ -144,14 +165,14 @@ class HotTierCache {
                 const data = await this.storage.load(dataPath);
                 if (data && data.byteLength > end) {
                     // Cache in memory for subsequent calls
-                    this._metaCache.set(url, { meta, fullFileData: data });
+                    this._setMetaCache(url, { meta, fullFileData: data });
                     this._stats.hits++;
                     this._stats.bytesFromCache += (end - start + 1);
                     return data.slice(start, end + 1).buffer;
                 }
             }
             // Mark as checked even if not cached
-            this._metaCache.set(url, { meta: cached ? meta : null, fullFileData: null });
+            this._setMetaCache(url, { meta: cached ? meta : null, fullFileData: null });
         }
 
         // Cache miss - fetch from network

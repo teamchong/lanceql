@@ -62,10 +62,10 @@ export async function evaluateSimpleFilter(executor, filter, totalRows, onProgre
         }
 
         const batchEnd = Math.min(batchStart + batchSize, totalRows);
-        const batchIndices = [];
-        for (let i = batchStart; i < batchEnd; i++) {
-            batchIndices.push(i);
-        }
+        const batchIndices = Array.from(
+            { length: batchEnd - batchStart },
+            (_, i) => batchStart + i
+        );
 
         // Fetch only the filter column
         const colData = await executor.readColumnData(filter.colIdx, batchIndices);
@@ -120,10 +120,10 @@ export async function evaluateComplexFilter(executor, whereExpr, totalRows, onPr
         }
 
         const batchEnd = Math.min(batchStart + batchSize, totalRows);
-        const batchIndices = [];
-        for (let i = batchStart; i < batchEnd; i++) {
-            batchIndices.push(i);
-        }
+        const batchIndices = Array.from(
+            { length: batchEnd - batchStart },
+            (_, i) => batchStart + i
+        );
 
         // Fetch needed column data for this batch
         const batchData = {};

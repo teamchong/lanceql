@@ -207,17 +207,18 @@ export async function executeBM25Search(executor, nearInfo, totalRows) {
     if (queryTokens.length === 0) return [];
 
     // Step 2: Get or build inverted index for this column
-    const cacheKey = `fts_${colIdx}`;
-    if (!executor._ftsIndexCache) executor._ftsIndexCache = new Map();
+    // Cache on file object (persists across executor instances)
+    const cacheKey = `fts_${colIdx}_${totalRows}`;
+    if (!executor.file._ftsIndexCache) executor.file._ftsIndexCache = new Map();
 
-    let index = executor._ftsIndexCache.get(cacheKey);
+    let index = executor.file._ftsIndexCache.get(cacheKey);
     if (!index) {
         index = await buildFTSIndex(
             (idx, indices) => executor.readColumnData(idx, indices),
             colIdx,
             totalRows
         );
-        executor._ftsIndexCache.set(cacheKey, index);
+        executor.file._ftsIndexCache.set(cacheKey, index);
     }
 
     // Step 3: Compute BM25 scores

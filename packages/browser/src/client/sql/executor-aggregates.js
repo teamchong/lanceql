@@ -464,8 +464,10 @@ export function executeGroupByAggregation(executor, ast, data, columnData, filte
         if (hasGroupByClause) {
             groupKey = ast.groupBy.map(expr => {
                 const colName = (expr.column || expr.name || '').toLowerCase();
-                return JSON.stringify(columnData[colName]?.[idx]);
-            }).join('|');
+                const val = columnData[colName]?.[idx];
+                // Fast key: null→'\0', else String() (avoids JSON.stringify overhead)
+                return val == null ? '\0' : String(val);
+            }).join('\x1F');  // Unit separator avoids collisions with data
         }
 
         if (!groups.has(groupKey)) {
