@@ -316,6 +316,18 @@ fn outputResults(result: *executor.Result, legacy_args: LegacyArgs) void {
     }
 }
 
+/// Execute query on an already-initialized executor and output results
+fn executeAndOutput(allocator: std.mem.Allocator, exec: *executor.Executor, query: []const u8, legacy_args: LegacyArgs) !void {
+    const parsed = try tokenizeAndParse(allocator, query);
+    var tokens = parsed.tokens;
+    defer tokens.deinit(allocator);
+
+    var result = try exec.execute(&parsed.stmt.select, &[_]ast.Value{});
+    defer result.deinit();
+
+    outputResults(&result, legacy_args);
+}
+
 
 /// Extract table path from SQL query (finds 'path' in FROM clause)
 fn extractTablePath(query: []const u8) ?[]const u8 {
@@ -520,51 +532,30 @@ fn runParquetQuery(allocator: std.mem.Allocator, data: []const u8, query: []cons
     var pq_table = try ParquetTable.init(allocator, data);
     defer pq_table.deinit();
 
-    const parsed = try tokenizeAndParse(allocator, query);
-    var tokens = parsed.tokens;
-    defer tokens.deinit(allocator);
-
     var exec = executor.Executor.initWithParquet(&pq_table, allocator);
     defer exec.deinit();
 
-    var result = try exec.execute(&parsed.stmt.select, &[_]ast.Value{});
-    defer result.deinit();
-
-    outputResults(&result, legacy_args);
+    try executeAndOutput(allocator, &exec, query, legacy_args);
 }
 
 fn runLanceQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
     var table = try Table.init(allocator, data);
     defer table.deinit();
 
-    const parsed = try tokenizeAndParse(allocator, query);
-    var tokens = parsed.tokens;
-    defer tokens.deinit(allocator);
-
     var exec = executor.Executor.init(&table, allocator);
     defer exec.deinit();
 
-    var result = try exec.execute(&parsed.stmt.select, &[_]ast.Value{});
-    defer result.deinit();
-
-    outputResults(&result, legacy_args);
+    try executeAndOutput(allocator, &exec, query, legacy_args);
 }
 
 fn runDeltaQuery(allocator: std.mem.Allocator, path: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
     var delta_table = try DeltaTable.init(allocator, path);
     defer delta_table.deinit();
 
-    const parsed = try tokenizeAndParse(allocator, query);
-    var tokens = parsed.tokens;
-    defer tokens.deinit(allocator);
-
     var exec = executor.Executor.initWithDelta(&delta_table, allocator);
     defer exec.deinit();
 
-    var result = try exec.execute(&parsed.stmt.select, &[_]ast.Value{});
-    defer result.deinit();
-
-    outputResults(&result, legacy_args);
+    try executeAndOutput(allocator, &exec, query, legacy_args);
 }
 
 fn runIcebergQuery(allocator: std.mem.Allocator, path: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
@@ -576,85 +567,50 @@ fn runIcebergQuery(allocator: std.mem.Allocator, path: []const u8, query: []cons
         return;
     }
 
-    const parsed = try tokenizeAndParse(allocator, query);
-    var tokens = parsed.tokens;
-    defer tokens.deinit(allocator);
-
     var exec = executor.Executor.initWithIceberg(&iceberg_table, allocator);
     defer exec.deinit();
 
-    var result = try exec.execute(&parsed.stmt.select, &[_]ast.Value{});
-    defer result.deinit();
-
-    outputResults(&result, legacy_args);
+    try executeAndOutput(allocator, &exec, query, legacy_args);
 }
 
 fn runArrowQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
     var arrow_table = try ArrowTable.init(allocator, data);
     defer arrow_table.deinit();
 
-    const parsed = try tokenizeAndParse(allocator, query);
-    var tokens = parsed.tokens;
-    defer tokens.deinit(allocator);
-
     var exec = executor.Executor.initWithArrow(&arrow_table, allocator);
     defer exec.deinit();
 
-    var result = try exec.execute(&parsed.stmt.select, &[_]ast.Value{});
-    defer result.deinit();
-
-    outputResults(&result, legacy_args);
+    try executeAndOutput(allocator, &exec, query, legacy_args);
 }
 
 fn runAvroQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
     var avro_table = try AvroTable.init(allocator, data);
     defer avro_table.deinit();
 
-    const parsed = try tokenizeAndParse(allocator, query);
-    var tokens = parsed.tokens;
-    defer tokens.deinit(allocator);
-
     var exec = executor.Executor.initWithAvro(&avro_table, allocator);
     defer exec.deinit();
 
-    var result = try exec.execute(&parsed.stmt.select, &[_]ast.Value{});
-    defer result.deinit();
-
-    outputResults(&result, legacy_args);
+    try executeAndOutput(allocator, &exec, query, legacy_args);
 }
 
 fn runOrcQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
     var orc_table = try OrcTable.init(allocator, data);
     defer orc_table.deinit();
 
-    const parsed = try tokenizeAndParse(allocator, query);
-    var tokens = parsed.tokens;
-    defer tokens.deinit(allocator);
-
     var exec = executor.Executor.initWithOrc(&orc_table, allocator);
     defer exec.deinit();
 
-    var result = try exec.execute(&parsed.stmt.select, &[_]ast.Value{});
-    defer result.deinit();
-
-    outputResults(&result, legacy_args);
+    try executeAndOutput(allocator, &exec, query, legacy_args);
 }
 
 fn runXlsxQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
     var xlsx_table = try XlsxTable.init(allocator, data);
     defer xlsx_table.deinit();
 
-    const parsed = try tokenizeAndParse(allocator, query);
-    var tokens = parsed.tokens;
-    defer tokens.deinit(allocator);
-
     var exec = executor.Executor.initWithXlsx(&xlsx_table, allocator);
     defer exec.deinit();
 
-    var result = try exec.execute(&parsed.stmt.select, &[_]ast.Value{});
-    defer result.deinit();
-
-    outputResults(&result, legacy_args);
+    try executeAndOutput(allocator, &exec, query, legacy_args);
 }
 
 fn printResultsDelimited(result: *executor.Result, comptime delimiter: []const u8) void {
