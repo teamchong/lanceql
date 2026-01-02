@@ -24,6 +24,21 @@ pub const DatePart = enum {
     dayofyear,
     week,
     quarter,
+
+    /// Map shorthand function names to DatePart (e.g., "YEAR" -> .year)
+    pub fn fromFunctionName(upper_name: []const u8) ?DatePart {
+        if (std.mem.eql(u8, upper_name, "YEAR")) return .year;
+        if (std.mem.eql(u8, upper_name, "MONTH")) return .month;
+        if (std.mem.eql(u8, upper_name, "DAY")) return .day;
+        if (std.mem.eql(u8, upper_name, "HOUR")) return .hour;
+        if (std.mem.eql(u8, upper_name, "MINUTE")) return .minute;
+        if (std.mem.eql(u8, upper_name, "SECOND")) return .second;
+        if (std.mem.eql(u8, upper_name, "DAYOFWEEK") or std.mem.eql(u8, upper_name, "DOW")) return .dayofweek;
+        if (std.mem.eql(u8, upper_name, "DAYOFYEAR") or std.mem.eql(u8, upper_name, "DOY")) return .dayofyear;
+        if (std.mem.eql(u8, upper_name, "WEEK")) return .week;
+        if (std.mem.eql(u8, upper_name, "QUARTER")) return .quarter;
+        return null;
+    }
 };
 
 /// Date components for conversions

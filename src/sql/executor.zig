@@ -3124,35 +3124,8 @@ pub const Executor = struct {
         }
 
         // Shorthand date part extractors: YEAR(ts), MONTH(ts), DAY(ts), etc.
-        if (std.mem.eql(u8, upper_name, "YEAR")) {
-            return scalar_functions.funcExtractPart(.year, args[0]);
-        }
-        if (std.mem.eql(u8, upper_name, "MONTH")) {
-            return scalar_functions.funcExtractPart(.month, args[0]);
-        }
-        if (std.mem.eql(u8, upper_name, "DAY")) {
-            return scalar_functions.funcExtractPart(.day, args[0]);
-        }
-        if (std.mem.eql(u8, upper_name, "HOUR")) {
-            return scalar_functions.funcExtractPart(.hour, args[0]);
-        }
-        if (std.mem.eql(u8, upper_name, "MINUTE")) {
-            return scalar_functions.funcExtractPart(.minute, args[0]);
-        }
-        if (std.mem.eql(u8, upper_name, "SECOND")) {
-            return scalar_functions.funcExtractPart(.second, args[0]);
-        }
-        if (std.mem.eql(u8, upper_name, "DAYOFWEEK") or std.mem.eql(u8, upper_name, "DOW")) {
-            return scalar_functions.funcExtractPart(.dayofweek, args[0]);
-        }
-        if (std.mem.eql(u8, upper_name, "DAYOFYEAR") or std.mem.eql(u8, upper_name, "DOY")) {
-            return scalar_functions.funcExtractPart(.dayofyear, args[0]);
-        }
-        if (std.mem.eql(u8, upper_name, "WEEK")) {
-            return scalar_functions.funcExtractPart(.week, args[0]);
-        }
-        if (std.mem.eql(u8, upper_name, "QUARTER")) {
-            return scalar_functions.funcExtractPart(.quarter, args[0]);
+        if (scalar_functions.DatePart.fromFunctionName(upper_name)) |part| {
+            return scalar_functions.funcExtractPart(part, args[0]);
         }
 
         // DATE_TRUNC(part, timestamp)
