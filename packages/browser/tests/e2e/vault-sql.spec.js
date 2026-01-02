@@ -5775,4 +5775,118 @@ test.describe('Vault SQL Operations', () => {
             expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
         }
     });
+
+    test('QUALIFY clause - filter on window function results', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Create employees table for QUALIFY tests
+            await v.exec(`CREATE TABLE employees (
+                id INT,
+                name TEXT,
+                dept TEXT,
+                salary DOUBLE
+            )`);
+
+            // Insert test data
+            await v.exec(`INSERT INTO employees VALUES
+                (1, 'Alice', 'Engineering', 120000),
+                (2, 'Bob', 'Engineering', 110000),
+                (3, 'Charlie', 'Engineering', 100000),
+                (4, 'Diana', 'Sales', 90000),
+                (5, 'Eve', 'Sales', 95000),
+                (6, 'Frank', 'Sales', 85000),
+                (7, 'Grace', 'HR', 80000),
+                (8, 'Henry', 'HR', 75000)
+            `);
+
+            // Test 1: Basic QUALIFY with ROW_NUMBER - top 1 per department
+            try {
+                const res = await v.exec(`
+                    SELECT id, name, dept, salary,
+                           ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) as rn
+                    FROM employees
+                    QUALIFY rn = 1
+                `);
+                // Should get 3 rows (1 per department: Alice, Eve, Grace)
+                const names = res.rows.map(r => r.name);
+                const hasTopEng = names.includes('Alice');
+                const hasTopSales = names.includes('Eve');
+                const hasTopHR = names.includes('Grace');
+                tests.push({
+                    name: 'QUALIFY ROW_NUMBER = 1',
+                    pass: res.rows.length === 3 && hasTopEng && hasTopSales && hasTopHR,
+                    actual: `rows: ${res.rows.length}, names: ${names.join(',')}`
+                });
+            } catch (e) {
+                tests.push({ name: 'QUALIFY ROW_NUMBER = 1', pass: false, error: e.message });
+            }
+
+            // Test 2: QUALIFY with RANK - top 2 per department
+            try {
+                const res = await v.exec(`
+                    SELECT id, name, dept, salary,
+                           RANK() OVER (PARTITION BY dept ORDER BY salary DESC) as rnk
+                    FROM employees
+                    QUALIFY rnk <= 2
+                `);
+                // Should get 6 rows (2 per department)
+                // Engineering: Alice, Bob; Sales: Eve, Diana; HR: Grace, Henry
+                tests.push({
+                    name: 'QUALIFY RANK <= 2',
+                    pass: res.rows.length === 6,
+                    actual: `rows: ${res.rows.length}`
+                });
+            } catch (e) {
+                tests.push({ name: 'QUALIFY RANK <= 2', pass: false, error: e.message });
+            }
+
+            // Test 3: QUALIFY without partition - global top 3
+            try {
+                const res = await v.exec(`
+                    SELECT id, name, salary,
+                           ROW_NUMBER() OVER (ORDER BY salary DESC) as rn
+                    FROM employees
+                    QUALIFY rn <= 3
+                `);
+                // Should get top 3 by salary: Alice (120k), Bob (110k), Charlie (100k)
+                const names = res.rows.map(r => r.name);
+                tests.push({
+                    name: 'QUALIFY global top 3',
+                    pass: res.rows.length === 3 && names.includes('Alice') && names.includes('Bob'),
+                    actual: `rows: ${res.rows.length}, names: ${names.join(',')}`
+                });
+            } catch (e) {
+                tests.push({ name: 'QUALIFY global top 3', pass: false, error: e.message });
+            }
+
+            // Test 4: QUALIFY with compound condition
+            try {
+                const res = await v.exec(`
+                    SELECT id, name, dept, salary,
+                           ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) as rn
+                    FROM employees
+                    QUALIFY rn = 1 AND salary > 85000
+                `);
+                // Should get Alice (120k) and Eve (95k), but not Grace (80k < 85k)
+                const names = res.rows.map(r => r.name);
+                tests.push({
+                    name: 'QUALIFY compound condition',
+                    pass: res.rows.length === 2 && names.includes('Alice') && names.includes('Eve'),
+                    actual: `rows: ${res.rows.length}, names: ${names.join(',')}`
+                });
+            } catch (e) {
+                tests.push({ name: 'QUALIFY compound condition', pass: false, error: e.message });
+            }
+
+            await v.exec('DROP TABLE employees');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
 });

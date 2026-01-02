@@ -11054,6 +11054,7 @@ const TokenType = {
     FALSE: 'FALSE',
     GROUP: 'GROUP',
     HAVING: 'HAVING',
+    QUALIFY: 'QUALIFY',
     ROLLUP: 'ROLLUP',
     CUBE: 'CUBE',
     GROUPING: 'GROUPING',
@@ -11193,6 +11194,7 @@ const KEYWORDS = {
     'FALSE': TokenType.FALSE,
     'GROUP': TokenType.GROUP,
     'HAVING': TokenType.HAVING,
+    'QUALIFY': TokenType.QUALIFY,
     'ROLLUP': TokenType.ROLLUP,
     'CUBE': TokenType.CUBE,
     'GROUPING': TokenType.GROUPING,
@@ -11686,6 +11688,12 @@ export class SQLParser {
             having = this.parseExpr();
         }
 
+        // QUALIFY - filter on window function results
+        let qualify = null;
+        if (this.match(TokenType.QUALIFY)) {
+            qualify = this.parseExpr();
+        }
+
         // NEAR - vector similarity search
         // Syntax: NEAR [column] <'text'|row_num> [TOPK n]
         let search = null;
@@ -11738,6 +11746,7 @@ export class SQLParser {
             where,
             groupBy,
             having,
+            qualify,
             search,
             orderBy: [],
             limit: null,
@@ -14378,12 +14387,34 @@ export class SQLExecutor {
             resultRows.push(row);
         }
 
+        // Apply QUALIFY filter (filter on window function results)
+        let finalRows = resultRows;
+        if (ast.qualify) {
+            finalRows = [];
+            // Build column name to index map for expression evaluation
+            const qualifyColMap = {};
+            resultColumns.forEach((name, idx) => { qualifyColMap[name.toLowerCase()] = idx; });
+
+            for (let i = 0; i < resultRows.length; i++) {
+                // Build row data object for expression evaluation
+                const rowData = {};
+                for (let c = 0; c < resultColumns.length; c++) {
+                    rowData[resultColumns[c].toLowerCase()] = resultRows[i][c];
+                }
+
+                // Evaluate QUALIFY condition
+                if (this._evaluateInMemoryExpr(ast.qualify, rowData, 0)) {
+                    finalRows.push(resultRows[i]);
+                }
+            }
+        }
+
         // Apply ORDER BY
         if (ast.orderBy && ast.orderBy.length > 0) {
             const colIdxMap = {};
             resultColumns.forEach((name, idx) => { colIdxMap[name.toLowerCase()] = idx; });
 
-            resultRows.sort((a, b) => {
+            finalRows.sort((a, b) => {
                 for (const ob of ast.orderBy) {
                     const colIdx = colIdxMap[ob.column.toLowerCase()];
                     if (colIdx === undefined) continue;
@@ -14401,11 +14432,11 @@ export class SQLExecutor {
 
         // Apply LIMIT/OFFSET
         const offset = ast.offset || 0;
-        let rows = resultRows;
+        let rows = finalRows;
         if (offset > 0) rows = rows.slice(offset);
         if (ast.limit) rows = rows.slice(0, ast.limit);
 
-        return { columns: resultColumns, rows, total: filteredIndices.length };
+        return { columns: resultColumns, rows, total: finalRows.length };
     }
 
     /**
