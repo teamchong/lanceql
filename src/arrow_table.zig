@@ -9,6 +9,7 @@ const ArrowIpcReader = @import("lanceql.encoding").ArrowIpcReader;
 const ArrowType = @import("lanceql.encoding").ArrowType;
 const format = @import("lanceql.format");
 const Type = format.parquet_metadata.Type;
+const table_utils = @import("lanceql.table_utils");
 
 pub const ArrowTableError = error{
     InvalidArrowFile,
@@ -95,12 +96,7 @@ pub const ArrowTable = struct {
 
     /// Get column index by name
     pub fn columnIndex(self: Self, name: []const u8) ?usize {
-        for (self.column_names, 0..) |col_name, i| {
-            if (std.mem.eql(u8, col_name, name)) {
-                return i;
-            }
-        }
-        return null;
+        return table_utils.findColumnIndex(self.column_names, name);
     }
 
     /// Get column type (mapped to Parquet types)
@@ -111,13 +107,9 @@ pub const ArrowTable = struct {
 
     /// Generic helper to convert array from one type to another
     fn convertArray(self: *Self, comptime From: type, comptime To: type, values: []const From) ArrowTableError![]To {
-        var result = self.allocator.alloc(To, values.len) catch {
+        return table_utils.convertArray(self.allocator, From, To, values) catch {
             return ArrowTableError.OutOfMemory;
         };
-        for (values, 0..) |v, i| {
-            result[i] = if (To == bool) (v != 0) else if (@typeInfo(To) == .float) @floatCast(v) else @intCast(v);
-        }
-        return result;
     }
 
     /// Read int64 column data

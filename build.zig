@@ -26,6 +26,10 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/encoding/snappy.zig"),
     });
 
+    const table_utils_mod = b.addModule("lanceql.table_utils", .{
+        .root_source_file = b.path("src/table_utils.zig"),
+    });
+
     const encoding_mod = b.addModule("lanceql.encoding", .{
         .root_source_file = b.path("src/encoding/encoding.zig"),
         .imports = &.{
@@ -154,6 +158,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "lanceql.format", .module = format_mod },
             .{ .name = "lanceql.encoding", .module = encoding_mod },
+            .{ .name = "lanceql.table_utils", .module = table_utils_mod },
         },
     });
 
@@ -162,6 +167,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "lanceql.format", .module = format_mod },
             .{ .name = "lanceql.encoding", .module = encoding_mod },
+            .{ .name = "lanceql.table_utils", .module = table_utils_mod },
         },
     });
 
@@ -170,6 +176,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "lanceql.format", .module = format_mod },
             .{ .name = "lanceql.encoding", .module = encoding_mod },
+            .{ .name = "lanceql.table_utils", .module = table_utils_mod },
         },
     });
 
@@ -178,6 +185,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "lanceql.format", .module = format_mod },
             .{ .name = "lanceql.encoding", .module = encoding_mod },
+            .{ .name = "lanceql.table_utils", .module = table_utils_mod },
         },
     });
 
