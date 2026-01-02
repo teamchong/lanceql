@@ -18,6 +18,9 @@ const ingest = @import("cli/ingest.zig");
 const enrich = @import("cli/enrich.zig");
 const transform = @import("cli/transform.zig");
 const serve = @import("cli/serve.zig");
+const output = @import("cli/output.zig");
+const benchmark = @import("cli/benchmark.zig");
+const file_utils = @import("cli/file_utils.zig");
 const lanceql = @import("lanceql");
 const metal = @import("lanceql.metal");
 const Table = @import("lanceql.table").Table;
@@ -213,7 +216,11 @@ fn cmdQuery(allocator: std.mem.Allocator, opts: args.QueryOptions) !void {
     };
 
     if (opts.benchmark) {
-        try runBenchmark(allocator, query, legacy_args);
+        try benchmark.run(allocator, query, .{
+            .iterations = opts.iterations,
+            .warmup = opts.warmup,
+            .json = opts.json,
+        });
     } else {
         try runQuery(allocator, query, legacy_args);
     }
@@ -307,13 +314,7 @@ fn tokenizeAndParse(allocator: std.mem.Allocator, query: []const u8) !struct { s
 
 /// Output query results in the format specified by legacy_args
 fn outputResults(result: *executor.Result, legacy_args: LegacyArgs) void {
-    if (legacy_args.json) {
-        printResultsJson(result);
-    } else if (legacy_args.csv) {
-        printResultsCsv(result);
-    } else {
-        printResultsTable(result);
-    }
+    output.outputResults(result, legacy_args.json, legacy_args.csv);
 }
 
 /// Execute query on an already-initialized executor and output results
@@ -329,120 +330,10 @@ fn executeAndOutput(allocator: std.mem.Allocator, exec: *executor.Executor, quer
 }
 
 
-/// Extract table path from SQL query (finds 'path' in FROM clause)
-fn extractTablePath(query: []const u8) ?[]const u8 {
-    // Simple extraction: find FROM 'path' or FROM "path"
-    const from_pos = std.mem.indexOf(u8, query, "FROM ") orelse
-        std.mem.indexOf(u8, query, "from ") orelse return null;
-
-    const after_from = query[from_pos + 5 ..];
-
-    // Skip whitespace
-    var start: usize = 0;
-    while (start < after_from.len and (after_from[start] == ' ' or after_from[start] == '\t')) {
-        start += 1;
-    }
-
-    if (start >= after_from.len) return null;
-
-    // Check for quoted path
-    const quote_char = after_from[start];
-    if (quote_char == '\'' or quote_char == '"') {
-        const path_start = start + 1;
-        const path_end = std.mem.indexOfScalarPos(u8, after_from, path_start, quote_char) orelse return null;
-        return after_from[path_start..path_end];
-    }
-
-    // Unquoted identifier
-    var end = start;
-    while (end < after_from.len and after_from[end] != ' ' and after_from[end] != '\t' and
-        after_from[end] != '\n' and after_from[end] != ';' and after_from[end] != ')') {
-        end += 1;
-    }
-
-    return after_from[start..end];
-}
-
-/// Open a file or Lance dataset directory and return its contents
-fn openFileOrDataset(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
-    // Check if path is a file or directory
-    const stat = std.fs.cwd().statFile(path) catch {
-        // Try as directory - read all .lance fragments
-        return readLanceDataset(allocator, path);
-    };
-
-    if (stat.kind == .directory) {
-        // It's a directory, try to open as Lance dataset
-        return readLanceDataset(allocator, path);
-    }
-
-    // It's a file, open it directly
-    var file = std.fs.cwd().openFile(path, .{}) catch return null;
-    defer file.close();
-
-    return file.readToEndAlloc(allocator, 500 * 1024 * 1024) catch null;
-}
-
-/// Read all .lance fragments from a Lance dataset directory
-fn readLanceDataset(allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
-    var data_path_buf: [4096]u8 = undefined;
-    const data_path = std.fmt.bufPrint(&data_path_buf, "{s}/data", .{path}) catch return null;
-
-    var data_dir = std.fs.cwd().openDir(data_path, .{ .iterate = true }) catch return null;
-    defer data_dir.close();
-
-    // Collect all .lance files
-    var lance_files = std.ArrayList([]const u8){};
-    defer {
-        for (lance_files.items) |name| allocator.free(name);
-        lance_files.deinit(allocator);
-    }
-
-    var iter = data_dir.iterate();
-    while (iter.next() catch null) |entry| {
-        if (entry.kind != .file) continue;
-        if (std.mem.endsWith(u8, entry.name, ".lance")) {
-            lance_files.append(allocator, allocator.dupe(u8, entry.name) catch continue) catch continue;
-        }
-    }
-
-    if (lance_files.items.len == 0) return null;
-
-    // Sort by filename (0.lance, 1.lance, 2.lance, etc.)
-    std.mem.sort([]const u8, lance_files.items, {}, struct {
-        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
-            // Extract numeric prefix for proper sorting
-            const a_num = extractFragmentNumber(a);
-            const b_num = extractFragmentNumber(b);
-            if (a_num != null and b_num != null) {
-                return a_num.? < b_num.?;
-            }
-            return std.mem.lessThan(u8, a, b);
-        }
-        fn extractFragmentNumber(name: []const u8) ?u64 {
-            // Parse "0.lance", "1.lance", etc.
-            const dot_pos = std.mem.indexOf(u8, name, ".") orelse return null;
-            return std.fmt.parseInt(u64, name[0..dot_pos], 10) catch null;
-        }
-    }.lessThan);
-
-    // Read and concatenate all fragments
-    var combined = std.ArrayList(u8){};
-    for (lance_files.items) |name| {
-        var file = data_dir.openFile(name, .{}) catch continue;
-        defer file.close();
-        const content = file.readToEndAlloc(allocator, 500 * 1024 * 1024) catch continue;
-        defer allocator.free(content);
-        combined.appendSlice(allocator, content) catch continue;
-    }
-
-    if (combined.items.len == 0) return null;
-    return combined.toOwnedSlice(allocator) catch null;
-}
 
 fn runQuery(allocator: std.mem.Allocator, query: []const u8, legacy_args: LegacyArgs) !void {
     // Extract table path from query
-    const table_path = extractTablePath(query) orelse {
+    const table_path = file_utils.extractTablePath(query) orelse {
         std.debug.print("Error: Could not extract table path from query\n", .{});
         std.debug.print("Query should be: SELECT ... FROM 'path/to/file.parquet'\n", .{});
         return;
@@ -465,7 +356,7 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, legacy_args: Legacy
     }
 
     // Read file into memory
-    const data = openFileOrDataset(allocator, table_path) orelse {
+    const data = file_utils.openFileOrDataset(allocator, table_path) orelse {
         std.debug.print("Error opening '{s}': file not found or unreadable\n", .{table_path});
         return;
     };
@@ -613,201 +504,4 @@ fn runXlsxQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u
     try executeAndOutput(allocator, &exec, query, legacy_args);
 }
 
-fn printResultsDelimited(result: *executor.Result, comptime delimiter: []const u8) void {
-    // Print header
-    for (result.columns, 0..) |col, i| {
-        if (i > 0) std.debug.print(delimiter, .{});
-        std.debug.print("{s}", .{col.name});
-    }
-    std.debug.print("\n", .{});
 
-    // Print rows
-    for (0..result.row_count) |row| {
-        for (result.columns, 0..) |col, i| {
-            if (i > 0) std.debug.print(delimiter, .{});
-            printValue(col.data, row);
-        }
-        std.debug.print("\n", .{});
-    }
-}
-
-fn printResultsTable(result: *executor.Result) void {
-    printResultsDelimited(result, "\t");
-}
-
-fn printResultsCsv(result: *executor.Result) void {
-    printResultsDelimited(result, ",");
-}
-
-fn printResultsJson(result: *executor.Result) void {
-    std.debug.print("[", .{});
-    for (0..result.row_count) |row| {
-        if (row > 0) std.debug.print(",", .{});
-        std.debug.print("{{", .{});
-        for (result.columns, 0..) |col, i| {
-            if (i > 0) std.debug.print(",", .{});
-            std.debug.print("\"{s}\":", .{col.name});
-            printValueJson(col.data, row);
-        }
-        std.debug.print("}}", .{});
-    }
-    std.debug.print("]\n", .{});
-}
-
-fn printValue(data: executor.Result.ColumnData, row: usize) void {
-    switch (data) {
-        .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |arr| {
-            std.debug.print("{d}", .{arr[row]});
-        },
-        .int32, .date32 => |arr| {
-            std.debug.print("{d}", .{arr[row]});
-        },
-        .float64 => |arr| {
-            std.debug.print("{d:.6}", .{arr[row]});
-        },
-        .float32 => |arr| {
-            std.debug.print("{d:.6}", .{arr[row]});
-        },
-        .bool_ => |arr| {
-            std.debug.print("{}", .{arr[row]});
-        },
-        .string => |arr| {
-            std.debug.print("{s}", .{arr[row]});
-        },
-    }
-}
-
-fn printValueJson(data: executor.Result.ColumnData, row: usize) void {
-    switch (data) {
-        .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |arr| {
-            std.debug.print("{d}", .{arr[row]});
-        },
-        .int32, .date32 => |arr| {
-            std.debug.print("{d}", .{arr[row]});
-        },
-        .float64 => |arr| {
-            std.debug.print("{d}", .{arr[row]});
-        },
-        .float32 => |arr| {
-            std.debug.print("{d}", .{arr[row]});
-        },
-        .bool_ => |arr| {
-            std.debug.print("{}", .{arr[row]});
-        },
-        .string => |arr| {
-            std.debug.print("\"{s}\"", .{arr[row]});
-        },
-    }
-}
-
-fn runBenchmark(allocator: std.mem.Allocator, query: []const u8, legacy_args: LegacyArgs) !void {
-    // Extract table path from query
-    const table_path = extractTablePath(query) orelse {
-        std.debug.print("Error: Could not extract table path from query\n", .{});
-        return;
-    };
-
-    // Read file into memory
-    const data = openFileOrDataset(allocator, table_path) orelse {
-        std.debug.print("Error opening '{s}': file not found or unreadable\n", .{table_path});
-        return;
-    };
-    defer allocator.free(data);
-
-    // Initialize Table
-    var table = Table.init(allocator, data) catch |err| {
-        std.debug.print("Error parsing '{s}': {}\n", .{ table_path, err });
-        return;
-    };
-    defer table.deinit();
-
-    // Tokenize
-    var lex = lexer.Lexer.init(query);
-    var tokens = std.ArrayList(lexer.Token){};
-    defer tokens.deinit(allocator);
-
-    while (true) {
-        const tok = lex.nextToken() catch |err| {
-            std.debug.print("Lexer error: {}\n", .{err});
-            return;
-        };
-        tokens.append(allocator, tok) catch {
-            std.debug.print("Error: out of memory during tokenization\n", .{});
-            return;
-        };
-        if (tok.type == .EOF) break;
-    }
-
-    // Parse
-    var parse = parser.Parser.init(tokens.items, allocator);
-    const stmt = parse.parseStatement() catch |err| {
-        std.debug.print("Parse error: {}\n", .{err});
-        return;
-    };
-
-    // Get column count
-    const num_rows = table.numColumns();
-
-    std.debug.print("LanceQL Benchmark\n", .{});
-    std.debug.print("=================\n", .{});
-    std.debug.print("Query: {s}\n", .{query});
-    std.debug.print("Table: {s} ({d} columns)\n", .{ table_path, num_rows });
-    std.debug.print("Warmup: {d}, Iterations: {d}\n\n", .{ legacy_args.warmup, legacy_args.iterations });
-
-    // Warmup
-    for (0..legacy_args.warmup) |_| {
-        var exec = executor.Executor.init(&table, allocator);
-        var result = exec.execute(&stmt.select, &[_]ast.Value{}) catch continue;
-        result.deinit();
-        exec.deinit();
-    }
-
-    // Benchmark
-    var times = try allocator.alloc(u64, legacy_args.iterations);
-    defer allocator.free(times);
-
-    for (0..legacy_args.iterations) |i| {
-        var timer = try std.time.Timer.start();
-        var exec = executor.Executor.init(&table, allocator);
-        var result = exec.execute(&stmt.select, &[_]ast.Value{}) catch {
-            times[i] = 0;
-            exec.deinit();
-            continue;
-        };
-        times[i] = timer.read();
-        result.deinit();
-        exec.deinit();
-    }
-
-    // Calculate stats
-    var min_ns: u64 = std.math.maxInt(u64);
-    var max_ns: u64 = 0;
-    var total_ns: u64 = 0;
-
-    for (times) |t| {
-        if (t == 0) continue;
-        min_ns = @min(min_ns, t);
-        max_ns = @max(max_ns, t);
-        total_ns += t;
-    }
-
-    const avg_ns = total_ns / legacy_args.iterations;
-    const avg_ms = @as(f64, @floatFromInt(avg_ns)) / 1_000_000;
-    const min_ms = @as(f64, @floatFromInt(min_ns)) / 1_000_000;
-    const max_ms = @as(f64, @floatFromInt(max_ns)) / 1_000_000;
-    const throughput = @as(f64, @floatFromInt(num_rows)) / avg_ms / 1000;
-
-    if (legacy_args.json) {
-        std.debug.print(
-            \\{{"query": "{s}", "columns": {d}, "min_ms": {d:.3}, "avg_ms": {d:.3}, "max_ms": {d:.3}, "throughput_mrows_sec": {d:.2}}}
-            \\
-        , .{ query, num_rows, min_ms, avg_ms, max_ms, throughput });
-    } else {
-        std.debug.print("Results:\n", .{});
-        std.debug.print("  Columns:    {d}\n", .{num_rows});
-        std.debug.print("  Min:        {d:.2} ms\n", .{min_ms});
-        std.debug.print("  Avg:        {d:.2} ms\n", .{avg_ms});
-        std.debug.print("  Max:        {d:.2} ms\n", .{max_ms});
-        std.debug.print("  Throughput: {d:.1}M rows/sec\n", .{throughput});
-    }
-}
