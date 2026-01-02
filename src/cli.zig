@@ -21,6 +21,7 @@ const serve = @import("cli/serve.zig");
 const output = @import("cli/output.zig");
 const benchmark = @import("cli/benchmark.zig");
 const file_utils = @import("cli/file_utils.zig");
+const yaml = @import("cli/yaml.zig");
 const lanceql = @import("lanceql");
 const metal = @import("lanceql.metal");
 const Table = @import("lanceql.table").Table;
@@ -281,13 +282,74 @@ fn cmdServe(allocator: std.mem.Allocator, opts: args.ServeOptions) !void {
 
 /// Run pipeline from config file
 fn runConfigFile(allocator: std.mem.Allocator, config_path: []const u8) !void {
-    _ = allocator;
-    std.debug.print("Error: Config file execution not yet implemented.\n", .{});
-    std.debug.print("Config path: {s}\n", .{config_path});
-    std.debug.print("\nConfig files will support:\n", .{});
-    std.debug.print("  - YAML pipeline definitions\n", .{});
-    std.debug.print("  - Multi-step data processing\n", .{});
-    std.debug.print("  - Scheduled execution\n", .{});
+    const content = std.fs.cwd().readFileAlloc(allocator, config_path, 1024 * 1024) catch |err| {
+        std.debug.print("Error reading config file '{s}': {}\n", .{ config_path, err });
+        return;
+    };
+    defer allocator.free(content);
+
+    var config = yaml.parse(allocator, content) catch |err| {
+        std.debug.print("Error parsing config file: {}\n", .{err});
+        return;
+    };
+    defer config.deinit();
+
+    std.debug.print("Running: {s}\n", .{config.command});
+
+    if (std.mem.eql(u8, config.command, "ingest")) {
+        var opts = args.IngestOptions{
+            .input = config.input,
+            .output = config.output,
+        };
+        if (config.options.get("format")) |fmt| {
+            opts.format = parseFormat(fmt);
+        }
+        if (config.options.get("delimiter")) |d| {
+            if (d.len > 0) opts.delimiter = d[0];
+        }
+        if (config.options.get("header")) |h| {
+            opts.header = !std.mem.eql(u8, h, "false");
+        }
+        try ingest.run(allocator, opts);
+    } else if (std.mem.eql(u8, config.command, "transform")) {
+        const opts = args.TransformOptions{
+            .input = config.input,
+            .output = config.output,
+            .select = config.options.get("select"),
+            .filter = config.options.get("filter"),
+            .rename = config.options.get("rename"),
+            .limit = if (config.options.get("limit")) |l| std.fmt.parseInt(usize, l, 10) catch null else null,
+        };
+        try transform.run(allocator, opts);
+    } else if (std.mem.eql(u8, config.command, "enrich")) {
+        var opts = args.EnrichOptions{
+            .input = config.input,
+            .output = config.output,
+            .embed = config.options.get("embed"),
+        };
+        if (config.options.get("model")) |m| {
+            if (std.mem.eql(u8, m, "clip")) opts.model = .clip;
+        }
+        if (config.options.get("index")) |idx| {
+            opts.index = idx;
+        }
+        try enrich.run(allocator, opts);
+    } else {
+        std.debug.print("Unknown command: {s}\n", .{config.command});
+    }
+}
+
+fn parseFormat(fmt: []const u8) args.IngestOptions.Format {
+    if (std.mem.eql(u8, fmt, "csv")) return .csv;
+    if (std.mem.eql(u8, fmt, "tsv")) return .tsv;
+    if (std.mem.eql(u8, fmt, "json")) return .json;
+    if (std.mem.eql(u8, fmt, "jsonl")) return .jsonl;
+    if (std.mem.eql(u8, fmt, "parquet")) return .parquet;
+    if (std.mem.eql(u8, fmt, "arrow")) return .arrow;
+    if (std.mem.eql(u8, fmt, "avro")) return .avro;
+    if (std.mem.eql(u8, fmt, "orc")) return .orc;
+    if (std.mem.eql(u8, fmt, "xlsx")) return .xlsx;
+    return .auto;
 }
 
 /// Find config file in current directory

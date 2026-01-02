@@ -9,6 +9,9 @@
 const std = @import("std");
 const args = @import("args.zig");
 const http = @import("http.zig");
+const ingest = @import("ingest.zig");
+const transform = @import("transform.zig");
+const enrich = @import("enrich.zig");
 
 // SQL execution
 const lanceql = @import("lanceql");
@@ -216,6 +219,8 @@ pub const Server = struct {
             return self.handleFiles();
         } else if (std.mem.eql(u8, request.path, "/api/health")) {
             return http.jsonResponse(self.allocator, "{\"status\":\"ok\"}");
+        } else if (std.mem.eql(u8, request.path, "/api/run")) {
+            return self.handleRun(request);
         } else if (std.mem.startsWith(u8, request.path, "/api/schema/")) {
             const file_path = request.path["/api/schema/".len..];
             return self.handleSchemaForFile(file_path);
@@ -345,6 +350,66 @@ pub const Server = struct {
             return http.htmlResponse(self.allocator, CONFIG_HTML);
         }
         return http.htmlResponse(self.allocator, INDEX_HTML);
+    }
+
+    fn handleRun(self: *Self, request: *http.Request) !http.Response {
+        if (request.method != .POST) {
+            return http.errorResponse(self.allocator, 405, "Method not allowed");
+        }
+
+        // Parse command from JSON body
+        const command = extractJsonField(request.body, "command") orelse {
+            return http.errorResponse(self.allocator, 400, "Missing 'command' field");
+        };
+
+        const input_field = extractJsonField(request.body, "input");
+        const output_field = extractJsonField(request.body, "output");
+
+        if (std.mem.eql(u8, command, "ingest")) {
+            var opts = args.IngestOptions{
+                .input = input_field,
+                .output = output_field,
+            };
+            if (extractJsonField(request.body, "format")) |fmt| {
+                opts.format = parseFormat(fmt);
+            }
+            ingest.run(self.allocator, opts) catch |err| {
+                const msg = std.fmt.allocPrint(self.allocator, "{{\"error\":\"{}\"}}", .{err}) catch
+                    return http.jsonResponse(self.allocator, "{\"error\":\"execution failed\"}");
+                return http.jsonResponse(self.allocator, msg);
+            };
+            return http.jsonResponse(self.allocator, "{\"success\":true}");
+        } else if (std.mem.eql(u8, command, "transform")) {
+            const opts = args.TransformOptions{
+                .input = input_field,
+                .output = output_field,
+                .select = extractJsonField(request.body, "select"),
+                .filter = extractJsonField(request.body, "filter"),
+            };
+            transform.run(self.allocator, opts) catch |err| {
+                const msg = std.fmt.allocPrint(self.allocator, "{{\"error\":\"{}\"}}", .{err}) catch
+                    return http.jsonResponse(self.allocator, "{\"error\":\"execution failed\"}");
+                return http.jsonResponse(self.allocator, msg);
+            };
+            return http.jsonResponse(self.allocator, "{\"success\":true}");
+        } else if (std.mem.eql(u8, command, "enrich")) {
+            var opts = args.EnrichOptions{
+                .input = input_field,
+                .output = output_field,
+                .embed = extractJsonField(request.body, "embed"),
+            };
+            if (extractJsonField(request.body, "model")) |m| {
+                if (std.mem.eql(u8, m, "clip")) opts.model = .clip;
+            }
+            enrich.run(self.allocator, opts) catch |err| {
+                const msg = std.fmt.allocPrint(self.allocator, "{{\"error\":\"{}\"}}", .{err}) catch
+                    return http.jsonResponse(self.allocator, "{\"error\":\"execution failed\"}");
+                return http.jsonResponse(self.allocator, msg);
+            };
+            return http.jsonResponse(self.allocator, "{\"success\":true}");
+        }
+
+        return http.errorResponse(self.allocator, 400, "Unknown command");
     }
 
     fn handleSchema(self: *Self) !http.Response {
@@ -587,30 +652,47 @@ fn detectFolderType(allocator: std.mem.Allocator, parent: []const u8, name: []co
 
 /// Extract SQL from JSON body: {"sql": "..."}
 fn extractSqlFromJson(body: []const u8) ?[]const u8 {
-    // Simple JSON parsing for {"sql": "..."}
-    const sql_key = "\"sql\"";
-    const start = std.mem.indexOf(u8, body, sql_key) orelse return null;
-    const after_key = body[start + sql_key.len ..];
+    return extractJsonField(body, "sql");
+}
 
-    // Find colon
+/// Extract a string field from JSON body
+fn extractJsonField(body: []const u8, field: []const u8) ?[]const u8 {
+    // Build key pattern: "field"
+    var key_buf: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "\"{s}\"", .{field}) catch return null;
+
+    const start = std.mem.indexOf(u8, body, key) orelse return null;
+    const after_key = body[start + key.len ..];
+
     const colon = std.mem.indexOf(u8, after_key, ":") orelse return null;
     const after_colon = std.mem.trimLeft(u8, after_key[colon + 1 ..], " \t\n\r");
 
-    // Find opening quote
     if (after_colon.len == 0 or after_colon[0] != '"') return null;
     const value_start = after_colon[1..];
 
-    // Find closing quote (handle escaped quotes)
     var i: usize = 0;
     while (i < value_start.len) : (i += 1) {
         if (value_start[i] == '\\' and i + 1 < value_start.len) {
-            i += 1; // Skip escaped char
+            i += 1;
         } else if (value_start[i] == '"') {
             return value_start[0..i];
         }
     }
-
     return null;
+}
+
+/// Parse format string to IngestOptions.Format
+fn parseFormat(fmt: []const u8) args.IngestOptions.Format {
+    if (std.mem.eql(u8, fmt, "csv")) return .csv;
+    if (std.mem.eql(u8, fmt, "tsv")) return .tsv;
+    if (std.mem.eql(u8, fmt, "json")) return .json;
+    if (std.mem.eql(u8, fmt, "jsonl")) return .jsonl;
+    if (std.mem.eql(u8, fmt, "parquet")) return .parquet;
+    if (std.mem.eql(u8, fmt, "arrow")) return .arrow;
+    if (std.mem.eql(u8, fmt, "avro")) return .avro;
+    if (std.mem.eql(u8, fmt, "orc")) return .orc;
+    if (std.mem.eql(u8, fmt, "xlsx")) return .xlsx;
+    return .auto;
 }
 
 /// Convert executor result to JSON
