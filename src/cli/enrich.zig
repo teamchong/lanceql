@@ -9,6 +9,7 @@
 const std = @import("std");
 const args = @import("args.zig");
 const file_detect = @import("file_detect.zig");
+const query_utils = @import("query_utils.zig");
 
 // Index building module
 const index_builder = @import("enrich/index_builder.zig");
@@ -19,16 +20,7 @@ const embedding = @import("../embedding/embedding.zig");
 // Table and format modules
 const lanceql = @import("lanceql");
 const writer = lanceql.encoding.writer;
-const Table = lanceql.Table;
-const ParquetTable = @import("lanceql.parquet_table").ParquetTable;
-const ArrowTable = @import("lanceql.arrow_table").ArrowTable;
-
-// SQL executor for reading data
-const lexer = @import("lanceql.sql.lexer");
-const parser = @import("lanceql.sql.parser");
-const executor = @import("lanceql.sql.executor");
-const ast = @import("lanceql.sql.ast");
-const Result = executor.Result;
+const Result = @import("lanceql.sql.executor").Result;
 
 pub const EnrichError = error{
     NoInputFile,
@@ -47,17 +39,17 @@ pub const EnrichError = error{
 
 pub fn run(allocator: std.mem.Allocator, opts: args.EnrichOptions) !void {
     const input_path = opts.input orelse {
-        std.debug.print("No input file specified\n", .{});
+        std.debug.print("Error: No input file specified\n", .{});
         return EnrichError.NoInputFile;
     };
 
     const output_path = opts.output orelse {
-        std.debug.print("No output file specified (use -o)\n", .{});
+        std.debug.print("Error: No output file specified (use -o)\n", .{});
         return EnrichError.NoOutputFile;
     };
 
     const embed_column = opts.embed orelse {
-        std.debug.print("No column specified for embedding (use --embed)\n", .{});
+        std.debug.print("Error: No column specified for embedding (use --embed)\n", .{});
         return EnrichError.NoEmbedColumn;
     };
     const model_type = opts.model;
@@ -87,7 +79,7 @@ pub fn run(allocator: std.mem.Allocator, opts: args.EnrichOptions) !void {
 
     std.debug.print("\nReading input file...\n", .{});
     const data = std.fs.cwd().readFileAlloc(allocator, input_path, 500 * 1024 * 1024) catch |err| {
-        std.debug.print("Failed to read '{s}': {}\n", .{ input_path, err });
+        std.debug.print("Error reading '{s}': {}\n", .{ input_path, err });
         return EnrichError.FileReadError;
     };
     defer allocator.free(data);
@@ -96,7 +88,7 @@ pub fn run(allocator: std.mem.Allocator, opts: args.EnrichOptions) !void {
     const sql = try std.fmt.allocPrint(allocator, "SELECT * FROM '{s}'", .{input_path});
     defer allocator.free(sql);
 
-    var result = executeQuery(allocator, data, sql, file_type) catch |err| {
+    var result = query_utils.executeQuery(allocator, data, sql, file_type) catch |err| {
         std.debug.print("Query failed: {}\n", .{err});
         return EnrichError.QueryError;
     };
@@ -166,72 +158,6 @@ pub fn run(allocator: std.mem.Allocator, opts: args.EnrichOptions) !void {
         const index_path = try std.fmt.allocPrint(allocator, "{s}.index", .{output_path});
         defer allocator.free(index_path);
         std.debug.print("  Index: {s}\n", .{index_path});
-    }
-}
-
-/// Execute SQL query on data
-fn executeQuery(allocator: std.mem.Allocator, data: []const u8, sql: []const u8, file_type: file_detect.FileType) !Result {
-    // Tokenize
-    var lex = lexer.Lexer.init(sql);
-    var tokens = std.ArrayList(lexer.Token){};
-    defer tokens.deinit(allocator);
-
-    while (true) {
-        const tok = try lex.nextToken();
-        try tokens.append(allocator, tok);
-        if (tok.type == .EOF) break;
-    }
-
-    // Parse
-    var parse = parser.Parser.init(tokens.items, allocator);
-    const stmt = try parse.parseStatement();
-
-    // Execute based on file type
-    switch (file_type) {
-        .parquet => {
-            var pq_table = try ParquetTable.init(allocator, data);
-            defer pq_table.deinit();
-
-            var exec = executor.Executor.initWithParquet(&pq_table, allocator);
-            defer exec.deinit();
-
-            return try exec.execute(&stmt.select, &[_]ast.Value{});
-        },
-        .lance => {
-            var table = try Table.init(allocator, data);
-            defer table.deinit();
-
-            var exec = executor.Executor.init(&table, allocator);
-            defer exec.deinit();
-
-            return try exec.execute(&stmt.select, &[_]ast.Value{});
-        },
-        .arrow => {
-            var arrow_table = try ArrowTable.init(allocator, data);
-            defer arrow_table.deinit();
-
-            var exec = executor.Executor.initWithArrow(&arrow_table, allocator);
-            defer exec.deinit();
-
-            return try exec.execute(&stmt.select, &[_]ast.Value{});
-        },
-        else => {
-            // Unsupported formats (avro, orc, xlsx, csv, json, delta, iceberg, unknown)
-            // Try Lance first, then Parquet as fallback
-            if (Table.init(allocator, data)) |table_result| {
-                var table = table_result;
-                defer table.deinit();
-                var exec = executor.Executor.init(&table, allocator);
-                defer exec.deinit();
-                return try exec.execute(&stmt.select, &[_]ast.Value{});
-            } else |_| {
-                var pq_table = try ParquetTable.init(allocator, data);
-                defer pq_table.deinit();
-                var exec = executor.Executor.initWithParquet(&pq_table, allocator);
-                defer exec.deinit();
-                return try exec.execute(&stmt.select, &[_]ast.Value{});
-            }
-        },
     }
 }
 

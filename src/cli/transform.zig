@@ -10,19 +10,10 @@
 const std = @import("std");
 const lanceql = @import("lanceql");
 const writer = lanceql.encoding.writer;
-const Table = lanceql.Table;
-const ParquetTable = @import("lanceql.parquet_table").ParquetTable;
-const ArrowTable = @import("lanceql.arrow_table").ArrowTable;
-const AvroTable = @import("lanceql.avro_table").AvroTable;
-const OrcTable = @import("lanceql.orc_table").OrcTable;
-const XlsxTable = @import("lanceql.xlsx_table").XlsxTable;
-const lexer = @import("lanceql.sql.lexer");
-const parser = @import("lanceql.sql.parser");
-const executor = @import("lanceql.sql.executor");
-const ast = @import("lanceql.sql.ast");
-const Result = executor.Result;
+const Result = @import("lanceql.sql.executor").Result;
 const args = @import("args.zig");
 const file_detect = @import("file_detect.zig");
+const query_utils = @import("query_utils.zig");
 
 pub const TransformError = error{
     NoInputFile,
@@ -64,7 +55,7 @@ pub fn run(allocator: std.mem.Allocator, opts: args.TransformOptions) !void {
 
     // Detect file type and execute query
     const file_type = file_detect.detect(input_path, data);
-    var result = try executeQuery(allocator, data, sql, file_type);
+    var result = try query_utils.executeQuery(allocator, data, sql, file_type);
     defer result.deinit();
 
     std.debug.print("Query returned {d} rows, {d} columns\n", .{ result.row_count, result.columns.len });
@@ -150,99 +141,6 @@ fn findRename(rename_spec: []const u8, col_name: []const u8) ?[]const u8 {
         }
     }
     return null;
-}
-
-/// Execute SQL query on data
-fn executeQuery(allocator: std.mem.Allocator, data: []const u8, sql: []const u8, file_type: file_detect.FileType) !Result {
-    // Tokenize
-    var lex = lexer.Lexer.init(sql);
-    var tokens = std.ArrayList(lexer.Token){};
-    defer tokens.deinit(allocator);
-
-    while (true) {
-        const tok = try lex.nextToken();
-        try tokens.append(allocator, tok);
-        if (tok.type == .EOF) break;
-    }
-
-    // Parse
-    var parse = parser.Parser.init(tokens.items, allocator);
-    const stmt = try parse.parseStatement();
-
-    // Execute based on file type
-    switch (file_type) {
-        .parquet => {
-            var pq_table = try ParquetTable.init(allocator, data);
-            defer pq_table.deinit();
-
-            var exec = executor.Executor.initWithParquet(&pq_table, allocator);
-            defer exec.deinit();
-
-            return try exec.execute(&stmt.select, &[_]ast.Value{});
-        },
-        .lance => {
-            var table = try Table.init(allocator, data);
-            defer table.deinit();
-
-            var exec = executor.Executor.init(&table, allocator);
-            defer exec.deinit();
-
-            return try exec.execute(&stmt.select, &[_]ast.Value{});
-        },
-        .arrow => {
-            var arrow_table = try ArrowTable.init(allocator, data);
-            defer arrow_table.deinit();
-
-            var exec = executor.Executor.initWithArrow(&arrow_table, allocator);
-            defer exec.deinit();
-
-            return try exec.execute(&stmt.select, &[_]ast.Value{});
-        },
-        .avro => {
-            var avro_table = try AvroTable.init(allocator, data);
-            defer avro_table.deinit();
-
-            var exec = executor.Executor.initWithAvro(&avro_table, allocator);
-            defer exec.deinit();
-
-            return try exec.execute(&stmt.select, &[_]ast.Value{});
-        },
-        .orc => {
-            var orc_table = try OrcTable.init(allocator, data);
-            defer orc_table.deinit();
-
-            var exec = executor.Executor.initWithOrc(&orc_table, allocator);
-            defer exec.deinit();
-
-            return try exec.execute(&stmt.select, &[_]ast.Value{});
-        },
-        .xlsx => {
-            var xlsx_table = try XlsxTable.init(allocator, data);
-            defer xlsx_table.deinit();
-
-            var exec = executor.Executor.initWithXlsx(&xlsx_table, allocator);
-            defer exec.deinit();
-
-            return try exec.execute(&stmt.select, &[_]ast.Value{});
-        },
-        else => {
-            // Unsupported formats (csv, json, delta, iceberg, unknown)
-            // Try Lance first, then Parquet as fallback
-            if (Table.init(allocator, data)) |table_result| {
-                var table = table_result;
-                defer table.deinit();
-                var exec = executor.Executor.init(&table, allocator);
-                defer exec.deinit();
-                return try exec.execute(&stmt.select, &[_]ast.Value{});
-            } else |_| {
-                var pq_table = try ParquetTable.init(allocator, data);
-                defer pq_table.deinit();
-                var exec = executor.Executor.initWithParquet(&pq_table, allocator);
-                defer exec.deinit();
-                return try exec.execute(&stmt.select, &[_]ast.Value{});
-            }
-        },
-    }
 }
 
 /// Map Result.ColumnData type to writer.DataType
