@@ -112,9 +112,19 @@ pub const OrcTable = struct {
         return mapOrcToParquetType(orc_type);
     }
 
+    /// Generic helper to convert array from one type to another
+    fn convertArray(self: *Self, comptime From: type, comptime To: type, values: []const From) OrcTableError![]To {
+        var result = self.allocator.alloc(To, values.len) catch {
+            return OrcTableError.OutOfMemory;
+        };
+        for (values, 0..) |v, i| {
+            result[i] = if (To == bool) (v != 0) else if (@typeInfo(To) == .float) @floatCast(v) else @intCast(v);
+        }
+        return result;
+    }
+
     /// Read int64 column data
     pub fn readInt64Column(self: *Self, col_idx: usize) OrcTableError![]i64 {
-        // ORC uses 1-based column IDs (0 is struct root)
         return self.reader.readLongColumn(@intCast(col_idx + 1)) catch {
             return OrcTableError.ReadFailed;
         };
@@ -124,16 +134,7 @@ pub const OrcTable = struct {
     pub fn readInt32Column(self: *Self, col_idx: usize) OrcTableError![]i32 {
         const values64 = try self.readInt64Column(col_idx);
         defer self.allocator.free(values64);
-
-        var values32 = self.allocator.alloc(i32, values64.len) catch {
-            return OrcTableError.OutOfMemory;
-        };
-
-        for (values64, 0..) |v, i| {
-            values32[i] = @intCast(v);
-        }
-
-        return values32;
+        return self.convertArray(i64, i32, values64);
     }
 
     /// Read float64 column data
@@ -147,16 +148,7 @@ pub const OrcTable = struct {
     pub fn readFloat32Column(self: *Self, col_idx: usize) OrcTableError![]f32 {
         const values64 = try self.readFloat64Column(col_idx);
         defer self.allocator.free(values64);
-
-        var values32 = self.allocator.alloc(f32, values64.len) catch {
-            return OrcTableError.OutOfMemory;
-        };
-
-        for (values64, 0..) |v, i| {
-            values32[i] = @floatCast(v);
-        }
-
-        return values32;
+        return self.convertArray(f64, f32, values64);
     }
 
     /// Read string column data
@@ -170,16 +162,7 @@ pub const OrcTable = struct {
     pub fn readBoolColumn(self: *Self, col_idx: usize) OrcTableError![]bool {
         const values64 = try self.readInt64Column(col_idx);
         defer self.allocator.free(values64);
-
-        var bools = self.allocator.alloc(bool, values64.len) catch {
-            return OrcTableError.OutOfMemory;
-        };
-
-        for (values64, 0..) |v, i| {
-            bools[i] = v != 0;
-        }
-
-        return bools;
+        return self.convertArray(i64, bool, values64);
     }
 
     /// Check if path is a valid ORC file
