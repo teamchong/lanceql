@@ -43,6 +43,21 @@ fn csvTypeToLanceType(csv_type: csv.ColumnType) writer.DataType {
     };
 }
 
+/// Finalize Lance writer and write to output file
+fn finalizeLanceFile(lance_writer: *writer.LanceWriter, output_path: []const u8) !void {
+    const lance_data = try lance_writer.finalize();
+    const out_file = std.fs.cwd().createFile(output_path, .{}) catch |err| {
+        std.debug.print("Error creating output file: {}\n", .{err});
+        return error.WriteError;
+    };
+    defer out_file.close();
+    out_file.writeAll(lance_data) catch |err| {
+        std.debug.print("Error writing output file: {}\n", .{err});
+        return error.WriteError;
+    };
+    std.debug.print("Created: {s} ({d} bytes)\n", .{ output_path, lance_data.len });
+}
+
 /// Detect file format from extension or directory structure
 fn detectFormat(allocator: std.mem.Allocator, path: []const u8) args.IngestOptions.Format {
     // File extension detection
@@ -253,24 +268,7 @@ pub fn ingestCsv(
         try lance_writer.writeColumnBatch(batch);
     }
 
-    // Finalize and write file
-    // Note: finalize() returns a reference to internal buffer, not a copy
-    // It will be freed when lance_writer.deinit() is called, so don't free it here
-    const lance_data = try lance_writer.finalize();
-
-    // Write to output file
-    const out_file = std.fs.cwd().createFile(output_path, .{}) catch |err| {
-        std.debug.print("Error creating output file: {}\n", .{err});
-        return;
-    };
-    defer out_file.close();
-
-    out_file.writeAll(lance_data) catch |err| {
-        std.debug.print("Error writing output file: {}\n", .{err});
-        return;
-    };
-
-    std.debug.print("Created: {s} ({d} bytes)\n", .{ output_path, lance_data.len });
+    try finalizeLanceFile(&lance_writer, output_path);
 }
 
 /// Ingest JSON/JSONL data to Lance file
@@ -353,22 +351,7 @@ pub fn ingestJson(
         try lance_writer.writeColumnBatch(batch);
     }
 
-    // Finalize and write file
-    const lance_data = try lance_writer.finalize();
-
-    // Write to output file
-    const out_file = std.fs.cwd().createFile(output_path, .{}) catch |err| {
-        std.debug.print("Error creating output file: {}\n", .{err});
-        return;
-    };
-    defer out_file.close();
-
-    out_file.writeAll(lance_data) catch |err| {
-        std.debug.print("Error writing output file: {}\n", .{err});
-        return;
-    };
-
-    std.debug.print("Created: {s} ({d} bytes)\n", .{ output_path, lance_data.len });
+    try finalizeLanceFile(&lance_writer, output_path);
 }
 
 /// Map Parquet physical type to Lance DataType
@@ -523,21 +506,7 @@ pub fn ingestParquet(
         try lance_writer.writeColumnBatch(batch);
     }
 
-    // Finalize and write file
-    const lance_data = try lance_writer.finalize();
-
-    const out_file = std.fs.cwd().createFile(output_path, .{}) catch |err| {
-        std.debug.print("Error creating output file: {}\n", .{err});
-        return;
-    };
-    defer out_file.close();
-
-    out_file.writeAll(lance_data) catch |err| {
-        std.debug.print("Error writing output file: {}\n", .{err});
-        return;
-    };
-
-    std.debug.print("Created: {s} ({d} bytes)\n", .{ output_path, lance_data.len });
+    try finalizeLanceFile(&lance_writer, output_path);
 }
 
 /// Map Arrow type to Lance DataType
@@ -677,21 +646,7 @@ pub fn ingestArrow(
         }
     }
 
-    // Finalize and write file
-    const lance_data = try lance_writer.finalize();
-
-    const out_file = std.fs.cwd().createFile(output_path, .{}) catch |err| {
-        std.debug.print("Error creating output file: {}\n", .{err});
-        return;
-    };
-    defer out_file.close();
-
-    out_file.writeAll(lance_data) catch |err| {
-        std.debug.print("Error writing output file: {}\n", .{err});
-        return;
-    };
-
-    std.debug.print("Created: {s} ({d} bytes)\n", .{ output_path, lance_data.len });
+    try finalizeLanceFile(&lance_writer, output_path);
 }
 
 /// Ingest Avro data to Lance file
@@ -857,21 +812,7 @@ pub fn ingestAvro(
         }
     }
 
-    // Finalize and write file
-    const lance_data = try lance_writer.finalize();
-
-    const out_file = std.fs.cwd().createFile(output_path, .{}) catch |err| {
-        std.debug.print("Error creating output file: {}\n", .{err});
-        return;
-    };
-    defer out_file.close();
-
-    out_file.writeAll(lance_data) catch |err| {
-        std.debug.print("Error writing file: {}\n", .{err});
-        return;
-    };
-
-    std.debug.print("Created: {s} ({d} bytes)\n", .{output_path, lance_data.len});
+    try finalizeLanceFile(&lance_writer, output_path);
 }
 
 /// Convert ORC type to Lance type
@@ -1055,21 +996,7 @@ pub fn ingestOrc(
         }
     }
 
-    // Finalize and write file
-    const lance_data = try lance_writer.finalize();
-
-    const out_file = std.fs.cwd().createFile(output_path, .{}) catch |err| {
-        std.debug.print("Error creating output file: {}\n", .{err});
-        return;
-    };
-    defer out_file.close();
-
-    out_file.writeAll(lance_data) catch |err| {
-        std.debug.print("Error writing file: {}\n", .{err});
-        return;
-    };
-
-    std.debug.print("Created: {s} ({d} bytes)\n", .{ output_path, lance_data.len });
+    try finalizeLanceFile(&lance_writer, output_path);
 }
 
 /// Infer Lance type from XLSX cell values in a column
@@ -1236,21 +1163,7 @@ pub fn ingestXlsx(
         }
     }
 
-    // Finalize and write file
-    const lance_data = try lance_writer.finalize();
-
-    const out_file = std.fs.cwd().createFile(output_path, .{}) catch |err| {
-        std.debug.print("Error creating output file: {}\n", .{err});
-        return;
-    };
-    defer out_file.close();
-
-    out_file.writeAll(lance_data) catch |err| {
-        std.debug.print("Error writing file: {}\n", .{err});
-        return;
-    };
-
-    std.debug.print("Created: {s} ({d} bytes)\n", .{output_path, lance_data.len});
+    try finalizeLanceFile(&lance_writer, output_path);
 }
 
 /// Ingest Delta Lake table to Lance file
