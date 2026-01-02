@@ -24,6 +24,7 @@ pub const having_eval = @import("having_eval.zig");
 pub const set_ops = @import("set_ops.zig");
 pub const window_eval = @import("window_eval.zig");
 pub const where_eval = @import("where_eval.zig");
+pub const expr_eval = @import("expr_eval.zig");
 
 const Expr = ast.Expr;
 const SelectStmt = ast.SelectStmt;
@@ -243,6 +244,26 @@ pub const Executor = struct {
         const filtered = try self.allocator.alloc(T, indices.len);
         for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
         return filtered;
+    }
+
+    /// Method call wrapper conforming to MethodCallFn signature
+    /// Bridges expr_eval to executor's evaluateMethodCall
+    fn methodCallWrapper(ctx: *anyopaque, expr: *const Expr, row_idx: u32) anyerror!Value {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return switch (expr.*) {
+            .method_call => |mc| self.evaluateMethodCall(mc, row_idx),
+            else => error.NotAMethodCall,
+        };
+    }
+
+    /// Build ExprContext for expr_eval module
+    fn buildExprContext(self: *Self) expr_eval.ExprContext {
+        return .{
+            .allocator = self.allocator,
+            .column_cache = &self.column_cache,
+            .method_ctx = self,
+            .method_call_fn = methodCallWrapper,
+        };
     }
 
     /// Set the dispatcher for @logic_table method calls
@@ -1745,57 +1766,16 @@ pub const Executor = struct {
         return where_eval.evaluateWhere(ctx, where_expr, params);
     }
 
-    /// Evaluate expression to a concrete value (for WHERE clause comparisons)
+    /// Evaluate expression to a concrete value (delegates to expr_eval)
     fn evaluateToValue(self: *Self, expr: *const Expr, row_idx: u32) !Value {
-        return switch (expr.*) {
-            .value => expr.value,
-            .column => |col| blk: {
-                // Lookup in cache instead of reading from table
-                const cached = self.column_cache.get(col.name) orelse return error.ColumnNotCached;
-
-                break :blk switch (cached) {
-                    .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| Value{ .integer = data[row_idx] },
-                    .int32, .date32 => |data| Value{ .integer = data[row_idx] },
-                    .float64 => |data| Value{ .float = data[row_idx] },
-                    .float32 => |data| Value{ .float = data[row_idx] },
-                    .bool_ => |data| Value{ .integer = if (data[row_idx]) 1 else 0 },
-                    .string => |data| Value{ .string = data[row_idx] },
-                };
-            },
-            .method_call => |mc| try self.evaluateMethodCall(mc, row_idx),
-            .call => |call| try self.evaluateScalarFunction(call, row_idx),
-            else => error.UnsupportedExpression,
-        };
+        const ctx = self.buildExprContext();
+        return expr_eval.evaluateExprToValue(ctx, expr, row_idx);
     }
 
 
     // ========================================================================
-    // Expression Evaluation (for SELECT clause)
+    // Method Call Evaluation (for @logic_table)
     // ========================================================================
-
-    /// Evaluate any expression to a concrete Value for a given row
-    /// This handles arithmetic, function calls, and nested expressions
-    fn evaluateExprToValue(self: *Self, expr: *const Expr, row_idx: u32) !Value {
-        return switch (expr.*) {
-            .value => expr.value,
-            .column => |col| blk: {
-                const cached = self.column_cache.get(col.name) orelse return error.ColumnNotCached;
-                break :blk switch (cached) {
-                    .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| Value{ .integer = data[row_idx] },
-                    .int32, .date32 => |data| Value{ .integer = data[row_idx] },
-                    .float64 => |data| Value{ .float = data[row_idx] },
-                    .float32 => |data| Value{ .float = data[row_idx] },
-                    .bool_ => |data| Value{ .integer = if (data[row_idx]) 1 else 0 },
-                    .string => |data| Value{ .string = data[row_idx] },
-                };
-            },
-            .binary => |bin| try self.evaluateBinaryToValue(bin, row_idx),
-            .unary => |un| try self.evaluateUnaryToValue(un, row_idx),
-            .call => |call| try self.evaluateScalarFunction(call, row_idx),
-            .method_call => |mc| try self.evaluateMethodCall(mc, row_idx),
-            else => error.UnsupportedExpression,
-        };
-    }
 
     /// Evaluate a @logic_table method call (e.g., t.risk_score())
     ///
@@ -1894,247 +1874,7 @@ pub const Executor = struct {
         return Value{ .float = result };
     }
 
-    /// Evaluate binary expression to a Value (arithmetic operations)
-    fn evaluateBinaryToValue(self: *Self, bin: anytype, row_idx: u32) anyerror!Value {
-        const left = try self.evaluateExprToValue(bin.left, row_idx);
-        const right = try self.evaluateExprToValue(bin.right, row_idx);
-
-        return switch (bin.op) {
-            .add => scalar_functions.addValues(left, right),
-            .subtract => scalar_functions.subtractValues(left, right),
-            .multiply => scalar_functions.multiplyValues(left, right),
-            .divide => scalar_functions.divideValues(left, right),
-            .concat => try self.concatStrings(left, right),
-            else => error.UnsupportedOperator,
-        };
-    }
-
-    /// Evaluate unary expression to a Value
-    fn evaluateUnaryToValue(self: *Self, un: anytype, row_idx: u32) anyerror!Value {
-        const operand = try self.evaluateExprToValue(un.operand, row_idx);
-
-        return switch (un.op) {
-            .minus => scalar_functions.negateValue(operand),
-            .not => blk: {
-                // Boolean negation
-                const bool_val = switch (operand) {
-                    .integer => |i| i != 0,
-                    .float => |f| f != 0.0,
-                    .null => false,
-                    else => true,
-                };
-                break :blk Value{ .integer = if (bool_val) 0 else 1 };
-            },
-            else => error.UnsupportedOperator,
-        };
-    }
-
-    /// Concatenate two strings (|| operator)
-    fn concatStrings(self: *Self, left: Value, right: Value) !Value {
-        const left_str = switch (left) {
-            .string => |s| s,
-            .integer => |i| blk: {
-                var buf: [32]u8 = undefined;
-                const str = std.fmt.bufPrint(&buf, "{d}", .{i}) catch return error.FormatError;
-                break :blk str;
-            },
-            .float => |f| blk: {
-                var buf: [32]u8 = undefined;
-                const str = std.fmt.bufPrint(&buf, "{d}", .{f}) catch return error.FormatError;
-                break :blk str;
-            },
-            else => return Value{ .null = {} },
-        };
-
-        const right_str = switch (right) {
-            .string => |s| s,
-            .integer => |i| blk: {
-                var buf: [32]u8 = undefined;
-                const str = std.fmt.bufPrint(&buf, "{d}", .{i}) catch return error.FormatError;
-                break :blk str;
-            },
-            .float => |f| blk: {
-                var buf: [32]u8 = undefined;
-                const str = std.fmt.bufPrint(&buf, "{d}", .{f}) catch return error.FormatError;
-                break :blk str;
-            },
-            else => return Value{ .null = {} },
-        };
-
-        // Allocate new concatenated string
-        const result = try self.allocator.alloc(u8, left_str.len + right_str.len);
-        @memcpy(result[0..left_str.len], left_str);
-        @memcpy(result[left_str.len..], right_str);
-
-        return Value{ .string = result };
-    }
-
-    /// Evaluate scalar function call
-    fn evaluateScalarFunction(self: *Self, call: anytype, row_idx: u32) anyerror!Value {
-        // Skip aggregates - handled elsewhere
-        if (isAggregateFunction(call.name)) {
-            return error.AggregateInScalarContext;
-        }
-
-        // Evaluate all arguments
-        var args: [8]Value = undefined;
-        const arg_count = @min(call.args.len, 8);
-        for (call.args[0..arg_count], 0..) |*arg, i| {
-            args[i] = try self.evaluateExprToValue(arg, row_idx);
-        }
-
-        // Dispatch by function name (case-insensitive)
-        var upper_buf: [32]u8 = undefined;
-        const upper_name = std.ascii.upperString(&upper_buf, call.name);
-
-        // String functions
-        if (std.mem.eql(u8, upper_name, "UPPER")) {
-            return scalar_functions.funcUpper(self.allocator, args[0]);
-        }
-        if (std.mem.eql(u8, upper_name, "LOWER")) {
-            return scalar_functions.funcLower(self.allocator, args[0]);
-        }
-        if (std.mem.eql(u8, upper_name, "LENGTH")) {
-            return scalar_functions.funcLength(args[0]);
-        }
-        if (std.mem.eql(u8, upper_name, "TRIM")) {
-            return scalar_functions.funcTrim(self.allocator, args[0]);
-        }
-
-        // Math functions
-        if (std.mem.eql(u8, upper_name, "ABS")) {
-            return scalar_functions.funcAbs(args[0]);
-        }
-        if (std.mem.eql(u8, upper_name, "ROUND")) {
-            const precision: i32 = if (arg_count > 1) switch (args[1]) {
-                .integer => |i| @intCast(i),
-                else => 0,
-            } else 0;
-            return scalar_functions.funcRound(args[0], precision);
-        }
-        if (std.mem.eql(u8, upper_name, "FLOOR")) {
-            return scalar_functions.funcFloor(args[0]);
-        }
-        if (std.mem.eql(u8, upper_name, "CEIL") or std.mem.eql(u8, upper_name, "CEILING")) {
-            return scalar_functions.funcCeil(args[0]);
-        }
-
-        // Type functions
-        if (std.mem.eql(u8, upper_name, "COALESCE")) {
-            // Return first non-null value
-            for (args[0..arg_count]) |arg| {
-                if (arg != .null) return arg;
-            }
-            return Value{ .null = {} };
-        }
-
-        // Date/Time functions
-        // EXTRACT(part, timestamp) or DATE_PART(part, timestamp)
-        if (std.mem.eql(u8, upper_name, "EXTRACT") or std.mem.eql(u8, upper_name, "DATE_PART")) {
-            if (arg_count < 2) return Value{ .null = {} };
-            return scalar_functions.funcExtract(args[0], args[1]);
-        }
-
-        // Shorthand date part extractors: YEAR(ts), MONTH(ts), DAY(ts), etc.
-        if (scalar_functions.DatePart.fromFunctionName(upper_name)) |part| {
-            return scalar_functions.funcExtractPart(part, args[0]);
-        }
-
-        // DATE_TRUNC(part, timestamp)
-        if (std.mem.eql(u8, upper_name, "DATE_TRUNC")) {
-            if (arg_count < 2) return Value{ .null = {} };
-            return scalar_functions.funcDateTrunc(args[0], args[1]);
-        }
-
-        // DATE_ADD(timestamp, interval, part) - Add interval to timestamp
-        if (std.mem.eql(u8, upper_name, "DATE_ADD") or std.mem.eql(u8, upper_name, "DATEADD")) {
-            if (arg_count < 3) return Value{ .null = {} };
-            return scalar_functions.funcDateAdd(args[0], args[1], args[2]);
-        }
-
-        // DATE_DIFF(timestamp1, timestamp2, part) - Difference between timestamps
-        if (std.mem.eql(u8, upper_name, "DATE_DIFF") or std.mem.eql(u8, upper_name, "DATEDIFF")) {
-            if (arg_count < 3) return Value{ .null = {} };
-            return scalar_functions.funcDateDiff(args[0], args[1], args[2]);
-        }
-
-        // EPOCH(timestamp) - Convert to Unix epoch seconds
-        if (std.mem.eql(u8, upper_name, "EPOCH") or std.mem.eql(u8, upper_name, "UNIX_TIMESTAMP")) {
-            return scalar_functions.funcEpoch(args[0]);
-        }
-
-        // FROM_UNIXTIME(epoch_seconds) - Convert Unix epoch to timestamp
-        if (std.mem.eql(u8, upper_name, "FROM_UNIXTIME") or std.mem.eql(u8, upper_name, "TO_TIMESTAMP")) {
-            return args[0]; // Already an integer, just return as-is
-        }
-
-        return error.UnknownFunction;
-    }
-
-    // ========================================================================
-    // Type Inference for Expressions
-    // ========================================================================
-
-    /// Result type enum for expression type inference
-    const ResultType = scalar_functions.ResultType;
-
-    /// Infer the result type of an expression
-    fn inferExpressionType(self: *Self, expr: *const Expr) !ResultType {
-        return switch (expr.*) {
-            .value => |v| switch (v) {
-                .integer => .int64,
-                .float => .float64,
-                .string => .string,
-                else => .string,
-            },
-            .column => |col| blk: {
-                const cached = self.column_cache.get(col.name) orelse {
-                    // Not cached yet, look up from table
-                    const physical_col_id = self.tbl().physicalColumnId(col.name) orelse return error.ColumnNotFound;
-                    const fld = self.tbl().getFieldById(physical_col_id) orelse return error.InvalidColumn;
-                    const col_type = LanceColumnType.fromLogicalType(fld.logical_type);
-                    break :blk switch (col_type) {
-                        .int64, .int32, .timestamp_ns, .timestamp_us, .timestamp_ms, .timestamp_s, .date32, .date64, .bool_ => .int64,
-                        .float64, .float32 => .float64,
-                        .string, .unsupported => .string,
-                    };
-                };
-                // From cache: promote int32/float32 to int64/float64 for expressions
-                break :blk switch (cached) {
-                    .int64, .int32, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date32, .date64, .bool_ => .int64,
-                    .float64, .float32 => .float64,
-                    .string => .string,
-                };
-            },
-            .binary => |bin| try self.inferBinaryType(bin),
-            .unary => |un| try self.inferExpressionType(un.operand),
-            .call => |call| scalar_functions.inferFunctionReturnType(call.name),
-            else => .string,
-        };
-    }
-
-    /// Infer type of binary expression
-    fn inferBinaryType(self: *Self, bin: anytype) anyerror!ResultType {
-        // Concat always returns string
-        if (bin.op == .concat) return .string;
-
-        const left_type = try self.inferExpressionType(bin.left);
-        const right_type = try self.inferExpressionType(bin.right);
-
-        // Division always returns float
-        if (bin.op == .divide) return .float64;
-
-        // If either operand is float, result is float
-        if (left_type == .float64 or right_type == .float64) return .float64;
-
-        // Both integers -> integer
-        if (left_type == .int64 and right_type == .int64) return .int64;
-
-        // Default to float for mixed/unknown types
-        return .float64;
-    }
-
-    /// Evaluate an expression column for all filtered indices
+    /// Evaluate an expression column for all filtered indices (delegates to expr_eval)
     fn evaluateExpressionColumn(
         self: *Self,
         item: ast.SelectItem,
@@ -2146,95 +1886,9 @@ pub const Executor = struct {
         try self.extractExprColumnNames(&item.expr, &col_names);
         try self.preloadColumns(col_names.items);
 
-        // Infer result type
-        const result_type = try self.inferExpressionType(&item.expr);
-
-        // Generate column name from expression if no alias
-        const col_name = item.alias orelse "expr";
-
-        // Evaluate expression for each row and store results
-        switch (result_type) {
-            .int64 => {
-                const results = try self.allocator.alloc(i64, indices.len);
-                errdefer self.allocator.free(results);
-
-                for (indices, 0..) |row_idx, i| {
-                    const val = try self.evaluateExprToValue(&item.expr, row_idx);
-                    results[i] = switch (val) {
-                        .integer => |v| v,
-                        .float => |f| @intFromFloat(f),
-                        else => 0,
-                    };
-                }
-
-                return Result.Column{
-                    .name = col_name,
-                    .data = Result.ColumnData{ .int64 = results },
-                };
-            },
-            .float64 => {
-                const results = try self.allocator.alloc(f64, indices.len);
-                errdefer self.allocator.free(results);
-
-                for (indices, 0..) |row_idx, i| {
-                    const val = try self.evaluateExprToValue(&item.expr, row_idx);
-                    results[i] = switch (val) {
-                        .integer => |v| @floatFromInt(v),
-                        .float => |f| f,
-                        else => 0.0,
-                    };
-                }
-
-                return Result.Column{
-                    .name = col_name,
-                    .data = Result.ColumnData{ .float64 = results },
-                };
-            },
-            .string => {
-                const results = try self.allocator.alloc([]const u8, indices.len);
-                errdefer self.allocator.free(results);
-
-                // Check if expression produces owned strings (e.g., concat, UPPER)
-                // by checking if it's a binary concat or a function call
-                const expr_produces_owned = switch (item.expr) {
-                    .binary => |bin| bin.op == .concat,
-                    .call => true, // String functions allocate their results
-                    else => false,
-                };
-
-                for (indices, 0..) |row_idx, i| {
-                    const val = try self.evaluateExprToValue(&item.expr, row_idx);
-                    results[i] = switch (val) {
-                        .string => |s| blk: {
-                            if (expr_produces_owned) {
-                                // String was already allocated by concat/UPPER/etc.
-                                // Use it directly without duping
-                                break :blk s;
-                            } else {
-                                // String is borrowed from cache, must dupe
-                                break :blk try self.allocator.dupe(u8, s);
-                            }
-                        },
-                        .integer => |v| blk: {
-                            var buf: [32]u8 = undefined;
-                            const str = std.fmt.bufPrint(&buf, "{d}", .{v}) catch "";
-                            break :blk try self.allocator.dupe(u8, str);
-                        },
-                        .float => |f| blk: {
-                            var buf: [32]u8 = undefined;
-                            const str = std.fmt.bufPrint(&buf, "{d}", .{f}) catch "";
-                            break :blk try self.allocator.dupe(u8, str);
-                        },
-                        else => try self.allocator.dupe(u8, ""),
-                    };
-                }
-
-                return Result.Column{
-                    .name = col_name,
-                    .data = Result.ColumnData{ .string = results },
-                };
-            },
-        }
+        // Delegate to expr_eval module
+        const ctx = self.buildExprContext();
+        return expr_eval.evaluateExpressionColumn(ctx, item, indices);
     }
 
     /// Get all row indices (0, 1, 2, ..., n-1)
