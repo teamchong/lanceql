@@ -418,80 +418,49 @@ pub const Table = struct {
     // Future optimization: direct byte-range reads for fixed-size types
 
     /// Read int64 values at specific row indices.
-    pub fn readInt64AtIndices(self: Self, col_idx: u32, indices: []const u32) TableError![]i64 {
-        // Phase 2 implementation: read full column and filter
-        // TODO: Optimize with direct byte-range reads (index * 8 bytes)
-        const all_data = try self.readInt64Column(col_idx);
-        defer self.allocator.free(all_data);
-
-        const result = self.allocator.alloc(i64, indices.len) catch return TableError.OutOfMemory;
+    /// Generic helper to filter array by indices with bounds checking
+    fn filterByIndicesChecked(self: Self, comptime T: type, all_data: []const T, indices: []const u32) TableError![]T {
+        const result = self.allocator.alloc(T, indices.len) catch return TableError.OutOfMemory;
         errdefer self.allocator.free(result);
-
         for (indices, 0..) |idx, i| {
             if (idx >= all_data.len) return TableError.IndexOutOfBounds;
             result[i] = all_data[idx];
         }
         return result;
+    }
+
+    pub fn readInt64AtIndices(self: Self, col_idx: u32, indices: []const u32) TableError![]i64 {
+        const all_data = try self.readInt64Column(col_idx);
+        defer self.allocator.free(all_data);
+        return self.filterByIndicesChecked(i64, all_data, indices);
     }
 
     /// Read float64 values at specific row indices.
     pub fn readFloat64AtIndices(self: Self, col_idx: u32, indices: []const u32) TableError![]f64 {
         const all_data = try self.readFloat64Column(col_idx);
         defer self.allocator.free(all_data);
-
-        const result = self.allocator.alloc(f64, indices.len) catch return TableError.OutOfMemory;
-        errdefer self.allocator.free(result);
-
-        for (indices, 0..) |idx, i| {
-            if (idx >= all_data.len) return TableError.IndexOutOfBounds;
-            result[i] = all_data[idx];
-        }
-        return result;
+        return self.filterByIndicesChecked(f64, all_data, indices);
     }
 
     /// Read int32 values at specific row indices.
     pub fn readInt32AtIndices(self: Self, col_idx: u32, indices: []const u32) TableError![]i32 {
         const all_data = try self.readInt32Column(col_idx);
         defer self.allocator.free(all_data);
-
-        const result = self.allocator.alloc(i32, indices.len) catch return TableError.OutOfMemory;
-        errdefer self.allocator.free(result);
-
-        for (indices, 0..) |idx, i| {
-            if (idx >= all_data.len) return TableError.IndexOutOfBounds;
-            result[i] = all_data[idx];
-        }
-        return result;
+        return self.filterByIndicesChecked(i32, all_data, indices);
     }
 
     /// Read float32 values at specific row indices.
     pub fn readFloat32AtIndices(self: Self, col_idx: u32, indices: []const u32) TableError![]f32 {
         const all_data = try self.readFloat32Column(col_idx);
         defer self.allocator.free(all_data);
-
-        const result = self.allocator.alloc(f32, indices.len) catch return TableError.OutOfMemory;
-        errdefer self.allocator.free(result);
-
-        for (indices, 0..) |idx, i| {
-            if (idx >= all_data.len) return TableError.IndexOutOfBounds;
-            result[i] = all_data[idx];
-        }
-        return result;
+        return self.filterByIndicesChecked(f32, all_data, indices);
     }
 
     /// Read boolean values at specific row indices.
     pub fn readBoolAtIndices(self: Self, col_idx: u32, indices: []const u32) TableError![]bool {
         const all_data = try self.readBoolColumn(col_idx);
         defer self.allocator.free(all_data);
-
-        const result = self.allocator.alloc(bool, indices.len) catch return TableError.OutOfMemory;
-        errdefer self.allocator.free(result);
-
-        for (indices, 0..) |idx, i| {
-            if (idx >= all_data.len) return TableError.IndexOutOfBounds;
-            result[i] = all_data[idx];
-        }
-        return result;
+        return self.filterByIndicesChecked(bool, all_data, indices);
     }
 
     /// Read string values at specific row indices.
