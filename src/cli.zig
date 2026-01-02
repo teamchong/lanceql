@@ -17,6 +17,7 @@ const args = @import("cli/args.zig");
 const ingest = @import("cli/ingest.zig");
 const enrich = @import("cli/enrich.zig");
 const transform = @import("cli/transform.zig");
+const serve = @import("cli/serve.zig");
 const lanceql = @import("lanceql");
 const metal = @import("lanceql.metal");
 const Table = @import("lanceql.table").Table;
@@ -241,13 +242,10 @@ fn cmdEnrich(allocator: std.mem.Allocator, opts: args.EnrichOptions) !void {
 
 /// Serve command - start interactive web server
 fn cmdServe(allocator: std.mem.Allocator, opts: args.ServeOptions) !void {
-    _ = allocator;
-    _ = opts;
-    std.debug.print("Error: Serve command not yet implemented.\n", .{});
-    std.debug.print("\nServe will provide:\n", .{});
-    std.debug.print("  - REST API for SQL queries\n", .{});
-    std.debug.print("  - Vector search endpoints\n", .{});
-    std.debug.print("  - Web UI for data exploration\n", .{});
+    serve.run(allocator, opts) catch |err| {
+        std.debug.print("Serve command failed: {}\n", .{err});
+        return err;
+    };
 }
 
 /// Run pipeline from config file
