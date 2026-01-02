@@ -108,144 +108,49 @@ pub const ParquetTable = struct {
         return null;
     }
 
-    /// Read int64 column data
+    /// Generic helper to read numeric column data across row groups
+    fn readNumericColumn(self: *Self, comptime T: type, comptime field: []const u8, col_idx: usize) ParquetTableError![]T {
+        const num_row_groups = self.parquet_file.getNumRowGroups();
+        if (num_row_groups == 0) return ParquetTableError.NoRowGroups;
+
+        var all_values = std.ArrayListUnmanaged(T){};
+        errdefer all_values.deinit(self.allocator);
+
+        for (0..num_row_groups) |rg_idx| {
+            const chunk = self.parquet_file.getColumnChunk(rg_idx, col_idx) orelse continue;
+            const col_meta = chunk.meta_data orelse continue;
+            const col_data = self.parquet_file.getColumnData(rg_idx, col_idx) orelse continue;
+
+            var reader = PageReader.init(col_data, col_meta.type_, null, col_meta.codec, self.allocator);
+            defer reader.deinit();
+
+            const decoded = reader.readAll() catch continue;
+            defer {
+                if (@field(decoded, field)) |v| self.allocator.free(v);
+            }
+
+            if (@field(decoded, field)) |values| {
+                all_values.appendSlice(self.allocator, values) catch return ParquetTableError.OutOfMemory;
+            }
+        }
+
+        return all_values.toOwnedSlice(self.allocator) catch return ParquetTableError.OutOfMemory;
+    }
+
     pub fn readInt64Column(self: *Self, col_idx: usize) ParquetTableError![]i64 {
-        const num_row_groups = self.parquet_file.getNumRowGroups();
-        if (num_row_groups == 0) return ParquetTableError.NoRowGroups;
-
-        var all_values = std.ArrayListUnmanaged(i64){};
-        errdefer all_values.deinit(self.allocator);
-
-        for (0..num_row_groups) |rg_idx| {
-            const chunk = self.parquet_file.getColumnChunk(rg_idx, col_idx) orelse continue;
-            const col_meta = chunk.meta_data orelse continue;
-            const col_data = self.parquet_file.getColumnData(rg_idx, col_idx) orelse continue;
-
-            var reader = PageReader.init(
-                col_data,
-                col_meta.type_,
-                null, // type_length only needed for fixed_len_byte_array
-                col_meta.codec,
-                self.allocator,
-            );
-            defer reader.deinit();
-
-            const decoded = reader.readAll() catch continue;
-            defer {
-                if (decoded.int64_values) |v| self.allocator.free(v);
-            }
-
-            if (decoded.int64_values) |values| {
-                all_values.appendSlice(self.allocator, values) catch return ParquetTableError.OutOfMemory;
-            }
-        }
-
-        return all_values.toOwnedSlice(self.allocator) catch return ParquetTableError.OutOfMemory;
+        return self.readNumericColumn(i64, "int64_values", col_idx);
     }
 
-    /// Read int32 column data
     pub fn readInt32Column(self: *Self, col_idx: usize) ParquetTableError![]i32 {
-        const num_row_groups = self.parquet_file.getNumRowGroups();
-        if (num_row_groups == 0) return ParquetTableError.NoRowGroups;
-
-        var all_values = std.ArrayListUnmanaged(i32){};
-        errdefer all_values.deinit(self.allocator);
-
-        for (0..num_row_groups) |rg_idx| {
-            const chunk = self.parquet_file.getColumnChunk(rg_idx, col_idx) orelse continue;
-            const col_meta = chunk.meta_data orelse continue;
-            const col_data = self.parquet_file.getColumnData(rg_idx, col_idx) orelse continue;
-
-            var reader = PageReader.init(
-                col_data,
-                col_meta.type_,
-                null, // type_length only needed for fixed_len_byte_array
-                col_meta.codec,
-                self.allocator,
-            );
-            defer reader.deinit();
-
-            const decoded = reader.readAll() catch continue;
-            defer {
-                if (decoded.int32_values) |v| self.allocator.free(v);
-            }
-
-            if (decoded.int32_values) |values| {
-                all_values.appendSlice(self.allocator, values) catch return ParquetTableError.OutOfMemory;
-            }
-        }
-
-        return all_values.toOwnedSlice(self.allocator) catch return ParquetTableError.OutOfMemory;
+        return self.readNumericColumn(i32, "int32_values", col_idx);
     }
 
-    /// Read float64 column data
     pub fn readFloat64Column(self: *Self, col_idx: usize) ParquetTableError![]f64 {
-        const num_row_groups = self.parquet_file.getNumRowGroups();
-        if (num_row_groups == 0) return ParquetTableError.NoRowGroups;
-
-        var all_values = std.ArrayListUnmanaged(f64){};
-        errdefer all_values.deinit(self.allocator);
-
-        for (0..num_row_groups) |rg_idx| {
-            const chunk = self.parquet_file.getColumnChunk(rg_idx, col_idx) orelse continue;
-            const col_meta = chunk.meta_data orelse continue;
-            const col_data = self.parquet_file.getColumnData(rg_idx, col_idx) orelse continue;
-
-            var reader = PageReader.init(
-                col_data,
-                col_meta.type_,
-                null, // type_length only needed for fixed_len_byte_array
-                col_meta.codec,
-                self.allocator,
-            );
-            defer reader.deinit();
-
-            const decoded = reader.readAll() catch continue;
-            defer {
-                if (decoded.double_values) |v| self.allocator.free(v);
-            }
-
-            if (decoded.double_values) |values| {
-                all_values.appendSlice(self.allocator, values) catch return ParquetTableError.OutOfMemory;
-            }
-        }
-
-        return all_values.toOwnedSlice(self.allocator) catch return ParquetTableError.OutOfMemory;
+        return self.readNumericColumn(f64, "double_values", col_idx);
     }
 
-    /// Read float32 column data
     pub fn readFloat32Column(self: *Self, col_idx: usize) ParquetTableError![]f32 {
-        const num_row_groups = self.parquet_file.getNumRowGroups();
-        if (num_row_groups == 0) return ParquetTableError.NoRowGroups;
-
-        var all_values = std.ArrayListUnmanaged(f32){};
-        errdefer all_values.deinit(self.allocator);
-
-        for (0..num_row_groups) |rg_idx| {
-            const chunk = self.parquet_file.getColumnChunk(rg_idx, col_idx) orelse continue;
-            const col_meta = chunk.meta_data orelse continue;
-            const col_data = self.parquet_file.getColumnData(rg_idx, col_idx) orelse continue;
-
-            var reader = PageReader.init(
-                col_data,
-                col_meta.type_,
-                null, // type_length only needed for fixed_len_byte_array
-                col_meta.codec,
-                self.allocator,
-            );
-            defer reader.deinit();
-
-            const decoded = reader.readAll() catch continue;
-            defer {
-                if (decoded.float_values) |v| self.allocator.free(v);
-            }
-
-            if (decoded.float_values) |values| {
-                all_values.appendSlice(self.allocator, values) catch return ParquetTableError.OutOfMemory;
-            }
-        }
-
-        return all_values.toOwnedSlice(self.allocator) catch return ParquetTableError.OutOfMemory;
+        return self.readNumericColumn(f32, "float_values", col_idx);
     }
 
     /// Read string column data
@@ -287,38 +192,7 @@ pub const ParquetTable = struct {
         return all_values.toOwnedSlice(self.allocator) catch return ParquetTableError.OutOfMemory;
     }
 
-    /// Read bool column data
     pub fn readBoolColumn(self: *Self, col_idx: usize) ParquetTableError![]bool {
-        const num_row_groups = self.parquet_file.getNumRowGroups();
-        if (num_row_groups == 0) return ParquetTableError.NoRowGroups;
-
-        var all_values = std.ArrayListUnmanaged(bool){};
-        errdefer all_values.deinit(self.allocator);
-
-        for (0..num_row_groups) |rg_idx| {
-            const chunk = self.parquet_file.getColumnChunk(rg_idx, col_idx) orelse continue;
-            const col_meta = chunk.meta_data orelse continue;
-            const col_data = self.parquet_file.getColumnData(rg_idx, col_idx) orelse continue;
-
-            var reader = PageReader.init(
-                col_data,
-                col_meta.type_,
-                null, // type_length only needed for fixed_len_byte_array
-                col_meta.codec,
-                self.allocator,
-            );
-            defer reader.deinit();
-
-            const decoded = reader.readAll() catch continue;
-            defer {
-                if (decoded.bool_values) |v| self.allocator.free(v);
-            }
-
-            if (decoded.bool_values) |values| {
-                all_values.appendSlice(self.allocator, values) catch return ParquetTableError.OutOfMemory;
-            }
-        }
-
-        return all_values.toOwnedSlice(self.allocator) catch return ParquetTableError.OutOfMemory;
+        return self.readNumericColumn(bool, "bool_values", col_idx);
     }
 };
