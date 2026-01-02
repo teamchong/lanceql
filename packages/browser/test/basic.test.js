@@ -48,7 +48,7 @@ describe('Package Structure', () => {
         const pkgPath = path.join(__dirname, '..', 'package.json');
         const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
 
-        assert.strictEqual(pkg.name, 'lanceql');
+        assert.strictEqual(pkg.name, '@metal0/lanceql');
         assert.ok(pkg.version, 'version should be set');
         assert.ok(pkg.main, 'main should be set');
         assert.ok(pkg.module, 'module should be set');

@@ -323,6 +323,91 @@ fn emptyColumnData(data: Result.ColumnData) Result.ColumnData {
 }
 
 // ============================================================================
+// Column Data Operations
+// ============================================================================
+
+/// Concatenate two column data arrays
+pub fn concatenateColumnData(
+    allocator: std.mem.Allocator,
+    left_data: Result.ColumnData,
+    right_data: Result.ColumnData,
+    left_len: usize,
+    right_len: usize,
+) !Result.ColumnData {
+    const total_len = left_len + right_len;
+
+    return switch (left_data) {
+        .string => |left| blk: {
+            const right = right_data.string;
+            const new_data = try allocator.alloc([]const u8, total_len);
+            errdefer allocator.free(new_data);
+            for (0..left_len) |i| new_data[i] = try allocator.dupe(u8, left[i]);
+            for (0..right_len) |i| new_data[left_len + i] = try allocator.dupe(u8, right[i]);
+            break :blk Result.ColumnData{ .string = new_data };
+        },
+        inline else => |left, tag| blk: {
+            const right = @field(right_data, @tagName(tag));
+            const new_data = try allocator.alloc(@TypeOf(left[0]), total_len);
+            @memcpy(new_data[0..left_len], left[0..left_len]);
+            @memcpy(new_data[left_len..], right[0..right_len]);
+            break :blk @unionInit(Result.ColumnData, @tagName(tag), new_data);
+        },
+    };
+}
+
+/// Project specific rows from column data (filter by indices)
+pub fn projectColumnData(
+    allocator: std.mem.Allocator,
+    data: Result.ColumnData,
+    indices: []const usize,
+) !Result.ColumnData {
+    const len = indices.len;
+
+    return switch (data) {
+        .string => |d| blk: {
+            const new_data = try allocator.alloc([]const u8, len);
+            errdefer allocator.free(new_data);
+            for (indices, 0..) |src_idx, dst_idx| {
+                new_data[dst_idx] = try allocator.dupe(u8, d[src_idx]);
+            }
+            break :blk Result.ColumnData{ .string = new_data };
+        },
+        inline else => |d, tag| blk: {
+            const new_data = try allocator.alloc(@TypeOf(d[0]), len);
+            for (indices, 0..) |src_idx, dst_idx| new_data[dst_idx] = d[src_idx];
+            break :blk @unionInit(Result.ColumnData, @tagName(tag), new_data);
+        },
+    };
+}
+
+/// Project specific rows from a result set to create a new result
+pub fn projectRows(
+    allocator: std.mem.Allocator,
+    columns: []const Result.Column,
+    indices: []const usize,
+) !Result {
+    const new_row_count = indices.len;
+    const col_count = columns.len;
+
+    var new_columns = try allocator.alloc(Result.Column, col_count);
+    errdefer allocator.free(new_columns);
+
+    for (0..col_count) |col_idx| {
+        const col = columns[col_idx];
+        new_columns[col_idx] = Result.Column{
+            .name = col.name,
+            .data = try projectColumnData(allocator, col.data, indices),
+        };
+    }
+
+    return Result{
+        .columns = new_columns,
+        .row_count = new_row_count,
+        .allocator = allocator,
+    };
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
