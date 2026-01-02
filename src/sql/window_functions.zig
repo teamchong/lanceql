@@ -54,3 +54,46 @@ pub fn parseWindowFunctionType(name: []const u8) ?WindowFunctionType {
 pub fn isWindowFunctionName(name: []const u8) bool {
     return parseWindowFunctionType(name) != null;
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "window: parseWindowFunctionType" {
+    try std.testing.expectEqual(WindowFunctionType.row_number, parseWindowFunctionType("ROW_NUMBER").?);
+    try std.testing.expectEqual(WindowFunctionType.rank, parseWindowFunctionType("RANK").?);
+    try std.testing.expectEqual(WindowFunctionType.dense_rank, parseWindowFunctionType("DENSE_RANK").?);
+    try std.testing.expectEqual(WindowFunctionType.lag, parseWindowFunctionType("LAG").?);
+    try std.testing.expectEqual(WindowFunctionType.lead, parseWindowFunctionType("LEAD").?);
+
+    // Case insensitive
+    try std.testing.expectEqual(WindowFunctionType.row_number, parseWindowFunctionType("row_number").?);
+    try std.testing.expectEqual(WindowFunctionType.rank, parseWindowFunctionType("Rank").?);
+
+    // Non-window functions return null
+    try std.testing.expectEqual(@as(?WindowFunctionType, null), parseWindowFunctionType("SUM"));
+    try std.testing.expectEqual(@as(?WindowFunctionType, null), parseWindowFunctionType("COUNT"));
+    try std.testing.expectEqual(@as(?WindowFunctionType, null), parseWindowFunctionType("AVG"));
+    try std.testing.expectEqual(@as(?WindowFunctionType, null), parseWindowFunctionType("AB")); // Too short
+}
+
+test "window: isWindowFunctionName" {
+    // Positive cases
+    try std.testing.expect(isWindowFunctionName("ROW_NUMBER"));
+    try std.testing.expect(isWindowFunctionName("row_number"));
+    try std.testing.expect(isWindowFunctionName("RANK"));
+    try std.testing.expect(isWindowFunctionName("DENSE_RANK"));
+    try std.testing.expect(isWindowFunctionName("LAG"));
+    try std.testing.expect(isWindowFunctionName("LEAD"));
+
+    // Negative cases - aggregate functions
+    try std.testing.expect(!isWindowFunctionName("SUM"));
+    try std.testing.expect(!isWindowFunctionName("COUNT"));
+    try std.testing.expect(!isWindowFunctionName("AVG"));
+    try std.testing.expect(!isWindowFunctionName("MIN"));
+    try std.testing.expect(!isWindowFunctionName("MAX"));
+
+    // Negative cases - scalar functions
+    try std.testing.expect(!isWindowFunctionName("UPPER"));
+    try std.testing.expect(!isWindowFunctionName("LOWER"));
+}
