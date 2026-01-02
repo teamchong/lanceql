@@ -5580,4 +5580,199 @@ test.describe('Vault SQL Operations', () => {
             expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
         }
     });
+
+    test('PIVOT transformation - rows to columns with aggregation', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Create sales table for PIVOT tests
+            await v.exec(`CREATE TABLE sales (
+                region TEXT,
+                quarter TEXT,
+                amount DOUBLE
+            )`);
+
+            // Insert test data
+            await v.exec(`INSERT INTO sales VALUES
+                ('East', 'Q1', 100),
+                ('East', 'Q2', 150),
+                ('East', 'Q3', 200),
+                ('East', 'Q4', 180),
+                ('West', 'Q1', 120),
+                ('West', 'Q2', 130),
+                ('West', 'Q3', 170),
+                ('West', 'Q4', 160),
+                ('North', 'Q1', 90),
+                ('North', 'Q2', 110)
+            `);
+
+            // Test 1: Basic PIVOT with SUM
+            try {
+                const res = await v.exec(`
+                    SELECT region, quarter, amount FROM sales
+                    PIVOT (SUM(amount) FOR quarter IN ('Q1', 'Q2', 'Q3', 'Q4'))
+                `);
+                // Should have columns: region, Q1, Q2, Q3, Q4
+                const hasCorrectCols = res.columns.includes('Q1') && res.columns.includes('Q4');
+                // Find East row
+                const eastRow = res.rows.find(r => r.region === 'East');
+                const eastQ1 = eastRow?.Q1 || eastRow?.[1];
+                tests.push({
+                    name: 'PIVOT SUM basic',
+                    pass: hasCorrectCols && eastQ1 === 100,
+                    actual: `cols: ${res.columns.join(',')}, East Q1: ${eastQ1}`
+                });
+            } catch (e) {
+                tests.push({ name: 'PIVOT SUM basic', pass: false, error: e.message });
+            }
+
+            // Test 2: PIVOT with COUNT
+            try {
+                const res = await v.exec(`
+                    SELECT region, quarter, amount FROM sales
+                    PIVOT (COUNT(amount) FOR quarter IN ('Q1', 'Q2', 'Q3', 'Q4'))
+                `);
+                // East has 1 entry per quarter
+                const eastRow = res.rows.find(r => r.region === 'East');
+                const eastQ1Count = eastRow?.Q1 || eastRow?.[1];
+                // North only has Q1 and Q2
+                const northRow = res.rows.find(r => r.region === 'North');
+                const northQ3Count = northRow?.Q3 || northRow?.[3];
+                tests.push({
+                    name: 'PIVOT COUNT',
+                    pass: eastQ1Count === 1 && northQ3Count === 0,
+                    actual: `East Q1: ${eastQ1Count}, North Q3: ${northQ3Count}`
+                });
+            } catch (e) {
+                tests.push({ name: 'PIVOT COUNT', pass: false, error: e.message });
+            }
+
+            // Test 3: PIVOT with AVG
+            try {
+                // Add duplicate entries for avg testing
+                await v.exec(`INSERT INTO sales VALUES ('South', 'Q1', 100), ('South', 'Q1', 200)`);
+                const res = await v.exec(`
+                    SELECT region, quarter, amount FROM sales
+                    PIVOT (AVG(amount) FOR quarter IN ('Q1', 'Q2'))
+                `);
+                const southRow = res.rows.find(r => r.region === 'South');
+                const southQ1Avg = southRow?.Q1 || southRow?.[1];
+                tests.push({
+                    name: 'PIVOT AVG',
+                    pass: southQ1Avg === 150,
+                    actual: `South Q1 avg: ${southQ1Avg}`
+                });
+            } catch (e) {
+                tests.push({ name: 'PIVOT AVG', pass: false, error: e.message });
+            }
+
+            await v.exec('DROP TABLE sales');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('UNPIVOT transformation - columns to rows', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Create wide table for UNPIVOT tests
+            await v.exec(`CREATE TABLE quarterly_sales (
+                product TEXT,
+                q1_sales DOUBLE,
+                q2_sales DOUBLE,
+                q3_sales DOUBLE,
+                q4_sales DOUBLE
+            )`);
+
+            // Insert test data
+            await v.exec(`INSERT INTO quarterly_sales VALUES
+                ('Widget', 100, 150, 200, 180),
+                ('Gadget', 120, 130, 170, 160),
+                ('Doohickey', 90, 110, 140, 130)
+            `);
+
+            // Test 1: Basic UNPIVOT
+            try {
+                const res = await v.exec(`
+                    SELECT product, q1_sales, q2_sales, q3_sales, q4_sales FROM quarterly_sales
+                    UNPIVOT (sales FOR quarter IN (q1_sales, q2_sales, q3_sales, q4_sales))
+                `);
+                // Should have columns: product, quarter, sales
+                const hasCorrectCols = res.columns.includes('quarter') && res.columns.includes('sales');
+                // Should have 12 rows (3 products x 4 quarters)
+                const correctRowCount = res.rows.length === 12;
+                // Check first widget row
+                const widgetQ1 = res.rows.find(r => r.product === 'Widget' && r.quarter === 'q1_sales');
+                tests.push({
+                    name: 'UNPIVOT basic',
+                    pass: hasCorrectCols && correctRowCount && widgetQ1?.sales === 100,
+                    actual: `cols: ${res.columns.join(',')}, rows: ${res.rows.length}, Widget Q1: ${widgetQ1?.sales}`
+                });
+            } catch (e) {
+                tests.push({ name: 'UNPIVOT basic', pass: false, error: e.message });
+            }
+
+            // Test 2: UNPIVOT with NULL handling
+            try {
+                // Create table with NULL values
+                await v.exec(`CREATE TABLE sparse_data (
+                    id INT,
+                    jan DOUBLE,
+                    feb DOUBLE,
+                    mar DOUBLE
+                )`);
+                await v.exec(`INSERT INTO sparse_data VALUES (1, 100, NULL, 300), (2, NULL, 200, NULL)`);
+
+                const res = await v.exec(`
+                    SELECT id, jan, feb, mar FROM sparse_data
+                    UNPIVOT (value FOR month IN (jan, feb, mar))
+                `);
+                // Should skip NULL values - expect 3 rows (1:jan, 1:mar, 2:feb)
+                tests.push({
+                    name: 'UNPIVOT NULL skip',
+                    pass: res.rows.length === 3,
+                    actual: `rows: ${res.rows.length}`
+                });
+
+                await v.exec('DROP TABLE sparse_data');
+            } catch (e) {
+                tests.push({ name: 'UNPIVOT NULL skip', pass: false, error: e.message });
+            }
+
+            // Test 3: UNPIVOT preserves non-pivoted columns
+            try {
+                const res = await v.exec(`
+                    SELECT product, q1_sales, q2_sales FROM quarterly_sales
+                    UNPIVOT (amount FOR period IN (q1_sales, q2_sales))
+                `);
+                // Preserved column should be product
+                const hasProduct = res.columns.includes('product');
+                const hasPeriod = res.columns.includes('period');
+                const hasAmount = res.columns.includes('amount');
+                // Should have 6 rows (3 products x 2 periods)
+                tests.push({
+                    name: 'UNPIVOT preserved columns',
+                    pass: hasProduct && hasPeriod && hasAmount && res.rows.length === 6,
+                    actual: `cols: ${res.columns.join(',')}, rows: ${res.rows.length}`
+                });
+            } catch (e) {
+                tests.push({ name: 'UNPIVOT preserved columns', pass: false, error: e.message });
+            }
+
+            await v.exec('DROP TABLE quarterly_sales');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
 });

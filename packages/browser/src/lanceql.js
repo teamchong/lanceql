@@ -12892,6 +12892,24 @@ export class SQLExecutor {
             rows.push(row);
         }
 
+        // Apply PIVOT transformation (rows to columns with aggregation)
+        if (ast.pivot) {
+            const pivotResult = this._executePivot(rows, outputColumns, ast.pivot);
+            rows.length = 0;
+            rows.push(...pivotResult.rows);
+            outputColumns.length = 0;
+            outputColumns.push(...pivotResult.columns);
+        }
+
+        // Apply UNPIVOT transformation (columns to rows)
+        if (ast.unpivot) {
+            const unpivotResult = this._executeUnpivot(rows, outputColumns, ast.unpivot);
+            rows.length = 0;
+            rows.push(...unpivotResult.rows);
+            outputColumns.length = 0;
+            outputColumns.push(...unpivotResult.columns);
+        }
+
         // Apply DISTINCT (GPU-accelerated for large result sets)
         if (ast.distinct) {
             const uniqueRows = await this.applyDistinct(rows);
@@ -13375,6 +13393,181 @@ export class SQLExecutor {
             .sort((a, b) => b[1] - a[1])
             .slice(0, k)
             .map(([docId]) => docId);
+    }
+
+    /**
+     * Execute PIVOT transformation - convert rows to columns with aggregation.
+     * Example: PIVOT (SUM(amount) FOR quarter IN ('Q1', 'Q2', 'Q3', 'Q4'))
+     * @private
+     */
+    _executePivot(rows, columns, pivot) {
+        const { aggregate, forColumn, inValues } = pivot;
+
+        // Get column names from outputColumns
+        const colNames = columns.map(col => {
+            if (col.type === 'star') return '*';
+            return col.alias || (col.expr.type === 'column' ? col.expr.name : null);
+        });
+
+        // Find the FOR column index
+        const forColIdx = colNames.findIndex(
+            n => n && n.toLowerCase() === forColumn.toLowerCase()
+        );
+        if (forColIdx === -1) {
+            throw new Error(`PIVOT: Column '${forColumn}' not found in result set`);
+        }
+
+        // Find the aggregate source column
+        const aggSourceCol = aggregate.args && aggregate.args[0]
+            ? (aggregate.args[0].name || aggregate.args[0].column || aggregate.args[0])
+            : null;
+        const aggSourceIdx = aggSourceCol
+            ? colNames.findIndex(n => n && n.toLowerCase() === String(aggSourceCol).toLowerCase())
+            : -1;
+
+        if (aggSourceIdx === -1 && aggregate.name.toUpperCase() !== 'COUNT') {
+            throw new Error(`PIVOT: Aggregate source column not found`);
+        }
+
+        // Determine group columns (all columns except forColumn and aggregate source)
+        const groupColIndices = [];
+        for (let i = 0; i < colNames.length; i++) {
+            if (i !== forColIdx && i !== aggSourceIdx) {
+                groupColIndices.push(i);
+            }
+        }
+
+        // Build groups: Map<groupKey, Map<pivotValue, aggregateValues[]>>
+        const groups = new Map();
+
+        for (const row of rows) {
+            const groupKey = groupColIndices.map(i => JSON.stringify(row[i])).join('|');
+            const pivotValue = row[forColIdx];
+            const aggValue = aggSourceIdx >= 0 ? row[aggSourceIdx] : 1; // COUNT uses 1
+
+            if (!groups.has(groupKey)) {
+                groups.set(groupKey, {
+                    groupValues: groupColIndices.map(i => row[i]),
+                    pivots: new Map()
+                });
+            }
+
+            const group = groups.get(groupKey);
+            const pivotKey = String(pivotValue);
+            if (!group.pivots.has(pivotKey)) {
+                group.pivots.set(pivotKey, []);
+            }
+            group.pivots.get(pivotKey).push(aggValue);
+        }
+
+        // Compute aggregates and build output rows
+        const groupColNames = groupColIndices.map(i => colNames[i]);
+        const outputColNames = [...groupColNames, ...inValues.map(v => String(v))];
+        const outputRows = [];
+
+        for (const [, group] of groups) {
+            const row = [...group.groupValues];
+            for (const pivotVal of inValues) {
+                const key = String(pivotVal);
+                const values = group.pivots.get(key) || [];
+                row.push(this._computeAggregate(aggregate.name, values));
+            }
+            outputRows.push(row);
+        }
+
+        // Build new outputColumns structure
+        const newColumns = outputColNames.map(name => ({
+            type: 'column',
+            expr: { type: 'column', name },
+            alias: name
+        }));
+
+        return { rows: outputRows, columns: newColumns };
+    }
+
+    /**
+     * Execute UNPIVOT transformation - convert columns to rows.
+     * Example: UNPIVOT (value FOR month IN (jan, feb, mar))
+     * @private
+     */
+    _executeUnpivot(rows, columns, unpivot) {
+        const { valueColumn, nameColumn, inColumns } = unpivot;
+
+        // Get column names from outputColumns
+        const colNames = columns.map(col => {
+            if (col.type === 'star') return '*';
+            return col.alias || (col.expr.type === 'column' ? col.expr.name : null);
+        });
+
+        // Find column indices for unpivot sources
+        const inColIndices = inColumns.map(c => {
+            const idx = colNames.findIndex(n => n && n.toLowerCase() === c.toLowerCase());
+            if (idx === -1) {
+                throw new Error(`UNPIVOT: Column '${c}' not found in result set`);
+            }
+            return idx;
+        });
+
+        // Preserved columns (not in inColumns)
+        const preservedIndices = [];
+        const preservedNames = [];
+        for (let i = 0; i < colNames.length; i++) {
+            if (!inColIndices.includes(i)) {
+                preservedIndices.push(i);
+                preservedNames.push(colNames[i]);
+            }
+        }
+
+        // Output columns: preserved + nameColumn + valueColumn
+        const outputColNames = [...preservedNames, nameColumn, valueColumn];
+        const outputRows = [];
+
+        for (const row of rows) {
+            const preservedValues = preservedIndices.map(i => row[i]);
+
+            // Create one output row per unpivoted column
+            for (let i = 0; i < inColumns.length; i++) {
+                const colName = inColumns[i];
+                const value = row[inColIndices[i]];
+
+                // Skip NULL values (standard UNPIVOT behavior)
+                if (value != null) {
+                    outputRows.push([...preservedValues, colName, value]);
+                }
+            }
+        }
+
+        // Build new outputColumns structure
+        const newColumns = outputColNames.map(name => ({
+            type: 'column',
+            expr: { type: 'column', name },
+            alias: name
+        }));
+
+        return { rows: outputRows, columns: newColumns };
+    }
+
+    /**
+     * Compute aggregate function on a list of values.
+     * Used by PIVOT transformation.
+     * @private
+     */
+    _computeAggregate(funcName, values) {
+        const nums = values.filter(v => v != null && typeof v === 'number');
+        switch (funcName.toUpperCase()) {
+            case 'SUM':
+                return nums.length > 0 ? nums.reduce((a, b) => a + b, 0) : null;
+            case 'COUNT':
+                return values.filter(v => v != null).length;
+            case 'AVG':
+                return nums.length > 0 ? nums.reduce((a, b) => a + b, 0) / nums.length : null;
+            case 'MIN':
+                return nums.length > 0 ? Math.min(...nums) : null;
+            case 'MAX':
+                return nums.length > 0 ? Math.max(...nums) : null;
+            default:
+                return null;
+        }
     }
 
     /**
