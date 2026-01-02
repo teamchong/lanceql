@@ -227,7 +227,6 @@ pub const Tokenizer = struct {
                     try words.append(lower[start..i]);
                     word_start = null;
                 }
-                // Handle punctuation as separate tokens
                 if (std.ascii.isPunct(c)) {
                     const punct = try self.allocator.dupe(u8, &[_]u8{c});
                     try tokens.append(punct);

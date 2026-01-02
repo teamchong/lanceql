@@ -258,7 +258,6 @@ fn simdDotProduct(a: []const f32, b: []const f32) f32 {
     var sum: Vec8f = @splat(0.0);
     var i: usize = 0;
 
-    // Process 8 floats at a time
     while (i + 8 <= a.len) : (i += 8) {
         const va: Vec8f = a[i..][0..8].*;
         const vb: Vec8f = b[i..][0..8].*;

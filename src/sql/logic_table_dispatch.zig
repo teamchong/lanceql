@@ -483,7 +483,6 @@ test "Dispatcher batch method" {
 
             const out_buf = output.f64 orelse return;
 
-            // Process with or without selection
             if (selection) |sel| {
                 for (0..selection_len) |i| {
                     const idx = sel[i];

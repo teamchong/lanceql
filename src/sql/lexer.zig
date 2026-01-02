@@ -219,7 +219,6 @@ pub const Lexer = struct {
             if (std.ascii.isDigit(ch)) {
                 _ = self.advance();
             } else if (ch == '.') {
-                // Handle decimal point
                 _ = self.advance();
                 // Read fractional part
                 while (self.peek()) |digit| {
@@ -252,7 +251,6 @@ pub const Lexer = struct {
                 _ = self.advance();
                 break;
             } else if (ch == '\\') {
-                // Handle escape sequences
                 _ = self.advance();
                 _ = self.advance(); // Skip escaped character
             } else {

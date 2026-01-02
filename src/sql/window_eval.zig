@@ -46,7 +46,6 @@ pub fn evaluateWindowFunction(
     const results = try ctx.allocator.alloc(i64, indices.len);
     errdefer ctx.allocator.free(results);
 
-    // Process each partition
     var partition_iter = partitions.iterator();
     while (partition_iter.next()) |entry| {
         var partition_indices = entry.value_ptr.*;

@@ -687,7 +687,6 @@ pub const Parser = struct {
         const type_tok = try self.expect(.IDENTIFIER);
         const target_type = type_tok.lexeme;
 
-        // Handle type with size like VARCHAR(255)
         if (self.check(.LPAREN)) {
             self.advance();
             _ = try self.expect(.NUMBER); // size

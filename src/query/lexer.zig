@@ -184,7 +184,6 @@ pub const Lexer = struct {
         const start = self.pos;
         var is_float = false;
 
-        // Handle negative sign
         if (self.input[self.pos] == '-') {
             self.pos += 1;
         }

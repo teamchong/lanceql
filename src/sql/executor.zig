@@ -1108,7 +1108,6 @@ pub const Executor = struct {
             result_columns.deinit(self.allocator);
         }
 
-        // Process each SELECT item (delegate to group_eval)
         for (stmt.columns) |item| {
             const col = try group_eval.evaluateSelectItemForGroups(group_ctx, item, &groups, group_cols, num_groups);
             try result_columns.append(self.allocator, col);
@@ -1350,10 +1349,8 @@ pub const Executor = struct {
         }
 
         for (select_list) |item| {
-            // Skip window function expressions - they're handled separately
             if (isWindowFunction(&item.expr)) continue;
 
-            // Handle SELECT *
             if (item.expr == .column and std.mem.eql(u8, item.expr.column.name, "*")) {
                 const col_names = try self.getColumnNames();
                 // Only Lance allocates column names, other table types return stored slices
@@ -1370,10 +1367,9 @@ pub const Executor = struct {
                         .data = data,
                     });
                 }
-                break; // SELECT * means we're done
+                break;
             }
 
-            // Handle regular column
             if (item.expr == .column) {
                 const col_name = item.expr.column.name;
                 const col_idx = self.getPhysicalColumnId(col_name) orelse return error.ColumnNotFound;
@@ -1384,7 +1380,6 @@ pub const Executor = struct {
                     .data = data,
                 });
             } else {
-                // Handle expressions (arithmetic, functions, etc.)
                 const expr_col = try self.evaluateExpressionColumn(item, indices);
                 try columns.append(self.allocator, expr_col);
             }
