@@ -1,34 +1,24 @@
 # Vector operations for @logic_table benchmark
-# Compiled by metal0: metal0 build --emit-logic-table benchmarks/vector_ops.py -o lib/vector_ops.a
 #
-# HONEST BENCHMARK: These are ACTUAL Python for loops that get compiled to Zig.
-# No built-in functions - pure Python code that metal0 compiles.
+# Example Python code for future JIT compilation via metal0.
+# Currently benchmarks use native Zig SIMD functions instead.
 
 from logic_table import logic_table
 
 
 @logic_table
 class VectorOps:
-    """Core vector operations - REAL Python code compiled to native Zig.
-
-    These for loops are what metal0 compiles. No cheating with built-in SIMD.
-    """
+    """Core vector operations - example @logic_table Python code."""
 
     def dot_product(self, a: list, b: list) -> float:
-        """Compute dot product of two vectors.
-
-        This Python for loop is compiled to Zig by metal0.
-        """
+        """Compute dot product of two vectors."""
         result = 0.0
         for i in range(len(a)):
             result = result + a[i] * b[i]
         return result
 
     def sum_squares(self, a: list) -> float:
-        """Compute sum of squares of a vector.
-
-        This Python for loop is compiled to Zig by metal0.
-        """
+        """Compute sum of squares of a vector."""
         result = 0.0
         for i in range(len(a)):
             result = result + a[i] * a[i]

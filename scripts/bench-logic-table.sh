@@ -26,7 +26,7 @@ echo ""
 
 # Check engines
 echo "Engines:"
-echo "  - LanceQL: native Zig + Metal GPU (compiled @logic_table)"
+echo "  - LanceQL: native Zig SIMD"
 
 if python3 -c "import duckdb" 2>/dev/null; then
     echo "  - DuckDB: $(python3 -c 'import duckdb; print(duckdb.__version__)')"
@@ -40,27 +40,6 @@ else
     echo "  - Polars: not installed (pip install polars)"
 fi
 echo ""
-
-# Build vector_ops.a if not present (required for @logic_table benchmarks)
-if [ ! -f "$PROJECT_DIR/lib/vector_ops.a" ]; then
-    echo "Building @logic_table library..."
-
-    # Check if metal0 is built
-    if [ ! -f "$PROJECT_DIR/deps/metal0/zig-out/bin/metal0" ]; then
-        echo "  Building metal0 AOT Python compiler..."
-        (cd "$PROJECT_DIR/deps/metal0" && zig build)
-    fi
-
-    # Compile Python @logic_table to native static library
-    mkdir -p "$PROJECT_DIR/lib"
-    "$PROJECT_DIR/deps/metal0/zig-out/bin/metal0" build --emit-logic-table "$PROJECT_DIR/benchmarks/vector_ops.py" -o "$PROJECT_DIR/lib/vector_ops.a"
-
-    if [ ! -f "$PROJECT_DIR/lib/vector_ops.a" ]; then
-        echo "ERROR: Failed to compile @logic_table library"
-        exit 1
-    fi
-    echo "  ✓ Compiled lib/vector_ops.a"
-fi
 
 # Build and run
 zig build bench-logic-table 2>&1

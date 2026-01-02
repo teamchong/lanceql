@@ -568,8 +568,7 @@ pub fn build(b: *std.Build) void {
     const bench_column_io_step = b.step("bench-column-io", "Column-first I/O benchmark");
     bench_column_io_step.dependOn(&run_bench_column_io.step);
 
-    // @logic_table benchmark - uses REAL metal0 compiled lib/vector_ops.a
-    // Build with: metal0 build --emit-logic-table benchmarks/vector_ops.py -o lib/vector_ops.a
+    // @logic_table benchmark - uses built-in SIMD functions
     const bench_logic_table = b.addExecutable(.{
         .name = "bench_logic_table",
         .root_module = b.createModule(.{
@@ -582,11 +581,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    // Link the REAL metal0-compiled static library
-    bench_logic_table.addObjectFile(b.path("lib/vector_ops.a"));
-    bench_logic_table.linkLibC(); // Required for libc symbols used by metal0 runtime
     const run_bench_logic_table = b.addRunArtifact(bench_logic_table);
-    const bench_logic_table_step = b.step("bench-logic-table", "Benchmark REAL @logic_table (metal0 compiled Python)");
+    const bench_logic_table_step = b.step("bench-logic-table", "Benchmark @logic_table (SIMD)");
     bench_logic_table_step.dependOn(&run_bench_logic_table.step);
 
     // @logic_table End-to-End benchmark - full pipeline with comparisons
@@ -601,9 +597,6 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    // Link the compiled @logic_table static library
-    bench_logic_table_e2e.addObjectFile(b.path("lib/vector_ops.a"));
-    bench_logic_table_e2e.linkLibC(); // Required for libc symbols used by metal0 runtime
     const run_bench_logic_table_e2e = b.addRunArtifact(bench_logic_table_e2e);
     const bench_logic_table_e2e_step = b.step("bench-logic-table-e2e", "End-to-end @logic_table benchmark with DuckDB/Polars comparison");
     bench_logic_table_e2e_step.dependOn(&run_bench_logic_table_e2e.step);
@@ -620,11 +613,8 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    // Link the REAL metal0-compiled @logic_table static library
-    bench_pushdown.addObjectFile(b.path("lib/vector_ops.a"));
-    bench_pushdown.linkLibC(); // Required for libc symbols used by metal0 runtime
     const run_bench_pushdown = b.addRunArtifact(bench_pushdown);
-    const bench_pushdown_step = b.step("bench-pushdown", "Benchmark @logic_table pushdown (filtered_indices optimization)");
+    const bench_pushdown_step = b.step("bench-pushdown", "Benchmark pushdown (filtered_indices optimization)");
     bench_pushdown_step.dependOn(&run_bench_pushdown.step);
 
     // Window functions benchmark - @logic_table vs Python UDFs

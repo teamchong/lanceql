@@ -20,10 +20,12 @@
 const std = @import("std");
 const Table = @import("lanceql.table").Table;
 
-// Extern declaration for COMPILED @logic_table function
-// This is Python code compiled to native Zig by metal0
-// Source: benchmarks/vector_ops.py -> lib/vector_ops.a
-extern fn VectorOps_dot_product(a: [*]const f64, b: [*]const f64, len: usize) f64;
+// Native dot product - replaces pre-compiled @logic_table function
+fn dotProduct(a: []const f64, b: []const f64) f64 {
+    var sum: f64 = 0;
+    for (a, b) |av, bv| sum += av * bv;
+    return sum;
+}
 
 const WARMUP_SECONDS = 2;
 const BENCHMARK_SECONDS = 15;
@@ -131,7 +133,7 @@ pub fn main() !void {
         var iterations: u64 = 0;
         var total_rows: u64 = 0;
 
-        // Query vector as f64 (VectorOps_dot_product expects f64)
+        // Query vector as f64
         var query_vec: [EMBEDDING_DIM]f64 = undefined;
         for (&query_vec) |*v| v.* = 0.1;
 
@@ -157,10 +159,9 @@ pub fn main() !void {
                 // Filter: amount > 500
                 if (amounts[row] > 500.0) {
                     const emb = embeddings[row * EMBEDDING_DIM .. (row + 1) * EMBEDDING_DIM];
-                    // Convert f32 -> f64 for the compiled function
+                    // Convert f32 -> f64
                     for (emb, 0..) |v, i| emb_f64[i] = v;
-                    // VectorOps_dot_product is COMPILED from Python @logic_table
-                    total_score += VectorOps_dot_product(&emb_f64, &query_vec, EMBEDDING_DIM);
+                    total_score += dotProduct(&emb_f64, &query_vec);
                 }
             }
             std.mem.doNotOptimizeAway(&total_score);
@@ -187,10 +188,9 @@ pub fn main() !void {
                 // Filter: amount > 500
                 if (amounts[row] > 500.0) {
                     const emb = embeddings[row * EMBEDDING_DIM .. (row + 1) * EMBEDDING_DIM];
-                    // Convert f32 -> f64 for the compiled function
+                    // Convert f32 -> f64
                     for (emb, 0..) |v, i| emb_f64[i] = v;
-                    // VectorOps_dot_product is COMPILED from Python @logic_table
-                    total_score += VectorOps_dot_product(&emb_f64, &query_vec, EMBEDDING_DIM);
+                    total_score += dotProduct(&emb_f64, &query_vec);
                     filtered_rows += 1;
                 }
             }

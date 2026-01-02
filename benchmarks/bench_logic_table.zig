@@ -24,13 +24,6 @@ const std = @import("std");
 const Table = @import("lanceql.table").Table;
 const simd = @import("lanceql.simd");
 
-// Extern declaration for COMPILED @logic_table functions
-// This is Python code compiled to native Zig by metal0
-// Source: benchmarks/vector_ops.py -> lib/vector_ops.a
-
-// Scalar function (single vector dot product)
-extern fn VectorOps_dot_product(a: [*]const f64, b: [*]const f64, len: usize) f64;
-
 const WARMUP_SECONDS = 2;
 const BENCHMARK_SECONDS = 15;
 const LANCE_PATH = "benchmarks/benchmark_e2e.lance";
