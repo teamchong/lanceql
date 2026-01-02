@@ -12644,6 +12644,13 @@ export class SQLExecutor {
             rows.push(row);
         }
 
+        // Apply DISTINCT (GPU-accelerated for large result sets)
+        if (ast.distinct) {
+            const uniqueRows = await this.applyDistinct(rows);
+            rows.length = 0;
+            rows.push(...uniqueRows);
+        }
+
         // Apply ORDER BY (GPU-accelerated for large result sets)
         if (ast.orderBy && ast.orderBy.length > 0) {
             await this.applyOrderBy(rows, ast.orderBy, outputColumns);
@@ -14238,6 +14245,102 @@ export class SQLExecutor {
             }
             return 0;
         });
+    }
+
+    /**
+     * Apply DISTINCT to rows (GPU-accelerated for large datasets)
+     * @param {Array[]} rows - Row arrays to deduplicate
+     * @returns {Array[]} Deduplicated rows
+     */
+    async applyDistinct(rows) {
+        if (rows.length === 0) return rows;
+
+        // Use GPU for large datasets (10,000+ rows)
+        if (rows.length >= 10000 && gpuGrouper.isAvailable()) {
+            // Hash each row to create a unique signature
+            const rowHashes = this._hashRows(rows);
+
+            // Use GPUGrouper to find unique hashes
+            const { groupIds, numGroups } = await gpuGrouper.groupBy(rowHashes);
+
+            // Extract first occurrence of each unique group
+            const firstOccurrence = new Array(numGroups).fill(-1);
+            for (let i = 0; i < rows.length; i++) {
+                const gid = groupIds[i];
+                if (firstOccurrence[gid] === -1) {
+                    firstOccurrence[gid] = i;
+                }
+            }
+
+            // Build deduplicated result
+            const uniqueRows = [];
+            for (let gid = 0; gid < numGroups; gid++) {
+                if (firstOccurrence[gid] !== -1) {
+                    uniqueRows.push(rows[firstOccurrence[gid]]);
+                }
+            }
+            return uniqueRows;
+        }
+
+        // CPU fallback using Set with JSON serialization
+        const seen = new Set();
+        const uniqueRows = [];
+        for (const row of rows) {
+            const key = JSON.stringify(row);
+            if (!seen.has(key)) {
+                seen.add(key);
+                uniqueRows.push(row);
+            }
+        }
+        return uniqueRows;
+    }
+
+    /**
+     * Hash rows to u32 for GPU deduplication
+     */
+    _hashRows(rows) {
+        const hashes = new Uint32Array(rows.length);
+        for (let i = 0; i < rows.length; i++) {
+            hashes[i] = this._hashRow(rows[i]);
+        }
+        return hashes;
+    }
+
+    /**
+     * FNV-1a hash of a row's values
+     */
+    _hashRow(row) {
+        let hash = 2166136261;
+        for (const val of row) {
+            if (val === null || val === undefined) {
+                hash ^= 0;
+            } else if (typeof val === 'number') {
+                // Hash number as bytes
+                const buf = new ArrayBuffer(8);
+                new Float64Array(buf)[0] = val;
+                const bytes = new Uint8Array(buf);
+                for (const b of bytes) {
+                    hash ^= b;
+                    hash = Math.imul(hash, 16777619);
+                }
+            } else if (typeof val === 'string') {
+                for (let j = 0; j < val.length; j++) {
+                    hash ^= val.charCodeAt(j);
+                    hash = Math.imul(hash, 16777619);
+                }
+            } else {
+                // Fallback: stringify
+                const str = String(val);
+                for (let j = 0; j < str.length; j++) {
+                    hash ^= str.charCodeAt(j);
+                    hash = Math.imul(hash, 16777619);
+                }
+            }
+            // Separator between values
+            hash ^= 0xFF;
+            hash = Math.imul(hash, 16777619);
+        }
+        return hash >>> 0;
     }
 
     exprToName(expr) {

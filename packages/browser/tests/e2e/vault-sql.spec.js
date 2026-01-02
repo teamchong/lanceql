@@ -4930,4 +4930,132 @@ test.describe('Vault SQL Operations', () => {
             expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
         }
     });
+
+    test('SELECT DISTINCT deduplicates rows', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const tests = [];
+
+            const v = await vault();
+            await v.exec('CREATE TABLE test_distinct (id INT, category TEXT, value FLOAT)');
+            await v.exec("INSERT INTO test_distinct VALUES (1, 'A', 10.5), (2, 'B', 20.5), (3, 'A', 10.5), (4, 'B', 30.5), (5, 'A', 10.5)");
+
+            // Test DISTINCT on single column
+            try {
+                const res = await v.exec('SELECT DISTINCT category FROM test_distinct');
+                const categories = res.rows.map(r => r.category).sort();
+                const pass = categories.length === 2 && categories[0] === 'A' && categories[1] === 'B';
+                tests.push({ name: 'DISTINCT single column', pass, actual: JSON.stringify(categories) });
+            } catch (e) {
+                tests.push({ name: 'DISTINCT single column', pass: false, error: e.message });
+            }
+
+            // Test DISTINCT on multiple columns
+            try {
+                const res = await v.exec('SELECT DISTINCT category, value FROM test_distinct');
+                // A,10.5 appears 3 times but should be deduplicated to 1
+                // B,20.5 and B,30.5 are unique
+                tests.push({ name: 'DISTINCT multiple columns', pass: res.rows.length === 3, actual: res.rows.length });
+            } catch (e) {
+                tests.push({ name: 'DISTINCT multiple columns', pass: false, error: e.message });
+            }
+
+            // Test DISTINCT with all unique rows
+            try {
+                const res = await v.exec('SELECT DISTINCT id FROM test_distinct');
+                tests.push({ name: 'DISTINCT all unique', pass: res.rows.length === 5, actual: res.rows.length });
+            } catch (e) {
+                tests.push({ name: 'DISTINCT all unique', pass: false, error: e.message });
+            }
+
+            // Test DISTINCT preserves row content
+            try {
+                const res = await v.exec('SELECT DISTINCT category FROM test_distinct ORDER BY category');
+                const pass = res.rows[0].category === 'A' && res.rows[1].category === 'B';
+                tests.push({ name: 'DISTINCT with ORDER BY', pass, actual: JSON.stringify(res.rows) });
+            } catch (e) {
+                tests.push({ name: 'DISTINCT with ORDER BY', pass: false, error: e.message });
+            }
+
+            await v.exec('DROP TABLE test_distinct');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('SELECT DISTINCT handles edge cases', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const tests = [];
+
+            const v = await vault();
+
+            // Test DISTINCT with NULL values
+            await v.exec('CREATE TABLE test_nulls (id INT, value TEXT)');
+            await v.exec("INSERT INTO test_nulls VALUES (1, NULL), (2, 'A'), (3, NULL), (4, 'A'), (5, 'B')");
+            try {
+                const res = await v.exec('SELECT DISTINCT value FROM test_nulls');
+                // Should have NULL, 'A', 'B' = 3 unique values
+                tests.push({ name: 'DISTINCT with NULLs', pass: res.rows.length === 3, actual: res.rows.length });
+            } catch (e) {
+                tests.push({ name: 'DISTINCT with NULLs', pass: false, error: e.message });
+            }
+            await v.exec('DROP TABLE test_nulls');
+
+            // Test DISTINCT on empty table
+            await v.exec('CREATE TABLE test_empty (id INT)');
+            try {
+                const res = await v.exec('SELECT DISTINCT id FROM test_empty');
+                tests.push({ name: 'DISTINCT empty table', pass: res.rows.length === 0, actual: res.rows.length });
+            } catch (e) {
+                tests.push({ name: 'DISTINCT empty table', pass: false, error: e.message });
+            }
+            await v.exec('DROP TABLE test_empty');
+
+            // Test DISTINCT with single row
+            await v.exec('CREATE TABLE test_single (id INT, name TEXT)');
+            await v.exec("INSERT INTO test_single VALUES (1, 'Solo')");
+            try {
+                const res = await v.exec('SELECT DISTINCT name FROM test_single');
+                tests.push({ name: 'DISTINCT single row', pass: res.rows.length === 1 && res.rows[0].name === 'Solo', actual: JSON.stringify(res.rows) });
+            } catch (e) {
+                tests.push({ name: 'DISTINCT single row', pass: false, error: e.message });
+            }
+            await v.exec('DROP TABLE test_single');
+
+            // Test DISTINCT with numeric duplicates
+            await v.exec('CREATE TABLE test_nums (value FLOAT)');
+            await v.exec('INSERT INTO test_nums VALUES (1.5), (2.5), (1.5), (3.5), (2.5), (1.5)');
+            try {
+                const res = await v.exec('SELECT DISTINCT value FROM test_nums ORDER BY value');
+                const values = res.rows.map(r => r.value);
+                const pass = values.length === 3 && values[0] === 1.5 && values[1] === 2.5 && values[2] === 3.5;
+                tests.push({ name: 'DISTINCT numeric duplicates', pass, actual: JSON.stringify(values) });
+            } catch (e) {
+                tests.push({ name: 'DISTINCT numeric duplicates', pass: false, error: e.message });
+            }
+            await v.exec('DROP TABLE test_nums');
+
+            // Test DISTINCT * (all columns)
+            await v.exec('CREATE TABLE test_star (a INT, b TEXT)');
+            await v.exec("INSERT INTO test_star VALUES (1, 'X'), (2, 'Y'), (1, 'X'), (2, 'Z')");
+            try {
+                const res = await v.exec('SELECT DISTINCT * FROM test_star');
+                // (1,X), (2,Y), (2,Z) = 3 unique rows
+                tests.push({ name: 'DISTINCT *', pass: res.rows.length === 3, actual: res.rows.length });
+            } catch (e) {
+                tests.push({ name: 'DISTINCT *', pass: false, error: e.message });
+            }
+            await v.exec('DROP TABLE test_star');
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
 });
