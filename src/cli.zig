@@ -16,6 +16,7 @@ const std = @import("std");
 const args = @import("cli/args.zig");
 const ingest = @import("cli/ingest.zig");
 const enrich = @import("cli/enrich.zig");
+const transform = @import("cli/transform.zig");
 const lanceql = @import("lanceql");
 const metal = @import("lanceql.metal");
 const Table = @import("lanceql.table").Table;
@@ -222,16 +223,12 @@ fn cmdIngest(allocator: std.mem.Allocator, opts: args.IngestOptions) !void {
     try ingest.run(allocator, opts);
 }
 
-/// Transform command - apply transformations to Lance data
+/// Transform command - apply transformations to data files
 fn cmdTransform(allocator: std.mem.Allocator, opts: args.TransformOptions) !void {
-    _ = allocator;
-    _ = opts;
-    std.debug.print("Error: Transform command not yet implemented.\n", .{});
-    std.debug.print("\nTransform will support operations like:\n", .{});
-    std.debug.print("  - Column projection and renaming\n", .{});
-    std.debug.print("  - Row filtering\n", .{});
-    std.debug.print("  - Data type conversions\n", .{});
-    std.debug.print("\nWorkaround: Use SQL queries with 'lanceql query'\n", .{});
+    transform.run(allocator, opts) catch |err| {
+        std.debug.print("Transform command failed: {}\n", .{err});
+        return err;
+    };
 }
 
 /// Enrich command - add embeddings and indexes
