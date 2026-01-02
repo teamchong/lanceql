@@ -198,6 +198,14 @@ pub const Executor = struct {
     /// Field names of typed table pointers for comptime iteration
     const typed_table_fields = .{ "parquet_table", "delta_table", "iceberg_table", "arrow_table", "avro_table", "orc_table", "xlsx_table" };
 
+    /// Check if any typed table is set (non-Lance mode)
+    inline fn hasTypedTable(self: *Self) bool {
+        inline for (typed_table_fields) |field| {
+            if (@field(self, field) != null) return true;
+        }
+        return false;
+    }
+
     /// Get row count (works with Lance, Parquet, Delta, Iceberg, Arrow, Avro, ORC, or XLSX)
     fn getRowCount(self: *Self) !usize {
         inline for (typed_table_fields) |field| {
@@ -311,13 +319,9 @@ pub const Executor = struct {
     /// Preload columns into cache
     fn preloadColumns(self: *Self, col_names: []const []const u8) !void {
         // Use generic preloader for typed tables
-        if (self.parquet_table) |t| return self.preloadColumnsFromTable(t, col_names);
-        if (self.delta_table) |t| return self.preloadColumnsFromTable(t, col_names);
-        if (self.iceberg_table) |t| return self.preloadColumnsFromTable(t, col_names);
-        if (self.arrow_table) |t| return self.preloadColumnsFromTable(t, col_names);
-        if (self.avro_table) |t| return self.preloadColumnsFromTable(t, col_names);
-        if (self.orc_table) |t| return self.preloadColumnsFromTable(t, col_names);
-        if (self.xlsx_table) |t| return self.preloadColumnsFromTable(t, col_names);
+        inline for (typed_table_fields) |field| {
+            if (@field(self, field)) |t| return self.preloadColumnsFromTable(t, col_names);
+        }
 
         for (col_names) |name| {
             // Skip if already cached
@@ -877,9 +881,7 @@ pub const Executor = struct {
     /// Execute a SELECT statement
     pub fn execute(self: *Self, stmt: *const SelectStmt, params: []const Value) !Result {
         // Check if we have a typed table (skip FROM clause resolution)
-        const has_typed_table = self.parquet_table != null or self.delta_table != null or
-            self.iceberg_table != null or self.arrow_table != null or
-            self.avro_table != null or self.orc_table != null or self.xlsx_table != null;
+        const has_typed_table = self.hasTypedTable();
 
         // 0. Resolve FROM clause to get table source (only for Lance tables)
         var source: ?TableSource = null;
@@ -3494,15 +3496,7 @@ pub const Executor = struct {
             if (item.expr == .column and std.mem.eql(u8, item.expr.column.name, "*")) {
                 const col_names = try self.getColumnNames();
                 // Only Lance allocates column names, other table types return stored slices
-                // Check if we're in a mode that returns stored slices (don't free)
-                const should_free = self.parquet_table == null and
-                    self.delta_table == null and
-                    self.iceberg_table == null and
-                    self.arrow_table == null and
-                    self.avro_table == null and
-                    self.orc_table == null and
-                    self.xlsx_table == null;
-                defer if (should_free) self.allocator.free(col_names);
+                defer if (!self.hasTypedTable()) self.allocator.free(col_names);
 
                 for (col_names) |col_name| {
                     // Look up the physical column ID from the name
@@ -3545,21 +3539,17 @@ pub const Executor = struct {
         indices: []const u32,
     ) !Result.ColumnData {
         // Use generic reader for typed tables
-        if (self.parquet_table) |t| return self.readColumnFromTableAtIndices(t, col_idx, indices);
-        if (self.delta_table) |t| return self.readColumnFromTableAtIndices(t, col_idx, indices);
-        if (self.iceberg_table) |t| return self.readColumnFromTableAtIndices(t, col_idx, indices);
-        if (self.arrow_table) |t| return self.readColumnFromTableAtIndices(t, col_idx, indices);
-        if (self.avro_table) |t| return self.readColumnFromTableAtIndices(t, col_idx, indices);
-        if (self.orc_table) |t| return self.readColumnFromTableAtIndices(t, col_idx, indices);
-        if (self.xlsx_table) |t| return self.readColumnFromTableAtIndices(t, col_idx, indices);
+        inline for (typed_table_fields) |field| {
+            if (@field(self, field)) |t| return self.readColumnFromTableAtIndices(t, col_idx, indices);
+        }
 
-        const field = self.tbl().getFieldById(col_idx) orelse return error.InvalidColumn;
+        const fld = self.tbl().getFieldById(col_idx) orelse return error.InvalidColumn;
 
         // Phase 2: Table API now has readAtIndices() methods
         // Current implementation still uses inline filtering for type-specific handling
         // Future: refactor to use Table.readInt64AtIndices() etc. for cleaner code
 
-        const logical_type = field.logical_type;
+        const logical_type = fld.logical_type;
 
         // Precise type detection (order matters - check specific before general)
         // Timestamp types (check before generic "int" matches)
