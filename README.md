@@ -6,6 +6,21 @@ A browser-based Lance file reader with SQL and vector search support. Query Lanc
 
 **Live Demo:** [https://teamchong.github.io/lanceql](https://teamchong.github.io/lanceql)
 
+**Documentation:**
+- [SQL Reference](./docs/SQL_REFERENCE.md) - Complete SQL dialect reference
+- [Vector Search Guide](./docs/VECTOR_SEARCH.md) - Semantic search with NEAR clause
+- [@logic_table](./LOGIC_TABLE.md) - Compile Python to native GPU kernels
+
+## When to Use LanceQL
+
+| Use Case | LanceQL |
+|----------|---------|
+| Query columnar files in browser | Direct SQL on Lance/Parquet, no backend needed |
+| Semantic search on embeddings | Built-in vector search with IVF-PQ indices |
+| Python UDFs that are too slow | @logic_table compiles Python to native code |
+| Time-travel queries | Query any historical version |
+| Query remote data efficiently | HTTP Range requests - only fetch what you need |
+
 ## Features
 
 ### All Platforms
@@ -72,6 +87,8 @@ Default dataset: 1M LAION images with text embeddings at `https://data.metal0.de
 
 ## SQL Examples
 
+See [SQL Reference](./docs/SQL_REFERENCE.md) for complete documentation.
+
 ```sql
 -- Local uploaded file
 SELECT * FROM read_lance(FILE) LIMIT 50
@@ -89,21 +106,13 @@ LIMIT 100
 -- Aggregations
 SELECT COUNT(*), AVG(aesthetic), MAX(aesthetic) FROM read_lance(FILE)
 
--- Vector search by text (TOPK optional, default 20)
-SELECT * FROM read_lance(FILE) NEAR 'sunset beach'
-SELECT * FROM read_lance(FILE) NEAR 'cat' TOPK 50
-
--- Vector search by row
-SELECT * FROM read_lance(FILE) NEAR 0 TOPK 10
-
--- Specify vector column
-SELECT * FROM read_lance(FILE) NEAR embedding 'sunset'
-
--- Combined with WHERE
-SELECT * FROM read_lance(FILE)
-WHERE aesthetic > 0.5
-NEAR 'beach sunset' TOPK 30
+-- Vector search (see Vector Search Guide for more)
+SELECT * FROM read_lance(FILE) NEAR 'sunset beach' TOPK 20
+SELECT * FROM read_lance(FILE) NEAR embedding 'cat' TOPK 50
+SELECT * FROM read_lance(FILE) WHERE aesthetic > 0.5 NEAR 'beach' TOPK 30
 ```
+
+See [Vector Search Guide](./docs/VECTOR_SEARCH.md) for IVF-PQ indices, encoders, and performance tuning.
 
 ## DataFrame Examples
 
@@ -301,20 +310,20 @@ aws s3 cp ./meta.json s3://bucket/dataset.lance/.meta.json --profile r2 --endpoi
 
 ## Format Support
 
-### Lance Files
-- Lance v2.0 and v2.1 file format
-- Multi-fragment datasets with manifest discovery
-- IVF-PQ vector indices
-- Deletion vectors (logical deletes)
-- Version/time-travel queries
-- Data types: int32/64, float32/64, bool, string, timestamp[s/ms/us/ns], date32/64
+| Format | Function | Features |
+|--------|----------|----------|
+| **Lance** | `read_lance()` | v2.0/v2.1, IVF-PQ indices, time travel, deletion vectors |
+| **Parquet** | `read_parquet()` | Pure Zig, Snappy, RLE/PLAIN/DICTIONARY encoding |
+| **Delta Lake** | `read_delta()` | Parquet + transaction log |
+| **Iceberg** | `read_iceberg()` | Parquet + metadata layer |
+| **Arrow IPC** | `read_arrow()` | .arrow, .arrows, .feather files |
+| **Avro** | `read_avro()` | Deflate/Snappy compression |
+| **ORC** | `read_orc()` | Snappy compression |
+| **Excel** | `read_xlsx()` | Multi-sheet support |
 
-### Parquet Files
-- Pure Zig implementation (zero external dependencies)
-- Thrift TCompactProtocol metadata decoder
-- Encodings: PLAIN, RLE, RLE_DICTIONARY
-- Compression: Uncompressed, Snappy
-- Data types: boolean, int32/64, float/double, byte_array, fixed_len_byte_array
+**Supported Data Types:** int32/64, float32/64, bool, string, timestamp[s/ms/us/ns], date32/64
+
+See [SQL Reference](./docs/SQL_REFERENCE.md) for complete data source documentation.
 
 ## License
 
