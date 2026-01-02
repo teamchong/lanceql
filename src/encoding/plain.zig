@@ -27,143 +27,116 @@ pub const PlainDecoder = struct {
     }
 
     // ========================================================================
-    // Int64 decoding
+    // Generic helpers
     // ========================================================================
 
-    /// Get the number of int64 values in the buffer.
-    pub fn int64Count(self: Self) usize {
-        return self.data.len / 8;
+    /// Get the count of values for a given type
+    fn valueCount(self: Self, comptime T: type) usize {
+        return self.data.len / @sizeOf(T);
     }
 
-    /// Read a single int64 value at the given index.
-    pub fn readInt64(self: Self, index: usize) DecodeError!i64 {
-        const offset = index * 8;
-        if (offset + 8 > self.data.len) {
+    /// Read a single integer value at the given index
+    fn readIntValue(self: Self, comptime T: type, index: usize) DecodeError!T {
+        const size = @sizeOf(T);
+        const offset = index * size;
+        if (offset + size > self.data.len) {
             return DecodeError.IndexOutOfBounds;
         }
-        return std.mem.readInt(i64, self.data[offset..][0..8], .little);
+        return std.mem.readInt(T, self.data[offset..][0..size], .little);
     }
 
-    /// Read all int64 values into an allocated slice.
-    pub fn readAllInt64(self: Self, allocator: std.mem.Allocator) ![]i64 {
-        const count = self.int64Count();
-        const result = try allocator.alloc(i64, count);
+    /// Read a single float value at the given index (via bitcast from unsigned int)
+    fn readFloatValue(self: Self, comptime T: type, comptime U: type, index: usize) DecodeError!T {
+        const bits = try self.readIntValue(U, index);
+        return @bitCast(bits);
+    }
+
+    /// Read all values into an allocated slice using a read function
+    fn readAllValues(self: Self, comptime T: type, allocator: std.mem.Allocator, readFn: fn (Self, usize) DecodeError!T) ![]T {
+        const count = self.valueCount(T);
+        const result = try allocator.alloc(T, count);
         errdefer allocator.free(result);
 
         for (0..count) |i| {
-            result[i] = self.readInt64(i) catch return error.IndexOutOfBounds;
+            result[i] = readFn(self, i) catch return error.IndexOutOfBounds;
         }
         return result;
+    }
+
+    // ========================================================================
+    // Int64 decoding
+    // ========================================================================
+
+    pub fn int64Count(self: Self) usize {
+        return self.valueCount(i64);
+    }
+
+    pub fn readInt64(self: Self, index: usize) DecodeError!i64 {
+        return self.readIntValue(i64, index);
+    }
+
+    pub fn readAllInt64(self: Self, allocator: std.mem.Allocator) ![]i64 {
+        return self.readAllValues(i64, allocator, readInt64);
     }
 
     // ========================================================================
     // UInt64 decoding
     // ========================================================================
 
-    /// Get the number of uint64 values in the buffer.
     pub fn uint64Count(self: Self) usize {
-        return self.data.len / 8;
+        return self.valueCount(u64);
     }
 
-    /// Read a single uint64 value at the given index.
     pub fn readUint64(self: Self, index: usize) DecodeError!u64 {
-        const offset = index * 8;
-        if (offset + 8 > self.data.len) {
-            return DecodeError.IndexOutOfBounds;
-        }
-        return std.mem.readInt(u64, self.data[offset..][0..8], .little);
+        return self.readIntValue(u64, index);
     }
 
     // ========================================================================
     // Float64 decoding
     // ========================================================================
 
-    /// Get the number of float64 values in the buffer.
     pub fn float64Count(self: Self) usize {
-        return self.data.len / 8;
+        return self.valueCount(f64);
     }
 
-    /// Read a single float64 value at the given index.
     pub fn readFloat64(self: Self, index: usize) DecodeError!f64 {
-        const offset = index * 8;
-        if (offset + 8 > self.data.len) {
-            return DecodeError.IndexOutOfBounds;
-        }
-        const bits = std.mem.readInt(u64, self.data[offset..][0..8], .little);
-        return @bitCast(bits);
+        return self.readFloatValue(f64, u64, index);
     }
 
-    /// Read all float64 values into an allocated slice.
     pub fn readAllFloat64(self: Self, allocator: std.mem.Allocator) ![]f64 {
-        const count = self.float64Count();
-        const result = try allocator.alloc(f64, count);
-        errdefer allocator.free(result);
-
-        for (0..count) |i| {
-            result[i] = self.readFloat64(i) catch return error.IndexOutOfBounds;
-        }
-        return result;
+        return self.readAllValues(f64, allocator, readFloat64);
     }
 
     // ========================================================================
     // Int32 decoding
     // ========================================================================
 
-    /// Get the number of int32 values in the buffer.
     pub fn int32Count(self: Self) usize {
-        return self.data.len / 4;
+        return self.valueCount(i32);
     }
 
-    /// Read a single int32 value at the given index.
     pub fn readInt32(self: Self, index: usize) DecodeError!i32 {
-        const offset = index * 4;
-        if (offset + 4 > self.data.len) {
-            return DecodeError.IndexOutOfBounds;
-        }
-        return std.mem.readInt(i32, self.data[offset..][0..4], .little);
+        return self.readIntValue(i32, index);
     }
 
-    /// Read all int32 values into an allocated slice.
     pub fn readAllInt32(self: Self, allocator: std.mem.Allocator) ![]i32 {
-        const count = self.int32Count();
-        const result = try allocator.alloc(i32, count);
-        errdefer allocator.free(result);
-
-        for (0..count) |i| {
-            result[i] = self.readInt32(i) catch return error.IndexOutOfBounds;
-        }
-        return result;
+        return self.readAllValues(i32, allocator, readInt32);
     }
 
     // ========================================================================
     // Float32 decoding
     // ========================================================================
 
-    /// Get the number of float32 values in the buffer.
     pub fn float32Count(self: Self) usize {
-        return self.data.len / 4;
+        return self.valueCount(f32);
     }
 
-    /// Read a single float32 value at the given index.
     pub fn readFloat32(self: Self, index: usize) DecodeError!f32 {
-        const offset = index * 4;
-        if (offset + 4 > self.data.len) {
-            return DecodeError.IndexOutOfBounds;
-        }
-        const bits = std.mem.readInt(u32, self.data[offset..][0..4], .little);
-        return @bitCast(bits);
+        return self.readFloatValue(f32, u32, index);
     }
 
-    /// Read all float32 values into an allocated slice.
     pub fn readAllFloat32(self: Self, allocator: std.mem.Allocator) ![]f32 {
-        const count = self.float32Count();
-        const result = try allocator.alloc(f32, count);
-        errdefer allocator.free(result);
-
-        for (0..count) |i| {
-            result[i] = self.readFloat32(i) catch return error.IndexOutOfBounds;
-        }
-        return result;
+        return self.readAllValues(f32, allocator, readFloat32);
     }
 
     // ========================================================================
