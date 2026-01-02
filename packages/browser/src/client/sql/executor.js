@@ -6,7 +6,7 @@
 import { SQLLexer } from './lexer.js';
 import { SQLParser } from './parser.js';
 import { QueryPlanner, statisticsManager } from './query-planner.js';
-import { gpuSorter } from '../gpu/sorter.js';
+import { getGPUSorter } from '../gpu/sorter.js';
 
 // Import extracted modules
 import * as SearchModule from './executor-search.js';

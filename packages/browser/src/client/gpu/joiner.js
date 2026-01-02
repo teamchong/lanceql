@@ -205,12 +205,11 @@ fn init_t(@builtin(global_invocation_id) g: vec3<u32>) {
     _nextPow2(n) { let p = 1; while (p < n) p *= 2; return p; }
 }
 
-// Global GPU joiner instance
-const gpuJoiner = new GPUJoiner();
+// Lazy singleton - only instantiated when first accessed
+let _gpuJoiner = null;
+function getGPUJoiner() {
+    if (!_gpuJoiner) _gpuJoiner = new GPUJoiner();
+    return _gpuJoiner;
+}
 
-/**
- * GPU-accelerated SQL sorting using bitonic sort algorithm.
- * Falls back to CPU for small datasets where GPU overhead exceeds benefit.
- */
-
-export { GPUJoiner };
+export { GPUJoiner, getGPUJoiner };

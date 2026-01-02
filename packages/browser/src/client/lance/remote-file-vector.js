@@ -4,7 +4,7 @@
  */
 
 import { batchIndices } from './remote-file-proto.js';
-import { webgpuAccelerator } from '../gpu/accelerator.js';
+import { getWebGPUAccelerator } from '../gpu/accelerator.js';
 
 /**
  * Get vector info for a column via Range requests.
@@ -241,8 +241,9 @@ async function searchWithRowIdMappings(file, colIdx, queryVec, topK, rowIdMappin
     }
 
     let scores;
-    if (webgpuAccelerator.isAvailable()) {
-        scores = await webgpuAccelerator.batchCosineSimilarity(queryVec, allVectors, true);
+    const accelerator = getWebGPUAccelerator();
+    if (accelerator.isAvailable()) {
+        scores = await accelerator.batchCosineSimilarity(queryVec, allVectors, true);
     }
 
     if (!scores) {

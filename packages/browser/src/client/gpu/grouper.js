@@ -213,8 +213,11 @@ fn f2s(f: f32) -> u32 { let b = bitcast<u32>(f); return select(b ^ 0x80000000u, 
     _nextPow2(n) { let p = 1; while (p < n) p *= 2; return p; }
 }
 
-// Global GPU grouper instance
-const gpuGrouper = new GPUGrouper();
+// Lazy singleton - only instantiated when first accessed
+let _gpuGrouper = null;
+function getGPUGrouper() {
+    if (!_gpuGrouper) _gpuGrouper = new GPUGrouper();
+    return _gpuGrouper;
+}
 
-
-export { GPUGrouper };
+export { GPUGrouper, getGPUGrouper };

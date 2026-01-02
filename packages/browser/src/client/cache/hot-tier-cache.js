@@ -349,10 +349,11 @@ class HotTierCache {
     }
 }
 
-// Global hot-tier cache instance
-const hotTierCache = new HotTierCache();
+// Lazy singleton - only instantiated when first accessed
+let _hotTierCache = null;
+function getHotTierCache() {
+    if (!_hotTierCache) _hotTierCache = new HotTierCache();
+    return _hotTierCache;
+}
 
-// Export storage and statistics for external use
-
-
-export { HotTierCache, hotTierCache };
+export { HotTierCache, getHotTierCache };

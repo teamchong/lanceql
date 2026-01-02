@@ -8,15 +8,15 @@
 // Cache
 export { MetadataCache } from './cache/metadata-cache.js';
 export { LRUCache } from './cache/lru-cache.js';
-export { HotTierCache, hotTierCache } from './cache/hot-tier-cache.js';
+export { HotTierCache, getHotTierCache } from './cache/hot-tier-cache.js';
 
-// GPU Acceleration
-export { WebGPUAccelerator, webgpuAccelerator } from './gpu/accelerator.js';
-export { GPUAggregator } from './gpu/aggregator.js';
-export { GPUJoiner } from './gpu/joiner.js';
-export { GPUSorter } from './gpu/sorter.js';
-export { GPUGrouper } from './gpu/grouper.js';
-export { GPUVectorSearch } from './gpu/vector-search.js';
+// GPU Acceleration (lazy-loaded singletons via getters)
+export { WebGPUAccelerator, getWebGPUAccelerator } from './gpu/accelerator.js';
+export { GPUAggregator, getGPUAggregator } from './gpu/aggregator.js';
+export { GPUJoiner, getGPUJoiner } from './gpu/joiner.js';
+export { GPUSorter, getGPUSorter } from './gpu/sorter.js';
+export { GPUGrouper, getGPUGrouper } from './gpu/grouper.js';
+export { GPUVectorSearch, getGPUVectorSearch } from './gpu/vector-search.js';
 
 // Storage
 export { OPFSStorage, OPFSFileReader } from './storage/opfs.js';
@@ -51,15 +51,5 @@ export { Vault, TableRef, vault } from './store/vault.js';
 // WASM
 export { LocalSQLParser, LanceFileWriter, wasmUtils, LanceQL } from './wasm/lanceql.js';
 
-// Aliases for backwards compatibility
-export { lanceStore as createStore } from './store/store.js';
-export { Store as KeyValueStore } from './store/store.js';
-export { Database as SqlJsDatabase, Statement as SqlJsStatement } from './lance/lance-data.js';
-
 // Default export
 export { LanceQL as default } from './wasm/lanceql.js';
-
-// TODO: Add singleton instances when needed
-// export const metadataCache = new MetadataCache();
-// export const webgpuAccelerator = new WebGPUAccelerator();
-// etc.

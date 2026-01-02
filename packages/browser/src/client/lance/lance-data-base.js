@@ -3,7 +3,7 @@
  * Extracted from lance-data.js for modularity
  */
 
-import { hotTierCache } from '../cache/hot-tier-cache.js';
+import { getHotTierCache } from '../cache/hot-tier-cache.js';
 
 // Forward declarations - resolved at runtime
 let ChunkedLanceReader, LocalDatabase, opfsStorage, RemoteLanceFile;
@@ -164,7 +164,7 @@ class RemoteLanceData extends LanceDataBase {
         await loadDeps();
 
         // Check if already cached
-        const cacheInfo = await hotTierCache.getCacheInfo(this.url);
+        const cacheInfo = await getHotTierCache().getCacheInfo(this.url);
         if (cacheInfo && cacheInfo.complete) {
             this.type = 'cached';
             this.cachedPath = cacheInfo.path;
@@ -244,8 +244,9 @@ class RemoteLanceData extends LanceDataBase {
     }
 
     async prefetch() {
-        await hotTierCache.cache(this.url);
-        const cacheInfo = await hotTierCache.getCacheInfo(this.url);
+        const cache = getHotTierCache();
+        await cache.cache(this.url);
+        const cacheInfo = await cache.getCacheInfo(this.url);
         if (cacheInfo && cacheInfo.complete) {
             this.type = 'cached';
             this.cachedPath = cacheInfo.path;
@@ -253,7 +254,7 @@ class RemoteLanceData extends LanceDataBase {
     }
 
     async evict() {
-        await hotTierCache.evict(this.url);
+        await getHotTierCache().evict(this.url);
         this.type = 'remote';
         this.cachedPath = null;
     }

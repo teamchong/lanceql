@@ -147,17 +147,11 @@ class GPUVectorSearch {
     _createUniform(data) { const buf = this.device.createBuffer({ size: Math.max(data.byteLength, 16), usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }); this.device.queue.writeBuffer(buf, 0, data); return buf; }
 }
 
-const gpuVectorSearch = new GPUVectorSearch();
+// Lazy singleton - only instantiated when first accessed
+let _gpuVectorSearch = null;
+function getGPUVectorSearch() {
+    if (!_gpuVectorSearch) _gpuVectorSearch = new GPUVectorSearch();
+    return _gpuVectorSearch;
+}
 
-/**
- * Statistics Manager - computes and caches column statistics for query optimization.
- *
- * Unlike pre-generated sidecar files, this computes statistics dynamically:
- * 1. On first query to a column, stream through data to compute min/max/null_count
- * 2. Cache computed stats in OPFS for reuse across sessions
- * 3. Use statistics for fragment/page pruning during query execution
- *
- * This is the same approach used by DuckDB and DataFusion - no pre-processing required.
- */
-
-export { GPUVectorSearch };
+export { GPUVectorSearch, getGPUVectorSearch };

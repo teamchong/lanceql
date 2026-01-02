@@ -2,6 +2,9 @@
  * LanceFile - In-memory Lance file API
  */
 
+import { getWebGPUAccelerator } from '../gpu/accelerator.js';
+import { getGPUVectorSearch } from '../gpu/vector-search.js';
+
 class LanceFile {
     constructor(lanceql, data) {
         this.lanceql = lanceql;
@@ -975,7 +978,8 @@ class LanceFile {
         const numRows = info.rows;
 
         // Try WebGPU-accelerated path first
-        if (webgpuAccelerator.isAvailable()) {
+        const accelerator = getWebGPUAccelerator();
+        if (accelerator.isAvailable()) {
             if (onProgress) onProgress(0, numRows);
 
             const allVectors = this.readAllVectors(colIdx);
@@ -983,10 +987,10 @@ class LanceFile {
             if (onProgress) onProgress(numRows, numRows);
 
             // Batch compute with WebGPU
-            const scores = await webgpuAccelerator.batchCosineSimilarity(queryVec, allVectors, true);
+            const scores = await accelerator.batchCosineSimilarity(queryVec, allVectors, true);
 
             // GPU-accelerated top-K selection for large result sets
-            return await gpuVectorSearch.topK(scores, null, topK, true);
+            return await getGPUVectorSearch().topK(scores, null, topK, true);
         }
 
         if (onProgress) onProgress(0, numRows);
@@ -1000,7 +1004,7 @@ class LanceFile {
         const scores = this.lanceql.batchCosineSimilarity(queryVec, allVectors, true);
 
         // GPU-accelerated top-K selection for large result sets
-        return await gpuVectorSearch.topK(scores, null, topK, true);
+        return await getGPUVectorSearch().topK(scores, null, topK, true);
     }
 
     // ========================================================================

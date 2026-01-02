@@ -155,12 +155,11 @@ fn max_f(@builtin(local_invocation_id) l: vec3<u32>) {
     _cpuSum(values) { let s = 0; for (let i = 0; i < values.length; i++) s += values[i]; return s; }
 }
 
-// Global GPU aggregator instance
-const gpuAggregator = new GPUAggregator();
+// Lazy singleton - only instantiated when first accessed
+let _gpuAggregator = null;
+function getGPUAggregator() {
+    if (!_gpuAggregator) _gpuAggregator = new GPUAggregator();
+    return _gpuAggregator;
+}
 
-/**
- * GPU-accelerated SQL JOINs using hash join algorithm.
- * Falls back to CPU for small tables where GPU overhead exceeds benefit.
- */
-
-export { GPUAggregator };
+export { GPUAggregator, getGPUAggregator };

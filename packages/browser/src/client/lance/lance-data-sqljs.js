@@ -7,10 +7,10 @@
 
 import { SQLLexer } from '../sql/lexer.js';
 import { SQLParser } from '../sql/parser.js';
-import { webgpuAccelerator } from '../gpu/accelerator.js';
+import { getWebGPUAccelerator } from '../gpu/accelerator.js';
 import { GPUAggregator } from '../gpu/aggregator.js';
 import { GPUJoiner } from '../gpu/joiner.js';
-import { GPUSorter, gpuSorter } from '../gpu/sorter.js';
+import { GPUSorter, getGPUSorter } from '../gpu/sorter.js';
 import { GPUGrouper } from '../gpu/grouper.js';
 import { GPUVectorSearch } from '../gpu/vector-search.js';
 
@@ -334,7 +334,8 @@ async function initSqlJs(config = {}) {
 
     // Initialize WebGPU
     try {
-        await webgpuAccelerator.init();
+        const accelerator = getWebGPUAccelerator();
+        await accelerator.init();
 
         if (!gpuAggregator) gpuAggregator = new GPUAggregator();
         if (!gpuJoiner) gpuJoiner = new GPUJoiner();
@@ -343,7 +344,7 @@ async function initSqlJs(config = {}) {
 
         await gpuAggregator.init();
         await gpuJoiner.init();
-        await gpuSorter.init();
+        await getGPUSorter().init();
         await gpuGrouper.init();
         await gpuVectorSearch.init();
     } catch (e) {

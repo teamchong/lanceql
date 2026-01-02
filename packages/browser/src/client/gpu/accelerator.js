@@ -210,12 +210,11 @@ class WebGPUAccelerator {
     }
 }
 
-// Global WebGPU accelerator instance
-const webgpuAccelerator = new WebGPUAccelerator();
+// Lazy singleton - only instantiated when first accessed
+let _webgpuAccelerator = null;
+function getWebGPUAccelerator() {
+    if (!_webgpuAccelerator) _webgpuAccelerator = new WebGPUAccelerator();
+    return _webgpuAccelerator;
+}
 
-/**
- * GPU-accelerated SQL Aggregations (SUM, COUNT, AVG, MIN, MAX)
- * Uses WebGPU compute shaders for parallel reduction on large datasets.
- */
-
-export { WebGPUAccelerator, webgpuAccelerator };
+export { WebGPUAccelerator, getWebGPUAccelerator };

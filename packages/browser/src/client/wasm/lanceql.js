@@ -2,6 +2,8 @@
  * LanceQL - WASM loader and utilities
  */
 
+import { getWebGPUAccelerator } from '../gpu/accelerator.js';
+
 class LocalSQLParser {
     constructor(tokens) {
         this.tokens = tokens;
@@ -575,7 +577,7 @@ const _createLanceqlMethods = (proxy) => ({
      */
     async openUrl(url) {
         // Ensure WebGPU is initialized for vector search
-        await webgpuAccelerator.init();
+        await getWebGPUAccelerator().init();
         return await RemoteLanceFile.open(proxy, url);
     },
 
@@ -588,7 +590,7 @@ const _createLanceqlMethods = (proxy) => ({
      */
     async openDataset(baseUrl, options = {}) {
         // Ensure WebGPU is initialized for vector search
-        await webgpuAccelerator.init();
+        await getWebGPUAccelerator().init();
         return await RemoteLanceDataset.open(proxy, baseUrl, options);
     },
 

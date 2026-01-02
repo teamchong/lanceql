@@ -1,4 +1,4 @@
-import { webgpuAccelerator } from '../gpu/accelerator.js';
+import { getWebGPUAccelerator } from '../gpu/accelerator.js';
 
 export async function vectorSearch(dataset, colIdx, queryVec, topK = 10, onProgress = null, options = {}) {
     const { normalized = true, workerPool = null, useIndex = true, nprobe = 20 } = options;
@@ -48,8 +48,9 @@ async function ivfIndexSearch(dataset, queryVec, topK, vectorColIdx, nprobe, onP
     const scores = new Float32Array(vectors.length);
     const dim = queryVec.length;
 
-    if (webgpuAccelerator.isAvailable()) {
-        const maxBatch = webgpuAccelerator.getMaxVectorsPerBatch(dim);
+    const accelerator = getWebGPUAccelerator();
+    if (accelerator.isAvailable()) {
+        const maxBatch = accelerator.getMaxVectorsPerBatch(dim);
         let gpuProcessed = 0;
         let wasmProcessed = 0;
 
@@ -58,7 +59,7 @@ async function ivfIndexSearch(dataset, queryVec, topK, vectorColIdx, nprobe, onP
             const chunk = vectors.slice(start, end);
 
             try {
-                const chunkScores = await webgpuAccelerator.batchCosineSimilarity(queryVec, chunk, true);
+                const chunkScores = await accelerator.batchCosineSimilarity(queryVec, chunk, true);
                 if (chunkScores) {
                     scores.set(chunkScores, start);
                     gpuProcessed += chunk.length;

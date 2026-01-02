@@ -3,7 +3,7 @@
  * Main class that coordinates extracted modules.
  */
 
-import { hotTierCache } from '../cache/hot-tier-cache.js';
+import { getHotTierCache } from '../cache/hot-tier-cache.js';
 import { IVFIndex } from '../search/ivf-index.js';
 import { tryLoadSchema, getColumnNames, detectColumnTypes, parseManifest } from './remote-file-meta.js';
 import { parseColumnMeta, parseStringColumnMeta, batchIndices } from './remote-file-proto.js';
@@ -172,8 +172,9 @@ class RemoteLanceFile {
         }
 
         // Use hot-tier cache if available
-        if (hotTierCache.enabled) {
-            const data = await hotTierCache.getRange(this.url, start, end, this.size);
+        const cache = getHotTierCache();
+        if (cache.enabled) {
+            const data = await cache.getRange(this.url, start, end, this.size);
 
             if (this._onFetch) {
                 this._onFetch(data.byteLength, 1);

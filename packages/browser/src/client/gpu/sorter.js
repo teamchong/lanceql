@@ -183,7 +183,11 @@ fn init_idx(@builtin(global_invocation_id) g: vec3<u32>) {
     _nextPow2(n) { let p = 1; while (p < n) p *= 2; return p; }
 }
 
-// Singleton instance for GPU sorting
-const gpuSorter = new GPUSorter();
+// Lazy singleton - only instantiated when first accessed
+let _gpuSorter = null;
+function getGPUSorter() {
+    if (!_gpuSorter) _gpuSorter = new GPUSorter();
+    return _gpuSorter;
+}
 
-export { GPUSorter, gpuSorter };
+export { GPUSorter, getGPUSorter };
