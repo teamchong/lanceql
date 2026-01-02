@@ -47,6 +47,7 @@ pub const LanceColumnType = enum {
         if (std.mem.indexOf(u8, logical_type, "utf8") != null or std.mem.indexOf(u8, logical_type, "string") != null) return .string;
         return .unsupported;
     }
+
 };
 
 /// Query result in columnar format

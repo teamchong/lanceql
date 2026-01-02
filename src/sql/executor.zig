@@ -3179,24 +3179,18 @@ pub const Executor = struct {
                 const cached = self.column_cache.get(col.name) orelse {
                     // Not cached yet, look up from table
                     const physical_col_id = self.tbl().physicalColumnId(col.name) orelse return error.ColumnNotFound;
-                    const field = self.tbl().getFieldById(physical_col_id) orelse return error.InvalidColumn;
-
-                    if (std.mem.indexOf(u8, field.logical_type, "int") != null) {
-                        break :blk .int64;
-                    } else if (std.mem.indexOf(u8, field.logical_type, "float") != null or
-                              std.mem.indexOf(u8, field.logical_type, "double") != null) {
-                        break :blk .float64;
-                    } else {
-                        break :blk .string;
-                    }
+                    const fld = self.tbl().getFieldById(physical_col_id) orelse return error.InvalidColumn;
+                    const col_type = LanceColumnType.fromLogicalType(fld.logical_type);
+                    break :blk switch (col_type) {
+                        .int64, .int32, .timestamp_ns, .timestamp_us, .timestamp_ms, .timestamp_s, .date32, .date64, .bool_ => .int64,
+                        .float64, .float32 => .float64,
+                        .string, .unsupported => .string,
+                    };
                 };
-
+                // From cache: promote int32/float32 to int64/float64 for expressions
                 break :blk switch (cached) {
-                    .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => .int64,
-                    .int32, .date32 => .int64, // int32/date32 promoted to int64 for expressions
-                    .float64 => .float64,
-                    .float32 => .float64, // float32 promoted to float64 for expressions
-                    .bool_ => .int64, // bool treated as integer
+                    .int64, .int32, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date32, .date64, .bool_ => .int64,
+                    .float64, .float32 => .float64,
                     .string => .string,
                 };
             },
