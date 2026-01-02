@@ -28,6 +28,10 @@ pub const where_eval = @import("where_eval.zig");
 pub const expr_eval = @import("expr_eval.zig");
 pub const group_eval = @import("group_eval.zig");
 
+// Fused query compilation (optional)
+pub const planner = @import("planner/planner.zig");
+pub const fused_codegen = @import("codegen/fused_codegen.zig");
+
 const Expr = ast.Expr;
 const SelectStmt = ast.SelectStmt;
 const Value = ast.Value;
@@ -76,6 +80,12 @@ pub const Executor = struct {
     /// Cache for @logic_table method batch results
     /// Key: "ClassName.methodName", Value: results array
     method_results_cache: std.StringHashMap([]const f64),
+
+    /// Enable compiled query execution (fused compilation)
+    compiled_execution_enabled: bool = false,
+
+    /// Minimum row count to trigger compilation (below this, interpretation is faster)
+    compile_threshold: usize = 10_000,
 
     const Self = @This();
 
@@ -162,6 +172,85 @@ pub const Executor = struct {
             .xlsx => |*t| self.xlsx_table = t,
         }
         return self;
+    }
+
+    // ========================================================================
+    // Compiled Query Execution (Fused Compilation)
+    // ========================================================================
+
+    /// Enable compiled query execution
+    /// When enabled, queries that exceed the compile threshold will be JIT compiled
+    /// to native code for maximum performance.
+    pub fn enableCompiledExecution(self: *Self, enabled: bool) void {
+        self.compiled_execution_enabled = enabled;
+    }
+
+    /// Set the row count threshold for triggering compilation
+    /// Queries with fewer rows than this will use interpretation (faster for small data)
+    pub fn setCompileThreshold(self: *Self, threshold: usize) void {
+        self.compile_threshold = threshold;
+    }
+
+    /// Check if a query should use compiled execution
+    /// Returns true if:
+    /// - Compiled execution is enabled
+    /// - Row count exceeds threshold
+    /// - Query contains @logic_table method calls
+    fn shouldCompile(self: *Self, stmt: *const SelectStmt) bool {
+        if (!self.compiled_execution_enabled) return false;
+
+        // Check for @logic_table method calls (high benefit from compilation)
+        for (stmt.columns) |col| {
+            if (self.hasLogicTableMethodCall(&col.expr)) return true;
+        }
+        if (stmt.where) |*where| {
+            if (self.hasLogicTableMethodCall(where)) return true;
+        }
+
+        // Check row count threshold
+        if (self.table) |t| {
+            if (t.row_count >= self.compile_threshold) return true;
+        }
+
+        return false;
+    }
+
+    /// Check if expression contains @logic_table method call
+    fn hasLogicTableMethodCall(self: *Self, expr: *const Expr) bool {
+        switch (expr.*) {
+            .method_call => |mc| {
+                // Check if object is a logic_table alias
+                if (self.logic_table_aliases.get(mc.object)) |_| {
+                    return true;
+                }
+                return false;
+            },
+            .binary => |bin| {
+                return self.hasLogicTableMethodCall(bin.left) or
+                    self.hasLogicTableMethodCall(bin.right);
+            },
+            .unary => |un| {
+                return self.hasLogicTableMethodCall(un.operand);
+            },
+            .call => |call| {
+                for (call.args) |*arg| {
+                    if (self.hasLogicTableMethodCall(arg)) return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    /// Execute a query using fused compilation
+    /// This generates and JIT-compiles a single function for the entire query
+    fn executeCompiled(self: *Self, stmt: *const SelectStmt) !Result {
+        _ = self;
+        _ = stmt;
+        // Fused compilation execution path
+        // This will be fully implemented in the @logic_table inlining phase
+        // For now, return error to fall back to interpreted execution
+        return error.NotImplemented;
     }
 
     /// Register a table by name for use in JOINs and multi-table queries
