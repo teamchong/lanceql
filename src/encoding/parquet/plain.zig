@@ -308,3 +308,93 @@ test "read booleans" {
     try std.testing.expect(values[6] == true);
     try std.testing.expect(values[7] == false);
 }
+
+test "read float" {
+    var data: [8]u8 = undefined;
+    const val1: f32 = 1.5;
+    const val2: f32 = -2.25;
+    std.mem.writeInt(u32, data[0..4], @bitCast(val1), .little);
+    std.mem.writeInt(u32, data[4..8], @bitCast(val2), .little);
+
+    var decoder = PlainDecoder.init(&data);
+    const values = try decoder.readFloat(2, std.testing.allocator);
+    defer std.testing.allocator.free(values);
+
+    try std.testing.expectApproxEqAbs(val1, values[0], 0.0001);
+    try std.testing.expectApproxEqAbs(val2, values[1], 0.0001);
+}
+
+test "read int96" {
+    // Two INT96 values (12 bytes each) - deprecated timestamp format
+    const data = [_]u8{
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, // First
+        0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, // Second
+    };
+
+    var decoder = PlainDecoder.init(&data);
+    const values = try decoder.readInt96(2, std.testing.allocator);
+    defer std.testing.allocator.free(values);
+
+    try std.testing.expectEqualSlices(u8, data[0..12], &values[0]);
+    try std.testing.expectEqualSlices(u8, data[12..24], &values[1]);
+}
+
+test "read fixed_len_byte_array" {
+    // Three 4-byte fixed-length values
+    const data = [_]u8{
+        'A', 'B', 'C', 'D',
+        'E', 'F', 'G', 'H',
+        'I', 'J', 'K', 'L',
+    };
+
+    var decoder = PlainDecoder.init(&data);
+    const values = try decoder.readFixedLenByteArray(3, 4, std.testing.allocator);
+    defer std.testing.allocator.free(values);
+
+    try std.testing.expectEqualStrings("ABCD", values[0]);
+    try std.testing.expectEqualStrings("EFGH", values[1]);
+    try std.testing.expectEqualStrings("IJKL", values[2]);
+}
+
+test "read bytes and skip" {
+    const data = [_]u8{ 'H', 'E', 'L', 'L', 'O', 'W', 'O', 'R', 'L', 'D' };
+
+    var decoder = PlainDecoder.init(&data);
+    try std.testing.expectEqual(@as(usize, 10), decoder.remaining());
+
+    const first = try decoder.readBytes(5);
+    try std.testing.expectEqualStrings("HELLO", first);
+    try std.testing.expectEqual(@as(usize, 5), decoder.remaining());
+
+    try decoder.skip(2);
+    try std.testing.expectEqual(@as(usize, 3), decoder.remaining());
+
+    const last = try decoder.readBytes(3);
+    try std.testing.expectEqualStrings("RLD", last);
+    try std.testing.expectEqual(@as(usize, 0), decoder.remaining());
+}
+
+test "unexpected end of data error" {
+    const data = [_]u8{ 0x01, 0x02 }; // Only 2 bytes
+
+    var decoder = PlainDecoder.init(&data);
+
+    // Try to read 4 bytes as int32 - should fail
+    const result = decoder.readInt32(1, std.testing.allocator);
+    try std.testing.expectError(PlainError.UnexpectedEndOfData, result);
+}
+
+test "read booleans partial byte" {
+    // 5 booleans: true, true, false, true, false = 0b01011 = 0x0B
+    const data = [_]u8{0x0B};
+
+    var decoder = PlainDecoder.init(&data);
+    const values = try decoder.readBooleans(5, std.testing.allocator);
+    defer std.testing.allocator.free(values);
+
+    try std.testing.expect(values[0] == true);
+    try std.testing.expect(values[1] == true);
+    try std.testing.expect(values[2] == false);
+    try std.testing.expect(values[3] == true);
+    try std.testing.expect(values[4] == false);
+}
