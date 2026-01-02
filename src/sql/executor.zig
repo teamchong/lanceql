@@ -232,6 +232,13 @@ pub const Executor = struct {
         return self.tbl().physicalColumnId(name);
     }
 
+    /// Filter array by indices - comptime generic for DRY
+    fn filterByIndices(self: *Self, comptime T: type, all_data: []const T, indices: []const u32) ![]T {
+        const filtered = try self.allocator.alloc(T, indices.len);
+        for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
+        return filtered;
+    }
+
     /// Set the dispatcher for @logic_table method calls
     pub fn setDispatcher(self: *Self, dispatcher: *logic_table_dispatch.Dispatcher) void {
         self.dispatcher = dispatcher;
@@ -3556,105 +3563,49 @@ pub const Executor = struct {
         if (std.mem.indexOf(u8, logical_type, "timestamp[ns") != null) {
             const all_data = try self.tbl().readInt64Column(col_idx);
             defer self.allocator.free(all_data);
-
-            const filtered = try self.allocator.alloc(i64, indices.len);
-            for (indices, 0..) |idx, i| {
-                filtered[i] = all_data[idx];
-            }
-            return Result.ColumnData{ .timestamp_ns = filtered };
+            return Result.ColumnData{ .timestamp_ns = try self.filterByIndices(i64, all_data, indices) };
         } else if (std.mem.indexOf(u8, logical_type, "timestamp[us") != null) {
             const all_data = try self.tbl().readInt64Column(col_idx);
             defer self.allocator.free(all_data);
-
-            const filtered = try self.allocator.alloc(i64, indices.len);
-            for (indices, 0..) |idx, i| {
-                filtered[i] = all_data[idx];
-            }
-            return Result.ColumnData{ .timestamp_us = filtered };
+            return Result.ColumnData{ .timestamp_us = try self.filterByIndices(i64, all_data, indices) };
         } else if (std.mem.indexOf(u8, logical_type, "timestamp[ms") != null) {
             const all_data = try self.tbl().readInt64Column(col_idx);
             defer self.allocator.free(all_data);
-
-            const filtered = try self.allocator.alloc(i64, indices.len);
-            for (indices, 0..) |idx, i| {
-                filtered[i] = all_data[idx];
-            }
-            return Result.ColumnData{ .timestamp_ms = filtered };
+            return Result.ColumnData{ .timestamp_ms = try self.filterByIndices(i64, all_data, indices) };
         } else if (std.mem.indexOf(u8, logical_type, "timestamp[s") != null) {
             const all_data = try self.tbl().readInt64Column(col_idx);
             defer self.allocator.free(all_data);
-
-            const filtered = try self.allocator.alloc(i64, indices.len);
-            for (indices, 0..) |idx, i| {
-                filtered[i] = all_data[idx];
-            }
-            return Result.ColumnData{ .timestamp_s = filtered };
+            return Result.ColumnData{ .timestamp_s = try self.filterByIndices(i64, all_data, indices) };
         } else if (std.mem.indexOf(u8, logical_type, "date32") != null) {
             const all_data = try self.tbl().readInt32Column(col_idx);
             defer self.allocator.free(all_data);
-
-            const filtered = try self.allocator.alloc(i32, indices.len);
-            for (indices, 0..) |idx, i| {
-                filtered[i] = all_data[idx];
-            }
-            return Result.ColumnData{ .date32 = filtered };
+            return Result.ColumnData{ .date32 = try self.filterByIndices(i32, all_data, indices) };
         } else if (std.mem.indexOf(u8, logical_type, "date64") != null) {
             const all_data = try self.tbl().readInt64Column(col_idx);
             defer self.allocator.free(all_data);
-
-            const filtered = try self.allocator.alloc(i64, indices.len);
-            for (indices, 0..) |idx, i| {
-                filtered[i] = all_data[idx];
-            }
-            return Result.ColumnData{ .date64 = filtered };
+            return Result.ColumnData{ .date64 = try self.filterByIndices(i64, all_data, indices) };
         } else if (std.mem.eql(u8, logical_type, "int32")) {
             const all_data = try self.tbl().readInt32Column(col_idx);
             defer self.allocator.free(all_data);
-
-            const filtered = try self.allocator.alloc(i32, indices.len);
-            for (indices, 0..) |idx, i| {
-                filtered[i] = all_data[idx];
-            }
-            return Result.ColumnData{ .int32 = filtered };
+            return Result.ColumnData{ .int32 = try self.filterByIndices(i32, all_data, indices) };
         } else if (std.mem.eql(u8, logical_type, "float") or
             std.mem.indexOf(u8, logical_type, "float32") != null) {
             const all_data = try self.tbl().readFloat32Column(col_idx);
             defer self.allocator.free(all_data);
-
-            const filtered = try self.allocator.alloc(f32, indices.len);
-            for (indices, 0..) |idx, i| {
-                filtered[i] = all_data[idx];
-            }
-            return Result.ColumnData{ .float32 = filtered };
+            return Result.ColumnData{ .float32 = try self.filterByIndices(f32, all_data, indices) };
         } else if (std.mem.eql(u8, logical_type, "bool") or
             std.mem.indexOf(u8, logical_type, "boolean") != null) {
             const all_data = try self.tbl().readBoolColumn(col_idx);
             defer self.allocator.free(all_data);
-
-            const filtered = try self.allocator.alloc(bool, indices.len);
-            for (indices, 0..) |idx, i| {
-                filtered[i] = all_data[idx];
-            }
-            return Result.ColumnData{ .bool_ = filtered };
+            return Result.ColumnData{ .bool_ = try self.filterByIndices(bool, all_data, indices) };
         } else if (std.mem.indexOf(u8, logical_type, "int") != null) {
-            // Default integers to int64
             const all_data = try self.tbl().readInt64Column(col_idx);
             defer self.allocator.free(all_data);
-
-            const filtered = try self.allocator.alloc(i64, indices.len);
-            for (indices, 0..) |idx, i| {
-                filtered[i] = all_data[idx];
-            }
-            return Result.ColumnData{ .int64 = filtered };
+            return Result.ColumnData{ .int64 = try self.filterByIndices(i64, all_data, indices) };
         } else if (std.mem.indexOf(u8, logical_type, "double") != null) {
             const all_data = try self.tbl().readFloat64Column(col_idx);
             defer self.allocator.free(all_data);
-
-            const filtered = try self.allocator.alloc(f64, indices.len);
-            for (indices, 0..) |idx, i| {
-                filtered[i] = all_data[idx];
-            }
-            return Result.ColumnData{ .float64 = filtered };
+            return Result.ColumnData{ .float64 = try self.filterByIndices(f64, all_data, indices) };
         } else if (std.mem.indexOf(u8, logical_type, "utf8") != null or
             std.mem.indexOf(u8, logical_type, "string") != null) {
             const all_data = try self.tbl().readStringColumn(col_idx);
@@ -3692,37 +3643,27 @@ pub const Executor = struct {
             .int64 => {
                 const all_data = table.readInt64Column(col_idx) catch return error.ColumnReadError;
                 defer self.allocator.free(all_data);
-                const filtered = try self.allocator.alloc(i64, indices.len);
-                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
-                return Result.ColumnData{ .int64 = filtered };
+                return Result.ColumnData{ .int64 = try self.filterByIndices(i64, all_data, indices) };
             },
             .int32 => {
                 const all_data = table.readInt32Column(col_idx) catch return error.ColumnReadError;
                 defer self.allocator.free(all_data);
-                const filtered = try self.allocator.alloc(i32, indices.len);
-                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
-                return Result.ColumnData{ .int32 = filtered };
+                return Result.ColumnData{ .int32 = try self.filterByIndices(i32, all_data, indices) };
             },
             .double => {
                 const all_data = table.readFloat64Column(col_idx) catch return error.ColumnReadError;
                 defer self.allocator.free(all_data);
-                const filtered = try self.allocator.alloc(f64, indices.len);
-                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
-                return Result.ColumnData{ .float64 = filtered };
+                return Result.ColumnData{ .float64 = try self.filterByIndices(f64, all_data, indices) };
             },
             .float => {
                 const all_data = table.readFloat32Column(col_idx) catch return error.ColumnReadError;
                 defer self.allocator.free(all_data);
-                const filtered = try self.allocator.alloc(f32, indices.len);
-                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
-                return Result.ColumnData{ .float32 = filtered };
+                return Result.ColumnData{ .float32 = try self.filterByIndices(f32, all_data, indices) };
             },
             .boolean => {
                 const all_data = table.readBoolColumn(col_idx) catch return error.ColumnReadError;
                 defer self.allocator.free(all_data);
-                const filtered = try self.allocator.alloc(bool, indices.len);
-                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
-                return Result.ColumnData{ .bool_ = filtered };
+                return Result.ColumnData{ .bool_ = try self.filterByIndices(bool, all_data, indices) };
             },
             .byte_array, .fixed_len_byte_array => {
                 const all_data = table.readStringColumn(col_idx) catch return error.ColumnReadError;
@@ -3735,13 +3676,10 @@ pub const Executor = struct {
                 return Result.ColumnData{ .string = filtered };
             },
             else => {
-                // XLSX defaults to float64, others error
                 if (is_xlsx) {
                     const all_data = table.readFloat64Column(col_idx) catch return error.ColumnReadError;
                     defer self.allocator.free(all_data);
-                    const filtered = try self.allocator.alloc(f64, indices.len);
-                    for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
-                    return Result.ColumnData{ .float64 = filtered };
+                    return Result.ColumnData{ .float64 = try self.filterByIndices(f64, all_data, indices) };
                 }
                 return error.UnsupportedColumnType;
             },
