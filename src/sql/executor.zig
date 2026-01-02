@@ -17,6 +17,7 @@ const hash = @import("lanceql.hash");
 pub const logic_table_dispatch = @import("logic_table_dispatch.zig");
 pub const scalar_functions = @import("scalar_functions.zig");
 pub const aggregate_functions = @import("aggregate_functions.zig");
+pub const window_functions = @import("window_functions.zig");
 
 const Expr = ast.Expr;
 const SelectStmt = ast.SelectStmt;
@@ -2338,45 +2339,23 @@ pub const Executor = struct {
     // Window Function Support
     // ========================================================================
 
-    /// Window function types
-    const WindowFunctionType = enum {
-        row_number,
-        rank,
-        dense_rank,
-        lag,
-        lead,
-    };
+    /// Window function types (re-exported from window_functions module)
+    const WindowFunctionType = window_functions.WindowFunctionType;
 
     /// Check if expression is a window function (has OVER clause)
     fn isWindowFunction(expr: *const Expr) bool {
-        return switch (expr.*) {
-            .call => |call| call.window != null,
-            else => false,
-        };
+        return window_functions.isWindowFunction(expr);
     }
 
     /// Check if SELECT list contains any window functions
     fn hasWindowFunctions(self: *Self, select_list: []const ast.SelectItem) bool {
         _ = self;
-        for (select_list) |item| {
-            if (isWindowFunction(&item.expr)) {
-                return true;
-            }
-        }
-        return false;
+        return window_functions.hasWindowFunctions(select_list);
     }
 
     /// Parse window function name
     fn parseWindowFunctionType(name: []const u8) ?WindowFunctionType {
-        var upper_buf: [16]u8 = undefined;
-        const upper_name = std.ascii.upperString(&upper_buf, name);
-
-        if (std.mem.eql(u8, upper_name, "ROW_NUMBER")) return .row_number;
-        if (std.mem.eql(u8, upper_name, "RANK")) return .rank;
-        if (std.mem.eql(u8, upper_name, "DENSE_RANK")) return .dense_rank;
-        if (std.mem.eql(u8, upper_name, "LAG")) return .lag;
-        if (std.mem.eql(u8, upper_name, "LEAD")) return .lead;
-        return null;
+        return window_functions.parseWindowFunctionType(name);
     }
 
     /// Evaluate window functions and add result columns
