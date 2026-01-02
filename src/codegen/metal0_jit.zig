@@ -216,36 +216,19 @@ pub const JitContext = struct {
         }
     }
 
-    /// Load schema from Lance file
-    /// Extracts column names and types from the Lance file's schema buffer
-    pub fn loadSchema(self: *JitContext, lance_file: *format.LanceFile) !void {
-        // Schema is in global buffer 0
-        const schema_bytes = lance_file.getGlobalBuffer(0) catch |err| {
-            return switch (err) {
-                error.ColumnOutOfBounds => error.NoSchema,
-                else => error.SchemaReadError,
-            };
-        };
-
-        // Parse the schema protobuf
+    /// Parse schema bytes into LanceSchema
+    fn parseSchemaBytes(self: *JitContext, schema_bytes: []const u8) !void {
         var schema = proto.Schema.parse(self.allocator, schema_bytes) catch {
             return error.SchemaParseError;
         };
         defer schema.deinit();
 
-        // Convert to our ColumnDef format
         var columns = std.ArrayListUnmanaged(ColumnDef){};
         errdefer columns.deinit(self.allocator);
 
         for (schema.fields) |field| {
-            // Only include top-level (leaf) columns
             if (!field.isTopLevel()) continue;
-
-            const col_type = ColumnType.fromLogicalType(field.logical_type) orelse {
-                // Skip columns with unknown types
-                continue;
-            };
-
+            const col_type = ColumnType.fromLogicalType(field.logical_type) orelse continue;
             try columns.append(self.allocator, .{
                 .name = try self.allocator.dupe(u8, field.name),
                 .column_type = col_type,
@@ -259,32 +242,20 @@ pub const JitContext = struct {
         };
     }
 
+    /// Load schema from Lance file
+    pub fn loadSchema(self: *JitContext, lance_file: *format.LanceFile) !void {
+        const schema_bytes = lance_file.getGlobalBuffer(0) catch |err| {
+            return switch (err) {
+                error.ColumnOutOfBounds => error.NoSchema,
+                else => error.SchemaReadError,
+            };
+        };
+        return self.parseSchemaBytes(schema_bytes);
+    }
+
     /// Load schema from raw bytes (for testing or when LanceFile not available)
     pub fn loadSchemaFromBytes(self: *JitContext, schema_bytes: []const u8) !void {
-        var schema = proto.Schema.parse(self.allocator, schema_bytes) catch {
-            return error.SchemaParseError;
-        };
-        defer schema.deinit();
-
-        var columns = std.ArrayListUnmanaged(ColumnDef){};
-        errdefer columns.deinit(self.allocator);
-
-        for (schema.fields) |field| {
-            if (!field.isTopLevel()) continue;
-
-            const col_type = ColumnType.fromLogicalType(field.logical_type) orelse continue;
-
-            try columns.append(self.allocator, .{
-                .name = try self.allocator.dupe(u8, field.name),
-                .column_type = col_type,
-                .nullable = field.nullable,
-            });
-        }
-
-        self.schema = LanceSchema{
-            .columns = try columns.toOwnedSlice(self.allocator),
-            .allocator = self.allocator,
-        };
+        return self.parseSchemaBytes(schema_bytes);
     }
 
     /// Compile @logic_table Python source using metal0 subprocess
