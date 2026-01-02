@@ -15,7 +15,8 @@ import { evaluateInMemoryExpr } from './executor-filters.js';
  */
 export function executeSubquery(executor, subqueryAst, outerColumnData, outerRowIdx) {
     // Clone the subquery AST to avoid mutating the original
-    const resolvedAst = JSON.parse(JSON.stringify(subqueryAst));
+    // structuredClone is faster than JSON.parse(JSON.stringify())
+    const resolvedAst = structuredClone(subqueryAst);
 
     // Check for correlated references
     const subqueryTable = resolvedAst.from?.name || resolvedAst.from?.table;

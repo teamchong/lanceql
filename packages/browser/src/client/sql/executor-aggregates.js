@@ -47,12 +47,22 @@ export function getAllGroupColumns(groupBy) {
     return columns;
 }
 
+/** Maximum columns for CUBE power set to prevent 2^n explosion */
+const MAX_POWERSET_COLUMNS = 12;  // 2^12 = 4,096 groupings max
+
 /**
  * Generate power set (all subsets) of an array
  * @param {Array} arr - Input array
  * @returns {Array<Array>} - All subsets
+ * @throws {Error} If arr.length > MAX_POWERSET_COLUMNS
  */
 export function powerSet(arr) {
+    if (arr.length > MAX_POWERSET_COLUMNS) {
+        throw new Error(
+            `CUBE/ROLLUP power set limited to ${MAX_POWERSET_COLUMNS} columns ` +
+            `(got ${arr.length}). This would generate ${Math.pow(2, arr.length)} groupings.`
+        );
+    }
     const result = [[]];
     for (const item of arr) {
         const len = result.length;
