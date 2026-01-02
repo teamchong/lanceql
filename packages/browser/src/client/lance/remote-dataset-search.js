@@ -44,38 +44,64 @@ async function ivfIndexSearch(dataset, queryVec, topK, vectorColIdx, nprobe, onP
         throw new Error('IVF index not available. This dataset requires ivf_vectors.bin for efficient search.');
     }
 
-    const { rowIds, vectors } = partitionData;
-    const scores = new Float32Array(vectors.length);
+    const { rowIds, vectors, preFlattened } = partitionData;
     const dim = queryVec.length;
+    const numVectors = preFlattened ? vectors.length / dim : vectors.length;
+    const scores = new Float32Array(numVectors);
 
     const accelerator = getWebGPUAccelerator();
     if (accelerator.isAvailable()) {
         const maxBatch = accelerator.getMaxVectorsPerBatch(dim);
-        let gpuProcessed = 0;
-        let wasmProcessed = 0;
 
-        for (let start = 0; start < vectors.length; start += maxBatch) {
-            const end = Math.min(start + maxBatch, vectors.length);
-            const chunk = vectors.slice(start, end);
+        if (preFlattened) {
+            // Process flat vectors in batches
+            for (let vecStart = 0; vecStart < numVectors; vecStart += maxBatch) {
+                const vecEnd = Math.min(vecStart + maxBatch, numVectors);
+                const batchCount = vecEnd - vecStart;
+                const chunk = vectors.subarray(vecStart * dim, vecEnd * dim);
 
-            try {
-                const chunkScores = await accelerator.batchCosineSimilarity(queryVec, chunk, true);
-                if (chunkScores) {
-                    scores.set(chunkScores, start);
-                    gpuProcessed += chunk.length;
-                    continue;
+                try {
+                    const chunkScores = await accelerator.batchCosineSimilarity(queryVec, chunk, true, true);
+                    if (chunkScores) {
+                        scores.set(chunkScores, vecStart);
+                        continue;
+                    }
+                } catch (e) {
+                    // Fall through to WASM
                 }
-            } catch (e) {
-                // Fall through to WASM
-            }
 
-            // WASM SIMD fallback
-            if (dataset.lanceql?.batchCosineSimilarity) {
-                const chunkScores = dataset.lanceql.batchCosineSimilarity(queryVec, chunk, true);
-                scores.set(chunkScores, start);
-                wasmProcessed += chunk.length;
-            } else {
-                // JS fallback
+                // WASM SIMD fallback with flat vectors
+                if (dataset.lanceql?.batchCosineSimilarityFlat) {
+                    const chunkScores = dataset.lanceql.batchCosineSimilarityFlat(queryVec, chunk, dim, true);
+                    scores.set(chunkScores, vecStart);
+                } else {
+                    // JS fallback for flat vectors
+                    for (let i = 0; i < batchCount; i++) {
+                        const offset = i * dim;
+                        let dot = 0;
+                        for (let k = 0; k < dim; k++) {
+                            dot += queryVec[k] * chunk[offset + k];
+                        }
+                        scores[vecStart + i] = dot;
+                    }
+                }
+            }
+        } else {
+            // Legacy path for array-of-arrays
+            for (let start = 0; start < numVectors; start += maxBatch) {
+                const end = Math.min(start + maxBatch, numVectors);
+                const chunk = vectors.slice(start, end);
+
+                try {
+                    const chunkScores = await accelerator.batchCosineSimilarity(queryVec, chunk, true, false);
+                    if (chunkScores) {
+                        scores.set(chunkScores, start);
+                        continue;
+                    }
+                } catch (e) {
+                    // Fall through to JS
+                }
+
                 for (let i = 0; i < chunk.length; i++) {
                     const vec = chunk[i];
                     if (!vec || vec.length !== dim) continue;
@@ -85,16 +111,21 @@ async function ivfIndexSearch(dataset, queryVec, topK, vectorColIdx, nprobe, onP
                     }
                     scores[start + i] = dot;
                 }
-                wasmProcessed += chunk.length;
             }
         }
-
     } else {
-        if (dataset.lanceql?.batchCosineSimilarity) {
-            const allScores = dataset.lanceql.batchCosineSimilarity(queryVec, vectors, true);
-            scores.set(allScores);
+        // Non-GPU path
+        if (preFlattened) {
+            for (let i = 0; i < numVectors; i++) {
+                const offset = i * dim;
+                let dot = 0;
+                for (let k = 0; k < dim; k++) {
+                    dot += queryVec[k] * vectors[offset + k];
+                }
+                scores[i] = dot;
+            }
         } else {
-            for (let i = 0; i < vectors.length; i++) {
+            for (let i = 0; i < numVectors; i++) {
                 const vec = vectors[i];
                 if (!vec || vec.length !== dim) continue;
                 let dot = 0;
@@ -108,14 +139,14 @@ async function ivfIndexSearch(dataset, queryVec, topK, vectorColIdx, nprobe, onP
 
     if (onProgress) onProgress(90, 100);
 
-    // Build and sort results
-    const allResults = [];
+    // Build results and use quickselect for top-K (O(n) vs O(n log n) sort)
+    const allResults = new Array(rowIds.length);
     for (let i = 0; i < rowIds.length; i++) {
-        allResults.push({ index: rowIds[i], score: scores[i] });
+        allResults[i] = { index: rowIds[i], score: scores[i] };
     }
 
-    allResults.sort((a, b) => b.score - a.score);
     const finalK = Math.min(topK, allResults.length);
+    quickselectTopK(allResults, finalK);
 
     if (onProgress) onProgress(100, 100);
 
@@ -125,6 +156,43 @@ async function ivfIndexSearch(dataset, queryVec, topK, vectorColIdx, nprobe, onP
         usedIndex: true,
         searchedRows: rowIds.length
     };
+}
+
+/**
+ * Quickselect to find top-k elements by score in O(n) average time.
+ */
+function quickselectTopK(arr, k) {
+    if (k >= arr.length || k <= 0) return;
+
+    let left = 0;
+    let right = arr.length - 1;
+
+    while (left < right) {
+        const mid = (left + right) >> 1;
+        if (arr[mid].score > arr[left].score) swap(arr, left, mid);
+        if (arr[right].score > arr[left].score) swap(arr, left, right);
+        if (arr[mid].score > arr[right].score) swap(arr, mid, right);
+        const pivot = arr[right].score;
+
+        let i = left;
+        for (let j = left; j < right; j++) {
+            if (arr[j].score >= pivot) {
+                swap(arr, i, j);
+                i++;
+            }
+        }
+        swap(arr, i, right);
+
+        if (i === k - 1) break;
+        if (i < k - 1) left = i + 1;
+        else right = i - 1;
+    }
+}
+
+function swap(arr, i, j) {
+    const tmp = arr[i];
+    arr[i] = arr[j];
+    arr[j] = tmp;
 }
 
 export function findVectorColumn(dataset) {

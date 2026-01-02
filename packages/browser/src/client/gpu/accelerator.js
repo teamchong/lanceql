@@ -95,17 +95,18 @@ class WebGPUAccelerator {
     /**
      * Batch cosine similarity using WebGPU.
      * @param {Float32Array} queryVec - Query vector (dim)
-     * @param {Float32Array[]} vectors - Array of candidate vectors
+     * @param {Float32Array|Float32Array[]} vectors - Candidate vectors (flat or array of arrays)
      * @param {boolean} normalized - Whether vectors are L2-normalized
+     * @param {boolean} preFlattened - If true, vectors is a flat Float32Array
      * @returns {Promise<Float32Array>} Similarity scores
      */
-    async batchCosineSimilarity(queryVec, vectors, normalized = true) {
+    async batchCosineSimilarity(queryVec, vectors, normalized = true, preFlattened = false) {
         if (!this.available || vectors.length === 0) {
             return null; // Caller should fallback to WASM
         }
 
         const dim = queryVec.length;
-        const numVectors = vectors.length;
+        const numVectors = preFlattened ? vectors.length / dim : vectors.length;
 
         // Check buffer size limit (default 128MB, but check device limits)
         const vectorsBufferSize = numVectors * dim * 4;
@@ -145,12 +146,16 @@ class WebGPUAccelerator {
         this.device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([dim, numVectors]));
         this.device.queue.writeBuffer(queryBuffer, 0, queryVec);
 
-        // Flatten vectors into single array
-        const flatVectors = new Float32Array(numVectors * dim);
-        for (let i = 0; i < numVectors; i++) {
-            flatVectors.set(vectors[i], i * dim);
+        // Use pre-flattened vectors directly, or flatten if needed
+        if (preFlattened) {
+            this.device.queue.writeBuffer(vectorsBuffer, 0, vectors);
+        } else {
+            const flatVectors = new Float32Array(numVectors * dim);
+            for (let i = 0; i < numVectors; i++) {
+                flatVectors.set(vectors[i], i * dim);
+            }
+            this.device.queue.writeBuffer(vectorsBuffer, 0, flatVectors);
         }
-        this.device.queue.writeBuffer(vectorsBuffer, 0, flatVectors);
 
         // Create bind group
         const bindGroup = this.device.createBindGroup({

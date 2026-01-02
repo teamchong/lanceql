@@ -35,29 +35,42 @@ class LRUCache {
     }
 
     /**
+     * Set item in cache with explicit size
+     * @param {string} key - Cache key
+     * @param {*} data - Data to cache
+     * @param {number} size - Size in bytes (optional, auto-calculated if not provided)
+     */
+    set(key, data, size = null) {
+        return this.put(key, data, size);
+    }
+
+    /**
      * Put item in cache
      * @param {string} key - Cache key
      * @param {Uint8Array} data - Data to cache
+     * @param {number} explicitSize - Optional explicit size in bytes
      */
-    put(key, data) {
+    put(key, data, explicitSize = null) {
         // Remove existing entry if present
         if (this.cache.has(key)) {
             this.currentSize -= this.cache.get(key).size;
             this.cache.delete(key);
         }
 
-        // Calculate size based on data type
-        let size = 0;
-        if (data === null || data === undefined) {
-            size = 0;
-        } else if (data.byteLength !== undefined) {
-            size = data.byteLength;
-        } else if (typeof data === 'string') {
-            size = data.length * 2; // UTF-16
-        } else if (typeof data === 'object') {
-            size = JSON.stringify(data).length * 2;
-        } else {
-            size = 8; // primitive
+        // Use explicit size if provided, otherwise calculate
+        let size = explicitSize;
+        if (size === null) {
+            if (data === null || data === undefined) {
+                size = 0;
+            } else if (data.byteLength !== undefined) {
+                size = data.byteLength;
+            } else if (typeof data === 'string') {
+                size = data.length * 2; // UTF-16
+            } else if (typeof data === 'object') {
+                size = JSON.stringify(data).length * 2;
+            } else {
+                size = 8; // primitive
+            }
         }
 
         // Evict if needed

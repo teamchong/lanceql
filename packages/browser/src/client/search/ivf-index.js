@@ -2,6 +2,51 @@ import * as Manifest from './ivf-manifest.js';
 import * as Auxiliary from './ivf-auxiliary.js';
 import * as Partitions from './ivf-partitions.js';
 
+/**
+ * Quickselect algorithm to find top-k elements in O(n) average time.
+ * Partitions array in-place so indices 0..k-1 contain the k largest elements.
+ * @param {Array} arr - Array of objects with score property
+ * @param {number} k - Number of top elements to select
+ * @returns {Array} The top k elements (unordered)
+ */
+function quickselectTopK(arr, k) {
+    if (k >= arr.length) return arr;
+    if (k <= 0) return [];
+
+    let left = 0;
+    let right = arr.length - 1;
+
+    while (left < right) {
+        // Choose pivot using median-of-three for better performance
+        const mid = (left + right) >> 1;
+        if (arr[mid].score > arr[left].score) swap(arr, left, mid);
+        if (arr[right].score > arr[left].score) swap(arr, left, right);
+        if (arr[mid].score > arr[right].score) swap(arr, mid, right);
+        const pivot = arr[right].score;
+
+        let i = left;
+        for (let j = left; j < right; j++) {
+            if (arr[j].score >= pivot) {
+                swap(arr, i, j);
+                i++;
+            }
+        }
+        swap(arr, i, right);
+
+        if (i === k - 1) break;
+        if (i < k - 1) left = i + 1;
+        else right = i - 1;
+    }
+
+    return arr.slice(0, k);
+}
+
+function swap(arr, i, j) {
+    const tmp = arr[i];
+    arr[i] = arr[j];
+    arr[j] = tmp;
+}
+
 class IVFIndex {
     constructor() {
         this.centroids = null;
@@ -91,22 +136,28 @@ class IVFIndex {
         nprobe = Math.min(nprobe, this.numPartitions);
         const distances = new Array(this.numPartitions);
 
+        // Pre-compute query norm once
+        let normA = 0;
+        for (let i = 0; i < this.dimension; i++) {
+            normA += queryVec[i] * queryVec[i];
+        }
+        const sqrtNormA = Math.sqrt(normA);
+
         for (let p = 0; p < this.numPartitions; p++) {
             const start = p * this.dimension;
-            let dot = 0, normA = 0, normB = 0;
+            let dot = 0, normB = 0;
             for (let i = 0; i < this.dimension; i++) {
-                const a = queryVec[i];
                 const b = this.centroids[start + i];
-                dot += a * b;
-                normA += a * a;
+                dot += queryVec[i] * b;
                 normB += b * b;
             }
-            const denom = Math.sqrt(normA) * Math.sqrt(normB);
+            const denom = sqrtNormA * Math.sqrt(normB);
             distances[p] = { idx: p, score: denom === 0 ? 0 : dot / denom };
         }
 
-        distances.sort((a, b) => b.score - a.score);
-        return distances.slice(0, nprobe).map(d => d.idx);
+        // Use O(n) quickselect instead of O(n log n) sort
+        const topK = quickselectTopK(distances, nprobe);
+        return topK.map(d => d.idx);
     }
 }
 

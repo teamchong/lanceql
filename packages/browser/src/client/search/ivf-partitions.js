@@ -1,3 +1,8 @@
+import { LRUCache } from '../cache/lru-cache.js';
+
+// Default 50MB cache for partition data
+const PARTITION_CACHE_SIZE = 50 * 1024 * 1024;
+
 export async function loadPartitionIndex(index) {
     const url = `${index.datasetBaseUrl}/ivf_vectors.bin`;
     index.partitionVectorsUrl = url;
@@ -14,17 +19,21 @@ export async function loadPartitionIndex(index) {
 export async function fetchPartitionData(index, partitionIndices, dim = 384, onProgress = null) {
     if (!index.hasPartitionIndex || !index.partitionVectorsUrl) return null;
 
-    const allRowIds = [];
-    const allVectors = [];
     let totalBytesToFetch = 0;
     let bytesLoaded = 0;
 
     const uncachedPartitions = [];
     const cachedResults = new Map();
 
+    // Initialize LRU cache if not present
+    if (!index._partitionCache) {
+        index._partitionCache = new LRUCache({ maxSize: PARTITION_CACHE_SIZE });
+    }
+
     for (const p of partitionIndices) {
-        if (index._partitionCache?.has(p)) {
-            cachedResults.set(p, index._partitionCache.get(p));
+        const cached = index._partitionCache.get(p);
+        if (cached !== undefined) {
+            cachedResults.set(p, cached);
         } else {
             uncachedPartitions.push(p);
             totalBytesToFetch += index.partitionOffsets[p + 1] - index.partitionOffsets[p];
@@ -32,16 +41,8 @@ export async function fetchPartitionData(index, partitionIndices, dim = 384, onP
     }
 
     if (uncachedPartitions.length === 0) {
-        for (const p of partitionIndices) {
-            const result = cachedResults.get(p);
-            allRowIds.push(...result.rowIds);
-            allVectors.push(...result.vectors);
-        }
-        if (onProgress) onProgress(100, 100);
-        return { rowIds: allRowIds, vectors: allVectors };
+        return assembleResults(partitionIndices, cachedResults, dim, onProgress);
     }
-
-    if (!index._partitionCache) index._partitionCache = new Map();
 
     const PARALLEL_LIMIT = 6;
     for (let i = 0; i < uncachedPartitions.length; i += PARALLEL_LIMIT) {
@@ -64,37 +65,73 @@ export async function fetchPartitionData(index, partitionIndices, dim = 384, onP
                 const rowIdsEnd = 4 + rowCount * 4;
 
                 const rowIds = new Uint32Array(data.slice(4, rowIdsEnd));
+                // Keep vectors as flat Float32Array to avoid allocation overhead
                 const vectorsFlat = new Float32Array(data.slice(rowIdsEnd));
-
-                const vectors = [];
-                for (let j = 0; j < rowCount; j++) {
-                    vectors.push(vectorsFlat.slice(j * dim, (j + 1) * dim));
-                }
 
                 bytesLoaded += byteSize;
                 if (onProgress) onProgress(bytesLoaded, totalBytesToFetch);
 
-                return { p, rowIds: Array.from(rowIds), vectors };
+                return { p, rowIds: Array.from(rowIds), vectors: vectorsFlat, numVectors: rowCount };
             } catch {
                 return { p, rowIds: [], vectors: [] };
             }
         }));
 
         for (const result of results) {
-            index._partitionCache.set(result.p, { rowIds: result.rowIds, vectors: result.vectors });
-            cachedResults.set(result.p, { rowIds: result.rowIds, vectors: result.vectors });
+            const data = {
+                rowIds: result.rowIds,
+                vectors: result.vectors,
+                numVectors: result.numVectors ?? result.rowIds.length
+            };
+            // Estimate size: rowIds (4 bytes each) + flat vectors buffer
+            const size = result.rowIds.length * 4 + (result.vectors.byteLength || result.vectors.length * 4);
+            index._partitionCache.set(result.p, data, size);
+            cachedResults.set(result.p, data);
         }
     }
+
+    return assembleResults(partitionIndices, cachedResults, dim, onProgress);
+}
+
+/**
+ * Assemble results from cached partitions into a single flat output.
+ * Returns flat Float32Array for vectors to avoid allocation overhead.
+ */
+function assembleResults(partitionIndices, cachedResults, dim, onProgress) {
+    // Calculate total size
+    let totalRowIds = 0;
+    let totalVectorElements = 0;
 
     for (const p of partitionIndices) {
         const result = cachedResults.get(p);
         if (result) {
-            allRowIds.push(...result.rowIds);
-            allVectors.push(...result.vectors);
+            totalRowIds += result.rowIds.length;
+            totalVectorElements += result.vectors.length;
         }
     }
 
-    return { rowIds: allRowIds, vectors: allVectors };
+    // Pre-allocate arrays
+    const allRowIds = new Array(totalRowIds);
+    const allVectors = new Float32Array(totalVectorElements);
+
+    let rowIdOffset = 0;
+    let vectorOffset = 0;
+
+    for (const p of partitionIndices) {
+        const result = cachedResults.get(p);
+        if (result) {
+            // Copy row IDs
+            for (let i = 0; i < result.rowIds.length; i++) {
+                allRowIds[rowIdOffset++] = result.rowIds[i];
+            }
+            // Copy vectors (already flat)
+            allVectors.set(result.vectors, vectorOffset);
+            vectorOffset += result.vectors.length;
+        }
+    }
+
+    if (onProgress) onProgress(100, 100);
+    return { rowIds: allRowIds, vectors: allVectors, preFlattened: true };
 }
 
 export async function prefetchAllRowIds(index) {
