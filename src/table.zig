@@ -870,3 +870,125 @@ test "table error enum" {
     const err: TableError = TableError.NoSchema;
     try std.testing.expect(err == TableError.NoSchema);
 }
+
+test "table: read int64 column from lance file" {
+    const allocator = std.testing.allocator;
+
+    // Open the data file from simple_int64.lance/data/
+    var dir = std.fs.cwd().openDir("tests/fixtures/simple_int64.lance/data", .{ .iterate = true }) catch return error.SkipZigTest;
+    defer dir.close();
+
+    // Get the first .lance file
+    var iter = dir.iterate();
+    const entry = iter.next() catch return error.SkipZigTest;
+    const filename = (entry orelse return error.SkipZigTest).name;
+
+    // Read file
+    const file = dir.openFile(filename, .{}) catch return error.SkipZigTest;
+    defer file.close();
+
+    const data = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch return error.SkipZigTest;
+    defer allocator.free(data);
+
+    // Initialize table
+    var table = Table.init(allocator, data) catch return error.SkipZigTest;
+    defer table.deinit();
+
+    // Read values (column 0 = id)
+    const values = table.readInt64Column(0) catch return error.SkipZigTest;
+    defer allocator.free(values);
+
+    // simple_int64.lance contains 5 rows: 1, 2, 3, 4, 5
+    try std.testing.expectEqual(@as(usize, 5), values.len);
+    try std.testing.expectEqual(@as(i64, 1), values[0]);
+    try std.testing.expectEqual(@as(i64, 5), values[4]);
+}
+
+test "table: read float64 column from lance file" {
+    const allocator = std.testing.allocator;
+
+    // Open the data file from simple_float64.lance/data/
+    var dir = std.fs.cwd().openDir("tests/fixtures/simple_float64.lance/data", .{ .iterate = true }) catch return error.SkipZigTest;
+    defer dir.close();
+
+    var iter = dir.iterate();
+    const entry = iter.next() catch return error.SkipZigTest;
+    const filename = (entry orelse return error.SkipZigTest).name;
+
+    const file = dir.openFile(filename, .{}) catch return error.SkipZigTest;
+    defer file.close();
+
+    const data = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch return error.SkipZigTest;
+    defer allocator.free(data);
+
+    var table = Table.init(allocator, data) catch return error.SkipZigTest;
+    defer table.deinit();
+
+    const values = table.readFloat64Column(0) catch return error.SkipZigTest;
+    defer allocator.free(values);
+
+    // simple_float64.lance contains 5 rows: 1.1, 2.2, 3.3, 4.4, 5.5
+    try std.testing.expectEqual(@as(usize, 5), values.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.1), values[0], 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 5.5), values[4], 0.01);
+}
+
+test "table: schema and column names" {
+    const allocator = std.testing.allocator;
+
+    // Open the data file from simple_int64.lance/data/
+    var dir = std.fs.cwd().openDir("tests/fixtures/simple_int64.lance/data", .{ .iterate = true }) catch return error.SkipZigTest;
+    defer dir.close();
+
+    var iter = dir.iterate();
+    const entry = iter.next() catch return error.SkipZigTest;
+    const filename = (entry orelse return error.SkipZigTest).name;
+
+    const file = dir.openFile(filename, .{}) catch return error.SkipZigTest;
+    defer file.close();
+
+    const data = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch return error.SkipZigTest;
+    defer allocator.free(data);
+
+    var table = Table.init(allocator, data) catch return error.SkipZigTest;
+    defer table.deinit();
+
+    // Get column names
+    const names = table.columnNames() catch return error.SkipZigTest;
+    defer allocator.free(names);
+
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings("id", names[0]);
+
+    // Test column index lookup
+    try std.testing.expectEqual(@as(?usize, 0), table.columnIndex("id"));
+    try std.testing.expectEqual(@as(?usize, null), table.columnIndex("nonexistent"));
+}
+
+test "table: physical column id mapping" {
+    const allocator = std.testing.allocator;
+
+    // Open the data file from simple_int64.lance/data/
+    var dir = std.fs.cwd().openDir("tests/fixtures/simple_int64.lance/data", .{ .iterate = true }) catch return error.SkipZigTest;
+    defer dir.close();
+
+    var iter = dir.iterate();
+    const entry = iter.next() catch return error.SkipZigTest;
+    const filename = (entry orelse return error.SkipZigTest).name;
+
+    const file = dir.openFile(filename, .{}) catch return error.SkipZigTest;
+    defer file.close();
+
+    const data = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch return error.SkipZigTest;
+    defer allocator.free(data);
+
+    var table = Table.init(allocator, data) catch return error.SkipZigTest;
+    defer table.deinit();
+
+    // Test physical column ID
+    const physical_id = table.physicalColumnId("id");
+    try std.testing.expect(physical_id != null);
+
+    // Nonexistent column should return null
+    try std.testing.expectEqual(@as(?u32, null), table.physicalColumnId("nonexistent"));
+}

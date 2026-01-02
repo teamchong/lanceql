@@ -358,3 +358,70 @@ test "xlsx_table: read simple fixture" {
     const names = table.getColumnNames();
     try std.testing.expect(names.len >= 1);
 }
+
+test "xlsx_table: read string column" {
+    const allocator = std.testing.allocator;
+
+    const file = std.fs.cwd().openFile("tests/fixtures/simple.xlsx", .{}) catch return error.SkipZigTest;
+    defer file.close();
+    const data = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch return error.SkipZigTest;
+    defer allocator.free(data);
+
+    var table = XlsxTable.init(allocator, data) catch return error.SkipZigTest;
+    defer table.deinit();
+
+    // Find the string column (name column at index 1)
+    const values = table.readStringColumn(1) catch return error.SkipZigTest;
+    defer {
+        for (values) |v| allocator.free(v);
+        allocator.free(values);
+    }
+
+    // Verify we got string values
+    try std.testing.expect(values.len > 0);
+    try std.testing.expectEqualStrings("alice", values[0]);
+}
+
+test "xlsx_table: read float64 column" {
+    const allocator = std.testing.allocator;
+
+    const file = std.fs.cwd().openFile("tests/fixtures/simple.xlsx", .{}) catch return error.SkipZigTest;
+    defer file.close();
+    const data = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch return error.SkipZigTest;
+    defer allocator.free(data);
+
+    var table = XlsxTable.init(allocator, data) catch return error.SkipZigTest;
+    defer table.deinit();
+
+    // Read the value column (index 2)
+    const values = table.readFloat64Column(2) catch return error.SkipZigTest;
+    defer allocator.free(values);
+
+    // Verify we got float values
+    try std.testing.expect(values.len > 0);
+    // Values start at 1.1, 2.2, ...
+    try std.testing.expectApproxEqAbs(@as(f64, 1.1), values[0], 0.01);
+}
+
+test "xlsx_table: column index and type" {
+    const allocator = std.testing.allocator;
+
+    const file = std.fs.cwd().openFile("tests/fixtures/simple.xlsx", .{}) catch return error.SkipZigTest;
+    defer file.close();
+    const data = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch return error.SkipZigTest;
+    defer allocator.free(data);
+
+    var table = XlsxTable.init(allocator, data) catch return error.SkipZigTest;
+    defer table.deinit();
+
+    // Test columnIndex
+    try std.testing.expectEqual(@as(?usize, 0), table.columnIndex("id"));
+    try std.testing.expectEqual(@as(?usize, 1), table.columnIndex("name"));
+    try std.testing.expectEqual(@as(?usize, 2), table.columnIndex("value"));
+    try std.testing.expectEqual(@as(?usize, null), table.columnIndex("nonexistent"));
+
+    // Test column types (XLSX infers from first data cell)
+    try std.testing.expectEqual(Type.double, table.getColumnType(0).?);
+    try std.testing.expectEqual(Type.byte_array, table.getColumnType(1).?);
+    try std.testing.expectEqual(Type.double, table.getColumnType(2).?);
+}

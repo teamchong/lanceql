@@ -227,3 +227,68 @@ test "avro_table: read simple fixture" {
     try std.testing.expectEqual(@as(i64, 1), ids[0]);
     try std.testing.expectEqual(@as(i64, 5), ids[4]);
 }
+
+test "avro_table: read string column" {
+    const allocator = std.testing.allocator;
+
+    const file = std.fs.cwd().openFile("tests/fixtures/simple.avro", .{}) catch return error.SkipZigTest;
+    defer file.close();
+    const data = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch return error.SkipZigTest;
+    defer allocator.free(data);
+
+    var table = AvroTable.init(allocator, data) catch return error.SkipZigTest;
+    defer table.deinit();
+
+    const values = try table.readStringColumn(1);
+    defer {
+        for (values) |v| allocator.free(v);
+        allocator.free(values);
+    }
+
+    try std.testing.expectEqual(@as(usize, 5), values.len);
+    try std.testing.expectEqualStrings("alice", values[0]);
+    try std.testing.expectEqualStrings("bob", values[1]);
+}
+
+test "avro_table: read float64 column" {
+    const allocator = std.testing.allocator;
+
+    const file = std.fs.cwd().openFile("tests/fixtures/simple.avro", .{}) catch return error.SkipZigTest;
+    defer file.close();
+    const data = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch return error.SkipZigTest;
+    defer allocator.free(data);
+
+    var table = AvroTable.init(allocator, data) catch return error.SkipZigTest;
+    defer table.deinit();
+
+    const values = try table.readFloat64Column(2);
+    defer allocator.free(values);
+
+    try std.testing.expectEqual(@as(usize, 5), values.len);
+    // Values start at 1.1, 2.2, ...
+    try std.testing.expectApproxEqAbs(@as(f64, 1.1), values[0], 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.2), values[1], 0.01);
+}
+
+test "avro_table: column index and type" {
+    const allocator = std.testing.allocator;
+
+    const file = std.fs.cwd().openFile("tests/fixtures/simple.avro", .{}) catch return error.SkipZigTest;
+    defer file.close();
+    const data = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch return error.SkipZigTest;
+    defer allocator.free(data);
+
+    var table = AvroTable.init(allocator, data) catch return error.SkipZigTest;
+    defer table.deinit();
+
+    // Test columnIndex
+    try std.testing.expectEqual(@as(?usize, 0), table.columnIndex("id"));
+    try std.testing.expectEqual(@as(?usize, 1), table.columnIndex("name"));
+    try std.testing.expectEqual(@as(?usize, 2), table.columnIndex("value"));
+    try std.testing.expectEqual(@as(?usize, null), table.columnIndex("nonexistent"));
+
+    // Test column types
+    try std.testing.expectEqual(Type.int64, table.getColumnType(0).?);
+    try std.testing.expectEqual(Type.byte_array, table.getColumnType(1).?);
+    try std.testing.expectEqual(Type.double, table.getColumnType(2).?);
+}

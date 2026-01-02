@@ -196,3 +196,112 @@ pub const ParquetTable = struct {
         return self.readNumericColumn(bool, "bool_values", col_idx);
     }
 };
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+test "parquet_table: init and basic properties" {
+    const allocator = std.testing.allocator;
+    const data = @embedFile("../tests/fixtures/simple.parquet");
+
+    var table = try ParquetTable.init(allocator, data);
+    defer table.deinit();
+
+    // Verify basic properties
+    try std.testing.expectEqual(@as(u32, 3), table.numColumns());
+    try std.testing.expectEqual(@as(usize, 5), table.numRows());
+
+    // Verify column names
+    const names = table.getColumnNames();
+    try std.testing.expectEqual(@as(usize, 3), names.len);
+    try std.testing.expectEqualStrings("id", names[0]);
+    try std.testing.expectEqualStrings("name", names[1]);
+    try std.testing.expectEqualStrings("value", names[2]);
+}
+
+test "parquet_table: column index lookup" {
+    const allocator = std.testing.allocator;
+    const data = @embedFile("../tests/fixtures/simple.parquet");
+
+    var table = try ParquetTable.init(allocator, data);
+    defer table.deinit();
+
+    // Test columnIndex
+    try std.testing.expectEqual(@as(?usize, 0), table.columnIndex("id"));
+    try std.testing.expectEqual(@as(?usize, 1), table.columnIndex("name"));
+    try std.testing.expectEqual(@as(?usize, 2), table.columnIndex("value"));
+    try std.testing.expectEqual(@as(?usize, null), table.columnIndex("nonexistent"));
+}
+
+test "parquet_table: get column type" {
+    const allocator = std.testing.allocator;
+    const data = @embedFile("../tests/fixtures/simple.parquet");
+
+    var table = try ParquetTable.init(allocator, data);
+    defer table.deinit();
+
+    // Verify column types
+    try std.testing.expectEqual(Type.INT64, table.getColumnType(0).?);
+    try std.testing.expectEqual(Type.BYTE_ARRAY, table.getColumnType(1).?);
+    try std.testing.expectEqual(Type.DOUBLE, table.getColumnType(2).?);
+    try std.testing.expectEqual(@as(?Type, null), table.getColumnType(99));
+}
+
+test "parquet_table: read int64 column" {
+    const allocator = std.testing.allocator;
+    const data = @embedFile("../tests/fixtures/simple.parquet");
+
+    var table = try ParquetTable.init(allocator, data);
+    defer table.deinit();
+
+    const values = try table.readInt64Column(0);
+    defer allocator.free(values);
+
+    try std.testing.expectEqual(@as(usize, 5), values.len);
+    try std.testing.expectEqual(@as(i64, 1), values[0]);
+    try std.testing.expectEqual(@as(i64, 2), values[1]);
+    try std.testing.expectEqual(@as(i64, 3), values[2]);
+    try std.testing.expectEqual(@as(i64, 4), values[3]);
+    try std.testing.expectEqual(@as(i64, 5), values[4]);
+}
+
+test "parquet_table: read string column" {
+    const allocator = std.testing.allocator;
+    const data = @embedFile("../tests/fixtures/simple.parquet");
+
+    var table = try ParquetTable.init(allocator, data);
+    defer table.deinit();
+
+    const values = try table.readStringColumn(1);
+    defer {
+        for (values) |v| allocator.free(v);
+        allocator.free(values);
+    }
+
+    try std.testing.expectEqual(@as(usize, 5), values.len);
+    try std.testing.expectEqualStrings("alice", values[0]);
+    try std.testing.expectEqualStrings("bob", values[1]);
+    try std.testing.expectEqualStrings("charlie", values[2]);
+    try std.testing.expectEqualStrings("diana", values[3]);
+    try std.testing.expectEqualStrings("eve", values[4]);
+}
+
+test "parquet_table: read float64 column" {
+    const allocator = std.testing.allocator;
+    const data = @embedFile("../tests/fixtures/simple.parquet");
+
+    var table = try ParquetTable.init(allocator, data);
+    defer table.deinit();
+
+    const values = try table.readFloat64Column(2);
+    defer allocator.free(values);
+
+    try std.testing.expectEqual(@as(usize, 5), values.len);
+    // Check values are approximately correct (floating point)
+    try std.testing.expectApproxEqAbs(@as(f64, 1.1), values[0], 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.2), values[1], 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.3), values[2], 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.4), values[3], 0.01);
+    try std.testing.expectApproxEqAbs(@as(f64, 5.5), values[4], 0.01);
+}
