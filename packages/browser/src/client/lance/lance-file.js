@@ -978,13 +978,9 @@ class LanceFile {
         if (webgpuAccelerator.isAvailable()) {
             if (onProgress) onProgress(0, numRows);
 
-            // Read all vectors (bulk read)
-            console.log(`[LanceFile.vectorSearch] Reading ${numRows} vectors...`);
             const allVectors = this.readAllVectors(colIdx);
 
             if (onProgress) onProgress(numRows, numRows);
-
-            console.log(`[LanceFile.vectorSearch] Computing similarity for ${allVectors.length} vectors via WebGPU`);
 
             // Batch compute with WebGPU
             const scores = await webgpuAccelerator.batchCosineSimilarity(queryVec, allVectors, true);
@@ -992,9 +988,6 @@ class LanceFile {
             // GPU-accelerated top-K selection for large result sets
             return await gpuVectorSearch.topK(scores, null, topK, true);
         }
-
-        // Fall back to WASM SIMD (uses batchCosineSimilarity internally)
-        console.log(`[LanceFile.vectorSearch] Using WASM SIMD`);
 
         if (onProgress) onProgress(0, numRows);
 

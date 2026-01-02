@@ -1,20 +1,5 @@
-/**
- * RemoteLanceDataset - Vector search operations
- * Extracted from remote-dataset.js for modularity
- */
-
 import { webgpuAccelerator } from '../gpu/accelerator.js';
 
-/**
- * Vector search across all fragments.
- * @param {Object} dataset - Dataset instance
- * @param {number} colIdx - Vector column index
- * @param {Float32Array} queryVec - Query vector
- * @param {number} topK - Number of results
- * @param {Function} onProgress - Progress callback
- * @param {Object} options - Search options
- * @returns {Promise<Object>}
- */
 export async function vectorSearch(dataset, colIdx, queryVec, topK = 10, onProgress = null, options = {}) {
     const { normalized = true, workerPool = null, useIndex = true, nprobe = 20 } = options;
 
@@ -25,7 +10,6 @@ export async function vectorSearch(dataset, colIdx, queryVec, topK = 10, onProgr
     }
 
     const dim = queryVec.length;
-    console.log(`[VectorSearch] Query dim=${dim}, topK=${topK}, fragments=${dataset._fragments.length}, hasIndex=${dataset.hasIndex()}`);
 
     if (!dataset.hasIndex()) {
         throw new Error('No IVF index found. Vector search requires an IVF index for efficient querying.');
@@ -39,23 +23,11 @@ export async function vectorSearch(dataset, colIdx, queryVec, topK = 10, onProgr
         throw new Error('IVF partition index (ivf_partitions.bin) not found. Required for efficient search.');
     }
 
-    console.log(`[VectorSearch] Using IVF index (nprobe=${nprobe})`);
     return await ivfIndexSearch(dataset, queryVec, topK, vectorColIdx, nprobe, onProgress);
 }
 
-/**
- * IVF index-based ANN search.
- * @param {Object} dataset - Dataset instance
- * @param {Float32Array} queryVec - Query vector
- * @param {number} topK - Number of results
- * @param {number} vectorColIdx - Vector column index
- * @param {number} nprobe - Number of partitions to search
- * @param {Function} onProgress - Progress callback
- * @returns {Promise<Object>}
- */
 async function ivfIndexSearch(dataset, queryVec, topK, vectorColIdx, nprobe, onProgress) {
     const partitions = dataset._ivfIndex.findNearestPartitions(queryVec, nprobe);
-    console.log(`[VectorSearch] Searching ${partitions.length} partitions:`, partitions);
 
     const partitionData = await dataset._ivfIndex.fetchPartitionData(
         partitions,
@@ -116,10 +88,7 @@ async function ivfIndexSearch(dataset, queryVec, topK, vectorColIdx, nprobe, onP
             }
         }
 
-        console.log(`[VectorSearch] Processed ${vectors.length.toLocaleString()} vectors: ${gpuProcessed.toLocaleString()} WebGPU, ${wasmProcessed.toLocaleString()} WASM SIMD`);
     } else {
-        // Pure WASM/JS path
-        console.log(`[VectorSearch] Computing similarities for ${rowIds.length.toLocaleString()} vectors via WASM SIMD`);
         if (dataset.lanceql?.batchCosineSimilarity) {
             const allScores = dataset.lanceql.batchCosineSimilarity(queryVec, vectors, true);
             scores.set(allScores);
@@ -157,11 +126,6 @@ async function ivfIndexSearch(dataset, queryVec, topK, vectorColIdx, nprobe, onP
     };
 }
 
-/**
- * Find the vector column index by looking at schema.
- * @param {Object} dataset - Dataset instance
- * @returns {number} Column index or -1 if not found
- */
 export function findVectorColumn(dataset) {
     if (!dataset._schema) return -1;
 
@@ -176,16 +140,6 @@ export function findVectorColumn(dataset) {
     return dataset._schema.length - 1;
 }
 
-/**
- * Parallel vector search using WorkerPool.
- * @param {Object} dataset - Dataset instance
- * @param {Float32Array} query - Query vector
- * @param {number} topK - Number of results
- * @param {number} vectorColIdx - Vector column index
- * @param {boolean} normalized - Whether vectors are normalized
- * @param {Object} workerPool - Worker pool instance
- * @returns {Promise<Object>}
- */
 export async function parallelVectorSearch(dataset, query, topK, vectorColIdx, normalized, workerPool) {
     const dim = query.length;
 
@@ -223,12 +177,6 @@ export async function parallelVectorSearch(dataset, query, topK, vectorColIdx, n
     return { indices, scores, rows };
 }
 
-/**
- * Fetch full row data for result indices.
- * @param {Object} dataset - Dataset instance
- * @param {Uint32Array} indices - Result indices
- * @returns {Promise<Array>}
- */
 async function fetchResultRows(dataset, indices) {
     if (indices.length === 0) return [];
 

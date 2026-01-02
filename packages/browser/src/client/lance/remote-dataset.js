@@ -46,7 +46,6 @@ class RemoteLanceDataset {
         if (!options.skipCache) {
             const cached = await metadataCache.get(cacheKey);
             if (cached && cached.schema && cached.fragments) {
-                console.log(`[LanceQL Dataset] Using cached metadata for ${baseUrl}`);
                 dataset._schema = cached.schema;
                 dataset._fragments = cached.fragments;
                 dataset._numColumns = cached.schema.length;
@@ -104,13 +103,9 @@ class RemoteLanceDataset {
 
             const sidecar = await response.json();
 
-            // Validate sidecar format
             if (!sidecar.schema || !sidecar.fragments) {
-                console.warn('[LanceQL Dataset] Invalid sidecar format');
                 return false;
             }
-
-            console.log(`[LanceQL Dataset] Loaded sidecar manifest`);
 
             // Convert sidecar schema to internal format
             this._schema = sidecar.schema.map(col => ({
@@ -160,10 +155,7 @@ class RemoteLanceDataset {
         const prefetchPromises = this._fragments.map((_, idx) =>
             this.openFragment(idx).catch(() => null)
         );
-        // Run in background, don't await
-        Promise.all(prefetchPromises).then(() => {
-            console.log(`[LanceQL Dataset] Prefetched ${this._fragments.length} fragment(s)`);
-        });
+        Promise.all(prefetchPromises).catch(() => {});
     }
 
     /**
@@ -179,15 +171,8 @@ class RemoteLanceDataset {
      */
     async _tryLoadIndex() {
         try {
-            console.log(`[LanceQL Dataset] Trying to load IVF index from ${this.baseUrl}`);
             this._ivfIndex = await IVFIndex.tryLoad(this.baseUrl);
-            if (this._ivfIndex) {
-                console.log(`[LanceQL Dataset] IVF index loaded: ${this._ivfIndex.numPartitions} partitions, dim=${this._ivfIndex.dimension}`);
-            } else {
-                console.log('[LanceQL Dataset] IVF index not found or failed to parse');
-            }
-        } catch (e) {
-            console.log('[LanceQL Dataset] No IVF index found:', e.message);
+        } catch {
             this._ivfIndex = null;
         }
     }
@@ -264,10 +249,7 @@ class RemoteLanceDataset {
         this._version = manifestVersion;
         this._latestVersion = this._requestedVersion ? null : manifestVersion;
 
-        console.log(`[LanceQL Dataset] Loading manifest v${manifestVersion}${this._requestedVersion ? ' (time-travel)' : ''}...`);
         this._parseManifest(manifestData);
-
-        console.log(`[LanceQL Dataset] Loaded: ${this._fragments.length} fragments, ${this._totalRows.toLocaleString()} rows, ${this._numColumns} columns`);
     }
 
     /**
@@ -495,11 +477,6 @@ class RemoteLanceDataset {
         this._numColumns = fields.length;
         this._totalRows = fragments.reduce((sum, f) => sum + f.numRows, 0);
 
-        // Track if any fragment has deletions
-        const deletedCount = fragments.reduce((sum, f) => sum + (f.deletionFile?.numDeletedRows || 0), 0);
-        if (deletedCount > 0) {
-            console.log(`[LanceQL Dataset] Has ${deletedCount} deleted rows across fragments`);
-        }
     }
 
     /**

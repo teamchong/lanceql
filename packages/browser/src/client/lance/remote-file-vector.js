@@ -184,15 +184,10 @@ async function vectorSearchWithIndex(file, colIdx, queryVec, topK, nprobe, onPro
     // Find nearest partitions using centroids
     if (onProgress) onProgress(0, 100);
     const partitions = file._ivfIndex.findNearestPartitions(queryVec, nprobe);
-    const estimatedRows = file._ivfIndex.getPartitionRowCount(partitions);
 
-    console.log(`[IVFSearch] Searching ${partitions.length} partitions (~${estimatedRows.toLocaleString()} rows)`);
-
-    // Try to fetch row IDs from auxiliary.idx
     const rowIdMappings = await file._ivfIndex.fetchPartitionRowIds(partitions);
 
     if (rowIdMappings && rowIdMappings.length > 0) {
-        console.log(`[IVFSearch] Fetched ${rowIdMappings.length} row ID mappings`);
         return await searchWithRowIdMappings(file, colIdx, queryVec, topK, rowIdMappings, onProgress);
     }
 
@@ -222,8 +217,6 @@ async function searchWithRowIdMappings(file, colIdx, queryVec, topK, rowIdMappin
         byFragment.get(mapping.fragId).push(mapping.rowOffset);
     }
 
-    console.log(`[IVFSearch] Fetching from ${byFragment.size} fragments`);
-
     // Collect all vectors and their indices first
     const allVectors = [];
     const allIndices = [];
@@ -247,15 +240,12 @@ async function searchWithRowIdMappings(file, colIdx, queryVec, topK, rowIdMappin
         }
     }
 
-    // Try WebGPU first, fallback to WASM SIMD
     let scores;
     if (webgpuAccelerator.isAvailable()) {
-        console.log(`[IVFSearch] Computing similarity for ${allVectors.length} vectors via WebGPU`);
         scores = await webgpuAccelerator.batchCosineSimilarity(queryVec, allVectors, true);
     }
 
     if (!scores) {
-        console.log(`[IVFSearch] Computing similarity for ${allVectors.length} vectors via WASM SIMD`);
         scores = file.lanceql.batchCosineSimilarity(queryVec, allVectors, true);
     }
 
@@ -420,11 +410,9 @@ export async function readRows(file, { offset = 0, limit = 50, columns = null } 
                     return Array.isArray(vectors) ? vectors : Array.from(vectors);
 
                 default:
-                    console.warn(`[LanceQL] Unknown column type: ${type}, trying as string`);
                     return await file.readStringsAtIndices(colIdx, indices);
             }
-        } catch (e) {
-            console.warn(`[LanceQL] Error reading column ${colIdx} (${type}):`, e.message);
+        } catch {
             return indices.map(() => null);
         }
     });

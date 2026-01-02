@@ -143,15 +143,11 @@ export function prefetchNextPage(dataset, offset, limit, columns) {
         dataset._prefetchCache = new Map();
     }
 
-    // Start prefetch in background (don't await)
     const prefetchPromise = readRows(dataset, { offset, limit, columns, _isPrefetch: true })
         .then(result => {
             dataset._prefetchCache.set(cacheKey, result);
-            console.log(`[LanceQL] Prefetched rows ${offset}-${offset + limit}`);
         })
-        .catch(() => {
-            // Ignore prefetch errors
-        });
+        .catch(() => {});
 
     dataset._prefetchCache.set(cacheKey, prefetchPromise);
 }
@@ -167,18 +163,11 @@ export async function readStringsAtIndices(dataset, colIdx, indices) {
     const groups = groupIndicesByFragment(dataset, indices);
     const results = new Map();
 
-    console.log(`[ReadStrings] Reading ${indices.length} strings from col ${colIdx}`);
-    console.log(`[ReadStrings] First 5 indices: ${indices.slice(0, 5)}`);
-    console.log(`[ReadStrings] Fragment groups: ${Array.from(groups.keys())}`);
-
-    // Fetch from each fragment in parallel
     const fetchPromises = [];
     for (const [fragIdx, group] of groups) {
         fetchPromises.push((async () => {
             const file = await dataset.openFragment(fragIdx);
-            console.log(`[ReadStrings] Fragment ${fragIdx}: reading ${group.localIndices.length} strings, first local indices: ${group.localIndices.slice(0, 3)}`);
             const data = await file.readStringsAtIndices(colIdx, group.localIndices);
-            console.log(`[ReadStrings] Fragment ${fragIdx}: got ${data.length} strings, first 3: ${data.slice(0, 3).map(s => s?.slice(0, 20) + '...')}`);
             for (let i = 0; i < group.globalIndices.length; i++) {
                 results.set(group.globalIndices[i], data[i]);
             }
