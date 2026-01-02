@@ -79,6 +79,8 @@ export function getFrameBounds(frame, partition, currentIdx) {
     // Parse start bound (parser uses spaces in type names)
     const start = frame.start || { type: 'UNBOUNDED PRECEDING' };
     const startType = start.type.replace(' ', '_').toUpperCase();
+    // Coerce offset to number with fallback to 1
+    const startOffset = Number(start.offset ?? start.value ?? 1) || 1;
     switch (startType) {
         case 'UNBOUNDED_PRECEDING':
             startIdx = 0;
@@ -87,16 +89,17 @@ export function getFrameBounds(frame, partition, currentIdx) {
             startIdx = currentIdx;
             break;
         case 'PRECEDING':
-            startIdx = Math.max(0, currentIdx - (start.offset || start.value || 1));
+            startIdx = Math.max(0, currentIdx - startOffset);
             break;
         case 'FOLLOWING':
-            startIdx = Math.min(n - 1, currentIdx + (start.offset || start.value || 1));
+            startIdx = Math.min(n - 1, currentIdx + startOffset);
             break;
     }
 
     // Parse end bound
     const end = frame.end || { type: 'CURRENT ROW' };
     const endType = end.type.replace(' ', '_').toUpperCase();
+    const endOffset = Number(end.offset ?? end.value ?? 1) || 1;
     switch (endType) {
         case 'UNBOUNDED_FOLLOWING':
             endIdx = n - 1;
@@ -105,10 +108,10 @@ export function getFrameBounds(frame, partition, currentIdx) {
             endIdx = currentIdx;
             break;
         case 'PRECEDING':
-            endIdx = Math.max(0, currentIdx - (end.offset || end.value || 1));
+            endIdx = Math.max(0, currentIdx - endOffset);
             break;
         case 'FOLLOWING':
-            endIdx = Math.min(n - 1, currentIdx + (end.offset || end.value || 1));
+            endIdx = Math.min(n - 1, currentIdx + endOffset);
             break;
     }
 
@@ -171,9 +174,10 @@ export function computeWindowFunction(funcName, args, over, rows, columnData, ev
                 }
 
                 case 'NTILE': {
-                    const n = args[0]?.value || 1;
-                    const bucketSize = Math.ceil(partition.length / n);
-                    results[rowIdx] = Math.floor(i / bucketSize) + 1;
+                    // Clamp N to valid range and use SQL standard algorithm
+                    const requestedN = Math.max(1, Number(args[0]?.value) || 1);
+                    const n = Math.min(requestedN, partition.length);
+                    results[rowIdx] = Math.floor(i * n / partition.length) + 1;
                     break;
                 }
 
@@ -248,9 +252,13 @@ export function computeWindowFunction(funcName, args, over, rows, columnData, ev
                 }
 
                 case 'NTH_VALUE': {
-                    const n = args[1]?.value || 1;
-                    if (n > 0 && n <= partition.length) {
-                        const nthRowIdx = partition[n - 1].idx;
+                    const n = Number(args[1]?.value) || 1;
+                    // Use frame bounds, not partition length
+                    const frame = over.frame || { type: 'RANGE', start: { type: 'UNBOUNDED_PRECEDING' }, end: { type: 'CURRENT_ROW' } };
+                    const [startIdx, endIdx] = getFrameBounds(frame, partition, i);
+                    const frameSize = endIdx - startIdx + 1;
+                    if (n > 0 && n <= frameSize) {
+                        const nthRowIdx = partition[startIdx + n - 1].idx;
                         results[rowIdx] = evaluateExpr(args[0], columnData, nthRowIdx);
                     } else {
                         results[rowIdx] = null;
@@ -280,7 +288,8 @@ export function computeWindowFunction(funcName, args, over, rows, columnData, ev
                         frameRowCount++;
                         if (!isStar) {
                             const val = evaluateExpr(args[0], columnData, partition[j].idx);
-                            if (val != null) values.push(Number(val));
+                            const numVal = Number(val);
+                            if (val != null && !isNaN(numVal)) values.push(numVal);
                         }
                     }
 
@@ -437,7 +446,10 @@ export function executeWindowFunctions(executor, ast, data, columnData, filtered
         finalRows.sort((a, b) => {
             for (const ob of ast.orderBy) {
                 const colIdx = colIdxMap[ob.column.toLowerCase()];
-                if (colIdx === undefined) continue;
+                if (colIdx === undefined) {
+                    console.warn(`[SQLExecutor] ORDER BY column '${ob.column}' not found in result columns`);
+                    continue;
+                }
                 const valA = a[colIdx], valB = b[colIdx];
                 const dir = (ob.descending || ob.direction === 'DESC') ? -1 : 1;
                 if (valA == null && valB == null) continue;

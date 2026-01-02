@@ -214,6 +214,8 @@ export function evaluateExpr(executor, expr, columnData, rowIdx) {
             const value = evaluateExpr(executor, expr.expr, columnData, rowIdx);
             const low = evaluateExpr(executor, expr.low, columnData, rowIdx);
             const high = evaluateExpr(executor, expr.high, columnData, rowIdx);
+            // SQL NULL semantics: NULL in any operand returns NULL
+            if (value == null || low == null || high == null) return null;
             return value >= low && value <= high;
         }
 
@@ -319,7 +321,14 @@ export function evaluateInMemoryExpr(expr, columnData, rowIdx) {
                 case 'UPPER': return String(args[0]).toUpperCase();
                 case 'LOWER': return String(args[0]).toLowerCase();
                 case 'LENGTH': return String(args[0]).length;
-                case 'SUBSTR': case 'SUBSTRING': return String(args[0]).substring(args[1] - 1, args[2] ? args[1] - 1 + args[2] : undefined);
+                case 'SUBSTR': case 'SUBSTRING': {
+                    if (args[0] == null || args[1] == null) return null;
+                    const start = Number(args[1]);
+                    if (isNaN(start)) return null;
+                    const len = args[2] != null ? Number(args[2]) : undefined;
+                    if (len !== undefined && (isNaN(len) || len < 0)) return null;
+                    return String(args[0]).substring(start - 1, len !== undefined ? start - 1 + len : undefined);
+                }
                 case 'COALESCE': return args.find(a => a != null) ?? null;
                 case 'ABS': return Math.abs(args[0]);
                 case 'ROUND': return Math.round(args[0] * Math.pow(10, args[1] || 0)) / Math.pow(10, args[1] || 0);
@@ -345,6 +354,7 @@ export function evaluateInMemoryExpr(expr, columnData, rowIdx) {
             const val = evaluateInMemoryExpr(expr.expr, columnData, rowIdx);
             const low = evaluateInMemoryExpr(expr.low, columnData, rowIdx);
             const high = evaluateInMemoryExpr(expr.high, columnData, rowIdx);
+            if (val == null || low == null || high == null) return null;
             return val >= low && val <= high;
         }
 
