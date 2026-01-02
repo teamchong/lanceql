@@ -5439,7 +5439,7 @@ pub const Executor = struct {
                 // Match function name (case insensitive)
                 if (std.ascii.eqlIgnoreCase(item_call.name, call_name)) {
                     // Match arguments
-                    if (aggregateArgsMatch(item_call.args, call_args)) {
+                    if (aggregate_functions.aggregateArgsMatch(item_call.args, call_args)) {
                         return i;
                     }
                 }
@@ -5449,40 +5449,5 @@ pub const Executor = struct {
         return error.ColumnNotFound;
     }
 };
-
-/// Check if two aggregate argument lists match
-fn aggregateArgsMatch(a: []const Expr, b: []const Expr) bool {
-    if (a.len != b.len) return false;
-
-    for (a, b) |arg_a, arg_b| {
-        if (!exprEquals(&arg_a, &arg_b)) return false;
-    }
-
-    return true;
-}
-
-/// Check if two expressions are equal (for aggregate matching)
-fn exprEquals(a: *const Expr, b: *const Expr) bool {
-    if (std.meta.activeTag(a.*) != std.meta.activeTag(b.*)) return false;
-
-    return switch (a.*) {
-        .column => |col_a| blk: {
-            const col_b = b.column;
-            break :blk std.mem.eql(u8, col_a.name, col_b.name);
-        },
-        .value => |val_a| blk: {
-            const val_b = b.value;
-            if (std.meta.activeTag(val_a) != std.meta.activeTag(val_b)) break :blk false;
-            break :blk switch (val_a) {
-                .integer => |i| i == val_b.integer,
-                .float => |f| f == val_b.float,
-                .string => |s| std.mem.eql(u8, s, val_b.string),
-                .null => true,
-                else => false,
-            };
-        },
-        else => false,
-    };
-}
 
 // Tests are in tests/test_sql_executor.zig
