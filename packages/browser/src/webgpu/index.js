@@ -5,6 +5,7 @@
  * GPU-accelerated SQL aggregations (SUM, COUNT, AVG, MIN, MAX).
  * GPU-accelerated SQL JOINs (hash join for large tables).
  * GPU-accelerated SQL ORDER BY (bitonic sort for large result sets).
+ * GPU-accelerated SQL GROUP BY (hash-based grouping for large datasets).
  */
 
 export { GPUBufferManager, ModelWeightCache } from './gpu-buffers.js';
@@ -30,6 +31,11 @@ export {
     getGPUSorter,
     shouldUseGPUSort,
 } from './gpu-sort.js';
+export {
+    GPUGrouper,
+    getGPUGrouper,
+    shouldUseGPUGroup,
+} from './gpu-group-by.js';
 
 // Shader sources (for advanced users)
 export const SHADERS = {
@@ -41,6 +47,7 @@ export const SHADERS = {
     REDUCE: './shaders/reduce.wgsl',
     JOIN: './shaders/join.wgsl',
     SORT: './shaders/sort.wgsl',
+    GROUP_BY: './shaders/group_by.wgsl',
 };
 
 /**

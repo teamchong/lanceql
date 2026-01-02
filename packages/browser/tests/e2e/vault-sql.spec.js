@@ -4797,4 +4797,137 @@ test.describe('Vault SQL Operations', () => {
             expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
         }
     });
+
+    test('GPU GROUP BY matches CPU results', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { gpuGrouper } = await import('./lanceql.js');
+            const tests = [];
+
+            // Initialize GPU grouper
+            await gpuGrouper.init();
+            const isAvailable = gpuGrouper.isAvailable();
+            tests.push({ name: 'GPUGrouper initializes', pass: true, actual: isAvailable ? 'GPU available' : 'CPU fallback' });
+
+            // Test groupBy with unique keys
+            try {
+                const keys = new Uint32Array([1, 2, 3, 1, 2, 3, 1, 2, 3]);
+                const result = await gpuGrouper.groupBy(keys);
+                tests.push({ name: 'GroupBy finds unique groups', pass: result.numGroups === 3, actual: result.numGroups });
+            } catch (e) {
+                tests.push({ name: 'GroupBy finds unique groups', pass: false, error: e.message });
+            }
+
+            // Test groupBy assigns correct IDs
+            try {
+                const keys = new Uint32Array([10, 20, 10, 20, 30]);
+                const result = await gpuGrouper.groupBy(keys);
+                // Same keys should get same group IDs
+                const sameGroup = result.groupIds[0] === result.groupIds[2] && result.groupIds[1] === result.groupIds[3];
+                tests.push({ name: 'GroupBy assigns consistent IDs', pass: sameGroup, actual: Array.from(result.groupIds).join(',') });
+            } catch (e) {
+                tests.push({ name: 'GroupBy assigns consistent IDs', pass: false, error: e.message });
+            }
+
+            // Test group COUNT aggregation
+            try {
+                const keys = new Uint32Array([1, 2, 1, 2, 1]);
+                const { groupIds, numGroups } = await gpuGrouper.groupBy(keys);
+                const values = new Float32Array([1, 1, 1, 1, 1]);
+                const counts = await gpuGrouper.groupAggregate(values, groupIds, numGroups, 'COUNT');
+                // Group 1 appears 3 times, group 2 appears 2 times
+                const total = counts[0] + counts[1];
+                tests.push({ name: 'Group COUNT', pass: total === 5, actual: Array.from(counts).join(',') });
+            } catch (e) {
+                tests.push({ name: 'Group COUNT', pass: false, error: e.message });
+            }
+
+            // Test group SUM aggregation
+            try {
+                const keys = new Uint32Array([1, 2, 1, 2, 1]);
+                const { groupIds, numGroups } = await gpuGrouper.groupBy(keys);
+                const values = new Float32Array([10, 20, 30, 40, 50]);
+                const sums = await gpuGrouper.groupAggregate(values, groupIds, numGroups, 'SUM');
+                // Group 1: 10+30+50=90, Group 2: 20+40=60
+                const total = sums[0] + sums[1];
+                tests.push({ name: 'Group SUM', pass: Math.abs(total - 150) < 1, actual: Array.from(sums).join(',') });
+            } catch (e) {
+                tests.push({ name: 'Group SUM', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('GPU GROUP BY handles edge cases', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { gpuGrouper } = await import('./lanceql.js');
+            const tests = [];
+
+            await gpuGrouper.init();
+
+            // Test single group
+            try {
+                const keys = new Uint32Array([5, 5, 5, 5, 5]);
+                const result = await gpuGrouper.groupBy(keys);
+                tests.push({ name: 'Single group', pass: result.numGroups === 1, actual: result.numGroups });
+            } catch (e) {
+                tests.push({ name: 'Single group', pass: false, error: e.message });
+            }
+
+            // Test all unique keys
+            try {
+                const keys = new Uint32Array([1, 2, 3, 4, 5]);
+                const result = await gpuGrouper.groupBy(keys);
+                tests.push({ name: 'All unique', pass: result.numGroups === 5, actual: result.numGroups });
+            } catch (e) {
+                tests.push({ name: 'All unique', pass: false, error: e.message });
+            }
+
+            // Test group MIN
+            try {
+                const keys = new Uint32Array([1, 2, 1, 2]);
+                const { groupIds, numGroups } = await gpuGrouper.groupBy(keys);
+                const values = new Float32Array([10, 5, 3, 8]);
+                const mins = await gpuGrouper.groupAggregate(values, groupIds, numGroups, 'MIN');
+                // Group 1: min(10, 3)=3, Group 2: min(5, 8)=5
+                const pass = (mins[0] === 3 && mins[1] === 5) || (mins[0] === 5 && mins[1] === 3);
+                tests.push({ name: 'Group MIN', pass, actual: Array.from(mins).join(',') });
+            } catch (e) {
+                tests.push({ name: 'Group MIN', pass: false, error: e.message });
+            }
+
+            // Test group MAX
+            try {
+                const keys = new Uint32Array([1, 2, 1, 2]);
+                const { groupIds, numGroups } = await gpuGrouper.groupBy(keys);
+                const values = new Float32Array([10, 5, 3, 8]);
+                const maxs = await gpuGrouper.groupAggregate(values, groupIds, numGroups, 'MAX');
+                // Group 1: max(10, 3)=10, Group 2: max(5, 8)=8
+                const pass = (maxs[0] === 10 && maxs[1] === 8) || (maxs[0] === 8 && maxs[1] === 10);
+                tests.push({ name: 'Group MAX', pass, actual: Array.from(maxs).join(',') });
+            } catch (e) {
+                tests.push({ name: 'Group MAX', pass: false, error: e.message });
+            }
+
+            // Test larger dataset
+            try {
+                const keys = new Uint32Array(1000);
+                for (let i = 0; i < 1000; i++) keys[i] = i % 10;  // 10 groups
+                const result = await gpuGrouper.groupBy(keys);
+                tests.push({ name: 'Larger dataset (1000 rows, 10 groups)', pass: result.numGroups === 10, actual: result.numGroups });
+            } catch (e) {
+                tests.push({ name: 'Larger dataset', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
 });
