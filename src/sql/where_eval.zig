@@ -18,15 +18,18 @@ pub const scalar_functions = @import("scalar_functions.zig");
 /// Function pointer type for evaluating expressions that need executor context
 pub const EvalExprFn = *const fn (ctx: *anyopaque, expr: *const Expr, row_idx: u32) anyerror!Value;
 
+/// Function pointer for executing subqueries (EXISTS, IN subquery)
+/// Takes context, statement, and params, returns Result
+pub const ExecuteFn = *const fn (*anyopaque, *ast.SelectStmt, []const Value) anyerror!Result;
+
 /// Context for WHERE clause evaluation
 pub const WhereContext = struct {
     allocator: std.mem.Allocator,
     column_cache: *std.StringHashMap(CachedColumn),
     row_count: usize,
     /// Function pointer for executing subqueries (EXISTS, IN subquery)
-    /// Signature: fn(stmt: *ast.SelectStmt, params: []const Value) anyerror!Result
-    execute_fn: ?*const fn (*ast.SelectStmt, []const Value) anyerror!Result = null,
-    /// Opaque executor context for eval_expr_fn
+    execute_fn: ?ExecuteFn = null,
+    /// Opaque executor context for eval_expr_fn and execute_fn
     eval_ctx: ?*anyopaque = null,
     /// Function pointer for evaluating expressions that need executor context
     /// (e.g., scalar functions, method calls)
@@ -264,8 +267,9 @@ pub fn evaluateExprForRow(ctx: WhereContext, expr: *const Expr, row_idx: u32) an
 /// Evaluate EXISTS subquery
 fn evaluateExists(ctx: WhereContext, subquery: *ast.SelectStmt, negated: bool) anyerror!bool {
     const exec_fn = ctx.execute_fn orelse return error.NoExecuteFunctionProvided;
+    const exec_ctx = ctx.eval_ctx orelse return error.NoExecuteContextProvided;
 
-    var result = try exec_fn(subquery, &[_]Value{});
+    var result = try exec_fn(exec_ctx, subquery, &[_]Value{});
     defer result.deinit();
 
     const exists = result.row_count > 0;
@@ -308,8 +312,9 @@ fn evaluateInList(ctx: WhereContext, expr: *const Expr, values: []const Expr, ro
 fn evaluateInSubquery(ctx: WhereContext, expr: *const Expr, subquery: *ast.SelectStmt, negated: bool, row_idx: u32) anyerror!bool {
     const left_val = try evaluateToValue(ctx, expr, row_idx);
     const exec_fn = ctx.execute_fn orelse return error.NoExecuteFunctionProvided;
+    const exec_ctx = ctx.eval_ctx orelse return error.NoExecuteContextProvided;
 
-    var result = try exec_fn(subquery, &[_]Value{});
+    var result = try exec_fn(exec_ctx, subquery, &[_]Value{});
     defer result.deinit();
 
     if (result.columns.len != 1) {

@@ -1723,6 +1723,12 @@ pub const Executor = struct {
         return self.evaluateToValue(expr, row_idx);
     }
 
+    /// Static wrapper for execute - used as callback from where_eval for subqueries
+    fn executeCallback(ctx: *anyopaque, stmt: *ast.SelectStmt, params: []const Value) anyerror!Result {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        return self.execute(stmt, params);
+    }
+
     /// Evaluate WHERE clause and return matching row indices
     fn evaluateWhere(self: *Self, where_expr: *const Expr, params: []const Value) ![]u32 {
         const row_count = try self.getRowCount();
@@ -1731,7 +1737,7 @@ pub const Executor = struct {
             .allocator = self.allocator,
             .column_cache = &self.column_cache,
             .row_count = row_count,
-            .execute_fn = null, // Subqueries not supported via this path
+            .execute_fn = executeCallback,
             .eval_ctx = self,
             .eval_expr_fn = evalExprCallback,
         };

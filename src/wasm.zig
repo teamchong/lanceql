@@ -20,6 +20,8 @@ const clip_model = @import("wasm/clip_model.zig");
 const minilm_model = @import("wasm/minilm_model.zig");
 const lance_writer = @import("wasm/lance_writer.zig");
 const fragment_reader = @import("wasm/fragment_reader.zig");
+const column_meta = @import("wasm/column_meta.zig");
+const aggregates = @import("wasm/aggregates.zig");
 
 // Module exports are automatic via `pub export fn` in each module.
 // Force reference to ensure they're included in WASM binary:
@@ -35,6 +37,8 @@ comptime {
     _ = minilm_model;
     _ = lance_writer;
     _ = fragment_reader;
+    _ = column_meta;
+    _ = aggregates;
 }
 
 // ============================================================================
@@ -82,6 +86,9 @@ fn syncStateToModules() void {
     vector_column.file_data = file_data;
     vector_column.num_columns = num_columns;
     vector_column.column_meta_offsets_start = column_meta_offsets_start;
+    aggregates.file_data = file_data;
+    aggregates.num_columns = num_columns;
+    aggregates.column_meta_offsets_start = column_meta_offsets_start;
 }
 
 // ============================================================================
@@ -125,177 +132,37 @@ export fn getNumColumns() u32 {
 }
 
 // ============================================================================
-// Column Metadata Parsing
+// Column Metadata Debug Exports
 // ============================================================================
 
-fn getColumnOffsetEntry(col_idx: u32) struct { pos: u64, len: u64 } {
-    const data = file_data orelse return .{ .pos = 0, .len = 0 };
-    if (col_idx >= num_columns) return .{ .pos = 0, .len = 0 };
-
-    const entry_offset: usize = @intCast(column_meta_offsets_start + col_idx * 16);
-    if (entry_offset + 16 > data.len) return .{ .pos = 0, .len = 0 };
-
-    return .{
-        .pos = readU64LE(data, entry_offset),
-        .len = readU64LE(data, entry_offset + 8),
-    };
-}
-
-// Parse varint from protobuf data
-fn readVarint(data: []const u8, offset: *usize) u64 {
-    var result: u64 = 0;
-    var shift: u6 = 0;
-
-    while (offset.* < data.len) {
-        const byte = data[offset.*];
-        offset.* += 1;
-        result |= @as(u64, byte & 0x7F) << shift;
-        if (byte & 0x80 == 0) break;
-        shift +|= 7;
-    }
-    return result;
-}
-
-// Get page buffer info from column metadata protobuf
-fn getPageBufferInfo(col_meta: []const u8) struct { offset: u64, size: u64, rows: u64 } {
-    var pos: usize = 0;
-    var page_offset: u64 = 0;
-    var page_size: u64 = 0;
-    var page_rows: u64 = 0;
-
-    while (pos < col_meta.len) {
-        const tag = readVarint(col_meta, &pos);
-        const field_num = tag >> 3;
-        const wire_type: u3 = @truncate(tag);
-
-        switch (field_num) {
-            1 => { // encoding (length-delimited) - skip it
-                if (wire_type == 2) {
-                    const skip_len = readVarint(col_meta, &pos);
-                    pos += @as(usize, @intCast(skip_len));
-                }
-            },
-            2 => { // pages (length-delimited)
-                if (wire_type != 2) break;
-                const page_len = readVarint(col_meta, &pos);
-                const page_end = pos + @as(usize, @intCast(page_len));
-
-                // Parse page message
-                while (pos < page_end and pos < col_meta.len) {
-                    const page_tag = readVarint(col_meta, &pos);
-                    const page_field = page_tag >> 3;
-                    const page_wire: u3 = @truncate(page_tag);
-
-                    switch (page_field) {
-                        1 => { // buffer_offsets (packed repeated uint64)
-                            if (page_wire == 2) {
-                                const packed_len = readVarint(col_meta, &pos);
-                                const packed_end = pos + @as(usize, @intCast(packed_len));
-                                // Read first offset only
-                                if (pos < packed_end) {
-                                    page_offset = readVarint(col_meta, &pos);
-                                }
-                                // Skip rest
-                                pos = packed_end;
-                            } else {
-                                page_offset = readVarint(col_meta, &pos);
-                            }
-                        },
-                        2 => { // buffer_sizes (packed repeated uint64)
-                            if (page_wire == 2) {
-                                const packed_len = readVarint(col_meta, &pos);
-                                const packed_end = pos + @as(usize, @intCast(packed_len));
-                                // Read first size only
-                                if (pos < packed_end) {
-                                    page_size = readVarint(col_meta, &pos);
-                                }
-                                // Skip rest
-                                pos = packed_end;
-                            } else {
-                                page_size = readVarint(col_meta, &pos);
-                            }
-                        },
-                        3 => { // length (rows)
-                            page_rows = readVarint(col_meta, &pos);
-                        },
-                        else => {
-                            // Skip field
-                            if (page_wire == 0) {
-                                _ = readVarint(col_meta, &pos);
-                            } else if (page_wire == 2) {
-                                const skip_len = readVarint(col_meta, &pos);
-                                pos += @as(usize, @intCast(skip_len));
-                            } else if (page_wire == 5) {
-                                pos += 4; // 32-bit fixed
-                            } else if (page_wire == 1) {
-                                pos += 8; // 64-bit fixed
-                            }
-                        },
-                    }
-                }
-                // Only read first page
-                return .{ .offset = page_offset, .size = page_size, .rows = page_rows };
-            },
-            else => {
-                // Skip field
-                if (wire_type == 0) {
-                    _ = readVarint(col_meta, &pos);
-                } else if (wire_type == 2) {
-                    const skip_len = readVarint(col_meta, &pos);
-                    pos += @as(usize, @intCast(skip_len));
-                } else if (wire_type == 5) {
-                    pos += 4; // 32-bit fixed
-                } else if (wire_type == 1) {
-                    pos += 8; // 64-bit fixed
-                }
-            },
-        }
-    }
-
-    return .{ .offset = page_offset, .size = page_size, .rows = page_rows };
-}
-
 export fn getRowCount(col_idx: u32) u64 {
-    const data = file_data orelse return 0;
-    const entry = getColumnOffsetEntry(col_idx);
-    if (entry.len == 0) return 0;
-
-    const col_meta_start: usize = @intCast(entry.pos);
-    const col_meta_len: usize = @intCast(entry.len);
-    if (col_meta_start + col_meta_len > data.len) return 0;
-
-    const col_meta = data[col_meta_start..][0..col_meta_len];
-    const info = getPageBufferInfo(col_meta);
-    return info.rows;
+    const buf = getColumnBuffer(col_idx) orelse return 0;
+    return buf.rows;
 }
 
-// Debug: get buffer offset for column
 export fn getColumnBufferOffset(col_idx: u32) u64 {
     const data = file_data orelse return 0;
-    const entry = getColumnOffsetEntry(col_idx);
+    const entry = column_meta.getColumnOffsetEntry(data, num_columns, column_meta_offsets_start, col_idx);
     if (entry.len == 0) return 0;
 
     const col_meta_start: usize = @intCast(entry.pos);
     const col_meta_len: usize = @intCast(entry.len);
     if (col_meta_start + col_meta_len > data.len) return 0;
 
-    const col_meta = data[col_meta_start..][0..col_meta_len];
-    const info = getPageBufferInfo(col_meta);
+    const info = column_meta.getPageBufferInfo(data[col_meta_start..][0..col_meta_len]);
     return info.offset;
 }
 
-// Debug: get buffer size for column
 export fn getColumnBufferSize(col_idx: u32) u64 {
     const data = file_data orelse return 0;
-    const entry = getColumnOffsetEntry(col_idx);
+    const entry = column_meta.getColumnOffsetEntry(data, num_columns, column_meta_offsets_start, col_idx);
     if (entry.len == 0) return 0;
 
     const col_meta_start: usize = @intCast(entry.pos);
     const col_meta_len: usize = @intCast(entry.len);
     if (col_meta_start + col_meta_len > data.len) return 0;
 
-    const col_meta = data[col_meta_start..][0..col_meta_len];
-    const info = getPageBufferInfo(col_meta);
+    const info = column_meta.getPageBufferInfo(data[col_meta_start..][0..col_meta_len]);
     return info.size;
 }
 
@@ -307,15 +174,14 @@ export fn getColumnBufferSize(col_idx: u32) u64 {
 pub const ColumnBuffer = struct { data: []const u8, start: usize, size: usize, rows: usize };
 pub fn getColumnBuffer(col_idx: u32) ?ColumnBuffer {
     const data = file_data orelse return null;
-    const entry = getColumnOffsetEntry(col_idx);
+    const entry = column_meta.getColumnOffsetEntry(data, num_columns, column_meta_offsets_start, col_idx);
     if (entry.len == 0) return null;
 
     const col_meta_start: usize = @intCast(entry.pos);
     const col_meta_len: usize = @intCast(entry.len);
     if (col_meta_start + col_meta_len > data.len) return null;
 
-    const col_meta = data[col_meta_start..][0..col_meta_len];
-    const info = getPageBufferInfo(col_meta);
+    const info = column_meta.getPageBufferInfo(data[col_meta_start..][0..col_meta_len]);
 
     const buf_start: usize = @intCast(info.offset);
     const buf_size: usize = @intCast(info.size);
@@ -645,61 +511,4 @@ export fn readBoolAtIndices(
     return num_indices;
 }
 
-// ============================================================================
-// Aggregation Functions
-// ============================================================================
-
-/// Sum int64 column
-export fn sumInt64Column(col_idx: u32) i64 {
-    const buf = getColumnBuffer(col_idx) orelse return 0;
-    const row_count = buf.size / 8;
-    var sum: i64 = 0;
-    for (0..row_count) |i| sum += readI64LE(buf.data, buf.start + i * 8);
-    return sum;
-}
-
-/// Sum float64 column
-export fn sumFloat64Column(col_idx: u32) f64 {
-    const buf = getColumnBuffer(col_idx) orelse return 0;
-    const row_count = buf.size / 8;
-    var sum: f64 = 0;
-    for (0..row_count) |i| sum += readF64LE(buf.data, buf.start + i * 8);
-    return sum;
-}
-
-/// Min int64 column
-export fn minInt64Column(col_idx: u32) i64 {
-    const buf = getColumnBuffer(col_idx) orelse return 0;
-    const row_count = buf.size / 8;
-    if (row_count == 0) return 0;
-    var min_val: i64 = readI64LE(buf.data, buf.start);
-    for (1..row_count) |i| {
-        const val = readI64LE(buf.data, buf.start + i * 8);
-        if (val < min_val) min_val = val;
-    }
-    return min_val;
-}
-
-/// Max int64 column
-export fn maxInt64Column(col_idx: u32) i64 {
-    const buf = getColumnBuffer(col_idx) orelse return 0;
-    const row_count = buf.size / 8;
-    if (row_count == 0) return 0;
-    var max_val: i64 = readI64LE(buf.data, buf.start);
-    for (1..row_count) |i| {
-        const val = readI64LE(buf.data, buf.start + i * 8);
-        if (val > max_val) max_val = val;
-    }
-    return max_val;
-}
-
-/// Average float64 column
-export fn avgFloat64Column(col_idx: u32) f64 {
-    const buf = getColumnBuffer(col_idx) orelse return 0;
-    const row_count = buf.size / 8;
-    if (row_count == 0) return 0;
-    var sum: f64 = 0;
-    for (0..row_count) |i| sum += readF64LE(buf.data, buf.start + i * 8);
-    return sum / @as(f64, @floatFromInt(row_count));
-}
 
