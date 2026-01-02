@@ -5999,4 +5999,123 @@ test.describe('Vault SQL Operations', () => {
             expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
         }
     });
+
+    test('WITH RECURSIVE - recursive CTEs for hierarchical queries', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Test 1: Basic sequence generation (1 to 10)
+            try {
+                const res = await v.exec(`
+                    WITH RECURSIVE nums AS (
+                        SELECT 1 as n
+                        UNION ALL
+                        SELECT n + 1 FROM nums WHERE n < 10
+                    )
+                    SELECT * FROM nums
+                `);
+                // Should generate numbers 1-10
+                const values = res.rows.map(r => r.n);
+                tests.push({
+                    name: 'Recursive sequence generation',
+                    pass: res.rows.length === 10 && values.includes(1) && values.includes(10),
+                    actual: `rows: ${res.rows.length}, values: ${values.slice(0, 5).join(',')}...`
+                });
+            } catch (e) {
+                tests.push({ name: 'Recursive sequence generation', pass: false, error: e.message });
+            }
+
+            // Test 2: Factorial calculation
+            try {
+                const res = await v.exec(`
+                    WITH RECURSIVE fact AS (
+                        SELECT 1 as n, 1 as factorial
+                        UNION ALL
+                        SELECT n + 1, factorial * (n + 1) FROM fact WHERE n < 5
+                    )
+                    SELECT n, factorial FROM fact
+                `);
+                // Should have factorials: 1!=1, 2!=2, 3!=6, 4!=24, 5!=120
+                const row5 = res.rows.find(r => r.n === 5);
+                tests.push({
+                    name: 'Recursive factorial',
+                    pass: res.rows.length === 5 && row5?.factorial === 120,
+                    actual: `rows: ${res.rows.length}, 5!=${row5?.factorial}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Recursive factorial', pass: false, error: e.message });
+            }
+
+            // Test 3: Hierarchical traversal (org chart)
+            try {
+                // Create employees table with hierarchy
+                await v.exec(`CREATE TABLE employees (
+                    id INT,
+                    name TEXT,
+                    manager_id INT
+                )`);
+                await v.exec(`INSERT INTO employees VALUES
+                    (1, 'CEO', NULL),
+                    (2, 'VP Sales', 1),
+                    (3, 'VP Engineering', 1),
+                    (4, 'Sales Rep 1', 2),
+                    (5, 'Sales Rep 2', 2),
+                    (6, 'Engineer 1', 3),
+                    (7, 'Engineer 2', 3)
+                `);
+
+                const res = await v.exec(`
+                    WITH RECURSIVE org AS (
+                        SELECT id, name, manager_id, 0 as level FROM employees WHERE manager_id IS NULL
+                        UNION ALL
+                        SELECT e.id, e.name, e.manager_id, o.level + 1
+                        FROM employees e
+                        JOIN org o ON e.manager_id = o.id
+                    )
+                    SELECT id, name, level FROM org ORDER BY level, id
+                `);
+                // Should have all 7 employees with correct levels
+                const ceo = res.rows.find(r => r.name === 'CEO');
+                const vp = res.rows.find(r => r.name === 'VP Sales');
+                const rep = res.rows.find(r => r.name === 'Sales Rep 1');
+                tests.push({
+                    name: 'Recursive org hierarchy',
+                    pass: res.rows.length === 7 && ceo?.level === 0 && vp?.level === 1 && rep?.level === 2,
+                    actual: `rows: ${res.rows.length}, CEO level: ${ceo?.level}, VP level: ${vp?.level}`
+                });
+
+                await v.exec('DROP TABLE employees');
+            } catch (e) {
+                tests.push({ name: 'Recursive org hierarchy', pass: false, error: e.message });
+            }
+
+            // Test 4: Empty anchor returns empty result
+            try {
+                const res = await v.exec(`
+                    WITH RECURSIVE empty AS (
+                        SELECT 1 as n WHERE 1 = 0
+                        UNION ALL
+                        SELECT n + 1 FROM empty WHERE n < 10
+                    )
+                    SELECT * FROM empty
+                `);
+                // Anchor returns no rows, so recursive should also return nothing
+                tests.push({
+                    name: 'Empty anchor terminates',
+                    pass: res.rows.length === 0,
+                    actual: `rows: ${res.rows.length}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Empty anchor terminates', pass: false, error: e.message });
+            }
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
 });
