@@ -457,40 +457,14 @@ pub const Executor = struct {
 
     /// Preload columns into cache
     fn preloadColumns(self: *Self, col_names: []const []const u8) !void {
-        // Use Parquet-specific preloading if in Parquet mode
-        if (self.parquet_table) |pq| {
-            return self.preloadParquetColumns(pq, col_names);
-        }
-
-        // Use Delta-specific preloading if in Delta mode
-        if (self.delta_table) |dt| {
-            return self.preloadDeltaColumns(dt, col_names);
-        }
-
-        // Use Iceberg-specific preloading if in Iceberg mode
-        if (self.iceberg_table) |it| {
-            return self.preloadIcebergColumns(it, col_names);
-        }
-
-        // Use Arrow-specific preloading if in Arrow mode
-        if (self.arrow_table) |at| {
-            return self.preloadArrowColumns(at, col_names);
-        }
-
-        // Use Avro-specific preloading if in Avro mode
-        if (self.avro_table) |av| {
-            return self.preloadAvroColumns(av, col_names);
-        }
-
-        // Use ORC-specific preloading if in ORC mode
-        if (self.orc_table) |ot| {
-            return self.preloadOrcColumns(ot, col_names);
-        }
-
-        // Use XLSX-specific preloading if in XLSX mode
-        if (self.xlsx_table) |xt| {
-            return self.preloadXlsxColumns(xt, col_names);
-        }
+        // Use generic preloader for typed tables
+        if (self.parquet_table) |t| return self.preloadColumnsFromTable(t, col_names);
+        if (self.delta_table) |t| return self.preloadColumnsFromTable(t, col_names);
+        if (self.iceberg_table) |t| return self.preloadColumnsFromTable(t, col_names);
+        if (self.arrow_table) |t| return self.preloadColumnsFromTable(t, col_names);
+        if (self.avro_table) |t| return self.preloadColumnsFromTable(t, col_names);
+        if (self.orc_table) |t| return self.preloadColumnsFromTable(t, col_names);
+        if (self.xlsx_table) |t| return self.preloadColumnsFromTable(t, col_names);
 
         for (col_names) |name| {
             // Skip if already cached
@@ -558,265 +532,50 @@ pub const Executor = struct {
         }
     }
 
-    /// Preload Parquet columns into cache
-    fn preloadParquetColumns(self: *Self, pq: *ParquetTable, col_names: []const []const u8) !void {
-        for (col_names) |name| {
-            // Skip if already cached
-            if (self.column_cache.contains(name)) continue;
+    /// Generic column preloader for any table type with standard interface
+    fn preloadColumnsFromTable(self: *Self, table: anytype, col_names: []const []const u8) !void {
+        const T = @TypeOf(table.*);
+        const is_xlsx = T == XlsxTable;
 
-            const col_idx = pq.columnIndex(name) orelse return error.ColumnNotFound;
-            const col_type = pq.getColumnType(col_idx) orelse return error.InvalidColumn;
-
-            // Read and cache column based on Parquet type
-            switch (col_type) {
-                .int64 => {
-                    const data = pq.readInt64Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .int64 = data });
-                },
-                .int32 => {
-                    const data = pq.readInt32Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .int32 = data });
-                },
-                .double => {
-                    const data = pq.readFloat64Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .float64 = data });
-                },
-                .float => {
-                    const data = pq.readFloat32Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .float32 = data });
-                },
-                .boolean => {
-                    const data = pq.readBoolColumn(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .bool_ = data });
-                },
-                .byte_array, .fixed_len_byte_array => {
-                    const data = pq.readStringColumn(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .string = data });
-                },
-                else => return error.UnsupportedColumnType,
-            }
-        }
-    }
-
-    /// Preload columns into cache from Delta table
-    fn preloadDeltaColumns(self: *Self, dt: *DeltaTable, col_names: []const []const u8) !void {
-        for (col_names) |name| {
-            // Skip if already cached
-            if (self.column_cache.contains(name)) continue;
-
-            const col_idx = dt.columnIndex(name) orelse return error.ColumnNotFound;
-            const col_type = dt.getColumnType(col_idx) orelse return error.InvalidColumn;
-
-            // Read and cache column based on Parquet type (Delta uses Parquet underneath)
-            switch (col_type) {
-                .int64 => {
-                    const data = dt.readInt64Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .int64 = data });
-                },
-                .int32 => {
-                    const data = dt.readInt32Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .int32 = data });
-                },
-                .double => {
-                    const data = dt.readFloat64Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .float64 = data });
-                },
-                .float => {
-                    const data = dt.readFloat32Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .float32 = data });
-                },
-                .boolean => {
-                    const data = dt.readBoolColumn(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .bool_ = data });
-                },
-                .byte_array, .fixed_len_byte_array => {
-                    const data = dt.readStringColumn(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .string = data });
-                },
-                else => return error.UnsupportedColumnType,
-            }
-        }
-    }
-
-    /// Preload columns into cache from Iceberg table
-    fn preloadIcebergColumns(self: *Self, it: *IcebergTable, col_names: []const []const u8) !void {
-        for (col_names) |name| {
-            // Skip if already cached
-            if (self.column_cache.contains(name)) continue;
-
-            const col_idx = it.columnIndex(name) orelse return error.ColumnNotFound;
-            const col_type = it.getColumnType(col_idx) orelse return error.InvalidColumn;
-
-            // Read and cache column based on Parquet type (Iceberg uses Parquet underneath)
-            switch (col_type) {
-                .int64 => {
-                    const data = it.readInt64Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .int64 = data });
-                },
-                .int32 => {
-                    const data = it.readInt32Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .int32 = data });
-                },
-                .double => {
-                    const data = it.readFloat64Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .float64 = data });
-                },
-                .float => {
-                    const data = it.readFloat32Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .float32 = data });
-                },
-                .boolean => {
-                    const data = it.readBoolColumn(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .bool_ = data });
-                },
-                .byte_array, .fixed_len_byte_array => {
-                    const data = it.readStringColumn(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .string = data });
-                },
-                else => return error.UnsupportedColumnType,
-            }
-        }
-    }
-
-    /// Preload columns into cache from Arrow table
-    fn preloadArrowColumns(self: *Self, at: *ArrowTable, col_names: []const []const u8) !void {
         for (col_names) |name| {
             if (self.column_cache.contains(name)) continue;
 
-            const col_idx = at.columnIndex(name) orelse return error.ColumnNotFound;
-            const col_type = at.getColumnType(col_idx) orelse return error.InvalidColumn;
+            const col_idx = table.columnIndex(name) orelse return error.ColumnNotFound;
+            const col_type = table.getColumnType(col_idx) orelse return error.InvalidColumn;
 
             switch (col_type) {
                 .int64 => {
-                    const data = at.readInt64Column(col_idx) catch return error.ColumnReadError;
+                    const data = table.readInt64Column(col_idx) catch return error.ColumnReadError;
                     try self.column_cache.put(name, CachedColumn{ .int64 = data });
                 },
                 .int32 => {
-                    const data = at.readInt32Column(col_idx) catch return error.ColumnReadError;
+                    const data = table.readInt32Column(col_idx) catch return error.ColumnReadError;
                     try self.column_cache.put(name, CachedColumn{ .int32 = data });
                 },
                 .double => {
-                    const data = at.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                    const data = table.readFloat64Column(col_idx) catch return error.ColumnReadError;
                     try self.column_cache.put(name, CachedColumn{ .float64 = data });
                 },
                 .float => {
-                    const data = at.readFloat32Column(col_idx) catch return error.ColumnReadError;
+                    const data = table.readFloat32Column(col_idx) catch return error.ColumnReadError;
                     try self.column_cache.put(name, CachedColumn{ .float32 = data });
                 },
                 .boolean => {
-                    const data = at.readBoolColumn(col_idx) catch return error.ColumnReadError;
+                    const data = table.readBoolColumn(col_idx) catch return error.ColumnReadError;
                     try self.column_cache.put(name, CachedColumn{ .bool_ = data });
                 },
                 .byte_array, .fixed_len_byte_array => {
-                    const data = at.readStringColumn(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .string = data });
-                },
-                else => return error.UnsupportedColumnType,
-            }
-        }
-    }
-
-    /// Preload columns into cache from Avro table
-    fn preloadAvroColumns(self: *Self, av: *AvroTable, col_names: []const []const u8) !void {
-        for (col_names) |name| {
-            if (self.column_cache.contains(name)) continue;
-
-            const col_idx = av.columnIndex(name) orelse return error.ColumnNotFound;
-            const col_type = av.getColumnType(col_idx) orelse return error.InvalidColumn;
-
-            switch (col_type) {
-                .int64 => {
-                    const data = av.readInt64Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .int64 = data });
-                },
-                .int32 => {
-                    const data = av.readInt32Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .int32 = data });
-                },
-                .double => {
-                    const data = av.readFloat64Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .float64 = data });
-                },
-                .float => {
-                    const data = av.readFloat32Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .float32 = data });
-                },
-                .boolean => {
-                    const data = av.readBoolColumn(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .bool_ = data });
-                },
-                .byte_array, .fixed_len_byte_array => {
-                    const data = av.readStringColumn(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .string = data });
-                },
-                else => return error.UnsupportedColumnType,
-            }
-        }
-    }
-
-    /// Preload columns into cache from ORC table
-    fn preloadOrcColumns(self: *Self, ot: *OrcTable, col_names: []const []const u8) !void {
-        for (col_names) |name| {
-            if (self.column_cache.contains(name)) continue;
-
-            const col_idx = ot.columnIndex(name) orelse return error.ColumnNotFound;
-            const col_type = ot.getColumnType(col_idx) orelse return error.InvalidColumn;
-
-            switch (col_type) {
-                .int64 => {
-                    const data = ot.readInt64Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .int64 = data });
-                },
-                .int32 => {
-                    const data = ot.readInt32Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .int32 = data });
-                },
-                .double => {
-                    const data = ot.readFloat64Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .float64 = data });
-                },
-                .float => {
-                    const data = ot.readFloat32Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .float32 = data });
-                },
-                .boolean => {
-                    const data = ot.readBoolColumn(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .bool_ = data });
-                },
-                .byte_array, .fixed_len_byte_array => {
-                    const data = ot.readStringColumn(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .string = data });
-                },
-                else => return error.UnsupportedColumnType,
-            }
-        }
-    }
-
-    /// Preload columns into cache from XLSX table
-    fn preloadXlsxColumns(self: *Self, xt: *XlsxTable, col_names: []const []const u8) !void {
-        for (col_names) |name| {
-            if (self.column_cache.contains(name)) continue;
-
-            const col_idx = xt.columnIndex(name) orelse return error.ColumnNotFound;
-            const col_type = xt.getColumnType(col_idx) orelse return error.InvalidColumn;
-
-            switch (col_type) {
-                .double => {
-                    const data = xt.readFloat64Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .float64 = data });
-                },
-                .boolean => {
-                    const data = xt.readBoolColumn(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .bool_ = data });
-                },
-                .byte_array, .fixed_len_byte_array => {
-                    const data = xt.readStringColumn(col_idx) catch return error.ColumnReadError;
+                    const data = table.readStringColumn(col_idx) catch return error.ColumnReadError;
                     try self.column_cache.put(name, CachedColumn{ .string = data });
                 },
                 else => {
-                    // Default to float64 for XLSX since numbers are stored as f64
-                    const data = xt.readFloat64Column(col_idx) catch return error.ColumnReadError;
-                    try self.column_cache.put(name, CachedColumn{ .float64 = data });
+                    // XLSX defaults to float64, others error
+                    if (is_xlsx) {
+                        const data = table.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                        try self.column_cache.put(name, CachedColumn{ .float64 = data });
+                    } else {
+                        return error.UnsupportedColumnType;
+                    }
                 },
             }
         }
