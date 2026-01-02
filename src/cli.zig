@@ -32,6 +32,7 @@ const ArrowTable = @import("lanceql.arrow_table").ArrowTable;
 const AvroTable = @import("lanceql.avro_table").AvroTable;
 const OrcTable = @import("lanceql.orc_table").OrcTable;
 const XlsxTable = @import("lanceql.xlsx_table").XlsxTable;
+const AnyTable = @import("lanceql.any_table").AnyTable;
 const executor = @import("lanceql.sql.executor");
 const lexer = @import("lanceql.sql.lexer");
 const parser = @import("lanceql.sql.parser");
@@ -427,7 +428,7 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, legacy_args: Legacy
 
     // Check for Delta first (directory-based, doesn't need to read file data)
     if (isDeltaDirectory(table_path) or std.mem.endsWith(u8, table_path, ".delta")) {
-        runDeltaQuery(allocator, table_path, query, legacy_args) catch |err| {
+        runQueryWithFormat(allocator, .delta, .{ .path = table_path }, query, legacy_args) catch |err| {
             std.debug.print("Delta query error: {}\n", .{err});
         };
         return;
@@ -435,7 +436,7 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, legacy_args: Legacy
 
     // Check for Iceberg (directory-based, doesn't need to read file data)
     if (isIcebergDirectory(table_path) or std.mem.endsWith(u8, table_path, ".iceberg")) {
-        runIcebergQuery(allocator, table_path, query, legacy_args) catch |err| {
+        runQueryWithFormat(allocator, .iceberg, .{ .path = table_path }, query, legacy_args) catch |err| {
             std.debug.print("Iceberg query error: {}\n", .{err});
         };
         return;
@@ -451,140 +452,45 @@ fn runQuery(allocator: std.mem.Allocator, query: []const u8, legacy_args: Legacy
     // Detect file type
     const file_type = detectFileType(table_path, data);
 
-    switch (file_type) {
-        .parquet => {
-            runParquetQuery(allocator, data, query, legacy_args) catch |err| {
-                std.debug.print("Parquet query error: {}\n", .{err});
+    const format: AnyTable.Format = switch (file_type) {
+        .parquet => .parquet,
+        .lance => .lance,
+        .delta => .delta,
+        .iceberg => .iceberg,
+        .arrow => .arrow,
+        .avro => .avro,
+        .orc => .orc,
+        .xlsx => .xlsx,
+        .unknown => .lance, // Try Lance first for unknown formats
+    };
+
+    const input: AnyTable.InitInput = switch (format) {
+        .delta, .iceberg => .{ .path = table_path },
+        else => .{ .data = data },
+    };
+
+    runQueryWithFormat(allocator, format, input, query, legacy_args) catch |err| {
+        if (file_type == .unknown) {
+            // Fallback to Parquet for unknown formats
+            runQueryWithFormat(allocator, .parquet, .{ .data = data }, query, legacy_args) catch |e| {
+                std.debug.print("Query error: {}\n", .{e});
             };
-        },
-        .lance => {
-            runLanceQuery(allocator, data, query, legacy_args) catch |err| {
-                std.debug.print("Lance query error: {}\n", .{err});
-            };
-        },
-        .delta => {
-            // Should not reach here since we check Delta first, but handle anyway
-            runDeltaQuery(allocator, table_path, query, legacy_args) catch |err| {
-                std.debug.print("Delta query error: {}\n", .{err});
-            };
-        },
-        .iceberg => {
-            // Should not reach here since we check Iceberg first, but handle anyway
-            runIcebergQuery(allocator, table_path, query, legacy_args) catch |err| {
-                std.debug.print("Iceberg query error: {}\n", .{err});
-            };
-        },
-        .arrow => {
-            runArrowQuery(allocator, data, query, legacy_args) catch |err| {
-                std.debug.print("Arrow query error: {}\n", .{err});
-            };
-        },
-        .avro => {
-            runAvroQuery(allocator, data, query, legacy_args) catch |err| {
-                std.debug.print("Avro query error: {}\n", .{err});
-            };
-        },
-        .orc => {
-            runOrcQuery(allocator, data, query, legacy_args) catch |err| {
-                std.debug.print("ORC query error: {}\n", .{err});
-            };
-        },
-        .xlsx => {
-            runXlsxQuery(allocator, data, query, legacy_args) catch |err| {
-                std.debug.print("XLSX query error: {}\n", .{err});
-            };
-        },
-        .unknown => {
-            // Try Lance first, then Parquet
-            runLanceQuery(allocator, data, query, legacy_args) catch {
-                runParquetQuery(allocator, data, query, legacy_args) catch |err| {
-                    std.debug.print("Query error: {}\n", .{err});
-                };
-            };
-        },
-    }
+        } else {
+            std.debug.print("{s} query error: {}\n", .{ @tagName(format), err });
+        }
+    };
 }
 
-fn runParquetQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
-    var pq_table = try ParquetTable.init(allocator, data);
-    defer pq_table.deinit();
-
-    var exec = executor.Executor.initWithParquet(&pq_table, allocator);
-    defer exec.deinit();
-
-    try executeAndOutput(allocator, &exec, query, legacy_args);
-}
-
-fn runLanceQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
-    var table = try Table.init(allocator, data);
+fn runQueryWithFormat(allocator: std.mem.Allocator, format: AnyTable.Format, input: AnyTable.InitInput, query: []const u8, legacy_args: LegacyArgs) !void {
+    var table = try AnyTable.init(allocator, format, input);
     defer table.deinit();
 
-    var exec = executor.Executor.init(&table, allocator);
-    defer exec.deinit();
-
-    try executeAndOutput(allocator, &exec, query, legacy_args);
-}
-
-fn runDeltaQuery(allocator: std.mem.Allocator, path: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
-    var delta_table = try DeltaTable.init(allocator, path);
-    defer delta_table.deinit();
-
-    var exec = executor.Executor.initWithDelta(&delta_table, allocator);
-    defer exec.deinit();
-
-    try executeAndOutput(allocator, &exec, query, legacy_args);
-}
-
-fn runIcebergQuery(allocator: std.mem.Allocator, path: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
-    var iceberg_table = try IcebergTable.init(allocator, path);
-    defer iceberg_table.deinit();
-
-    if (iceberg_table.numRows() == 0) {
+    if (format == .iceberg and table.numRows() == 0) {
         std.debug.print("Warning: Iceberg table has no data files\n", .{});
         return;
     }
 
-    var exec = executor.Executor.initWithIceberg(&iceberg_table, allocator);
-    defer exec.deinit();
-
-    try executeAndOutput(allocator, &exec, query, legacy_args);
-}
-
-fn runArrowQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
-    var arrow_table = try ArrowTable.init(allocator, data);
-    defer arrow_table.deinit();
-
-    var exec = executor.Executor.initWithArrow(&arrow_table, allocator);
-    defer exec.deinit();
-
-    try executeAndOutput(allocator, &exec, query, legacy_args);
-}
-
-fn runAvroQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
-    var avro_table = try AvroTable.init(allocator, data);
-    defer avro_table.deinit();
-
-    var exec = executor.Executor.initWithAvro(&avro_table, allocator);
-    defer exec.deinit();
-
-    try executeAndOutput(allocator, &exec, query, legacy_args);
-}
-
-fn runOrcQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
-    var orc_table = try OrcTable.init(allocator, data);
-    defer orc_table.deinit();
-
-    var exec = executor.Executor.initWithOrc(&orc_table, allocator);
-    defer exec.deinit();
-
-    try executeAndOutput(allocator, &exec, query, legacy_args);
-}
-
-fn runXlsxQuery(allocator: std.mem.Allocator, data: []const u8, query: []const u8, legacy_args: LegacyArgs) !void {
-    var xlsx_table = try XlsxTable.init(allocator, data);
-    defer xlsx_table.deinit();
-
-    var exec = executor.Executor.initWithXlsx(&xlsx_table, allocator);
+    var exec = executor.Executor.initWithAnyTable(&table, allocator);
     defer exec.deinit();
 
     try executeAndOutput(allocator, &exec, query, legacy_args);

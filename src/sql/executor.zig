@@ -13,6 +13,7 @@ const ArrowTable = @import("lanceql.arrow_table").ArrowTable;
 const AvroTable = @import("lanceql.avro_table").AvroTable;
 const OrcTable = @import("lanceql.orc_table").OrcTable;
 const XlsxTable = @import("lanceql.xlsx_table").XlsxTable;
+const AnyTable = @import("lanceql.any_table").AnyTable;
 const hash = @import("lanceql.hash");
 pub const logic_table_dispatch = @import("logic_table_dispatch.zig");
 pub const scalar_functions = @import("scalar_functions.zig");
@@ -144,6 +145,22 @@ pub const Executor = struct {
     pub fn initWithXlsx(xlsx_table: *XlsxTable, allocator: std.mem.Allocator) Self {
         var self = init(null, allocator);
         self.xlsx_table = xlsx_table;
+        return self;
+    }
+
+    /// Initialize executor with any table type via AnyTable union
+    pub fn initWithAnyTable(any_table: *AnyTable, allocator: std.mem.Allocator) Self {
+        var self = init(null, allocator);
+        switch (any_table.*) {
+            .lance => |*t| self.table = t,
+            .parquet => |*t| self.parquet_table = t,
+            .delta => |*t| self.delta_table = t,
+            .iceberg => |*t| self.iceberg_table = t,
+            .arrow => |*t| self.arrow_table = t,
+            .avro => |*t| self.avro_table = t,
+            .orc => |*t| self.orc_table = t,
+            .xlsx => |*t| self.xlsx_table = t,
+        }
         return self;
     }
 
