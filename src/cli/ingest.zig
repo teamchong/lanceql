@@ -553,20 +553,13 @@ pub fn ingestArrow(
     for (0..num_cols) |i| {
         const arrow_type = reader.getColumnType(i);
         const lance_type = arrowTypeToLanceType(arrow_type);
-        // Only support numeric types for now (string reading not implemented)
         switch (lance_type) {
-            .int64, .float64 => {
+            .int64, .float64, .string => {
                 try supported_cols.append(allocator, i);
                 std.debug.print("    - {s}: {s} -> {s}\n", .{
                     reader.getColumnName(i),
                     @tagName(arrow_type),
                     @tagName(lance_type),
-                });
-            },
-            .string => {
-                std.debug.print("    - {s}: {s} (skipped - string reading not implemented)\n", .{
-                    reader.getColumnName(i),
-                    @tagName(arrow_type),
                 });
             },
             else => {
@@ -640,6 +633,27 @@ pub fn ingestArrow(
                     .data = encoder.getBytes(),
                     .row_count = @intCast(values.len),
                     .offsets = null,
+                });
+            },
+            .string => {
+                const values = reader.readStringColumn(orig_idx) catch |err| {
+                    std.debug.print("  Error reading string column {d}: {}\n", .{ orig_idx, err });
+                    return;
+                };
+                defer {
+                    for (values) |v| allocator.free(v);
+                    allocator.free(values);
+                }
+
+                var offsets_buf = std.ArrayListUnmanaged(u8){};
+                defer offsets_buf.deinit(allocator);
+                try encoder.writeStrings(values, &offsets_buf, allocator);
+
+                try lance_writer.writeColumnBatch(.{
+                    .column_index = @intCast(schema_idx),
+                    .data = encoder.getBytes(),
+                    .row_count = @intCast(values.len),
+                    .offsets = offsets_buf.items,
                 });
             },
             else => {},
