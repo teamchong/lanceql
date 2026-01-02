@@ -183,12 +183,7 @@ fn init_idx(@builtin(global_invocation_id) g: vec3<u32>) {
     _nextPow2(n) { let p = 1; while (p < n) p *= 2; return p; }
 }
 
-// Global GPU sorter instance
+// Singleton instance for GPU sorting
 const gpuSorter = new GPUSorter();
 
-/**
- * GPU-accelerated SQL GROUP BY using hash-based grouping.
- * Falls back to CPU for small datasets where GPU overhead exceeds benefit.
- */
-
-export { GPUSorter };
+export { GPUSorter, gpuSorter };

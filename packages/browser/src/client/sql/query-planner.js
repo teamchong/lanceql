@@ -1389,5 +1389,4 @@ class QueryPlanner {
     }
 }
 
-
-export { StatisticsManager, CostModel, QueryPlanner };
+export { StatisticsManager, CostModel, QueryPlanner, statisticsManager };

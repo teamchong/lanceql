@@ -218,4 +218,4 @@ const webgpuAccelerator = new WebGPUAccelerator();
  * Uses WebGPU compute shaders for parallel reduction on large datasets.
  */
 
-export { WebGPUAccelerator };
+export { WebGPUAccelerator, webgpuAccelerator };

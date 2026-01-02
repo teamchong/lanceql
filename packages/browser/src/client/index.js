@@ -8,10 +8,10 @@
 // Cache
 export { MetadataCache } from './cache/metadata-cache.js';
 export { LRUCache } from './cache/lru-cache.js';
-export { HotTierCache } from './cache/hot-tier-cache.js';
+export { HotTierCache, hotTierCache } from './cache/hot-tier-cache.js';
 
 // GPU Acceleration
-export { WebGPUAccelerator } from './gpu/accelerator.js';
+export { WebGPUAccelerator, webgpuAccelerator } from './gpu/accelerator.js';
 export { GPUAggregator } from './gpu/aggregator.js';
 export { GPUJoiner } from './gpu/joiner.js';
 export { GPUSorter } from './gpu/sorter.js';

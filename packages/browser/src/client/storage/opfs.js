@@ -426,4 +426,7 @@ class OPFSFileReader {
  * Keeps recently accessed pages in memory to avoid repeated OPFS reads
  */
 
-export { OPFSStorage, OPFSFileReader };
+// Singleton instance
+const opfsStorage = new OPFSStorage();
+
+export { OPFSStorage, OPFSFileReader, opfsStorage };

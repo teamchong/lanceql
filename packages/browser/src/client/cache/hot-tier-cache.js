@@ -355,4 +355,4 @@ const hotTierCache = new HotTierCache();
 // Export storage and statistics for external use
 
 
-export { HotTierCache };
+export { HotTierCache, hotTierCache };
