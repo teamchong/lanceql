@@ -92,149 +92,51 @@ pub const Executor = struct {
 
     /// Initialize executor with a Parquet table
     pub fn initWithParquet(parquet_table: *ParquetTable, allocator: std.mem.Allocator) Self {
-        return .{
-            .table = null,
-            .parquet_table = parquet_table,
-            .delta_table = null,
-            .iceberg_table = null,
-            .arrow_table = null,
-            .avro_table = null,
-            .orc_table = null,
-            .xlsx_table = null,
-            .allocator = allocator,
-            .column_cache = std.StringHashMap(CachedColumn).init(allocator),
-            .dispatcher = null,
-            .logic_table_aliases = std.StringHashMap([]const u8).init(allocator),
-            .active_source = null,
-            .tables = std.StringHashMap(*Table).init(allocator),
-            .method_results_cache = std.StringHashMap([]const f64).init(allocator),
-        };
+        var self = init(null, allocator);
+        self.parquet_table = parquet_table;
+        return self;
     }
 
     /// Initialize executor with a Delta table
     pub fn initWithDelta(delta_table: *DeltaTable, allocator: std.mem.Allocator) Self {
-        return .{
-            .table = null,
-            .parquet_table = null,
-            .delta_table = delta_table,
-            .iceberg_table = null,
-            .arrow_table = null,
-            .avro_table = null,
-            .orc_table = null,
-            .xlsx_table = null,
-            .allocator = allocator,
-            .column_cache = std.StringHashMap(CachedColumn).init(allocator),
-            .dispatcher = null,
-            .logic_table_aliases = std.StringHashMap([]const u8).init(allocator),
-            .active_source = null,
-            .tables = std.StringHashMap(*Table).init(allocator),
-            .method_results_cache = std.StringHashMap([]const f64).init(allocator),
-        };
+        var self = init(null, allocator);
+        self.delta_table = delta_table;
+        return self;
     }
 
     /// Initialize executor with an Iceberg table
     pub fn initWithIceberg(iceberg_table: *IcebergTable, allocator: std.mem.Allocator) Self {
-        return .{
-            .table = null,
-            .parquet_table = null,
-            .delta_table = null,
-            .iceberg_table = iceberg_table,
-            .arrow_table = null,
-            .avro_table = null,
-            .orc_table = null,
-            .xlsx_table = null,
-            .allocator = allocator,
-            .column_cache = std.StringHashMap(CachedColumn).init(allocator),
-            .dispatcher = null,
-            .logic_table_aliases = std.StringHashMap([]const u8).init(allocator),
-            .active_source = null,
-            .tables = std.StringHashMap(*Table).init(allocator),
-            .method_results_cache = std.StringHashMap([]const f64).init(allocator),
-        };
+        var self = init(null, allocator);
+        self.iceberg_table = iceberg_table;
+        return self;
     }
 
     /// Initialize executor with an Arrow IPC table
     pub fn initWithArrow(arrow_table: *ArrowTable, allocator: std.mem.Allocator) Self {
-        return .{
-            .table = null,
-            .parquet_table = null,
-            .delta_table = null,
-            .iceberg_table = null,
-            .arrow_table = arrow_table,
-            .avro_table = null,
-            .orc_table = null,
-            .xlsx_table = null,
-            .allocator = allocator,
-            .column_cache = std.StringHashMap(CachedColumn).init(allocator),
-            .dispatcher = null,
-            .logic_table_aliases = std.StringHashMap([]const u8).init(allocator),
-            .active_source = null,
-            .tables = std.StringHashMap(*Table).init(allocator),
-            .method_results_cache = std.StringHashMap([]const f64).init(allocator),
-        };
+        var self = init(null, allocator);
+        self.arrow_table = arrow_table;
+        return self;
     }
 
     /// Initialize executor with an Avro table
     pub fn initWithAvro(avro_table: *AvroTable, allocator: std.mem.Allocator) Self {
-        return .{
-            .table = null,
-            .parquet_table = null,
-            .delta_table = null,
-            .iceberg_table = null,
-            .arrow_table = null,
-            .avro_table = avro_table,
-            .orc_table = null,
-            .xlsx_table = null,
-            .allocator = allocator,
-            .column_cache = std.StringHashMap(CachedColumn).init(allocator),
-            .dispatcher = null,
-            .logic_table_aliases = std.StringHashMap([]const u8).init(allocator),
-            .active_source = null,
-            .tables = std.StringHashMap(*Table).init(allocator),
-            .method_results_cache = std.StringHashMap([]const f64).init(allocator),
-        };
+        var self = init(null, allocator);
+        self.avro_table = avro_table;
+        return self;
     }
 
     /// Initialize executor with an ORC table
     pub fn initWithOrc(orc_table: *OrcTable, allocator: std.mem.Allocator) Self {
-        return .{
-            .table = null,
-            .parquet_table = null,
-            .delta_table = null,
-            .iceberg_table = null,
-            .arrow_table = null,
-            .avro_table = null,
-            .orc_table = orc_table,
-            .xlsx_table = null,
-            .allocator = allocator,
-            .column_cache = std.StringHashMap(CachedColumn).init(allocator),
-            .dispatcher = null,
-            .logic_table_aliases = std.StringHashMap([]const u8).init(allocator),
-            .active_source = null,
-            .tables = std.StringHashMap(*Table).init(allocator),
-            .method_results_cache = std.StringHashMap([]const f64).init(allocator),
-        };
+        var self = init(null, allocator);
+        self.orc_table = orc_table;
+        return self;
     }
 
     /// Initialize executor with an XLSX table
     pub fn initWithXlsx(xlsx_table: *XlsxTable, allocator: std.mem.Allocator) Self {
-        return .{
-            .table = null,
-            .parquet_table = null,
-            .delta_table = null,
-            .iceberg_table = null,
-            .arrow_table = null,
-            .avro_table = null,
-            .orc_table = null,
-            .xlsx_table = xlsx_table,
-            .allocator = allocator,
-            .column_cache = std.StringHashMap(CachedColumn).init(allocator),
-            .dispatcher = null,
-            .logic_table_aliases = std.StringHashMap([]const u8).init(allocator),
-            .active_source = null,
-            .tables = std.StringHashMap(*Table).init(allocator),
-            .method_results_cache = std.StringHashMap([]const f64).init(allocator),
-        };
+        var self = init(null, allocator);
+        self.xlsx_table = xlsx_table;
+        return self;
     }
 
     /// Register a table by name for use in JOINs and multi-table queries
@@ -293,80 +195,31 @@ pub const Executor = struct {
         return self.xlsx_table != null;
     }
 
+    /// Field names of typed table pointers for comptime iteration
+    const typed_table_fields = .{ "parquet_table", "delta_table", "iceberg_table", "arrow_table", "avro_table", "orc_table", "xlsx_table" };
+
     /// Get row count (works with Lance, Parquet, Delta, Iceberg, Arrow, Avro, ORC, or XLSX)
     fn getRowCount(self: *Self) !usize {
-        if (self.parquet_table) |pq| {
-            return pq.numRows();
-        }
-        if (self.delta_table) |dt| {
-            return dt.numRows();
-        }
-        if (self.iceberg_table) |it| {
-            return it.numRows();
-        }
-        if (self.arrow_table) |at| {
-            return at.numRows();
-        }
-        if (self.avro_table) |av| {
-            return av.numRows();
-        }
-        if (self.orc_table) |ot| {
-            return ot.numRows();
-        }
-        if (self.xlsx_table) |xt| {
-            return xt.numRows();
+        inline for (typed_table_fields) |field| {
+            if (@field(self, field)) |t| return t.numRows();
         }
         return try self.tbl().rowCount(0);
     }
 
     /// Get column names (works with Lance, Parquet, Delta, Iceberg, Arrow, Avro, ORC, or XLSX)
     fn getColumnNames(self: *Self) ![][]const u8 {
-        if (self.parquet_table) |pq| {
-            return pq.getColumnNames();
-        }
-        if (self.delta_table) |dt| {
-            return dt.getColumnNames();
-        }
-        if (self.iceberg_table) |it| {
-            return it.getColumnNames();
-        }
-        if (self.arrow_table) |at| {
-            return at.getColumnNames();
-        }
-        if (self.avro_table) |av| {
-            return av.getColumnNames();
-        }
-        if (self.orc_table) |ot| {
-            return ot.getColumnNames();
-        }
-        if (self.xlsx_table) |xt| {
-            return xt.getColumnNames();
+        inline for (typed_table_fields) |field| {
+            if (@field(self, field)) |t| return t.getColumnNames();
         }
         return try self.tbl().columnNames();
     }
 
     /// Get physical column ID by name (works with Lance, Parquet, Delta, Iceberg, Arrow, Avro, ORC, or XLSX)
     fn getPhysicalColumnId(self: *Self, name: []const u8) ?u32 {
-        if (self.parquet_table) |pq| {
-            return if (pq.columnIndex(name)) |idx| @intCast(idx) else null;
-        }
-        if (self.delta_table) |dt| {
-            return if (dt.columnIndex(name)) |idx| @intCast(idx) else null;
-        }
-        if (self.iceberg_table) |it| {
-            return if (it.columnIndex(name)) |idx| @intCast(idx) else null;
-        }
-        if (self.arrow_table) |at| {
-            return if (at.columnIndex(name)) |idx| @intCast(idx) else null;
-        }
-        if (self.avro_table) |av| {
-            return if (av.columnIndex(name)) |idx| @intCast(idx) else null;
-        }
-        if (self.orc_table) |ot| {
-            return if (ot.columnIndex(name)) |idx| @intCast(idx) else null;
-        }
-        if (self.xlsx_table) |xt| {
-            return if (xt.columnIndex(name)) |idx| @intCast(idx) else null;
+        inline for (typed_table_fields) |field| {
+            if (@field(self, field)) |t| {
+                return if (t.columnIndex(name)) |idx| @intCast(idx) else null;
+            }
         }
         return self.tbl().physicalColumnId(name);
     }
