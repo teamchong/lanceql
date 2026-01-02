@@ -4077,40 +4077,14 @@ pub const Executor = struct {
         col_idx: u32,
         indices: []const u32,
     ) !Result.ColumnData {
-        // Use Parquet-specific reading if in Parquet mode
-        if (self.parquet_table) |pq| {
-            return self.readParquetColumnAtIndices(pq, col_idx, indices);
-        }
-
-        // Use Delta-specific reading if in Delta mode
-        if (self.delta_table) |dt| {
-            return self.readDeltaColumnAtIndices(dt, col_idx, indices);
-        }
-
-        // Use Iceberg-specific reading if in Iceberg mode
-        if (self.iceberg_table) |it| {
-            return self.readIcebergColumnAtIndices(it, col_idx, indices);
-        }
-
-        // Use Arrow-specific reading if in Arrow mode
-        if (self.arrow_table) |at| {
-            return self.readArrowColumnAtIndices(at, col_idx, indices);
-        }
-
-        // Use Avro-specific reading if in Avro mode
-        if (self.avro_table) |av| {
-            return self.readAvroColumnAtIndices(av, col_idx, indices);
-        }
-
-        // Use ORC-specific reading if in ORC mode
-        if (self.orc_table) |ot| {
-            return self.readOrcColumnAtIndices(ot, col_idx, indices);
-        }
-
-        // Use XLSX-specific reading if in XLSX mode
-        if (self.xlsx_table) |xt| {
-            return self.readXlsxColumnAtIndices(xt, col_idx, indices);
-        }
+        // Use generic reader for typed tables
+        if (self.parquet_table) |t| return self.readColumnFromTableAtIndices(t, col_idx, indices);
+        if (self.delta_table) |t| return self.readColumnFromTableAtIndices(t, col_idx, indices);
+        if (self.iceberg_table) |t| return self.readColumnFromTableAtIndices(t, col_idx, indices);
+        if (self.arrow_table) |t| return self.readColumnFromTableAtIndices(t, col_idx, indices);
+        if (self.avro_table) |t| return self.readColumnFromTableAtIndices(t, col_idx, indices);
+        if (self.orc_table) |t| return self.readColumnFromTableAtIndices(t, col_idx, indices);
+        if (self.xlsx_table) |t| return self.readColumnFromTableAtIndices(t, col_idx, indices);
 
         const field = self.tbl().getFieldById(col_idx) orelse return error.InvalidColumn;
 
@@ -4246,376 +4220,55 @@ pub const Executor = struct {
         }
     }
 
-    /// Read Parquet column data at specific row indices
-    fn readParquetColumnAtIndices(
+    /// Generic column reader for any table type with standard interface
+    fn readColumnFromTableAtIndices(
         self: *Self,
-        pq: *ParquetTable,
+        table: anytype,
         col_idx: u32,
         indices: []const u32,
     ) !Result.ColumnData {
-        const col_type = pq.getColumnType(col_idx) orelse return error.InvalidColumn;
+        const T = @TypeOf(table.*);
+        const is_xlsx = T == XlsxTable;
+        const col_type = table.getColumnType(col_idx) orelse return error.InvalidColumn;
 
         switch (col_type) {
             .int64 => {
-                const all_data = pq.readInt64Column(col_idx) catch return error.ColumnReadError;
+                const all_data = table.readInt64Column(col_idx) catch return error.ColumnReadError;
                 defer self.allocator.free(all_data);
-
                 const filtered = try self.allocator.alloc(i64, indices.len);
-                for (indices, 0..) |idx, i| {
-                    filtered[i] = all_data[idx];
-                }
+                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
                 return Result.ColumnData{ .int64 = filtered };
             },
             .int32 => {
-                const all_data = pq.readInt32Column(col_idx) catch return error.ColumnReadError;
+                const all_data = table.readInt32Column(col_idx) catch return error.ColumnReadError;
                 defer self.allocator.free(all_data);
-
                 const filtered = try self.allocator.alloc(i32, indices.len);
-                for (indices, 0..) |idx, i| {
-                    filtered[i] = all_data[idx];
-                }
+                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
                 return Result.ColumnData{ .int32 = filtered };
             },
             .double => {
-                const all_data = pq.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                const all_data = table.readFloat64Column(col_idx) catch return error.ColumnReadError;
                 defer self.allocator.free(all_data);
-
                 const filtered = try self.allocator.alloc(f64, indices.len);
-                for (indices, 0..) |idx, i| {
-                    filtered[i] = all_data[idx];
-                }
+                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
                 return Result.ColumnData{ .float64 = filtered };
             },
             .float => {
-                const all_data = pq.readFloat32Column(col_idx) catch return error.ColumnReadError;
+                const all_data = table.readFloat32Column(col_idx) catch return error.ColumnReadError;
                 defer self.allocator.free(all_data);
-
                 const filtered = try self.allocator.alloc(f32, indices.len);
-                for (indices, 0..) |idx, i| {
-                    filtered[i] = all_data[idx];
-                }
+                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
                 return Result.ColumnData{ .float32 = filtered };
             },
             .boolean => {
-                const all_data = pq.readBoolColumn(col_idx) catch return error.ColumnReadError;
+                const all_data = table.readBoolColumn(col_idx) catch return error.ColumnReadError;
                 defer self.allocator.free(all_data);
-
                 const filtered = try self.allocator.alloc(bool, indices.len);
-                for (indices, 0..) |idx, i| {
-                    filtered[i] = all_data[idx];
-                }
+                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
                 return Result.ColumnData{ .bool_ = filtered };
             },
             .byte_array, .fixed_len_byte_array => {
-                const all_data = pq.readStringColumn(col_idx) catch return error.ColumnReadError;
-                defer {
-                    for (all_data) |str| {
-                        self.allocator.free(str);
-                    }
-                    self.allocator.free(all_data);
-                }
-
-                const filtered = try self.allocator.alloc([]const u8, indices.len);
-                for (indices, 0..) |idx, i| {
-                    filtered[i] = try self.allocator.dupe(u8, all_data[idx]);
-                }
-                return Result.ColumnData{ .string = filtered };
-            },
-            else => return error.UnsupportedColumnType,
-        }
-    }
-
-    /// Read Delta column data at specific indices (filtered access)
-    fn readDeltaColumnAtIndices(
-        self: *Self,
-        dt: *DeltaTable,
-        col_idx: u32,
-        indices: []const u32,
-    ) !Result.ColumnData {
-        const col_type = dt.getColumnType(col_idx) orelse return error.InvalidColumn;
-
-        switch (col_type) {
-            .int64 => {
-                const all_data = dt.readInt64Column(col_idx) catch return error.ColumnReadError;
-                defer self.allocator.free(all_data);
-
-                const filtered = try self.allocator.alloc(i64, indices.len);
-                for (indices, 0..) |idx, i| {
-                    filtered[i] = all_data[idx];
-                }
-                return Result.ColumnData{ .int64 = filtered };
-            },
-            .int32 => {
-                const all_data = dt.readInt32Column(col_idx) catch return error.ColumnReadError;
-                defer self.allocator.free(all_data);
-
-                const filtered = try self.allocator.alloc(i32, indices.len);
-                for (indices, 0..) |idx, i| {
-                    filtered[i] = all_data[idx];
-                }
-                return Result.ColumnData{ .int32 = filtered };
-            },
-            .double => {
-                const all_data = dt.readFloat64Column(col_idx) catch return error.ColumnReadError;
-                defer self.allocator.free(all_data);
-
-                const filtered = try self.allocator.alloc(f64, indices.len);
-                for (indices, 0..) |idx, i| {
-                    filtered[i] = all_data[idx];
-                }
-                return Result.ColumnData{ .float64 = filtered };
-            },
-            .float => {
-                const all_data = dt.readFloat32Column(col_idx) catch return error.ColumnReadError;
-                defer self.allocator.free(all_data);
-
-                const filtered = try self.allocator.alloc(f32, indices.len);
-                for (indices, 0..) |idx, i| {
-                    filtered[i] = all_data[idx];
-                }
-                return Result.ColumnData{ .float32 = filtered };
-            },
-            .boolean => {
-                const all_data = dt.readBoolColumn(col_idx) catch return error.ColumnReadError;
-                defer self.allocator.free(all_data);
-
-                const filtered = try self.allocator.alloc(bool, indices.len);
-                for (indices, 0..) |idx, i| {
-                    filtered[i] = all_data[idx];
-                }
-                return Result.ColumnData{ .bool_ = filtered };
-            },
-            .byte_array, .fixed_len_byte_array => {
-                const all_data = dt.readStringColumn(col_idx) catch return error.ColumnReadError;
-                defer {
-                    for (all_data) |str| {
-                        self.allocator.free(str);
-                    }
-                    self.allocator.free(all_data);
-                }
-
-                const filtered = try self.allocator.alloc([]const u8, indices.len);
-                for (indices, 0..) |idx, i| {
-                    filtered[i] = try self.allocator.dupe(u8, all_data[idx]);
-                }
-                return Result.ColumnData{ .string = filtered };
-            },
-            else => return error.UnsupportedColumnType,
-        }
-    }
-
-    /// Read Iceberg column data at specific indices (filtered access)
-    fn readIcebergColumnAtIndices(
-        self: *Self,
-        it: *IcebergTable,
-        col_idx: u32,
-        indices: []const u32,
-    ) !Result.ColumnData {
-        const col_type = it.getColumnType(col_idx) orelse return error.InvalidColumn;
-
-        switch (col_type) {
-            .int64 => {
-                const all_data = it.readInt64Column(col_idx) catch return error.ColumnReadError;
-                defer self.allocator.free(all_data);
-
-                const filtered = try self.allocator.alloc(i64, indices.len);
-                for (indices, 0..) |idx, i| {
-                    filtered[i] = all_data[idx];
-                }
-                return Result.ColumnData{ .int64 = filtered };
-            },
-            .int32 => {
-                const all_data = it.readInt32Column(col_idx) catch return error.ColumnReadError;
-                defer self.allocator.free(all_data);
-
-                const filtered = try self.allocator.alloc(i32, indices.len);
-                for (indices, 0..) |idx, i| {
-                    filtered[i] = all_data[idx];
-                }
-                return Result.ColumnData{ .int32 = filtered };
-            },
-            .double => {
-                const all_data = it.readFloat64Column(col_idx) catch return error.ColumnReadError;
-                defer self.allocator.free(all_data);
-
-                const filtered = try self.allocator.alloc(f64, indices.len);
-                for (indices, 0..) |idx, i| {
-                    filtered[i] = all_data[idx];
-                }
-                return Result.ColumnData{ .float64 = filtered };
-            },
-            .float => {
-                const all_data = it.readFloat32Column(col_idx) catch return error.ColumnReadError;
-                defer self.allocator.free(all_data);
-
-                const filtered = try self.allocator.alloc(f32, indices.len);
-                for (indices, 0..) |idx, i| {
-                    filtered[i] = all_data[idx];
-                }
-                return Result.ColumnData{ .float32 = filtered };
-            },
-            .boolean => {
-                const all_data = it.readBoolColumn(col_idx) catch return error.ColumnReadError;
-                defer self.allocator.free(all_data);
-
-                const filtered = try self.allocator.alloc(bool, indices.len);
-                for (indices, 0..) |idx, i| {
-                    filtered[i] = all_data[idx];
-                }
-                return Result.ColumnData{ .bool_ = filtered };
-            },
-            .byte_array, .fixed_len_byte_array => {
-                const all_data = it.readStringColumn(col_idx) catch return error.ColumnReadError;
-                defer {
-                    for (all_data) |str| {
-                        self.allocator.free(str);
-                    }
-                    self.allocator.free(all_data);
-                }
-
-                const filtered = try self.allocator.alloc([]const u8, indices.len);
-                for (indices, 0..) |idx, i| {
-                    filtered[i] = try self.allocator.dupe(u8, all_data[idx]);
-                }
-                return Result.ColumnData{ .string = filtered };
-            },
-            else => return error.UnsupportedColumnType,
-        }
-    }
-
-    /// Read Arrow column data at specific indices (filtered access)
-    fn readArrowColumnAtIndices(
-        self: *Self,
-        at: *ArrowTable,
-        col_idx: u32,
-        indices: []const u32,
-    ) !Result.ColumnData {
-        const col_type = at.getColumnType(col_idx) orelse return error.InvalidColumn;
-
-        switch (col_type) {
-            .int64 => {
-                const all_data = at.readInt64Column(col_idx) catch return error.ColumnReadError;
-                defer self.allocator.free(all_data);
-                const filtered = try self.allocator.alloc(i64, indices.len);
-                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
-                return Result.ColumnData{ .int64 = filtered };
-            },
-            .double => {
-                const all_data = at.readFloat64Column(col_idx) catch return error.ColumnReadError;
-                defer self.allocator.free(all_data);
-                const filtered = try self.allocator.alloc(f64, indices.len);
-                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
-                return Result.ColumnData{ .float64 = filtered };
-            },
-            .byte_array, .fixed_len_byte_array => {
-                const all_data = at.readStringColumn(col_idx) catch return error.ColumnReadError;
-                defer {
-                    for (all_data) |str| self.allocator.free(str);
-                    self.allocator.free(all_data);
-                }
-                const filtered = try self.allocator.alloc([]const u8, indices.len);
-                for (indices, 0..) |idx, i| filtered[i] = try self.allocator.dupe(u8, all_data[idx]);
-                return Result.ColumnData{ .string = filtered };
-            },
-            else => return error.UnsupportedColumnType,
-        }
-    }
-
-    /// Read Avro column data at specific indices (filtered access)
-    fn readAvroColumnAtIndices(
-        self: *Self,
-        av: *AvroTable,
-        col_idx: u32,
-        indices: []const u32,
-    ) !Result.ColumnData {
-        const col_type = av.getColumnType(col_idx) orelse return error.InvalidColumn;
-
-        switch (col_type) {
-            .int64 => {
-                const all_data = av.readInt64Column(col_idx) catch return error.ColumnReadError;
-                defer self.allocator.free(all_data);
-                const filtered = try self.allocator.alloc(i64, indices.len);
-                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
-                return Result.ColumnData{ .int64 = filtered };
-            },
-            .double => {
-                const all_data = av.readFloat64Column(col_idx) catch return error.ColumnReadError;
-                defer self.allocator.free(all_data);
-                const filtered = try self.allocator.alloc(f64, indices.len);
-                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
-                return Result.ColumnData{ .float64 = filtered };
-            },
-            .byte_array, .fixed_len_byte_array => {
-                const all_data = av.readStringColumn(col_idx) catch return error.ColumnReadError;
-                defer {
-                    for (all_data) |str| self.allocator.free(str);
-                    self.allocator.free(all_data);
-                }
-                const filtered = try self.allocator.alloc([]const u8, indices.len);
-                for (indices, 0..) |idx, i| filtered[i] = try self.allocator.dupe(u8, all_data[idx]);
-                return Result.ColumnData{ .string = filtered };
-            },
-            else => return error.UnsupportedColumnType,
-        }
-    }
-
-    /// Read ORC column data at specific indices (filtered access)
-    fn readOrcColumnAtIndices(
-        self: *Self,
-        ot: *OrcTable,
-        col_idx: u32,
-        indices: []const u32,
-    ) !Result.ColumnData {
-        const col_type = ot.getColumnType(col_idx) orelse return error.InvalidColumn;
-
-        switch (col_type) {
-            .int64 => {
-                const all_data = ot.readInt64Column(col_idx) catch return error.ColumnReadError;
-                defer self.allocator.free(all_data);
-                const filtered = try self.allocator.alloc(i64, indices.len);
-                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
-                return Result.ColumnData{ .int64 = filtered };
-            },
-            .double => {
-                const all_data = ot.readFloat64Column(col_idx) catch return error.ColumnReadError;
-                defer self.allocator.free(all_data);
-                const filtered = try self.allocator.alloc(f64, indices.len);
-                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
-                return Result.ColumnData{ .float64 = filtered };
-            },
-            .byte_array, .fixed_len_byte_array => {
-                const all_data = ot.readStringColumn(col_idx) catch return error.ColumnReadError;
-                defer {
-                    for (all_data) |str| self.allocator.free(str);
-                    self.allocator.free(all_data);
-                }
-                const filtered = try self.allocator.alloc([]const u8, indices.len);
-                for (indices, 0..) |idx, i| filtered[i] = try self.allocator.dupe(u8, all_data[idx]);
-                return Result.ColumnData{ .string = filtered };
-            },
-            else => return error.UnsupportedColumnType,
-        }
-    }
-
-    /// Read XLSX column data at specific indices (filtered access)
-    fn readXlsxColumnAtIndices(
-        self: *Self,
-        xt: *XlsxTable,
-        col_idx: u32,
-        indices: []const u32,
-    ) !Result.ColumnData {
-        const col_type = xt.getColumnType(col_idx) orelse return error.InvalidColumn;
-
-        switch (col_type) {
-            .double => {
-                const all_data = xt.readFloat64Column(col_idx) catch return error.ColumnReadError;
-                defer self.allocator.free(all_data);
-                const filtered = try self.allocator.alloc(f64, indices.len);
-                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
-                return Result.ColumnData{ .float64 = filtered };
-            },
-            .byte_array, .fixed_len_byte_array => {
-                const all_data = xt.readStringColumn(col_idx) catch return error.ColumnReadError;
+                const all_data = table.readStringColumn(col_idx) catch return error.ColumnReadError;
                 defer {
                     for (all_data) |str| self.allocator.free(str);
                     self.allocator.free(all_data);
@@ -4625,12 +4278,15 @@ pub const Executor = struct {
                 return Result.ColumnData{ .string = filtered };
             },
             else => {
-                // Default to float64 for XLSX since numbers are stored as f64
-                const all_data = xt.readFloat64Column(col_idx) catch return error.ColumnReadError;
-                defer self.allocator.free(all_data);
-                const filtered = try self.allocator.alloc(f64, indices.len);
-                for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
-                return Result.ColumnData{ .float64 = filtered };
+                // XLSX defaults to float64, others error
+                if (is_xlsx) {
+                    const all_data = table.readFloat64Column(col_idx) catch return error.ColumnReadError;
+                    defer self.allocator.free(all_data);
+                    const filtered = try self.allocator.alloc(f64, indices.len);
+                    for (indices, 0..) |idx, i| filtered[i] = all_data[idx];
+                    return Result.ColumnData{ .float64 = filtered };
+                }
+                return error.UnsupportedColumnType;
             },
         }
     }
