@@ -39,23 +39,17 @@ SELECT * FROM read_lance(FILE) LIMIT 50
 
 ### read_parquet()
 
-Read Parquet files.
-
 ```sql
 SELECT * FROM read_parquet('path/to/file.parquet')
 ```
 
 ### read_delta()
 
-Read Delta Lake tables.
-
 ```sql
 SELECT * FROM read_delta('path/to/delta_table/')
 ```
 
 ### read_iceberg()
-
-Read Apache Iceberg tables.
 
 ```sql
 SELECT * FROM read_iceberg('path/to/iceberg_table/')
@@ -71,23 +65,17 @@ SELECT * FROM read_arrow('path/to/file.arrow')
 
 ### read_avro()
 
-Read Apache Avro files.
-
 ```sql
 SELECT * FROM read_avro('path/to/file.avro')
 ```
 
 ### read_orc()
 
-Read Apache ORC files.
-
 ```sql
 SELECT * FROM read_orc('path/to/file.orc')
 ```
 
 ### read_xlsx()
-
-Read Microsoft Excel files.
 
 ```sql
 -- Read first sheet
@@ -421,23 +409,17 @@ SELECT COUNT(DISTINCT category) FROM read_lance('data.lance')    -- Unique categ
 
 ### SUM
 
-Sum of values.
-
 ```sql
 SELECT SUM(amount) FROM read_lance('orders.lance')
 ```
 
 ### AVG
 
-Average of values.
-
 ```sql
 SELECT AVG(price) FROM read_lance('products.lance')
 ```
 
 ### MIN / MAX
-
-Minimum and maximum values.
 
 ```sql
 SELECT MIN(created_at), MAX(created_at) FROM read_lance('events.lance')
@@ -577,8 +559,6 @@ FROM read_lance('students.lance')
 ---
 
 ## Data Types
-
-LanceQL supports the following data types:
 
 | Type | Description | Example Values |
 |------|-------------|----------------|

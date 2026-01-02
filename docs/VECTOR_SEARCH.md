@@ -15,8 +15,6 @@
 
 ### Text Search
 
-Find images similar to a text description:
-
 ```sql
 SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance')
 NEAR 'sunset on the beach'
@@ -24,8 +22,6 @@ TOPK 20
 ```
 
 ### Search by Row
-
-Find items similar to an existing row:
 
 ```sql
 -- Find 10 items similar to row 0
@@ -91,8 +87,6 @@ ORDER BY aesthetic_score DESC
 ---
 
 ## Text Encoders
-
-LanceQL supports multiple text encoders for different use cases.
 
 ### MiniLM (Default)
 
