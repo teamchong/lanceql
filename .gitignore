@@ -32,6 +32,7 @@ Thumbs.db
 # Generated benchmark data
 benchmarks/*.lance/
 benchmarks/*.parquet
+benchmarks/*_results.json
 data/
 *.dylib
 *.wasm
