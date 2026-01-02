@@ -15,6 +15,7 @@ const OrcTable = @import("lanceql.orc_table").OrcTable;
 const XlsxTable = @import("lanceql.xlsx_table").XlsxTable;
 const hash = @import("lanceql.hash");
 pub const logic_table_dispatch = @import("logic_table_dispatch.zig");
+pub const scalar_functions = @import("scalar_functions.zig");
 
 const Expr = ast.Expr;
 const SelectStmt = ast.SelectStmt;
