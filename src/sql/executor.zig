@@ -3064,10 +3064,10 @@ pub const Executor = struct {
         const right = try self.evaluateExprToValue(bin.right, row_idx);
 
         return switch (bin.op) {
-            .add => self.addValues(left, right),
-            .subtract => self.subtractValues(left, right),
-            .multiply => self.multiplyValues(left, right),
-            .divide => self.divideValues(left, right),
+            .add => scalar_functions.addValues(left, right),
+            .subtract => scalar_functions.subtractValues(left, right),
+            .multiply => scalar_functions.multiplyValues(left, right),
+            .divide => scalar_functions.divideValues(left, right),
             .concat => try self.concatStrings(left, right),
             else => error.UnsupportedOperator,
         };
@@ -3078,7 +3078,7 @@ pub const Executor = struct {
         const operand = try self.evaluateExprToValue(un.operand, row_idx);
 
         return switch (un.op) {
-            .minus => self.negateValue(operand),
+            .minus => scalar_functions.negateValue(operand),
             .not => blk: {
                 // Boolean negation
                 const bool_val = switch (operand) {
@@ -3091,36 +3091,6 @@ pub const Executor = struct {
             },
             else => error.UnsupportedOperator,
         };
-    }
-
-    /// Negate a numeric value
-    fn negateValue(self: *Self, val: Value) Value {
-        _ = self;
-        return scalar_functions.negateValue(val);
-    }
-
-    /// Add two values
-    fn addValues(self: *Self, left: Value, right: Value) Value {
-        _ = self;
-        return scalar_functions.addValues(left, right);
-    }
-
-    /// Subtract two values
-    fn subtractValues(self: *Self, left: Value, right: Value) Value {
-        _ = self;
-        return scalar_functions.subtractValues(left, right);
-    }
-
-    /// Multiply two values
-    fn multiplyValues(self: *Self, left: Value, right: Value) Value {
-        _ = self;
-        return scalar_functions.multiplyValues(left, right);
-    }
-
-    /// Divide two values
-    fn divideValues(self: *Self, left: Value, right: Value) Value {
-        _ = self;
-        return scalar_functions.divideValues(left, right);
     }
 
     /// Concatenate two strings (|| operator)
@@ -4205,10 +4175,10 @@ pub const Executor = struct {
         const right = try self.getHavingValue(columns, select_items, bin.right, row_idx);
 
         return switch (bin.op) {
-            .add => self.addValues(left, right),
-            .subtract => self.subtractValues(left, right),
-            .multiply => self.multiplyValues(left, right),
-            .divide => self.divideValues(left, right),
+            .add => scalar_functions.addValues(left, right),
+            .subtract => scalar_functions.subtractValues(left, right),
+            .multiply => scalar_functions.multiplyValues(left, right),
+            .divide => scalar_functions.divideValues(left, right),
             else => error.UnsupportedOperator,
         };
     }
