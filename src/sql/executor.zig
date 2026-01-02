@@ -3897,83 +3897,31 @@ pub const Executor = struct {
     /// Negate a numeric value
     fn negateValue(self: *Self, val: Value) Value {
         _ = self;
-        return switch (val) {
-            .integer => |i| Value{ .integer = -i },
-            .float => |f| Value{ .float = -f },
-            else => Value{ .null = {} },
-        };
+        return scalar_functions.negateValue(val);
     }
 
-    /// Add two values (int + int = int, int + float = float, float + float = float)
+    /// Add two values
     fn addValues(self: *Self, left: Value, right: Value) Value {
         _ = self;
-        return switch (left) {
-            .integer => |l| switch (right) {
-                .integer => |r| Value{ .integer = l + r },
-                .float => |r| Value{ .float = @as(f64, @floatFromInt(l)) + r },
-                else => Value{ .null = {} },
-            },
-            .float => |l| switch (right) {
-                .integer => |r| Value{ .float = l + @as(f64, @floatFromInt(r)) },
-                .float => |r| Value{ .float = l + r },
-                else => Value{ .null = {} },
-            },
-            else => Value{ .null = {} },
-        };
+        return scalar_functions.addValues(left, right);
     }
 
     /// Subtract two values
     fn subtractValues(self: *Self, left: Value, right: Value) Value {
         _ = self;
-        return switch (left) {
-            .integer => |l| switch (right) {
-                .integer => |r| Value{ .integer = l - r },
-                .float => |r| Value{ .float = @as(f64, @floatFromInt(l)) - r },
-                else => Value{ .null = {} },
-            },
-            .float => |l| switch (right) {
-                .integer => |r| Value{ .float = l - @as(f64, @floatFromInt(r)) },
-                .float => |r| Value{ .float = l - r },
-                else => Value{ .null = {} },
-            },
-            else => Value{ .null = {} },
-        };
+        return scalar_functions.subtractValues(left, right);
     }
 
     /// Multiply two values
     fn multiplyValues(self: *Self, left: Value, right: Value) Value {
         _ = self;
-        return switch (left) {
-            .integer => |l| switch (right) {
-                .integer => |r| Value{ .integer = l * r },
-                .float => |r| Value{ .float = @as(f64, @floatFromInt(l)) * r },
-                else => Value{ .null = {} },
-            },
-            .float => |l| switch (right) {
-                .integer => |r| Value{ .float = l * @as(f64, @floatFromInt(r)) },
-                .float => |r| Value{ .float = l * r },
-                else => Value{ .null = {} },
-            },
-            else => Value{ .null = {} },
-        };
+        return scalar_functions.multiplyValues(left, right);
     }
 
-    /// Divide two values (always returns float for precision)
+    /// Divide two values
     fn divideValues(self: *Self, left: Value, right: Value) Value {
         _ = self;
-        const left_f = switch (left) {
-            .integer => |i| @as(f64, @floatFromInt(i)),
-            .float => |f| f,
-            else => return Value{ .null = {} },
-        };
-        const right_f = switch (right) {
-            .integer => |i| @as(f64, @floatFromInt(i)),
-            .float => |f| f,
-            else => return Value{ .null = {} },
-        };
-
-        if (right_f == 0) return Value{ .null = {} }; // Division by zero
-        return Value{ .float = left_f / right_f };
+        return scalar_functions.divideValues(left, right);
     }
 
     /// Concatenate two strings (|| operator)

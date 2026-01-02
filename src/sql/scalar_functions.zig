@@ -453,3 +453,100 @@ pub fn compareStrings(op: BinaryOp, left: []const u8, right: []const u8) bool {
         else => unreachable,
     };
 }
+
+// ============================================================================
+// Value Arithmetic Functions
+// ============================================================================
+
+/// Negate a numeric value
+pub fn negateValue(val: Value) Value {
+    return switch (val) {
+        .integer => |i| Value{ .integer = -i },
+        .float => |f| Value{ .float = -f },
+        else => Value{ .null = {} },
+    };
+}
+
+/// Add two values (int + int = int, int + float = float, float + float = float)
+pub fn addValues(left: Value, right: Value) Value {
+    return switch (left) {
+        .integer => |l| switch (right) {
+            .integer => |r| Value{ .integer = l + r },
+            .float => |r| Value{ .float = @as(f64, @floatFromInt(l)) + r },
+            else => Value{ .null = {} },
+        },
+        .float => |l| switch (right) {
+            .integer => |r| Value{ .float = l + @as(f64, @floatFromInt(r)) },
+            .float => |r| Value{ .float = l + r },
+            else => Value{ .null = {} },
+        },
+        else => Value{ .null = {} },
+    };
+}
+
+/// Subtract two values
+pub fn subtractValues(left: Value, right: Value) Value {
+    return switch (left) {
+        .integer => |l| switch (right) {
+            .integer => |r| Value{ .integer = l - r },
+            .float => |r| Value{ .float = @as(f64, @floatFromInt(l)) - r },
+            else => Value{ .null = {} },
+        },
+        .float => |l| switch (right) {
+            .integer => |r| Value{ .float = l - @as(f64, @floatFromInt(r)) },
+            .float => |r| Value{ .float = l - r },
+            else => Value{ .null = {} },
+        },
+        else => Value{ .null = {} },
+    };
+}
+
+/// Multiply two values
+pub fn multiplyValues(left: Value, right: Value) Value {
+    return switch (left) {
+        .integer => |l| switch (right) {
+            .integer => |r| Value{ .integer = l * r },
+            .float => |r| Value{ .float = @as(f64, @floatFromInt(l)) * r },
+            else => Value{ .null = {} },
+        },
+        .float => |l| switch (right) {
+            .integer => |r| Value{ .float = l * @as(f64, @floatFromInt(r)) },
+            .float => |r| Value{ .float = l * r },
+            else => Value{ .null = {} },
+        },
+        else => Value{ .null = {} },
+    };
+}
+
+/// Divide two values (always returns float for precision)
+pub fn divideValues(left: Value, right: Value) Value {
+    const left_f = switch (left) {
+        .integer => |i| @as(f64, @floatFromInt(i)),
+        .float => |f| f,
+        else => return Value{ .null = {} },
+    };
+    const right_f = switch (right) {
+        .integer => |i| @as(f64, @floatFromInt(i)),
+        .float => |f| f,
+        else => return Value{ .null = {} },
+    };
+
+    if (right_f == 0) return Value{ .null = {} }; // Division by zero
+    return Value{ .float = left_f / right_f };
+}
+
+/// Modulo two values
+pub fn moduloValues(left: Value, right: Value) Value {
+    return switch (left) {
+        .integer => |l| switch (right) {
+            .integer => |r| if (r != 0) Value{ .integer = @mod(l, r) } else Value{ .null = {} },
+            else => Value{ .null = {} },
+        },
+        .float => |l| switch (right) {
+            .float => |r| if (r != 0) Value{ .float = @mod(l, r) } else Value{ .null = {} },
+            .integer => |r| if (r != 0) Value{ .float = @mod(l, @as(f64, @floatFromInt(r))) } else Value{ .null = {} },
+            else => Value{ .null = {} },
+        },
+        else => Value{ .null = {} },
+    };
+}
