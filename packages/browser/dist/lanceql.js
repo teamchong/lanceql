@@ -345,6 +345,1043 @@ class WebGPUAccelerator {
 const webgpuAccelerator = new WebGPUAccelerator();
 
 /**
+ * GPU-accelerated SQL Aggregations (SUM, COUNT, AVG, MIN, MAX)
+ * Uses WebGPU compute shaders for parallel reduction on large datasets.
+ */
+class GPUAggregator {
+    constructor() {
+        this.device = null;
+        this.pipelines = new Map();
+        this.available = false;
+        this._initPromise = null;
+    }
+
+    async init() {
+        if (this._initPromise) return this._initPromise;
+        this._initPromise = this._doInit();
+        return this._initPromise;
+    }
+
+    async _doInit() {
+        if (!navigator.gpu) return false;
+        try {
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) return false;
+            this.device = await adapter.requestDevice({
+                requiredLimits: { maxStorageBufferBindingSize: 256 * 1024 * 1024 },
+            });
+            this._compileShaders();
+            this.available = true;
+            console.log('[GPUAggregator] Initialized');
+            return true;
+        } catch (e) {
+            console.warn('[GPUAggregator] Init failed:', e);
+            return false;
+        }
+    }
+
+    _compileShaders() {
+        const code = `
+struct P { size: u32, wg: u32 }
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage, read> i: array<f32>;
+@group(0) @binding(2) var<storage, read_write> o: array<f32>;
+var<workgroup> s: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn sum(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: vec3<u32>) {
+    s[l.x] = select(0.0, i[g.x], g.x < p.size);
+    workgroupBarrier();
+    for (var t: u32 = 128u; t > 0u; t >>= 1u) { if (l.x < t) { s[l.x] += s[l.x + t]; } workgroupBarrier(); }
+    if (l.x == 0u) { o[w.x] = s[0]; }
+}
+
+@compute @workgroup_size(256)
+fn sum_f(@builtin(local_invocation_id) l: vec3<u32>) {
+    s[l.x] = select(0.0, i[l.x], l.x < p.wg);
+    workgroupBarrier();
+    for (var t: u32 = 128u; t > 0u; t >>= 1u) { if (l.x < t) { s[l.x] += s[l.x + t]; } workgroupBarrier(); }
+    if (l.x == 0u) { o[0] = s[0]; }
+}
+
+@compute @workgroup_size(256)
+fn min_r(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: vec3<u32>) {
+    s[l.x] = select(3.4e+38, i[g.x], g.x < p.size);
+    workgroupBarrier();
+    for (var t: u32 = 128u; t > 0u; t >>= 1u) { if (l.x < t) { s[l.x] = min(s[l.x], s[l.x + t]); } workgroupBarrier(); }
+    if (l.x == 0u) { o[w.x] = s[0]; }
+}
+
+@compute @workgroup_size(256)
+fn min_f(@builtin(local_invocation_id) l: vec3<u32>) {
+    s[l.x] = select(3.4e+38, i[l.x], l.x < p.wg);
+    workgroupBarrier();
+    for (var t: u32 = 128u; t > 0u; t >>= 1u) { if (l.x < t) { s[l.x] = min(s[l.x], s[l.x + t]); } workgroupBarrier(); }
+    if (l.x == 0u) { o[0] = s[0]; }
+}
+
+@compute @workgroup_size(256)
+fn max_r(@builtin(global_invocation_id) g: vec3<u32>, @builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: vec3<u32>) {
+    s[l.x] = select(-3.4e+38, i[g.x], g.x < p.size);
+    workgroupBarrier();
+    for (var t: u32 = 128u; t > 0u; t >>= 1u) { if (l.x < t) { s[l.x] = max(s[l.x], s[l.x + t]); } workgroupBarrier(); }
+    if (l.x == 0u) { o[w.x] = s[0]; }
+}
+
+@compute @workgroup_size(256)
+fn max_f(@builtin(local_invocation_id) l: vec3<u32>) {
+    s[l.x] = select(-3.4e+38, i[l.x], l.x < p.wg);
+    workgroupBarrier();
+    for (var t: u32 = 128u; t > 0u; t >>= 1u) { if (l.x < t) { s[l.x] = max(s[l.x], s[l.x + t]); } workgroupBarrier(); }
+    if (l.x == 0u) { o[0] = s[0]; }
+}`;
+        const module = this.device.createShaderModule({ code });
+        for (const [name, entry] of [['sum', 'sum'], ['sum_final', 'sum_f'], ['min', 'min_r'], ['min_final', 'min_f'], ['max', 'max_r'], ['max_final', 'max_f']]) {
+            this.pipelines.set(name, this.device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: entry } }));
+        }
+    }
+
+    isAvailable() { return this.available; }
+
+    async sum(values) {
+        if (!this.available || values.length < 1000) return this._cpuSum(values);
+        return this._gpuReduce(values, 'sum');
+    }
+
+    async min(values) {
+        if (!this.available || values.length < 1000) return values.length ? Math.min(...values) : null;
+        return this._gpuReduce(values, 'min');
+    }
+
+    async max(values) {
+        if (!this.available || values.length < 1000) return values.length ? Math.max(...values) : null;
+        return this._gpuReduce(values, 'max');
+    }
+
+    async avg(values) {
+        if (values.length === 0) return null;
+        const sum = await this.sum(values);
+        return sum / values.length;
+    }
+
+    count(values) { return values.length; }
+
+    async _gpuReduce(values, op) {
+        const n = values.length, wgSize = 256, numWg = Math.ceil(n / wgSize);
+        const input = values instanceof Float32Array ? values : new Float32Array(values);
+
+        const inputBuf = this.device.createBuffer({ size: input.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+        this.device.queue.writeBuffer(inputBuf, 0, input);
+        const partialBuf = this.device.createBuffer({ size: numWg * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const outBuf = this.device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const stageBuf = this.device.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        const paramsBuf = this.device.createBuffer({ size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.device.queue.writeBuffer(paramsBuf, 0, new Uint32Array([n, numWg]));
+        const finalParamsBuf = this.device.createBuffer({ size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.device.queue.writeBuffer(finalParamsBuf, 0, new Uint32Array([numWg, numWg]));
+
+        const p1 = this.pipelines.get(op), p2 = this.pipelines.get(op + '_final');
+        const bg1 = this.device.createBindGroup({ layout: p1.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: paramsBuf } }, { binding: 1, resource: { buffer: inputBuf } }, { binding: 2, resource: { buffer: partialBuf } }] });
+        const bg2 = this.device.createBindGroup({ layout: p2.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: finalParamsBuf } }, { binding: 1, resource: { buffer: partialBuf } }, { binding: 2, resource: { buffer: outBuf } }] });
+
+        const enc = this.device.createCommandEncoder();
+        const c1 = enc.beginComputePass(); c1.setPipeline(p1); c1.setBindGroup(0, bg1); c1.dispatchWorkgroups(numWg); c1.end();
+        const c2 = enc.beginComputePass(); c2.setPipeline(p2); c2.setBindGroup(0, bg2); c2.dispatchWorkgroups(1); c2.end();
+        enc.copyBufferToBuffer(outBuf, 0, stageBuf, 0, 4);
+        this.device.queue.submit([enc.finish()]);
+
+        await stageBuf.mapAsync(GPUMapMode.READ);
+        const result = new Float32Array(stageBuf.getMappedRange())[0];
+        stageBuf.unmap();
+
+        inputBuf.destroy(); partialBuf.destroy(); outBuf.destroy(); stageBuf.destroy(); paramsBuf.destroy(); finalParamsBuf.destroy();
+        return result;
+    }
+
+    _cpuSum(values) { let s = 0; for (let i = 0; i < values.length; i++) s += values[i]; return s; }
+}
+
+// Global GPU aggregator instance
+const gpuAggregator = new GPUAggregator();
+
+/**
+ * GPU-accelerated SQL JOINs using hash join algorithm.
+ * Falls back to CPU for small tables where GPU overhead exceeds benefit.
+ */
+class GPUJoiner {
+    constructor() {
+        this.device = null;
+        this.pipelines = new Map();
+        this.available = false;
+        this._initPromise = null;
+    }
+
+    async init() {
+        if (this._initPromise) return this._initPromise;
+        this._initPromise = this._doInit();
+        return this._initPromise;
+    }
+
+    async _doInit() {
+        if (!navigator.gpu) return false;
+        try {
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) return false;
+            this.device = await adapter.requestDevice({
+                requiredLimits: { maxStorageBufferBindingSize: 256 * 1024 * 1024 },
+            });
+            this._compileShaders();
+            this.available = true;
+            console.log('[GPUJoiner] Initialized');
+            return true;
+        } catch (e) {
+            console.warn('[GPUJoiner] Init failed:', e);
+            return false;
+        }
+    }
+
+    _compileShaders() {
+        const code = `
+struct BP { size: u32, cap: u32 }
+struct PP { left_size: u32, cap: u32, max_matches: u32 }
+@group(0) @binding(0) var<uniform> bp: BP;
+@group(0) @binding(1) var<storage, read> bkeys: array<u32>;
+@group(0) @binding(2) var<storage, read_write> ht: array<atomic<u32>>;
+
+fn fnv(k: u32) -> u32 {
+    var h = 2166136261u;
+    h ^= (k & 0xFFu); h *= 16777619u;
+    h ^= ((k >> 8u) & 0xFFu); h *= 16777619u;
+    h ^= ((k >> 16u) & 0xFFu); h *= 16777619u;
+    h ^= ((k >> 24u) & 0xFFu); h *= 16777619u;
+    return h;
+}
+
+@compute @workgroup_size(256)
+fn build(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= bp.size) { return; }
+    let k = bkeys[g.x];
+    var s = fnv(k) % bp.cap;
+    for (var p = 0u; p < bp.cap; p++) {
+        let i = s * 2u;
+        let o = atomicCompareExchangeWeak(&ht[i], 0xFFFFFFFFu, k);
+        if (o.exchanged) { atomicStore(&ht[i + 1u], g.x); return; }
+        s = (s + 1u) % bp.cap;
+    }
+}
+
+@group(0) @binding(0) var<uniform> pp: PP;
+@group(0) @binding(1) var<storage, read> lkeys: array<u32>;
+@group(0) @binding(2) var<storage, read> pht: array<u32>;
+@group(0) @binding(3) var<storage, read_write> matches: array<u32>;
+@group(0) @binding(4) var<storage, read_write> mc: atomic<u32>;
+
+@compute @workgroup_size(256)
+fn probe(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= pp.left_size) { return; }
+    let k = lkeys[g.x];
+    var s = fnv(k) % pp.cap;
+    for (var p = 0u; p < pp.cap; p++) {
+        let i = s * 2u;
+        let sk = pht[i];
+        if (sk == 0xFFFFFFFFu) { return; }
+        if (sk == k) {
+            let ri = pht[i + 1u];
+            let o = atomicAdd(&mc, 1u);
+            if (o * 2u + 1u < pp.max_matches * 2u) {
+                matches[o * 2u] = g.x;
+                matches[o * 2u + 1u] = ri;
+            }
+        }
+        s = (s + 1u) % pp.cap;
+    }
+}
+
+struct IP { cap: u32 }
+@group(0) @binding(0) var<uniform> ip: IP;
+@group(0) @binding(1) var<storage, read_write> it: array<u32>;
+
+@compute @workgroup_size(256)
+fn init_t(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= ip.cap * 2u) { return; }
+    it[g.x] = select(0u, 0xFFFFFFFFu, g.x % 2u == 0u);
+}`;
+        const module = this.device.createShaderModule({ code });
+        this.pipelines.set('init', this.device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'init_t' } }));
+        this.pipelines.set('build', this.device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'build' } }));
+        this.pipelines.set('probe', this.device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'probe' } }));
+    }
+
+    isAvailable() { return this.available; }
+
+    async hashJoin(leftRows, rightRows, leftKey, rightKey) {
+        const lSize = leftRows.length, rSize = rightRows.length;
+        if (!this.available || lSize * rSize < 100000000) {
+            return this._cpuHashJoin(leftRows, rightRows, leftKey, rightKey);
+        }
+        const lKeys = this._extractKeys(leftRows, leftKey);
+        const rKeys = this._extractKeys(rightRows, rightKey);
+        const cap = this._nextPow2(rSize * 2);
+        const maxM = Math.max(lSize * 10, 100000);
+
+        const rKeysBuf = this._createBuf(rKeys, GPUBufferUsage.STORAGE);
+        const lKeysBuf = this._createBuf(lKeys, GPUBufferUsage.STORAGE);
+        const htBuf = this.device.createBuffer({ size: cap * 2 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const matchBuf = this.device.createBuffer({ size: maxM * 2 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const mcBuf = this.device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const stageBuf = this.device.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+
+        const ipBuf = this._createUniform(new Uint32Array([cap]));
+        const bpBuf = this._createUniform(new Uint32Array([rSize, cap]));
+        const ppBuf = this._createUniform(new Uint32Array([lSize, cap, maxM]));
+
+        const initP = this.pipelines.get('init'), buildP = this.pipelines.get('build'), probeP = this.pipelines.get('probe');
+        const initBG = this.device.createBindGroup({ layout: initP.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ipBuf } }, { binding: 1, resource: { buffer: htBuf } }] });
+        const buildBG = this.device.createBindGroup({ layout: buildP.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: bpBuf } }, { binding: 1, resource: { buffer: rKeysBuf } }, { binding: 2, resource: { buffer: htBuf } }] });
+        const probeBG = this.device.createBindGroup({ layout: probeP.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ppBuf } }, { binding: 1, resource: { buffer: lKeysBuf } }, { binding: 2, resource: { buffer: htBuf } }, { binding: 3, resource: { buffer: matchBuf } }, { binding: 4, resource: { buffer: mcBuf } }] });
+
+        const enc = this.device.createCommandEncoder();
+        const p1 = enc.beginComputePass(); p1.setPipeline(initP); p1.setBindGroup(0, initBG); p1.dispatchWorkgroups(Math.ceil(cap * 2 / 256)); p1.end();
+        const p2 = enc.beginComputePass(); p2.setPipeline(buildP); p2.setBindGroup(0, buildBG); p2.dispatchWorkgroups(Math.ceil(rSize / 256)); p2.end();
+        const p3 = enc.beginComputePass(); p3.setPipeline(probeP); p3.setBindGroup(0, probeBG); p3.dispatchWorkgroups(Math.ceil(lSize / 256)); p3.end();
+        enc.copyBufferToBuffer(mcBuf, 0, stageBuf, 0, 4);
+        this.device.queue.submit([enc.finish()]);
+
+        await stageBuf.mapAsync(GPUMapMode.READ);
+        const mc = new Uint32Array(stageBuf.getMappedRange())[0];
+        stageBuf.unmap();
+
+        const actualM = Math.min(mc, maxM);
+        const mStageBuf = this.device.createBuffer({ size: actualM * 2 * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        const cEnc = this.device.createCommandEncoder();
+        cEnc.copyBufferToBuffer(matchBuf, 0, mStageBuf, 0, actualM * 2 * 4);
+        this.device.queue.submit([cEnc.finish()]);
+
+        await mStageBuf.mapAsync(GPUMapMode.READ);
+        const mData = new Uint32Array(mStageBuf.getMappedRange().slice(0));
+        mStageBuf.unmap();
+
+        const lIdx = new Uint32Array(actualM), rIdx = new Uint32Array(actualM);
+        for (let i = 0; i < actualM; i++) { lIdx[i] = mData[i * 2]; rIdx[i] = mData[i * 2 + 1]; }
+
+        rKeysBuf.destroy(); lKeysBuf.destroy(); htBuf.destroy(); matchBuf.destroy(); mcBuf.destroy(); stageBuf.destroy(); mStageBuf.destroy(); ipBuf.destroy(); bpBuf.destroy(); ppBuf.destroy();
+        return { leftIndices: lIdx, rightIndices: rIdx, matchCount: actualM };
+    }
+
+    _cpuHashJoin(leftRows, rightRows, leftKey, rightKey) {
+        const rMap = new Map();
+        for (let i = 0; i < rightRows.length; i++) {
+            const k = this._hashKey(rightRows[i][rightKey]);
+            if (!rMap.has(k)) rMap.set(k, []);
+            rMap.get(k).push(i);
+        }
+        const lIdx = [], rIdx = [];
+        for (let i = 0; i < leftRows.length; i++) {
+            const k = this._hashKey(leftRows[i][leftKey]);
+            for (const ri of (rMap.get(k) || [])) { lIdx.push(i); rIdx.push(ri); }
+        }
+        return { leftIndices: new Uint32Array(lIdx), rightIndices: new Uint32Array(rIdx), matchCount: lIdx.length };
+    }
+
+    _extractKeys(rows, key) {
+        const keys = new Uint32Array(rows.length);
+        for (let i = 0; i < rows.length; i++) keys[i] = this._hashKey(rows[i][key]);
+        return keys;
+    }
+
+    _hashKey(v) {
+        if (v == null) return 0xFFFFFFFE;
+        if (typeof v === 'number') return Number.isInteger(v) && v >= 0 && v < 0xFFFFFFFF ? v >>> 0 : (new Uint32Array(new Float32Array([v]).buffer))[0];
+        if (typeof v === 'string') { let h = 2166136261; for (let i = 0; i < v.length; i++) { h ^= v.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+        return this._hashKey(String(v));
+    }
+
+    _createBuf(data, usage) {
+        const buf = this.device.createBuffer({ size: data.byteLength, usage: usage | GPUBufferUsage.COPY_DST });
+        this.device.queue.writeBuffer(buf, 0, data);
+        return buf;
+    }
+
+    _createUniform(data) {
+        const buf = this.device.createBuffer({ size: Math.max(data.byteLength, 16), usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.device.queue.writeBuffer(buf, 0, data);
+        return buf;
+    }
+
+    _nextPow2(n) { let p = 1; while (p < n) p *= 2; return p; }
+}
+
+// Global GPU joiner instance
+const gpuJoiner = new GPUJoiner();
+
+/**
+ * GPU-accelerated SQL sorting using bitonic sort algorithm.
+ * Falls back to CPU for small datasets where GPU overhead exceeds benefit.
+ */
+class GPUSorter {
+    constructor() {
+        this.device = null;
+        this.pipelines = new Map();
+        this.available = false;
+        this._initPromise = null;
+    }
+
+    async init() {
+        if (this._initPromise) return this._initPromise;
+        this._initPromise = this._doInit();
+        return this._initPromise;
+    }
+
+    async _doInit() {
+        if (!navigator.gpu) return false;
+        try {
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) return false;
+            this.device = await adapter.requestDevice({
+                requiredLimits: { maxStorageBufferBindingSize: 256 * 1024 * 1024 },
+            });
+            this._compileShaders();
+            this.available = true;
+            console.log('[GPUSorter] Initialized');
+            return true;
+        } catch (e) {
+            console.warn('[GPUSorter] Init failed:', e);
+            return false;
+        }
+    }
+
+    _compileShaders() {
+        const code = `
+struct LP { size: u32, stage: u32, step: u32, asc: u32 }
+@group(0) @binding(0) var<uniform> lp: LP;
+@group(0) @binding(1) var<storage, read_write> keys: array<f32>;
+@group(0) @binding(2) var<storage, read_write> idx: array<u32>;
+var<workgroup> sk: array<f32, 512>;
+var<workgroup> si: array<u32, 512>;
+
+fn cswap(i: u32, j: u32, d: bool) {
+    let ki = sk[i]; let kj = sk[j];
+    if (select(ki > kj, ki < kj, d)) {
+        sk[i] = kj; sk[j] = ki;
+        let t = si[i]; si[i] = si[j]; si[j] = t;
+    }
+}
+
+@compute @workgroup_size(256)
+fn local_sort(@builtin(local_invocation_id) l: vec3<u32>, @builtin(workgroup_id) w: vec3<u32>) {
+    let base = w.x * 512u; let t = l.x;
+    let i1 = base + t; let i2 = base + t + 256u;
+    if (i1 < lp.size) { sk[t] = keys[i1]; si[t] = idx[i1]; } else { sk[t] = 3.4e38; si[t] = i1; }
+    if (i2 < lp.size) { sk[t + 256u] = keys[i2]; si[t + 256u] = idx[i2]; } else { sk[t + 256u] = 3.4e38; si[t + 256u] = i2; }
+    workgroupBarrier();
+    let asc = lp.asc == 1u;
+    for (var s = 1u; s < 512u; s = s << 1u) {
+        for (var st = s; st > 0u; st = st >> 1u) {
+            let bs = st << 1u;
+            if (t < 256u) {
+                let bi = t / st; let ib = t % st;
+                let i = bi * bs + ib; let j = i + st;
+                if (j < 512u) { cswap(i, j, ((i / (s << 1u)) % 2u == 0u) == asc); }
+            }
+            workgroupBarrier();
+        }
+    }
+    if (i1 < lp.size) { keys[i1] = sk[t]; idx[i1] = si[t]; }
+    if (i2 < lp.size) { keys[i2] = sk[t + 256u]; idx[i2] = si[t + 256u]; }
+}
+
+struct MP { size: u32, stage: u32, step: u32, asc: u32 }
+@group(0) @binding(0) var<uniform> mp: MP;
+@group(0) @binding(1) var<storage, read_write> mkeys: array<f32>;
+@group(0) @binding(2) var<storage, read_write> midx: array<u32>;
+
+@compute @workgroup_size(256)
+fn merge(@builtin(global_invocation_id) g: vec3<u32>) {
+    let t = g.x; let step = mp.step; let stage = mp.stage;
+    let bs = 1u << (stage + 1u); let hb = 1u << stage;
+    let bi = t / hb; let ih = t % hb;
+    let i = bi * bs + ih; let j = i + step;
+    if (j >= mp.size) { return; }
+    let d = ((i / bs) % 2u == 0u) == (mp.asc == 1u);
+    let ki = mkeys[i]; let kj = mkeys[j];
+    if (select(ki > kj, ki < kj, d)) {
+        mkeys[i] = kj; mkeys[j] = ki;
+        let ti = midx[i]; midx[i] = midx[j]; midx[j] = ti;
+    }
+}
+
+struct IP { size: u32 }
+@group(0) @binding(0) var<uniform> ip: IP;
+@group(0) @binding(1) var<storage, read_write> iidx: array<u32>;
+
+@compute @workgroup_size(256)
+fn init_idx(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x < ip.size) { iidx[g.x] = g.x; }
+}`;
+        const module = this.device.createShaderModule({ code });
+        this.pipelines.set('init', this.device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'init_idx' } }));
+        this.pipelines.set('local', this.device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'local_sort' } }));
+        this.pipelines.set('merge', this.device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'merge' } }));
+    }
+
+    isAvailable() { return this.available; }
+
+    async sort(values, ascending = true) {
+        const size = values.length;
+        if (!this.available || size < 10000) return this._cpuSort(values, ascending);
+
+        const padSize = this._nextPow2(size);
+        const keys = new Float32Array(padSize);
+        keys.set(values instanceof Float32Array ? values : new Float32Array(values));
+        for (let i = size; i < padSize; i++) keys[i] = 3.4e38;
+
+        const keysBuf = this._createBuf(keys, GPUBufferUsage.STORAGE);
+        const idxBuf = this.device.createBuffer({ size: padSize * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+
+        const initP = this.pipelines.get('init');
+        const ipBuf = this._createUniform(new Uint32Array([padSize]));
+        const initBG = this.device.createBindGroup({ layout: initP.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ipBuf } }, { binding: 1, resource: { buffer: idxBuf } }] });
+
+        const localP = this.pipelines.get('local');
+        const lpBuf = this._createUniform(new Uint32Array([padSize, 0, 0, ascending ? 1 : 0]));
+        const localBG = this.device.createBindGroup({ layout: localP.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: lpBuf } }, { binding: 1, resource: { buffer: keysBuf } }, { binding: 2, resource: { buffer: idxBuf } }] });
+
+        const enc = this.device.createCommandEncoder();
+        const p1 = enc.beginComputePass(); p1.setPipeline(initP); p1.setBindGroup(0, initBG); p1.dispatchWorkgroups(Math.ceil(padSize / 256)); p1.end();
+        const p2 = enc.beginComputePass(); p2.setPipeline(localP); p2.setBindGroup(0, localBG); p2.dispatchWorkgroups(Math.ceil(padSize / 512)); p2.end();
+        this.device.queue.submit([enc.finish()]);
+
+        if (padSize > 512) {
+            const mergeP = this.pipelines.get('merge');
+            for (let stageExp = 9; (1 << stageExp) < padSize; stageExp++) {
+                for (let step = 1 << stageExp; step > 0; step >>= 1) {
+                    const mEnc = this.device.createCommandEncoder();
+                    const mpBuf = this._createUniform(new Uint32Array([padSize, stageExp, step, ascending ? 1 : 0]));
+                    const mergeBG = this.device.createBindGroup({ layout: mergeP.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: mpBuf } }, { binding: 1, resource: { buffer: keysBuf } }, { binding: 2, resource: { buffer: idxBuf } }] });
+                    const mp = mEnc.beginComputePass(); mp.setPipeline(mergeP); mp.setBindGroup(0, mergeBG); mp.dispatchWorkgroups(Math.ceil(padSize / 256)); mp.end();
+                    this.device.queue.submit([mEnc.finish()]);
+                    mpBuf.destroy();
+                }
+            }
+        }
+
+        const stageBuf = this.device.createBuffer({ size: size * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        const cEnc = this.device.createCommandEncoder();
+        cEnc.copyBufferToBuffer(idxBuf, 0, stageBuf, 0, size * 4);
+        this.device.queue.submit([cEnc.finish()]);
+
+        await stageBuf.mapAsync(GPUMapMode.READ);
+        const result = new Uint32Array(stageBuf.getMappedRange().slice(0));
+        stageBuf.unmap();
+
+        keysBuf.destroy(); idxBuf.destroy(); ipBuf.destroy(); lpBuf.destroy(); stageBuf.destroy();
+        return result;
+    }
+
+    _cpuSort(values, ascending) {
+        const indexed = Array.from(values).map((v, i) => ({ v, i }));
+        indexed.sort((a, b) => { const c = a.v < b.v ? -1 : a.v > b.v ? 1 : 0; return ascending ? c : -c; });
+        return new Uint32Array(indexed.map(x => x.i));
+    }
+
+    _createBuf(data, usage) {
+        const buf = this.device.createBuffer({ size: data.byteLength, usage: usage | GPUBufferUsage.COPY_DST });
+        this.device.queue.writeBuffer(buf, 0, data);
+        return buf;
+    }
+
+    _createUniform(data) {
+        const buf = this.device.createBuffer({ size: Math.max(data.byteLength, 16), usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+        this.device.queue.writeBuffer(buf, 0, data);
+        return buf;
+    }
+
+    _nextPow2(n) { let p = 1; while (p < n) p *= 2; return p; }
+}
+
+// Global GPU sorter instance
+const gpuSorter = new GPUSorter();
+
+/**
+ * GPU-accelerated SQL GROUP BY using hash-based grouping.
+ * Falls back to CPU for small datasets where GPU overhead exceeds benefit.
+ */
+class GPUGrouper {
+    constructor() {
+        this.device = null;
+        this.pipelines = new Map();
+        this.available = false;
+        this._initPromise = null;
+    }
+
+    async init() {
+        if (this._initPromise) return this._initPromise;
+        this._initPromise = this._doInit();
+        return this._initPromise;
+    }
+
+    async _doInit() {
+        if (!navigator.gpu) return false;
+        try {
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) return false;
+            this.device = await adapter.requestDevice({
+                requiredLimits: { maxStorageBufferBindingSize: 256 * 1024 * 1024 },
+            });
+            this._compileShaders();
+            this.available = true;
+            console.log('[GPUGrouper] Initialized');
+            return true;
+        } catch (e) {
+            console.warn('[GPUGrouper] Init failed:', e);
+            return false;
+        }
+    }
+
+    _compileShaders() {
+        const code = `
+struct BP { size: u32, cap: u32 }
+struct AP { size: u32, cap: u32 }
+struct AGP { size: u32, ng: u32, at: u32 }
+struct IP { cap: u32 }
+struct IAP { ng: u32, iv: u32 }
+
+@group(0) @binding(0) var<uniform> bp: BP;
+@group(0) @binding(1) var<storage, read> bk: array<u32>;
+@group(0) @binding(2) var<storage, read_write> ht: array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write> gc: atomic<u32>;
+
+fn fnv(k: u32) -> u32 { var h = 2166136261u; h ^= (k & 0xFFu); h *= 16777619u; h ^= ((k >> 8u) & 0xFFu); h *= 16777619u; h ^= ((k >> 16u) & 0xFFu); h *= 16777619u; h ^= ((k >> 24u) & 0xFFu); h *= 16777619u; return h; }
+
+@compute @workgroup_size(256) fn build(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= bp.size) { return; }
+    let k = bk[g.x]; var s = fnv(k) % bp.cap;
+    for (var p = 0u; p < bp.cap; p++) { let i = s * 2u; let o = atomicCompareExchangeWeak(&ht[i], 0xFFFFFFFFu, k); if (o.exchanged) { atomicStore(&ht[i + 1u], atomicAdd(&gc, 1u)); return; } if (o.old_value == k) { return; } s = (s + 1u) % bp.cap; }
+}
+
+@group(0) @binding(0) var<uniform> ap: AP;
+@group(0) @binding(1) var<storage, read> ak: array<u32>;
+@group(0) @binding(2) var<storage, read> lt: array<u32>;
+@group(0) @binding(3) var<storage, read_write> gids: array<u32>;
+
+@compute @workgroup_size(256) fn assign(@builtin(global_invocation_id) g: vec3<u32>) {
+    if (g.x >= ap.size) { return; }
+    let k = ak[g.x]; var s = fnv(k) % ap.cap;
+    for (var p = 0u; p < ap.cap; p++) { let i = s * 2u; if (lt[i] == k) { gids[g.x] = lt[i + 1u]; return; } if (lt[i] == 0xFFFFFFFFu) { gids[g.x] = 0xFFFFFFFFu; return; } s = (s + 1u) % ap.cap; }
+    gids[g.x] = 0xFFFFFFFFu;
+}
+
+@group(0) @binding(0) var<uniform> agp: AGP;
+@group(0) @binding(1) var<storage, read> agi: array<u32>;
+@group(0) @binding(2) var<storage, read> vals: array<f32>;
+@group(0) @binding(3) var<storage, read_write> res: array<atomic<u32>>;
+
+fn f2s(f: f32) -> u32 { let b = bitcast<u32>(f); return select(b ^ 0x80000000u, ~b, (b & 0x80000000u) != 0u); }
+
+@compute @workgroup_size(256) fn cnt(@builtin(global_invocation_id) g: vec3<u32>) { if (g.x >= agp.size) { return; } let gid = agi[g.x]; if (gid < agp.ng) { atomicAdd(&res[gid], 1u); } }
+@compute @workgroup_size(256) fn sum(@builtin(global_invocation_id) g: vec3<u32>) { if (g.x >= agp.size) { return; } let gid = agi[g.x]; let v = vals[g.x]; if (gid < agp.ng && !isNan(v)) { atomicAdd(&res[gid], u32(i32(v * 1000.0))); } }
+@compute @workgroup_size(256) fn mn(@builtin(global_invocation_id) g: vec3<u32>) { if (g.x >= agp.size) { return; } let gid = agi[g.x]; let v = vals[g.x]; if (gid < agp.ng && !isNan(v)) { atomicMin(&res[gid], f2s(v)); } }
+@compute @workgroup_size(256) fn mx(@builtin(global_invocation_id) g: vec3<u32>) { if (g.x >= agp.size) { return; } let gid = agi[g.x]; let v = vals[g.x]; if (gid < agp.ng && !isNan(v)) { atomicMax(&res[gid], f2s(v)); } }
+
+@group(0) @binding(0) var<uniform> ip: IP;
+@group(0) @binding(1) var<storage, read_write> it: array<u32>;
+@compute @workgroup_size(256) fn iht(@builtin(global_invocation_id) g: vec3<u32>) { if (g.x >= ip.cap * 2u) { return; } it[g.x] = select(0u, 0xFFFFFFFFu, g.x % 2u == 0u); }
+
+@group(0) @binding(0) var<uniform> iap: IAP;
+@group(0) @binding(1) var<storage, read_write> iar: array<u32>;
+@compute @workgroup_size(256) fn iag(@builtin(global_invocation_id) g: vec3<u32>) { if (g.x >= iap.ng) { return; } iar[g.x] = iap.iv; }`;
+        const module = this.device.createShaderModule({ code });
+        this.pipelines.set('iht', this.device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'iht' } }));
+        this.pipelines.set('build', this.device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'build' } }));
+        this.pipelines.set('assign', this.device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'assign' } }));
+        this.pipelines.set('iag', this.device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'iag' } }));
+        this.pipelines.set('cnt', this.device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'cnt' } }));
+        this.pipelines.set('sum', this.device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'sum' } }));
+        this.pipelines.set('mn', this.device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'mn' } }));
+        this.pipelines.set('mx', this.device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'mx' } }));
+    }
+
+    isAvailable() { return this.available; }
+
+    async groupBy(keys) {
+        const size = keys.length;
+        if (!this.available || size < 10000) return this._cpuGroupBy(keys);
+
+        const cap = this._nextPow2(Math.min(size, 100000) * 2);
+        const keysBuf = this._createBuf(keys, GPUBufferUsage.STORAGE);
+        const htBuf = this.device.createBuffer({ size: cap * 2 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const gcBuf = this.device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const gidsBuf = this.device.createBuffer({ size: size * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+
+        const ihtP = this.pipelines.get('iht'), buildP = this.pipelines.get('build'), assignP = this.pipelines.get('assign');
+        const ipBuf = this._createUniform(new Uint32Array([cap]));
+        const bpBuf = this._createUniform(new Uint32Array([size, cap]));
+        const apBuf = this._createUniform(new Uint32Array([size, cap]));
+
+        const ihtBG = this.device.createBindGroup({ layout: ihtP.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ipBuf } }, { binding: 1, resource: { buffer: htBuf } }] });
+        const buildBG = this.device.createBindGroup({ layout: buildP.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: bpBuf } }, { binding: 1, resource: { buffer: keysBuf } }, { binding: 2, resource: { buffer: htBuf } }, { binding: 3, resource: { buffer: gcBuf } }] });
+        const assignBG = this.device.createBindGroup({ layout: assignP.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: apBuf } }, { binding: 1, resource: { buffer: keysBuf } }, { binding: 2, resource: { buffer: htBuf } }, { binding: 3, resource: { buffer: gidsBuf } }] });
+
+        const enc = this.device.createCommandEncoder();
+        const p1 = enc.beginComputePass(); p1.setPipeline(ihtP); p1.setBindGroup(0, ihtBG); p1.dispatchWorkgroups(Math.ceil(cap * 2 / 256)); p1.end();
+        const p2 = enc.beginComputePass(); p2.setPipeline(buildP); p2.setBindGroup(0, buildBG); p2.dispatchWorkgroups(Math.ceil(size / 256)); p2.end();
+        const p3 = enc.beginComputePass(); p3.setPipeline(assignP); p3.setBindGroup(0, assignBG); p3.dispatchWorkgroups(Math.ceil(size / 256)); p3.end();
+
+        const gcStage = this.device.createBuffer({ size: 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        enc.copyBufferToBuffer(gcBuf, 0, gcStage, 0, 4);
+        this.device.queue.submit([enc.finish()]);
+
+        await gcStage.mapAsync(GPUMapMode.READ);
+        const numGroups = new Uint32Array(gcStage.getMappedRange())[0];
+        gcStage.unmap();
+
+        const gidsStage = this.device.createBuffer({ size: size * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        const cEnc = this.device.createCommandEncoder();
+        cEnc.copyBufferToBuffer(gidsBuf, 0, gidsStage, 0, size * 4);
+        this.device.queue.submit([cEnc.finish()]);
+
+        await gidsStage.mapAsync(GPUMapMode.READ);
+        const groupIds = new Uint32Array(gidsStage.getMappedRange().slice(0));
+        gidsStage.unmap();
+
+        keysBuf.destroy(); htBuf.destroy(); gcBuf.destroy(); gidsBuf.destroy(); gcStage.destroy(); gidsStage.destroy(); ipBuf.destroy(); bpBuf.destroy(); apBuf.destroy();
+        return { groupIds, numGroups };
+    }
+
+    async groupAggregate(values, groupIds, numGroups, aggType) {
+        const size = values.length;
+        if (!this.available || size < 10000) return this._cpuGroupAggregate(values, groupIds, numGroups, aggType);
+
+        let initVal = 0, pName = 'cnt';
+        if (aggType === 'SUM') pName = 'sum';
+        else if (aggType === 'MIN') { initVal = 0x7F7FFFFF; pName = 'mn'; }
+        else if (aggType === 'MAX') pName = 'mx';
+
+        const gidsBuf = this._createBuf(groupIds, GPUBufferUsage.STORAGE);
+        const valsBuf = this._createBuf(values, GPUBufferUsage.STORAGE);
+        const resBuf = this.device.createBuffer({ size: numGroups * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+
+        const iagP = this.pipelines.get('iag'), aggP = this.pipelines.get(pName);
+        const iapBuf = this._createUniform(new Uint32Array([numGroups, initVal]));
+        const agpBuf = this._createUniform(new Uint32Array([size, numGroups, 0]));
+
+        const iagBG = this.device.createBindGroup({ layout: iagP.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: iapBuf } }, { binding: 1, resource: { buffer: resBuf } }] });
+        const aggBG = this.device.createBindGroup({ layout: aggP.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: agpBuf } }, { binding: 1, resource: { buffer: gidsBuf } }, { binding: 2, resource: { buffer: valsBuf } }, { binding: 3, resource: { buffer: resBuf } }] });
+
+        const enc = this.device.createCommandEncoder();
+        const p1 = enc.beginComputePass(); p1.setPipeline(iagP); p1.setBindGroup(0, iagBG); p1.dispatchWorkgroups(Math.max(1, Math.ceil(numGroups / 256))); p1.end();
+        const p2 = enc.beginComputePass(); p2.setPipeline(aggP); p2.setBindGroup(0, aggBG); p2.dispatchWorkgroups(Math.ceil(size / 256)); p2.end();
+
+        const stage = this.device.createBuffer({ size: numGroups * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        enc.copyBufferToBuffer(resBuf, 0, stage, 0, numGroups * 4);
+        this.device.queue.submit([enc.finish()]);
+
+        await stage.mapAsync(GPUMapMode.READ);
+        const raw = new Uint32Array(stage.getMappedRange().slice(0));
+        stage.unmap();
+
+        const results = new Float32Array(numGroups);
+        for (let i = 0; i < numGroups; i++) {
+            if (aggType === 'COUNT') results[i] = raw[i];
+            else if (aggType === 'SUM') results[i] = (raw[i] | 0) / 1000;
+            else { const u = raw[i], bits = (u & 0x80000000) ? u ^ 0x80000000 : ~u; results[i] = new Float32Array(new Uint32Array([bits]).buffer)[0]; }
+        }
+
+        gidsBuf.destroy(); valsBuf.destroy(); resBuf.destroy(); stage.destroy(); iapBuf.destroy(); agpBuf.destroy();
+        return results;
+    }
+
+    _cpuGroupBy(keys) {
+        const gMap = new Map(); const gids = new Uint32Array(keys.length); let nid = 0;
+        for (let i = 0; i < keys.length; i++) { const k = keys[i]; if (!gMap.has(k)) gMap.set(k, nid++); gids[i] = gMap.get(k); }
+        return { groupIds: gids, numGroups: nid };
+    }
+
+    _cpuGroupAggregate(values, groupIds, numGroups, aggType) {
+        const res = new Float32Array(numGroups);
+        if (aggType === 'MIN') res.fill(Infinity);
+        else if (aggType === 'MAX') res.fill(-Infinity);
+        for (let i = 0; i < values.length; i++) {
+            const gid = groupIds[i], v = values[i];
+            if (gid >= numGroups || isNaN(v)) continue;
+            if (aggType === 'COUNT') res[gid]++;
+            else if (aggType === 'SUM') res[gid] += v;
+            else if (aggType === 'MIN') res[gid] = Math.min(res[gid], v);
+            else if (aggType === 'MAX') res[gid] = Math.max(res[gid], v);
+        }
+        return res;
+    }
+
+    _createBuf(data, usage) { const buf = this.device.createBuffer({ size: data.byteLength, usage: usage | GPUBufferUsage.COPY_DST }); this.device.queue.writeBuffer(buf, 0, data); return buf; }
+    _createUniform(data) { const buf = this.device.createBuffer({ size: Math.max(data.byteLength, 16), usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }); this.device.queue.writeBuffer(buf, 0, data); return buf; }
+    _nextPow2(n) { let p = 1; while (p < n) p *= 2; return p; }
+}
+
+// Global GPU grouper instance
+const gpuGrouper = new GPUGrouper();
+
+// ============================================================================
+// GPU Vector Search - GPU-accelerated distance computation and top-K selection
+// ============================================================================
+
+const GPU_DISTANCE_THRESHOLD = 5000;
+const GPU_TOPK_THRESHOLD = 10000;
+
+const DistanceMetric = { COSINE: 0, L2: 1, DOT_PRODUCT: 2 };
+
+const VECTOR_DISTANCE_SHADER = `
+struct DistanceParams { dim: u32, num_vectors: u32, num_queries: u32, metric: u32, }
+@group(0) @binding(0) var<uniform> params: DistanceParams;
+@group(0) @binding(1) var<storage, read> queries: array<f32>;
+@group(0) @binding(2) var<storage, read> vectors: array<f32>;
+@group(0) @binding(3) var<storage, read_write> distances: array<f32>;
+var<workgroup> shared_query: array<f32, 512>;
+fn compute_dot(vec_offset: u32, dim: u32) -> f32 {
+    var sum: f32 = 0.0;
+    for (var i = 0u; i < dim; i++) { sum += shared_query[i] * vectors[vec_offset + i]; }
+    return sum;
+}
+fn compute_l2(vec_offset: u32, dim: u32) -> f32 {
+    var sum: f32 = 0.0;
+    for (var i = 0u; i < dim; i++) { let d = shared_query[i] - vectors[vec_offset + i]; sum += d * d; }
+    return sqrt(sum);
+}
+@compute @workgroup_size(256)
+fn compute_distances(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+    let query_idx = wid.y; let vec_idx = gid.x;
+    if (vec_idx >= params.num_vectors || query_idx >= params.num_queries) { return; }
+    let dim = params.dim; let tid = lid.x;
+    for (var i = tid; i < dim && i < 512u; i += 256u) { shared_query[i] = queries[query_idx * dim + i]; }
+    workgroupBarrier();
+    let vec_offset = vec_idx * dim;
+    var result: f32 = 0.0;
+    switch params.metric {
+        case 0u, 2u: { result = compute_dot(vec_offset, dim); }
+        case 1u: { result = compute_l2(vec_offset, dim); }
+        default: { result = compute_dot(vec_offset, dim); }
+    }
+    distances[query_idx * params.num_vectors + vec_idx] = result;
+}`;
+
+const TOPK_SHADER = `
+struct TopKParams { size: u32, k: u32, descending: u32, num_workgroups: u32, }
+@group(0) @binding(0) var<uniform> params: TopKParams;
+@group(0) @binding(1) var<storage, read> input_scores: array<f32>;
+@group(0) @binding(2) var<storage, read> input_indices: array<u32>;
+@group(0) @binding(3) var<storage, read_write> output_scores: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output_indices: array<u32>;
+var<workgroup> local_scores: array<f32, 512>;
+var<workgroup> local_indices: array<u32, 512>;
+fn should_swap(a: f32, b: f32, descending: bool) -> bool { if (descending) { return a < b; } else { return a > b; } }
+fn get_sentinel(descending: bool) -> f32 { if (descending) { return -3.4028235e+38; } else { return 3.4028235e+38; } }
+@compute @workgroup_size(256)
+fn local_topk(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid: vec3<u32>) {
+    let chunk_size = 512u; let base = wid.x * chunk_size; let tid = lid.x;
+    let descending = params.descending == 1u; let sentinel = get_sentinel(descending);
+    let idx1 = base + tid; let idx2 = base + tid + 256u;
+    if (idx1 < params.size) { local_scores[tid] = input_scores[idx1]; local_indices[tid] = input_indices[idx1]; } else { local_scores[tid] = sentinel; local_indices[tid] = 0xFFFFFFFFu; }
+    if (idx2 < params.size) { local_scores[tid + 256u] = input_scores[idx2]; local_indices[tid + 256u] = input_indices[idx2]; } else { local_scores[tid + 256u] = sentinel; local_indices[tid + 256u] = 0xFFFFFFFFu; }
+    workgroupBarrier();
+    for (var k = 2u; k <= chunk_size; k = k << 1u) {
+        for (var j = k >> 1u; j > 0u; j = j >> 1u) {
+            for (var t = 0u; t < 2u; t++) {
+                let i = tid + t * 256u; let ixj = i ^ j;
+                if (ixj > i && ixj < chunk_size) {
+                    let direction = ((i & k) == 0u) == descending;
+                    if (should_swap(local_scores[i], local_scores[ixj], direction)) {
+                        let tmp_score = local_scores[i]; local_scores[i] = local_scores[ixj]; local_scores[ixj] = tmp_score;
+                        let tmp_idx = local_indices[i]; local_indices[i] = local_indices[ixj]; local_indices[ixj] = tmp_idx;
+                    }
+                }
+            }
+            workgroupBarrier();
+        }
+    }
+    let k_per_wg = min(params.k, chunk_size);
+    if (tid < k_per_wg) { let out_base = wid.x * params.k; output_scores[out_base + tid] = local_scores[tid]; output_indices[out_base + tid] = local_indices[tid]; }
+    if (tid + 256u < k_per_wg) { let out_base = wid.x * params.k; output_scores[out_base + tid + 256u] = local_scores[tid + 256u]; output_indices[out_base + tid + 256u] = local_indices[tid + 256u]; }
+}
+struct MergeParams { num_candidates: u32, k: u32, descending: u32, _pad: u32, }
+@group(0) @binding(0) var<uniform> merge_params: MergeParams;
+@group(0) @binding(1) var<storage, read> merge_scores: array<f32>;
+@group(0) @binding(2) var<storage, read> merge_indices: array<u32>;
+@group(0) @binding(3) var<storage, read_write> final_scores: array<f32>;
+@group(0) @binding(4) var<storage, read_write> final_indices: array<u32>;
+@compute @workgroup_size(256)
+fn merge_topk(@builtin(local_invocation_id) lid: vec3<u32>) {
+    let tid = lid.x; let n = merge_params.num_candidates; let k = merge_params.k;
+    let descending = merge_params.descending == 1u; let sentinel = get_sentinel(descending);
+    let n_local = min(n, 512u);
+    if (tid < n_local) { local_scores[tid] = merge_scores[tid]; local_indices[tid] = merge_indices[tid]; } else if (tid < 512u) { local_scores[tid] = sentinel; local_indices[tid] = 0xFFFFFFFFu; }
+    if (tid + 256u < n_local) { local_scores[tid + 256u] = merge_scores[tid + 256u]; local_indices[tid + 256u] = merge_indices[tid + 256u]; } else if (tid + 256u < 512u) { local_scores[tid + 256u] = sentinel; local_indices[tid + 256u] = 0xFFFFFFFFu; }
+    workgroupBarrier();
+    let chunk_size = 512u;
+    for (var ks = 2u; ks <= chunk_size; ks = ks << 1u) {
+        for (var j = ks >> 1u; j > 0u; j = j >> 1u) {
+            for (var t = 0u; t < 2u; t++) {
+                let i = tid + t * 256u; let ixj = i ^ j;
+                if (ixj > i && ixj < chunk_size) {
+                    let direction = ((i & ks) == 0u) == descending;
+                    if (should_swap(local_scores[i], local_scores[ixj], direction)) {
+                        let tmp_score = local_scores[i]; local_scores[i] = local_scores[ixj]; local_scores[ixj] = tmp_score;
+                        let tmp_idx = local_indices[i]; local_indices[i] = local_indices[ixj]; local_indices[ixj] = tmp_idx;
+                    }
+                }
+            }
+            workgroupBarrier();
+        }
+    }
+    if (tid < k) { final_scores[tid] = local_scores[tid]; final_indices[tid] = local_indices[tid]; }
+}`;
+
+class GPUVectorSearch {
+    constructor() { this.device = null; this.pipelines = new Map(); this.available = false; this._initPromise = null; }
+    async init() { if (this._initPromise) return this._initPromise; this._initPromise = this._doInit(); return this._initPromise; }
+    async _doInit() {
+        if (typeof navigator === 'undefined' || !navigator.gpu) return false;
+        try {
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) return false;
+            this.device = await adapter.requestDevice({ requiredLimits: { maxStorageBufferBindingSize: 256 * 1024 * 1024, maxBufferSize: 256 * 1024 * 1024 } });
+            await this._compileShaders();
+            this.available = true;
+            return true;
+        } catch (e) { return false; }
+    }
+    async _compileShaders() {
+        const distMod = this.device.createShaderModule({ code: VECTOR_DISTANCE_SHADER });
+        this.pipelines.set('distance', this.device.createComputePipeline({ layout: 'auto', compute: { module: distMod, entryPoint: 'compute_distances' } }));
+        const topkMod = this.device.createShaderModule({ code: TOPK_SHADER });
+        this.pipelines.set('local_topk', this.device.createComputePipeline({ layout: 'auto', compute: { module: topkMod, entryPoint: 'local_topk' } }));
+        this.pipelines.set('merge_topk', this.device.createComputePipeline({ layout: 'auto', compute: { module: topkMod, entryPoint: 'merge_topk' } }));
+    }
+    isAvailable() { return this.available; }
+
+    async computeDistances(queryVec, vectors, numQueries = 1, metric = 0) {
+        const numVectors = vectors.length;
+        const dim = queryVec.length / numQueries;
+        if (!this.available || numVectors < GPU_DISTANCE_THRESHOLD) return this._cpuDistances(queryVec, vectors, numQueries, metric);
+        const flatVectors = new Float32Array(numVectors * dim);
+        for (let i = 0; i < numVectors; i++) flatVectors.set(vectors[i], i * dim);
+        const paramsBuffer = this._createUniform(new Uint32Array([dim, numVectors, numQueries, metric]));
+        const queryBuffer = this._createStorage(queryVec);
+        const vectorsBuffer = this._createStorage(flatVectors);
+        const distanceBuffer = this.device.createBuffer({ size: numQueries * numVectors * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const readBuffer = this.device.createBuffer({ size: numQueries * numVectors * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        const bindGroup = this.device.createBindGroup({ layout: this.pipelines.get('distance').getBindGroupLayout(0), entries: [
+            { binding: 0, resource: { buffer: paramsBuffer } }, { binding: 1, resource: { buffer: queryBuffer } },
+            { binding: 2, resource: { buffer: vectorsBuffer } }, { binding: 3, resource: { buffer: distanceBuffer } }
+        ]});
+        const encoder = this.device.createCommandEncoder();
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(this.pipelines.get('distance'));
+        pass.setBindGroup(0, bindGroup);
+        pass.dispatchWorkgroups(Math.ceil(numVectors / 256), numQueries, 1);
+        pass.end();
+        encoder.copyBufferToBuffer(distanceBuffer, 0, readBuffer, 0, numQueries * numVectors * 4);
+        this.device.queue.submit([encoder.finish()]);
+        await readBuffer.mapAsync(GPUMapMode.READ);
+        const distances = new Float32Array(readBuffer.getMappedRange().slice(0));
+        readBuffer.unmap();
+        [paramsBuffer, queryBuffer, vectorsBuffer, distanceBuffer, readBuffer].forEach(b => b.destroy());
+        return distances;
+    }
+
+    async topK(scores, indices = null, k = 10, descending = true) {
+        const n = scores.length;
+        if (!this.available || n < GPU_TOPK_THRESHOLD) return this._cpuTopK(scores, indices, k, descending);
+        if (!indices) { indices = new Uint32Array(n); for (let i = 0; i < n; i++) indices[i] = i; }
+        const numWorkgroups = Math.ceil(n / 512);
+        const kPerWg = Math.min(k, 512);
+        const numCandidates = numWorkgroups * kPerWg;
+        // Phase 1
+        const paramsBuffer = this._createUniform(new Uint32Array([n, k, descending ? 1 : 0, numWorkgroups]));
+        const inputScoresBuffer = this._createStorage(scores);
+        const inputIndicesBuffer = this._createStorage(indices);
+        const intermediateScoresBuffer = this.device.createBuffer({ size: numCandidates * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const intermediateIndicesBuffer = this.device.createBuffer({ size: numCandidates * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const localBG = this.device.createBindGroup({ layout: this.pipelines.get('local_topk').getBindGroupLayout(0), entries: [
+            { binding: 0, resource: { buffer: paramsBuffer } }, { binding: 1, resource: { buffer: inputScoresBuffer } },
+            { binding: 2, resource: { buffer: inputIndicesBuffer } }, { binding: 3, resource: { buffer: intermediateScoresBuffer } },
+            { binding: 4, resource: { buffer: intermediateIndicesBuffer } }
+        ]});
+        let encoder = this.device.createCommandEncoder();
+        let pass = encoder.beginComputePass();
+        pass.setPipeline(this.pipelines.get('local_topk'));
+        pass.setBindGroup(0, localBG);
+        pass.dispatchWorkgroups(numWorkgroups, 1, 1);
+        pass.end();
+        this.device.queue.submit([encoder.finish()]);
+        // Phase 2
+        const mergeParamsBuffer = this._createUniform(new Uint32Array([numCandidates, k, descending ? 1 : 0, 0]));
+        const finalScoresBuffer = this.device.createBuffer({ size: k * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const finalIndicesBuffer = this.device.createBuffer({ size: k * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+        const readScoresBuffer = this.device.createBuffer({ size: k * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        const readIndicesBuffer = this.device.createBuffer({ size: k * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+        const mergeBG = this.device.createBindGroup({ layout: this.pipelines.get('merge_topk').getBindGroupLayout(0), entries: [
+            { binding: 0, resource: { buffer: mergeParamsBuffer } }, { binding: 1, resource: { buffer: intermediateScoresBuffer } },
+            { binding: 2, resource: { buffer: intermediateIndicesBuffer } }, { binding: 3, resource: { buffer: finalScoresBuffer } },
+            { binding: 4, resource: { buffer: finalIndicesBuffer } }
+        ]});
+        encoder = this.device.createCommandEncoder();
+        pass = encoder.beginComputePass();
+        pass.setPipeline(this.pipelines.get('merge_topk'));
+        pass.setBindGroup(0, mergeBG);
+        pass.dispatchWorkgroups(1, 1, 1);
+        pass.end();
+        encoder.copyBufferToBuffer(finalScoresBuffer, 0, readScoresBuffer, 0, k * 4);
+        encoder.copyBufferToBuffer(finalIndicesBuffer, 0, readIndicesBuffer, 0, k * 4);
+        this.device.queue.submit([encoder.finish()]);
+        await Promise.all([readScoresBuffer.mapAsync(GPUMapMode.READ), readIndicesBuffer.mapAsync(GPUMapMode.READ)]);
+        const resultScores = new Float32Array(readScoresBuffer.getMappedRange().slice(0));
+        const resultIndices = new Uint32Array(readIndicesBuffer.getMappedRange().slice(0));
+        readScoresBuffer.unmap(); readIndicesBuffer.unmap();
+        [paramsBuffer, inputScoresBuffer, inputIndicesBuffer, intermediateScoresBuffer, intermediateIndicesBuffer,
+         mergeParamsBuffer, finalScoresBuffer, finalIndicesBuffer, readScoresBuffer, readIndicesBuffer].forEach(b => b.destroy());
+        return { indices: resultIndices, scores: resultScores };
+    }
+
+    async search(queryVec, vectors, k = 10, options = {}) {
+        const { metric = 0 } = options;
+        const scores = await this.computeDistances(queryVec, vectors, 1, metric);
+        const descending = metric === 0 || metric === 2;
+        return await this.topK(scores, null, k, descending);
+    }
+
+    _cpuDistances(queryVec, vectors, numQueries, metric) {
+        const dim = queryVec.length / numQueries;
+        const numVectors = vectors.length;
+        const distances = new Float32Array(numQueries * numVectors);
+        for (let q = 0; q < numQueries; q++) {
+            const qOff = q * dim;
+            for (let v = 0; v < numVectors; v++) {
+                const vec = vectors[v];
+                let result = 0;
+                if (metric === 1) { for (let i = 0; i < dim; i++) { const d = queryVec[qOff + i] - vec[i]; result += d * d; } result = Math.sqrt(result); }
+                else { for (let i = 0; i < dim; i++) result += queryVec[qOff + i] * vec[i]; }
+                distances[q * numVectors + v] = result;
+            }
+        }
+        return distances;
+    }
+
+    _cpuTopK(scores, indices, k, descending) {
+        const n = scores.length;
+        if (!indices) { indices = new Uint32Array(n); for (let i = 0; i < n; i++) indices[i] = i; }
+        const indexed = Array.from(scores).map((score, i) => ({ score, idx: indices[i] }));
+        if (descending) indexed.sort((a, b) => b.score - a.score);
+        else indexed.sort((a, b) => a.score - b.score);
+        const topK = indexed.slice(0, k);
+        return { indices: new Uint32Array(topK.map(x => x.idx)), scores: new Float32Array(topK.map(x => x.score)) };
+    }
+
+    _createStorage(data) { const buf = this.device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }); this.device.queue.writeBuffer(buf, 0, data); return buf; }
+    _createUniform(data) { const buf = this.device.createBuffer({ size: Math.max(data.byteLength, 16), usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }); this.device.queue.writeBuffer(buf, 0, data); return buf; }
+}
+
+const gpuVectorSearch = new GPUVectorSearch();
+
+/**
  * Statistics Manager - computes and caches column statistics for query optimization.
  *
  * Unlike pre-generated sidecar files, this computes statistics dynamically:
@@ -2979,16 +4016,29 @@ class OPFSJoinExecutor {
      * @returns {AsyncGenerator} Yields result chunks
      */
     async *executeHashJoin(leftStream, rightStream, leftKey, rightKey, options = {}) {
-        const { limit = Infinity, projection = null } = options;
+        const {
+            limit = Infinity,
+            projection = null,
+            leftAlias = 'left',
+            rightAlias = 'right',
+            joinType = 'INNER',
+            prePartitionedLeft = null  // Optional: pre-partitioned left metadata for semi-join optimization
+        } = options;
 
-        console.log(`[OPFSJoin] Starting OPFS-backed hash join`);
+        console.log(`[OPFSJoin] Starting OPFS-backed hash join (${joinType})`);
         console.log(`[OPFSJoin] Session: ${this.sessionId}`);
         console.log(`[OPFSJoin] Partitions: ${this.numPartitions}`);
 
         try {
-            // Phase 1: Partition left table to OPFS
-            console.log(`[OPFSJoin] Phase 1: Partitioning left table...`);
-            const leftMeta = await this._partitionToOPFS(leftStream, leftKey, 'left');
+            // Phase 1: Partition left table to OPFS (skip if pre-partitioned)
+            let leftMeta;
+            if (prePartitionedLeft) {
+                console.log(`[OPFSJoin] Phase 1: Using pre-partitioned left table (semi-join optimization)`);
+                leftMeta = prePartitionedLeft;
+            } else {
+                console.log(`[OPFSJoin] Phase 1: Partitioning left table...`);
+                leftMeta = await this._partitionToOPFS(leftStream, leftKey, 'left');
+            }
             console.log(`[OPFSJoin] Left table: ${leftMeta.totalRows} rows in ${leftMeta.partitionsUsed.size} partitions`);
 
             // Phase 2: Partition right table to OPFS
@@ -2997,58 +4047,139 @@ class OPFSJoinExecutor {
             console.log(`[OPFSJoin] Right table: ${rightMeta.totalRows} rows in ${rightMeta.partitionsUsed.size} partitions`);
 
             // Phase 3: Join partition by partition
-            console.log(`[OPFSJoin] Phase 3: Joining partitions...`);
+            console.log(`[OPFSJoin] Phase 3: Joining partitions (${joinType})...`);
             let totalYielded = 0;
 
-            // Only process partitions that have data on both sides
-            const activePartitions = new Set(
+            // Create NULL padding arrays for outer joins
+            const leftNulls = new Array(leftMeta.columns.length).fill(null);
+            const rightNulls = new Array(rightMeta.columns.length).fill(null);
+
+            // Helper to build result columns
+            const resultColumns = [
+                ...leftMeta.columns.map(c => `${leftAlias}.${c}`),
+                ...rightMeta.columns.map(c => `${rightAlias}.${c}`)
+            ];
+
+            // Helper to yield a chunk
+            const yieldChunk = function*(chunk) {
+                if (chunk.length > 0) {
+                    yield { columns: resultColumns, rows: chunk.splice(0) };
+                }
+            };
+
+            // For CROSS JOIN: cartesian product without partitioning
+            if (joinType === 'CROSS') {
+                console.log(`[OPFSJoin] CROSS JOIN: computing cartesian product`);
+                const chunk = [];
+
+                // Load all partitions for both tables
+                for (const leftPartitionId of leftMeta.partitionsUsed) {
+                    const leftPartition = await this._loadPartition('left', leftPartitionId, leftMeta.columns);
+                    for (const rightPartitionId of rightMeta.partitionsUsed) {
+                        const rightPartition = await this._loadPartition('right', rightPartitionId, rightMeta.columns);
+                        for (const leftRow of leftPartition) {
+                            for (const rightRow of rightPartition) {
+                                if (totalYielded >= limit) break;
+                                chunk.push([...leftRow, ...rightRow]);
+                                totalYielded++;
+                                if (chunk.length >= this.chunkSize) {
+                                    yield { columns: resultColumns, rows: chunk.splice(0) };
+                                }
+                            }
+                            if (totalYielded >= limit) break;
+                        }
+                        if (totalYielded >= limit) break;
+                    }
+                    if (totalYielded >= limit) break;
+                }
+                if (chunk.length > 0) {
+                    yield { columns: resultColumns, rows: chunk };
+                }
+                console.log(`[OPFSJoin] CROSS JOIN complete: ${totalYielded} result rows`);
+                return;
+            }
+
+            // For hash-based joins, determine which partitions to process
+            const leftKeyIndex = leftMeta.columns.indexOf(leftKey);
+            const rightKeyIndex = rightMeta.columns.indexOf(rightKey);
+
+            // Track matched rows for outer joins
+            const isLeftOuter = joinType === 'LEFT' || joinType === 'FULL';
+            const isRightOuter = joinType === 'RIGHT' || joinType === 'FULL';
+
+            // For RIGHT/FULL: track which right rows have been matched (by partition_rowIndex)
+            const matchedRightRows = isRightOuter ? new Set() : null;
+
+            // Process partitions that have data on both sides (for INNER and outer join matches)
+            const bothSidesPartitions = new Set(
                 [...leftMeta.partitionsUsed].filter(p => rightMeta.partitionsUsed.has(p))
             );
-            console.log(`[OPFSJoin] Active partitions (both sides): ${activePartitions.size}`);
+            console.log(`[OPFSJoin] Partitions with both sides: ${bothSidesPartitions.size}`);
 
-            for (const partitionId of activePartitions) {
+            for (const partitionId of bothSidesPartitions) {
                 if (totalYielded >= limit) break;
 
-                // Load left partition into memory (fits because we partitioned)
+                // Load left partition into memory
                 const leftPartition = await this._loadPartition('left', partitionId, leftMeta.columns);
                 if (leftPartition.length === 0) continue;
 
-                // Build in-memory hash map for this partition only
+                // Build hash map and track matched left rows for LEFT/FULL JOIN
                 const hashMap = new Map();
-                const leftKeyIndex = leftMeta.columns.indexOf(leftKey);
-                for (const row of leftPartition) {
+                const matchedLeftIndices = isLeftOuter ? new Set() : null;
+
+                for (let i = 0; i < leftPartition.length; i++) {
+                    const row = leftPartition[i];
                     const key = row[leftKeyIndex];
                     if (key !== null && key !== undefined) {
                         if (!hashMap.has(key)) hashMap.set(key, []);
-                        hashMap.get(key).push(row);
+                        hashMap.get(key).push({ row, index: i });
                     }
                 }
 
-                // Stream right partition and probe hash map
-                const rightKeyIndex = rightMeta.columns.indexOf(rightKey);
+                // Load right partition and probe hash map
                 const rightPartition = await this._loadPartition('right', partitionId, rightMeta.columns);
 
                 const chunk = [];
-                for (const rightRow of rightPartition) {
+                for (let rightIdx = 0; rightIdx < rightPartition.length; rightIdx++) {
                     if (totalYielded >= limit) break;
 
+                    const rightRow = rightPartition[rightIdx];
                     const key = rightRow[rightKeyIndex];
-                    const leftRows = hashMap.get(key);
+                    const leftEntries = hashMap.get(key);
 
-                    if (leftRows) {
-                        for (const leftRow of leftRows) {
+                    if (leftEntries) {
+                        // Track that this right row matched (for RIGHT/FULL)
+                        if (matchedRightRows) {
+                            matchedRightRows.add(`${partitionId}_${rightIdx}`);
+                        }
+
+                        for (const { row: leftRow, index: leftIdx } of leftEntries) {
                             if (totalYielded >= limit) break;
 
-                            const mergedRow = [...leftRow, ...rightRow];
-                            chunk.push(mergedRow);
+                            // Track that this left row matched (for LEFT/FULL)
+                            if (matchedLeftIndices) {
+                                matchedLeftIndices.add(leftIdx);
+                            }
+
+                            chunk.push([...leftRow, ...rightRow]);
                             totalYielded++;
 
-                            // Yield in chunks to avoid memory buildup
                             if (chunk.length >= this.chunkSize) {
-                                yield {
-                                    columns: [...leftMeta.columns, ...rightMeta.columns],
-                                    rows: chunk.splice(0),
-                                };
+                                yield { columns: resultColumns, rows: chunk.splice(0) };
+                            }
+                        }
+                    }
+                }
+
+                // For LEFT/FULL: emit unmatched left rows with NULL right side
+                if (isLeftOuter && matchedLeftIndices) {
+                    for (let i = 0; i < leftPartition.length; i++) {
+                        if (totalYielded >= limit) break;
+                        if (!matchedLeftIndices.has(i)) {
+                            chunk.push([...leftPartition[i], ...rightNulls]);
+                            totalYielded++;
+                            if (chunk.length >= this.chunkSize) {
+                                yield { columns: resultColumns, rows: chunk.splice(0) };
                             }
                         }
                     }
@@ -3056,14 +4187,61 @@ class OPFSJoinExecutor {
 
                 // Yield remaining rows in chunk
                 if (chunk.length > 0) {
-                    yield {
-                        columns: [...leftMeta.columns, ...rightMeta.columns],
-                        rows: chunk,
-                    };
+                    yield { columns: resultColumns, rows: chunk };
                 }
             }
 
-            console.log(`[OPFSJoin] Join complete: ${totalYielded} result rows`);
+            // For LEFT/FULL: handle left-only partitions (no matching right data)
+            if (isLeftOuter) {
+                for (const partitionId of leftMeta.partitionsUsed) {
+                    if (totalYielded >= limit) break;
+                    if (bothSidesPartitions.has(partitionId)) continue;  // Already processed
+
+                    const leftPartition = await this._loadPartition('left', partitionId, leftMeta.columns);
+                    const chunk = [];
+                    for (const leftRow of leftPartition) {
+                        if (totalYielded >= limit) break;
+                        chunk.push([...leftRow, ...rightNulls]);
+                        totalYielded++;
+                        if (chunk.length >= this.chunkSize) {
+                            yield { columns: resultColumns, rows: chunk.splice(0) };
+                        }
+                    }
+                    if (chunk.length > 0) {
+                        yield { columns: resultColumns, rows: chunk };
+                    }
+                }
+            }
+
+            // For RIGHT/FULL: emit unmatched right rows with NULL left side
+            if (isRightOuter) {
+                for (const partitionId of rightMeta.partitionsUsed) {
+                    if (totalYielded >= limit) break;
+
+                    const rightPartition = await this._loadPartition('right', partitionId, rightMeta.columns);
+                    const chunk = [];
+
+                    for (let rightIdx = 0; rightIdx < rightPartition.length; rightIdx++) {
+                        if (totalYielded >= limit) break;
+
+                        // Check if this row was matched during the main join
+                        const rowKey = `${partitionId}_${rightIdx}`;
+                        if (!matchedRightRows.has(rowKey)) {
+                            chunk.push([...leftNulls, ...rightPartition[rightIdx]]);
+                            totalYielded++;
+                            if (chunk.length >= this.chunkSize) {
+                                yield { columns: resultColumns, rows: chunk.splice(0) };
+                            }
+                        }
+                    }
+
+                    if (chunk.length > 0) {
+                        yield { columns: resultColumns, rows: chunk };
+                    }
+                }
+            }
+
+            console.log(`[OPFSJoin] ${joinType} JOIN complete: ${totalYielded} result rows`);
             console.log(`[OPFSJoin] Stats:`, this.getStats());
 
         } finally {
@@ -3074,14 +4252,19 @@ class OPFSJoinExecutor {
 
     /**
      * Partition a stream of data to OPFS files by hash(key)
+     * @param {AsyncGenerator} stream - Data stream to partition
+     * @param {string} keyColumn - Column name to use as partition key
+     * @param {string} side - 'left' or 'right' table
+     * @param {boolean} collectKeys - If true, collect unique key values for semi-join optimization
      */
-    async _partitionToOPFS(stream, keyColumn, side) {
+    async _partitionToOPFS(stream, keyColumn, side, collectKeys = false) {
         const partitionBuffers = new Map();  // partitionId -> rows[]
         const flushThreshold = 500;  // Flush to OPFS when buffer reaches this size
         let columns = null;
         let keyIndex = -1;
         let totalRows = 0;
         const partitionsUsed = new Set();
+        const collectedKeys = collectKeys ? new Set() : null;
 
         for await (const chunk of stream) {
             if (!columns) {
@@ -3096,6 +4279,11 @@ class OPFSJoinExecutor {
                 const key = row[keyIndex];
                 const partitionId = this._hashToPartition(key);
                 partitionsUsed.add(partitionId);
+
+                // Collect unique keys for semi-join optimization
+                if (collectKeys && key !== null && key !== undefined) {
+                    collectedKeys.add(key);
+                }
 
                 if (!partitionBuffers.has(partitionId)) {
                     partitionBuffers.set(partitionId, []);
@@ -3124,7 +4312,7 @@ class OPFSJoinExecutor {
             this.stats.rightRowsWritten = totalRows;
         }
 
-        return { columns, totalRows, partitionsUsed };
+        return { columns, totalRows, partitionsUsed, collectedKeys };
     }
 
     /**
@@ -4129,6 +5317,149 @@ class Vault {
      */
     async tables() {
         return workerRPC('vault:tables', {});
+    }
+
+    // =========================================================================
+    // Export Operations
+    // =========================================================================
+
+    /**
+     * Export a table to Lance format bytes.
+     * @param {string} tableName - Name of the table to export
+     * @returns {Promise<Uint8Array>} Lance file bytes
+     */
+    async exportToLance(tableName) {
+        // Get table schema
+        const schemaResult = await this.exec(`SELECT * FROM ${tableName} LIMIT 0`);
+        if (!schemaResult || !schemaResult.columns) {
+            throw new Error(`Table '${tableName}' not found or empty`);
+        }
+
+        // Get all data
+        const dataResult = await this.exec(`SELECT * FROM ${tableName}`);
+        if (!dataResult || !dataResult.rows || dataResult.rows.length === 0) {
+            throw new Error(`Table '${tableName}' is empty`);
+        }
+
+        // Create Lance writer
+        const writer = new PureLanceWriter();
+
+        // Infer column types and add to writer
+        const columns = dataResult.columns;
+        const rows = dataResult.rows;
+
+        for (let colIdx = 0; colIdx < columns.length; colIdx++) {
+            const colName = columns[colIdx];
+            const values = rows.map(row => row[colName] !== undefined ? row[colName] : row[colIdx]);
+
+            // Infer type from first non-null value
+            const firstValue = values.find(v => v !== null && v !== undefined);
+
+            if (firstValue === undefined) {
+                // All nulls - default to string
+                writer.addStringColumn(colName, values.map(v => v === null ? '' : String(v)));
+            } else if (typeof firstValue === 'bigint') {
+                writer.addInt64Column(colName, BigInt64Array.from(values.map(v => v === null ? 0n : BigInt(v))));
+            } else if (typeof firstValue === 'number') {
+                if (Number.isInteger(firstValue) && firstValue <= 2147483647 && firstValue >= -2147483648) {
+                    writer.addInt32Column(colName, Int32Array.from(values.map(v => v === null ? 0 : v)));
+                } else {
+                    writer.addFloat64Column(colName, Float64Array.from(values.map(v => v === null ? 0 : v)));
+                }
+            } else if (typeof firstValue === 'boolean') {
+                writer.addBoolColumn(colName, values.map(v => v === null ? false : v));
+            } else if (Array.isArray(firstValue)) {
+                // Vector column
+                const dim = firstValue.length;
+                const flat = new Float32Array(values.length * dim);
+                for (let i = 0; i < values.length; i++) {
+                    const vec = values[i] || new Array(dim).fill(0);
+                    for (let j = 0; j < dim; j++) {
+                        flat[i * dim + j] = vec[j] || 0;
+                    }
+                }
+                writer.addVectorColumn(colName, flat, dim);
+            } else {
+                // String column
+                writer.addStringColumn(colName, values.map(v => v === null ? '' : String(v)));
+            }
+        }
+
+        return writer.finalize();
+    }
+
+    /**
+     * Upload binary data to a URL using PUT.
+     * @param {Uint8Array} data - Binary data to upload
+     * @param {string} url - Signed URL for upload
+     * @param {Object} [options] - Upload options
+     * @param {Function} [options.onProgress] - Progress callback (loaded, total)
+     * @returns {Promise<Response>} Fetch response
+     */
+    async uploadToUrl(data, url, options = {}) {
+        const { onProgress } = options;
+
+        if (onProgress && typeof XMLHttpRequest !== 'undefined') {
+            // Use XHR for progress support
+            return new Promise((resolve, reject) => {
+                const xhr = new XMLHttpRequest();
+                xhr.open('PUT', url, true);
+                xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+
+                xhr.upload.onprogress = (e) => {
+                    if (e.lengthComputable) {
+                        onProgress(e.loaded, e.total);
+                    }
+                };
+
+                xhr.onload = () => {
+                    if (xhr.status >= 200 && xhr.status < 300) {
+                        resolve({ ok: true, status: xhr.status });
+                    } else {
+                        reject(new Error(`Upload failed: ${xhr.status} ${xhr.statusText}`));
+                    }
+                };
+
+                xhr.onerror = () => reject(new Error('Upload failed: network error'));
+                xhr.send(data);
+            });
+        }
+
+        // Simple fetch for no progress
+        const response = await fetch(url, {
+            method: 'PUT',
+            body: data,
+            headers: {
+                'Content-Type': 'application/octet-stream',
+            },
+        });
+
+        if (!response.ok) {
+            throw new Error(`Upload failed: ${response.status} ${response.statusText}`);
+        }
+
+        return response;
+    }
+
+    /**
+     * Export a table to Lance format and upload to a signed URL.
+     * @param {string} tableName - Name of the table to export
+     * @param {string} signedUrl - Pre-signed URL for upload (S3/R2/GCS)
+     * @param {Object} [options] - Export options
+     * @param {Function} [options.onProgress] - Progress callback (loaded, total)
+     * @returns {Promise<{size: number, url: string}>} Upload result
+     */
+    async exportToRemote(tableName, signedUrl, options = {}) {
+        // Export to Lance bytes
+        const lanceBytes = await this.exportToLance(tableName);
+
+        // Upload to signed URL
+        await this.uploadToUrl(lanceBytes, signedUrl, options);
+
+        return {
+            size: lanceBytes.length,
+            url: signedUrl.split('?')[0], // Return URL without query params
+        };
     }
 }
 
@@ -6255,6 +7586,7 @@ class LanceFile {
     /**
      * Find top-k most similar vectors to query.
      * Uses WebGPU if available, otherwise falls back to WASM SIMD.
+     * GPU-accelerated top-K selection for large result sets.
      * @param {number} colIdx - Column index with vectors
      * @param {Float32Array} queryVec - Query vector
      * @param {number} topK - Number of results to return
@@ -6281,15 +7613,8 @@ class LanceFile {
             // Batch compute with WebGPU
             const scores = await webgpuAccelerator.batchCosineSimilarity(queryVec, allVectors, true);
 
-            // Find top-k
-            const indexedScores = Array.from(scores).map((score, idx) => ({ idx, score }));
-            indexedScores.sort((a, b) => b.score - a.score);
-
-            const topResults = indexedScores.slice(0, topK);
-            const indices = new Uint32Array(topResults.map(r => r.idx));
-            const topScores = new Float32Array(topResults.map(r => r.score));
-
-            return { indices, scores: topScores };
+            // GPU-accelerated top-K selection for large result sets
+            return await gpuVectorSearch.topK(scores, null, topK, true);
         }
 
         // Fall back to WASM SIMD (uses batchCosineSimilarity internally)
@@ -6305,15 +7630,8 @@ class LanceFile {
         // Use WASM batch cosine similarity
         const scores = this.lanceql.batchCosineSimilarity(queryVec, allVectors, true);
 
-        // Find top-k
-        const indexedScores = Array.from(scores).map((score, idx) => ({ idx, score }));
-        indexedScores.sort((a, b) => b.score - a.score);
-
-        const topResults = indexedScores.slice(0, topK);
-        const indices = new Uint32Array(topResults.map(r => r.idx));
-        const topScores = new Float32Array(topResults.map(r => r.score));
-
-        return { indices, scores: topScores };
+        // GPU-accelerated top-K selection for large result sets
+        return await gpuVectorSearch.topK(scores, null, topK, true);
     }
 
     // ========================================================================
@@ -9736,6 +11054,11 @@ const TokenType = {
     FALSE: 'FALSE',
     GROUP: 'GROUP',
     HAVING: 'HAVING',
+    QUALIFY: 'QUALIFY',
+    ROLLUP: 'ROLLUP',
+    CUBE: 'CUBE',
+    GROUPING: 'GROUPING',
+    SETS: 'SETS',
     COUNT: 'COUNT',
     SUM: 'SUM',
     AVG: 'AVG',
@@ -9781,6 +11104,41 @@ const TokenType = {
     VECTOR: 'VECTOR',
     PRIMARY: 'PRIMARY',
     KEY: 'KEY',
+    // CTE keywords
+    WITH: 'WITH',
+    RECURSIVE: 'RECURSIVE',
+    UNION: 'UNION',
+    ALL: 'ALL',
+    // PIVOT/UNPIVOT keywords
+    PIVOT: 'PIVOT',
+    UNPIVOT: 'UNPIVOT',
+    FOR: 'FOR',
+    // Set operation keywords
+    INTERSECT: 'INTERSECT',
+    EXCEPT: 'EXCEPT',
+    // Window function keywords
+    OVER: 'OVER',
+    PARTITION: 'PARTITION',
+    ROW_NUMBER: 'ROW_NUMBER',
+    RANK: 'RANK',
+    DENSE_RANK: 'DENSE_RANK',
+    NTILE: 'NTILE',
+    LAG: 'LAG',
+    LEAD: 'LEAD',
+    FIRST_VALUE: 'FIRST_VALUE',
+    LAST_VALUE: 'LAST_VALUE',
+    NTH_VALUE: 'NTH_VALUE',
+    PERCENT_RANK: 'PERCENT_RANK',
+    CUME_DIST: 'CUME_DIST',
+    ROWS: 'ROWS',
+    RANGE: 'RANGE',
+    UNBOUNDED: 'UNBOUNDED',
+    PRECEDING: 'PRECEDING',
+    FOLLOWING: 'FOLLOWING',
+    CURRENT: 'CURRENT',
+    ROW: 'ROW',
+    // Query optimization
+    EXPLAIN: 'EXPLAIN',
 
     // Literals
     IDENTIFIER: 'IDENTIFIER',
@@ -9802,6 +11160,11 @@ const TokenType = {
     PLUS: 'PLUS',
     MINUS: 'MINUS',
     SLASH: 'SLASH',
+    LBRACKET: 'LBRACKET',
+    RBRACKET: 'RBRACKET',
+
+    // Array keyword
+    ARRAY: 'ARRAY',
 
     // Special
     EOF: 'EOF',
@@ -9831,6 +11194,11 @@ const KEYWORDS = {
     'FALSE': TokenType.FALSE,
     'GROUP': TokenType.GROUP,
     'HAVING': TokenType.HAVING,
+    'QUALIFY': TokenType.QUALIFY,
+    'ROLLUP': TokenType.ROLLUP,
+    'CUBE': TokenType.CUBE,
+    'GROUPING': TokenType.GROUPING,
+    'SETS': TokenType.SETS,
     'COUNT': TokenType.COUNT,
     'SUM': TokenType.SUM,
     'AVG': TokenType.AVG,
@@ -9874,6 +11242,42 @@ const KEYWORDS = {
     'VECTOR': TokenType.VECTOR,
     'PRIMARY': TokenType.PRIMARY,
     'KEY': TokenType.KEY,
+    // CTE keywords
+    'WITH': TokenType.WITH,
+    'RECURSIVE': TokenType.RECURSIVE,
+    'UNION': TokenType.UNION,
+    'ALL': TokenType.ALL,
+    // PIVOT/UNPIVOT keywords
+    'PIVOT': TokenType.PIVOT,
+    'UNPIVOT': TokenType.UNPIVOT,
+    'FOR': TokenType.FOR,
+    // Set operation keywords
+    'INTERSECT': TokenType.INTERSECT,
+    'EXCEPT': TokenType.EXCEPT,
+    // Window function keywords
+    'OVER': TokenType.OVER,
+    'PARTITION': TokenType.PARTITION,
+    'ROW_NUMBER': TokenType.ROW_NUMBER,
+    'RANK': TokenType.RANK,
+    'DENSE_RANK': TokenType.DENSE_RANK,
+    'NTILE': TokenType.NTILE,
+    'LAG': TokenType.LAG,
+    'LEAD': TokenType.LEAD,
+    'FIRST_VALUE': TokenType.FIRST_VALUE,
+    'LAST_VALUE': TokenType.LAST_VALUE,
+    'NTH_VALUE': TokenType.NTH_VALUE,
+    'PERCENT_RANK': TokenType.PERCENT_RANK,
+    'CUME_DIST': TokenType.CUME_DIST,
+    'ROWS': TokenType.ROWS,
+    'RANGE': TokenType.RANGE,
+    'UNBOUNDED': TokenType.UNBOUNDED,
+    'PRECEDING': TokenType.PRECEDING,
+    'FOLLOWING': TokenType.FOLLOWING,
+    'CURRENT': TokenType.CURRENT,
+    'ROW': TokenType.ROW,
+    // Query optimization
+    'EXPLAIN': TokenType.EXPLAIN,
+    'ARRAY': TokenType.ARRAY,
 };
 
 /**
@@ -9994,6 +11398,8 @@ class SQLLexer {
             case '+': return { type: TokenType.PLUS, value: '+' };
             case '-': return { type: TokenType.MINUS, value: '-' };
             case '/': return { type: TokenType.SLASH, value: '/' };
+            case '[': return { type: TokenType.LBRACKET, value: '[' };
+            case ']': return { type: TokenType.RBRACKET, value: ']' };
             case '=': return { type: TokenType.EQ, value: '=' };
             case '<':
                 if (this.peek() === '=') {
@@ -10076,9 +11482,24 @@ class SQLParser {
      * Parse SQL statement (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE)
      */
     parse() {
+        // Handle EXPLAIN prefix
+        if (this.check(TokenType.EXPLAIN)) {
+            this.advance();  // consume EXPLAIN
+            const statement = this.parse();  // Parse the inner statement
+            return { type: 'EXPLAIN', statement };
+        }
+
+        // Check for WITH clause (CTEs)
+        let ctes = [];
+        if (this.check(TokenType.WITH)) {
+            ctes = this.parseWithClause();
+        }
+
         // Dispatch based on first keyword
         if (this.check(TokenType.SELECT)) {
-            return this.parseSelect();
+            const result = this.parseSelect();
+            result.ctes = ctes;  // Attach CTEs to SELECT
+            return result;
         } else if (this.check(TokenType.INSERT)) {
             return this.parseInsert();
         } else if (this.check(TokenType.UPDATE)) {
@@ -10090,14 +11511,78 @@ class SQLParser {
         } else if (this.check(TokenType.DROP)) {
             return this.parseDropTable();
         } else {
-            throw new Error(`Unexpected token: ${this.current().type}. Expected SELECT, INSERT, UPDATE, DELETE, CREATE, or DROP`);
+            throw new Error(`Unexpected token: ${this.current().type}. Expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, or EXPLAIN`);
         }
     }
 
     /**
-     * Parse SELECT statement
+     * Parse WITH clause (Common Table Expressions)
+     * Syntax: WITH [RECURSIVE] name [(columns)] AS (subquery) [, ...]
      */
-    parseSelect() {
+    parseWithClause() {
+        this.expect(TokenType.WITH);
+        const isRecursive = !!this.match(TokenType.RECURSIVE);
+
+        const ctes = [];
+        do {
+            const name = this.expect(TokenType.IDENTIFIER).value;
+
+            // Optional column list
+            let columns = [];
+            if (this.match(TokenType.LPAREN)) {
+                columns.push(this.expect(TokenType.IDENTIFIER).value);
+                while (this.match(TokenType.COMMA)) {
+                    columns.push(this.expect(TokenType.IDENTIFIER).value);
+                }
+                this.expect(TokenType.RPAREN);
+            }
+
+            this.expect(TokenType.AS);
+            this.expect(TokenType.LPAREN);
+
+            // Parse CTE body - may contain UNION ALL for recursive CTEs
+            const body = this.parseCteBody(isRecursive);
+
+            this.expect(TokenType.RPAREN);
+
+            ctes.push({
+                name,
+                columns,
+                body,
+                recursive: isRecursive
+            });
+        } while (this.match(TokenType.COMMA));
+
+        return ctes;
+    }
+
+    /**
+     * Parse CTE body which may contain UNION ALL for recursive CTEs
+     */
+    parseCteBody(isRecursive) {
+        // Parse anchor query - disable set operation parsing, we handle UNION ALL here
+        const anchor = this.parseSelect(true, true);  // isSubquery=true, noSetOps=true
+
+        // Check for UNION ALL (required for recursive CTEs)
+        if (isRecursive && this.match(TokenType.UNION)) {
+            this.expect(TokenType.ALL);
+            const recursive = this.parseSelect(true, true);  // Same for recursive part
+            return {
+                type: 'RECURSIVE_CTE',
+                anchor,
+                recursive
+            };
+        }
+
+        return anchor;
+    }
+
+    /**
+     * Parse SELECT statement
+     * @param {boolean} isSubquery - If true, don't require EOF at end (for subqueries)
+     * @param {boolean} noSetOps - If true, don't parse set operations (for CTE body parsing)
+     */
+    parseSelect(isSubquery = false, noSetOps = false) {
         this.expect(TokenType.SELECT);
 
         // DISTINCT
@@ -10120,23 +11605,93 @@ class SQLParser {
             joins.push(this.parseJoinClause());
         }
 
+        // PIVOT clause (optional)
+        // Syntax: PIVOT (aggregate FOR column IN (value1, value2, ...))
+        let pivot = null;
+        if (this.match(TokenType.PIVOT)) {
+            this.expect(TokenType.LPAREN);
+
+            // Parse aggregate function
+            const aggFunc = this.parsePrimary();
+            if (aggFunc.type !== 'call') {
+                throw new Error('PIVOT requires an aggregate function (e.g., SUM, COUNT, AVG)');
+            }
+
+            this.expect(TokenType.FOR);
+            const forColumn = this.expect(TokenType.IDENTIFIER).value;
+
+            this.expect(TokenType.IN);
+            this.expect(TokenType.LPAREN);
+
+            // Parse IN values
+            const inValues = [];
+            inValues.push(this.parsePrimary().value);
+            while (this.match(TokenType.COMMA)) {
+                inValues.push(this.parsePrimary().value);
+            }
+            this.expect(TokenType.RPAREN);
+            this.expect(TokenType.RPAREN);
+
+            pivot = {
+                aggregate: aggFunc,
+                forColumn,
+                inValues
+            };
+        }
+
+        // UNPIVOT clause (optional)
+        // Syntax: UNPIVOT (valueColumn FOR nameColumn IN (col1, col2, ...))
+        let unpivot = null;
+        if (this.match(TokenType.UNPIVOT)) {
+            this.expect(TokenType.LPAREN);
+
+            const valueColumn = this.expect(TokenType.IDENTIFIER).value;
+
+            this.expect(TokenType.FOR);
+            const nameColumn = this.expect(TokenType.IDENTIFIER).value;
+
+            this.expect(TokenType.IN);
+            this.expect(TokenType.LPAREN);
+
+            // Parse IN columns
+            const inColumns = [];
+            inColumns.push(this.expect(TokenType.IDENTIFIER).value);
+            while (this.match(TokenType.COMMA)) {
+                inColumns.push(this.expect(TokenType.IDENTIFIER).value);
+            }
+            this.expect(TokenType.RPAREN);
+            this.expect(TokenType.RPAREN);
+
+            unpivot = {
+                valueColumn,
+                nameColumn,
+                inColumns
+            };
+        }
+
         // WHERE
         let where = null;
         if (this.match(TokenType.WHERE)) {
             where = this.parseExpr();
         }
 
-        // GROUP BY
+        // GROUP BY (supports ROLLUP, CUBE, GROUPING SETS)
         let groupBy = [];
         if (this.match(TokenType.GROUP)) {
             this.expect(TokenType.BY);
-            groupBy = this.parseColumnList();
+            groupBy = this.parseGroupByList();
         }
 
         // HAVING
         let having = null;
         if (this.match(TokenType.HAVING)) {
             having = this.parseExpr();
+        }
+
+        // QUALIFY - filter on window function results
+        let qualify = null;
+        if (this.match(TokenType.QUALIFY)) {
+            qualify = this.parseExpr();
         }
 
         // NEAR - vector similarity search
@@ -10179,50 +11734,103 @@ class SQLParser {
             search = { query, searchRow, column, topK, encoder };
         }
 
-        // ORDER BY and LIMIT can appear in either order
-        let orderBy = [];
-        let limit = null;
-        let offset = null;
-
-        // First pass: check for ORDER BY or LIMIT
-        if (this.match(TokenType.ORDER)) {
-            this.expect(TokenType.BY);
-            orderBy = this.parseOrderByList();
-        }
-        if (this.match(TokenType.LIMIT)) {
-            limit = parseInt(this.expect(TokenType.NUMBER).value, 10);
-        }
-
-        // Second pass: allow ORDER BY after LIMIT (non-standard but common)
-        if (orderBy.length === 0 && this.match(TokenType.ORDER)) {
-            this.expect(TokenType.BY);
-            orderBy = this.parseOrderByList();
-        }
-
-        // OFFSET (can come after LIMIT)
-        if (this.match(TokenType.OFFSET)) {
-            offset = parseInt(this.expect(TokenType.NUMBER).value, 10);
-        }
-
-        // Check that we've consumed all tokens
-        if (this.current().type !== TokenType.EOF) {
-            throw new Error(`Unexpected token after query: ${this.current().type} (${this.current().value}). Check your SQL syntax.`);
-        }
-
-        return {
+        // Build the base SELECT AST (without ORDER BY/LIMIT/OFFSET yet)
+        const baseAst = {
             type: 'SELECT',
             distinct,
             columns,
             from,
             joins,
+            pivot,
+            unpivot,
             where,
             groupBy,
             having,
+            qualify,
             search,
-            orderBy,
-            limit,
-            offset,
+            orderBy: [],
+            limit: null,
+            offset: null,
         };
+
+        // Check for set operations (UNION, INTERSECT, EXCEPT) BEFORE parsing ORDER BY/LIMIT
+        // This ensures ORDER BY/LIMIT apply to the set operation result, not individual SELECTs
+        if (!noSetOps && (this.check(TokenType.UNION) || this.check(TokenType.INTERSECT) || this.check(TokenType.EXCEPT))) {
+            const operator = this.advance().type;
+            const all = !!this.match(TokenType.ALL);
+            // Parse right side without set operations (will be handled here) and without ORDER BY/LIMIT
+            const right = this.parseSelect(true, true);  // noSetOps=true for right side
+
+            // Now parse ORDER BY/LIMIT/OFFSET for the combined result
+            let orderBy = [];
+            let limit = null;
+            let offset = null;
+
+            if (this.match(TokenType.ORDER)) {
+                this.expect(TokenType.BY);
+                orderBy = this.parseOrderByList();
+            }
+            if (this.match(TokenType.LIMIT)) {
+                limit = parseInt(this.expect(TokenType.NUMBER).value, 10);
+            }
+            if (orderBy.length === 0 && this.match(TokenType.ORDER)) {
+                this.expect(TokenType.BY);
+                orderBy = this.parseOrderByList();
+            }
+            if (this.match(TokenType.OFFSET)) {
+                offset = parseInt(this.expect(TokenType.NUMBER).value, 10);
+            }
+
+            // Check that we've consumed all tokens (unless this is a subquery)
+            if (!isSubquery && this.current().type !== TokenType.EOF) {
+                throw new Error(`Unexpected token after query: ${this.current().type} (${this.current().value}). Check your SQL syntax.`);
+            }
+
+            return {
+                type: 'SET_OPERATION',
+                operator,
+                all,
+                left: baseAst,
+                right,
+                orderBy,
+                limit,
+                offset,
+            };
+        }
+
+        // No set operation - parse ORDER BY/LIMIT/OFFSET for this SELECT
+        // UNLESS noSetOps is true (we're part of a set operation and ORDER BY/LIMIT belong to outer context)
+        if (!noSetOps) {
+            let orderBy = [];
+            let limit = null;
+            let offset = null;
+
+            if (this.match(TokenType.ORDER)) {
+                this.expect(TokenType.BY);
+                orderBy = this.parseOrderByList();
+            }
+            if (this.match(TokenType.LIMIT)) {
+                limit = parseInt(this.expect(TokenType.NUMBER).value, 10);
+            }
+            if (orderBy.length === 0 && this.match(TokenType.ORDER)) {
+                this.expect(TokenType.BY);
+                orderBy = this.parseOrderByList();
+            }
+            if (this.match(TokenType.OFFSET)) {
+                offset = parseInt(this.expect(TokenType.NUMBER).value, 10);
+            }
+
+            baseAst.orderBy = orderBy;
+            baseAst.limit = limit;
+            baseAst.offset = offset;
+        }
+
+        // Check that we've consumed all tokens (unless this is a subquery)
+        if (!isSubquery && this.current().type !== TokenType.EOF) {
+            throw new Error(`Unexpected token after query: ${this.current().type} (${this.current().value}). Check your SQL syntax.`);
+        }
+
+        return baseAst;
     }
 
     /**
@@ -10301,19 +11909,28 @@ class SQLParser {
         }
         // Vector literal: [1.0, 2.0, 3.0]
         if (this.check(TokenType.LBRACKET)) {
-            return this.parseVectorLiteral();
+            return this.parseArrayLiteral();
         }
 
         throw new Error(`Expected value, got ${this.current().type}`);
     }
 
     /**
-     * Parse vector literal: [1.0, 2.0, 3.0]
+     * Parse array literal: [1, 2, 3] or ARRAY[1, 2, 3]
      */
-    parseVectorLiteral() {
-        // Note: This requires adding LBRACKET/RBRACKET tokens
-        // For now, we'll handle arrays as strings that start with '['
-        throw new Error('Vector literals not yet supported. Use INSERT with individual columns.');
+    parseArrayLiteral() {
+        this.expect(TokenType.LBRACKET);
+        const elements = [];
+
+        if (!this.check(TokenType.RBRACKET)) {
+            elements.push(this.parseExpr());
+            while (this.match(TokenType.COMMA)) {
+                elements.push(this.parseExpr());
+            }
+        }
+
+        this.expect(TokenType.RBRACKET);
+        return { type: 'array', elements };
     }
 
     /**
@@ -10639,6 +12256,63 @@ class SQLParser {
         return columns;
     }
 
+    /**
+     * Parse GROUP BY list with support for ROLLUP, CUBE, GROUPING SETS
+     * Returns array of items, each with { type, column/columns/sets }
+     */
+    parseGroupByList() {
+        const items = [];
+
+        do {
+            if (this.match(TokenType.ROLLUP)) {
+                // ROLLUP(col1, col2, ...)
+                this.expect(TokenType.LPAREN);
+                const columns = this.parseColumnList();
+                this.expect(TokenType.RPAREN);
+                items.push({ type: 'ROLLUP', columns });
+            } else if (this.match(TokenType.CUBE)) {
+                // CUBE(col1, col2, ...)
+                this.expect(TokenType.LPAREN);
+                const columns = this.parseColumnList();
+                this.expect(TokenType.RPAREN);
+                items.push({ type: 'CUBE', columns });
+            } else if (this.match(TokenType.GROUPING)) {
+                // GROUPING SETS((col1, col2), (col1), ())
+                this.expect(TokenType.SETS);
+                this.expect(TokenType.LPAREN);
+                const sets = this.parseGroupingSets();
+                this.expect(TokenType.RPAREN);
+                items.push({ type: 'GROUPING_SETS', sets });
+            } else {
+                // Simple column
+                items.push({ type: 'COLUMN', column: this.expect(TokenType.IDENTIFIER).value });
+            }
+        } while (this.match(TokenType.COMMA));
+
+        return items;
+    }
+
+    /**
+     * Parse the sets inside GROUPING SETS(...)
+     * Each set is (col1, col2) or () for grand total
+     */
+    parseGroupingSets() {
+        const sets = [];
+
+        do {
+            this.expect(TokenType.LPAREN);
+            if (this.check(TokenType.RPAREN)) {
+                // Empty set () = grand total
+                sets.push([]);
+            } else {
+                sets.push(this.parseColumnList());
+            }
+            this.expect(TokenType.RPAREN);
+        } while (this.match(TokenType.COMMA));
+
+        return sets;
+    }
+
     parseOrderByList() {
         const items = [this.parseOrderByItem()];
 
@@ -10712,9 +12386,18 @@ class SQLParser {
             };
         }
 
-        // IN
+        // IN - can be a list of values or a subquery
         if (this.match(TokenType.IN)) {
             this.expect(TokenType.LPAREN);
+
+            // Check if this is a subquery (starts with SELECT)
+            if (this.check(TokenType.SELECT)) {
+                const subquery = this.parseSelect(true);  // isSubquery=true
+                this.expect(TokenType.RPAREN);
+                return { type: 'in', expr: left, values: [{ type: 'subquery', query: subquery }] };
+            }
+
+            // Otherwise, parse as list of values
             const values = [];
             values.push(this.parsePrimary());
             while (this.match(TokenType.COMMA)) {
@@ -10811,6 +12494,32 @@ class SQLParser {
             return { type: 'literal', value: false };
         }
 
+        // ARRAY[...] literal
+        if (this.match(TokenType.ARRAY)) {
+            let result = this.parseArrayLiteral();
+            // Check for subscript: ARRAY[1,2,3][2]
+            while (this.check(TokenType.LBRACKET)) {
+                this.advance();
+                const index = this.parseExpr();
+                this.expect(TokenType.RBRACKET);
+                result = { type: 'subscript', array: result, index };
+            }
+            return result;
+        }
+
+        // Bare bracket array [...]
+        if (this.check(TokenType.LBRACKET)) {
+            let result = this.parseArrayLiteral();
+            // Check for subscript: [1,2,3][2]
+            while (this.check(TokenType.LBRACKET)) {
+                this.advance();
+                const index = this.parseExpr();
+                this.expect(TokenType.RBRACKET);
+                result = { type: 'subscript', array: result, index };
+            }
+            return result;
+        }
+
         // Number
         if (this.check(TokenType.NUMBER)) {
             const value = this.advance().value;
@@ -10823,8 +12532,31 @@ class SQLParser {
             return { type: 'literal', value };
         }
 
+        // Window function keywords (ROW_NUMBER, RANK, etc.)
+        const windowFuncTokens = [
+            TokenType.ROW_NUMBER, TokenType.RANK, TokenType.DENSE_RANK, TokenType.NTILE,
+            TokenType.LAG, TokenType.LEAD, TokenType.FIRST_VALUE, TokenType.LAST_VALUE, TokenType.NTH_VALUE,
+            TokenType.PERCENT_RANK, TokenType.CUME_DIST
+        ];
+        if (windowFuncTokens.some(t => this.check(t))) {
+            const name = this.advance().type;  // Use token type as function name
+            this.expect(TokenType.LPAREN);
+            const args = [];
+            if (!this.check(TokenType.RPAREN)) {
+                args.push(this.parseExpr());
+                while (this.match(TokenType.COMMA)) {
+                    args.push(this.parseExpr());
+                }
+            }
+            this.expect(TokenType.RPAREN);
+
+            // OVER clause is required for window functions
+            const over = this.parseOverClause();
+            return { type: 'call', name, args, distinct: false, over };
+        }
+
         // Function call or column reference
-        if (this.check(TokenType.IDENTIFIER) || this.check(TokenType.COUNT, TokenType.SUM, TokenType.AVG, TokenType.MIN, TokenType.MAX)) {
+        if (this.check(TokenType.IDENTIFIER) || this.check(TokenType.COUNT, TokenType.SUM, TokenType.AVG, TokenType.MIN, TokenType.MAX, TokenType.GROUPING)) {
             const name = this.advance().value;
 
             // Function call
@@ -10846,7 +12578,14 @@ class SQLParser {
                 }
 
                 this.expect(TokenType.RPAREN);
-                return { type: 'call', name: name.toUpperCase(), args, distinct };
+
+                // Check for OVER clause (aggregate as window function)
+                let over = null;
+                if (this.check(TokenType.OVER)) {
+                    over = this.parseOverClause();
+                }
+
+                return { type: 'call', name: name.toUpperCase(), args, distinct, over };
             }
 
             // Column reference - check for table.column syntax
@@ -10860,11 +12599,27 @@ class SQLParser {
             }
 
             // Simple column reference
-            return { type: 'column', column: name };
+            let result = { type: 'column', column: name };
+
+            // Check for array subscript: column[index]
+            if (this.check(TokenType.LBRACKET)) {
+                this.advance();  // consume [
+                const index = this.parseExpr();
+                this.expect(TokenType.RBRACKET);
+                result = { type: 'subscript', array: result, index };
+            }
+
+            return result;
         }
 
-        // Parenthesized expression
+        // Parenthesized expression or subquery
         if (this.match(TokenType.LPAREN)) {
+            // Check if this is a subquery (starts with SELECT)
+            if (this.check(TokenType.SELECT)) {
+                const subquery = this.parseSelect(true);  // isSubquery=true
+                this.expect(TokenType.RPAREN);
+                return { type: 'subquery', query: subquery };
+            }
             const expr = this.parseExpr();
             this.expect(TokenType.RPAREN);
             return expr;
@@ -10877,6 +12632,96 @@ class SQLParser {
 
         throw new Error(`Unexpected token: ${this.current().type} (${this.current().value})`);
     }
+
+    /**
+     * Parse OVER clause for window functions
+     * Syntax: OVER ([PARTITION BY expr, ...] [ORDER BY expr [ASC|DESC], ...] [frame_clause])
+     */
+    parseOverClause() {
+        this.expect(TokenType.OVER);
+        this.expect(TokenType.LPAREN);
+
+        const over = { partitionBy: [], orderBy: [], frame: null };
+
+        // PARTITION BY clause
+        if (this.match(TokenType.PARTITION)) {
+            this.expect(TokenType.BY);
+            over.partitionBy.push(this.parseExpr());
+            while (this.match(TokenType.COMMA)) {
+                over.partitionBy.push(this.parseExpr());
+            }
+        }
+
+        // ORDER BY clause
+        if (this.match(TokenType.ORDER)) {
+            this.expect(TokenType.BY);
+            over.orderBy = this.parseOrderByList();
+        }
+
+        // Optional frame clause: ROWS/RANGE BETWEEN ... AND ...
+        if (this.check(TokenType.ROWS) || this.check(TokenType.RANGE)) {
+            over.frame = this.parseFrameClause();
+        }
+
+        this.expect(TokenType.RPAREN);
+        return over;
+    }
+
+    /**
+     * Parse frame clause for window functions
+     * Syntax: ROWS|RANGE BETWEEN frame_start AND frame_end
+     *         or: ROWS|RANGE frame_start
+     */
+    parseFrameClause() {
+        const frameType = this.advance().type;  // ROWS or RANGE
+        const frame = { type: frameType, start: null, end: null };
+
+        // Check for BETWEEN ... AND ... syntax
+        if (this.match(TokenType.BETWEEN)) {
+            frame.start = this.parseFrameBound();
+            this.expect(TokenType.AND);
+            frame.end = this.parseFrameBound();
+        } else {
+            // Single bound (implies CURRENT ROW as end for some DBs, or just start)
+            frame.start = this.parseFrameBound();
+            frame.end = { type: 'CURRENT ROW' };  // Default end
+        }
+
+        return frame;
+    }
+
+    /**
+     * Parse a frame bound
+     * Options: UNBOUNDED PRECEDING, UNBOUNDED FOLLOWING, CURRENT ROW, N PRECEDING, N FOLLOWING
+     */
+    parseFrameBound() {
+        if (this.match(TokenType.UNBOUNDED)) {
+            if (this.match(TokenType.PRECEDING)) {
+                return { type: 'UNBOUNDED PRECEDING' };
+            } else if (this.match(TokenType.FOLLOWING)) {
+                return { type: 'UNBOUNDED FOLLOWING' };
+            }
+            throw new Error('Expected PRECEDING or FOLLOWING after UNBOUNDED');
+        }
+
+        if (this.match(TokenType.CURRENT)) {
+            this.expect(TokenType.ROW);
+            return { type: 'CURRENT ROW' };
+        }
+
+        // N PRECEDING or N FOLLOWING
+        if (this.check(TokenType.NUMBER)) {
+            const n = parseInt(this.advance().value, 10);
+            if (this.match(TokenType.PRECEDING)) {
+                return { type: 'PRECEDING', offset: n };
+            } else if (this.match(TokenType.FOLLOWING)) {
+                return { type: 'FOLLOWING', offset: n };
+            }
+            throw new Error('Expected PRECEDING or FOLLOWING after number');
+        }
+
+        throw new Error('Invalid frame bound');
+    }
 }
 
 /**
@@ -10887,6 +12732,8 @@ class SQLExecutor {
         this.file = file;
         this.columnMap = {};
         this.columnTypes = [];
+        this._cteResults = new Map();  // Store materialized CTE results
+        this._database = null;          // Reference to LanceDatabase for subqueries
 
         // Build column name -> index map
         if (file.columnNames) {
@@ -10894,6 +12741,13 @@ class SQLExecutor {
                 this.columnMap[name.toLowerCase()] = idx;
             });
         }
+    }
+
+    /**
+     * Set reference to parent database for CTE/subquery execution
+     */
+    setDatabase(db) {
+        this._database = db;
     }
 
     /**
@@ -10980,8 +12834,8 @@ class SQLExecutor {
                     queryPlan: plan,  // Include plan in result
                 };
             }
-            // For aggregations with SEARCH, we need to run search first
-            if (ast.search) {
+            // For aggregations with SEARCH/NEAR, we need to run search first
+            if (ast.search || this._extractNearCondition(ast.where)) {
                 return await this.executeAggregateWithSearch(ast, totalRows, onProgress);
             }
             return await this.executeAggregateQuery(ast, totalRows, onProgress);
@@ -11047,9 +12901,34 @@ class SQLExecutor {
             rows.push(row);
         }
 
-        // Apply ORDER BY
+        // Apply PIVOT transformation (rows to columns with aggregation)
+        if (ast.pivot) {
+            const pivotResult = this._executePivot(rows, outputColumns, ast.pivot);
+            rows.length = 0;
+            rows.push(...pivotResult.rows);
+            outputColumns.length = 0;
+            outputColumns.push(...pivotResult.columns);
+        }
+
+        // Apply UNPIVOT transformation (columns to rows)
+        if (ast.unpivot) {
+            const unpivotResult = this._executeUnpivot(rows, outputColumns, ast.unpivot);
+            rows.length = 0;
+            rows.push(...unpivotResult.rows);
+            outputColumns.length = 0;
+            outputColumns.push(...unpivotResult.columns);
+        }
+
+        // Apply DISTINCT (GPU-accelerated for large result sets)
+        if (ast.distinct) {
+            const uniqueRows = await this.applyDistinct(rows);
+            rows.length = 0;
+            rows.push(...uniqueRows);
+        }
+
+        // Apply ORDER BY (GPU-accelerated for large result sets)
         if (ast.orderBy && ast.orderBy.length > 0) {
-            this.applyOrderBy(rows, ast.orderBy, outputColumns);
+            await this.applyOrderBy(rows, ast.orderBy, outputColumns);
         }
 
         // Build column names for output
@@ -11340,9 +13219,8 @@ class SQLExecutor {
         );
 
         if (!vectorColName) {
-            // No vector column found, fall back to text-based search
-            // For now, throw an error - full text search not implemented yet
-            throw new Error(`NEAR requires a vector column. Add 'embedding' column or use LIKE for text patterns.`);
+            // No vector column found, fall back to BM25 text search
+            return await this._executeBM25Search(nearInfo, totalRows);
         }
 
         // Use existing vector search infrastructure
@@ -11355,6 +13233,349 @@ class SQLExecutor {
         } catch (e) {
             console.error('[SQLExecutor] Vector search failed:', e);
             throw new Error(`NEAR search failed: ${e.message}`);
+        }
+    }
+
+    /**
+     * Execute BM25 full-text search when no vector column exists.
+     * @private
+     */
+    async _executeBM25Search(nearInfo, totalRows) {
+        const { column, text, limit } = nearInfo;
+        const colIdx = this.columnMap[column.toLowerCase()];
+
+        if (colIdx === undefined) {
+            throw new Error(`Column '${column}' not found for text search`);
+        }
+
+        // Step 1: Tokenize query
+        const queryTokens = this._tokenize(text);
+        if (queryTokens.length === 0) return [];
+
+        // Step 2: Get or build inverted index for this column
+        const index = await this._getOrBuildFTSIndex(colIdx, totalRows);
+
+        // Step 3: Compute BM25 scores
+        const scores = this._computeBM25Scores(queryTokens, index);
+
+        // Step 4: Return top-K indices
+        return this._topKByScore(scores, limit);
+    }
+
+    /**
+     * Tokenize text for BM25 search.
+     * @private
+     */
+    _tokenize(text) {
+        if (!text || typeof text !== 'string') return [];
+
+        return text
+            .toLowerCase()
+            .replace(/[^\w\s]/g, ' ')  // Remove punctuation
+            .split(/\s+/)              // Split on whitespace
+            .filter(t => t.length > 1) // Remove single chars
+            .filter(t => !this._isStopWord(t)); // Remove stop words
+    }
+
+    /**
+     * Check if word is a stop word.
+     * @private
+     */
+    _isStopWord(word) {
+        const stopWords = new Set([
+            'a', 'an', 'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
+            'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been',
+            'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would',
+            'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'need',
+            'it', 'its', 'this', 'that', 'these', 'those', 'i', 'you', 'he', 'she',
+            'we', 'they', 'what', 'which', 'who', 'whom', 'where', 'when', 'why', 'how'
+        ]);
+        return stopWords.has(word);
+    }
+
+    /**
+     * Get or build inverted index for a text column.
+     * @private
+     */
+    async _getOrBuildFTSIndex(colIdx, totalRows) {
+        const cacheKey = `fts_${colIdx}`;
+        if (this._ftsIndexCache?.has(cacheKey)) {
+            return this._ftsIndexCache.get(cacheKey);
+        }
+
+        // Build index
+        const index = {
+            termDocs: new Map(),    // term -> Set of docIds
+            termFreqs: new Map(),   // term -> Map(docId -> freq)
+            docLengths: new Map(),  // docId -> word count
+            totalDocs: 0,
+            avgDocLength: 0,
+        };
+
+        // Read all text from column in batches
+        const batchSize = 1000;
+        let totalLength = 0;
+
+        for (let start = 0; start < totalRows; start += batchSize) {
+            const end = Math.min(start + batchSize, totalRows);
+            const indices = Array.from({ length: end - start }, (_, i) => start + i);
+            const texts = await this.readColumnData(colIdx, indices);
+
+            for (let i = 0; i < texts.length; i++) {
+                const docId = start + i;
+                const text = texts[i];
+                if (!text || typeof text !== 'string') continue;
+
+                const tokens = this._tokenize(text);
+                index.docLengths.set(docId, tokens.length);
+                totalLength += tokens.length;
+                index.totalDocs++;
+
+                // Count term frequencies
+                const termCounts = new Map();
+                for (const token of tokens) {
+                    termCounts.set(token, (termCounts.get(token) || 0) + 1);
+                }
+
+                // Update inverted index
+                for (const [term, freq] of termCounts) {
+                    if (!index.termDocs.has(term)) {
+                        index.termDocs.set(term, new Set());
+                        index.termFreqs.set(term, new Map());
+                    }
+                    index.termDocs.get(term).add(docId);
+                    index.termFreqs.get(term).set(docId, freq);
+                }
+            }
+        }
+
+        index.avgDocLength = index.totalDocs > 0 ? totalLength / index.totalDocs : 0;
+
+        // Cache the index
+        if (!this._ftsIndexCache) this._ftsIndexCache = new Map();
+        this._ftsIndexCache.set(cacheKey, index);
+
+        return index;
+    }
+
+    /**
+     * Compute BM25 scores for query tokens against indexed documents.
+     * @private
+     */
+    _computeBM25Scores(queryTokens, index) {
+        const k1 = 1.2;
+        const b = 0.75;
+        const scores = new Map();
+
+        for (const term of queryTokens) {
+            const docIds = index.termDocs.get(term);
+            if (!docIds) continue;
+
+            // IDF: log((N - n + 0.5) / (n + 0.5) + 1)
+            const n = docIds.size;
+            const N = index.totalDocs;
+            const idf = Math.log((N - n + 0.5) / (n + 0.5) + 1);
+
+            for (const docId of docIds) {
+                const tf = index.termFreqs.get(term).get(docId);
+                const docLen = index.docLengths.get(docId);
+                const avgDL = index.avgDocLength;
+
+                // BM25 term score
+                const numerator = tf * (k1 + 1);
+                const denominator = tf + k1 * (1 - b + b * docLen / avgDL);
+                const termScore = idf * (numerator / denominator);
+
+                scores.set(docId, (scores.get(docId) || 0) + termScore);
+            }
+        }
+
+        return scores;
+    }
+
+    /**
+     * Get top-K documents by score.
+     * @private
+     */
+    _topKByScore(scores, k) {
+        return Array.from(scores.entries())
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, k)
+            .map(([docId]) => docId);
+    }
+
+    /**
+     * Execute PIVOT transformation - convert rows to columns with aggregation.
+     * Example: PIVOT (SUM(amount) FOR quarter IN ('Q1', 'Q2', 'Q3', 'Q4'))
+     * @private
+     */
+    _executePivot(rows, columns, pivot) {
+        const { aggregate, forColumn, inValues } = pivot;
+
+        // Get column names from outputColumns
+        const colNames = columns.map(col => {
+            if (col.type === 'star') return '*';
+            return col.alias || (col.expr.type === 'column' ? col.expr.name : null);
+        });
+
+        // Find the FOR column index
+        const forColIdx = colNames.findIndex(
+            n => n && n.toLowerCase() === forColumn.toLowerCase()
+        );
+        if (forColIdx === -1) {
+            throw new Error(`PIVOT: Column '${forColumn}' not found in result set`);
+        }
+
+        // Find the aggregate source column
+        const aggSourceCol = aggregate.args && aggregate.args[0]
+            ? (aggregate.args[0].name || aggregate.args[0].column || aggregate.args[0])
+            : null;
+        const aggSourceIdx = aggSourceCol
+            ? colNames.findIndex(n => n && n.toLowerCase() === String(aggSourceCol).toLowerCase())
+            : -1;
+
+        if (aggSourceIdx === -1 && aggregate.name.toUpperCase() !== 'COUNT') {
+            throw new Error(`PIVOT: Aggregate source column not found`);
+        }
+
+        // Determine group columns (all columns except forColumn and aggregate source)
+        const groupColIndices = [];
+        for (let i = 0; i < colNames.length; i++) {
+            if (i !== forColIdx && i !== aggSourceIdx) {
+                groupColIndices.push(i);
+            }
+        }
+
+        // Build groups: Map<groupKey, Map<pivotValue, aggregateValues[]>>
+        const groups = new Map();
+
+        for (const row of rows) {
+            const groupKey = groupColIndices.map(i => JSON.stringify(row[i])).join('|');
+            const pivotValue = row[forColIdx];
+            const aggValue = aggSourceIdx >= 0 ? row[aggSourceIdx] : 1; // COUNT uses 1
+
+            if (!groups.has(groupKey)) {
+                groups.set(groupKey, {
+                    groupValues: groupColIndices.map(i => row[i]),
+                    pivots: new Map()
+                });
+            }
+
+            const group = groups.get(groupKey);
+            const pivotKey = String(pivotValue);
+            if (!group.pivots.has(pivotKey)) {
+                group.pivots.set(pivotKey, []);
+            }
+            group.pivots.get(pivotKey).push(aggValue);
+        }
+
+        // Compute aggregates and build output rows
+        const groupColNames = groupColIndices.map(i => colNames[i]);
+        const outputColNames = [...groupColNames, ...inValues.map(v => String(v))];
+        const outputRows = [];
+
+        for (const [, group] of groups) {
+            const row = [...group.groupValues];
+            for (const pivotVal of inValues) {
+                const key = String(pivotVal);
+                const values = group.pivots.get(key) || [];
+                row.push(this._computeAggregate(aggregate.name, values));
+            }
+            outputRows.push(row);
+        }
+
+        // Build new outputColumns structure
+        const newColumns = outputColNames.map(name => ({
+            type: 'column',
+            expr: { type: 'column', name },
+            alias: name
+        }));
+
+        return { rows: outputRows, columns: newColumns };
+    }
+
+    /**
+     * Execute UNPIVOT transformation - convert columns to rows.
+     * Example: UNPIVOT (value FOR month IN (jan, feb, mar))
+     * @private
+     */
+    _executeUnpivot(rows, columns, unpivot) {
+        const { valueColumn, nameColumn, inColumns } = unpivot;
+
+        // Get column names from outputColumns
+        const colNames = columns.map(col => {
+            if (col.type === 'star') return '*';
+            return col.alias || (col.expr.type === 'column' ? col.expr.name : null);
+        });
+
+        // Find column indices for unpivot sources
+        const inColIndices = inColumns.map(c => {
+            const idx = colNames.findIndex(n => n && n.toLowerCase() === c.toLowerCase());
+            if (idx === -1) {
+                throw new Error(`UNPIVOT: Column '${c}' not found in result set`);
+            }
+            return idx;
+        });
+
+        // Preserved columns (not in inColumns)
+        const preservedIndices = [];
+        const preservedNames = [];
+        for (let i = 0; i < colNames.length; i++) {
+            if (!inColIndices.includes(i)) {
+                preservedIndices.push(i);
+                preservedNames.push(colNames[i]);
+            }
+        }
+
+        // Output columns: preserved + nameColumn + valueColumn
+        const outputColNames = [...preservedNames, nameColumn, valueColumn];
+        const outputRows = [];
+
+        for (const row of rows) {
+            const preservedValues = preservedIndices.map(i => row[i]);
+
+            // Create one output row per unpivoted column
+            for (let i = 0; i < inColumns.length; i++) {
+                const colName = inColumns[i];
+                const value = row[inColIndices[i]];
+
+                // Skip NULL values (standard UNPIVOT behavior)
+                if (value != null) {
+                    outputRows.push([...preservedValues, colName, value]);
+                }
+            }
+        }
+
+        // Build new outputColumns structure
+        const newColumns = outputColNames.map(name => ({
+            type: 'column',
+            expr: { type: 'column', name },
+            alias: name
+        }));
+
+        return { rows: outputRows, columns: newColumns };
+    }
+
+    /**
+     * Compute aggregate function on a list of values.
+     * Used by PIVOT transformation.
+     * @private
+     */
+    _computeAggregate(funcName, values) {
+        const nums = values.filter(v => v != null && typeof v === 'number');
+        switch (funcName.toUpperCase()) {
+            case 'SUM':
+                return nums.length > 0 ? nums.reduce((a, b) => a + b, 0) : null;
+            case 'COUNT':
+                return values.filter(v => v != null).length;
+            case 'AVG':
+                return nums.length > 0 ? nums.reduce((a, b) => a + b, 0) / nums.length : null;
+            case 'MIN':
+                return nums.length > 0 ? Math.min(...nums) : null;
+            case 'MAX':
+                return nums.length > 0 ? Math.max(...nums) : null;
+            default:
+                return null;
         }
     }
 
@@ -11576,12 +13797,1327 @@ class SQLExecutor {
                 // Aggregate functions not supported in row-level evaluation
                 return null;
 
+            case 'subquery': {
+                // Execute subquery and return scalar result
+                // For correlated subqueries, pass outer row context
+                return this._executeSubquery(expr.query, columnData, rowIdx);
+            }
+
+            case 'array': {
+                // Evaluate each element to build the array
+                return expr.elements.map(el => this.evaluateExpr(el, columnData, rowIdx));
+            }
+
+            case 'subscript': {
+                // Array subscript access with 1-based indexing (SQL standard)
+                const arr = this.evaluateExpr(expr.array, columnData, rowIdx);
+                const idx = this.evaluateExpr(expr.index, columnData, rowIdx);
+                if (!Array.isArray(arr)) return null;
+                // SQL uses 1-based indexing
+                return arr[idx - 1] ?? null;
+            }
+
             default:
                 return null;
         }
     }
 
-    applyOrderBy(rows, orderBy, outputColumns) {
+    /**
+     * Execute a subquery and return its result.
+     * For scalar subqueries (returns single value), returns that value.
+     * For correlated subqueries, substitutes outer row values.
+     */
+    _executeSubquery(subqueryAst, outerColumnData, outerRowIdx) {
+        // Clone the subquery AST to avoid mutating the original
+        const resolvedAst = JSON.parse(JSON.stringify(subqueryAst));
+
+        // Check for correlated references (columns not in the subquery's FROM)
+        // and substitute with outer row values
+        const subqueryTable = resolvedAst.from?.name || resolvedAst.from?.table;
+        const correlatedColumns = this._findCorrelatedColumns(resolvedAst, subqueryTable);
+
+        // Build correlation context with outer row values
+        const correlationContext = {};
+        for (const col of correlatedColumns) {
+            const colName = col.column.toLowerCase();
+            if (outerColumnData[colName]) {
+                correlationContext[col.table + '.' + col.column] = outerColumnData[colName][outerRowIdx];
+            }
+        }
+
+        // If we have correlations, modify the WHERE clause to use literals
+        if (Object.keys(correlationContext).length > 0) {
+            this._substituteCorrelations(resolvedAst.where, correlationContext);
+        }
+
+        // Check if FROM references a CTE
+        const tableName = resolvedAst.from?.name?.toLowerCase() || resolvedAst.from?.table?.toLowerCase();
+        if (tableName && this._cteResults?.has(tableName)) {
+            const result = this._executeOnInMemoryData(resolvedAst, this._cteResults.get(tableName));
+            return result.rows.length > 0 ? result.rows[0][0] : null;  // Scalar result
+        }
+
+        // Execute against database if available
+        if (this._database) {
+            try {
+                const result = this._database._executeSingleTable(resolvedAst);
+                if (result && result.then) {
+                    // This is async - we need to handle it synchronously for expression evaluation
+                    // For now, return null and recommend using CTE approach instead
+                    console.warn('[SQLExecutor] Async subquery in expression context - consider using CTE');
+                    return null;
+                }
+                return result?.rows?.[0]?.[0] ?? null;
+            } catch (e) {
+                console.warn('[SQLExecutor] Subquery execution failed:', e.message);
+                return null;
+            }
+        }
+
+        console.warn('[SQLExecutor] Subquery execution requires LanceDatabase context');
+        return null;
+    }
+
+    /**
+     * Find columns that reference the outer query (correlated columns)
+     */
+    _findCorrelatedColumns(ast, subqueryTable) {
+        const correlatedCols = [];
+
+        const walkExpr = (expr) => {
+            if (!expr) return;
+
+            if (expr.type === 'column' && expr.table && expr.table !== subqueryTable) {
+                correlatedCols.push(expr);
+            } else if (expr.type === 'binary') {
+                walkExpr(expr.left);
+                walkExpr(expr.right);
+            } else if (expr.type === 'unary') {
+                walkExpr(expr.operand);
+            } else if (expr.type === 'in') {
+                walkExpr(expr.expr);
+                expr.values?.forEach(walkExpr);
+            } else if (expr.type === 'between') {
+                walkExpr(expr.expr);
+                walkExpr(expr.low);
+                walkExpr(expr.high);
+            } else if (expr.type === 'like') {
+                walkExpr(expr.expr);
+                walkExpr(expr.pattern);
+            } else if (expr.type === 'call') {
+                expr.args?.forEach(walkExpr);
+            }
+        };
+
+        walkExpr(ast.where);
+        return correlatedCols;
+    }
+
+    /**
+     * Substitute correlated column references with literal values
+     */
+    _substituteCorrelations(expr, correlationContext) {
+        if (!expr) return;
+
+        if (expr.type === 'column' && expr.table) {
+            const key = expr.table + '.' + expr.column;
+            if (correlationContext.hasOwnProperty(key)) {
+                // Convert to literal
+                expr.type = 'literal';
+                expr.value = correlationContext[key];
+                delete expr.table;
+                delete expr.column;
+            }
+        } else if (expr.type === 'binary') {
+            this._substituteCorrelations(expr.left, correlationContext);
+            this._substituteCorrelations(expr.right, correlationContext);
+        } else if (expr.type === 'unary') {
+            this._substituteCorrelations(expr.operand, correlationContext);
+        } else if (expr.type === 'in') {
+            this._substituteCorrelations(expr.expr, correlationContext);
+            expr.values?.forEach(v => this._substituteCorrelations(v, correlationContext));
+        } else if (expr.type === 'between') {
+            this._substituteCorrelations(expr.expr, correlationContext);
+            this._substituteCorrelations(expr.low, correlationContext);
+            this._substituteCorrelations(expr.high, correlationContext);
+        } else if (expr.type === 'like') {
+            this._substituteCorrelations(expr.expr, correlationContext);
+            this._substituteCorrelations(expr.pattern, correlationContext);
+        } else if (expr.type === 'call') {
+            expr.args?.forEach(a => this._substituteCorrelations(a, correlationContext));
+        }
+    }
+
+    /**
+     * Materialize CTEs before query execution
+     * @param {Array} ctes - Array of CTE definitions from AST
+     * @param {LanceDatabase} db - Database reference for executing CTE bodies
+     */
+    async materializeCTEs(ctes, db) {
+        this._database = db;
+        for (const cte of ctes) {
+            const cteName = cte.name.toLowerCase();
+            if (cte.body.type === 'RECURSIVE_CTE') {
+                // Execute anchor query first
+                const anchorResult = await this._executeCTEBody(cte.body.anchor, db);
+                let result = { columns: anchorResult.columns, rows: [...anchorResult.rows] };
+
+                // Iterate recursive part until no new rows (max 1000 iterations)
+                for (let i = 0; i < 1000; i++) {
+                    this._cteResults.set(cteName, result);
+                    const recursiveResult = await this._executeCTEBody(cte.body.recursive, db);
+                    if (recursiveResult.rows.length === 0) break;
+                    result = { columns: result.columns, rows: [...result.rows, ...recursiveResult.rows] };
+                }
+                this._cteResults.set(cteName, result);
+            } else {
+                const result = await this._executeCTEBody(cte.body, db);
+                this._cteResults.set(cteName, result);
+            }
+        }
+    }
+
+    /**
+     * Execute a CTE body - either against database or against already-materialized CTE
+     */
+    async _executeCTEBody(bodyAst, db) {
+        // Check if FROM references another CTE
+        const tableName = bodyAst.from?.name?.toLowerCase() || bodyAst.from?.table?.toLowerCase();
+        if (tableName && this._cteResults.has(tableName)) {
+            return this._executeOnInMemoryData(bodyAst, this._cteResults.get(tableName));
+        }
+        // Fall back to database execution
+        return db._executeSingleTable(bodyAst);
+    }
+
+    /**
+     * Execute query on in-memory data (for CTEs and subqueries)
+     * @param {Object} ast - Parsed SELECT AST
+     * @param {Object} data - In-memory data { columns: string[], rows: any[][] }
+     * @returns {Object} - Query result { columns: string[], rows: any[][] }
+     */
+    _executeOnInMemoryData(ast, data) {
+        // Build column lookup: column name -> array of values
+        const columnData = {};
+        for (let i = 0; i < data.columns.length; i++) {
+            const colName = data.columns[i].toLowerCase();
+            columnData[colName] = data.rows.map(row => row[i]);
+        }
+
+        // Apply WHERE filter
+        const filteredIndices = [];
+        for (let i = 0; i < data.rows.length; i++) {
+            if (!ast.where || this._evaluateInMemoryExpr(ast.where, columnData, i)) {
+                filteredIndices.push(i);
+            }
+        }
+
+        // Check for GROUP BY or aggregations
+        const hasGroupBy = ast.groupBy && ast.groupBy.length > 0;
+        const hasAggregates = this._hasAggregatesInSelect(ast.columns);
+
+        if (hasGroupBy || hasAggregates) {
+            return this._executeGroupByAggregation(ast, data, columnData, filteredIndices);
+        }
+
+        // Check for window functions
+        if (this.hasWindowFunctions(ast)) {
+            return this._executeWindowFunctions(ast, data, columnData, filteredIndices);
+        }
+
+        // Project columns and build result
+        const resultColumns = [];
+        const resultRows = [];
+
+        // Handle SELECT * - parser returns { type: 'star' } directly, not { expr: { type: 'star' } }
+        const isSelectStar = ast.columns.length === 1 &&
+            (ast.columns[0].type === 'star' || ast.columns[0].expr?.type === 'star');
+        if (isSelectStar) {
+            for (const colName of data.columns) {
+                resultColumns.push(colName);
+            }
+            for (const idx of filteredIndices) {
+                resultRows.push([...data.rows[idx]]);
+            }
+        } else {
+            // Named columns
+            for (const col of ast.columns) {
+                resultColumns.push(col.alias || col.expr?.column || '*');
+            }
+            for (const idx of filteredIndices) {
+                const row = ast.columns.map(col => {
+                    if (col.type === 'star' || col.expr?.type === 'star') {
+                        return data.rows[idx];
+                    }
+                    return this._evaluateInMemoryExpr(col.expr, columnData, idx);
+                });
+                resultRows.push(row.flat());
+            }
+        }
+
+        // Apply ORDER BY
+        if (ast.orderBy && ast.orderBy.length > 0) {
+            const colIdxMap = {};
+            resultColumns.forEach((name, idx) => { colIdxMap[name.toLowerCase()] = idx; });
+
+            resultRows.sort((a, b) => {
+                for (const ob of ast.orderBy) {
+                    const colIdx = colIdxMap[ob.column.toLowerCase()];
+                    if (colIdx === undefined) continue;
+                    const valA = a[colIdx], valB = b[colIdx];
+                    // Parser uses 'descending' boolean, some places use 'direction' string
+                    const dir = (ob.descending || ob.direction === 'DESC') ? -1 : 1;
+                    if (valA == null && valB == null) continue;
+                    if (valA == null) return 1 * dir;
+                    if (valB == null) return -1 * dir;
+                    if (valA < valB) return -1 * dir;
+                    if (valA > valB) return 1 * dir;
+                }
+                return 0;
+            });
+        }
+
+        // Apply LIMIT/OFFSET
+        const offset = ast.offset || 0;
+        let rows = resultRows;
+        if (offset > 0) rows = rows.slice(offset);
+        if (ast.limit) rows = rows.slice(0, ast.limit);
+
+        return { columns: resultColumns, rows, total: filteredIndices.length };
+    }
+
+    /**
+     * Check if SELECT columns contain aggregate functions
+     */
+    _hasAggregatesInSelect(columns) {
+        const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'STDDEV_SAMP', 'STDDEV_POP', 'VARIANCE', 'VAR_SAMP', 'VAR_POP', 'MEDIAN', 'STRING_AGG', 'GROUP_CONCAT'];
+        for (const col of columns) {
+            if (col.expr?.type === 'call') {
+                // Skip window functions (those with OVER clause)
+                if (col.expr.over) continue;
+                const funcName = (col.expr.name || '').toUpperCase();
+                if (aggFuncs.includes(funcName)) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Execute GROUP BY with aggregation on in-memory data
+     */
+    _executeGroupByAggregation(ast, data, columnData, filteredIndices) {
+        const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'STDDEV_SAMP', 'STDDEV_POP', 'VARIANCE', 'VAR_SAMP', 'VAR_POP', 'MEDIAN', 'STRING_AGG', 'GROUP_CONCAT'];
+        const hasGroupBy = ast.groupBy && ast.groupBy.length > 0;
+
+        // Check for advanced GROUP BY (ROLLUP/CUBE/GROUPING SETS)
+        if (hasGroupBy && this._hasAdvancedGroupBy(ast.groupBy)) {
+            return this._executeAdvancedGroupBy(ast, data, columnData, filteredIndices);
+        }
+
+        // Group rows by GROUP BY columns
+        const groups = new Map();
+        for (const idx of filteredIndices) {
+            let groupKey = '';
+            if (hasGroupBy) {
+                groupKey = ast.groupBy.map(expr => {
+                    const colName = (expr.column || expr.name || '').toLowerCase();
+                    const val = columnData[colName]?.[idx];
+                    return JSON.stringify(val);
+                }).join('|');
+            }
+
+            if (!groups.has(groupKey)) {
+                groups.set(groupKey, []);
+            }
+            groups.get(groupKey).push(idx);
+        }
+
+        // If no GROUP BY and no rows, create one group with empty indices for aggregate results
+        // (e.g., COUNT(*) on empty table should return 0, not empty result)
+        if (!hasGroupBy && groups.size === 0) {
+            groups.set('', []);
+        }
+
+        // Build result columns
+        const resultColumns = [];
+        for (const col of ast.columns) {
+            if (col.alias) {
+                resultColumns.push(col.alias);
+            } else if (col.expr?.type === 'call') {
+                const argName = col.expr.args?.[0]?.name || col.expr.args?.[0]?.column || '*';
+                resultColumns.push(`${col.expr.name}(${argName})`);
+            } else if (col.expr?.type === 'column') {
+                resultColumns.push(col.expr.name || col.expr.column);
+            } else {
+                resultColumns.push('?');
+            }
+        }
+
+        // Compute aggregations for each group
+        const resultRows = [];
+        for (const [, groupIndices] of groups) {
+            const row = [];
+            for (const col of ast.columns) {
+                const expr = col.expr;
+                if (expr?.type === 'call' && aggFuncs.includes((expr.name || '').toUpperCase())) {
+                    const funcName = expr.name.toUpperCase();
+                    const argExpr = expr.args?.[0];
+                    const isStar = argExpr?.type === 'star';
+                    const colName = (argExpr?.name || argExpr?.column || '').toLowerCase();
+
+                    let result = null;
+                    switch (funcName) {
+                        case 'COUNT':
+                            if (isStar) {
+                                result = groupIndices.length;
+                            } else {
+                                result = groupIndices.filter(i => columnData[colName]?.[i] != null).length;
+                            }
+                            break;
+                        case 'SUM': {
+                            let sum = 0;
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && !isNaN(v)) sum += v;
+                            }
+                            result = sum;
+                            break;
+                        }
+                        case 'AVG': {
+                            let sum = 0, count = 0;
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && !isNaN(v)) { sum += v; count++; }
+                            }
+                            result = count > 0 ? sum / count : null;
+                            break;
+                        }
+                        case 'MIN': {
+                            let min = null;
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && (min === null || v < min)) min = v;
+                            }
+                            result = min;
+                            break;
+                        }
+                        case 'MAX': {
+                            let max = null;
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && (max === null || v > max)) max = v;
+                            }
+                            result = max;
+                            break;
+                        }
+                        case 'STDDEV':
+                        case 'STDDEV_SAMP': {
+                            const vals = [];
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && typeof v === 'number' && !isNaN(v)) vals.push(v);
+                            }
+                            if (vals.length < 2) {
+                                result = null;
+                            } else {
+                                const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                                const variance = vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / (vals.length - 1);
+                                result = Math.sqrt(variance);
+                            }
+                            break;
+                        }
+                        case 'STDDEV_POP': {
+                            const vals = [];
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && typeof v === 'number' && !isNaN(v)) vals.push(v);
+                            }
+                            if (vals.length === 0) {
+                                result = null;
+                            } else {
+                                const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                                const variance = vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / vals.length;
+                                result = Math.sqrt(variance);
+                            }
+                            break;
+                        }
+                        case 'VARIANCE':
+                        case 'VAR_SAMP': {
+                            const vals = [];
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && typeof v === 'number' && !isNaN(v)) vals.push(v);
+                            }
+                            if (vals.length < 2) {
+                                result = null;
+                            } else {
+                                const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                                result = vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / (vals.length - 1);
+                            }
+                            break;
+                        }
+                        case 'VAR_POP': {
+                            const vals = [];
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && typeof v === 'number' && !isNaN(v)) vals.push(v);
+                            }
+                            if (vals.length === 0) {
+                                result = null;
+                            } else {
+                                const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                                result = vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / vals.length;
+                            }
+                            break;
+                        }
+                        case 'MEDIAN': {
+                            const vals = [];
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && typeof v === 'number' && !isNaN(v)) vals.push(v);
+                            }
+                            if (vals.length === 0) {
+                                result = null;
+                            } else {
+                                vals.sort((a, b) => a - b);
+                                const mid = Math.floor(vals.length / 2);
+                                result = vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
+                            }
+                            break;
+                        }
+                        case 'STRING_AGG':
+                        case 'GROUP_CONCAT': {
+                            // STRING_AGG(col, separator) or GROUP_CONCAT(col)
+                            const separatorArg = expr.args?.[1];
+                            const separator = separatorArg?.value ?? ',';
+                            const vals = [];
+                            for (const i of groupIndices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null) vals.push(String(v));
+                            }
+                            result = vals.join(separator);
+                            break;
+                        }
+                    }
+                    row.push(result);
+                } else if (expr?.type === 'column') {
+                    // Non-aggregate column - take first value from group
+                    const colName = (expr.name || expr.column || '').toLowerCase();
+                    row.push(columnData[colName]?.[groupIndices[0]] ?? null);
+                } else {
+                    row.push(this._evaluateInMemoryExpr(expr, columnData, groupIndices[0]));
+                }
+            }
+            resultRows.push(row);
+        }
+
+        // Apply ORDER BY
+        if (ast.orderBy && ast.orderBy.length > 0) {
+            const colIdxMap = {};
+            resultColumns.forEach((name, idx) => { colIdxMap[name.toLowerCase()] = idx; });
+
+            resultRows.sort((a, b) => {
+                for (const ob of ast.orderBy) {
+                    const colIdx = colIdxMap[ob.column.toLowerCase()];
+                    if (colIdx === undefined) continue;
+                    const valA = a[colIdx], valB = b[colIdx];
+                    const dir = (ob.descending || ob.direction === 'DESC') ? -1 : 1;
+                    if (valA == null && valB == null) continue;
+                    if (valA == null) return 1 * dir;
+                    if (valB == null) return -1 * dir;
+                    if (valA < valB) return -1 * dir;
+                    if (valA > valB) return 1 * dir;
+                }
+                return 0;
+            });
+        }
+
+        // Apply LIMIT/OFFSET
+        const offset = ast.offset || 0;
+        let rows = resultRows;
+        if (offset > 0) rows = rows.slice(offset);
+        if (ast.limit) rows = rows.slice(0, ast.limit);
+
+        return { columns: resultColumns, rows, total: groups.size };
+    }
+
+    /**
+     * Execute advanced GROUP BY with ROLLUP, CUBE, or GROUPING SETS
+     */
+    _executeAdvancedGroupBy(ast, data, columnData, filteredIndices) {
+        // 1. Expand GROUP BY into grouping sets
+        const groupingSets = this._expandGroupBy(ast.groupBy);
+
+        // 2. Get all column names for results
+        const allGroupColumns = this._getAllGroupColumns(ast.groupBy);
+
+        // 3. Execute aggregation for each grouping set
+        const allResults = [];
+        for (const groupingSet of groupingSets) {
+            const setResults = this._executeGroupByForSet(
+                ast, columnData, filteredIndices, groupingSet, allGroupColumns
+            );
+            allResults.push(...setResults);
+        }
+
+        // 4. Build result with proper column order
+        return this._buildAdvancedGroupByResult(ast, allResults, allGroupColumns);
+    }
+
+    /**
+     * Execute GROUP BY aggregation for a single grouping set
+     */
+    _executeGroupByForSet(ast, columnData, filteredIndices, groupingSet, allGroupColumns) {
+        const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'STDDEV_SAMP', 'STDDEV_POP', 'VARIANCE', 'VAR_SAMP', 'VAR_POP', 'MEDIAN', 'STRING_AGG', 'GROUP_CONCAT'];
+        const groups = new Map();
+
+        // Normalize groupingSet to lowercase for comparison
+        const groupingSetLower = groupingSet.map(c => c.toLowerCase());
+
+        for (const idx of filteredIndices) {
+            // Build group key from current grouping set columns only
+            const groupKey = groupingSet.length > 0
+                ? groupingSet.map(col => {
+                    const val = columnData[col.toLowerCase()]?.[idx];
+                    return JSON.stringify(val);
+                }).join('|')
+                : '__grand_total__';
+
+            if (!groups.has(groupKey)) {
+                // Store group values for all columns (NULL for non-grouped)
+                const groupValues = {};
+                for (const col of allGroupColumns) {
+                    if (groupingSetLower.includes(col.toLowerCase())) {
+                        groupValues[col] = columnData[col.toLowerCase()]?.[idx];
+                    } else {
+                        groupValues[col] = null; // NULL for super-aggregate rows
+                    }
+                }
+                groups.set(groupKey, {
+                    values: groupValues,
+                    indices: [],
+                    _groupingSet: groupingSet
+                });
+            }
+            groups.get(groupKey).indices.push(idx);
+        }
+
+        // Handle empty data - still need grand total row
+        if (groupingSet.length === 0 && groups.size === 0) {
+            const groupValues = {};
+            for (const col of allGroupColumns) {
+                groupValues[col] = null;
+            }
+            groups.set('__grand_total__', {
+                values: groupValues,
+                indices: [],
+                _groupingSet: groupingSet
+            });
+        }
+
+        // Compute aggregates for each group
+        const results = [];
+        for (const [, group] of groups) {
+            const row = { ...group.values, _groupingSet: group._groupingSet };
+
+            // Compute each aggregate column
+            for (const col of ast.columns) {
+                const expr = col.expr;
+                if (expr?.type === 'call' && aggFuncs.includes((expr.name || '').toUpperCase())) {
+                    const funcName = expr.name.toUpperCase();
+                    const argExpr = expr.args?.[0];
+                    const isStar = argExpr?.type === 'star';
+                    const colName = (argExpr?.name || argExpr?.column || '').toLowerCase();
+                    const alias = col.alias || `${funcName}(${isStar ? '*' : colName})`;
+
+                    let result = null;
+                    const indices = group.indices;
+
+                    switch (funcName) {
+                        case 'COUNT':
+                            result = isStar
+                                ? indices.length
+                                : indices.filter(i => columnData[colName]?.[i] != null).length;
+                            break;
+                        case 'SUM': {
+                            let sum = 0;
+                            for (const i of indices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && !isNaN(v)) sum += v;
+                            }
+                            result = sum;
+                            break;
+                        }
+                        case 'AVG': {
+                            let sum = 0, count = 0;
+                            for (const i of indices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && !isNaN(v)) { sum += v; count++; }
+                            }
+                            result = count > 0 ? sum / count : null;
+                            break;
+                        }
+                        case 'MIN': {
+                            let min = null;
+                            for (const i of indices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && (min === null || v < min)) min = v;
+                            }
+                            result = min;
+                            break;
+                        }
+                        case 'MAX': {
+                            let max = null;
+                            for (const i of indices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && (max === null || v > max)) max = v;
+                            }
+                            result = max;
+                            break;
+                        }
+                    }
+                    row[alias] = result;
+                }
+            }
+            results.push(row);
+        }
+
+        return results;
+    }
+
+    /**
+     * Get all column names from GROUP BY (for column ordering)
+     */
+    _getAllGroupColumns(groupBy) {
+        const columns = [];
+        for (const item of groupBy) {
+            if (item.type === 'COLUMN') {
+                if (!columns.includes(item.column)) columns.push(item.column);
+            } else if (item.type === 'ROLLUP' || item.type === 'CUBE') {
+                for (const col of item.columns) {
+                    if (!columns.includes(col)) columns.push(col);
+                }
+            } else if (item.type === 'GROUPING_SETS') {
+                for (const set of item.sets) {
+                    for (const col of set) {
+                        if (!columns.includes(col)) columns.push(col);
+                    }
+                }
+            }
+        }
+        return columns;
+    }
+
+    /**
+     * Build final result from advanced GROUP BY results
+     */
+    _buildAdvancedGroupByResult(ast, allResults, allGroupColumns) {
+        // Build result columns from AST
+        const resultColumns = [];
+        for (const col of ast.columns) {
+            if (col.alias) {
+                resultColumns.push(col.alias);
+            } else if (col.expr?.type === 'call') {
+                const argName = col.expr.args?.[0]?.name || col.expr.args?.[0]?.column || '*';
+                resultColumns.push(`${col.expr.name}(${argName})`);
+            } else if (col.expr?.type === 'column') {
+                resultColumns.push(col.expr.name || col.expr.column);
+            } else {
+                resultColumns.push('?');
+            }
+        }
+
+        // Convert result objects to arrays matching column order
+        const resultRows = allResults.map(rowObj => {
+            const row = [];
+            for (const colName of resultColumns) {
+                // Check if this is a group column or aggregate
+                const val = rowObj[colName] ?? rowObj[colName.toLowerCase()] ?? null;
+                row.push(val);
+            }
+            return row;
+        });
+
+        // Apply ORDER BY if present
+        if (ast.orderBy && ast.orderBy.length > 0) {
+            const colIdxMap = {};
+            resultColumns.forEach((name, idx) => { colIdxMap[name.toLowerCase()] = idx; });
+
+            resultRows.sort((a, b) => {
+                for (const ob of ast.orderBy) {
+                    const colIdx = colIdxMap[ob.column.toLowerCase()];
+                    if (colIdx === undefined) continue;
+                    const valA = a[colIdx], valB = b[colIdx];
+                    const dir = (ob.descending || ob.direction === 'DESC') ? -1 : 1;
+                    if (valA == null && valB == null) continue;
+                    if (valA == null) return 1 * dir;
+                    if (valB == null) return -1 * dir;
+                    if (valA < valB) return -1 * dir;
+                    if (valA > valB) return 1 * dir;
+                }
+                return 0;
+            });
+        }
+
+        // Apply LIMIT/OFFSET
+        const offset = ast.offset || 0;
+        let rows = resultRows;
+        if (offset > 0) rows = rows.slice(offset);
+        if (ast.limit) rows = rows.slice(0, ast.limit);
+
+        return { columns: resultColumns, rows, total: allResults.length };
+    }
+
+    /**
+     * Execute window functions on in-memory data
+     */
+    _executeWindowFunctions(ast, data, columnData, filteredIndices) {
+        // Build filtered rows
+        const filteredRows = filteredIndices.map(idx => data.rows[idx]);
+
+        // Compute window function results
+        const windowResults = this.computeWindowFunctions(ast, filteredRows, columnData);
+
+        // Build result columns
+        const resultColumns = [];
+        for (const col of ast.columns) {
+            if (col.alias) {
+                resultColumns.push(col.alias);
+            } else if (col.expr?.type === 'call') {
+                const argName = col.expr.args?.[0]?.name || col.expr.args?.[0]?.column || '*';
+                resultColumns.push(`${col.expr.name}(${argName})`);
+            } else if (col.expr?.type === 'column') {
+                resultColumns.push(col.expr.name || col.expr.column);
+            } else {
+                resultColumns.push('?');
+            }
+        }
+
+        // Build result rows
+        const resultRows = [];
+        for (let i = 0; i < filteredIndices.length; i++) {
+            const origIdx = filteredIndices[i];
+            const row = [];
+
+            for (let c = 0; c < ast.columns.length; c++) {
+                const col = ast.columns[c];
+                const expr = col.expr;
+
+                // Check if this is a window function column
+                if (expr?.over) {
+                    // Find the corresponding window result
+                    const windowCol = windowResults.find(w => w.colIndex === c);
+                    row.push(windowCol ? windowCol.values[i] : null);
+                } else if (expr?.type === 'column') {
+                    const colName = (expr.name || expr.column || '').toLowerCase();
+                    row.push(columnData[colName]?.[origIdx] ?? null);
+                } else {
+                    row.push(this._evaluateInMemoryExpr(expr, columnData, origIdx));
+                }
+            }
+
+            resultRows.push(row);
+        }
+
+        // Apply QUALIFY filter (filter on window function results)
+        let finalRows = resultRows;
+        if (ast.qualify) {
+            finalRows = [];
+            // Build column name to index map for expression evaluation
+            const qualifyColMap = {};
+            resultColumns.forEach((name, idx) => { qualifyColMap[name.toLowerCase()] = idx; });
+
+            for (let i = 0; i < resultRows.length; i++) {
+                // Build row data object for expression evaluation
+                const rowData = {};
+                for (let c = 0; c < resultColumns.length; c++) {
+                    rowData[resultColumns[c].toLowerCase()] = resultRows[i][c];
+                }
+
+                // Evaluate QUALIFY condition
+                if (this._evaluateInMemoryExpr(ast.qualify, rowData, 0)) {
+                    finalRows.push(resultRows[i]);
+                }
+            }
+        }
+
+        // Apply ORDER BY
+        if (ast.orderBy && ast.orderBy.length > 0) {
+            const colIdxMap = {};
+            resultColumns.forEach((name, idx) => { colIdxMap[name.toLowerCase()] = idx; });
+
+            finalRows.sort((a, b) => {
+                for (const ob of ast.orderBy) {
+                    const colIdx = colIdxMap[ob.column.toLowerCase()];
+                    if (colIdx === undefined) continue;
+                    const valA = a[colIdx], valB = b[colIdx];
+                    const dir = (ob.descending || ob.direction === 'DESC') ? -1 : 1;
+                    if (valA == null && valB == null) continue;
+                    if (valA == null) return 1 * dir;
+                    if (valB == null) return -1 * dir;
+                    if (valA < valB) return -1 * dir;
+                    if (valA > valB) return 1 * dir;
+                }
+                return 0;
+            });
+        }
+
+        // Apply LIMIT/OFFSET
+        const offset = ast.offset || 0;
+        let rows = finalRows;
+        if (offset > 0) rows = rows.slice(offset);
+        if (ast.limit) rows = rows.slice(0, ast.limit);
+
+        return { columns: resultColumns, rows, total: finalRows.length };
+    }
+
+    /**
+     * Evaluate expression on in-memory data
+     */
+    _evaluateInMemoryExpr(expr, columnData, rowIdx) {
+        if (!expr) return null;
+
+        switch (expr.type) {
+            case 'literal':
+                return expr.value;
+
+            case 'column': {
+                const colName = expr.column.toLowerCase();
+                const col = columnData[colName];
+                return col ? col[rowIdx] : null;
+            }
+
+            case 'binary': {
+                const left = this._evaluateInMemoryExpr(expr.left, columnData, rowIdx);
+                const right = this._evaluateInMemoryExpr(expr.right, columnData, rowIdx);
+                const op = expr.op || expr.operator;  // Parser uses 'op', some places use 'operator'
+                switch (op) {
+                    case '=': case '==': return left == right;
+                    case '!=': case '<>': return left != right;
+                    case '<': return left < right;
+                    case '<=': return left <= right;
+                    case '>': return left > right;
+                    case '>=': return left >= right;
+                    case '+': return Number(left) + Number(right);
+                    case '-': return Number(left) - Number(right);
+                    case '*': return Number(left) * Number(right);
+                    case '/': return right !== 0 ? Number(left) / Number(right) : null;
+                    case 'AND': return left && right;
+                    case 'OR': return left || right;
+                    default: return null;
+                }
+            }
+
+            case 'unary': {
+                const operand = this._evaluateInMemoryExpr(expr.operand, columnData, rowIdx);
+                const op = expr.op || expr.operator;
+                switch (op) {
+                    case 'NOT': return !operand;
+                    case '-': return -operand;
+                    case 'IS NULL': return operand == null;
+                    case 'IS NOT NULL': return operand != null;
+                    default: return null;
+                }
+            }
+
+            case 'call': {
+                // Aggregate functions would need special handling
+                const funcName = expr.name.toUpperCase();
+                const args = expr.args?.map(a => this._evaluateInMemoryExpr(a, columnData, rowIdx)) || [];
+                switch (funcName) {
+                    case 'UPPER': return String(args[0]).toUpperCase();
+                    case 'LOWER': return String(args[0]).toLowerCase();
+                    case 'LENGTH': return String(args[0]).length;
+                    case 'SUBSTR': case 'SUBSTRING': return String(args[0]).substring(args[1] - 1, args[2] ? args[1] - 1 + args[2] : undefined);
+                    case 'COALESCE': return args.find(a => a != null) ?? null;
+                    case 'ABS': return Math.abs(args[0]);
+                    case 'ROUND': return Math.round(args[0] * Math.pow(10, args[1] || 0)) / Math.pow(10, args[1] || 0);
+                    case 'GROUPING': {
+                        // GROUPING(col) returns 1 if col is a super-aggregate (null due to ROLLUP/CUBE), 0 otherwise
+                        // The column name is in the first argument
+                        const colArg = expr.args?.[0];
+                        const colName = colArg?.column || colArg?.name;
+                        if (!colName) return 0;
+                        // Check if this column is in the current grouping set
+                        // columnData._groupingSet contains the columns that are grouped (not super-aggregate)
+                        const groupingSet = columnData._groupingSet || [];
+                        return groupingSet.includes(colName.toLowerCase()) ? 0 : 1;
+                    }
+                    default: return null;
+                }
+            }
+
+            case 'in': {
+                const val = this._evaluateInMemoryExpr(expr.expr, columnData, rowIdx);
+                const values = expr.values.map(v => v.value ?? this._evaluateInMemoryExpr(v, columnData, rowIdx));
+                return values.includes(val);
+            }
+
+            case 'between': {
+                const val = this._evaluateInMemoryExpr(expr.expr, columnData, rowIdx);
+                const low = this._evaluateInMemoryExpr(expr.low, columnData, rowIdx);
+                const high = this._evaluateInMemoryExpr(expr.high, columnData, rowIdx);
+                return val >= low && val <= high;
+            }
+
+            case 'like': {
+                const val = String(this._evaluateInMemoryExpr(expr.expr, columnData, rowIdx));
+                const pattern = this._evaluateInMemoryExpr(expr.pattern, columnData, rowIdx);
+                const regex = new RegExp('^' + String(pattern).replace(/%/g, '.*').replace(/_/g, '.') + '$', 'i');
+                return regex.test(val);
+            }
+
+            case 'array': {
+                // Evaluate each element to build the array
+                return expr.elements.map(el => this._evaluateInMemoryExpr(el, columnData, rowIdx));
+            }
+
+            case 'subscript': {
+                // Array subscript access with 1-based indexing (SQL standard)
+                const arr = this._evaluateInMemoryExpr(expr.array, columnData, rowIdx);
+                const idx = this._evaluateInMemoryExpr(expr.index, columnData, rowIdx);
+                if (!Array.isArray(arr)) return null;
+                // SQL uses 1-based indexing
+                return arr[idx - 1] ?? null;
+            }
+
+            default:
+                return null;
+        }
+    }
+
+    /**
+     * Check if query has window functions
+     */
+    hasWindowFunctions(ast) {
+        return ast.columns?.some(col => col.expr?.type === 'call' && col.expr.over);
+    }
+
+    /**
+     * Execute window functions on in-memory data
+     * Window functions are computed after WHERE but before ORDER BY/LIMIT
+     */
+    computeWindowFunctions(ast, rows, columnData) {
+        const windowColumns = [];
+
+        for (let colIndex = 0; colIndex < ast.columns.length; colIndex++) {
+            const col = ast.columns[colIndex];
+            if (col.expr?.type === 'call' && col.expr.over) {
+                const values = this._computeWindowFunction(
+                    col.expr.name,
+                    col.expr.args,
+                    col.expr.over,
+                    rows,
+                    columnData
+                );
+                windowColumns.push({
+                    colIndex,
+                    alias: col.alias || col.expr.name,
+                    values
+                });
+            }
+        }
+
+        return windowColumns;
+    }
+
+    /**
+     * Compute a single window function
+     */
+    _computeWindowFunction(funcName, args, over, rows, columnData) {
+        const results = new Array(rows.length).fill(null);
+
+        // Partition rows
+        const partitions = this._partitionRows(rows, over.partitionBy, columnData);
+
+        for (const partition of partitions) {
+            // Sort partition by ORDER BY if specified
+            if (over.orderBy && over.orderBy.length > 0) {
+                partition.sort((a, b) => this._compareRowsByOrder(a, b, over.orderBy, columnData));
+            }
+
+            // Compute function for each row in partition
+            for (let i = 0; i < partition.length; i++) {
+                const rowIdx = partition[i].idx;
+
+                switch (funcName) {
+                    case 'ROW_NUMBER':
+                        results[rowIdx] = i + 1;
+                        break;
+
+                    case 'RANK': {
+                        // RANK: same rank for ties, gaps after ties
+                        let rank = 1;
+                        for (let j = 0; j < i; j++) {
+                            if (this._compareRowsByOrder(partition[j], partition[i], over.orderBy, columnData) !== 0) {
+                                rank = j + 1;
+                            }
+                        }
+                        if (i > 0 && this._compareRowsByOrder(partition[i-1], partition[i], over.orderBy, columnData) === 0) {
+                            results[rowIdx] = results[partition[i-1].idx];
+                        } else {
+                            results[rowIdx] = i + 1;
+                        }
+                        break;
+                    }
+
+                    case 'DENSE_RANK': {
+                        // DENSE_RANK: same rank for ties, no gaps
+                        if (i === 0) {
+                            results[rowIdx] = 1;
+                        } else if (this._compareRowsByOrder(partition[i-1], partition[i], over.orderBy, columnData) === 0) {
+                            results[rowIdx] = results[partition[i-1].idx];
+                        } else {
+                            results[rowIdx] = results[partition[i-1].idx] + 1;
+                        }
+                        break;
+                    }
+
+                    case 'NTILE': {
+                        const n = args[0]?.value || 1;
+                        const bucketSize = Math.ceil(partition.length / n);
+                        results[rowIdx] = Math.floor(i / bucketSize) + 1;
+                        break;
+                    }
+
+                    case 'PERCENT_RANK': {
+                        // PERCENT_RANK = (rank - 1) / (partition_size - 1)
+                        // First row in partition always 0, only row returns 0
+                        // rank = position of first row with same value (ties get same rank)
+                        let rank = i + 1;
+                        for (let j = 0; j < i; j++) {
+                            if (this._compareRowsByOrder(partition[j], partition[i], over.orderBy, columnData) === 0) {
+                                rank = j + 1;  // Found a tie - use its position
+                                break;
+                            }
+                        }
+                        const partitionSize = partition.length;
+                        results[rowIdx] = partitionSize > 1 ? (rank - 1) / (partitionSize - 1) : 0;
+                        break;
+                    }
+
+                    case 'CUME_DIST': {
+                        // CUME_DIST = (rows with value <= current) / total_rows
+                        // Includes all tied rows
+                        let countLessOrEqual = 0;
+                        for (let j = 0; j < partition.length; j++) {
+                            const cmp = this._compareRowsByOrder(partition[j], partition[i], over.orderBy, columnData);
+                            if (cmp <= 0) countLessOrEqual++;
+                        }
+                        results[rowIdx] = countLessOrEqual / partition.length;
+                        break;
+                    }
+
+                    case 'LAG': {
+                        const lagCol = args[0];
+                        const lagN = args[1]?.value || 1;
+                        const defaultVal = args[2]?.value ?? null;
+                        if (i >= lagN) {
+                            const prevRowIdx = partition[i - lagN].idx;
+                            results[rowIdx] = this._evaluateInMemoryExpr(lagCol, columnData, prevRowIdx);
+                        } else {
+                            results[rowIdx] = defaultVal;
+                        }
+                        break;
+                    }
+
+                    case 'LEAD': {
+                        const leadCol = args[0];
+                        const leadN = args[1]?.value || 1;
+                        const defaultVal = args[2]?.value ?? null;
+                        if (i + leadN < partition.length) {
+                            const nextRowIdx = partition[i + leadN].idx;
+                            results[rowIdx] = this._evaluateInMemoryExpr(leadCol, columnData, nextRowIdx);
+                        } else {
+                            results[rowIdx] = defaultVal;
+                        }
+                        break;
+                    }
+
+                    case 'FIRST_VALUE': {
+                        const firstRowIdx = partition[0].idx;
+                        results[rowIdx] = this._evaluateInMemoryExpr(args[0], columnData, firstRowIdx);
+                        break;
+                    }
+
+                    case 'LAST_VALUE': {
+                        // LAST_VALUE returns the last value within the frame
+                        // Default frame: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                        const frame = over.frame || {
+                            type: 'RANGE',
+                            start: { type: 'UNBOUNDED_PRECEDING' },
+                            end: { type: 'CURRENT_ROW' }
+                        };
+                        const [, endIdx] = this._getFrameBounds(frame, partition, i);
+                        const lastRowIdx = partition[endIdx].idx;
+                        results[rowIdx] = this._evaluateInMemoryExpr(args[0], columnData, lastRowIdx);
+                        break;
+                    }
+
+                    case 'NTH_VALUE': {
+                        const n = args[1]?.value || 1;
+                        if (n > 0 && n <= partition.length) {
+                            const nthRowIdx = partition[n - 1].idx;
+                            results[rowIdx] = this._evaluateInMemoryExpr(args[0], columnData, nthRowIdx);
+                        } else {
+                            results[rowIdx] = null;
+                        }
+                        break;
+                    }
+
+                    // Aggregate window functions (frame-aware)
+                    case 'SUM':
+                    case 'AVG':
+                    case 'COUNT':
+                    case 'MIN':
+                    case 'MAX': {
+                        // Get frame bounds - default to RANGE UNBOUNDED PRECEDING TO CURRENT ROW
+                        const frame = over.frame || {
+                            type: 'RANGE',
+                            start: { type: 'UNBOUNDED_PRECEDING' },
+                            end: { type: 'CURRENT_ROW' }
+                        };
+                        const [startIdx, endIdx] = this._getFrameBounds(frame, partition, i);
+
+                        // Collect values within frame
+                        const isStar = args[0]?.type === 'star';
+                        let values = [];
+                        let frameRowCount = 0;
+                        for (let j = startIdx; j <= endIdx; j++) {
+                            frameRowCount++;
+                            if (!isStar) {
+                                const val = this._evaluateInMemoryExpr(args[0], columnData, partition[j].idx);
+                                if (val != null) values.push(Number(val));
+                            }
+                        }
+
+                        // Compute aggregate
+                        let result = null;
+                        switch (funcName) {
+                            case 'SUM':
+                                result = values.reduce((a, b) => a + b, 0);
+                                break;
+                            case 'AVG':
+                                result = values.length > 0 ? values.reduce((a, b) => a + b, 0) / values.length : null;
+                                break;
+                            case 'COUNT':
+                                result = isStar ? frameRowCount : values.length;
+                                break;
+                            case 'MIN':
+                                result = values.length > 0 ? Math.min(...values) : null;
+                                break;
+                            case 'MAX':
+                                result = values.length > 0 ? Math.max(...values) : null;
+                                break;
+                        }
+                        results[rowIdx] = result;
+                        break;
+                    }
+
+                    default:
+                        results[rowIdx] = null;
+                }
+            }
+        }
+
+        return results;
+    }
+
+    /**
+     * Partition rows based on PARTITION BY expressions
+     */
+    _partitionRows(rows, partitionBy, columnData) {
+        if (!partitionBy || partitionBy.length === 0) {
+            // No partitioning - all rows in one partition
+            return [rows.map((r, i) => ({ idx: i, row: r }))];
+        }
+
+        const groups = new Map();
+        for (let i = 0; i < rows.length; i++) {
+            const key = partitionBy
+                .map(expr => JSON.stringify(this._evaluateInMemoryExpr(expr, columnData, i)))
+                .join('|');
+            if (!groups.has(key)) {
+                groups.set(key, []);
+            }
+            groups.get(key).push({ idx: i, row: rows[i] });
+        }
+
+        return Array.from(groups.values());
+    }
+
+    /**
+     * Compare two rows based on ORDER BY specification
+     */
+    _compareRowsByOrder(a, b, orderBy, columnData) {
+        for (const ob of orderBy) {
+            const valA = this._evaluateInMemoryExpr({ type: 'column', column: ob.column }, columnData, a.idx);
+            const valB = this._evaluateInMemoryExpr({ type: 'column', column: ob.column }, columnData, b.idx);
+
+            const dir = ob.direction === 'DESC' ? -1 : 1;
+            if (valA == null && valB == null) continue;
+            if (valA == null) return 1 * dir;
+            if (valB == null) return -1 * dir;
+            if (valA < valB) return -1 * dir;
+            if (valA > valB) return 1 * dir;
+        }
+        return 0;
+    }
+
+    /**
+     * Calculate frame bounds for window function
+     * @param {Object} frame - Frame specification { type, start, end }
+     * @param {Array} partition - Sorted partition rows
+     * @param {number} currentIdx - Current row index within partition
+     * @returns {[number, number]} - [startIdx, endIdx] bounds
+     */
+    _getFrameBounds(frame, partition, currentIdx) {
+        const n = partition.length;
+        let startIdx = 0;
+        let endIdx = currentIdx;
+
+        // Parse start bound (parser uses spaces in type names)
+        const start = frame.start || { type: 'UNBOUNDED PRECEDING' };
+        const startType = start.type.replace(' ', '_').toUpperCase();
+        switch (startType) {
+            case 'UNBOUNDED_PRECEDING':
+                startIdx = 0;
+                break;
+            case 'CURRENT_ROW':
+                startIdx = currentIdx;
+                break;
+            case 'PRECEDING':
+                startIdx = Math.max(0, currentIdx - (start.offset || start.value || 1));
+                break;
+            case 'FOLLOWING':
+                startIdx = Math.min(n - 1, currentIdx + (start.offset || start.value || 1));
+                break;
+        }
+
+        // Parse end bound
+        const end = frame.end || { type: 'CURRENT ROW' };
+        const endType = end.type.replace(' ', '_').toUpperCase();
+        switch (endType) {
+            case 'UNBOUNDED_FOLLOWING':
+                endIdx = n - 1;
+                break;
+            case 'CURRENT_ROW':
+                endIdx = currentIdx;
+                break;
+            case 'PRECEDING':
+                endIdx = Math.max(0, currentIdx - (end.offset || end.value || 1));
+                break;
+            case 'FOLLOWING':
+                endIdx = Math.min(n - 1, currentIdx + (end.offset || end.value || 1));
+                break;
+        }
+
+        // Ensure valid bounds
+        if (startIdx > endIdx) [startIdx, endIdx] = [endIdx, startIdx];
+        return [startIdx, endIdx];
+    }
+
+    async applyOrderBy(rows, orderBy, outputColumns) {
         // Build column index map
         const colIdxMap = {};
         let idx = 0;
@@ -11596,6 +15132,57 @@ class SQLExecutor {
             }
         }
 
+        // Use GPU for large datasets (10,000+ rows)
+        if (rows.length >= 10000 && gpuSorter.isAvailable()) {
+            // Multi-column sort: stable sort from last to first column
+            let indices = new Uint32Array(rows.length);
+            for (let i = 0; i < rows.length; i++) indices[i] = i;
+
+            for (let c = orderBy.length - 1; c >= 0; c--) {
+                const ob = orderBy[c];
+                const colIdx = colIdxMap[ob.column.toLowerCase()];
+                if (colIdx === undefined) continue;
+
+                const ascending = !ob.descending;
+                const values = new Float32Array(rows.length);
+                for (let i = 0; i < rows.length; i++) {
+                    const val = rows[indices[i]][colIdx];
+                    if (val == null) {
+                        values[i] = ascending ? 3.4e38 : -3.4e38; // NULLS LAST
+                    } else if (typeof val === 'number') {
+                        values[i] = val;
+                    } else if (typeof val === 'string') {
+                        // Use string hash for approximate sorting
+                        let key = 0;
+                        for (let j = 0; j < Math.min(4, val.length); j++) {
+                            key = key * 256 + val.charCodeAt(j);
+                        }
+                        values[i] = key;
+                    } else {
+                        values[i] = 0;
+                    }
+                }
+
+                const sortedIdx = await gpuSorter.sort(values, ascending);
+                const newIndices = new Uint32Array(rows.length);
+                for (let i = 0; i < rows.length; i++) {
+                    newIndices[i] = indices[sortedIdx[i]];
+                }
+                indices = newIndices;
+            }
+
+            // Apply permutation in-place
+            const sorted = new Array(rows.length);
+            for (let i = 0; i < rows.length; i++) {
+                sorted[i] = rows[indices[i]];
+            }
+            for (let i = 0; i < rows.length; i++) {
+                rows[i] = sorted[i];
+            }
+            return;
+        }
+
+        // CPU fallback for smaller datasets
         rows.sort((a, b) => {
             for (const ob of orderBy) {
                 const colIdx = colIdxMap[ob.column.toLowerCase()];
@@ -11617,6 +15204,102 @@ class SQLExecutor {
             }
             return 0;
         });
+    }
+
+    /**
+     * Apply DISTINCT to rows (GPU-accelerated for large datasets)
+     * @param {Array[]} rows - Row arrays to deduplicate
+     * @returns {Array[]} Deduplicated rows
+     */
+    async applyDistinct(rows) {
+        if (rows.length === 0) return rows;
+
+        // Use GPU for large datasets (10,000+ rows)
+        if (rows.length >= 10000 && gpuGrouper.isAvailable()) {
+            // Hash each row to create a unique signature
+            const rowHashes = this._hashRows(rows);
+
+            // Use GPUGrouper to find unique hashes
+            const { groupIds, numGroups } = await gpuGrouper.groupBy(rowHashes);
+
+            // Extract first occurrence of each unique group
+            const firstOccurrence = new Array(numGroups).fill(-1);
+            for (let i = 0; i < rows.length; i++) {
+                const gid = groupIds[i];
+                if (firstOccurrence[gid] === -1) {
+                    firstOccurrence[gid] = i;
+                }
+            }
+
+            // Build deduplicated result
+            const uniqueRows = [];
+            for (let gid = 0; gid < numGroups; gid++) {
+                if (firstOccurrence[gid] !== -1) {
+                    uniqueRows.push(rows[firstOccurrence[gid]]);
+                }
+            }
+            return uniqueRows;
+        }
+
+        // CPU fallback using Set with JSON serialization
+        const seen = new Set();
+        const uniqueRows = [];
+        for (const row of rows) {
+            const key = JSON.stringify(row);
+            if (!seen.has(key)) {
+                seen.add(key);
+                uniqueRows.push(row);
+            }
+        }
+        return uniqueRows;
+    }
+
+    /**
+     * Hash rows to u32 for GPU deduplication
+     */
+    _hashRows(rows) {
+        const hashes = new Uint32Array(rows.length);
+        for (let i = 0; i < rows.length; i++) {
+            hashes[i] = this._hashRow(rows[i]);
+        }
+        return hashes;
+    }
+
+    /**
+     * FNV-1a hash of a row's values
+     */
+    _hashRow(row) {
+        let hash = 2166136261;
+        for (const val of row) {
+            if (val === null || val === undefined) {
+                hash ^= 0;
+            } else if (typeof val === 'number') {
+                // Hash number as bytes
+                const buf = new ArrayBuffer(8);
+                new Float64Array(buf)[0] = val;
+                const bytes = new Uint8Array(buf);
+                for (const b of bytes) {
+                    hash ^= b;
+                    hash = Math.imul(hash, 16777619);
+                }
+            } else if (typeof val === 'string') {
+                for (let j = 0; j < val.length; j++) {
+                    hash ^= val.charCodeAt(j);
+                    hash = Math.imul(hash, 16777619);
+                }
+            } else {
+                // Fallback: stringify
+                const str = String(val);
+                for (let j = 0; j < str.length; j++) {
+                    hash ^= str.charCodeAt(j);
+                    hash = Math.imul(hash, 16777619);
+                }
+            }
+            // Separator between values
+            hash ^= 0xFF;
+            hash = Math.imul(hash, 16777619);
+        }
+        return hash >>> 0;
     }
 
     exprToName(expr) {
@@ -11657,13 +15340,497 @@ class SQLExecutor {
      * Execute aggregation query after running vector search
      */
     async executeAggregateWithSearch(ast, totalRows, onProgress) {
-        // This is a simplified version - aggregate over search results
-        // For now, just return an error/notice that this combination isn't fully supported
+        // Step 1: Extract NEAR info from WHERE
+        const nearInfo = this._extractNearCondition(ast.where);
+        if (!nearInfo) {
+            throw new Error('SEARCH aggregation requires NEAR clause');
+        }
+
+        // Step 2: Execute vector search to get candidate indices
+        if (onProgress) onProgress('Executing vector search...', 0, 100);
+        const searchIndices = await this._executeNearSearch(nearInfo, totalRows);
+
+        if (searchIndices.length === 0) {
+            return this._emptyAggregateResult(ast);
+        }
+
+        // Step 3: Apply remaining WHERE conditions (non-NEAR)
+        const remainingWhere = this._removeNearCondition(ast.where);
+        let filteredIndices = searchIndices;
+
+        if (remainingWhere) {
+            if (onProgress) onProgress('Applying filters...', 30, 100);
+            filteredIndices = await this._filterIndicesByWhere(searchIndices, remainingWhere);
+        }
+
+        if (filteredIndices.length === 0) {
+            return this._emptyAggregateResult(ast);
+        }
+
+        // Step 4: Route to appropriate aggregation path
+        if (onProgress) onProgress('Aggregating results...', 60, 100);
+
+        if (ast.groupBy && ast.groupBy.length > 0) {
+            // GROUP BY aggregation on filtered indices
+            return await this._executeGroupByOnIndices(ast, filteredIndices, onProgress);
+        } else {
+            // Simple aggregation on filtered indices
+            return await this._executeSimpleAggregateOnIndices(ast, filteredIndices, onProgress);
+        }
+    }
+
+    /**
+     * Filter indices by WHERE expression
+     * @private
+     */
+    async _filterIndicesByWhere(indices, whereExpr) {
+        const neededCols = new Set();
+        this.collectColumnsFromExpr(whereExpr, neededCols);
+
+        const columnData = {};
+        for (const colName of neededCols) {
+            const colIdx = this.columnMap[colName.toLowerCase()];
+            if (colIdx !== undefined) {
+                columnData[colName.toLowerCase()] = await this.readColumnData(colIdx, indices);
+            }
+        }
+
+        return indices.filter((_, i) => this.evaluateExpr(whereExpr, columnData, i));
+    }
+
+    /**
+     * Execute simple aggregation on specific indices (no GROUP BY)
+     * @private
+     */
+    async _executeSimpleAggregateOnIndices(ast, indices, onProgress) {
+        const aggFunctions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'STDDEV_SAMP', 'STDDEV_POP', 'VARIANCE', 'VAR_SAMP', 'VAR_POP', 'MEDIAN', 'STRING_AGG', 'GROUP_CONCAT'];
+
+        // Initialize aggregators
+        const aggregators = [];
+        const colNames = [];
+
+        for (const col of ast.columns) {
+            if (col.type === 'star') {
+                aggregators.push({ type: 'COUNT', column: null, isStar: true, count: 0 });
+                colNames.push('COUNT(*)');
+            } else if (col.expr?.type === 'call' && aggFunctions.includes(col.expr.name.toUpperCase())) {
+                const aggType = col.expr.name.toUpperCase();
+                const argExpr = col.expr.args?.[0];
+                const colName = argExpr?.type === 'column' ? (argExpr.name || argExpr.column) : null;
+                const isStar = argExpr?.type === 'star';
+
+                aggregators.push({
+                    type: aggType,
+                    column: colName,
+                    isStar,
+                    expr: col.expr,
+                    sum: 0,
+                    count: 0,
+                    min: null,
+                    max: null,
+                    values: [],
+                });
+
+                const displayName = col.alias || this.exprToName(col.expr);
+                colNames.push(displayName);
+            } else {
+                aggregators.push({
+                    type: 'FIRST',
+                    column: col.expr?.type === 'column' ? (col.expr.name || col.expr.column) : null,
+                    value: null,
+                });
+                colNames.push(col.alias || this.exprToName(col.expr));
+            }
+        }
+
+        // Collect needed columns
+        const neededCols = new Set();
+        for (const agg of aggregators) {
+            if (agg.column) neededCols.add(agg.column.toLowerCase());
+        }
+
+        // Fetch column data for the indices
+        const columnData = {};
+        for (const colName of neededCols) {
+            const colIdx = this.columnMap[colName.toLowerCase()];
+            if (colIdx !== undefined) {
+                columnData[colName.toLowerCase()] = await this.readColumnData(colIdx, indices);
+            }
+        }
+
+        // Process all rows
+        for (let i = 0; i < indices.length; i++) {
+            for (const agg of aggregators) {
+                if (agg.type === 'COUNT' && agg.isStar) {
+                    agg.count++;
+                } else if (agg.type === 'FIRST' && agg.value === null) {
+                    const data = agg.column ? columnData[agg.column.toLowerCase()] : null;
+                    agg.value = data ? data[i] : null;
+                } else if (agg.column) {
+                    const data = columnData[agg.column.toLowerCase()];
+                    const val = data ? data[i] : null;
+
+                    if (val !== null && val !== undefined) {
+                        if (agg.type === 'COUNT') {
+                            agg.count++;
+                        } else if (typeof val === 'number' && !isNaN(val)) {
+                            agg.count++;
+                            if (agg.type === 'SUM' || agg.type === 'AVG' || agg.type.startsWith('STDDEV') || agg.type.startsWith('VAR')) {
+                                agg.sum += val;
+                                agg.values.push(val);
+                            }
+                            if (agg.type === 'MIN') {
+                                agg.min = agg.min === null ? val : Math.min(agg.min, val);
+                            }
+                            if (agg.type === 'MAX') {
+                                agg.max = agg.max === null ? val : Math.max(agg.max, val);
+                            }
+                            if (agg.type === 'MEDIAN') {
+                                agg.values.push(val);
+                            }
+                        }
+                        if (agg.type === 'STRING_AGG' || agg.type === 'GROUP_CONCAT') {
+                            agg.values.push(String(val));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Compute final results
+        const resultRow = [];
+        for (const agg of aggregators) {
+            switch (agg.type) {
+                case 'COUNT':
+                    resultRow.push(agg.count);
+                    break;
+                case 'SUM':
+                    resultRow.push(agg.sum);
+                    break;
+                case 'AVG':
+                    resultRow.push(agg.count > 0 ? agg.sum / agg.count : null);
+                    break;
+                case 'MIN':
+                    resultRow.push(agg.min);
+                    break;
+                case 'MAX':
+                    resultRow.push(agg.max);
+                    break;
+                case 'STDDEV':
+                case 'STDDEV_SAMP': {
+                    if (agg.values.length < 2) {
+                        resultRow.push(null);
+                    } else {
+                        const mean = agg.sum / agg.values.length;
+                        const variance = agg.values.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / (agg.values.length - 1);
+                        resultRow.push(Math.sqrt(variance));
+                    }
+                    break;
+                }
+                case 'STDDEV_POP': {
+                    if (agg.values.length === 0) {
+                        resultRow.push(null);
+                    } else {
+                        const mean = agg.sum / agg.values.length;
+                        const variance = agg.values.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / agg.values.length;
+                        resultRow.push(Math.sqrt(variance));
+                    }
+                    break;
+                }
+                case 'VARIANCE':
+                case 'VAR_SAMP': {
+                    if (agg.values.length < 2) {
+                        resultRow.push(null);
+                    } else {
+                        const mean = agg.sum / agg.values.length;
+                        resultRow.push(agg.values.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / (agg.values.length - 1));
+                    }
+                    break;
+                }
+                case 'VAR_POP': {
+                    if (agg.values.length === 0) {
+                        resultRow.push(null);
+                    } else {
+                        const mean = agg.sum / agg.values.length;
+                        resultRow.push(agg.values.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / agg.values.length);
+                    }
+                    break;
+                }
+                case 'MEDIAN': {
+                    if (agg.values.length === 0) {
+                        resultRow.push(null);
+                    } else {
+                        agg.values.sort((a, b) => a - b);
+                        const mid = Math.floor(agg.values.length / 2);
+                        resultRow.push(agg.values.length % 2 ? agg.values[mid] : (agg.values[mid - 1] + agg.values[mid]) / 2);
+                    }
+                    break;
+                }
+                case 'STRING_AGG': {
+                    const separator = agg.expr?.args?.[1]?.value ?? ',';
+                    resultRow.push(agg.values.join(separator));
+                    break;
+                }
+                case 'GROUP_CONCAT': {
+                    resultRow.push(agg.values.join(','));
+                    break;
+                }
+                case 'FIRST':
+                    resultRow.push(agg.value);
+                    break;
+                default:
+                    resultRow.push(null);
+            }
+        }
+
         return {
-            columns: ['error'],
-            rows: [['Aggregations with SEARCH not yet supported. Use SEARCH without aggregations, or aggregations without SEARCH.']],
+            columns: colNames,
+            rows: [resultRow],
             total: 1,
-            aggregationStats: null,
+            aggregationStats: {
+                scannedRows: indices.length,
+                totalRows: indices.length,
+                coveragePercent: '100.00',
+                isPartialScan: false,
+                fromSearch: true,
+            },
+        };
+    }
+
+    /**
+     * Execute GROUP BY aggregation on specific indices
+     * @private
+     */
+    async _executeGroupByOnIndices(ast, indices, onProgress) {
+        const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'STDDEV_SAMP', 'STDDEV_POP', 'VARIANCE', 'VAR_SAMP', 'VAR_POP', 'MEDIAN', 'STRING_AGG', 'GROUP_CONCAT'];
+
+        // Collect all needed columns
+        const neededCols = new Set();
+        for (const expr of ast.groupBy) {
+            const colName = expr.column || expr.name;
+            if (colName) neededCols.add(colName.toLowerCase());
+        }
+        for (const col of ast.columns) {
+            if (col.expr?.type === 'column') {
+                neededCols.add((col.expr.name || col.expr.column).toLowerCase());
+            } else if (col.expr?.type === 'call' && col.expr.args?.[0]?.type === 'column') {
+                neededCols.add((col.expr.args[0].name || col.expr.args[0].column).toLowerCase());
+            }
+        }
+
+        // Fetch column data for the indices
+        const columnData = {};
+        for (const colName of neededCols) {
+            const colIdx = this.columnMap[colName.toLowerCase()];
+            if (colIdx !== undefined) {
+                columnData[colName.toLowerCase()] = await this.readColumnData(colIdx, indices);
+            }
+        }
+
+        // Group rows by GROUP BY columns
+        const groups = new Map();
+        for (let i = 0; i < indices.length; i++) {
+            const groupKey = ast.groupBy.map(expr => {
+                const colName = (expr.column || expr.name || '').toLowerCase();
+                return JSON.stringify(columnData[colName]?.[i]);
+            }).join('|');
+
+            if (!groups.has(groupKey)) {
+                groups.set(groupKey, []);
+            }
+            groups.get(groupKey).push(i);
+        }
+
+        // Build column names
+        const colNames = ast.columns.map(col => col.alias || this.exprToName(col.expr || col));
+
+        // Compute aggregates per group
+        const resultRows = [];
+        for (const [, groupLocalIndices] of groups) {
+            const row = [];
+            for (const col of ast.columns) {
+                const expr = col.expr || col;
+                if (expr.type === 'call' && aggFuncs.includes(expr.name.toUpperCase())) {
+                    const funcName = expr.name.toUpperCase();
+                    const argExpr = expr.args?.[0];
+                    const colName = argExpr?.type === 'column' ? (argExpr.name || argExpr.column)?.toLowerCase() : null;
+                    const isStar = argExpr?.type === 'star';
+
+                    let result = null;
+                    if (funcName === 'COUNT') {
+                        if (isStar) {
+                            result = groupLocalIndices.length;
+                        } else {
+                            result = 0;
+                            for (const i of groupLocalIndices) {
+                                if (columnData[colName]?.[i] != null) result++;
+                            }
+                        }
+                    } else if (funcName === 'SUM') {
+                        result = 0;
+                        for (const i of groupLocalIndices) {
+                            const v = columnData[colName]?.[i];
+                            if (v != null && typeof v === 'number' && !isNaN(v)) result += v;
+                        }
+                    } else if (funcName === 'AVG') {
+                        let sum = 0, count = 0;
+                        for (const i of groupLocalIndices) {
+                            const v = columnData[colName]?.[i];
+                            if (v != null && typeof v === 'number' && !isNaN(v)) { sum += v; count++; }
+                        }
+                        result = count > 0 ? sum / count : null;
+                    } else if (funcName === 'MIN') {
+                        for (const i of groupLocalIndices) {
+                            const v = columnData[colName]?.[i];
+                            if (v != null && (result === null || v < result)) result = v;
+                        }
+                    } else if (funcName === 'MAX') {
+                        for (const i of groupLocalIndices) {
+                            const v = columnData[colName]?.[i];
+                            if (v != null && (result === null || v > result)) result = v;
+                        }
+                    } else if (funcName === 'MEDIAN') {
+                        const vals = [];
+                        for (const i of groupLocalIndices) {
+                            const v = columnData[colName]?.[i];
+                            if (v != null && typeof v === 'number' && !isNaN(v)) vals.push(v);
+                        }
+                        if (vals.length > 0) {
+                            vals.sort((a, b) => a - b);
+                            const mid = Math.floor(vals.length / 2);
+                            result = vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
+                        }
+                    } else if (funcName === 'STRING_AGG' || funcName === 'GROUP_CONCAT') {
+                        const separator = funcName === 'STRING_AGG' ? (expr.args?.[1]?.value ?? ',') : ',';
+                        const vals = [];
+                        for (const i of groupLocalIndices) {
+                            const v = columnData[colName]?.[i];
+                            if (v != null) vals.push(String(v));
+                        }
+                        result = vals.join(separator);
+                    } else if (funcName === 'STDDEV' || funcName === 'STDDEV_SAMP' || funcName === 'STDDEV_POP') {
+                        const vals = [];
+                        for (const i of groupLocalIndices) {
+                            const v = columnData[colName]?.[i];
+                            if (v != null && typeof v === 'number' && !isNaN(v)) vals.push(v);
+                        }
+                        if (vals.length >= (funcName === 'STDDEV_POP' ? 1 : 2)) {
+                            const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                            const divisor = funcName === 'STDDEV_POP' ? vals.length : (vals.length - 1);
+                            const variance = vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / divisor;
+                            result = Math.sqrt(variance);
+                        }
+                    } else if (funcName === 'VARIANCE' || funcName === 'VAR_SAMP' || funcName === 'VAR_POP') {
+                        const vals = [];
+                        for (const i of groupLocalIndices) {
+                            const v = columnData[colName]?.[i];
+                            if (v != null && typeof v === 'number' && !isNaN(v)) vals.push(v);
+                        }
+                        if (vals.length >= (funcName === 'VAR_POP' ? 1 : 2)) {
+                            const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                            const divisor = funcName === 'VAR_POP' ? vals.length : (vals.length - 1);
+                            result = vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / divisor;
+                        }
+                    }
+                    row.push(result);
+                } else if (expr.type === 'column') {
+                    const colName = (expr.name || expr.column)?.toLowerCase();
+                    row.push(columnData[colName]?.[groupLocalIndices[0]] ?? null);
+                } else {
+                    row.push(null);
+                }
+            }
+            resultRows.push(row);
+        }
+
+        // Apply ORDER BY
+        if (ast.orderBy && ast.orderBy.length > 0) {
+            const colNameToIdx = {};
+            colNames.forEach((name, idx) => { colNameToIdx[name.toLowerCase()] = idx; });
+
+            resultRows.sort((a, b) => {
+                for (const order of ast.orderBy) {
+                    const colName = (order.column || order.expr?.name || order.expr?.column || '').toLowerCase();
+                    const colIdx = colNameToIdx[colName] ?? -1;
+                    if (colIdx === -1) continue;
+
+                    const aVal = a[colIdx];
+                    const bVal = b[colIdx];
+                    const dir = order.direction === 'DESC' ? -1 : 1;
+
+                    if (aVal === null && bVal === null) continue;
+                    if (aVal === null) return dir;
+                    if (bVal === null) return -dir;
+                    if (aVal < bVal) return -dir;
+                    if (aVal > bVal) return dir;
+                }
+                return 0;
+            });
+        }
+
+        // Apply LIMIT/OFFSET
+        const offset = ast.offset || 0;
+        let rows = resultRows;
+        if (offset > 0) rows = rows.slice(offset);
+        if (ast.limit) rows = rows.slice(0, ast.limit);
+
+        return {
+            columns: colNames,
+            rows,
+            total: rows.length,
+            aggregationStats: {
+                scannedRows: indices.length,
+                totalRows: indices.length,
+                groups: groups.size,
+                coveragePercent: '100.00',
+                isPartialScan: false,
+                fromSearch: true,
+            },
+        };
+    }
+
+    /**
+     * Return empty aggregate result with proper column names
+     * @private
+     */
+    _emptyAggregateResult(ast) {
+        const colNames = ast.columns.map(col => col.alias || this.exprToName(col.expr || col));
+        const emptyRow = ast.columns.map(col => {
+            const expr = col.expr || col;
+            if (expr.type === 'call' && expr.name.toUpperCase() === 'COUNT') {
+                return 0;
+            }
+            return null;
+        });
+
+        // For GROUP BY with no matches, return empty rows (no groups)
+        if (ast.groupBy && ast.groupBy.length > 0) {
+            return {
+                columns: colNames,
+                rows: [],
+                total: 0,
+                aggregationStats: {
+                    scannedRows: 0,
+                    totalRows: 0,
+                    coveragePercent: '100.00',
+                    isPartialScan: false,
+                    fromSearch: true,
+                },
+            };
+        }
+
+        // For simple aggregates, return single row with COUNT=0, others NULL
+        return {
+            columns: colNames,
+            rows: [emptyRow],
+            total: 1,
+            aggregationStats: {
+                scannedRows: 0,
+                totalRows: 0,
+                coveragePercent: '100.00',
+                isPartialScan: false,
+                fromSearch: true,
+            },
         };
     }
 
@@ -11671,7 +15838,7 @@ class SQLExecutor {
      * Check if the query contains aggregate functions
      */
     hasAggregates(ast) {
-        const aggFunctions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'];
+        const aggFunctions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'STDDEV_SAMP', 'STDDEV_POP', 'VARIANCE', 'VAR_SAMP', 'VAR_POP', 'MEDIAN', 'STRING_AGG', 'GROUP_CONCAT'];
         for (const col of ast.columns) {
             if (col.type === 'expr' && col.expr.type === 'call') {
                 if (aggFunctions.includes(col.expr.name.toUpperCase())) {
@@ -11686,7 +15853,7 @@ class SQLExecutor {
      * Execute an aggregation query
      */
     async executeAggregateQuery(ast, totalRows, onProgress) {
-        const aggFunctions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX'];
+        const aggFunctions = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'STDDEV_SAMP', 'STDDEV_POP', 'VARIANCE', 'VAR_SAMP', 'VAR_POP', 'MEDIAN', 'STRING_AGG', 'GROUP_CONCAT'];
 
         // Initialize aggregators for each column
         const aggregators = [];
@@ -11833,6 +16000,37 @@ class SQLExecutor {
             }
         }
 
+        // Apply HAVING filter if present
+        if (ast.having) {
+            // Build column data for HAVING evaluation
+            const havingColumnData = {};
+            for (let i = 0; i < colNames.length; i++) {
+                // Support both column name and alias lookup
+                const colName = colNames[i].toLowerCase();
+                havingColumnData[colName] = [resultRow[i]];
+                // Also support aggregate function names like COUNT(*)
+                const cleanName = colName.replace(/[()]/g, '').replace('*', 'star');
+                havingColumnData[cleanName] = [resultRow[i]];
+            }
+
+            // Evaluate HAVING condition
+            if (!this._evaluateInMemoryExpr(ast.having, havingColumnData, 0)) {
+                // HAVING condition not met - return empty result
+                return {
+                    columns: colNames,
+                    rows: [],
+                    total: 0,
+                    aggregationStats: {
+                        scannedRows,
+                        totalRows,
+                        coveragePercent: totalRows > 0 ? ((scannedRows / totalRows) * 100).toFixed(2) : 100,
+                        isPartialScan: scannedRows < totalRows,
+                        havingFiltered: true,
+                    },
+                };
+            }
+        }
+
         // Calculate coverage stats
         const coveragePercent = totalRows > 0 ? ((scannedRows / totalRows) * 100).toFixed(2) : 100;
         const isPartialScan = scannedRows < totalRows;
@@ -11848,6 +16046,97 @@ class SQLExecutor {
                 isPartialScan,
             },
         };
+    }
+
+    /**
+     * Expand GROUP BY clause into list of grouping sets.
+     * Handles ROLLUP, CUBE, and GROUPING SETS operators.
+     * @param {Array} groupBy - Array of GROUP BY items
+     * @returns {Array<Array<string>>} - List of grouping sets (each is array of column names)
+     */
+    _expandGroupBy(groupBy) {
+        if (!groupBy || groupBy.length === 0) return [[]];
+
+        // Check if it's old-style simple column list (backward compat)
+        // Old style: ['col1', 'col2']
+        if (typeof groupBy[0] === 'string') {
+            return [groupBy];
+        }
+
+        let result = [[]];
+
+        for (const item of groupBy) {
+            if (item.type === 'COLUMN') {
+                // Simple column: cross-product with single column added
+                result = result.map(set => [...set, item.column]);
+            } else if (item.type === 'ROLLUP') {
+                // ROLLUP(a, b, c) generates: (a,b,c), (a,b), (a), ()
+                const rollupSets = [];
+                for (let i = item.columns.length; i >= 0; i--) {
+                    rollupSets.push(item.columns.slice(0, i));
+                }
+                result = this._crossProductSets(result, rollupSets);
+            } else if (item.type === 'CUBE') {
+                // CUBE(a, b) generates all 2^n subsets: (a,b), (a), (b), ()
+                const cubeSets = this._powerSet(item.columns);
+                result = this._crossProductSets(result, cubeSets);
+            } else if (item.type === 'GROUPING_SETS') {
+                // GROUPING SETS uses explicit sets
+                result = this._crossProductSets(result, item.sets);
+            }
+        }
+
+        // Deduplicate grouping sets
+        const seen = new Set();
+        return result.filter(set => {
+            const key = JSON.stringify(set.sort());
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+    }
+
+    /**
+     * Generate power set (all subsets) of an array
+     * @param {Array} arr - Input array
+     * @returns {Array<Array>} - All subsets
+     */
+    _powerSet(arr) {
+        const result = [[]];
+        for (const item of arr) {
+            const len = result.length;
+            for (let i = 0; i < len; i++) {
+                result.push([...result[i], item]);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Cross-product two lists of sets
+     * @param {Array<Array>} sets1 - First list of sets
+     * @param {Array<Array>} sets2 - Second list of sets
+     * @returns {Array<Array>} - Combined sets
+     */
+    _crossProductSets(sets1, sets2) {
+        const result = [];
+        for (const s1 of sets1) {
+            for (const s2 of sets2) {
+                result.push([...s1, ...s2]);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Check if GROUP BY uses advanced operators (ROLLUP, CUBE, GROUPING SETS)
+     */
+    _hasAdvancedGroupBy(groupBy) {
+        if (!groupBy || groupBy.length === 0) return false;
+        if (typeof groupBy[0] === 'string') return false;
+        return groupBy.some(item =>
+            item.type === 'ROLLUP' || item.type === 'CUBE' || item.type === 'GROUPING_SETS'
+        );
     }
 
     /**
@@ -13856,11 +18145,21 @@ class QueryPlanner {
                 walk(e.left);
                 walk(e.right);
             } else if (e.type === 'unary') {
-                walk(e.expr);
+                walk(e.operand);  // Note: parser uses 'operand', not 'expr'
             } else if (e.type === 'call') {
                 for (const arg of e.args || []) {
                     walk(arg);
                 }
+            } else if (e.type === 'in') {
+                walk(e.expr);
+                for (const v of e.values || []) walk(v);
+            } else if (e.type === 'between') {
+                walk(e.expr);
+                walk(e.low);
+                walk(e.high);
+            } else if (e.type === 'like') {
+                walk(e.expr);
+                walk(e.pattern);
             }
         };
 
@@ -14124,7 +18423,7 @@ class QueryPlanner {
             // Check for aggregation
             if (expr.type === 'call') {
                 const funcName = expr.name.toUpperCase();
-                const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'VARIANCE'];
+                const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'STDDEV_SAMP', 'STDDEV_POP', 'VARIANCE', 'VAR_SAMP', 'VAR_POP', 'MEDIAN', 'STRING_AGG', 'GROUP_CONCAT'];
 
                 if (aggFuncs.includes(funcName)) {
                     const agg = {
@@ -14341,6 +18640,36 @@ class QueryPlanner {
 // ============================================================================
 
 /**
+ * MemoryTable - In-memory table for temporary data storage.
+ * Ephemeral by design - lost on page refresh.
+ * Used for intermediate results, temp tables, and JOIN lookups.
+ */
+class MemoryTable {
+    constructor(name, schema) {
+        this.name = name;
+        this.schema = schema;  // [{ name, dataType, primaryKey }]
+        this.columns = schema.map(c => c.name);
+        this.rows = [];
+        this._columnIndex = new Map();
+        this.columns.forEach((col, i) => this._columnIndex.set(col.toLowerCase(), i));
+    }
+
+    /**
+     * Convert to format compatible with _executeOnInMemoryData
+     */
+    toInMemoryData() {
+        return { columns: this.columns, rows: this.rows };
+    }
+
+    /**
+     * Get row count
+     */
+    get rowCount() {
+        return this.rows.length;
+    }
+}
+
+/**
  * LanceDatabase manages multiple Lance datasets and executes multi-table queries.
  * Supports SQL JOINs across remote datasets with smart byte-range fetching.
  *
@@ -14366,6 +18695,11 @@ class LanceDatabase {
     constructor() {
         this.tables = new Map(); // name -> RemoteLanceDataset
         this.aliases = new Map(); // alias -> table name
+        // Query plan cache
+        this._planCache = new Map(); // normalized SQL -> { plan, hits, lastUsed }
+        this._planCacheMaxSize = 100;
+        // In-memory tables (ephemeral)
+        this.memoryTables = new Map(); // name -> MemoryTable
     }
 
     /**
@@ -14409,17 +18743,61 @@ class LanceDatabase {
     }
 
     /**
-     * Execute SQL query (supports SELECT with JOINs)
+     * Execute SQL query (supports SELECT with JOINs, CTEs, SET operations, and EXPLAIN)
      */
     async executeSQL(sql) {
-        // Parse SQL
-        const lexer = new SQLLexer(sql);
-        const tokens = lexer.tokenize();
-        const parser = new SQLParser(tokens);
-        const ast = parser.parse();
+        // Check plan cache first
+        const cachedPlan = this._getCachedPlan(sql);
+        let ast;
+
+        if (cachedPlan) {
+            ast = cachedPlan;
+        } else {
+            // Parse SQL
+            const lexer = new SQLLexer(sql);
+            const tokens = lexer.tokenize();
+            const parser = new SQLParser(tokens);
+            ast = parser.parse();
+
+            // Cache the plan (unless it's EXPLAIN which is meta)
+            if (ast.type !== 'EXPLAIN') {
+                this._setCachedPlan(sql, ast);
+            }
+        }
+
+        // Handle EXPLAIN - return plan without executing
+        if (ast.type === 'EXPLAIN') {
+            return this._explainQuery(ast.statement);
+        }
+
+        // Handle memory table operations (CREATE, DROP, INSERT, UPDATE, DELETE)
+        if (ast.type === 'CREATE_TABLE') {
+            return this._executeCreateTable(ast);
+        }
+        if (ast.type === 'DROP_TABLE') {
+            return this._executeDropTable(ast);
+        }
+        if (ast.type === 'INSERT') {
+            return this._executeInsert(ast);
+        }
+        if (ast.type === 'UPDATE') {
+            return this._executeUpdate(ast);
+        }
+        if (ast.type === 'DELETE') {
+            return this._executeDelete(ast);
+        }
+
+        if (ast.type === 'SET_OPERATION') {
+            return this._executeSetOperation(ast);
+        }
 
         if (ast.type !== 'SELECT') {
             throw new Error('Only SELECT queries are supported in LanceDatabase');
+        }
+
+        // Handle CTEs - materialize them first
+        if (ast.ctes && ast.ctes.length > 0) {
+            return this._executeWithCTEs(ast);
         }
 
         // No joins - simple single-table query
@@ -14429,6 +18807,198 @@ class LanceDatabase {
 
         // Multi-table query with JOINs
         return this._executeJoin(ast);
+    }
+
+    /**
+     * Execute query with CTEs
+     */
+    async _executeWithCTEs(ast) {
+        // Create a temporary executor for CTE materialization
+        const cteExecutor = new SQLExecutor({ columnNames: [] });
+        cteExecutor.setDatabase(this);
+        await cteExecutor.materializeCTEs(ast.ctes, this);
+
+        // Check if main query references a CTE
+        const mainTableName = ast.from?.name?.toLowerCase() || ast.from?.table?.toLowerCase();
+        if (mainTableName && cteExecutor._cteResults.has(mainTableName)) {
+            // Execute main query against CTE result
+            return cteExecutor._executeOnInMemoryData(ast, cteExecutor._cteResults.get(mainTableName));
+        }
+
+        // Otherwise execute against actual tables
+        if (!ast.joins || ast.joins.length === 0) {
+            return this._executeSingleTable(ast);
+        }
+        return this._executeJoin(ast);
+    }
+
+    /**
+     * Execute SET operation (UNION, INTERSECT, EXCEPT)
+     */
+    async _executeSetOperation(ast) {
+        // Execute left and right sides
+        const leftResult = await this.executeSQL(this._astToSQL(ast.left));
+        const rightResult = await this.executeSQL(this._astToSQL(ast.right));
+
+        if (leftResult.columns.length !== rightResult.columns.length) {
+            throw new Error('SET operations require same number of columns');
+        }
+
+        const rowKey = row => JSON.stringify(row);
+        let combinedRows;
+
+        switch (ast.operator) {
+            case 'UNION':
+                combinedRows = [...leftResult.rows, ...rightResult.rows];
+                if (!ast.all) {
+                    const seen = new Set();
+                    combinedRows = combinedRows.filter(row => {
+                        const key = rowKey(row);
+                        if (seen.has(key)) return false;
+                        seen.add(key);
+                        return true;
+                    });
+                }
+                break;
+
+            case 'INTERSECT':
+                const rightKeys = new Set(rightResult.rows.map(rowKey));
+                combinedRows = leftResult.rows.filter(row => rightKeys.has(rowKey(row)));
+                if (!ast.all) {
+                    const seenI = new Set();
+                    combinedRows = combinedRows.filter(row => {
+                        const key = rowKey(row);
+                        if (seenI.has(key)) return false;
+                        seenI.add(key);
+                        return true;
+                    });
+                }
+                break;
+
+            case 'EXCEPT':
+                const excludeKeys = new Set(rightResult.rows.map(rowKey));
+                combinedRows = leftResult.rows.filter(row => !excludeKeys.has(rowKey(row)));
+                if (!ast.all) {
+                    const seenE = new Set();
+                    combinedRows = combinedRows.filter(row => {
+                        const key = rowKey(row);
+                        if (seenE.has(key)) return false;
+                        seenE.add(key);
+                        return true;
+                    });
+                }
+                break;
+
+            default:
+                throw new Error(`Unknown SET operator: ${ast.operator}`);
+        }
+
+        // Apply ORDER BY to combined result
+        if (ast.orderBy && ast.orderBy.length > 0) {
+            const colIdxMap = {};
+            leftResult.columns.forEach((name, idx) => { colIdxMap[name.toLowerCase()] = idx; });
+
+            combinedRows.sort((a, b) => {
+                for (const ob of ast.orderBy) {
+                    const colIdx = colIdxMap[ob.column.toLowerCase()];
+                    if (colIdx === undefined) continue;
+                    const valA = a[colIdx], valB = b[colIdx];
+                    const dir = ob.direction === 'DESC' ? -1 : 1;
+                    if (valA == null && valB == null) continue;
+                    if (valA == null) return 1 * dir;
+                    if (valB == null) return -1 * dir;
+                    if (valA < valB) return -1 * dir;
+                    if (valA > valB) return 1 * dir;
+                }
+                return 0;
+            });
+        }
+
+        // Apply LIMIT/OFFSET to combined result
+        const offset = ast.offset || 0;
+        if (offset > 0) combinedRows = combinedRows.slice(offset);
+        if (ast.limit) combinedRows = combinedRows.slice(0, ast.limit);
+
+        return { columns: leftResult.columns, rows: combinedRows, total: combinedRows.length };
+    }
+
+    /**
+     * Convert AST back to SQL (for recursive SET operation execution)
+     */
+    _astToSQL(ast) {
+        if (ast.type === 'SET_OPERATION') {
+            const left = this._astToSQL(ast.left);
+            const right = this._astToSQL(ast.right);
+            const op = ast.operator + (ast.all ? ' ALL' : '');
+            return `(${left}) ${op} (${right})`;
+        }
+
+        // Build SELECT statement
+        let sql = ast.distinct ? 'SELECT DISTINCT ' : 'SELECT ';
+        sql += ast.columns.map(col => {
+            if (col.expr?.type === 'star') return '*';
+            const expr = this._exprToSQL(col.expr);
+            return col.alias ? `${expr} AS ${col.alias}` : expr;
+        }).join(', ');
+
+        if (ast.from) {
+            const tableName = ast.from.name || ast.from.table;
+            sql += ` FROM ${tableName}`;
+            if (ast.from.alias) sql += ` AS ${ast.from.alias}`;
+        }
+
+        if (ast.joins) {
+            for (const join of ast.joins) {
+                const rightTable = join.table?.name || join.table?.table;
+                sql += ` ${join.type} ${rightTable}`;
+                if (join.alias) sql += ` AS ${join.alias}`;
+                if (join.on) sql += ` ON ${this._exprToSQL(join.on)}`;
+            }
+        }
+
+        if (ast.where) sql += ` WHERE ${this._exprToSQL(ast.where)}`;
+        if (ast.groupBy?.length) sql += ` GROUP BY ${ast.groupBy.join(', ')}`;
+        if (ast.having) sql += ` HAVING ${this._exprToSQL(ast.having)}`;
+        if (ast.orderBy?.length) {
+            sql += ` ORDER BY ${ast.orderBy.map(o => `${o.column} ${o.direction || 'ASC'}`).join(', ')}`;
+        }
+        if (ast.limit) sql += ` LIMIT ${ast.limit}`;
+        if (ast.offset) sql += ` OFFSET ${ast.offset}`;
+
+        return sql;
+    }
+
+    /**
+     * Convert expression AST to SQL string
+     */
+    _exprToSQL(expr) {
+        if (!expr) return '';
+        switch (expr.type) {
+            case 'literal':
+                if (expr.value === null) return 'NULL';
+                if (typeof expr.value === 'string') return `'${expr.value.replace(/'/g, "''")}'`;
+                return String(expr.value);
+            case 'column':
+                return expr.table ? `${expr.table}.${expr.column}` : expr.column;
+            case 'star':
+                return '*';
+            case 'binary':
+                return `(${this._exprToSQL(expr.left)} ${expr.operator} ${this._exprToSQL(expr.right)})`;
+            case 'unary':
+                return `(${expr.operator} ${this._exprToSQL(expr.operand)})`;
+            case 'call':
+                const args = expr.args.map(a => this._exprToSQL(a)).join(', ');
+                return `${expr.name}(${expr.distinct ? 'DISTINCT ' : ''}${args})`;
+            case 'in':
+                const vals = expr.values.map(v => this._exprToSQL(v)).join(', ');
+                return `${this._exprToSQL(expr.expr)} IN (${vals})`;
+            case 'between':
+                return `${this._exprToSQL(expr.expr)} BETWEEN ${this._exprToSQL(expr.low)} AND ${this._exprToSQL(expr.high)}`;
+            case 'like':
+                return `${this._exprToSQL(expr.expr)} LIKE ${this._exprToSQL(expr.pattern)}`;
+            default:
+                return '';
+        }
     }
 
     /**
@@ -14445,6 +19015,16 @@ class LanceDatabase {
             throw new Error('Single-table queries must use registered table names, not URLs');
         }
 
+        const tableNameLower = tableName.toLowerCase();
+
+        // Check memory table first
+        if (this.memoryTables.has(tableNameLower)) {
+            const memTable = this.memoryTables.get(tableNameLower);
+            const executor = new SQLExecutor({ columnNames: memTable.columns });
+            return executor._executeOnInMemoryData(ast, memTable.toInMemoryData());
+        }
+
+        // Otherwise use remote dataset
         const dataset = this.getTable(tableName);
 
         // Build SQL and execute
@@ -14467,33 +19047,64 @@ class LanceDatabase {
             this.aliases.set(ast.from.alias, leftTableName);
         }
 
-        // For now, support only single JOIN (can extend later)
-        if (ast.joins.length > 1) {
-            throw new Error('Multiple JOINs not yet supported. Coming soon!');
+        // Process joins iteratively: (A JOIN B) JOIN C
+        // Each join's result becomes the left input for the next
+        console.log(`[LanceDatabase] Processing ${ast.joins.length} JOIN(s)`);
+
+        let currentResult = null;  // In-memory intermediate result
+        let currentAlias = leftAlias;
+        let currentTableName = leftTableName;
+        let leftDataset = this.getTable(leftTableName);
+
+        for (let i = 0; i < ast.joins.length; i++) {
+            const join = ast.joins[i];
+            const rightTableName = join.table.name || join.table.table;
+            const rightAlias = join.alias || rightTableName;
+
+            // Register right table alias
+            if (join.alias) {
+                this.aliases.set(join.alias, rightTableName);
+            }
+
+            console.log(`[LanceDatabase] JOIN ${i + 1}/${ast.joins.length}: ${currentTableName} (${currentAlias}) ${join.type} ${rightTableName} (${rightAlias})`);
+
+            // Get right dataset
+            const rightDataset = this.getTable(rightTableName);
+
+            // Build AST for this single join
+            const singleJoinAst = {
+                ...ast,
+                joins: [join],  // Only this join
+                // For intermediate joins, don't apply final limit/projection
+                limit: (i === ast.joins.length - 1) ? ast.limit : undefined,
+                columns: (i === ast.joins.length - 1) ? ast.columns : [{ type: 'column', column: '*' }]
+            };
+
+            // Execute hash join
+            if (currentResult === null) {
+                // First join: left is a dataset
+                currentResult = await this._hashJoin(
+                    leftDataset,
+                    rightDataset,
+                    singleJoinAst,
+                    { leftAlias: currentAlias, rightAlias, leftTableName: currentTableName, rightTableName }
+                );
+            } else {
+                // Subsequent joins: left is in-memory result
+                currentResult = await this._hashJoinWithInMemoryLeft(
+                    currentResult,
+                    rightDataset,
+                    singleJoinAst,
+                    { leftAlias: currentAlias, rightAlias, leftTableName: currentTableName, rightTableName }
+                );
+            }
+
+            // Update current state for next iteration
+            currentAlias = `${currentAlias}_${rightAlias}`;  // Compound alias for tracing
+            currentTableName = `(${currentTableName} JOIN ${rightTableName})`;
         }
 
-        const join = ast.joins[0];
-        const rightTableName = join.table.name || join.table.table;
-        const rightAlias = join.alias || rightTableName;
-
-        // Register right table alias
-        if (join.alias) {
-            this.aliases.set(join.alias, rightTableName);
-        }
-
-        console.log(`[LanceDatabase] JOIN: ${leftTableName} (${leftAlias}) ${join.type} ${rightTableName} (${rightAlias})`);
-
-        // Get datasets
-        const leftDataset = this.getTable(leftTableName);
-        const rightDataset = this.getTable(rightTableName);
-
-        // Execute hash join
-        return this._hashJoin(
-            leftDataset,
-            rightDataset,
-            ast,
-            { leftAlias, rightAlias, leftTableName, rightTableName }
-        );
+        return currentResult;
     }
 
     /**
@@ -14503,49 +19114,63 @@ class LanceDatabase {
     async _hashJoin(leftDataset, rightDataset, ast, context) {
         const { leftAlias, rightAlias, leftTableName, rightTableName } = context;
         const join = ast.joins[0];
+        const joinType = join.type || 'INNER';
 
-        // Parse JOIN ON condition (e.g., i.id = c.image_id)
+        // For CROSS JOIN, no ON condition is required
         const joinCondition = join.on;
-        if (!joinCondition || joinCondition.type !== 'binary' || joinCondition.op !== '=') {
-            throw new Error('JOIN ON condition must be an equality (e.g., table1.col1 = table2.col2)');
+        if (joinType !== 'CROSS') {
+            if (!joinCondition || joinCondition.type !== 'binary' || joinCondition.op !== '=') {
+                throw new Error('JOIN ON condition must be an equality (e.g., table1.col1 = table2.col2)');
+            }
         }
 
-        // Use QueryPlanner to generate optimized execution plan
-        const planner = new QueryPlanner();
-        const plan = planner.plan(ast, context);
+        // For CROSS JOIN, use simplified execution (no keys needed)
+        let leftKey, rightKey, leftSQL, rightSQL;
 
-        // Extract columns and keys from the plan
-        const leftKey = plan.join.leftKey;
-        const rightKey = plan.join.rightKey;
-        const leftColumns = plan.leftScan.columns;
-        const rightColumns = plan.rightScan.columns;
-        const leftFilters = plan.leftScan.filters;
-        const rightFilters = plan.rightScan.filters;
+        if (joinType === 'CROSS') {
+            // CROSS JOIN: select all columns, no join keys
+            leftKey = null;
+            rightKey = null;
+            leftSQL = `SELECT * FROM ${leftTableName}`;
+            rightSQL = `SELECT * FROM ${rightTableName}`;
+            console.log('[LanceDatabase] CROSS JOIN - no keys, cartesian product');
+        } else {
+            // Use QueryPlanner to generate optimized execution plan
+            const planner = new QueryPlanner();
+            const plan = planner.plan(ast, context);
 
-        // Build SQL queries for streaming
-        const leftColsWithKey = leftColumns.includes('*')
-            ? ['*']
-            : [...new Set([leftKey, ...leftColumns])];
+            // Extract columns and keys from the plan
+            leftKey = plan.join.leftKey;
+            rightKey = plan.join.rightKey;
+            const leftColumns = plan.leftScan.columns;
+            const rightColumns = plan.rightScan.columns;
+            const leftFilters = plan.leftScan.filters;
+            const rightFilters = plan.rightScan.filters;
 
-        let leftWhereClause = '';
-        if (leftFilters.length > 0) {
-            leftWhereClause = ` WHERE ${leftFilters.map(f => this._filterToSQL(f)).join(' AND ')}`;
+            // Build SQL queries for streaming
+            const leftColsWithKey = leftColumns.includes('*')
+                ? ['*']
+                : [...new Set([leftKey, ...leftColumns])];
+
+            let leftWhereClause = '';
+            if (leftFilters.length > 0) {
+                leftWhereClause = ` WHERE ${leftFilters.map(f => this._filterToSQL(f)).join(' AND ')}`;
+            }
+            leftSQL = `SELECT ${leftColsWithKey.join(', ')} FROM ${leftTableName}${leftWhereClause}`;
+
+            const rightColsWithKey = rightColumns.includes('*')
+                ? ['*']
+                : [...new Set([rightKey, ...rightColumns])];
+
+            let rightWhereClause = '';
+            if (rightFilters.length > 0) {
+                rightWhereClause = ` WHERE ${rightFilters.map(f => this._filterToSQL(f)).join(' AND ')}`;
+            }
+            rightSQL = `SELECT ${rightColsWithKey.join(', ')} FROM ${rightTableName}${rightWhereClause}`;
         }
-        const leftSQL = `SELECT ${leftColsWithKey.join(', ')} FROM ${leftTableName}${leftWhereClause}`;
-
-        const rightColsWithKey = rightColumns.includes('*')
-            ? ['*']
-            : [...new Set([rightKey, ...rightColumns])];
-
-        let rightWhereClause = '';
-        if (rightFilters.length > 0) {
-            rightWhereClause = ` WHERE ${rightFilters.map(f => this._filterToSQL(f)).join(' AND ')}`;
-        }
-        const rightSQL = `SELECT ${rightColsWithKey.join(', ')} FROM ${rightTableName}${rightWhereClause}`;
 
         console.log('[LanceDatabase] OPFS-backed hash join starting...');
         console.log('[LanceDatabase] Left query:', leftSQL);
-        console.log('[LanceDatabase] Right query:', rightSQL);
 
         // Initialize OPFS storage
         await opfsStorage.open();
@@ -14557,21 +19182,42 @@ class LanceDatabase {
         const leftExecutor = new SQLExecutor(leftDataset);
         const rightExecutor = new SQLExecutor(rightDataset);
 
-        // Create async generators for streaming
+        // Semi-join optimization: partition left first and collect keys
         const leftStream = leftExecutor.executeStream(leftSQL);
-        const rightStream = rightExecutor.executeStream(rightSQL);
+        const leftMeta = await joinExecutor._partitionToOPFS(leftStream, leftKey, 'left', true);
+        console.log(`[LanceDatabase] Left partitioned: ${leftMeta.totalRows} rows, ${leftMeta.collectedKeys?.size || 0} unique keys`);
 
-        // Execute OPFS-backed join
+        // Build optimized right SQL with IN clause if we have reasonable key count
+        let optimizedRightSQL = rightSQL;
+        const maxKeysForInClause = 1000;  // Don't create huge IN clauses
+        if (leftMeta.collectedKeys && leftMeta.collectedKeys.size > 0 &&
+            leftMeta.collectedKeys.size <= maxKeysForInClause) {
+            const inClause = this._buildInClause(rightKey, leftMeta.collectedKeys);
+            optimizedRightSQL = this._appendWhereClause(rightSQL, inClause);
+            console.log(`[LanceDatabase] Semi-join optimization: added IN clause with ${leftMeta.collectedKeys.size} keys`);
+        }
+        console.log('[LanceDatabase] Right query:', optimizedRightSQL);
+
+        // Create right stream with optimized SQL
+        const rightStream = rightExecutor.executeStream(optimizedRightSQL);
+
+        // Execute OPFS-backed join with pre-partitioned left
         const results = [];
         let resultColumns = null;
 
         try {
             for await (const chunk of joinExecutor.executeHashJoin(
-                leftStream,
+                null,  // leftStream already partitioned
                 rightStream,
                 leftKey,
                 rightKey,
-                { limit: ast.limit || Infinity }
+                {
+                    limit: ast.limit || Infinity,
+                    leftAlias,
+                    rightAlias,
+                    joinType: join.type || 'INNER',
+                    prePartitionedLeft: leftMeta
+                }
             )) {
                 if (!resultColumns) {
                     resultColumns = chunk.columns;
@@ -14620,7 +19266,183 @@ class LanceDatabase {
     }
 
     /**
+     * Execute hash join with in-memory left side (for multiple JOINs).
+     * The left side comes from a previous join's result.
+     */
+    async _hashJoinWithInMemoryLeft(leftResult, rightDataset, ast, context) {
+        const { leftAlias, rightAlias, leftTableName, rightTableName } = context;
+        const join = ast.joins[0];
+        const joinType = join.type || 'INNER';
+
+        // For CROSS JOIN, no ON condition required
+        const joinCondition = join.on;
+        if (joinType !== 'CROSS') {
+            if (!joinCondition || joinCondition.type !== 'binary' || joinCondition.op !== '=') {
+                throw new Error('JOIN ON condition must be an equality (e.g., table1.col1 = table2.col2)');
+            }
+        }
+
+        // Extract join keys
+        let leftKey, rightKey;
+        if (joinType === 'CROSS') {
+            leftKey = null;
+            rightKey = null;
+        } else {
+            // Extract keys from ON condition
+            const leftExpr = joinCondition.left;
+            const rightExpr = joinCondition.right;
+
+            // Determine which side refers to left vs right
+            const leftCol = leftExpr.column;
+            const rightCol = rightExpr.column;
+
+            // Find which column is in the left result columns
+            const leftColsSet = new Set(leftResult.columns.map(c => {
+                const parts = c.split('.');
+                return parts[parts.length - 1];  // Get base column name
+            }));
+
+            if (leftColsSet.has(leftCol)) {
+                leftKey = leftCol;
+                rightKey = rightCol;
+            } else {
+                leftKey = rightCol;
+                rightKey = leftCol;
+            }
+        }
+
+        console.log(`[LanceDatabase] Multi-JOIN: left in-memory (${leftResult.rows.length} rows), right: ${rightTableName}`);
+
+        // Build right SQL - select all for now
+        let rightSQL = `SELECT * FROM ${rightTableName}`;
+
+        // Semi-join optimization: use in-memory left keys to filter right
+        const maxKeysForInClause = 1000;
+        if (leftKey && joinType !== 'CROSS') {
+            const leftKeyIndex = this._findColumnIndex(leftResult.columns, leftKey);
+            if (leftKeyIndex !== -1) {
+                const leftKeys = new Set();
+                for (const row of leftResult.rows) {
+                    const key = row[leftKeyIndex];
+                    if (key !== null && key !== undefined) {
+                        leftKeys.add(key);
+                    }
+                }
+                if (leftKeys.size > 0 && leftKeys.size <= maxKeysForInClause) {
+                    const inClause = this._buildInClause(rightKey, leftKeys);
+                    rightSQL = this._appendWhereClause(rightSQL, inClause);
+                    console.log(`[LanceDatabase] Multi-JOIN semi-join: ${leftKeys.size} keys`);
+                }
+            }
+        }
+
+        // Execute right query
+        const rightExecutor = new SQLExecutor(rightDataset);
+        const rightResult = await rightExecutor.execute(new SQLParser(new SQLLexer(rightSQL).tokenize()).parse());
+
+        // Find key indices for in-memory hash join
+        const leftKeyIndex = leftKey ? this._findColumnIndex(leftResult.columns, leftKey) : -1;
+        const rightKeyIndex = rightKey ? this._findColumnIndex(rightResult.columns, rightKey) : -1;
+
+        // Build result columns
+        const resultColumns = [
+            ...leftResult.columns,
+            ...rightResult.columns.map(c => `${rightAlias}.${c}`)
+        ];
+
+        // Execute in-memory hash join
+        const results = [];
+        const rightNulls = new Array(rightResult.columns.length).fill(null);
+        const leftNulls = new Array(leftResult.columns.length).fill(null);
+
+        if (joinType === 'CROSS') {
+            // Cartesian product
+            for (const leftRow of leftResult.rows) {
+                for (const rightRow of rightResult.rows) {
+                    results.push([...leftRow, ...rightRow]);
+                    if (ast.limit && results.length >= ast.limit) break;
+                }
+                if (ast.limit && results.length >= ast.limit) break;
+            }
+        } else {
+            // Build hash table from right side
+            const rightHash = new Map();
+            for (const row of rightResult.rows) {
+                const key = row[rightKeyIndex];
+                if (key !== null && key !== undefined) {
+                    if (!rightHash.has(key)) rightHash.set(key, []);
+                    rightHash.get(key).push(row);
+                }
+            }
+
+            // Track matched right rows for FULL/RIGHT joins
+            const matchedRightRows = (joinType === 'FULL' || joinType === 'RIGHT')
+                ? new Set() : null;
+
+            // Probe with left rows
+            for (const leftRow of leftResult.rows) {
+                const key = leftRow[leftKeyIndex];
+                const rightMatches = rightHash.get(key) || [];
+
+                if (rightMatches.length > 0) {
+                    for (const rightRow of rightMatches) {
+                        results.push([...leftRow, ...rightRow]);
+                        if (matchedRightRows) {
+                            matchedRightRows.add(rightResult.rows.indexOf(rightRow));
+                        }
+                        if (ast.limit && results.length >= ast.limit) break;
+                    }
+                } else if (joinType === 'LEFT' || joinType === 'FULL') {
+                    // Left row with no match
+                    results.push([...leftRow, ...rightNulls]);
+                }
+                if (ast.limit && results.length >= ast.limit) break;
+            }
+
+            // Add unmatched right rows for RIGHT/FULL joins
+            if ((joinType === 'RIGHT' || joinType === 'FULL') && matchedRightRows) {
+                for (let i = 0; i < rightResult.rows.length; i++) {
+                    if (!matchedRightRows.has(i)) {
+                        results.push([...leftNulls, ...rightResult.rows[i]]);
+                        if (ast.limit && results.length >= ast.limit) break;
+                    }
+                }
+            }
+        }
+
+        // Apply projection if this is the final join
+        const limitedResults = ast.limit ? results.slice(0, ast.limit) : results;
+
+        return {
+            columns: resultColumns,
+            rows: limitedResults,
+            total: limitedResults.length
+        };
+    }
+
+    /**
+     * Find column index by name, handling qualified names (table.column)
+     */
+    _findColumnIndex(columns, columnName) {
+        // Try exact match first
+        let idx = columns.indexOf(columnName);
+        if (idx !== -1) return idx;
+
+        // Try with any table prefix (for qualified names like "users.id")
+        for (let i = 0; i < columns.length; i++) {
+            const col = columns[i];
+            const parts = col.split('.');
+            if (parts[parts.length - 1] === columnName) {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    /**
      * Convert filter expression to SQL WHERE clause
+     * Note: Strips table aliases since pushed-down queries are single-table
      */
     _filterToSQL(expr) {
         if (!expr) return '';
@@ -14630,17 +19452,39 @@ class LanceDatabase {
             const right = this._filterToSQL(expr.right);
             return `${left} ${expr.op} ${right}`;
         } else if (expr.type === 'column') {
-            return expr.table ? `${expr.table}.${expr.column}` : expr.column;
+            // Strip table alias - pushed query is single-table
+            return expr.column;
         } else if (expr.type === 'literal') {
             if (typeof expr.value === 'string') {
-                return `'${expr.value}'`;
+                // Escape single quotes to prevent SQL injection
+                const escaped = expr.value.replace(/'/g, "''");
+                return `'${escaped}'`;
             }
+            if (expr.value === null) return 'NULL';
             return String(expr.value);
         } else if (expr.type === 'call') {
             const args = (expr.args || []).map(a => this._filterToSQL(a)).join(', ');
             return `${expr.name}(${args})`;
+        } else if (expr.type === 'in') {
+            const col = this._filterToSQL(expr.expr);
+            const vals = expr.values.map(v => this._filterToSQL(v)).join(', ');
+            return `${col} IN (${vals})`;
+        } else if (expr.type === 'between') {
+            const col = this._filterToSQL(expr.expr);
+            const low = this._filterToSQL(expr.low);
+            const high = this._filterToSQL(expr.high);
+            return `${col} BETWEEN ${low} AND ${high}`;
+        } else if (expr.type === 'like') {
+            const col = this._filterToSQL(expr.expr);
+            const pattern = this._filterToSQL(expr.pattern);
+            return `${col} LIKE ${pattern}`;
+        } else if (expr.type === 'unary') {
+            const operand = this._filterToSQL(expr.operand);
+            if (expr.op === 'NOT') return `NOT ${operand}`;
+            return `${expr.op}${operand}`;
         }
 
+        console.warn('[LanceDB] Unknown filter expression type:', expr.type);
         return '';
     }
 
@@ -14663,19 +19507,26 @@ class LanceDatabase {
                 continue;
             }
 
-            const targetCol = col.table
-                ? `${col.column}`  // Use just column name for matching
-                : col.column;
+            let idx = -1;
+            let outputColName = col.column;
 
-            // Find column in result set
-            let idx = allColumns.indexOf(targetCol);
+            if (col.table) {
+                // Try exact match with table prefix first (most specific)
+                const qualifiedName = `${col.table}.${col.column}`;
+                idx = allColumns.indexOf(qualifiedName);
+                outputColName = qualifiedName;
+            }
+
             if (idx === -1) {
-                // Try with table prefix
-                idx = allColumns.indexOf(`${col.table}.${col.column}`);
+                // Fallback: find first column ending with this column name
+                idx = allColumns.findIndex(c => c === col.column || c.endsWith(`.${col.column}`));
+                if (idx !== -1) {
+                    outputColName = allColumns[idx];
+                }
             }
 
             if (idx !== -1) {
-                projectedColumns.push(col.alias || targetCol);
+                projectedColumns.push(col.alias || outputColName);
                 columnIndices.push(idx);
             }
         }
@@ -14724,6 +19575,614 @@ class LanceDatabase {
         }
 
         return columns.length > 0 ? columns : ['*'];
+    }
+
+    /**
+     * Build an IN clause for semi-join optimization
+     * @param {string} column - Column name for IN clause
+     * @param {Set} keys - Unique key values collected from left table
+     * @returns {string} SQL IN clause fragment
+     */
+    _buildInClause(column, keys) {
+        const values = Array.from(keys).map(k => {
+            if (typeof k === 'string') {
+                return `'${k.replace(/'/g, "''")}'`;  // Escape single quotes
+            }
+            if (k === null) return 'NULL';
+            return String(k);
+        }).join(', ');
+        return `${column} IN (${values})`;
+    }
+
+    /**
+     * Append a WHERE clause or AND condition to existing SQL
+     * @param {string} sql - Existing SQL query
+     * @param {string} clause - Condition to add
+     * @returns {string} SQL with added condition
+     */
+    _appendWhereClause(sql, clause) {
+        const upperSQL = sql.toUpperCase();
+        if (upperSQL.includes('WHERE')) {
+            // Insert after WHERE keyword
+            return sql.replace(/WHERE\s+/i, `WHERE ${clause} AND `);
+        }
+        // Find FROM table (with optional alias) and add WHERE after
+        // Match: FROM tablename or FROM tablename alias
+        return sql.replace(/FROM\s+(\w+)(\s+\w+)?/i, (match) => `${match} WHERE ${clause}`);
+    }
+
+    // ========================================================================
+    // Phase 9: Query Optimization Methods
+    // ========================================================================
+
+    /**
+     * Get cached query plan
+     * @param {string} sql - SQL query string
+     * @returns {Object|null} Cached plan or null
+     */
+    _getCachedPlan(sql) {
+        const normalized = this._normalizeSQL(sql);
+        const cached = this._planCache.get(normalized);
+        if (cached) {
+            cached.hits++;
+            cached.lastUsed = Date.now();
+            return cached.plan;
+        }
+        return null;
+    }
+
+    /**
+     * Cache a query plan
+     * @param {string} sql - SQL query string
+     * @param {Object} plan - Parsed AST plan
+     */
+    _setCachedPlan(sql, plan) {
+        const normalized = this._normalizeSQL(sql);
+
+        // LRU eviction if at capacity
+        if (this._planCache.size >= this._planCacheMaxSize) {
+            let oldest = null;
+            let oldestTime = Infinity;
+            for (const [key, value] of this._planCache) {
+                if (value.lastUsed < oldestTime) {
+                    oldestTime = value.lastUsed;
+                    oldest = key;
+                }
+            }
+            if (oldest) this._planCache.delete(oldest);
+        }
+
+        this._planCache.set(normalized, {
+            plan,
+            hits: 0,
+            lastUsed: Date.now(),
+            created: Date.now()
+        });
+    }
+
+    /**
+     * Normalize SQL for cache key (remove extra whitespace, lowercase)
+     * @param {string} sql - SQL query string
+     * @returns {string} Normalized SQL
+     */
+    _normalizeSQL(sql) {
+        return sql.trim().replace(/\s+/g, ' ').toLowerCase();
+    }
+
+    /**
+     * Clear the query plan cache
+     */
+    clearPlanCache() {
+        this._planCache.clear();
+    }
+
+    /**
+     * Get plan cache statistics
+     * @returns {Object} Cache stats
+     */
+    getPlanCacheStats() {
+        let totalHits = 0;
+        for (const v of this._planCache.values()) {
+            totalHits += v.hits;
+        }
+        return {
+            size: this._planCache.size,
+            maxSize: this._planCacheMaxSize,
+            totalHits
+        };
+    }
+
+    /**
+     * Optimize expression with constant folding and boolean simplification
+     * @param {Object} expr - Expression AST node
+     * @returns {Object} Optimized expression
+     */
+    _optimizeExpr(expr) {
+        if (!expr) return expr;
+
+        // Recursively optimize children
+        if (expr.left) expr.left = this._optimizeExpr(expr.left);
+        if (expr.right) expr.right = this._optimizeExpr(expr.right);
+        if (expr.operand) expr.operand = this._optimizeExpr(expr.operand);
+        if (expr.args) expr.args = expr.args.map(a => this._optimizeExpr(a));
+
+        // Get operator - AST may use 'op' or 'operator'
+        const op = expr.op || expr.operator;
+
+        // Constant folding for binary operations
+        if (expr.type === 'binary' &&
+            this._isConstantExpr(expr.left) &&
+            this._isConstantExpr(expr.right)) {
+            return this._foldBinary(expr);
+        }
+
+        // Boolean simplification
+        if (expr.type === 'binary' && op === 'AND') {
+            if (this._isTrueExpr(expr.right)) return expr.left;
+            if (this._isTrueExpr(expr.left)) return expr.right;
+            if (this._isFalseExpr(expr.left) || this._isFalseExpr(expr.right)) {
+                return { type: 'literal', value: false };
+            }
+        }
+        if (expr.type === 'binary' && op === 'OR') {
+            if (this._isFalseExpr(expr.right)) return expr.left;
+            if (this._isFalseExpr(expr.left)) return expr.right;
+            if (this._isTrueExpr(expr.left) || this._isTrueExpr(expr.right)) {
+                return { type: 'literal', value: true };
+            }
+        }
+
+        return expr;
+    }
+
+    /**
+     * Check if expression is a constant
+     */
+    _isConstantExpr(expr) {
+        return expr && ['literal', 'number', 'string'].includes(expr.type);
+    }
+
+    /**
+     * Check if expression is TRUE
+     */
+    _isTrueExpr(expr) {
+        return expr?.type === 'literal' && expr.value === true;
+    }
+
+    /**
+     * Check if expression is FALSE
+     */
+    _isFalseExpr(expr) {
+        return expr?.type === 'literal' && expr.value === false;
+    }
+
+    /**
+     * Fold binary constant expression
+     * @param {Object} expr - Binary expression with constant operands
+     * @returns {Object} Literal result
+     */
+    _foldBinary(expr) {
+        const left = this._getConstantValueExpr(expr.left);
+        const right = this._getConstantValueExpr(expr.right);
+
+        // Get operator - AST may use 'op' or 'operator'
+        const op = expr.op || expr.operator;
+
+        let result;
+        switch (op) {
+            case '+': result = left + right; break;
+            case '-': result = left - right; break;
+            case '*': result = left * right; break;
+            case '/': result = right !== 0 ? left / right : null; break;
+            case '%': result = left % right; break;
+            case '=': case '==': result = left === right; break;
+            case '!=': case '<>': result = left !== right; break;
+            case '<': result = left < right; break;
+            case '>': result = left > right; break;
+            case '<=': result = left <= right; break;
+            case '>=': result = left >= right; break;
+            default: return expr;  // Can't fold
+        }
+
+        return { type: 'literal', value: result };
+    }
+
+    /**
+     * Get constant value from expression
+     */
+    _getConstantValueExpr(expr) {
+        if (expr.type === 'number') return expr.value;
+        if (expr.type === 'string') return expr.value;
+        if (expr.type === 'literal') return expr.value;
+        return null;
+    }
+
+    /**
+     * Extract range predicates from WHERE clause for statistics-based pruning
+     * @param {Object} where - WHERE clause AST
+     * @returns {Array} Array of predicate objects
+     */
+    _extractRangePredicates(where) {
+        const predicates = [];
+        this._collectRangePredicates(where, predicates);
+        return predicates;
+    }
+
+    /**
+     * Recursively collect range predicates
+     */
+    _collectRangePredicates(expr, predicates) {
+        if (!expr) return;
+
+        // Get operator - AST uses 'op' or 'operator'
+        const op = expr.op || expr.operator;
+
+        // Handle AND - recurse both sides
+        if (expr.type === 'binary' && op === 'AND') {
+            this._collectRangePredicates(expr.left, predicates);
+            this._collectRangePredicates(expr.right, predicates);
+            return;
+        }
+
+        // Range operators (normalize '==' to '=')
+        const normalizedOp = op === '==' ? '=' : op;
+        if (['>', '<', '>=', '<=', '=', '!=', '<>'].includes(normalizedOp)) {
+            // Column on left, constant on right
+            if (this._isColumnRefExpr(expr.left) && this._isConstantExpr(expr.right)) {
+                predicates.push({
+                    column: this._getColumnNameExpr(expr.left),
+                    operator: normalizedOp,
+                    value: this._getConstantValueExpr(expr.right)
+                });
+            }
+            // Constant on left, column on right - flip operator
+            else if (this._isConstantExpr(expr.left) && this._isColumnRefExpr(expr.right)) {
+                predicates.push({
+                    column: this._getColumnNameExpr(expr.right),
+                    operator: this._flipOperatorExpr(normalizedOp),
+                    value: this._getConstantValueExpr(expr.left)
+                });
+            }
+        }
+
+        // BETWEEN clause
+        if (expr.type === 'between' && expr.expr) {
+            const col = this._getColumnNameExpr(expr.expr);
+            if (col && expr.low && expr.high) {
+                predicates.push({
+                    column: col,
+                    operator: '>=',
+                    value: this._getConstantValueExpr(expr.low)
+                });
+                predicates.push({
+                    column: col,
+                    operator: '<=',
+                    value: this._getConstantValueExpr(expr.high)
+                });
+            }
+        }
+    }
+
+    /**
+     * Flip comparison operator (for constant on left side)
+     */
+    _flipOperatorExpr(op) {
+        const flips = { '>': '<', '<': '>', '>=': '<=', '<=': '>=' };
+        return flips[op] || op;
+    }
+
+    /**
+     * Check if expression is a column reference
+     */
+    _isColumnRefExpr(expr) {
+        return expr && (expr.type === 'column' || expr.type === 'identifier');
+    }
+
+    /**
+     * Get column name from expression
+     */
+    _getColumnNameExpr(expr) {
+        if (expr.type === 'column') return expr.name || expr.column;
+        if (expr.type === 'identifier') return expr.name || expr.value;
+        return null;
+    }
+
+    /**
+     * Check if a fragment can be pruned based on statistics and predicates
+     * @param {Object} fragmentStats - Column statistics for the fragment
+     * @param {Array} predicates - Extracted predicates from WHERE clause
+     * @returns {boolean} True if fragment can be safely skipped
+     */
+    _canPruneFragment(fragmentStats, predicates) {
+        for (const pred of predicates) {
+            const stats = fragmentStats[pred.column];
+            if (!stats) continue;  // No stats for this column
+
+            const { min, max, nullCount, rowCount } = stats;
+
+            // All nulls - can't satisfy any comparison
+            if (nullCount === rowCount) return true;
+
+            switch (pred.operator) {
+                case '>':
+                    // If max <= value, no rows can satisfy > value
+                    if (max <= pred.value) return true;
+                    break;
+                case '>=':
+                    if (max < pred.value) return true;
+                    break;
+                case '<':
+                    if (min >= pred.value) return true;
+                    break;
+                case '<=':
+                    if (min > pred.value) return true;
+                    break;
+                case '=':
+                    // If value outside [min, max], no match possible
+                    if (pred.value < min || pred.value > max) return true;
+                    break;
+                case '!=':
+                case '<>':
+                    // Can only prune if all values are the same and equal to pred.value
+                    if (min === max && min === pred.value) return true;
+                    break;
+            }
+        }
+
+        return false;  // Cannot prune
+    }
+
+    /**
+     * Execute EXPLAIN query - return query plan without executing
+     * @param {Object} ast - Parsed AST of the inner query
+     * @returns {Object} Plan information
+     */
+    _explainQuery(ast) {
+        const plan = {
+            type: ast.type,
+            tables: [],
+            predicates: [],
+            optimizations: []
+        };
+
+        // Collect table info
+        if (ast.from) {
+            plan.tables.push({
+                name: ast.from.name || ast.from.table,
+                alias: ast.from.alias
+            });
+        }
+
+        // Collect joined tables
+        if (ast.joins) {
+            for (const join of ast.joins) {
+                plan.tables.push({
+                    name: join.table?.name || join.table?.table,
+                    alias: join.table?.alias,
+                    joinType: join.type
+                });
+            }
+        }
+
+        // Extract predicates from WHERE
+        if (ast.where) {
+            plan.predicates = this._extractRangePredicates(ast.where);
+        }
+
+        // Identify optimizations
+        if (ast.where) {
+            plan.optimizations.push('PREDICATE_PUSHDOWN');
+        }
+        if (ast.groupBy) {
+            plan.optimizations.push('AGGREGATE');
+        }
+        if (ast.orderBy) {
+            plan.optimizations.push('SORT');
+        }
+        if (ast.limit) {
+            plan.optimizations.push('LIMIT_PUSHDOWN');
+        }
+
+        return {
+            columns: ['Plan'],
+            rows: [[JSON.stringify(plan, null, 2)]],
+            total: 1
+        };
+    }
+
+    // ========================================================================
+    // Phase 10: Memory Table CRUD Operations
+    // ========================================================================
+
+    /**
+     * Execute CREATE TABLE - creates an in-memory table
+     * @param {Object} ast - Parsed CREATE TABLE AST
+     * @returns {Object} Result with success flag
+     */
+    _executeCreateTable(ast) {
+        const tableName = (ast.table || ast.name || '').toLowerCase();
+
+        if (!tableName) {
+            throw new Error('CREATE TABLE requires a table name');
+        }
+
+        // Check if table already exists (memory or remote)
+        if (this.memoryTables.has(tableName) || this.tables.has(tableName)) {
+            if (ast.ifNotExists) {
+                return { success: true, existed: true, table: tableName };
+            }
+            throw new Error(`Table '${tableName}' already exists`);
+        }
+
+        // Build schema from AST columns
+        const schema = (ast.columns || []).map(col => ({
+            name: col.name,
+            dataType: col.dataType || col.type || 'TEXT',
+            primaryKey: col.primaryKey || false
+        }));
+
+        if (schema.length === 0) {
+            throw new Error('CREATE TABLE requires at least one column');
+        }
+
+        // Create and store the memory table
+        const table = new MemoryTable(tableName, schema);
+        this.memoryTables.set(tableName, table);
+
+        return {
+            success: true,
+            table: tableName,
+            columns: schema.map(c => c.name)
+        };
+    }
+
+    /**
+     * Execute DROP TABLE - removes an in-memory table
+     * @param {Object} ast - Parsed DROP TABLE AST
+     * @returns {Object} Result with success flag
+     */
+    _executeDropTable(ast) {
+        const tableName = (ast.table || ast.name || '').toLowerCase();
+
+        if (!this.memoryTables.has(tableName)) {
+            if (ast.ifExists) {
+                return { success: true, existed: false, table: tableName };
+            }
+            throw new Error(`Memory table '${tableName}' not found`);
+        }
+
+        this.memoryTables.delete(tableName);
+        return { success: true, table: tableName };
+    }
+
+    /**
+     * Execute INSERT - adds rows to a memory table
+     * @param {Object} ast - Parsed INSERT AST
+     * @returns {Object} Result with inserted count
+     */
+    _executeInsert(ast) {
+        const tableName = (ast.table || '').toLowerCase();
+        const table = this.memoryTables.get(tableName);
+
+        if (!table) {
+            throw new Error(`Memory table '${tableName}' not found. Use CREATE TABLE first.`);
+        }
+
+        // Get column names to insert into (use table columns if not specified)
+        const insertCols = ast.columns || table.columns;
+        let inserted = 0;
+
+        // Process each row from VALUES clause
+        for (const astRow of (ast.rows || ast.values || [])) {
+            const row = new Array(table.columns.length).fill(null);
+
+            insertCols.forEach((colName, i) => {
+                const colIdx = table._columnIndex.get(
+                    (typeof colName === 'string' ? colName : colName.name || colName).toLowerCase()
+                );
+                if (colIdx !== undefined && i < astRow.length) {
+                    // Handle AST value nodes or raw values
+                    const val = astRow[i];
+                    row[colIdx] = val?.value !== undefined ? val.value : val;
+                }
+            });
+
+            table.rows.push(row);
+            inserted++;
+        }
+
+        return {
+            success: true,
+            inserted,
+            total: table.rows.length
+        };
+    }
+
+    /**
+     * Execute UPDATE - modifies rows in a memory table
+     * @param {Object} ast - Parsed UPDATE AST
+     * @returns {Object} Result with updated count
+     */
+    _executeUpdate(ast) {
+        const tableName = (ast.table || '').toLowerCase();
+        const table = this.memoryTables.get(tableName);
+
+        if (!table) {
+            throw new Error(`Memory table '${tableName}' not found`);
+        }
+
+        // Build column data for WHERE expression evaluation
+        const columnData = {};
+        table.columns.forEach((col, idx) => {
+            columnData[col.toLowerCase()] = table.rows.map(row => row[idx]);
+        });
+
+        // Create executor for expression evaluation
+        const executor = new SQLExecutor({ columnNames: table.columns });
+        let updated = 0;
+
+        // Process each row
+        for (let i = 0; i < table.rows.length; i++) {
+            // Check WHERE condition (if present)
+            const matches = !ast.where || executor._evaluateInMemoryExpr(ast.where, columnData, i);
+
+            if (matches) {
+                // Apply SET assignments
+                for (const assignment of (ast.assignments || ast.set || [])) {
+                    const colName = (assignment.column || assignment.name || '').toLowerCase();
+                    const colIdx = table._columnIndex.get(colName);
+
+                    if (colIdx !== undefined) {
+                        const val = assignment.value;
+                        table.rows[i][colIdx] = val?.value !== undefined ? val.value : val;
+                    }
+                }
+                updated++;
+            }
+        }
+
+        return { success: true, updated };
+    }
+
+    /**
+     * Execute DELETE - removes rows from a memory table
+     * @param {Object} ast - Parsed DELETE AST
+     * @returns {Object} Result with deleted count
+     */
+    _executeDelete(ast) {
+        const tableName = (ast.table || '').toLowerCase();
+        const table = this.memoryTables.get(tableName);
+
+        if (!table) {
+            throw new Error(`Memory table '${tableName}' not found`);
+        }
+
+        const originalCount = table.rows.length;
+
+        if (ast.where) {
+            // Build column data for WHERE expression evaluation
+            const columnData = {};
+            table.columns.forEach((col, idx) => {
+                columnData[col.toLowerCase()] = table.rows.map(row => row[idx]);
+            });
+
+            // Create executor for expression evaluation
+            const executor = new SQLExecutor({ columnNames: table.columns });
+
+            // Keep rows that DON'T match the WHERE condition
+            table.rows = table.rows.filter((_, i) =>
+                !executor._evaluateInMemoryExpr(ast.where, columnData, i)
+            );
+        } else {
+            // DELETE without WHERE = truncate
+            table.rows = [];
+        }
+
+        return {
+            success: true,
+            deleted: originalCount - table.rows.length,
+            remaining: table.rows.length
+        };
     }
 }
 
@@ -16296,9 +21755,14 @@ async function initSqlJs(config = {}) {
         console.warn('[LanceQL] OPFS not available:', e.message);
     }
 
-    // Initialize WebGPU for accelerated vector search
+    // Initialize WebGPU for accelerated vector search, aggregations, joins, sorting, and grouping
     try {
         await webgpuAccelerator.init();
+        await gpuAggregator.init();
+        await gpuJoiner.init();
+        await gpuSorter.init();
+        await gpuGrouper.init();
+        await gpuVectorSearch.init();
     } catch (e) {
         console.warn('[LanceQL] WebGPU not available:', e.message);
     }
@@ -16312,39 +21776,11 @@ async function initSqlJs(config = {}) {
 // Also export as sqljs for explicit naming
 
 
-// Export WebGPU accelerator for direct access
+// Export WebGPU accelerator, GPU aggregator, GPU joiner, GPU sorter, and GPU grouper for direct access
 
 
 // LogicTable exports (disabled - LanceDataset API not yet implemented)
 // export { Table, logicTable, LogicTableQuery, loadLogicTable } from './logic-table.js';
 
 // Default export for convenience
-// default export: LanceQL
 
-
-// CommonJS exports
-module.exports = {
-    wasmUtils,
-    OPFSJoinExecutor,
-    LocalDatabase,
-    Store,
-    LanceQL,
-    LanceFile,
-    DataFrame,
-    RemoteLanceFile,
-    IVFIndex,
-    SQLLexer,
-    SQLParser,
-    SQLExecutor,
-    RemoteLanceDataset,
-    QueryPlanner,
-    LanceDatabase,
-    WorkerPool,
-    SharedVectorStore,
-    LanceData,
-    vault,
-    lanceStore,
-    parseSQL,
-    initSqlJs,
-    default: LanceQL
-};
