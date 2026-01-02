@@ -2,7 +2,7 @@
  * SQLParser - Recursive descent SQL parser
  */
 
-import { SQLLexer } from './lexer.js';
+import { SQLLexer, TokenType } from './lexer.js';
 
 class SQLParser {
     constructor(tokens) {

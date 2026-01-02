@@ -20,6 +20,9 @@ pub const aggregate_functions = @import("aggregate_functions.zig");
 pub const window_functions = @import("window_functions.zig");
 pub const result_types = @import("result_types.zig");
 pub const result_ops = @import("result_ops.zig");
+pub const having_eval = @import("having_eval.zig");
+pub const set_ops = @import("set_ops.zig");
+pub const window_eval = @import("window_eval.zig");
 
 const Expr = ast.Expr;
 const SelectStmt = ast.SelectStmt;
@@ -915,12 +918,12 @@ pub const Executor = struct {
 
     /// Execute a set operation (UNION, INTERSECT, EXCEPT) between two result sets
     /// Note: Takes ownership of left result and frees it after use
-    fn executeSetOperation(self: *Self, left_in: Result, set_op: ast.SetOperation, params: []const Value) anyerror!Result {
+    fn executeSetOperation(self: *Self, left_in: Result, set_op_def: ast.SetOperation, params: []const Value) anyerror!Result {
         var left = left_in;
         defer left.deinit();
 
         // Execute the right-hand SELECT
-        var right = try self.execute(set_op.right, params);
+        var right = try self.execute(set_op_def.right, params);
         defer right.deinit();
 
         // Verify column count matches
@@ -928,144 +931,12 @@ pub const Executor = struct {
             return error.SetOperationColumnMismatch;
         }
 
-        return switch (set_op.op_type) {
-            .union_all => try self.executeUnionAll(left, right),
-            .union_distinct => try self.executeUnionDistinct(left, right),
-            .intersect => try self.executeIntersect(left, right),
-            .except => try self.executeExcept(left, right),
+        return switch (set_op_def.op_type) {
+            .union_all => try set_ops.executeUnionAll(self.allocator, left, right),
+            .union_distinct => try set_ops.executeUnionDistinct(self.allocator, left, right),
+            .intersect => try set_ops.executeIntersect(self.allocator, left, right),
+            .except => try set_ops.executeExcept(self.allocator, left, right),
         };
-    }
-
-    /// UNION ALL: Concatenate both result sets (keeping duplicates)
-    fn executeUnionAll(self: *Self, left: Result, right: Result) !Result {
-        const col_count = left.columns.len;
-        const total_rows = left.row_count + right.row_count;
-
-        var new_columns = try self.allocator.alloc(Result.Column, col_count);
-        errdefer self.allocator.free(new_columns);
-
-        for (0..col_count) |i| {
-            const left_col = left.columns[i];
-            const right_col = right.columns[i];
-
-            new_columns[i] = Result.Column{
-                .name = left_col.name,
-                .data = try result_ops.concatenateColumnData(self.allocator, left_col.data, right_col.data, left.row_count, right.row_count),
-            };
-        }
-
-        // Free old left result columns (but not the data, which is now owned by new_columns)
-        // Actually, we need to be careful - left's data is NOT reused, we copied it
-        // So we should let the caller free left
-
-        return Result{
-            .columns = new_columns,
-            .row_count = total_rows,
-            .allocator = self.allocator,
-        };
-    }
-
-    /// UNION: Concatenate and remove duplicates
-    fn executeUnionDistinct(self: *Self, left: Result, right: Result) !Result {
-        // First do UNION ALL, then apply DISTINCT
-        var union_all = try self.executeUnionAll(left, right);
-        errdefer union_all.deinit();
-
-        const distinct_result = try result_ops.applyDistinct(self.allocator, union_all.columns);
-        union_all.columns = distinct_result.columns;
-        union_all.row_count = distinct_result.row_count;
-
-        return union_all;
-    }
-
-    /// INTERSECT: Keep only rows that appear in both result sets
-    fn executeIntersect(self: *Self, left: Result, right: Result) !Result {
-        // Build a hash set of rows from right result
-        var right_rows = std.StringHashMap(void).init(self.allocator);
-        defer right_rows.deinit();
-
-        for (0..right.row_count) |i| {
-            const key = try result_ops.buildRowKey(self.allocator, right.columns, i);
-            defer self.allocator.free(key);
-            try right_rows.put(try self.allocator.dupe(u8, key), {});
-        }
-        defer {
-            var iter = right_rows.keyIterator();
-            while (iter.next()) |key| {
-                self.allocator.free(key.*);
-            }
-        }
-
-        // Find matching rows in left result
-        var matching_indices = std.ArrayList(usize){};
-        defer matching_indices.deinit(self.allocator);
-
-        var seen = std.StringHashMap(void).init(self.allocator);
-        defer {
-            var iter = seen.keyIterator();
-            while (iter.next()) |key| {
-                self.allocator.free(key.*);
-            }
-            seen.deinit();
-        }
-
-        for (0..left.row_count) |i| {
-            const key = try result_ops.buildRowKey(self.allocator, left.columns, i);
-            defer self.allocator.free(key);
-
-            // Only include if in right AND not already included (for distinct)
-            if (right_rows.contains(key) and !seen.contains(key)) {
-                try matching_indices.append(self.allocator, i);
-                try seen.put(try self.allocator.dupe(u8, key), {});
-            }
-        }
-
-        return try result_ops.projectRows(self.allocator, left.columns, matching_indices.items);
-    }
-
-    /// EXCEPT: Keep rows from left that don't appear in right
-    fn executeExcept(self: *Self, left: Result, right: Result) !Result {
-        // Build a hash set of rows from right result
-        var right_rows = std.StringHashMap(void).init(self.allocator);
-        defer right_rows.deinit();
-
-        for (0..right.row_count) |i| {
-            const key = try result_ops.buildRowKey(self.allocator, right.columns, i);
-            defer self.allocator.free(key);
-            try right_rows.put(try self.allocator.dupe(u8, key), {});
-        }
-        defer {
-            var iter = right_rows.keyIterator();
-            while (iter.next()) |key| {
-                self.allocator.free(key.*);
-            }
-        }
-
-        // Find rows in left that are NOT in right
-        var non_matching_indices = std.ArrayList(usize){};
-        defer non_matching_indices.deinit(self.allocator);
-
-        var seen = std.StringHashMap(void).init(self.allocator);
-        defer {
-            var iter = seen.keyIterator();
-            while (iter.next()) |key| {
-                self.allocator.free(key.*);
-            }
-            seen.deinit();
-        }
-
-        for (0..left.row_count) |i| {
-            const key = try result_ops.buildRowKey(self.allocator, left.columns, i);
-            defer self.allocator.free(key);
-
-            // Include if NOT in right AND not already included (for distinct)
-            if (!right_rows.contains(key) and !seen.contains(key)) {
-                try non_matching_indices.append(self.allocator, i);
-                try seen.put(try self.allocator.dupe(u8, key), {});
-            }
-        }
-
-        return try result_ops.projectRows(self.allocator, left.columns, non_matching_indices.items);
     }
 
     // ========================================================================
@@ -1538,7 +1409,7 @@ pub const Executor = struct {
         // Apply HAVING clause
         if (stmt.group_by) |gb| {
             if (gb.having) |having_expr| {
-                try self.applyHaving(&result, &having_expr, stmt.columns);
+                try having_eval.applyHaving(self.allocator, &result, &having_expr, stmt.columns);
             }
         }
 
@@ -3291,235 +3162,6 @@ pub const Executor = struct {
         data.free(self.allocator);
     }
 
-    // ========================================================================
-    // HAVING Clause Implementation
-    // ========================================================================
-
-    /// Apply HAVING filter to result, returning filtered result
-    fn applyHaving(
-        self: *Self,
-        result: *Result,
-        having_expr: *const Expr,
-        select_items: []const ast.SelectItem,
-    ) !void {
-        if (result.row_count == 0) return;
-
-        // Collect indices of rows that pass the HAVING filter
-        var passing_indices = std.ArrayList(usize){};
-        defer passing_indices.deinit(self.allocator);
-
-        for (0..result.row_count) |row_idx| {
-            const passes = try self.evaluateHavingExpr(result.columns, select_items, having_expr, row_idx);
-            if (passes) {
-                try passing_indices.append(self.allocator, row_idx);
-            }
-        }
-
-        // If all rows pass, nothing to do
-        if (passing_indices.items.len == result.row_count) return;
-
-        // Build filtered result columns
-        const indices = passing_indices.items;
-        var new_columns = try self.allocator.alloc(Result.Column, result.columns.len);
-        errdefer self.allocator.free(new_columns);
-
-        for (result.columns, 0..) |col, i| {
-            new_columns[i] = try result_ops.filterColumnByIndices(self.allocator, col, indices);
-        }
-
-        // Free old column data
-        for (result.columns) |col| {
-            var data = col.data;
-            self.freeColumnData(&data);
-        }
-        self.allocator.free(result.columns);
-
-        result.columns = new_columns;
-        result.row_count = indices.len;
-    }
-
-    /// Evaluate HAVING expression for a single result row
-    fn evaluateHavingExpr(
-        self: *Self,
-        columns: []const Result.Column,
-        select_items: []const ast.SelectItem,
-        expr: *const Expr,
-        row_idx: usize,
-    ) anyerror!bool {
-        return switch (expr.*) {
-            .value => |val| switch (val) {
-                .integer => |i| i != 0,
-                .float => |f| f != 0.0,
-                .null => false,
-                else => true,
-            },
-            .binary => |bin| try self.evaluateHavingBinaryOp(columns, select_items, bin.op, bin.left, bin.right, row_idx),
-            .unary => |un| switch (un.op) {
-                .not => !(try self.evaluateHavingExpr(columns, select_items, un.operand, row_idx)),
-                else => error.UnsupportedOperator,
-            },
-            else => error.UnsupportedExpression,
-        };
-    }
-
-    /// Evaluate binary operation in HAVING context
-    fn evaluateHavingBinaryOp(
-        self: *Self,
-        columns: []const Result.Column,
-        select_items: []const ast.SelectItem,
-        op: BinaryOp,
-        left: *const Expr,
-        right: *const Expr,
-        row_idx: usize,
-    ) anyerror!bool {
-        return switch (op) {
-            .@"and" => (try self.evaluateHavingExpr(columns, select_items, left, row_idx)) and
-                (try self.evaluateHavingExpr(columns, select_items, right, row_idx)),
-            .@"or" => (try self.evaluateHavingExpr(columns, select_items, left, row_idx)) or
-                (try self.evaluateHavingExpr(columns, select_items, right, row_idx)),
-            .eq, .ne, .lt, .le, .gt, .ge => try self.evaluateHavingComparison(columns, select_items, op, left, right, row_idx),
-            else => error.UnsupportedOperator,
-        };
-    }
-
-    /// Evaluate comparison in HAVING context
-    fn evaluateHavingComparison(
-        self: *Self,
-        columns: []const Result.Column,
-        select_items: []const ast.SelectItem,
-        op: BinaryOp,
-        left: *const Expr,
-        right: *const Expr,
-        row_idx: usize,
-    ) !bool {
-        const left_val = try self.getHavingValue(columns, select_items, left, row_idx);
-        const right_val = try self.getHavingValue(columns, select_items, right, row_idx);
-
-        // Compare as floats for numeric comparison
-        return switch (left_val) {
-            .integer => |left_int| blk: {
-                const right_num = switch (right_val) {
-                    .integer => |i| @as(f64, @floatFromInt(i)),
-                    .float => |f| f,
-                    else => return error.TypeMismatch,
-                };
-                const left_num = @as(f64, @floatFromInt(left_int));
-                break :blk self.compareNumbers(op, left_num, right_num);
-            },
-            .float => |left_float| blk: {
-                const right_num = switch (right_val) {
-                    .integer => |i| @as(f64, @floatFromInt(i)),
-                    .float => |f| f,
-                    else => return error.TypeMismatch,
-                };
-                break :blk self.compareNumbers(op, left_float, right_num);
-            },
-            .string => |left_str| blk: {
-                const right_str = switch (right_val) {
-                    .string => |s| s,
-                    else => return error.TypeMismatch,
-                };
-                break :blk self.compareStrings(op, left_str, right_str);
-            },
-            .null => op == .ne,
-            else => error.UnsupportedType,
-        };
-    }
-
-    /// Get value of expression in HAVING context (from result columns)
-    fn getHavingValue(
-        self: *Self,
-        columns: []const Result.Column,
-        select_items: []const ast.SelectItem,
-        expr: *const Expr,
-        row_idx: usize,
-    ) !Value {
-        return switch (expr.*) {
-            .value => expr.value,
-            .column => |col| blk: {
-                // Look up column by name in result columns
-                const col_idx = result_ops.findColumnIndex(columns, col.name) orelse
-                    return error.ColumnNotFound;
-                break :blk self.getResultColumnValue(columns[col_idx], row_idx);
-            },
-            .call => |call| blk: {
-                // For aggregate functions, find matching SELECT item
-                if (isAggregateFunction(call.name)) {
-                    const col_idx = try self.findAggregateColumnIndex(columns, select_items, call.name, call.args);
-                    break :blk self.getResultColumnValue(columns[col_idx], row_idx);
-                }
-                return error.UnsupportedExpression;
-            },
-            .binary => |bin| try self.evaluateHavingBinaryToValue(columns, select_items, bin, row_idx),
-            else => error.UnsupportedExpression,
-        };
-    }
-
-    /// Evaluate binary expression to value in HAVING context
-    fn evaluateHavingBinaryToValue(
-        self: *Self,
-        columns: []const Result.Column,
-        select_items: []const ast.SelectItem,
-        bin: anytype,
-        row_idx: usize,
-    ) anyerror!Value {
-        const left = try self.getHavingValue(columns, select_items, bin.left, row_idx);
-        const right = try self.getHavingValue(columns, select_items, bin.right, row_idx);
-
-        return switch (bin.op) {
-            .add => scalar_functions.addValues(left, right),
-            .subtract => scalar_functions.subtractValues(left, right),
-            .multiply => scalar_functions.multiplyValues(left, right),
-            .divide => scalar_functions.divideValues(left, right),
-            else => error.UnsupportedOperator,
-        };
-    }
-
-    /// Get value from a result column at a given row index
-    fn getResultColumnValue(self: *Self, col: Result.Column, row_idx: usize) Value {
-        _ = self;
-        return switch (col.data) {
-            .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| Value{ .integer = data[row_idx] },
-            .int32, .date32 => |data| Value{ .integer = data[row_idx] },
-            .float64 => |data| Value{ .float = data[row_idx] },
-            .float32 => |data| Value{ .float = data[row_idx] },
-            .bool_ => |data| Value{ .integer = if (data[row_idx]) 1 else 0 },
-            .string => |data| Value{ .string = data[row_idx] },
-        };
-    }
-
-    /// Find the result column index that matches an aggregate function call
-    fn findAggregateColumnIndex(
-        self: *Self,
-        columns: []const Result.Column,
-        select_items: []const ast.SelectItem,
-        call_name: []const u8,
-        call_args: []const Expr,
-    ) !usize {
-        _ = self;
-        // First, try to find by alias matching the function name
-        for (columns, 0..) |col, i| {
-            if (std.ascii.eqlIgnoreCase(col.name, call_name)) {
-                return i;
-            }
-        }
-
-        // Match by comparing SELECT item expressions
-        for (select_items, 0..) |item, i| {
-            if (item.expr == .call) {
-                const item_call = item.expr.call;
-                // Match function name (case insensitive)
-                if (std.ascii.eqlIgnoreCase(item_call.name, call_name)) {
-                    // Match arguments
-                    if (aggregate_functions.aggregateArgsMatch(item_call.args, call_args)) {
-                        return i;
-                    }
-                }
-            }
-        }
-
-        return error.ColumnNotFound;
-    }
 };
 
 // Tests are in tests/test_sql_executor.zig

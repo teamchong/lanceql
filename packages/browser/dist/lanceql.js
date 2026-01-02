@@ -2923,6 +2923,246 @@ var opfsStorage2 = new OPFSStorage2();
 var datasetStorage = new DatasetStorage();
 
 // src/client/sql/lexer.js
+var TokenType2 = {
+  // Keywords
+  SELECT: "SELECT",
+  DISTINCT: "DISTINCT",
+  FROM: "FROM",
+  WHERE: "WHERE",
+  AND: "AND",
+  OR: "OR",
+  NOT: "NOT",
+  ORDER: "ORDER",
+  BY: "BY",
+  ASC: "ASC",
+  DESC: "DESC",
+  LIMIT: "LIMIT",
+  OFFSET: "OFFSET",
+  AS: "AS",
+  NULL: "NULL",
+  IS: "IS",
+  IN: "IN",
+  BETWEEN: "BETWEEN",
+  LIKE: "LIKE",
+  TRUE: "TRUE",
+  FALSE: "FALSE",
+  GROUP: "GROUP",
+  HAVING: "HAVING",
+  QUALIFY: "QUALIFY",
+  ROLLUP: "ROLLUP",
+  CUBE: "CUBE",
+  GROUPING: "GROUPING",
+  SETS: "SETS",
+  COUNT: "COUNT",
+  SUM: "SUM",
+  AVG: "AVG",
+  MIN: "MIN",
+  MAX: "MAX",
+  NEAR: "NEAR",
+  TOPK: "TOPK",
+  FILE: "FILE",
+  JOIN: "JOIN",
+  INNER: "INNER",
+  LEFT: "LEFT",
+  RIGHT: "RIGHT",
+  FULL: "FULL",
+  OUTER: "OUTER",
+  CROSS: "CROSS",
+  ON: "ON",
+  CREATE: "CREATE",
+  TABLE: "TABLE",
+  INSERT: "INSERT",
+  INTO: "INTO",
+  VALUES: "VALUES",
+  UPDATE: "UPDATE",
+  SET: "SET",
+  DELETE: "DELETE",
+  DROP: "DROP",
+  IF: "IF",
+  EXISTS: "EXISTS",
+  INT: "INT",
+  INTEGER: "INTEGER",
+  BIGINT: "BIGINT",
+  FLOAT: "FLOAT",
+  REAL: "REAL",
+  DOUBLE: "DOUBLE",
+  TEXT: "TEXT",
+  VARCHAR: "VARCHAR",
+  BOOLEAN: "BOOLEAN",
+  BOOL: "BOOL",
+  VECTOR: "VECTOR",
+  PRIMARY: "PRIMARY",
+  KEY: "KEY",
+  WITH: "WITH",
+  RECURSIVE: "RECURSIVE",
+  UNION: "UNION",
+  ALL: "ALL",
+  PIVOT: "PIVOT",
+  UNPIVOT: "UNPIVOT",
+  FOR: "FOR",
+  INTERSECT: "INTERSECT",
+  EXCEPT: "EXCEPT",
+  OVER: "OVER",
+  PARTITION: "PARTITION",
+  ROW_NUMBER: "ROW_NUMBER",
+  RANK: "RANK",
+  DENSE_RANK: "DENSE_RANK",
+  NTILE: "NTILE",
+  LAG: "LAG",
+  LEAD: "LEAD",
+  FIRST_VALUE: "FIRST_VALUE",
+  LAST_VALUE: "LAST_VALUE",
+  NTH_VALUE: "NTH_VALUE",
+  PERCENT_RANK: "PERCENT_RANK",
+  CUME_DIST: "CUME_DIST",
+  ROWS: "ROWS",
+  RANGE: "RANGE",
+  UNBOUNDED: "UNBOUNDED",
+  PRECEDING: "PRECEDING",
+  FOLLOWING: "FOLLOWING",
+  CURRENT: "CURRENT",
+  ROW: "ROW",
+  EXPLAIN: "EXPLAIN",
+  ARRAY: "ARRAY",
+  CASE: "CASE",
+  WHEN: "WHEN",
+  THEN: "THEN",
+  ELSE: "ELSE",
+  END: "END",
+  CAST: "CAST",
+  COALESCE: "COALESCE",
+  NULLIF: "NULLIF",
+  // Literals & Operators
+  IDENTIFIER: "IDENTIFIER",
+  NUMBER: "NUMBER",
+  STRING: "STRING",
+  STAR: "STAR",
+  COMMA: "COMMA",
+  DOT: "DOT",
+  LPAREN: "LPAREN",
+  RPAREN: "RPAREN",
+  EQ: "EQ",
+  NE: "NE",
+  LT: "LT",
+  LE: "LE",
+  GT: "GT",
+  GE: "GE",
+  PLUS: "PLUS",
+  MINUS: "MINUS",
+  SLASH: "SLASH",
+  LBRACKET: "LBRACKET",
+  RBRACKET: "RBRACKET",
+  EOF: "EOF"
+};
+var KEYWORDS = {
+  "SELECT": TokenType2.SELECT,
+  "DISTINCT": TokenType2.DISTINCT,
+  "FROM": TokenType2.FROM,
+  "WHERE": TokenType2.WHERE,
+  "AND": TokenType2.AND,
+  "OR": TokenType2.OR,
+  "NOT": TokenType2.NOT,
+  "ORDER": TokenType2.ORDER,
+  "BY": TokenType2.BY,
+  "ASC": TokenType2.ASC,
+  "DESC": TokenType2.DESC,
+  "LIMIT": TokenType2.LIMIT,
+  "OFFSET": TokenType2.OFFSET,
+  "AS": TokenType2.AS,
+  "NULL": TokenType2.NULL,
+  "IS": TokenType2.IS,
+  "IN": TokenType2.IN,
+  "BETWEEN": TokenType2.BETWEEN,
+  "LIKE": TokenType2.LIKE,
+  "TRUE": TokenType2.TRUE,
+  "FALSE": TokenType2.FALSE,
+  "GROUP": TokenType2.GROUP,
+  "HAVING": TokenType2.HAVING,
+  "QUALIFY": TokenType2.QUALIFY,
+  "ROLLUP": TokenType2.ROLLUP,
+  "CUBE": TokenType2.CUBE,
+  "GROUPING": TokenType2.GROUPING,
+  "SETS": TokenType2.SETS,
+  "COUNT": TokenType2.COUNT,
+  "SUM": TokenType2.SUM,
+  "AVG": TokenType2.AVG,
+  "MIN": TokenType2.MIN,
+  "MAX": TokenType2.MAX,
+  "NEAR": TokenType2.NEAR,
+  "TOPK": TokenType2.TOPK,
+  "FILE": TokenType2.FILE,
+  "JOIN": TokenType2.JOIN,
+  "INNER": TokenType2.INNER,
+  "LEFT": TokenType2.LEFT,
+  "RIGHT": TokenType2.RIGHT,
+  "FULL": TokenType2.FULL,
+  "OUTER": TokenType2.OUTER,
+  "CROSS": TokenType2.CROSS,
+  "ON": TokenType2.ON,
+  "CREATE": TokenType2.CREATE,
+  "TABLE": TokenType2.TABLE,
+  "INSERT": TokenType2.INSERT,
+  "INTO": TokenType2.INTO,
+  "VALUES": TokenType2.VALUES,
+  "UPDATE": TokenType2.UPDATE,
+  "SET": TokenType2.SET,
+  "DELETE": TokenType2.DELETE,
+  "DROP": TokenType2.DROP,
+  "IF": TokenType2.IF,
+  "EXISTS": TokenType2.EXISTS,
+  "INT": TokenType2.INT,
+  "INTEGER": TokenType2.INTEGER,
+  "BIGINT": TokenType2.BIGINT,
+  "FLOAT": TokenType2.FLOAT,
+  "REAL": TokenType2.REAL,
+  "DOUBLE": TokenType2.DOUBLE,
+  "TEXT": TokenType2.TEXT,
+  "VARCHAR": TokenType2.VARCHAR,
+  "BOOLEAN": TokenType2.BOOLEAN,
+  "BOOL": TokenType2.BOOL,
+  "VECTOR": TokenType2.VECTOR,
+  "PRIMARY": TokenType2.PRIMARY,
+  "KEY": TokenType2.KEY,
+  "WITH": TokenType2.WITH,
+  "RECURSIVE": TokenType2.RECURSIVE,
+  "UNION": TokenType2.UNION,
+  "ALL": TokenType2.ALL,
+  "PIVOT": TokenType2.PIVOT,
+  "UNPIVOT": TokenType2.UNPIVOT,
+  "FOR": TokenType2.FOR,
+  "INTERSECT": TokenType2.INTERSECT,
+  "EXCEPT": TokenType2.EXCEPT,
+  "OVER": TokenType2.OVER,
+  "PARTITION": TokenType2.PARTITION,
+  "ROW_NUMBER": TokenType2.ROW_NUMBER,
+  "RANK": TokenType2.RANK,
+  "DENSE_RANK": TokenType2.DENSE_RANK,
+  "NTILE": TokenType2.NTILE,
+  "LAG": TokenType2.LAG,
+  "LEAD": TokenType2.LEAD,
+  "FIRST_VALUE": TokenType2.FIRST_VALUE,
+  "LAST_VALUE": TokenType2.LAST_VALUE,
+  "NTH_VALUE": TokenType2.NTH_VALUE,
+  "PERCENT_RANK": TokenType2.PERCENT_RANK,
+  "CUME_DIST": TokenType2.CUME_DIST,
+  "ROWS": TokenType2.ROWS,
+  "RANGE": TokenType2.RANGE,
+  "UNBOUNDED": TokenType2.UNBOUNDED,
+  "PRECEDING": TokenType2.PRECEDING,
+  "FOLLOWING": TokenType2.FOLLOWING,
+  "CURRENT": TokenType2.CURRENT,
+  "ROW": TokenType2.ROW,
+  "EXPLAIN": TokenType2.EXPLAIN,
+  "ARRAY": TokenType2.ARRAY,
+  "CASE": TokenType2.CASE,
+  "WHEN": TokenType2.WHEN,
+  "THEN": TokenType2.THEN,
+  "ELSE": TokenType2.ELSE,
+  "END": TokenType2.END,
+  "CAST": TokenType2.CAST,
+  "COALESCE": TokenType2.COALESCE,
+  "NULLIF": TokenType2.NULLIF
+};
 var SQLLexer2 = class {
   constructor(sql) {
     this.sql = sql;
@@ -2988,67 +3228,67 @@ var SQLLexer2 = class {
   nextToken() {
     this.skipWhitespace();
     if (this.pos >= this.length) {
-      return { type: TokenType.EOF, value: null };
+      return { type: TokenType2.EOF, value: null };
     }
     const ch = this.peek();
     if (/[a-zA-Z_]/.test(ch)) {
       const value = this.readIdentifier();
       const upper = value.toUpperCase();
-      const type = KEYWORDS[upper] || TokenType.IDENTIFIER;
-      return { type, value: type === TokenType.IDENTIFIER ? value : upper };
+      const type = KEYWORDS[upper] || TokenType2.IDENTIFIER;
+      return { type, value: type === TokenType2.IDENTIFIER ? value : upper };
     }
     if (/\d/.test(ch)) {
       const value = this.readNumber();
-      return { type: TokenType.NUMBER, value };
+      return { type: TokenType2.NUMBER, value };
     }
     if (ch === "'" || ch === '"') {
       const value = this.readString(ch);
-      return { type: TokenType.STRING, value };
+      return { type: TokenType2.STRING, value };
     }
     this.advance();
     switch (ch) {
       case "*":
-        return { type: TokenType.STAR, value: "*" };
+        return { type: TokenType2.STAR, value: "*" };
       case ",":
-        return { type: TokenType.COMMA, value: "," };
+        return { type: TokenType2.COMMA, value: "," };
       case ".":
-        return { type: TokenType.DOT, value: "." };
+        return { type: TokenType2.DOT, value: "." };
       case "(":
-        return { type: TokenType.LPAREN, value: "(" };
+        return { type: TokenType2.LPAREN, value: "(" };
       case ")":
-        return { type: TokenType.RPAREN, value: ")" };
+        return { type: TokenType2.RPAREN, value: ")" };
       case "+":
-        return { type: TokenType.PLUS, value: "+" };
+        return { type: TokenType2.PLUS, value: "+" };
       case "-":
-        return { type: TokenType.MINUS, value: "-" };
+        return { type: TokenType2.MINUS, value: "-" };
       case "/":
-        return { type: TokenType.SLASH, value: "/" };
+        return { type: TokenType2.SLASH, value: "/" };
       case "[":
-        return { type: TokenType.LBRACKET, value: "[" };
+        return { type: TokenType2.LBRACKET, value: "[" };
       case "]":
-        return { type: TokenType.RBRACKET, value: "]" };
+        return { type: TokenType2.RBRACKET, value: "]" };
       case "=":
-        return { type: TokenType.EQ, value: "=" };
+        return { type: TokenType2.EQ, value: "=" };
       case "<":
         if (this.peek() === "=") {
           this.advance();
-          return { type: TokenType.LE, value: "<=" };
+          return { type: TokenType2.LE, value: "<=" };
         }
         if (this.peek() === ">") {
           this.advance();
-          return { type: TokenType.NE, value: "<>" };
+          return { type: TokenType2.NE, value: "<>" };
         }
-        return { type: TokenType.LT, value: "<" };
+        return { type: TokenType2.LT, value: "<" };
       case ">":
         if (this.peek() === "=") {
           this.advance();
-          return { type: TokenType.GE, value: ">=" };
+          return { type: TokenType2.GE, value: ">=" };
         }
-        return { type: TokenType.GT, value: ">" };
+        return { type: TokenType2.GT, value: ">" };
       case "!":
         if (this.peek() === "=") {
           this.advance();
-          return { type: TokenType.NE, value: "!=" };
+          return { type: TokenType2.NE, value: "!=" };
         }
         throw new Error(`Unexpected character: ${ch}`);
       default:
@@ -3058,7 +3298,7 @@ var SQLLexer2 = class {
   tokenize() {
     const tokens = [];
     let token;
-    while ((token = this.nextToken()).type !== TokenType.EOF) {
+    while ((token = this.nextToken()).type !== TokenType2.EOF) {
       tokens.push(token);
     }
     tokens.push(token);
@@ -3073,13 +3313,13 @@ var SQLParser2 = class {
     this.pos = 0;
   }
   current() {
-    return this.tokens[this.pos] || { type: TokenType.EOF };
+    return this.tokens[this.pos] || { type: TokenType2.EOF };
   }
   advance() {
     if (this.pos < this.tokens.length) {
       return this.tokens[this.pos++];
     }
-    return { type: TokenType.EOF };
+    return { type: TokenType2.EOF };
   }
   expect(type) {
     const token = this.current();
@@ -3101,28 +3341,28 @@ var SQLParser2 = class {
    * Parse SQL statement (SELECT, INSERT, UPDATE, DELETE, CREATE TABLE, DROP TABLE)
    */
   parse() {
-    if (this.check(TokenType.EXPLAIN)) {
+    if (this.check(TokenType2.EXPLAIN)) {
       this.advance();
       const statement = this.parse();
       return { type: "EXPLAIN", statement };
     }
     let ctes = [];
-    if (this.check(TokenType.WITH)) {
+    if (this.check(TokenType2.WITH)) {
       ctes = this.parseWithClause();
     }
-    if (this.check(TokenType.SELECT)) {
+    if (this.check(TokenType2.SELECT)) {
       const result = this.parseSelect();
       result.ctes = ctes;
       return result;
-    } else if (this.check(TokenType.INSERT)) {
+    } else if (this.check(TokenType2.INSERT)) {
       return this.parseInsert();
-    } else if (this.check(TokenType.UPDATE)) {
+    } else if (this.check(TokenType2.UPDATE)) {
       return this.parseUpdate();
-    } else if (this.check(TokenType.DELETE)) {
+    } else if (this.check(TokenType2.DELETE)) {
       return this.parseDelete();
-    } else if (this.check(TokenType.CREATE)) {
+    } else if (this.check(TokenType2.CREATE)) {
       return this.parseCreateTable();
-    } else if (this.check(TokenType.DROP)) {
+    } else if (this.check(TokenType2.DROP)) {
       return this.parseDropTable();
     } else {
       throw new Error(`Unexpected token: ${this.current().type}. Expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, or EXPLAIN`);
@@ -3133,30 +3373,30 @@ var SQLParser2 = class {
    * Syntax: WITH [RECURSIVE] name [(columns)] AS (subquery) [, ...]
    */
   parseWithClause() {
-    this.expect(TokenType.WITH);
-    const isRecursive = !!this.match(TokenType.RECURSIVE);
+    this.expect(TokenType2.WITH);
+    const isRecursive = !!this.match(TokenType2.RECURSIVE);
     const ctes = [];
     do {
-      const name = this.expect(TokenType.IDENTIFIER).value;
+      const name = this.expect(TokenType2.IDENTIFIER).value;
       let columns = [];
-      if (this.match(TokenType.LPAREN)) {
-        columns.push(this.expect(TokenType.IDENTIFIER).value);
-        while (this.match(TokenType.COMMA)) {
-          columns.push(this.expect(TokenType.IDENTIFIER).value);
+      if (this.match(TokenType2.LPAREN)) {
+        columns.push(this.expect(TokenType2.IDENTIFIER).value);
+        while (this.match(TokenType2.COMMA)) {
+          columns.push(this.expect(TokenType2.IDENTIFIER).value);
         }
-        this.expect(TokenType.RPAREN);
+        this.expect(TokenType2.RPAREN);
       }
-      this.expect(TokenType.AS);
-      this.expect(TokenType.LPAREN);
+      this.expect(TokenType2.AS);
+      this.expect(TokenType2.LPAREN);
       const body = this.parseCteBody(isRecursive);
-      this.expect(TokenType.RPAREN);
+      this.expect(TokenType2.RPAREN);
       ctes.push({
         name,
         columns,
         body,
         recursive: isRecursive
       });
-    } while (this.match(TokenType.COMMA));
+    } while (this.match(TokenType2.COMMA));
     return ctes;
   }
   /**
@@ -3164,8 +3404,8 @@ var SQLParser2 = class {
    */
   parseCteBody(isRecursive) {
     const anchor = this.parseSelect(true, true);
-    if (isRecursive && this.match(TokenType.UNION)) {
-      this.expect(TokenType.ALL);
+    if (isRecursive && this.match(TokenType2.UNION)) {
+      this.expect(TokenType2.ALL);
       const recursive = this.parseSelect(true, true);
       return {
         type: "RECURSIVE_CTE",
@@ -3181,35 +3421,35 @@ var SQLParser2 = class {
    * @param {boolean} noSetOps - If true, don't parse set operations (for CTE body parsing)
    */
   parseSelect(isSubquery = false, noSetOps = false) {
-    this.expect(TokenType.SELECT);
-    const distinct = !!this.match(TokenType.DISTINCT);
+    this.expect(TokenType2.SELECT);
+    const distinct = !!this.match(TokenType2.DISTINCT);
     const columns = this.parseSelectList();
     let from = null;
-    if (this.match(TokenType.FROM)) {
+    if (this.match(TokenType2.FROM)) {
       from = this.parseFromClause();
     }
     const joins = [];
-    while (this.check(TokenType.JOIN) || this.check(TokenType.INNER) || this.check(TokenType.LEFT) || this.check(TokenType.RIGHT) || this.check(TokenType.FULL) || this.check(TokenType.CROSS)) {
+    while (this.check(TokenType2.JOIN) || this.check(TokenType2.INNER) || this.check(TokenType2.LEFT) || this.check(TokenType2.RIGHT) || this.check(TokenType2.FULL) || this.check(TokenType2.CROSS)) {
       joins.push(this.parseJoinClause());
     }
     let pivot = null;
-    if (this.match(TokenType.PIVOT)) {
-      this.expect(TokenType.LPAREN);
+    if (this.match(TokenType2.PIVOT)) {
+      this.expect(TokenType2.LPAREN);
       const aggFunc = this.parsePrimary();
       if (aggFunc.type !== "call") {
         throw new Error("PIVOT requires an aggregate function (e.g., SUM, COUNT, AVG)");
       }
-      this.expect(TokenType.FOR);
-      const forColumn = this.expect(TokenType.IDENTIFIER).value;
-      this.expect(TokenType.IN);
-      this.expect(TokenType.LPAREN);
+      this.expect(TokenType2.FOR);
+      const forColumn = this.expect(TokenType2.IDENTIFIER).value;
+      this.expect(TokenType2.IN);
+      this.expect(TokenType2.LPAREN);
       const inValues = [];
       inValues.push(this.parsePrimary().value);
-      while (this.match(TokenType.COMMA)) {
+      while (this.match(TokenType2.COMMA)) {
         inValues.push(this.parsePrimary().value);
       }
-      this.expect(TokenType.RPAREN);
-      this.expect(TokenType.RPAREN);
+      this.expect(TokenType2.RPAREN);
+      this.expect(TokenType2.RPAREN);
       pivot = {
         aggregate: aggFunc,
         forColumn,
@@ -3217,20 +3457,20 @@ var SQLParser2 = class {
       };
     }
     let unpivot = null;
-    if (this.match(TokenType.UNPIVOT)) {
-      this.expect(TokenType.LPAREN);
-      const valueColumn = this.expect(TokenType.IDENTIFIER).value;
-      this.expect(TokenType.FOR);
-      const nameColumn = this.expect(TokenType.IDENTIFIER).value;
-      this.expect(TokenType.IN);
-      this.expect(TokenType.LPAREN);
+    if (this.match(TokenType2.UNPIVOT)) {
+      this.expect(TokenType2.LPAREN);
+      const valueColumn = this.expect(TokenType2.IDENTIFIER).value;
+      this.expect(TokenType2.FOR);
+      const nameColumn = this.expect(TokenType2.IDENTIFIER).value;
+      this.expect(TokenType2.IN);
+      this.expect(TokenType2.LPAREN);
       const inColumns = [];
-      inColumns.push(this.expect(TokenType.IDENTIFIER).value);
-      while (this.match(TokenType.COMMA)) {
-        inColumns.push(this.expect(TokenType.IDENTIFIER).value);
+      inColumns.push(this.expect(TokenType2.IDENTIFIER).value);
+      while (this.match(TokenType2.COMMA)) {
+        inColumns.push(this.expect(TokenType2.IDENTIFIER).value);
       }
-      this.expect(TokenType.RPAREN);
-      this.expect(TokenType.RPAREN);
+      this.expect(TokenType2.RPAREN);
+      this.expect(TokenType2.RPAREN);
       unpivot = {
         valueColumn,
         nameColumn,
@@ -3238,46 +3478,46 @@ var SQLParser2 = class {
       };
     }
     let where = null;
-    if (this.match(TokenType.WHERE)) {
+    if (this.match(TokenType2.WHERE)) {
       where = this.parseExpr();
     }
     let groupBy = [];
-    if (this.match(TokenType.GROUP)) {
-      this.expect(TokenType.BY);
+    if (this.match(TokenType2.GROUP)) {
+      this.expect(TokenType2.BY);
       groupBy = this.parseGroupByList();
     }
     let having = null;
-    if (this.match(TokenType.HAVING)) {
+    if (this.match(TokenType2.HAVING)) {
       having = this.parseExpr();
     }
     let qualify = null;
-    if (this.match(TokenType.QUALIFY)) {
+    if (this.match(TokenType2.QUALIFY)) {
       qualify = this.parseExpr();
     }
     let search = null;
-    if (this.match(TokenType.NEAR)) {
+    if (this.match(TokenType2.NEAR)) {
       let column = null;
       let query = null;
       let searchRow = null;
       let topK = 20;
       let encoder = "minilm";
-      if (this.check(TokenType.IDENTIFIER)) {
+      if (this.check(TokenType2.IDENTIFIER)) {
         const ident = this.advance().value;
-        if (this.check(TokenType.STRING) || this.check(TokenType.NUMBER)) {
+        if (this.check(TokenType2.STRING) || this.check(TokenType2.NUMBER)) {
           column = ident;
         } else {
           throw new Error(`NEAR requires quoted text or row number. Did you mean: NEAR '${ident}'?`);
         }
       }
-      if (this.check(TokenType.STRING)) {
+      if (this.check(TokenType2.STRING)) {
         query = this.advance().value;
-      } else if (this.check(TokenType.NUMBER)) {
+      } else if (this.check(TokenType2.NUMBER)) {
         searchRow = parseInt(this.advance().value, 10);
       } else {
         throw new Error("NEAR requires a quoted text string or row number");
       }
-      if (this.match(TokenType.TOPK)) {
-        topK = parseInt(this.expect(TokenType.NUMBER).value, 10);
+      if (this.match(TokenType2.TOPK)) {
+        topK = parseInt(this.expect(TokenType2.NUMBER).value, 10);
       }
       search = { query, searchRow, column, topK, encoder };
     }
@@ -3298,28 +3538,28 @@ var SQLParser2 = class {
       limit: null,
       offset: null
     };
-    if (!noSetOps && (this.check(TokenType.UNION) || this.check(TokenType.INTERSECT) || this.check(TokenType.EXCEPT))) {
+    if (!noSetOps && (this.check(TokenType2.UNION) || this.check(TokenType2.INTERSECT) || this.check(TokenType2.EXCEPT))) {
       const operator = this.advance().type;
-      const all = !!this.match(TokenType.ALL);
+      const all = !!this.match(TokenType2.ALL);
       const right = this.parseSelect(true, true);
       let orderBy = [];
       let limit = null;
       let offset = null;
-      if (this.match(TokenType.ORDER)) {
-        this.expect(TokenType.BY);
+      if (this.match(TokenType2.ORDER)) {
+        this.expect(TokenType2.BY);
         orderBy = this.parseOrderByList();
       }
-      if (this.match(TokenType.LIMIT)) {
-        limit = parseInt(this.expect(TokenType.NUMBER).value, 10);
+      if (this.match(TokenType2.LIMIT)) {
+        limit = parseInt(this.expect(TokenType2.NUMBER).value, 10);
       }
-      if (orderBy.length === 0 && this.match(TokenType.ORDER)) {
-        this.expect(TokenType.BY);
+      if (orderBy.length === 0 && this.match(TokenType2.ORDER)) {
+        this.expect(TokenType2.BY);
         orderBy = this.parseOrderByList();
       }
-      if (this.match(TokenType.OFFSET)) {
-        offset = parseInt(this.expect(TokenType.NUMBER).value, 10);
+      if (this.match(TokenType2.OFFSET)) {
+        offset = parseInt(this.expect(TokenType2.NUMBER).value, 10);
       }
-      if (!isSubquery && this.current().type !== TokenType.EOF) {
+      if (!isSubquery && this.current().type !== TokenType2.EOF) {
         throw new Error(`Unexpected token after query: ${this.current().type} (${this.current().value}). Check your SQL syntax.`);
       }
       return {
@@ -3337,25 +3577,25 @@ var SQLParser2 = class {
       let orderBy = [];
       let limit = null;
       let offset = null;
-      if (this.match(TokenType.ORDER)) {
-        this.expect(TokenType.BY);
+      if (this.match(TokenType2.ORDER)) {
+        this.expect(TokenType2.BY);
         orderBy = this.parseOrderByList();
       }
-      if (this.match(TokenType.LIMIT)) {
-        limit = parseInt(this.expect(TokenType.NUMBER).value, 10);
+      if (this.match(TokenType2.LIMIT)) {
+        limit = parseInt(this.expect(TokenType2.NUMBER).value, 10);
       }
-      if (orderBy.length === 0 && this.match(TokenType.ORDER)) {
-        this.expect(TokenType.BY);
+      if (orderBy.length === 0 && this.match(TokenType2.ORDER)) {
+        this.expect(TokenType2.BY);
         orderBy = this.parseOrderByList();
       }
-      if (this.match(TokenType.OFFSET)) {
-        offset = parseInt(this.expect(TokenType.NUMBER).value, 10);
+      if (this.match(TokenType2.OFFSET)) {
+        offset = parseInt(this.expect(TokenType2.NUMBER).value, 10);
       }
       baseAst.orderBy = orderBy;
       baseAst.limit = limit;
       baseAst.offset = offset;
     }
-    if (!isSubquery && this.current().type !== TokenType.EOF) {
+    if (!isSubquery && this.current().type !== TokenType2.EOF) {
       throw new Error(`Unexpected token after query: ${this.current().type} (${this.current().value}). Check your SQL syntax.`);
     }
     return baseAst;
@@ -3365,30 +3605,30 @@ var SQLParser2 = class {
    * Syntax: INSERT INTO table_name [(col1, col2, ...)] VALUES (val1, val2, ...), ...
    */
   parseInsert() {
-    this.expect(TokenType.INSERT);
-    this.expect(TokenType.INTO);
-    const table = this.expect(TokenType.IDENTIFIER).value;
+    this.expect(TokenType2.INSERT);
+    this.expect(TokenType2.INTO);
+    const table = this.expect(TokenType2.IDENTIFIER).value;
     let columns = null;
-    if (this.match(TokenType.LPAREN)) {
+    if (this.match(TokenType2.LPAREN)) {
       columns = [];
-      columns.push(this.expect(TokenType.IDENTIFIER).value);
-      while (this.match(TokenType.COMMA)) {
-        columns.push(this.expect(TokenType.IDENTIFIER).value);
+      columns.push(this.expect(TokenType2.IDENTIFIER).value);
+      while (this.match(TokenType2.COMMA)) {
+        columns.push(this.expect(TokenType2.IDENTIFIER).value);
       }
-      this.expect(TokenType.RPAREN);
+      this.expect(TokenType2.RPAREN);
     }
-    this.expect(TokenType.VALUES);
+    this.expect(TokenType2.VALUES);
     const rows = [];
     do {
-      this.expect(TokenType.LPAREN);
+      this.expect(TokenType2.LPAREN);
       const values = [];
       values.push(this.parseValue());
-      while (this.match(TokenType.COMMA)) {
+      while (this.match(TokenType2.COMMA)) {
         values.push(this.parseValue());
       }
-      this.expect(TokenType.RPAREN);
+      this.expect(TokenType2.RPAREN);
       rows.push(values);
-    } while (this.match(TokenType.COMMA));
+    } while (this.match(TokenType2.COMMA));
     return {
       type: "INSERT",
       table,
@@ -3400,31 +3640,31 @@ var SQLParser2 = class {
    * Parse a single value (number, string, null, true, false)
    */
   parseValue() {
-    if (this.match(TokenType.NULL)) {
+    if (this.match(TokenType2.NULL)) {
       return { type: "null", value: null };
     }
-    if (this.match(TokenType.TRUE)) {
+    if (this.match(TokenType2.TRUE)) {
       return { type: "boolean", value: true };
     }
-    if (this.match(TokenType.FALSE)) {
+    if (this.match(TokenType2.FALSE)) {
       return { type: "boolean", value: false };
     }
-    if (this.check(TokenType.NUMBER)) {
+    if (this.check(TokenType2.NUMBER)) {
       const token = this.advance();
       const value = token.value.includes(".") ? parseFloat(token.value) : parseInt(token.value, 10);
       return { type: "number", value };
     }
-    if (this.check(TokenType.STRING)) {
+    if (this.check(TokenType2.STRING)) {
       const token = this.advance();
       return { type: "string", value: token.value };
     }
-    if (this.check(TokenType.MINUS)) {
+    if (this.check(TokenType2.MINUS)) {
       this.advance();
-      const token = this.expect(TokenType.NUMBER);
+      const token = this.expect(TokenType2.NUMBER);
       const value = token.value.includes(".") ? -parseFloat(token.value) : -parseInt(token.value, 10);
       return { type: "number", value };
     }
-    if (this.check(TokenType.LBRACKET)) {
+    if (this.check(TokenType2.LBRACKET)) {
       return this.parseArrayLiteral();
     }
     throw new Error(`Expected value, got ${this.current().type}`);
@@ -3433,15 +3673,15 @@ var SQLParser2 = class {
    * Parse array literal: [1, 2, 3] or ARRAY[1, 2, 3]
    */
   parseArrayLiteral() {
-    this.expect(TokenType.LBRACKET);
+    this.expect(TokenType2.LBRACKET);
     const elements = [];
-    if (!this.check(TokenType.RBRACKET)) {
+    if (!this.check(TokenType2.RBRACKET)) {
       elements.push(this.parseExpr());
-      while (this.match(TokenType.COMMA)) {
+      while (this.match(TokenType2.COMMA)) {
         elements.push(this.parseExpr());
       }
     }
-    this.expect(TokenType.RBRACKET);
+    this.expect(TokenType2.RBRACKET);
     return { type: "array", elements };
   }
   /**
@@ -3449,18 +3689,18 @@ var SQLParser2 = class {
    * Syntax: UPDATE table_name SET col1 = val1, col2 = val2 [WHERE condition]
    */
   parseUpdate() {
-    this.expect(TokenType.UPDATE);
-    const table = this.expect(TokenType.IDENTIFIER).value;
-    this.expect(TokenType.SET);
+    this.expect(TokenType2.UPDATE);
+    const table = this.expect(TokenType2.IDENTIFIER).value;
+    this.expect(TokenType2.SET);
     const assignments = [];
     do {
-      const column = this.expect(TokenType.IDENTIFIER).value;
-      this.expect(TokenType.EQ);
+      const column = this.expect(TokenType2.IDENTIFIER).value;
+      this.expect(TokenType2.EQ);
       const value = this.parseValue();
       assignments.push({ column, value });
-    } while (this.match(TokenType.COMMA));
+    } while (this.match(TokenType2.COMMA));
     let where = null;
-    if (this.match(TokenType.WHERE)) {
+    if (this.match(TokenType2.WHERE)) {
       where = this.parseExpr();
     }
     return {
@@ -3475,11 +3715,11 @@ var SQLParser2 = class {
    * Syntax: DELETE FROM table_name [WHERE condition]
    */
   parseDelete() {
-    this.expect(TokenType.DELETE);
-    this.expect(TokenType.FROM);
-    const table = this.expect(TokenType.IDENTIFIER).value;
+    this.expect(TokenType2.DELETE);
+    this.expect(TokenType2.FROM);
+    const table = this.expect(TokenType2.IDENTIFIER).value;
     let where = null;
-    if (this.match(TokenType.WHERE)) {
+    if (this.match(TokenType2.WHERE)) {
       where = this.parseExpr();
     }
     return {
@@ -3493,49 +3733,49 @@ var SQLParser2 = class {
    * Syntax: CREATE TABLE [IF NOT EXISTS] table_name (col1 TYPE, col2 TYPE, ...)
    */
   parseCreateTable() {
-    this.expect(TokenType.CREATE);
-    this.expect(TokenType.TABLE);
+    this.expect(TokenType2.CREATE);
+    this.expect(TokenType2.TABLE);
     let ifNotExists = false;
-    if (this.match(TokenType.IF)) {
-      this.expect(TokenType.NOT);
-      this.expect(TokenType.EXISTS);
+    if (this.match(TokenType2.IF)) {
+      this.expect(TokenType2.NOT);
+      this.expect(TokenType2.EXISTS);
       ifNotExists = true;
     }
-    const table = this.expect(TokenType.IDENTIFIER).value;
-    this.expect(TokenType.LPAREN);
+    const table = this.expect(TokenType2.IDENTIFIER).value;
+    this.expect(TokenType2.LPAREN);
     const columns = [];
     do {
-      const name = this.expect(TokenType.IDENTIFIER).value;
+      const name = this.expect(TokenType2.IDENTIFIER).value;
       let dataType = "TEXT";
       let primaryKey = false;
       let vectorDim = null;
-      if (this.check(TokenType.INT) || this.check(TokenType.INTEGER) || this.check(TokenType.BIGINT)) {
+      if (this.check(TokenType2.INT) || this.check(TokenType2.INTEGER) || this.check(TokenType2.BIGINT)) {
         this.advance();
         dataType = "INT64";
-      } else if (this.check(TokenType.FLOAT) || this.check(TokenType.REAL) || this.check(TokenType.DOUBLE)) {
+      } else if (this.check(TokenType2.FLOAT) || this.check(TokenType2.REAL) || this.check(TokenType2.DOUBLE)) {
         this.advance();
         dataType = "FLOAT64";
-      } else if (this.check(TokenType.TEXT) || this.check(TokenType.VARCHAR)) {
+      } else if (this.check(TokenType2.TEXT) || this.check(TokenType2.VARCHAR)) {
         this.advance();
         dataType = "STRING";
-      } else if (this.check(TokenType.BOOLEAN) || this.check(TokenType.BOOL)) {
+      } else if (this.check(TokenType2.BOOLEAN) || this.check(TokenType2.BOOL)) {
         this.advance();
         dataType = "BOOL";
-      } else if (this.check(TokenType.VECTOR)) {
+      } else if (this.check(TokenType2.VECTOR)) {
         this.advance();
         dataType = "VECTOR";
-        if (this.match(TokenType.LPAREN)) {
-          vectorDim = parseInt(this.expect(TokenType.NUMBER).value, 10);
-          this.expect(TokenType.RPAREN);
+        if (this.match(TokenType2.LPAREN)) {
+          vectorDim = parseInt(this.expect(TokenType2.NUMBER).value, 10);
+          this.expect(TokenType2.RPAREN);
         }
       }
-      if (this.match(TokenType.PRIMARY)) {
-        this.expect(TokenType.KEY);
+      if (this.match(TokenType2.PRIMARY)) {
+        this.expect(TokenType2.KEY);
         primaryKey = true;
       }
       columns.push({ name, dataType, primaryKey, vectorDim });
-    } while (this.match(TokenType.COMMA));
-    this.expect(TokenType.RPAREN);
+    } while (this.match(TokenType2.COMMA));
+    this.expect(TokenType2.RPAREN);
     return {
       type: "CREATE_TABLE",
       table,
@@ -3548,14 +3788,14 @@ var SQLParser2 = class {
    * Syntax: DROP TABLE [IF EXISTS] table_name
    */
   parseDropTable() {
-    this.expect(TokenType.DROP);
-    this.expect(TokenType.TABLE);
+    this.expect(TokenType2.DROP);
+    this.expect(TokenType2.TABLE);
     let ifExists = false;
-    if (this.match(TokenType.IF)) {
-      this.expect(TokenType.EXISTS);
+    if (this.match(TokenType2.IF)) {
+      this.expect(TokenType2.EXISTS);
       ifExists = true;
     }
-    const table = this.expect(TokenType.IDENTIFIER).value;
+    const table = this.expect(TokenType2.IDENTIFIER).value;
     return {
       type: "DROP_TABLE",
       table,
@@ -3564,20 +3804,20 @@ var SQLParser2 = class {
   }
   parseSelectList() {
     const items = [this.parseSelectItem()];
-    while (this.match(TokenType.COMMA)) {
+    while (this.match(TokenType2.COMMA)) {
       items.push(this.parseSelectItem());
     }
     return items;
   }
   parseSelectItem() {
-    if (this.match(TokenType.STAR)) {
+    if (this.match(TokenType2.STAR)) {
       return { type: "star" };
     }
     const expr = this.parseExpr();
     let alias = null;
-    if (this.match(TokenType.AS)) {
-      alias = this.expect(TokenType.IDENTIFIER).value;
-    } else if (this.check(TokenType.IDENTIFIER) && !this.check(TokenType.FROM, TokenType.WHERE, TokenType.ORDER, TokenType.LIMIT, TokenType.GROUP, TokenType.JOIN, TokenType.INNER, TokenType.LEFT, TokenType.RIGHT, TokenType.COMMA)) {
+    if (this.match(TokenType2.AS)) {
+      alias = this.expect(TokenType2.IDENTIFIER).value;
+    } else if (this.check(TokenType2.IDENTIFIER) && !this.check(TokenType2.FROM, TokenType2.WHERE, TokenType2.ORDER, TokenType2.LIMIT, TokenType2.GROUP, TokenType2.JOIN, TokenType2.INNER, TokenType2.LEFT, TokenType2.RIGHT, TokenType2.COMMA)) {
       alias = this.advance().value;
     }
     return { type: "expr", expr, alias };
@@ -3590,29 +3830,29 @@ var SQLParser2 = class {
    */
   parseFromClause() {
     let from = null;
-    if (this.check(TokenType.STRING)) {
+    if (this.check(TokenType2.STRING)) {
       const url = this.advance().value;
       from = { type: "url", url };
-    } else if (this.check(TokenType.IDENTIFIER)) {
+    } else if (this.check(TokenType2.IDENTIFIER)) {
       const name = this.advance().value;
-      if (this.match(TokenType.LPAREN)) {
+      if (this.match(TokenType2.LPAREN)) {
         const funcName = name.toLowerCase();
         if (funcName === "read_lance") {
           from = { type: "url", function: "read_lance" };
-          if (!this.check(TokenType.RPAREN)) {
-            if (this.match(TokenType.FILE)) {
+          if (!this.check(TokenType2.RPAREN)) {
+            if (this.match(TokenType2.FILE)) {
               from.isFile = true;
-              if (this.match(TokenType.COMMA)) {
-                from.version = parseInt(this.expect(TokenType.NUMBER).value, 10);
+              if (this.match(TokenType2.COMMA)) {
+                from.version = parseInt(this.expect(TokenType2.NUMBER).value, 10);
               }
-            } else if (this.check(TokenType.STRING)) {
+            } else if (this.check(TokenType2.STRING)) {
               from.url = this.advance().value;
-              if (this.match(TokenType.COMMA)) {
-                from.version = parseInt(this.expect(TokenType.NUMBER).value, 10);
+              if (this.match(TokenType2.COMMA)) {
+                from.version = parseInt(this.expect(TokenType2.NUMBER).value, 10);
               }
             }
           }
-          this.expect(TokenType.RPAREN);
+          this.expect(TokenType2.RPAREN);
         } else {
           throw new Error(`Unknown table function: ${name}. Supported: read_lance()`);
         }
@@ -3623,9 +3863,9 @@ var SQLParser2 = class {
       throw new Error("Expected table name, URL string, or read_lance() after FROM");
     }
     if (from) {
-      if (this.match(TokenType.AS)) {
-        from.alias = this.expect(TokenType.IDENTIFIER).value;
-      } else if (this.check(TokenType.IDENTIFIER) && !this.check(TokenType.WHERE, TokenType.ORDER, TokenType.LIMIT, TokenType.GROUP, TokenType.NEAR, TokenType.JOIN, TokenType.INNER, TokenType.LEFT, TokenType.RIGHT, TokenType.COMMA)) {
+      if (this.match(TokenType2.AS)) {
+        from.alias = this.expect(TokenType2.IDENTIFIER).value;
+      } else if (this.check(TokenType2.IDENTIFIER) && !this.check(TokenType2.WHERE, TokenType2.ORDER, TokenType2.LIMIT, TokenType2.GROUP, TokenType2.NEAR, TokenType2.JOIN, TokenType2.INNER, TokenType2.LEFT, TokenType2.RIGHT, TokenType2.COMMA)) {
         from.alias = this.advance().value;
       }
     }
@@ -3642,32 +3882,32 @@ var SQLParser2 = class {
    */
   parseJoinClause() {
     let joinType = "INNER";
-    if (this.match(TokenType.INNER)) {
-      this.expect(TokenType.JOIN);
+    if (this.match(TokenType2.INNER)) {
+      this.expect(TokenType2.JOIN);
       joinType = "INNER";
-    } else if (this.match(TokenType.LEFT)) {
-      this.match(TokenType.OUTER);
-      this.expect(TokenType.JOIN);
+    } else if (this.match(TokenType2.LEFT)) {
+      this.match(TokenType2.OUTER);
+      this.expect(TokenType2.JOIN);
       joinType = "LEFT";
-    } else if (this.match(TokenType.RIGHT)) {
-      this.match(TokenType.OUTER);
-      this.expect(TokenType.JOIN);
+    } else if (this.match(TokenType2.RIGHT)) {
+      this.match(TokenType2.OUTER);
+      this.expect(TokenType2.JOIN);
       joinType = "RIGHT";
-    } else if (this.match(TokenType.FULL)) {
-      this.match(TokenType.OUTER);
-      this.expect(TokenType.JOIN);
+    } else if (this.match(TokenType2.FULL)) {
+      this.match(TokenType2.OUTER);
+      this.expect(TokenType2.JOIN);
       joinType = "FULL";
-    } else if (this.match(TokenType.CROSS)) {
-      this.expect(TokenType.JOIN);
+    } else if (this.match(TokenType2.CROSS)) {
+      this.expect(TokenType2.JOIN);
       joinType = "CROSS";
     } else {
-      this.expect(TokenType.JOIN);
+      this.expect(TokenType2.JOIN);
     }
     const table = this.parseFromClause();
     const alias = table.alias || null;
     let on = null;
     if (joinType !== "CROSS") {
-      this.expect(TokenType.ON);
+      this.expect(TokenType2.ON);
       on = this.parseExpr();
     }
     return {
@@ -3678,9 +3918,9 @@ var SQLParser2 = class {
     };
   }
   parseColumnList() {
-    const columns = [this.expect(TokenType.IDENTIFIER).value];
-    while (this.match(TokenType.COMMA)) {
-      columns.push(this.expect(TokenType.IDENTIFIER).value);
+    const columns = [this.expect(TokenType2.IDENTIFIER).value];
+    while (this.match(TokenType2.COMMA)) {
+      columns.push(this.expect(TokenType2.IDENTIFIER).value);
     }
     return columns;
   }
@@ -3691,26 +3931,26 @@ var SQLParser2 = class {
   parseGroupByList() {
     const items = [];
     do {
-      if (this.match(TokenType.ROLLUP)) {
-        this.expect(TokenType.LPAREN);
+      if (this.match(TokenType2.ROLLUP)) {
+        this.expect(TokenType2.LPAREN);
         const columns = this.parseColumnList();
-        this.expect(TokenType.RPAREN);
+        this.expect(TokenType2.RPAREN);
         items.push({ type: "ROLLUP", columns });
-      } else if (this.match(TokenType.CUBE)) {
-        this.expect(TokenType.LPAREN);
+      } else if (this.match(TokenType2.CUBE)) {
+        this.expect(TokenType2.LPAREN);
         const columns = this.parseColumnList();
-        this.expect(TokenType.RPAREN);
+        this.expect(TokenType2.RPAREN);
         items.push({ type: "CUBE", columns });
-      } else if (this.match(TokenType.GROUPING)) {
-        this.expect(TokenType.SETS);
-        this.expect(TokenType.LPAREN);
+      } else if (this.match(TokenType2.GROUPING)) {
+        this.expect(TokenType2.SETS);
+        this.expect(TokenType2.LPAREN);
         const sets = this.parseGroupingSets();
-        this.expect(TokenType.RPAREN);
+        this.expect(TokenType2.RPAREN);
         items.push({ type: "GROUPING_SETS", sets });
       } else {
-        items.push({ type: "COLUMN", column: this.expect(TokenType.IDENTIFIER).value });
+        items.push({ type: "COLUMN", column: this.expect(TokenType2.IDENTIFIER).value });
       }
-    } while (this.match(TokenType.COMMA));
+    } while (this.match(TokenType2.COMMA));
     return items;
   }
   /**
@@ -3720,30 +3960,30 @@ var SQLParser2 = class {
   parseGroupingSets() {
     const sets = [];
     do {
-      this.expect(TokenType.LPAREN);
-      if (this.check(TokenType.RPAREN)) {
+      this.expect(TokenType2.LPAREN);
+      if (this.check(TokenType2.RPAREN)) {
         sets.push([]);
       } else {
         sets.push(this.parseColumnList());
       }
-      this.expect(TokenType.RPAREN);
-    } while (this.match(TokenType.COMMA));
+      this.expect(TokenType2.RPAREN);
+    } while (this.match(TokenType2.COMMA));
     return sets;
   }
   parseOrderByList() {
     const items = [this.parseOrderByItem()];
-    while (this.match(TokenType.COMMA)) {
+    while (this.match(TokenType2.COMMA)) {
       items.push(this.parseOrderByItem());
     }
     return items;
   }
   parseOrderByItem() {
-    const column = this.expect(TokenType.IDENTIFIER).value;
+    const column = this.expect(TokenType2.IDENTIFIER).value;
     let descending = false;
-    if (this.match(TokenType.DESC)) {
+    if (this.match(TokenType2.DESC)) {
       descending = true;
     } else {
-      this.match(TokenType.ASC);
+      this.match(TokenType2.ASC);
     }
     return { column, descending };
   }
@@ -3753,7 +3993,7 @@ var SQLParser2 = class {
   }
   parseOrExpr() {
     let left = this.parseAndExpr();
-    while (this.match(TokenType.OR)) {
+    while (this.match(TokenType2.OR)) {
       const right = this.parseAndExpr();
       left = { type: "binary", op: "OR", left, right };
     }
@@ -3761,14 +4001,14 @@ var SQLParser2 = class {
   }
   parseAndExpr() {
     let left = this.parseNotExpr();
-    while (this.match(TokenType.AND)) {
+    while (this.match(TokenType2.AND)) {
       const right = this.parseNotExpr();
       left = { type: "binary", op: "AND", left, right };
     }
     return left;
   }
   parseNotExpr() {
-    if (this.match(TokenType.NOT)) {
+    if (this.match(TokenType2.NOT)) {
       const operand = this.parseNotExpr();
       return { type: "unary", op: "NOT", operand };
     }
@@ -3776,9 +4016,9 @@ var SQLParser2 = class {
   }
   parseCmpExpr() {
     let left = this.parseAddExpr();
-    if (this.match(TokenType.IS)) {
-      const negated = !!this.match(TokenType.NOT);
-      this.expect(TokenType.NULL);
+    if (this.match(TokenType2.IS)) {
+      const negated = !!this.match(TokenType2.NOT);
+      this.expect(TokenType2.NULL);
       return {
         type: "binary",
         op: negated ? "!=" : "==",
@@ -3786,44 +4026,44 @@ var SQLParser2 = class {
         right: { type: "literal", value: null }
       };
     }
-    if (this.match(TokenType.IN)) {
-      this.expect(TokenType.LPAREN);
-      if (this.check(TokenType.SELECT)) {
+    if (this.match(TokenType2.IN)) {
+      this.expect(TokenType2.LPAREN);
+      if (this.check(TokenType2.SELECT)) {
         const subquery = this.parseSelect(true);
-        this.expect(TokenType.RPAREN);
+        this.expect(TokenType2.RPAREN);
         return { type: "in", expr: left, values: [{ type: "subquery", query: subquery }] };
       }
       const values = [];
       values.push(this.parsePrimary());
-      while (this.match(TokenType.COMMA)) {
+      while (this.match(TokenType2.COMMA)) {
         values.push(this.parsePrimary());
       }
-      this.expect(TokenType.RPAREN);
+      this.expect(TokenType2.RPAREN);
       return { type: "in", expr: left, values };
     }
-    if (this.match(TokenType.BETWEEN)) {
+    if (this.match(TokenType2.BETWEEN)) {
       const low = this.parseAddExpr();
-      this.expect(TokenType.AND);
+      this.expect(TokenType2.AND);
       const high = this.parseAddExpr();
       return { type: "between", expr: left, low, high };
     }
-    if (this.match(TokenType.LIKE)) {
+    if (this.match(TokenType2.LIKE)) {
       const pattern = this.parsePrimary();
       return { type: "like", expr: left, pattern };
     }
-    if (this.match(TokenType.NEAR)) {
+    if (this.match(TokenType2.NEAR)) {
       const text = this.parsePrimary();
       return { type: "near", column: left, text };
     }
     const opMap = {
-      [TokenType.EQ]: "==",
-      [TokenType.NE]: "!=",
-      [TokenType.LT]: "<",
-      [TokenType.LE]: "<=",
-      [TokenType.GT]: ">",
-      [TokenType.GE]: ">="
+      [TokenType2.EQ]: "==",
+      [TokenType2.NE]: "!=",
+      [TokenType2.LT]: "<",
+      [TokenType2.LE]: "<=",
+      [TokenType2.GT]: ">",
+      [TokenType2.GE]: ">="
     };
-    const opToken = this.match(TokenType.EQ, TokenType.NE, TokenType.LT, TokenType.LE, TokenType.GT, TokenType.GE);
+    const opToken = this.match(TokenType2.EQ, TokenType2.NE, TokenType2.LT, TokenType2.LE, TokenType2.GT, TokenType2.GE);
     if (opToken) {
       const right = this.parseAddExpr();
       return { type: "binary", op: opMap[opToken.type], left, right };
@@ -3833,7 +4073,7 @@ var SQLParser2 = class {
   parseAddExpr() {
     let left = this.parseMulExpr();
     while (true) {
-      const opToken = this.match(TokenType.PLUS, TokenType.MINUS);
+      const opToken = this.match(TokenType2.PLUS, TokenType2.MINUS);
       if (!opToken) break;
       const right = this.parseMulExpr();
       left = { type: "binary", op: opToken.value, left, right };
@@ -3843,7 +4083,7 @@ var SQLParser2 = class {
   parseMulExpr() {
     let left = this.parseUnaryExpr();
     while (true) {
-      const opToken = this.match(TokenType.STAR, TokenType.SLASH);
+      const opToken = this.match(TokenType2.STAR, TokenType2.SLASH);
       if (!opToken) break;
       const right = this.parseUnaryExpr();
       left = { type: "binary", op: opToken.value, left, right };
@@ -3851,126 +4091,126 @@ var SQLParser2 = class {
     return left;
   }
   parseUnaryExpr() {
-    if (this.match(TokenType.MINUS)) {
+    if (this.match(TokenType2.MINUS)) {
       const operand = this.parseUnaryExpr();
       return { type: "unary", op: "-", operand };
     }
     return this.parsePrimary();
   }
   parsePrimary() {
-    if (this.match(TokenType.NULL)) {
+    if (this.match(TokenType2.NULL)) {
       return { type: "literal", value: null };
     }
-    if (this.match(TokenType.TRUE)) {
+    if (this.match(TokenType2.TRUE)) {
       return { type: "literal", value: true };
     }
-    if (this.match(TokenType.FALSE)) {
+    if (this.match(TokenType2.FALSE)) {
       return { type: "literal", value: false };
     }
-    if (this.match(TokenType.ARRAY)) {
+    if (this.match(TokenType2.ARRAY)) {
       let result = this.parseArrayLiteral();
-      while (this.check(TokenType.LBRACKET)) {
+      while (this.check(TokenType2.LBRACKET)) {
         this.advance();
         const index = this.parseExpr();
-        this.expect(TokenType.RBRACKET);
+        this.expect(TokenType2.RBRACKET);
         result = { type: "subscript", array: result, index };
       }
       return result;
     }
-    if (this.check(TokenType.LBRACKET)) {
+    if (this.check(TokenType2.LBRACKET)) {
       let result = this.parseArrayLiteral();
-      while (this.check(TokenType.LBRACKET)) {
+      while (this.check(TokenType2.LBRACKET)) {
         this.advance();
         const index = this.parseExpr();
-        this.expect(TokenType.RBRACKET);
+        this.expect(TokenType2.RBRACKET);
         result = { type: "subscript", array: result, index };
       }
       return result;
     }
-    if (this.check(TokenType.NUMBER)) {
+    if (this.check(TokenType2.NUMBER)) {
       const value = this.advance().value;
       return { type: "literal", value: parseFloat(value) };
     }
-    if (this.check(TokenType.STRING)) {
+    if (this.check(TokenType2.STRING)) {
       const value = this.advance().value;
       return { type: "literal", value };
     }
     const windowFuncTokens = [
-      TokenType.ROW_NUMBER,
-      TokenType.RANK,
-      TokenType.DENSE_RANK,
-      TokenType.NTILE,
-      TokenType.LAG,
-      TokenType.LEAD,
-      TokenType.FIRST_VALUE,
-      TokenType.LAST_VALUE,
-      TokenType.NTH_VALUE,
-      TokenType.PERCENT_RANK,
-      TokenType.CUME_DIST
+      TokenType2.ROW_NUMBER,
+      TokenType2.RANK,
+      TokenType2.DENSE_RANK,
+      TokenType2.NTILE,
+      TokenType2.LAG,
+      TokenType2.LEAD,
+      TokenType2.FIRST_VALUE,
+      TokenType2.LAST_VALUE,
+      TokenType2.NTH_VALUE,
+      TokenType2.PERCENT_RANK,
+      TokenType2.CUME_DIST
     ];
     if (windowFuncTokens.some((t) => this.check(t))) {
       const name = this.advance().type;
-      this.expect(TokenType.LPAREN);
+      this.expect(TokenType2.LPAREN);
       const args = [];
-      if (!this.check(TokenType.RPAREN)) {
+      if (!this.check(TokenType2.RPAREN)) {
         args.push(this.parseExpr());
-        while (this.match(TokenType.COMMA)) {
+        while (this.match(TokenType2.COMMA)) {
           args.push(this.parseExpr());
         }
       }
-      this.expect(TokenType.RPAREN);
+      this.expect(TokenType2.RPAREN);
       const over = this.parseOverClause();
       return { type: "call", name, args, distinct: false, over };
     }
-    if (this.check(TokenType.IDENTIFIER) || this.check(TokenType.COUNT, TokenType.SUM, TokenType.AVG, TokenType.MIN, TokenType.MAX, TokenType.GROUPING)) {
+    if (this.check(TokenType2.IDENTIFIER) || this.check(TokenType2.COUNT, TokenType2.SUM, TokenType2.AVG, TokenType2.MIN, TokenType2.MAX, TokenType2.GROUPING)) {
       const name = this.advance().value;
-      if (this.match(TokenType.LPAREN)) {
-        let distinct = !!this.match(TokenType.DISTINCT);
+      if (this.match(TokenType2.LPAREN)) {
+        let distinct = !!this.match(TokenType2.DISTINCT);
         const args = [];
-        if (!this.check(TokenType.RPAREN)) {
-          if (this.check(TokenType.STAR)) {
+        if (!this.check(TokenType2.RPAREN)) {
+          if (this.check(TokenType2.STAR)) {
             this.advance();
             args.push({ type: "star" });
           } else {
             args.push(this.parseExpr());
-            while (this.match(TokenType.COMMA)) {
+            while (this.match(TokenType2.COMMA)) {
               args.push(this.parseExpr());
             }
           }
         }
-        this.expect(TokenType.RPAREN);
+        this.expect(TokenType2.RPAREN);
         let over = null;
-        if (this.check(TokenType.OVER)) {
+        if (this.check(TokenType2.OVER)) {
           over = this.parseOverClause();
         }
         return { type: "call", name: name.toUpperCase(), args, distinct, over };
       }
-      if (this.match(TokenType.DOT)) {
+      if (this.match(TokenType2.DOT)) {
         const table = name;
         const token = this.advance();
         const column = token.value || token.type.toLowerCase();
         return { type: "column", table, column };
       }
       let result = { type: "column", column: name };
-      if (this.check(TokenType.LBRACKET)) {
+      if (this.check(TokenType2.LBRACKET)) {
         this.advance();
         const index = this.parseExpr();
-        this.expect(TokenType.RBRACKET);
+        this.expect(TokenType2.RBRACKET);
         result = { type: "subscript", array: result, index };
       }
       return result;
     }
-    if (this.match(TokenType.LPAREN)) {
-      if (this.check(TokenType.SELECT)) {
+    if (this.match(TokenType2.LPAREN)) {
+      if (this.check(TokenType2.SELECT)) {
         const subquery = this.parseSelect(true);
-        this.expect(TokenType.RPAREN);
+        this.expect(TokenType2.RPAREN);
         return { type: "subquery", query: subquery };
       }
       const expr = this.parseExpr();
-      this.expect(TokenType.RPAREN);
+      this.expect(TokenType2.RPAREN);
       return expr;
     }
-    if (this.match(TokenType.STAR)) {
+    if (this.match(TokenType2.STAR)) {
       return { type: "star" };
     }
     throw new Error(`Unexpected token: ${this.current().type} (${this.current().value})`);
@@ -3980,24 +4220,24 @@ var SQLParser2 = class {
    * Syntax: OVER ([PARTITION BY expr, ...] [ORDER BY expr [ASC|DESC], ...] [frame_clause])
    */
   parseOverClause() {
-    this.expect(TokenType.OVER);
-    this.expect(TokenType.LPAREN);
+    this.expect(TokenType2.OVER);
+    this.expect(TokenType2.LPAREN);
     const over = { partitionBy: [], orderBy: [], frame: null };
-    if (this.match(TokenType.PARTITION)) {
-      this.expect(TokenType.BY);
+    if (this.match(TokenType2.PARTITION)) {
+      this.expect(TokenType2.BY);
       over.partitionBy.push(this.parseExpr());
-      while (this.match(TokenType.COMMA)) {
+      while (this.match(TokenType2.COMMA)) {
         over.partitionBy.push(this.parseExpr());
       }
     }
-    if (this.match(TokenType.ORDER)) {
-      this.expect(TokenType.BY);
+    if (this.match(TokenType2.ORDER)) {
+      this.expect(TokenType2.BY);
       over.orderBy = this.parseOrderByList();
     }
-    if (this.check(TokenType.ROWS) || this.check(TokenType.RANGE)) {
+    if (this.check(TokenType2.ROWS) || this.check(TokenType2.RANGE)) {
       over.frame = this.parseFrameClause();
     }
-    this.expect(TokenType.RPAREN);
+    this.expect(TokenType2.RPAREN);
     return over;
   }
   /**
@@ -4008,9 +4248,9 @@ var SQLParser2 = class {
   parseFrameClause() {
     const frameType = this.advance().type;
     const frame = { type: frameType, start: null, end: null };
-    if (this.match(TokenType.BETWEEN)) {
+    if (this.match(TokenType2.BETWEEN)) {
       frame.start = this.parseFrameBound();
-      this.expect(TokenType.AND);
+      this.expect(TokenType2.AND);
       frame.end = this.parseFrameBound();
     } else {
       frame.start = this.parseFrameBound();
@@ -4023,23 +4263,23 @@ var SQLParser2 = class {
    * Options: UNBOUNDED PRECEDING, UNBOUNDED FOLLOWING, CURRENT ROW, N PRECEDING, N FOLLOWING
    */
   parseFrameBound() {
-    if (this.match(TokenType.UNBOUNDED)) {
-      if (this.match(TokenType.PRECEDING)) {
+    if (this.match(TokenType2.UNBOUNDED)) {
+      if (this.match(TokenType2.PRECEDING)) {
         return { type: "UNBOUNDED PRECEDING" };
-      } else if (this.match(TokenType.FOLLOWING)) {
+      } else if (this.match(TokenType2.FOLLOWING)) {
         return { type: "UNBOUNDED FOLLOWING" };
       }
       throw new Error("Expected PRECEDING or FOLLOWING after UNBOUNDED");
     }
-    if (this.match(TokenType.CURRENT)) {
-      this.expect(TokenType.ROW);
+    if (this.match(TokenType2.CURRENT)) {
+      this.expect(TokenType2.ROW);
       return { type: "CURRENT ROW" };
     }
-    if (this.check(TokenType.NUMBER)) {
+    if (this.check(TokenType2.NUMBER)) {
       const n = parseInt(this.advance().value, 10);
-      if (this.match(TokenType.PRECEDING)) {
+      if (this.match(TokenType2.PRECEDING)) {
         return { type: "PRECEDING", offset: n };
-      } else if (this.match(TokenType.FOLLOWING)) {
+      } else if (this.match(TokenType2.FOLLOWING)) {
         return { type: "FOLLOWING", offset: n };
       }
       throw new Error("Expected PRECEDING or FOLLOWING after number");
