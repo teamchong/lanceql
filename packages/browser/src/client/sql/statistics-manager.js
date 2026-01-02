@@ -1,8 +1,3 @@
-/**
- * StatisticsManager - Column statistics for query optimization
- * Extracted from query-planner.js for modularity
- */
-
 class StatisticsManager {
     constructor() {
         this._cache = new Map();
@@ -21,8 +16,7 @@ class StatisticsManager {
             const opfsRoot = await navigator.storage.getDirectory();
             this._opfsRoot = await opfsRoot.getDirectoryHandle('lanceql-stats', { create: true });
             return this._opfsRoot;
-        } catch (e) {
-            console.warn('[StatisticsManager] OPFS not available:', e);
+        } catch {
             return null;
         }
     }
@@ -87,8 +81,8 @@ class StatisticsManager {
             const writable = await fileHandle.createWritable();
             await writable.write(JSON.stringify(cacheData));
             await writable.close();
-        } catch (e) {
-            console.warn('[StatisticsManager] Failed to persist stats:', e);
+        } catch {
+            // Persist failure is non-fatal
         }
     }
 
@@ -172,12 +166,11 @@ class StatisticsManager {
                 }
 
                 rowsProcessed += values.length;
-            } catch (e) {
-                console.warn(`[StatisticsManager] Error reading fragment ${fragIdx}:`, e);
+            } catch {
+                // Fragment read failure - continue with next
             }
         }
 
-        console.log(`[StatisticsManager] Computed stats for ${columnName}: min=${stats.min}, max=${stats.max}, nulls=${stats.nullCount}/${stats.rowCount}`);
         return stats;
     }
 
@@ -191,10 +184,7 @@ class StatisticsManager {
         }
 
         const statsPromises = Array.from(filterColumns).map(col =>
-            this.getColumnStats(dataset, col).catch(e => {
-                console.warn(`[StatisticsManager] Failed to compute stats for ${col}:`, e);
-                return null;
-            })
+            this.getColumnStats(dataset, col).catch(() => null)
         );
 
         const results = await Promise.all(statsPromises);
@@ -294,8 +284,7 @@ class StatisticsManager {
             await this.saveToCache(datasetUrl, version, existing);
 
             return stats;
-        } catch (e) {
-            console.warn(`[StatisticsManager] Error computing fragment ${fragmentIndex} stats:`, e);
+        } catch {
             return null;
         }
     }
@@ -334,8 +323,6 @@ class StatisticsManager {
                 fragmentsPruned++;
             }
         }
-
-        console.log(`[StatisticsManager] Fragment pruning: ${fragmentsPruned}/${numFragments} fragments pruned`);
 
         return {
             matchingFragments,

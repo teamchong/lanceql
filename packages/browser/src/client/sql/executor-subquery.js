@@ -47,18 +47,15 @@ export function executeSubquery(executor, subqueryAst, outerColumnData, outerRow
         try {
             const result = executor._database._executeSingleTable(resolvedAst);
             if (result && result.then) {
-                console.warn('[SQLExecutor] Async subquery in expression context - consider using CTE');
-                return null;
+                return null; // Async subquery in expression context not supported
             }
             return result?.rows?.[0]?.[0] ?? null;
-        } catch (e) {
-            console.warn('[SQLExecutor] Subquery execution failed:', e.message);
+        } catch {
             return null;
         }
     }
 
-    console.warn('[SQLExecutor] Subquery execution requires LanceDatabase context');
-    return null;
+    return null; // Requires LanceDatabase context
 }
 
 /**

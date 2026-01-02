@@ -73,10 +73,6 @@ export function planSingleTable(planner, ast) {
         f.type === 'range' || f.type === 'equality'
     );
 
-    if (planner.debug) {
-        logSingleTablePlan(plan, ast);
-    }
-
     return plan;
 }
 
@@ -257,33 +253,3 @@ export function estimateSelectivity(filters) {
     return Math.max(0.01, selectivity);
 }
 
-/**
- * Log single-table query plan
- */
-export function logSingleTablePlan(plan, ast) {
-    console.log('\n' + '='.repeat(60));
-    console.log('📋 SINGLE-TABLE QUERY PLAN');
-    console.log('='.repeat(60));
-
-    console.log('\n🔍 Query Analysis:');
-    console.log(`  Type: ${plan.type}`);
-    console.log(`  Aggregations: ${plan.aggregations.length}`);
-    console.log(`  Group By: ${plan.groupBy.length} columns`);
-    console.log(`  Order By: ${plan.orderBy.length} columns`);
-    console.log(`  Limit: ${plan.limit || 'none'}`);
-
-    console.log('\n📊 Scan Strategy:');
-    console.log(`  Columns to fetch: [${plan.scanColumns.join(', ')}]`);
-    console.log(`  Pushed filters: ${plan.pushedFilters.length}`);
-    plan.pushedFilters.forEach((f, i) => {
-        console.log(`    ${i + 1}. ${f.type}: ${f.column} ${f.op || ''} ${JSON.stringify(f.value || f.values || f.pattern || '')}`);
-    });
-    console.log(`  Post-fetch filters: ${plan.postFilters.length}`);
-
-    console.log('\n💡 Optimizations:');
-    console.log(`  Can use column statistics: ${plan.canUseStatistics}`);
-    console.log(`  Can stream results: ${plan.canStreamResults}`);
-    console.log(`  Estimated selectivity: ${(plan.estimatedSelectivity * 100).toFixed(1)}%`);
-
-    console.log('\n' + '='.repeat(60) + '\n');
-}
