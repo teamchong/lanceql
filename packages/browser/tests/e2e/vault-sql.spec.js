@@ -5889,4 +5889,114 @@ test.describe('Vault SQL Operations', () => {
             expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
         }
     });
+
+    test('ROLLUP, CUBE, GROUPING SETS - multi-dimensional aggregation', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Create sales table for advanced GROUP BY tests
+            await v.exec(`CREATE TABLE sales (
+                region TEXT,
+                product TEXT,
+                amount DOUBLE
+            )`);
+
+            // Insert test data
+            await v.exec(`INSERT INTO sales VALUES
+                ('East', 'Widget', 100),
+                ('East', 'Widget', 150),
+                ('East', 'Gadget', 200),
+                ('West', 'Widget', 120),
+                ('West', 'Gadget', 180),
+                ('West', 'Gadget', 160)
+            `);
+
+            // Test 1: ROLLUP with SUM - hierarchical subtotals
+            try {
+                const res = await v.exec(`
+                    SELECT region, product, SUM(amount) as total
+                    FROM sales
+                    GROUP BY ROLLUP(region, product)
+                `);
+                // Should have: (East,Widget), (East,Gadget), (East,NULL), (West,Widget), (West,Gadget), (West,NULL), (NULL,NULL)
+                // At least 7 rows for 2 regions x 2 products + region subtotals + grand total
+                const grandTotal = res.rows.find(r => r.region === null && r.product === null);
+                tests.push({
+                    name: 'ROLLUP hierarchical subtotals',
+                    pass: res.rows.length >= 7 && grandTotal?.total === 910,
+                    actual: `rows: ${res.rows.length}, grand total: ${grandTotal?.total}`
+                });
+            } catch (e) {
+                tests.push({ name: 'ROLLUP hierarchical subtotals', pass: false, error: e.message });
+            }
+
+            // Test 2: CUBE with COUNT - all combinations
+            try {
+                const res = await v.exec(`
+                    SELECT region, product, COUNT(*) as cnt
+                    FROM sales
+                    GROUP BY CUBE(region, product)
+                `);
+                // CUBE produces all combinations: (region,product), (region), (product), ()
+                // Should have rows for: each (region,product), each region total, each product total, grand total
+                const grandTotal = res.rows.find(r => r.region === null && r.product === null);
+                const widgetTotal = res.rows.find(r => r.region === null && r.product === 'Widget');
+                tests.push({
+                    name: 'CUBE all combinations',
+                    pass: grandTotal?.cnt === 6 && widgetTotal?.cnt === 3,
+                    actual: `grand total cnt: ${grandTotal?.cnt}, Widget total: ${widgetTotal?.cnt}`
+                });
+            } catch (e) {
+                tests.push({ name: 'CUBE all combinations', pass: false, error: e.message });
+            }
+
+            // Test 3: GROUPING SETS - explicit groupings
+            try {
+                const res = await v.exec(`
+                    SELECT region, product, SUM(amount) as total
+                    FROM sales
+                    GROUP BY GROUPING SETS ((region, product), (region), ())
+                `);
+                // Explicit groupings: all (region,product) combos + region totals + grand total
+                const eastTotal = res.rows.find(r => r.region === 'East' && r.product === null);
+                const grandTotal = res.rows.find(r => r.region === null && r.product === null);
+                tests.push({
+                    name: 'GROUPING SETS explicit',
+                    pass: eastTotal?.total === 450 && grandTotal?.total === 910,
+                    actual: `East total: ${eastTotal?.total}, grand: ${grandTotal?.total}`
+                });
+            } catch (e) {
+                tests.push({ name: 'GROUPING SETS explicit', pass: false, error: e.message });
+            }
+
+            // Test 4: ROLLUP with single column
+            try {
+                const res = await v.exec(`
+                    SELECT region, SUM(amount) as total
+                    FROM sales
+                    GROUP BY ROLLUP(region)
+                `);
+                // Should have: East total, West total, grand total
+                const eastRow = res.rows.find(r => r.region === 'East');
+                const westRow = res.rows.find(r => r.region === 'West');
+                const grandRow = res.rows.find(r => r.region === null);
+                tests.push({
+                    name: 'ROLLUP single column',
+                    pass: eastRow?.total === 450 && westRow?.total === 460 && grandRow?.total === 910,
+                    actual: `East: ${eastRow?.total}, West: ${westRow?.total}, Grand: ${grandRow?.total}`
+                });
+            } catch (e) {
+                tests.push({ name: 'ROLLUP single column', pass: false, error: e.message });
+            }
+
+            await v.exec('DROP TABLE sales');
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
 });

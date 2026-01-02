@@ -14109,6 +14109,11 @@ export class SQLExecutor {
         const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'STDDEV_SAMP', 'STDDEV_POP', 'VARIANCE', 'VAR_SAMP', 'VAR_POP', 'MEDIAN', 'STRING_AGG', 'GROUP_CONCAT'];
         const hasGroupBy = ast.groupBy && ast.groupBy.length > 0;
 
+        // Check for advanced GROUP BY (ROLLUP/CUBE/GROUPING SETS)
+        if (hasGroupBy && this._hasAdvancedGroupBy(ast.groupBy)) {
+            return this._executeAdvancedGroupBy(ast, data, columnData, filteredIndices);
+        }
+
         // Group rows by GROUP BY columns
         const groups = new Map();
         for (const idx of filteredIndices) {
@@ -14334,6 +14339,233 @@ export class SQLExecutor {
         if (ast.limit) rows = rows.slice(0, ast.limit);
 
         return { columns: resultColumns, rows, total: groups.size };
+    }
+
+    /**
+     * Execute advanced GROUP BY with ROLLUP, CUBE, or GROUPING SETS
+     */
+    _executeAdvancedGroupBy(ast, data, columnData, filteredIndices) {
+        // 1. Expand GROUP BY into grouping sets
+        const groupingSets = this._expandGroupBy(ast.groupBy);
+
+        // 2. Get all column names for results
+        const allGroupColumns = this._getAllGroupColumns(ast.groupBy);
+
+        // 3. Execute aggregation for each grouping set
+        const allResults = [];
+        for (const groupingSet of groupingSets) {
+            const setResults = this._executeGroupByForSet(
+                ast, columnData, filteredIndices, groupingSet, allGroupColumns
+            );
+            allResults.push(...setResults);
+        }
+
+        // 4. Build result with proper column order
+        return this._buildAdvancedGroupByResult(ast, allResults, allGroupColumns);
+    }
+
+    /**
+     * Execute GROUP BY aggregation for a single grouping set
+     */
+    _executeGroupByForSet(ast, columnData, filteredIndices, groupingSet, allGroupColumns) {
+        const aggFuncs = ['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'STDDEV', 'STDDEV_SAMP', 'STDDEV_POP', 'VARIANCE', 'VAR_SAMP', 'VAR_POP', 'MEDIAN', 'STRING_AGG', 'GROUP_CONCAT'];
+        const groups = new Map();
+
+        // Normalize groupingSet to lowercase for comparison
+        const groupingSetLower = groupingSet.map(c => c.toLowerCase());
+
+        for (const idx of filteredIndices) {
+            // Build group key from current grouping set columns only
+            const groupKey = groupingSet.length > 0
+                ? groupingSet.map(col => {
+                    const val = columnData[col.toLowerCase()]?.[idx];
+                    return JSON.stringify(val);
+                }).join('|')
+                : '__grand_total__';
+
+            if (!groups.has(groupKey)) {
+                // Store group values for all columns (NULL for non-grouped)
+                const groupValues = {};
+                for (const col of allGroupColumns) {
+                    if (groupingSetLower.includes(col.toLowerCase())) {
+                        groupValues[col] = columnData[col.toLowerCase()]?.[idx];
+                    } else {
+                        groupValues[col] = null; // NULL for super-aggregate rows
+                    }
+                }
+                groups.set(groupKey, {
+                    values: groupValues,
+                    indices: [],
+                    _groupingSet: groupingSet
+                });
+            }
+            groups.get(groupKey).indices.push(idx);
+        }
+
+        // Handle empty data - still need grand total row
+        if (groupingSet.length === 0 && groups.size === 0) {
+            const groupValues = {};
+            for (const col of allGroupColumns) {
+                groupValues[col] = null;
+            }
+            groups.set('__grand_total__', {
+                values: groupValues,
+                indices: [],
+                _groupingSet: groupingSet
+            });
+        }
+
+        // Compute aggregates for each group
+        const results = [];
+        for (const [, group] of groups) {
+            const row = { ...group.values, _groupingSet: group._groupingSet };
+
+            // Compute each aggregate column
+            for (const col of ast.columns) {
+                const expr = col.expr;
+                if (expr?.type === 'call' && aggFuncs.includes((expr.name || '').toUpperCase())) {
+                    const funcName = expr.name.toUpperCase();
+                    const argExpr = expr.args?.[0];
+                    const isStar = argExpr?.type === 'star';
+                    const colName = (argExpr?.name || argExpr?.column || '').toLowerCase();
+                    const alias = col.alias || `${funcName}(${isStar ? '*' : colName})`;
+
+                    let result = null;
+                    const indices = group.indices;
+
+                    switch (funcName) {
+                        case 'COUNT':
+                            result = isStar
+                                ? indices.length
+                                : indices.filter(i => columnData[colName]?.[i] != null).length;
+                            break;
+                        case 'SUM': {
+                            let sum = 0;
+                            for (const i of indices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && !isNaN(v)) sum += v;
+                            }
+                            result = sum;
+                            break;
+                        }
+                        case 'AVG': {
+                            let sum = 0, count = 0;
+                            for (const i of indices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && !isNaN(v)) { sum += v; count++; }
+                            }
+                            result = count > 0 ? sum / count : null;
+                            break;
+                        }
+                        case 'MIN': {
+                            let min = null;
+                            for (const i of indices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && (min === null || v < min)) min = v;
+                            }
+                            result = min;
+                            break;
+                        }
+                        case 'MAX': {
+                            let max = null;
+                            for (const i of indices) {
+                                const v = columnData[colName]?.[i];
+                                if (v != null && (max === null || v > max)) max = v;
+                            }
+                            result = max;
+                            break;
+                        }
+                    }
+                    row[alias] = result;
+                }
+            }
+            results.push(row);
+        }
+
+        return results;
+    }
+
+    /**
+     * Get all column names from GROUP BY (for column ordering)
+     */
+    _getAllGroupColumns(groupBy) {
+        const columns = [];
+        for (const item of groupBy) {
+            if (item.type === 'COLUMN') {
+                if (!columns.includes(item.column)) columns.push(item.column);
+            } else if (item.type === 'ROLLUP' || item.type === 'CUBE') {
+                for (const col of item.columns) {
+                    if (!columns.includes(col)) columns.push(col);
+                }
+            } else if (item.type === 'GROUPING_SETS') {
+                for (const set of item.sets) {
+                    for (const col of set) {
+                        if (!columns.includes(col)) columns.push(col);
+                    }
+                }
+            }
+        }
+        return columns;
+    }
+
+    /**
+     * Build final result from advanced GROUP BY results
+     */
+    _buildAdvancedGroupByResult(ast, allResults, allGroupColumns) {
+        // Build result columns from AST
+        const resultColumns = [];
+        for (const col of ast.columns) {
+            if (col.alias) {
+                resultColumns.push(col.alias);
+            } else if (col.expr?.type === 'call') {
+                const argName = col.expr.args?.[0]?.name || col.expr.args?.[0]?.column || '*';
+                resultColumns.push(`${col.expr.name}(${argName})`);
+            } else if (col.expr?.type === 'column') {
+                resultColumns.push(col.expr.name || col.expr.column);
+            } else {
+                resultColumns.push('?');
+            }
+        }
+
+        // Convert result objects to arrays matching column order
+        const resultRows = allResults.map(rowObj => {
+            const row = [];
+            for (const colName of resultColumns) {
+                // Check if this is a group column or aggregate
+                const val = rowObj[colName] ?? rowObj[colName.toLowerCase()] ?? null;
+                row.push(val);
+            }
+            return row;
+        });
+
+        // Apply ORDER BY if present
+        if (ast.orderBy && ast.orderBy.length > 0) {
+            const colIdxMap = {};
+            resultColumns.forEach((name, idx) => { colIdxMap[name.toLowerCase()] = idx; });
+
+            resultRows.sort((a, b) => {
+                for (const ob of ast.orderBy) {
+                    const colIdx = colIdxMap[ob.column.toLowerCase()];
+                    if (colIdx === undefined) continue;
+                    const valA = a[colIdx], valB = b[colIdx];
+                    const dir = (ob.descending || ob.direction === 'DESC') ? -1 : 1;
+                    if (valA == null && valB == null) continue;
+                    if (valA == null) return 1 * dir;
+                    if (valB == null) return -1 * dir;
+                    if (valA < valB) return -1 * dir;
+                    if (valA > valB) return 1 * dir;
+                }
+                return 0;
+            });
+        }
+
+        // Apply LIMIT/OFFSET
+        const offset = ast.offset || 0;
+        let rows = resultRows;
+        if (offset > 0) rows = rows.slice(offset);
+        if (ast.limit) rows = rows.slice(0, ast.limit);
+
+        return { columns: resultColumns, rows, total: allResults.length };
     }
 
     /**
