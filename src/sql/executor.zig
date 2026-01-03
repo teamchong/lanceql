@@ -197,29 +197,11 @@ pub const Executor = struct {
     }
 
     /// Check if a query should use compiled execution
-    /// Returns true if:
-    /// - Compiled execution is enabled
-    /// - Row count exceeds threshold
-    /// - Query contains @logic_table method calls
+    /// Returns true if compiled execution is enabled
+    /// All queries now use compiled execution - no interpreted fallback
     fn shouldCompile(self: *Self, stmt: *const SelectStmt) bool {
-        if (!self.compiled_execution_enabled) return false;
-
-        // Check for @logic_table method calls (high benefit from compilation)
-        for (stmt.columns) |col| {
-            if (self.hasLogicTableMethodCall(&col.expr)) return true;
-        }
-        if (stmt.where) |*where| {
-            if (self.hasLogicTableMethodCall(where)) return true;
-        }
-
-        // Check row count threshold
-        if (self.table) |t| {
-            if (t.rowCount(0)) |count| {
-                if (count >= self.compile_threshold) return true;
-            } else |_| {}
-        }
-
-        return false;
+        _ = stmt;
+        return self.compiled_execution_enabled;
     }
 
     /// Check if expression contains @logic_table method call
@@ -267,6 +249,10 @@ pub const Executor = struct {
         // 3. Generate fused Zig code with layout metadata and resolved types
         var codegen = fused_codegen.FusedCodeGen.init(self.allocator);
         defer codegen.deinit(); // This handles freeing the generated source code
+
+        // 3a. Pre-execute any subqueries and pass results to codegen
+        try self.preExecuteSubqueries(stmt, &codegen);
+
         var gen_result = try codegen.generateWithLayoutAndTypes(&plan, &type_map);
         defer gen_result.layout.deinit(); // Free the layout slices
         // Note: gen_result.source is owned by codegen and freed in deinit()
@@ -364,6 +350,82 @@ pub const Executor = struct {
             }
         }
         self.allocator.free(data);
+    }
+
+    /// Pre-execute subqueries and pass results to codegen
+    fn preExecuteSubqueries(self: *Self, stmt: *const SelectStmt, codegen: *fused_codegen.FusedCodeGen) !void {
+        // Collect subqueries from WHERE clause
+        if (stmt.where) |where| {
+            try self.collectAndExecuteSubqueries(&where, codegen);
+        }
+
+        // Collect subqueries from SELECT expressions
+        for (stmt.columns) |col| {
+            try self.collectAndExecuteSubqueries(&col.expr, codegen);
+        }
+    }
+
+    /// Recursively find and execute subqueries in an expression
+    fn collectAndExecuteSubqueries(self: *Self, expr: *const Expr, codegen: *fused_codegen.FusedCodeGen) anyerror!void {
+        switch (expr.*) {
+            .in_subquery => |in| {
+                // Execute the subquery
+                var result = try self.execute(in.subquery, &[_]Value{});
+                defer result.deinit();
+
+                // Extract integer values from single-column result
+                if (result.columns.len == 1) {
+                    const col = result.columns[0];
+                    var values = try self.allocator.alloc(i64, result.row_count);
+                    for (0..result.row_count) |i| {
+                        values[i] = switch (col.data) {
+                            .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| data[i],
+                            .int32, .date32 => |data| data[i],
+                            .float64 => |data| @as(i64, @intFromFloat(data[i])),
+                            .float32 => |data| @as(i64, @intFromFloat(data[i])),
+                            .bool_ => |data| if (data[i]) @as(i64, 1) else 0,
+                            .string => 0, // String subqueries not supported for IN
+                        };
+                    }
+                    try codegen.setSubqueryIntResults(@intFromPtr(in.subquery), values);
+                }
+            },
+            .exists => |ex| {
+                // Execute the subquery and check if rows exist
+                var result = try self.execute(ex.subquery, &[_]Value{});
+                defer result.deinit();
+                try codegen.setExistsResult(@intFromPtr(ex.subquery), result.row_count > 0);
+            },
+            .binary => |bin| {
+                try self.collectAndExecuteSubqueries(bin.left, codegen);
+                try self.collectAndExecuteSubqueries(bin.right, codegen);
+            },
+            .unary => |un| {
+                try self.collectAndExecuteSubqueries(un.operand, codegen);
+            },
+            .call => |call| {
+                for (call.args) |*arg| {
+                    try self.collectAndExecuteSubqueries(arg, codegen);
+                }
+            },
+            .in_list => |in| {
+                try self.collectAndExecuteSubqueries(in.expr, codegen);
+            },
+            .between => |bet| {
+                try self.collectAndExecuteSubqueries(bet.expr, codegen);
+                try self.collectAndExecuteSubqueries(bet.low, codegen);
+                try self.collectAndExecuteSubqueries(bet.high, codegen);
+            },
+            .case_expr => |case| {
+                if (case.operand) |op| try self.collectAndExecuteSubqueries(op, codegen);
+                for (case.when_clauses) |clause| {
+                    try self.collectAndExecuteSubqueries(&clause.condition, codegen);
+                    try self.collectAndExecuteSubqueries(&clause.result, codegen);
+                }
+                if (case.else_result) |else_expr| try self.collectAndExecuteSubqueries(else_expr, codegen);
+            },
+            else => {},
+        }
     }
 
     /// Get physical column index by name
@@ -1183,19 +1245,20 @@ pub const Executor = struct {
             }
         }
 
-        // Try compiled execution first if enabled and query qualifies
+        // Try compiled execution first (fused code generation)
         if (self.shouldCompile(stmt)) {
             if (self.executeCompiled(stmt)) |result| {
-                return result;
-            } else |err| {
-                // Fall back to interpreted on compilation failure
-                switch (err) {
-                    error.NotImplemented => {}, // Expected fallback
-                    else => {}, // Log and continue with interpreted path
+                // Handle set operations if present
+                if (stmt.set_operation) |set_op| {
+                    return self.executeSetOperation(result, set_op, params);
                 }
+                return result;
+            } else |_| {
+                // Fall through to interpreted path on compilation failure
             }
         }
 
+        // Interpreted fallback (will be removed once compiled handles all cases)
         if (stmt.where) |where_expr| {
             var col_names = std.ArrayList([]const u8){};
             defer col_names.deinit(self.allocator);
@@ -1215,7 +1278,6 @@ pub const Executor = struct {
         const has_aggregates = self.hasAggregates(stmt.columns);
 
         if (has_group_by or has_aggregates) {
-            // Execute with GROUP BY / aggregation
             return self.executeWithGroupBy(stmt, indices);
         }
 

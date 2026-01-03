@@ -200,6 +200,13 @@ pub const FusedCodeGen = struct {
     /// Analyzed plan (stored for generateCode)
     analyzed_plan: ?*const QueryPlan,
 
+    /// Pre-computed subquery results for IN/EXISTS
+    /// Key: subquery ID (pointer hash), Value: list of integer values
+    subquery_int_results: std.AutoHashMap(usize, []const i64),
+
+    /// Pre-computed EXISTS results (subquery ID -> exists boolean)
+    exists_results: std.AutoHashMap(usize, bool),
+
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator) Self {
@@ -225,6 +232,8 @@ pub const FusedCodeGen = struct {
             .right_column_order = .{},
             .var_counter = 0,
             .analyzed_plan = null,
+            .subquery_int_results = std.AutoHashMap(usize, []const i64).init(allocator),
+            .exists_results = std.AutoHashMap(usize, bool).init(allocator),
         };
     }
 
@@ -242,6 +251,18 @@ pub const FusedCodeGen = struct {
         self.right_columns.deinit();
         self.right_column_order.deinit(self.allocator);
         self.aggregate_specs.deinit(self.allocator);
+        self.subquery_int_results.deinit();
+        self.exists_results.deinit();
+    }
+
+    /// Set pre-computed IN subquery results (call before generateCode)
+    pub fn setSubqueryIntResults(self: *Self, subquery_ptr: usize, values: []const i64) !void {
+        try self.subquery_int_results.put(subquery_ptr, values);
+    }
+
+    /// Set pre-computed EXISTS result (call before generateCode)
+    pub fn setExistsResult(self: *Self, subquery_ptr: usize, exists: bool) !void {
+        try self.exists_results.put(subquery_ptr, exists);
     }
 
     /// Analyze plan to collect column info (call before updateColumnTypes)
@@ -2590,8 +2611,110 @@ pub const FusedCodeGen = struct {
                 try self.genExpr(bet.high);
                 try self.write(")");
             },
-            else => {
-                try self.write("/* unsupported expr */");
+            .case_expr => |case| {
+                // Generate CASE as nested if-else
+                // CASE x WHEN a THEN b WHEN c THEN d ELSE e END
+                // becomes: if (x == a) b else if (x == c) d else e
+                try self.write("blk: {\n");
+                self.indent += 1;
+
+                for (case.when_clauses, 0..) |clause, idx| {
+                    try self.writeIndent();
+                    if (idx > 0) try self.write("} else ");
+                    try self.write("if (");
+                    if (case.operand) |op| {
+                        try self.genExpr(op);
+                        try self.write(" == ");
+                    }
+                    try self.genExpr(&clause.condition);
+                    try self.write(") {\n");
+                    self.indent += 1;
+                    try self.writeIndent();
+                    try self.write("break :blk ");
+                    try self.genExpr(&clause.result);
+                    try self.write(";\n");
+                    self.indent -= 1;
+                }
+
+                try self.writeIndent();
+                try self.write("} else {\n");
+                self.indent += 1;
+                try self.writeIndent();
+                try self.write("break :blk ");
+                if (case.else_result) |else_expr| {
+                    try self.genExpr(else_expr);
+                } else {
+                    try self.write("null");
+                }
+                try self.write(";\n");
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.write("}\n");
+
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.write("}");
+            },
+            .cast => |c| {
+                // CAST(expr AS type) - generate type coercion
+                const target = c.target_type;
+                if (std.ascii.eqlIgnoreCase(target, "int") or
+                    std.ascii.eqlIgnoreCase(target, "integer") or
+                    std.ascii.eqlIgnoreCase(target, "bigint"))
+                {
+                    try self.write("@as(i64, @intFromFloat(");
+                    try self.genExpr(c.expr);
+                    try self.write("))");
+                } else if (std.ascii.eqlIgnoreCase(target, "float") or
+                    std.ascii.eqlIgnoreCase(target, "double") or
+                    std.ascii.eqlIgnoreCase(target, "real"))
+                {
+                    try self.write("@as(f64, @floatFromInt(");
+                    try self.genExpr(c.expr);
+                    try self.write("))");
+                } else {
+                    // Unknown cast type - pass through
+                    try self.genExpr(c.expr);
+                }
+            },
+            .in_subquery => |in| {
+                // Use pre-computed subquery results
+                const subquery_id = @intFromPtr(in.subquery);
+                if (self.subquery_int_results.get(subquery_id)) |values| {
+                    if (values.len == 0) {
+                        // Empty result - never matches
+                        try self.write(if (in.negated) "true" else "false");
+                    } else if (values.len <= 10) {
+                        // Small result - inline as OR chain
+                        try self.write("(");
+                        for (values, 0..) |val, idx| {
+                            if (idx > 0) {
+                                try self.write(if (in.negated) " and " else " or ");
+                            }
+                            try self.genExpr(in.expr);
+                            try self.write(if (in.negated) " != " else " == ");
+                            try self.fmt("{d}", .{val});
+                        }
+                        try self.write(")");
+                    } else {
+                        // Large result - would need hashset, not supported inline
+                        return CodeGenError.UnsupportedPlanNode;
+                    }
+                } else {
+                    // Subquery result not pre-computed
+                    return CodeGenError.UnsupportedPlanNode;
+                }
+            },
+            .exists => |ex| {
+                // Use pre-computed EXISTS result
+                const subquery_id = @intFromPtr(ex.subquery);
+                if (self.exists_results.get(subquery_id)) |exists| {
+                    const result = if (ex.negated) !exists else exists;
+                    try self.write(if (result) "true" else "false");
+                } else {
+                    // EXISTS result not pre-computed
+                    return CodeGenError.UnsupportedPlanNode;
+                }
             },
         }
     }
