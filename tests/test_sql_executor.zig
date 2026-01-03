@@ -1458,3 +1458,55 @@ test "execute EPOCH function on column" {
     try std.testing.expectEqual(@as(usize, 1), result.row_count);
     try std.testing.expectEqual(@as(i64, 1), result.columns[0].data.int64[0]);
 }
+
+// ============================================================================
+// Compiled Execution Tests
+// ============================================================================
+
+test "compiled vs interpreted produce same results" {
+    var ctx: TestContext = undefined;
+    try ctx.init(std.testing.allocator, int64_fixture);
+    defer ctx.deinit();
+
+    // Force compilation with low threshold
+    ctx.executor.setCompileThreshold(0);
+    const r1 = try ctx.exec("SELECT id FROM table WHERE id > 2");
+    const compiled_count = r1.row_count;
+
+    // Disable compilation, run same query
+    ctx.executor.enableCompiledExecution(false);
+    const r2 = try ctx.exec("SELECT id FROM table WHERE id > 2");
+
+    try std.testing.expectEqual(compiled_count, r2.row_count);
+}
+
+test "fallback to interpreted on GROUP BY" {
+    var ctx: TestContext = undefined;
+    try ctx.init(std.testing.allocator, int64_fixture);
+    defer ctx.deinit();
+
+    ctx.executor.setCompileThreshold(0);
+    // GROUP BY not compiled - should fallback gracefully
+    const result = try ctx.exec("SELECT COUNT(*) FROM table GROUP BY id");
+    try std.testing.expect(result.row_count > 0);
+}
+
+test "compilation can be disabled" {
+    var ctx: TestContext = undefined;
+    try ctx.init(std.testing.allocator, int64_fixture);
+    defer ctx.deinit();
+
+    ctx.executor.enableCompiledExecution(false);
+    const result = try ctx.exec("SELECT * FROM table");
+    try std.testing.expectEqual(@as(usize, 5), result.row_count);
+}
+
+test "compiled filter with AND" {
+    var ctx: TestContext = undefined;
+    try ctx.init(std.testing.allocator, int64_fixture);
+    defer ctx.deinit();
+
+    ctx.executor.setCompileThreshold(0);
+    const result = try ctx.exec("SELECT id FROM table WHERE id > 1 AND id < 5");
+    try std.testing.expectEqual(@as(usize, 3), result.row_count);
+}
