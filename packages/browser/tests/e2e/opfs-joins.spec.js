@@ -13,7 +13,7 @@ import { test, expect } from '@playwright/test';
  */
 test.describe('OPFS JOIN Infrastructure', () => {
     test.beforeEach(async ({ page }) => {
-        await page.goto('/test-join.html');
+        await page.goto('/examples/wasm/test-join.html');
         await page.waitForLoadState('domcontentloaded');
     });
 
@@ -525,7 +525,7 @@ test.describe('OPFS JOIN Infrastructure', () => {
  */
 test.describe('Phase 7: CTE, Set Operations, Window Functions', () => {
     test.beforeEach(async ({ page }) => {
-        await page.goto('/test-join.html');
+        await page.goto('/examples/wasm/test-join.html');
         await page.waitForLoadState('domcontentloaded');
     });
 
@@ -1111,7 +1111,7 @@ test.describe('Phase 7: CTE, Set Operations, Window Functions', () => {
 
 test.describe('Phase 8: Advanced Aggregations', () => {
     test.beforeEach(async ({ page }) => {
-        await page.goto('/test-join.html');
+        await page.goto('/examples/wasm/test-join.html');
         await page.waitForLoadState('domcontentloaded');
     });
 
@@ -1499,7 +1499,7 @@ test.describe('Phase 8: Advanced Aggregations', () => {
 
 test.describe('Phase 9: Query Optimization', () => {
     test.beforeEach(async ({ page }) => {
-        await page.goto('/test-join.html');
+        await page.goto('/examples/wasm/test-join.html');
     });
 
     test('9.1 Plan cache is initialized in LanceDatabase', async ({ page }) => {
@@ -2002,7 +2002,7 @@ test.describe('Phase 9: Query Optimization', () => {
 
 test.describe('Phase 10: Memory Tables', () => {
     test.beforeEach(async ({ page }) => {
-        await page.goto('/test-join.html');
+        await page.goto('/examples/wasm/test-join.html');
     });
 
     test('10.1 CREATE TABLE creates memory table', async ({ page }) => {
@@ -2256,7 +2256,7 @@ test.describe('Phase 10: Memory Tables', () => {
 // Phase 11: Window Function Enhancements Tests
 test.describe('Phase 11: Window Function Enhancements', () => {
     test.beforeEach(async ({ page }) => {
-        await page.goto('/test-join.html');
+        await page.goto('/examples/wasm/test-join.html');
     });
 
     test('11.1 PERCENT_RANK returns 0 for first row', async ({ page }) => {

@@ -3,7 +3,7 @@ import { test, expect } from '@playwright/test';
 
 test.describe('WASM Demo', () => {
   test('homepage loads successfully', async ({ page }) => {
-    await page.goto('/');
+    await page.goto('/examples/wasm/');
 
     // Check that the page has loaded
     await expect(page).toHaveTitle(/Lance|LanceQL/i);
@@ -18,7 +18,7 @@ test.describe('WASM Demo', () => {
       }
     });
 
-    await page.goto('/');
+    await page.goto('/examples/wasm/');
 
     // Wait for potential WASM loading
     await page.waitForTimeout(2000);
@@ -65,7 +65,7 @@ test.describe('WASM Demo', () => {
   });
 
   test('file drop zone exists', async ({ page }) => {
-    await page.goto('/');
+    await page.goto('/examples/wasm/');
 
     // Check for common drop zone elements
     const dropZone = page.locator('[data-dropzone], .drop-zone, #dropzone, .file-drop');
@@ -93,7 +93,7 @@ test.describe('Error Handling', () => {
       }
     });
 
-    await page.goto('/');
+    await page.goto('/examples/wasm/');
     await page.waitForTimeout(2000);
 
     // Page should still load (graceful degradation)

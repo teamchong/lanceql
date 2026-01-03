@@ -7,7 +7,7 @@ import { test, expect } from '@playwright/test';
 
 test.describe('SQL Lexer (Browser)', () => {
     test('tokenizes simple SELECT', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLLexer } = await import('./src/client/sql/lexer.js');
@@ -29,7 +29,7 @@ test.describe('SQL Lexer (Browser)', () => {
     });
 
     test('tokenizes numbers', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLLexer } = await import('./src/client/sql/lexer.js');
@@ -44,7 +44,7 @@ test.describe('SQL Lexer (Browser)', () => {
     });
 
     test('tokenizes strings', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLLexer } = await import('./src/client/sql/lexer.js');
@@ -58,7 +58,7 @@ test.describe('SQL Lexer (Browser)', () => {
     });
 
     test('tokenizes comparison operators', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLLexer } = await import('./src/client/sql/lexer.js');
@@ -71,7 +71,7 @@ test.describe('SQL Lexer (Browser)', () => {
     });
 
     test('tokenizes complex query', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLLexer } = await import('./src/client/sql/lexer.js');
@@ -106,7 +106,7 @@ test.describe('SQL Lexer (Browser)', () => {
     });
 
     test('tokenizes window functions', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLLexer } = await import('./src/client/sql/lexer.js');
@@ -127,7 +127,7 @@ test.describe('SQL Lexer (Browser)', () => {
 
 test.describe('SQL Parser (Browser)', () => {
     test('parses simple SELECT *', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLLexer } = await import('./src/client/sql/lexer.js');
@@ -145,7 +145,7 @@ test.describe('SQL Parser (Browser)', () => {
     });
 
     test('parses SELECT with specific columns', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLLexer } = await import('./src/client/sql/lexer.js');
@@ -161,7 +161,7 @@ test.describe('SQL Parser (Browser)', () => {
     });
 
     test('parses WHERE with AND/OR', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLLexer } = await import('./src/client/sql/lexer.js');
@@ -177,7 +177,7 @@ test.describe('SQL Parser (Browser)', () => {
     });
 
     test('parses JOIN', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLLexer } = await import('./src/client/sql/lexer.js');
@@ -194,7 +194,7 @@ test.describe('SQL Parser (Browser)', () => {
     });
 
     test('parses GROUP BY with HAVING', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLLexer } = await import('./src/client/sql/lexer.js');
@@ -211,7 +211,7 @@ test.describe('SQL Parser (Browser)', () => {
     });
 
     test('parses LIMIT with OFFSET', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLLexer } = await import('./src/client/sql/lexer.js');
@@ -228,7 +228,7 @@ test.describe('SQL Parser (Browser)', () => {
     });
 
     test('parses CTE (WITH clause)', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLLexer } = await import('./src/client/sql/lexer.js');
@@ -250,7 +250,7 @@ test.describe('SQL Parser (Browser)', () => {
     });
 
     test('parses UNION', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLLexer } = await import('./src/client/sql/lexer.js');
@@ -267,7 +267,7 @@ test.describe('SQL Parser (Browser)', () => {
     });
 
     test('parses INSERT', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLLexer } = await import('./src/client/sql/lexer.js');
@@ -284,7 +284,7 @@ test.describe('SQL Parser (Browser)', () => {
     });
 
     test('parses UPDATE', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLLexer } = await import('./src/client/sql/lexer.js');
@@ -301,7 +301,7 @@ test.describe('SQL Parser (Browser)', () => {
     });
 
     test('parses DELETE', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLLexer } = await import('./src/client/sql/lexer.js');
@@ -318,7 +318,7 @@ test.describe('SQL Parser (Browser)', () => {
     });
 
     test('parses CREATE TABLE', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLLexer } = await import('./src/client/sql/lexer.js');
@@ -337,7 +337,7 @@ test.describe('SQL Parser (Browser)', () => {
 
 test.describe('LRU Cache (Browser)', () => {
     test('put and get a value', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { LRUCache } = await import('./src/client/cache/lru-cache.js');
@@ -352,7 +352,7 @@ test.describe('LRU Cache (Browser)', () => {
     });
 
     test('returns undefined for missing key', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { LRUCache } = await import('./src/client/cache/lru-cache.js');
@@ -364,7 +364,7 @@ test.describe('LRU Cache (Browser)', () => {
     });
 
     test('overwrites existing key', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { LRUCache } = await import('./src/client/cache/lru-cache.js');
@@ -378,7 +378,7 @@ test.describe('LRU Cache (Browser)', () => {
     });
 
     test('delete removes a key', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { LRUCache } = await import('./src/client/cache/lru-cache.js');
@@ -392,7 +392,7 @@ test.describe('LRU Cache (Browser)', () => {
     });
 
     test('clear removes all keys', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { LRUCache } = await import('./src/client/cache/lru-cache.js');
@@ -414,7 +414,7 @@ test.describe('LRU Cache (Browser)', () => {
     });
 
     test('evicts oldest entry when max size exceeded', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { LRUCache } = await import('./src/client/cache/lru-cache.js');
@@ -435,7 +435,7 @@ test.describe('LRU Cache (Browser)', () => {
     });
 
     test('recently accessed items are not evicted', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { LRUCache } = await import('./src/client/cache/lru-cache.js');
@@ -457,7 +457,7 @@ test.describe('LRU Cache (Browser)', () => {
     });
 
     test('tracks statistics', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { LRUCache } = await import('./src/client/cache/lru-cache.js');
@@ -475,7 +475,7 @@ test.describe('LRU Cache (Browser)', () => {
 
 test.describe('WebGPU Shaders (Browser)', () => {
     test('WebGPU availability check', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             return {
@@ -489,7 +489,7 @@ test.describe('WebGPU Shaders (Browser)', () => {
     });
 
     test('GEMM CPU reference produces correct results', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(() => {
             function cpuGemm(A, B, M, N, K, alpha = 1.0) {
@@ -515,7 +515,7 @@ test.describe('WebGPU Shaders (Browser)', () => {
     });
 
     test('GELU CPU reference handles negative values', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(() => {
             function cpuGelu(input) {
@@ -540,7 +540,7 @@ test.describe('WebGPU Shaders (Browser)', () => {
     });
 
     test('LayerNorm CPU reference normalizes to zero mean', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(() => {
             function cpuLayerNorm(input, gamma, beta, eps = 1e-5) {
@@ -573,7 +573,7 @@ test.describe('WebGPU Shaders (Browser)', () => {
 
 test.describe.serial('Module Loading (Browser)', () => {
     test('SQLLexer exports correctly', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLLexer } = await import('./src/client/sql/lexer.js');
@@ -584,7 +584,7 @@ test.describe.serial('Module Loading (Browser)', () => {
     });
 
     test('SQLParser exports correctly', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { SQLParser } = await import('./src/client/sql/parser.js');
@@ -595,7 +595,7 @@ test.describe.serial('Module Loading (Browser)', () => {
     });
 
     test('LRUCache exports correctly', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         const result = await page.evaluate(async () => {
             const { LRUCache } = await import('./src/client/cache/lru-cache.js');
@@ -606,7 +606,7 @@ test.describe.serial('Module Loading (Browser)', () => {
     });
 
     test('WASM demo page loads', async ({ page }) => {
-        await page.goto('/');
+        await page.goto('/examples/wasm/');
         await page.waitForLoadState('networkidle');
 
         const result = await page.evaluate(() => {
@@ -617,7 +617,7 @@ test.describe.serial('Module Loading (Browser)', () => {
     });
 
     test('lanceql.js loads and exports vault function', async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
         await page.waitForLoadState('networkidle');
 
         const result = await page.evaluate(async () => {

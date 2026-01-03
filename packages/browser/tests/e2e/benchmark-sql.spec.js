@@ -17,7 +17,7 @@ test.describe('LanceQL SQL Performance Benchmarks', () => {
     const BENCHMARK_RUNS = 5;
 
     test.beforeEach(async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
         await page.waitForLoadState('domcontentloaded');
     });
 

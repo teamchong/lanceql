@@ -4,7 +4,7 @@ import { test, expect } from '@playwright/test';
 test.describe('Vault SQL Operations', () => {
     test.beforeEach(async ({ page }) => {
         // Navigate to test page
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
 
         // Wait for page to load
         await page.waitForLoadState('domcontentloaded');

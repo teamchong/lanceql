@@ -16,7 +16,12 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      use: {
+        ...devices['Desktop Chrome'],
+        launchOptions: {
+          args: ['--disable-web-security', '--disable-features=IsolateOrigins,site-per-process'],
+        },
+      },
     },
     // Firefox temporarily disabled - browser binary missing
     // {
@@ -25,7 +30,7 @@ export default defineConfig({
     // },
   ],
   webServer: {
-    command: 'python3 -m http.server 3000 -d ../../examples/wasm',
+    command: 'python3 -m http.server 3000 -d ../../',
     url: 'http://localhost:3000',
     reuseExistingServer: !process.env.CI,
     timeout: 30000,

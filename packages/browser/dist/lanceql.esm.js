@@ -13784,6 +13784,10 @@ if (typeof document !== "undefined") {
 init_accelerator();
 var LocalDatabase3;
 var opfsStorage5;
+var gpuAggregator;
+var gpuJoiner;
+var gpuGrouper;
+var gpuVectorSearch;
 var Statement = class {
   constructor(db, sql) {
     this.db = db;
@@ -14030,6 +14034,36 @@ Statement: ${stmt}`);
     return String(val);
   }
 };
+async function initSqlJs(config = {}) {
+  try {
+    if (!opfsStorage5) {
+      const opfsModule = await Promise.resolve().then(() => (init_opfs(), opfs_exports));
+      opfsStorage5 = opfsModule.opfsStorage;
+    }
+    await opfsStorage5.open();
+  } catch (e) {
+    console.warn("[LanceQL] OPFS not available:", e.message);
+  }
+  try {
+    const accelerator = getWebGPUAccelerator();
+    await accelerator.init();
+    if (!gpuAggregator) gpuAggregator = new GPUAggregator();
+    if (!gpuJoiner) gpuJoiner = new GPUJoiner();
+    if (!gpuGrouper) gpuGrouper = new GPUGrouper();
+    if (!gpuVectorSearch) gpuVectorSearch = new GPUVectorSearch();
+    await gpuAggregator.init();
+    await gpuJoiner.init();
+    await getGPUSorter().init();
+    await gpuGrouper.init();
+    await gpuVectorSearch.init();
+  } catch (e) {
+    console.warn("[LanceQL] WebGPU not available:", e.message);
+  }
+  return {
+    Database,
+    Statement
+  };
+}
 
 // src/client/index.js
 init_ivf_index();
@@ -16115,6 +16149,7 @@ export {
   getGPUVectorSearch,
   getHotTierCache,
   getWebGPUAccelerator,
+  initSqlJs,
   lanceStore,
   vault,
   wasmUtils

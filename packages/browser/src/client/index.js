@@ -35,6 +35,7 @@ export { LanceFile } from './lance/lance-file.js';
 export { RemoteLanceFile } from './lance/remote-file.js';
 export { RemoteLanceDataset } from './lance/remote-dataset.js';
 export { LanceDataBase, OPFSLanceData, RemoteLanceData, DataFrame, LanceData, Statement, Database } from './lance/lance-data.js';
+export { initSqlJs } from './lance/lance-data-sqljs.js';
 
 // Vector Search
 export { IVFIndex } from './search/ivf-index.js';
