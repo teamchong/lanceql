@@ -138,8 +138,8 @@ pub const Planner = struct {
             }) catch return PlannerError.OutOfMemory;
         }
 
-        // GROUP BY queries require interpreted execution (aggregation not yet compiled)
-        const has_group_by = stmt.group_by != null;
+        // GROUP BY queries are now compilable (codegen for aggregates implemented)
+        _ = stmt.group_by; // Used in plan building
 
         // Convert to owned slices and free the ArrayList buffers
         const sources_slice = sources.toOwnedSlice(self.allocator) catch return PlannerError.OutOfMemory;
@@ -153,7 +153,7 @@ pub const Planner = struct {
             .root = root,
             .sources = sources_slice,
             .logic_table_methods = methods_slice,
-            .compilable = !has_group_by,
+            .compilable = true, // All query types now support compilation
         };
     }
 

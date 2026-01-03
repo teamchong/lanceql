@@ -35,6 +35,7 @@
 const std = @import("std");
 const ast = @import("ast");
 const plan_nodes = @import("../planner/plan_nodes.zig");
+const simd_ops = @import("simd_ops.zig");
 
 const PlanNode = plan_nodes.PlanNode;
 const QueryPlan = plan_nodes.QueryPlan;
@@ -44,6 +45,9 @@ const ComputeExpr = plan_nodes.ComputeExpr;
 const WindowFuncType = plan_nodes.WindowFuncType;
 const WindowFuncSpec = plan_nodes.WindowFuncSpec;
 const OrderBySpec = plan_nodes.OrderBySpec;
+const AggregateType = plan_nodes.AggregateType;
+const AggregateSpec = plan_nodes.AggregateSpec;
+const SimdOp = simd_ops.SimdOp;
 
 /// Code generation errors
 pub const CodeGenError = error{
@@ -110,6 +114,28 @@ pub const WindowFuncInfo = struct {
     default_val: i64 = 0,
 };
 
+/// Join type for Hash JOIN
+pub const JoinType = enum {
+    inner,
+    left,
+    right,
+    full,
+};
+
+/// Join info for code generation
+pub const JoinInfo = struct {
+    /// Join type (INNER, LEFT, etc.)
+    join_type: JoinType,
+    /// Left table join key column
+    left_key: ColumnRef,
+    /// Right table join key column
+    right_key: ColumnRef,
+    /// Left side columns to output
+    left_output_cols: []const ColumnRef,
+    /// Right side columns to output
+    right_output_cols: []const ColumnRef,
+};
+
 /// Fused code generator
 pub const FusedCodeGen = struct {
     allocator: std.mem.Allocator,
@@ -141,6 +167,27 @@ pub const FusedCodeGen = struct {
     /// Sort specifications (ORDER BY columns)
     sort_specs: std.ArrayList(OrderBySpec),
 
+    /// GROUP BY key columns
+    group_keys: std.ArrayList(ColumnRef),
+
+    /// Aggregate specifications
+    aggregate_specs: std.ArrayList(AggregateSpec),
+
+    /// Flag indicating this is a GROUP BY query
+    has_group_by: bool,
+
+    /// SIMD vector functions to generate (name -> op type)
+    simd_functions: std.StringHashMap(SimdOp),
+
+    /// Hash JOIN specification (if present)
+    join_info: ?JoinInfo,
+
+    /// Right-side columns for JOIN (separate from main input columns)
+    right_columns: std.StringHashMap(ColumnType),
+
+    /// Right-side column order (for layout)
+    right_column_order: std.ArrayList(ColumnInfo),
+
     /// Counter for unique variable names
     var_counter: u32,
 
@@ -161,6 +208,13 @@ pub const FusedCodeGen = struct {
             .window_specs = .{},
             .window_columns = std.StringHashMap(void).init(allocator),
             .sort_specs = .{},
+            .group_keys = .{},
+            .aggregate_specs = .{},
+            .has_group_by = false,
+            .simd_functions = std.StringHashMap(SimdOp).init(allocator),
+            .join_info = null,
+            .right_columns = std.StringHashMap(ColumnType).init(allocator),
+            .right_column_order = .{},
             .var_counter = 0,
             .analyzed_plan = null,
         };
@@ -175,6 +229,11 @@ pub const FusedCodeGen = struct {
         self.window_specs.deinit(self.allocator);
         self.window_columns.deinit();
         self.sort_specs.deinit(self.allocator);
+        self.group_keys.deinit(self.allocator);
+        self.simd_functions.deinit();
+        self.right_columns.deinit();
+        self.right_column_order.deinit(self.allocator);
+        self.aggregate_specs.deinit(self.allocator);
     }
 
     /// Analyze plan to collect column info (call before updateColumnTypes)
@@ -287,7 +346,60 @@ pub const FusedCodeGen = struct {
         // Add len field offset
         const columns_size = offset + ptr_size;
 
-        // Calculate output column offsets (input columns + computed columns + window columns)
+        // Calculate output column offsets
+        if (self.has_group_by) {
+            // GROUP BY output: group keys + aggregates
+            const output_count = self.group_keys.items.len + self.aggregate_specs.items.len;
+            var output_cols = self.allocator.alloc(ColumnInfo, output_count) catch
+                return CodeGenError.OutOfMemory;
+
+            offset = 0;
+            var out_idx: usize = 0;
+
+            // Group keys - use resolved types
+            for (self.group_keys.items) |key| {
+                const resolved_type = self.input_columns.get(key.column) orelse key.col_type;
+                output_cols[out_idx] = .{
+                    .name = key.column,
+                    .col_type = resolved_type,
+                    .offset = offset,
+                };
+                offset += ptr_size;
+                out_idx += 1;
+            }
+
+            // Aggregates - use resolved types
+            for (self.aggregate_specs.items) |agg| {
+                const col_type: ColumnType = switch (agg.agg_type) {
+                    .count, .count_distinct => .i64,
+                    .sum => if (agg.input_col) |col| blk: {
+                        break :blk self.input_columns.get(col.column) orelse col.col_type;
+                    } else .i64,
+                    .avg => .f64,
+                    .min, .max => if (agg.input_col) |col| blk: {
+                        break :blk self.input_columns.get(col.column) orelse col.col_type;
+                    } else .i64,
+                    else => .i64,
+                };
+                output_cols[out_idx] = .{
+                    .name = agg.name,
+                    .col_type = col_type,
+                    .offset = offset,
+                };
+                offset += ptr_size;
+                out_idx += 1;
+            }
+
+            return ColumnLayout{
+                .input_columns = input_cols,
+                .output_columns = output_cols,
+                .columns_size = columns_size,
+                .output_size = offset,
+                .allocator = self.allocator,
+            };
+        }
+
+        // Regular output: input columns + computed columns + window columns
         const output_count = self.input_column_order.items.len + self.computed_column_order.items.len + self.window_specs.items.len;
         var output_cols = self.allocator.alloc(ColumnInfo, output_count) catch
             return CodeGenError.OutOfMemory;
@@ -372,6 +484,22 @@ pub const FusedCodeGen = struct {
             },
             .group_by => |group_by| {
                 try self.analyzePlan(group_by.input);
+                self.has_group_by = true;
+
+                // Collect group keys
+                for (group_by.group_keys) |key| {
+                    self.group_keys.append(self.allocator, key) catch return CodeGenError.OutOfMemory;
+                    try self.addInputColumn(key.column, key.col_type);
+                }
+
+                // Collect aggregate specifications
+                for (group_by.aggregates) |agg| {
+                    self.aggregate_specs.append(self.allocator, agg) catch return CodeGenError.OutOfMemory;
+                    // Add input column for aggregate if not COUNT(*)
+                    if (agg.input_col) |col| {
+                        try self.addInputColumn(col.column, col.col_type);
+                    }
+                }
             },
             .sort => |sort| {
                 try self.analyzePlan(sort.input);
@@ -425,14 +553,33 @@ pub const FusedCodeGen = struct {
                 }
             },
             .hash_join => |join| {
+                // Analyze left side (populates input_columns as "left" columns)
                 try self.analyzePlan(join.left);
-                try self.analyzePlan(join.right);
+
+                // Analyze right side - collect columns separately
+                try self.analyzeJoinRight(join.right);
+
+                // Add join keys to appropriate column sets
+                try self.addInputColumn(join.left_key.column, join.left_key.col_type);
+                try self.addRightColumn(join.right_key.column, join.right_key.col_type);
+
+                // Store join info
+                self.join_info = .{
+                    .join_type = @enumFromInt(@intFromEnum(join.join_type)),
+                    .left_key = join.left_key,
+                    .right_key = join.right_key,
+                    .left_output_cols = &.{}, // Will be populated from SELECT list
+                    .right_output_cols = &.{},
+                };
             },
         }
     }
 
     /// Add a column to input columns (if not already present)
     fn addInputColumn(self: *Self, name: []const u8, col_type: ColumnType) CodeGenError!void {
+        // Skip invalid column names (like "*" from SELECT *)
+        if (name.len == 0 or std.mem.eql(u8, name, "*")) return;
+
         if (!self.input_columns.contains(name)) {
             self.input_columns.put(name, col_type) catch return CodeGenError.OutOfMemory;
             self.input_column_order.append(self.allocator, .{
@@ -443,10 +590,46 @@ pub const FusedCodeGen = struct {
         }
     }
 
+    /// Add a column to right-side columns (for JOIN)
+    fn addRightColumn(self: *Self, name: []const u8, col_type: ColumnType) CodeGenError!void {
+        // Skip invalid column names
+        if (name.len == 0 or std.mem.eql(u8, name, "*")) return;
+
+        if (!self.right_columns.contains(name)) {
+            self.right_columns.put(name, col_type) catch return CodeGenError.OutOfMemory;
+            self.right_column_order.append(self.allocator, .{
+                .name = name,
+                .col_type = col_type,
+                .offset = 0,
+            }) catch return CodeGenError.OutOfMemory;
+        }
+    }
+
+    /// Analyze right side of JOIN (collects columns into right_columns)
+    fn analyzeJoinRight(self: *Self, node: *const PlanNode) CodeGenError!void {
+        switch (node.*) {
+            .scan => |scan| {
+                for (scan.columns) |col| {
+                    try self.addRightColumn(col.column, col.col_type);
+                }
+            },
+            .filter => |filter| {
+                try self.analyzeJoinRight(filter.input);
+            },
+            .project => |project| {
+                try self.analyzeJoinRight(project.input);
+            },
+            else => {},
+        }
+    }
+
     /// Analyze expression to collect column references
     fn analyzeExpr(self: *Self, expr: *const ast.Expr) CodeGenError!void {
         switch (expr.*) {
             .column => |col| {
+                // Skip invalid column names (like "*" from SELECT *)
+                if (col.name.len == 0 or std.mem.eql(u8, col.name, "*")) return;
+
                 // Add to input columns if not already present
                 if (!self.input_columns.contains(col.name)) {
                     self.input_columns.put(col.name, .unknown) catch return CodeGenError.OutOfMemory;
@@ -469,6 +652,10 @@ pub const FusedCodeGen = struct {
                 for (call.args) |*arg| {
                     try self.analyzeExpr(arg);
                 }
+                // Track SIMD vector operations
+                if (simd_ops.detectSimdOp(call.name)) |op| {
+                    self.simd_functions.put(call.name, op) catch return CodeGenError.OutOfMemory;
+                }
             },
             .method_call => |mc| {
                 for (mc.args) |*arg| {
@@ -489,10 +676,28 @@ pub const FusedCodeGen = struct {
             \\
             \\
         );
+
+        // Generate SIMD helper functions if any were detected
+        try self.genSimdFunctions();
+    }
+
+    /// Generate SIMD helper functions for vector operations
+    fn genSimdFunctions(self: *Self) CodeGenError!void {
+        var iter = self.simd_functions.iterator();
+        while (iter.next()) |entry| {
+            simd_ops.genSimdFunction(&self.code, self.allocator, entry.value_ptr.*, entry.key_ptr.*) catch
+                return CodeGenError.OutOfMemory;
+        }
     }
 
     /// Generate Columns struct definition
     fn genColumnsStruct(self: *Self) CodeGenError!void {
+        if (self.join_info != null) {
+            // For JOINs, generate LeftColumns and RightColumns
+            try self.genJoinColumnsStructs();
+            return;
+        }
+
         try self.write("pub const Columns = struct {\n");
         self.indent += 1;
 
@@ -513,34 +718,132 @@ pub const FusedCodeGen = struct {
         try self.write("};\n\n");
     }
 
+    /// Generate LeftColumns and RightColumns for JOIN queries
+    fn genJoinColumnsStructs(self: *Self) CodeGenError!void {
+        // LeftColumns (from input_columns)
+        try self.write("pub const LeftColumns = struct {\n");
+        self.indent += 1;
+
+        var left_iter = self.input_columns.iterator();
+        while (left_iter.next()) |entry| {
+            try self.writeIndent();
+            try self.write(entry.key_ptr.*);
+            try self.write(": [*]const ");
+            try self.write(entry.value_ptr.toZigType());
+            try self.write(",\n");
+        }
+        try self.writeIndent();
+        try self.write("len: usize,\n");
+
+        self.indent -= 1;
+        try self.write("};\n\n");
+
+        // RightColumns (from right_columns)
+        try self.write("pub const RightColumns = struct {\n");
+        self.indent += 1;
+
+        var right_iter = self.right_columns.iterator();
+        while (right_iter.next()) |entry| {
+            try self.writeIndent();
+            try self.write(entry.key_ptr.*);
+            try self.write(": [*]const ");
+            try self.write(entry.value_ptr.toZigType());
+            try self.write(",\n");
+        }
+        try self.writeIndent();
+        try self.write("len: usize,\n");
+
+        self.indent -= 1;
+        try self.write("};\n\n");
+    }
+
     /// Generate OutputBuffers struct definition
     fn genOutputStruct(self: *Self) CodeGenError!void {
         try self.write("pub const OutputBuffers = struct {\n");
         self.indent += 1;
 
-        // Output columns from input columns
-        var iter = self.input_columns.iterator();
-        while (iter.next()) |entry| {
-            try self.writeIndent();
-            try self.write(entry.key_ptr.*);
-            try self.write(": [*]");
-            try self.write(entry.value_ptr.toZigType());
-            try self.write(",\n");
+        if (self.join_info != null) {
+            // JOIN output: columns from both left and right sides
+            // Left columns with "left_" prefix
+            var left_iter = self.input_columns.iterator();
+            while (left_iter.next()) |entry| {
+                try self.writeIndent();
+                try self.write(entry.key_ptr.*);
+                try self.write(": [*]");
+                try self.write(entry.value_ptr.toZigType());
+                try self.write(",\n");
+            }
+
+            // Right columns with "right_" prefix (to avoid name collisions)
+            var right_iter = self.right_columns.iterator();
+            while (right_iter.next()) |entry| {
+                try self.writeIndent();
+                try self.fmt("right_{s}: [*]{s},\n", .{ entry.key_ptr.*, entry.value_ptr.toZigType() });
+            }
+
+            self.indent -= 1;
+            try self.write("};\n\n");
+            return;
         }
 
-        // Add computed columns
-        var comp_iter = self.computed_columns.keyIterator();
-        while (comp_iter.next()) |key| {
-            try self.writeIndent();
-            try self.write(key.*);
-            try self.write(": [*]f64,\n");
-        }
+        if (self.has_group_by) {
+            // GROUP BY output: group keys + aggregates
+            for (self.group_keys.items) |key| {
+                // Use resolved type from input_columns if available
+                const resolved_type = self.input_columns.get(key.column) orelse key.col_type;
+                try self.writeIndent();
+                try self.write(key.column);
+                try self.write(": [*]");
+                try self.write(resolved_type.toZigType());
+                try self.write(",\n");
+            }
 
-        // Add window columns (all ranking functions output i64)
-        for (self.window_specs.items) |spec| {
-            try self.writeIndent();
-            try self.write(spec.name);
-            try self.write(": [*]i64,\n");
+            // Aggregate output columns
+            for (self.aggregate_specs.items) |agg| {
+                const zig_type: []const u8 = switch (agg.agg_type) {
+                    .count, .count_distinct => "i64",
+                    .sum => if (agg.input_col) |col| blk: {
+                        const resolved = self.input_columns.get(col.column) orelse col.col_type;
+                        break :blk resolved.toZigType();
+                    } else "i64",
+                    .avg => "f64",
+                    .min, .max => if (agg.input_col) |col| blk: {
+                        const resolved = self.input_columns.get(col.column) orelse col.col_type;
+                        break :blk resolved.toZigType();
+                    } else "i64",
+                    else => "i64",
+                };
+                try self.writeIndent();
+                try self.write(agg.name);
+                try self.write(": [*]");
+                try self.write(zig_type);
+                try self.write(",\n");
+            }
+        } else {
+            // Regular output: input columns + computed + window
+            var iter = self.input_columns.iterator();
+            while (iter.next()) |entry| {
+                try self.writeIndent();
+                try self.write(entry.key_ptr.*);
+                try self.write(": [*]");
+                try self.write(entry.value_ptr.toZigType());
+                try self.write(",\n");
+            }
+
+            // Add computed columns
+            var comp_iter = self.computed_columns.keyIterator();
+            while (comp_iter.next()) |key| {
+                try self.writeIndent();
+                try self.write(key.*);
+                try self.write(": [*]f64,\n");
+            }
+
+            // Add window columns (all ranking functions output i64)
+            for (self.window_specs.items) |spec| {
+                try self.writeIndent();
+                try self.write(spec.name);
+                try self.write(": [*]i64,\n");
+            }
         }
 
         self.indent -= 1;
@@ -557,7 +860,10 @@ pub const FusedCodeGen = struct {
                 .dense_rank => try self.genWindowRank(spec, true),
                 .lag => try self.genWindowLagLead(spec, true),
                 .lead => try self.genWindowLagLead(spec, false),
-                else => {}, // Other window functions not yet supported
+                .first_value => try self.genWindowFirstLastValue(spec, true),
+                .last_value => try self.genWindowFirstLastValue(spec, false),
+                .ntile => try self.genWindowNtile(spec),
+                else => {}, // nth_value, percent_rank, cume_dist not yet supported
             }
         }
     }
@@ -749,6 +1055,188 @@ pub const FusedCodeGen = struct {
         try self.write("}\n\n");
     }
 
+    /// Generate FIRST_VALUE or LAST_VALUE window function
+    fn genWindowFirstLastValue(self: *Self, spec: WindowFuncInfo, is_first: bool) CodeGenError!void {
+        try self.fmt("fn computeWindow_{s}(columns: *const Columns, results: []i64) void {{\n", .{spec.name});
+        self.indent += 1;
+
+        // Create index array
+        try self.writeIndent();
+        try self.write("var indices: [4096]u32 = undefined;\n");
+        try self.writeIndent();
+        try self.write("var idx: u32 = 0;\n");
+        try self.writeIndent();
+        try self.write("while (idx < columns.len) : (idx += 1) indices[idx] = idx;\n\n");
+
+        // Generate sort
+        if (spec.partition_cols.len > 0 or spec.order_cols.len > 0) {
+            try self.genWindowSort(spec);
+        }
+
+        // Compute first/last value per partition
+        try self.writeIndent();
+        if (spec.partition_cols.len > 0) {
+            try self.fmt("var current_partition: i64 = columns.{s}[indices[0]];\n", .{spec.partition_cols[0]});
+            try self.writeIndent();
+            if (is_first) {
+                // For FIRST_VALUE, capture first value in partition
+                if (spec.order_cols.len > 0) {
+                    try self.fmt("var partition_value: i64 = columns.{s}[indices[0]];\n", .{spec.order_cols[0]});
+                } else {
+                    try self.write("var partition_value: i64 = 0;\n");
+                }
+            } else {
+                // For LAST_VALUE, will update as we go
+                try self.write("var partition_value: i64 = 0;\n");
+            }
+            try self.writeIndent();
+            try self.write("var partition_start: usize = 0;\n\n");
+
+            try self.writeIndent();
+            try self.write("for (indices[0..columns.len], 0..) |i, pos| {\n");
+            self.indent += 1;
+            try self.writeIndent();
+            try self.fmt("if (columns.{s}[i] != current_partition) {{\n", .{spec.partition_cols[0]});
+            self.indent += 1;
+
+            // End of partition - fill results for previous partition
+            try self.writeIndent();
+            try self.write("for (indices[partition_start..pos]) |pi| results[pi] = partition_value;\n");
+
+            // Start new partition
+            try self.writeIndent();
+            try self.fmt("current_partition = columns.{s}[i];\n", .{spec.partition_cols[0]});
+            try self.writeIndent();
+            try self.write("partition_start = pos;\n");
+            if (is_first and spec.order_cols.len > 0) {
+                try self.writeIndent();
+                try self.fmt("partition_value = columns.{s}[i];\n", .{spec.order_cols[0]});
+            }
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+
+            if (!is_first and spec.order_cols.len > 0) {
+                // For LAST_VALUE, keep updating
+                try self.writeIndent();
+                try self.fmt("partition_value = columns.{s}[i];\n", .{spec.order_cols[0]});
+            }
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+
+            // Handle last partition
+            try self.writeIndent();
+            try self.write("for (indices[partition_start..columns.len]) |pi| results[pi] = partition_value;\n");
+        } else {
+            // No partitions - single value for all rows
+            if (spec.order_cols.len > 0) {
+                if (is_first) {
+                    try self.fmt("const value: i64 = columns.{s}[indices[0]];\n", .{spec.order_cols[0]});
+                } else {
+                    try self.fmt("const value: i64 = columns.{s}[indices[columns.len - 1]];\n", .{spec.order_cols[0]});
+                }
+            } else {
+                try self.write("const value: i64 = 0;\n");
+            }
+            try self.writeIndent();
+            try self.write("for (indices[0..columns.len]) |i| results[i] = value;\n");
+        }
+
+        self.indent -= 1;
+        try self.write("}\n\n");
+    }
+
+    /// Generate NTILE window function (divide rows into N buckets)
+    fn genWindowNtile(self: *Self, spec: WindowFuncInfo) CodeGenError!void {
+        const num_buckets: i64 = spec.offset; // Reuse offset field for bucket count
+
+        try self.fmt("fn computeWindow_{s}(columns: *const Columns, results: []i64) void {{\n", .{spec.name});
+        self.indent += 1;
+
+        // Create index array
+        try self.writeIndent();
+        try self.write("var indices: [4096]u32 = undefined;\n");
+        try self.writeIndent();
+        try self.write("var idx: u32 = 0;\n");
+        try self.writeIndent();
+        try self.write("while (idx < columns.len) : (idx += 1) indices[idx] = idx;\n\n");
+
+        // Generate sort
+        if (spec.partition_cols.len > 0 or spec.order_cols.len > 0) {
+            try self.genWindowSort(spec);
+        }
+
+        // Compute NTILE per partition
+        try self.writeIndent();
+        if (spec.partition_cols.len > 0) {
+            try self.fmt("var current_partition: i64 = columns.{s}[indices[0]];\n", .{spec.partition_cols[0]});
+            try self.writeIndent();
+            try self.write("var partition_start: usize = 0;\n\n");
+
+            try self.writeIndent();
+            try self.write("for (indices[0..columns.len], 0..) |i, pos| {\n");
+            self.indent += 1;
+            try self.writeIndent();
+            try self.fmt("if (columns.{s}[i] != current_partition) {{\n", .{spec.partition_cols[0]});
+            self.indent += 1;
+
+            // End of partition - compute NTILE for previous partition
+            try self.writeIndent();
+            try self.write("const part_size = pos - partition_start;\n");
+            try self.writeIndent();
+            try self.fmt("const bucket_size = (part_size + {d} - 1) / {d};\n", .{ num_buckets, num_buckets });
+            try self.writeIndent();
+            try self.write("for (indices[partition_start..pos], 0..) |pi, offset| {\n");
+            self.indent += 1;
+            try self.writeIndent();
+            try self.write("results[pi] = @intCast(offset / bucket_size + 1);\n");
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+
+            // Start new partition
+            try self.writeIndent();
+            try self.fmt("current_partition = columns.{s}[i];\n", .{spec.partition_cols[0]});
+            try self.writeIndent();
+            try self.write("partition_start = pos;\n");
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+
+            // Handle last partition
+            try self.writeIndent();
+            try self.write("const part_size = columns.len - partition_start;\n");
+            try self.writeIndent();
+            try self.fmt("const bucket_size = (part_size + {d} - 1) / {d};\n", .{ num_buckets, num_buckets });
+            try self.writeIndent();
+            try self.write("for (indices[partition_start..columns.len], 0..) |pi, offset| {\n");
+            self.indent += 1;
+            try self.writeIndent();
+            try self.write("results[pi] = @intCast(offset / bucket_size + 1);\n");
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+        } else {
+            // No partitions - compute NTILE for all rows
+            try self.fmt("const bucket_size = (columns.len + {d} - 1) / {d};\n", .{ num_buckets, num_buckets });
+            try self.writeIndent();
+            try self.write("for (indices[0..columns.len], 0..) |i, offset| {\n");
+            self.indent += 1;
+            try self.writeIndent();
+            try self.write("results[i] = @intCast(offset / bucket_size + 1);\n");
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+        }
+
+        self.indent -= 1;
+        try self.write("}\n\n");
+    }
+
     /// Generate sort context for window function
     fn genWindowSort(self: *Self, spec: WindowFuncInfo) CodeGenError!void {
         // Generate sort context struct
@@ -795,6 +1283,16 @@ pub const FusedCodeGen = struct {
 
     /// Generate the main fused query function
     fn genFusedFunction(self: *Self, root: *const PlanNode) CodeGenError!void {
+        // Use different code generation for GROUP BY queries
+        if (self.has_group_by) {
+            return self.genGroupByFunction(root);
+        }
+
+        // Use different code generation for JOIN queries
+        if (self.join_info != null) {
+            return self.genHashJoinFunction(root);
+        }
+
         // Function signature
         try self.write(
             \\pub export fn fused_query(
@@ -902,6 +1400,345 @@ pub const FusedCodeGen = struct {
         // Call sort
         try self.writeIndent();
         try self.write("std.mem.sort(u32, sorted_indices[0..columns.len], OrderSortCtx{ .cols = columns }, OrderSortCtx.lessThan);\n");
+    }
+
+    /// Generate GROUP BY function with hash grouping
+    fn genGroupByFunction(self: *Self, root: *const PlanNode) CodeGenError!void {
+        _ = root; // We use collected group_keys and aggregate_specs
+
+        // Function signature
+        try self.write(
+            \\pub export fn fused_query(
+            \\    columns: *const Columns,
+            \\    output: *OutputBuffers,
+            \\) callconv(.c) usize {
+            \\
+        );
+        self.indent += 1;
+
+        // Phase 1: Group key storage and aggregate accumulators
+        try self.writeIndent();
+        try self.write("// Phase 1: Group keys and aggregate accumulators\n");
+        try self.writeIndent();
+        try self.write("const max_groups: usize = 4096;\n");
+        try self.writeIndent();
+        try self.write("var num_groups: usize = 0;\n\n");
+
+        // Group key arrays (one per group key column)
+        for (self.group_keys.items, 0..) |key, idx| {
+            // Use resolved type from input_columns if available
+            const resolved_type = self.input_columns.get(key.column) orelse key.col_type;
+            try self.writeIndent();
+            try self.fmt("var group_key_{d}: [max_groups]{s} = undefined; // {s}\n", .{
+                idx,
+                resolved_type.toZigType(),
+                key.column,
+            });
+        }
+        try self.write("\n");
+
+        // Aggregate accumulator arrays
+        for (self.aggregate_specs.items) |agg| {
+            const zig_type: []const u8 = switch (agg.agg_type) {
+                .count, .count_distinct => "i64",
+                .sum => if (agg.input_col) |col| blk: {
+                    // Use resolved type from input_columns if available
+                    const resolved = self.input_columns.get(col.column) orelse col.col_type;
+                    break :blk resolved.toZigType();
+                } else "i64",
+                .avg => "f64",
+                .min, .max => if (agg.input_col) |col| blk: {
+                    const resolved = self.input_columns.get(col.column) orelse col.col_type;
+                    break :blk resolved.toZigType();
+                } else "i64",
+                else => "i64", // Default for unsupported
+            };
+            try self.writeIndent();
+            try self.fmt("var agg_{s}: [max_groups]{s} = ", .{ agg.name, zig_type });
+            // Initialize with appropriate default
+            switch (agg.agg_type) {
+                .count, .count_distinct, .sum => try self.write("[_]"),
+                .avg => try self.write("[_]"),
+                .min => try self.write("[_]"),
+                .max => try self.write("[_]"),
+                else => try self.write("[_]"),
+            }
+            try self.fmt("{s}{{0}} ** max_groups;\n", .{zig_type});
+
+            // For AVG, we need a count accumulator too
+            if (agg.agg_type == .avg) {
+                try self.writeIndent();
+                try self.fmt("var agg_{s}_count: [max_groups]i64 = [_]i64{{0}} ** max_groups;\n", .{agg.name});
+            }
+        }
+        try self.write("\n");
+
+        // Phase 2: Grouping loop
+        try self.writeIndent();
+        try self.write("// Phase 2: Build groups and accumulate aggregates\n");
+        try self.writeIndent();
+        try self.write("var i: usize = 0;\n");
+        try self.writeIndent();
+        try self.write("while (i < columns.len) : (i += 1) {\n");
+        self.indent += 1;
+
+        // Extract current row's group key values
+        for (self.group_keys.items, 0..) |key, idx| {
+            try self.writeIndent();
+            try self.fmt("const curr_key_{d} = columns.{s}[i];\n", .{ idx, key.column });
+        }
+        try self.write("\n");
+
+        // Find or create group
+        try self.writeIndent();
+        try self.write("// Find existing group or create new one\n");
+        try self.writeIndent();
+        try self.write("var group_idx: usize = 0;\n");
+        try self.writeIndent();
+        try self.write("var found: bool = false;\n");
+        try self.writeIndent();
+        try self.write("while (group_idx < num_groups) : (group_idx += 1) {\n");
+        self.indent += 1;
+
+        // Compare all group keys
+        try self.writeIndent();
+        try self.write("if (");
+        for (self.group_keys.items, 0..) |_, idx| {
+            if (idx > 0) try self.write(" and ");
+            try self.fmt("group_key_{d}[group_idx] == curr_key_{d}", .{ idx, idx });
+        }
+        try self.write(") {\n");
+        self.indent += 1;
+        try self.writeIndent();
+        try self.write("found = true;\n");
+        try self.writeIndent();
+        try self.write("break;\n");
+        self.indent -= 1;
+        try self.writeIndent();
+        try self.write("}\n");
+        self.indent -= 1;
+        try self.writeIndent();
+        try self.write("}\n\n");
+
+        // Create new group if not found
+        try self.writeIndent();
+        try self.write("if (!found) {\n");
+        self.indent += 1;
+        try self.writeIndent();
+        try self.write("group_idx = num_groups;\n");
+        for (self.group_keys.items, 0..) |_, idx| {
+            try self.writeIndent();
+            try self.fmt("group_key_{d}[group_idx] = curr_key_{d};\n", .{ idx, idx });
+        }
+        try self.writeIndent();
+        try self.write("num_groups += 1;\n");
+        self.indent -= 1;
+        try self.writeIndent();
+        try self.write("}\n\n");
+
+        // Accumulate aggregates
+        try self.writeIndent();
+        try self.write("// Accumulate aggregates\n");
+        for (self.aggregate_specs.items) |agg| {
+            try self.writeIndent();
+            switch (agg.agg_type) {
+                .count => {
+                    if (agg.input_col) |_| {
+                        // COUNT(col) - only count non-null values (for now, count all)
+                        try self.fmt("agg_{s}[group_idx] += 1;\n", .{agg.name});
+                    } else {
+                        // COUNT(*)
+                        try self.fmt("agg_{s}[group_idx] += 1;\n", .{agg.name});
+                    }
+                },
+                .sum => {
+                    if (agg.input_col) |col| {
+                        try self.fmt("agg_{s}[group_idx] += columns.{s}[i];\n", .{ agg.name, col.column });
+                    }
+                },
+                .avg => {
+                    if (agg.input_col) |col| {
+                        try self.fmt("agg_{s}[group_idx] += @as(f64, @floatFromInt(columns.{s}[i]));\n", .{ agg.name, col.column });
+                        try self.writeIndent();
+                        try self.fmt("agg_{s}_count[group_idx] += 1;\n", .{agg.name});
+                    }
+                },
+                .min => {
+                    if (agg.input_col) |col| {
+                        try self.fmt("if (!found or columns.{s}[i] < agg_{s}[group_idx]) agg_{s}[group_idx] = columns.{s}[i];\n", .{ col.column, agg.name, agg.name, col.column });
+                    }
+                },
+                .max => {
+                    if (agg.input_col) |col| {
+                        try self.fmt("if (!found or columns.{s}[i] > agg_{s}[group_idx]) agg_{s}[group_idx] = columns.{s}[i];\n", .{ col.column, agg.name, agg.name, col.column });
+                    }
+                },
+                else => {
+                    // Unsupported aggregate - skip
+                    try self.write("// Unsupported aggregate\n");
+                },
+            }
+        }
+
+        self.indent -= 1;
+        try self.writeIndent();
+        try self.write("}\n\n");
+
+        // Phase 3: Output results
+        try self.writeIndent();
+        try self.write("// Phase 3: Output group results\n");
+        try self.writeIndent();
+        try self.write("var result_idx: usize = 0;\n");
+        try self.writeIndent();
+        try self.write("while (result_idx < num_groups) : (result_idx += 1) {\n");
+        self.indent += 1;
+
+        // Output group keys
+        for (self.group_keys.items, 0..) |key, idx| {
+            try self.writeIndent();
+            try self.fmt("output.{s}[result_idx] = group_key_{d}[result_idx];\n", .{ key.column, idx });
+        }
+
+        // Output aggregates
+        for (self.aggregate_specs.items) |agg| {
+            try self.writeIndent();
+            if (agg.agg_type == .avg) {
+                // AVG = sum / count
+                try self.fmt("output.{s}[result_idx] = agg_{s}[result_idx] / @as(f64, @floatFromInt(agg_{s}_count[result_idx]));\n", .{ agg.name, agg.name, agg.name });
+            } else {
+                try self.fmt("output.{s}[result_idx] = agg_{s}[result_idx];\n", .{ agg.name, agg.name });
+            }
+        }
+
+        self.indent -= 1;
+        try self.writeIndent();
+        try self.write("}\n\n");
+
+        // Return
+        try self.writeIndent();
+        try self.write("return num_groups;\n");
+
+        self.indent -= 1;
+        try self.write("}\n");
+    }
+
+    /// Generate Hash JOIN function with build/probe phases
+    fn genHashJoinFunction(self: *Self, root: *const PlanNode) CodeGenError!void {
+        _ = root; // We use collected join_info
+
+        const join = self.join_info orelse return CodeGenError.InvalidPlan;
+
+        // Function signature with two input structs
+        try self.write(
+            \\pub export fn fused_query(
+            \\    left_columns: *const LeftColumns,
+            \\    right_columns: *const RightColumns,
+            \\    output: *OutputBuffers,
+            \\) callconv(.c) usize {
+            \\
+        );
+        self.indent += 1;
+
+        // Phase 1: Build hash table from right input
+        try self.writeIndent();
+        try self.write("// Phase 1: Build hash table from right input\n");
+        try self.writeIndent();
+        try self.write("const max_rows: usize = 4096;\n");
+
+        // Get right key type
+        const right_key_type = self.right_columns.get(join.right_key.column) orelse join.right_key.col_type;
+        try self.writeIndent();
+        try self.fmt("var hash_keys: [max_rows]{s} = undefined;\n", .{right_key_type.toZigType()});
+        try self.writeIndent();
+        try self.write("var hash_indices: [max_rows]u32 = undefined;\n");
+        try self.writeIndent();
+        try self.write("var hash_count: usize = 0;\n\n");
+
+        try self.writeIndent();
+        try self.write("var ri: usize = 0;\n");
+        try self.writeIndent();
+        try self.write("while (ri < right_columns.len) : (ri += 1) {\n");
+        self.indent += 1;
+        try self.writeIndent();
+        try self.fmt("hash_keys[hash_count] = right_columns.{s}[ri];\n", .{join.right_key.column});
+        try self.writeIndent();
+        try self.write("hash_indices[hash_count] = @intCast(ri);\n");
+        try self.writeIndent();
+        try self.write("hash_count += 1;\n");
+        self.indent -= 1;
+        try self.writeIndent();
+        try self.write("}\n\n");
+
+        // Phase 2: Probe with left input
+        try self.writeIndent();
+        try self.write("// Phase 2: Probe with left input\n");
+        try self.writeIndent();
+        try self.write("var result_count: usize = 0;\n");
+        try self.writeIndent();
+        try self.write("var li: usize = 0;\n");
+        try self.writeIndent();
+        try self.write("while (li < left_columns.len) : (li += 1) {\n");
+        self.indent += 1;
+
+        try self.writeIndent();
+        try self.fmt("const left_key = left_columns.{s}[li];\n\n", .{join.left_key.column});
+
+        // Linear probe (simple for now - can optimize with hash later)
+        try self.writeIndent();
+        try self.write("// Linear probe for matching keys\n");
+        try self.writeIndent();
+        try self.write("var hi: usize = 0;\n");
+        try self.writeIndent();
+        try self.write("while (hi < hash_count) : (hi += 1) {\n");
+        self.indent += 1;
+
+        try self.writeIndent();
+        try self.write("if (hash_keys[hi] == left_key) {\n");
+        self.indent += 1;
+        try self.writeIndent();
+        try self.write("const ri_match = hash_indices[hi];\n\n");
+
+        // Emit left columns
+        try self.writeIndent();
+        try self.write("// Emit joined row\n");
+        var left_iter = self.input_columns.keyIterator();
+        while (left_iter.next()) |key| {
+            try self.writeIndent();
+            try self.fmt("output.{s}[result_count] = left_columns.{s}[li];\n", .{ key.*, key.* });
+        }
+
+        // Emit right columns (with right_ prefix)
+        var right_iter = self.right_columns.keyIterator();
+        while (right_iter.next()) |key| {
+            try self.writeIndent();
+            try self.fmt("output.right_{s}[result_count] = right_columns.{s}[ri_match];\n", .{ key.*, key.* });
+        }
+
+        try self.writeIndent();
+        try self.write("result_count += 1;\n");
+        self.indent -= 1;
+        try self.writeIndent();
+        try self.write("}\n");
+        self.indent -= 1;
+        try self.writeIndent();
+        try self.write("}\n");
+
+        // For LEFT JOIN, emit left rows with no match
+        if (join.join_type == .left or join.join_type == .full) {
+            try self.writeIndent();
+            try self.write("// LEFT JOIN: emit unmatched left rows (not implemented yet)\n");
+        }
+
+        self.indent -= 1;
+        try self.writeIndent();
+        try self.write("}\n\n");
+
+        // Return
+        try self.writeIndent();
+        try self.write("return result_count;\n");
+
+        self.indent -= 1;
+        try self.write("}\n");
     }
 
     /// Generate code for a plan node
@@ -1032,6 +1869,12 @@ pub const FusedCodeGen = struct {
                 }
             },
             .column => |col| {
+                // Skip invalid column names (like "*" from SELECT *)
+                if (col.name.len == 0 or std.mem.eql(u8, col.name, "*")) {
+                    try self.write("0"); // Placeholder for invalid column
+                    return;
+                }
+
                 // Check if this is a window column
                 if (self.window_columns.contains(col.name)) {
                     try self.fmt("window_{s}[i]", .{col.name});
@@ -1071,14 +1914,25 @@ pub const FusedCodeGen = struct {
                 }
             },
             .call => |call| {
-                // Generate function call
-                try self.write(call.name);
-                try self.write("(");
-                for (call.args, 0..) |*arg, idx| {
-                    if (idx > 0) try self.write(", ");
-                    try self.genExpr(arg);
+                // Check if this is a SIMD vector operation
+                if (self.simd_functions.contains(call.name)) {
+                    // Generate SIMD function call: simd_NAME(a, b, dim)
+                    try self.fmt("simd_{s}(", .{call.name});
+                    for (call.args, 0..) |*arg, idx| {
+                        if (idx > 0) try self.write(", ");
+                        try self.genExpr(arg);
+                    }
+                    try self.write(")");
+                } else {
+                    // Generate regular function call
+                    try self.write(call.name);
+                    try self.write("(");
+                    for (call.args, 0..) |*arg, idx| {
+                        if (idx > 0) try self.write(", ");
+                        try self.genExpr(arg);
+                    }
+                    try self.write(")");
                 }
-                try self.write(")");
             },
             .method_call => |mc| {
                 // Check if this is a computed column
