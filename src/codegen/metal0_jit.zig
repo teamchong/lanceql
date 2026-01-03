@@ -411,6 +411,38 @@ pub const JitContext = struct {
         self.compiled_functions.put(cache_key, compiled) catch {};
         return compiled;
     }
+
+    /// Compile arbitrary Zig source to callable function
+    /// Uses caching to avoid recompiling the same source.
+    /// This is the main entry point for fused query compilation.
+    pub fn compileZigSource(
+        self: *JitContext,
+        zig_source: []const u8,
+        func_name: []const u8,
+    ) !CompiledFunction {
+        // Compute cache key from source hash
+        const cache_key = computeCacheKey(zig_source, func_name);
+        if (self.compiled_functions.get(cache_key)) |cached| return cached;
+
+        // Create sentinel-terminated function name for DynLib lookup
+        const func_name_z = try self.allocator.dupeZ(u8, func_name);
+        defer self.allocator.free(func_name_z);
+
+        // JIT compile the source
+        const jit_result = try jitCompileSource(self.allocator, zig_source, func_name_z);
+
+        const compiled = CompiledFunction{
+            .ptr = jit_result.ptr,
+            .source = try self.allocator.dupe(u8, zig_source),
+            .name = func_name,
+            .lib = jit_result.lib,
+            .lib_path = jit_result.lib_path,
+            .allocator = self.allocator,
+        };
+
+        try self.compiled_functions.put(cache_key, compiled);
+        return compiled;
+    }
 };
 
 /// Generate fused predicate + @logic_table Zig code

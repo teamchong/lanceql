@@ -276,6 +276,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lanceql.logic_table", .module = logic_table_mod },
             .{ .name = "lanceql.hash", .module = hash_mod },
             .{ .name = "lanceql.format", .module = format_mod },
+            .{ .name = "lanceql.codegen", .module = codegen_mod },
         },
     });
 

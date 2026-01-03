@@ -31,6 +31,7 @@ pub const group_eval = @import("group_eval.zig");
 // Fused query compilation (optional)
 pub const planner = @import("planner/planner.zig");
 pub const fused_codegen = @import("codegen/fused_codegen.zig");
+const metal0_jit = @import("lanceql.codegen");
 
 const Expr = ast.Expr;
 const SelectStmt = ast.SelectStmt;
@@ -245,11 +246,41 @@ pub const Executor = struct {
     /// Execute a query using fused compilation
     /// This generates and JIT-compiles a single function for the entire query
     fn executeCompiled(self: *Self, stmt: *const SelectStmt) !Result {
-        _ = self;
-        _ = stmt;
-        // Fused compilation execution path
-        // This will be fully implemented in the @logic_table inlining phase
-        // For now, return error to fall back to interpreted execution
+        // 1. Plan the query
+        var planner_inst = planner.Planner.init(self.allocator);
+        defer planner_inst.deinit();
+        const plan = try planner_inst.plan(stmt);
+
+        // Check if plan is compilable (has inlined bodies, no unsupported ops)
+        if (!plan.compilable) return error.NotImplemented;
+
+        // 2. Generate fused Zig code
+        var codegen = fused_codegen.FusedCodeGen.init(self.allocator);
+        defer codegen.deinit();
+        const zig_source = try codegen.generate(plan);
+        defer self.allocator.free(zig_source);
+
+        // 3. JIT compile to native code
+        var jit_ctx = metal0_jit.JitContext.init(self.allocator);
+        defer jit_ctx.deinit();
+
+        const compiled = try jit_ctx.compileZigSource(zig_source, "fused_query");
+        defer {
+            var c = compiled;
+            c.deinit();
+        }
+
+        // 4. Prepare column data (load into contiguous arrays)
+        const row_count = try self.getRowCount();
+
+        // For now, fall back to interpreted execution
+        // Full column data preparation requires:
+        // - Building Columns struct matching generated code
+        // - Allocating output buffers
+        // - Calling compiled function via function pointer
+        // This is deferred to integration phase
+        _ = row_count;
+
         return error.NotImplemented;
     }
 
