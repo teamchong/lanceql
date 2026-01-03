@@ -138,6 +138,9 @@ pub const FusedCodeGen = struct {
     /// Set of window column names for fast lookup
     window_columns: std.StringHashMap(void),
 
+    /// Sort specifications (ORDER BY columns)
+    sort_specs: std.ArrayList(OrderBySpec),
+
     /// Counter for unique variable names
     var_counter: u32,
 
@@ -157,6 +160,7 @@ pub const FusedCodeGen = struct {
             .computed_column_order = .{},
             .window_specs = .{},
             .window_columns = std.StringHashMap(void).init(allocator),
+            .sort_specs = .{},
             .var_counter = 0,
             .analyzed_plan = null,
         };
@@ -170,6 +174,7 @@ pub const FusedCodeGen = struct {
         self.computed_column_order.deinit(self.allocator);
         self.window_specs.deinit(self.allocator);
         self.window_columns.deinit();
+        self.sort_specs.deinit(self.allocator);
     }
 
     /// Analyze plan to collect column info (call before updateColumnTypes)
@@ -370,6 +375,12 @@ pub const FusedCodeGen = struct {
             },
             .sort => |sort| {
                 try self.analyzePlan(sort.input);
+                // Collect sort specifications
+                for (sort.order_by) |order_spec| {
+                    self.sort_specs.append(self.allocator, order_spec) catch return CodeGenError.OutOfMemory;
+                    // Ensure sort columns are in input
+                    try self.addInputColumn(order_spec.column.column, order_spec.column.col_type);
+                }
             },
             .limit => |limit| {
                 try self.analyzePlan(limit.input);
@@ -809,15 +820,35 @@ pub const FusedCodeGen = struct {
             try self.write("\n");
         }
 
+        // Phase 2: Sort indices if ORDER BY is present
+        const has_sort = self.sort_specs.items.len > 0;
+        if (has_sort) {
+            try self.writeIndent();
+            try self.write("// Phase 2: Sort indices for ORDER BY\n");
+            try self.writeIndent();
+            try self.write("var sorted_indices: [4096]u32 = undefined;\n");
+            try self.writeIndent();
+            try self.write("var init_idx: u32 = 0;\n");
+            try self.writeIndent();
+            try self.write("while (init_idx < columns.len) : (init_idx += 1) sorted_indices[init_idx] = init_idx;\n");
+            try self.genSortContext();
+            try self.write("\n");
+        }
+
         // Local variables
         try self.writeIndent();
         try self.write("var result_count: usize = 0;\n");
-        try self.writeIndent();
-        try self.write("var i: usize = 0;\n\n");
 
-        // Main loop
-        try self.writeIndent();
-        try self.write("while (i < columns.len) : (i += 1) {\n");
+        // Main loop - iterate over sorted indices if sorting, otherwise direct indices
+        if (has_sort) {
+            try self.writeIndent();
+            try self.write("for (sorted_indices[0..columns.len]) |i| {\n");
+        } else {
+            try self.writeIndent();
+            try self.write("var i: usize = 0;\n\n");
+            try self.writeIndent();
+            try self.write("while (i < columns.len) : (i += 1) {\n");
+        }
         self.indent += 1;
 
         // Generate body based on plan
@@ -833,6 +864,44 @@ pub const FusedCodeGen = struct {
 
         self.indent -= 1;
         try self.write("}\n");
+    }
+
+    /// Generate sort context and sort call for ORDER BY
+    fn genSortContext(self: *Self) CodeGenError!void {
+        try self.writeIndent();
+        try self.write("const OrderSortCtx = struct {\n");
+        self.indent += 1;
+        try self.writeIndent();
+        try self.write("cols: *const Columns,\n");
+        try self.writeIndent();
+        try self.write("fn lessThan(ctx: @This(), a: u32, b: u32) bool {\n");
+        self.indent += 1;
+
+        // Generate comparison for each ORDER BY column
+        for (self.sort_specs.items) |spec| {
+            const col = spec.column.column;
+            const desc = spec.direction == .desc;
+            if (desc) {
+                try self.writeIndent();
+                try self.fmt("if (ctx.cols.{s}[a] != ctx.cols.{s}[b]) return ctx.cols.{s}[a] > ctx.cols.{s}[b];\n", .{ col, col, col, col });
+            } else {
+                try self.writeIndent();
+                try self.fmt("if (ctx.cols.{s}[a] != ctx.cols.{s}[b]) return ctx.cols.{s}[a] < ctx.cols.{s}[b];\n", .{ col, col, col, col });
+            }
+        }
+
+        try self.writeIndent();
+        try self.write("return false;\n");
+        self.indent -= 1;
+        try self.writeIndent();
+        try self.write("}\n");
+        self.indent -= 1;
+        try self.writeIndent();
+        try self.write("};\n");
+
+        // Call sort
+        try self.writeIndent();
+        try self.write("std.mem.sort(u32, sorted_indices[0..columns.len], OrderSortCtx{ .cols = columns }, OrderSortCtx.lessThan);\n");
     }
 
     /// Generate code for a plan node
@@ -910,7 +979,12 @@ pub const FusedCodeGen = struct {
                 // Just process the input node
                 try self.genPlanNodeBody(window.input);
             },
-            .group_by, .sort, .hash_join => {
+            .sort => |sort| {
+                // Sort is handled in preamble (sorted_indices)
+                // Just process the input node
+                try self.genPlanNodeBody(sort.input);
+            },
+            .group_by, .hash_join => {
                 // These nodes require interpreted execution
                 return CodeGenError.UnsupportedPlanNode;
             },
