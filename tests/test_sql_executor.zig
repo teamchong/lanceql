@@ -1491,15 +1491,8 @@ test "fallback to interpreted on GROUP BY" {
     try std.testing.expect(result.row_count > 0);
 }
 
-test "compilation can be disabled" {
-    var ctx: TestContext = undefined;
-    try ctx.init(std.testing.allocator, int64_fixture);
-    defer ctx.deinit();
-
-    ctx.executor.enableCompiledExecution(false);
-    const result = try ctx.exec("SELECT * FROM table");
-    try std.testing.expectEqual(@as(usize, 5), result.row_count);
-}
+// Removed: "compilation can be disabled" test - interpreted fallback was removed,
+// all queries now use compiled execution
 
 test "compiled filter with AND" {
     var ctx: TestContext = undefined;

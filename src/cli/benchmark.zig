@@ -3,12 +3,13 @@
 //! Benchmark execution and statistics for query performance testing.
 
 const std = @import("std");
-const Table = @import("lanceql.table").Table;
+const AnyTable = @import("lanceql.any_table").AnyTable;
 const lexer = @import("lanceql.sql.lexer");
 const parser = @import("lanceql.sql.parser");
 const executor = @import("lanceql.sql.executor");
 const ast = @import("lanceql.sql.ast");
 const file_utils = @import("file_utils.zig");
+const file_detect = @import("file_detect.zig");
 
 /// Benchmark options
 pub const BenchmarkOptions = struct {
@@ -32,8 +33,27 @@ pub fn run(allocator: std.mem.Allocator, query: []const u8, opts: BenchmarkOptio
     };
     defer allocator.free(data);
 
+    // Detect file type
+    const file_type = file_detect.detect(table_path, data);
+    const format: AnyTable.Format = switch (file_type) {
+        .parquet => .parquet,
+        .lance => .lance,
+        .delta => .delta,
+        .iceberg => .iceberg,
+        .arrow => .arrow,
+        .avro => .avro,
+        .orc => .orc,
+        .xlsx => .xlsx,
+        else => .lance, // Try Lance first for unknown/text formats
+    };
+
+    const input: AnyTable.InitInput = switch (format) {
+        .delta, .iceberg => .{ .path = table_path },
+        else => .{ .data = data },
+    };
+
     // Initialize Table
-    var table = Table.init(allocator, data) catch |err| {
+    var table = AnyTable.init(allocator, format, input) catch |err| {
         std.debug.print("Error parsing '{s}': {}\n", .{ table_path, err });
         return;
     };
@@ -64,17 +84,17 @@ pub fn run(allocator: std.mem.Allocator, query: []const u8, opts: BenchmarkOptio
     };
 
     // Get column count
-    const num_rows = table.numColumns();
+    const num_cols = table.getColumnNames().len;
 
     std.debug.print("LanceQL Benchmark\n", .{});
     std.debug.print("=================\n", .{});
     std.debug.print("Query: {s}\n", .{query});
-    std.debug.print("Table: {s} ({d} columns)\n", .{ table_path, num_rows });
+    std.debug.print("Table: {s} ({d} columns)\n", .{ table_path, num_cols });
     std.debug.print("Warmup: {d}, Iterations: {d}\n\n", .{ opts.warmup, opts.iterations });
 
     // Warmup
     for (0..opts.warmup) |_| {
-        var exec = executor.Executor.init(&table, allocator);
+        var exec = executor.Executor.initWithAnyTable(&table, allocator);
         var result = exec.execute(&stmt.select, &[_]ast.Value{}) catch continue;
         result.deinit();
         exec.deinit();
@@ -86,7 +106,7 @@ pub fn run(allocator: std.mem.Allocator, query: []const u8, opts: BenchmarkOptio
 
     for (0..opts.iterations) |i| {
         var timer = try std.time.Timer.start();
-        var exec = executor.Executor.init(&table, allocator);
+        var exec = executor.Executor.initWithAnyTable(&table, allocator);
         var result = exec.execute(&stmt.select, &[_]ast.Value{}) catch {
             times[i] = 0;
             exec.deinit();
@@ -113,16 +133,18 @@ pub fn run(allocator: std.mem.Allocator, query: []const u8, opts: BenchmarkOptio
     const avg_ms = @as(f64, @floatFromInt(avg_ns)) / 1_000_000;
     const min_ms = @as(f64, @floatFromInt(min_ns)) / 1_000_000;
     const max_ms = @as(f64, @floatFromInt(max_ns)) / 1_000_000;
+    const num_rows = table.numRows();
     const throughput = @as(f64, @floatFromInt(num_rows)) / avg_ms / 1000;
 
     if (opts.json) {
         std.debug.print(
-            \\{{"query": "{s}", "columns": {d}, "min_ms": {d:.3}, "avg_ms": {d:.3}, "max_ms": {d:.3}, "throughput_mrows_sec": {d:.2}}}
+            \\{{"query": "{s}", "columns": {d}, "rows": {d}, "min_ms": {d:.3}, "avg_ms": {d:.3}, "max_ms": {d:.3}, "throughput_mrows_sec": {d:.2}}}
             \\
-        , .{ query, num_rows, min_ms, avg_ms, max_ms, throughput });
+        , .{ query, num_cols, num_rows, min_ms, avg_ms, max_ms, throughput });
     } else {
         std.debug.print("Results:\n", .{});
-        std.debug.print("  Columns:    {d}\n", .{num_rows});
+        std.debug.print("  Columns:    {d}\n", .{num_cols});
+        std.debug.print("  Rows:       {d}\n", .{num_rows});
         std.debug.print("  Min:        {d:.2} ms\n", .{min_ms});
         std.debug.print("  Avg:        {d:.2} ms\n", .{avg_ms});
         std.debug.print("  Max:        {d:.2} ms\n", .{max_ms});

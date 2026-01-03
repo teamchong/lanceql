@@ -7,6 +7,8 @@ const std = @import("std");
 const ast = @import("ast");
 const Table = @import("lanceql.table").Table;
 const ParquetTable = @import("lanceql.parquet_table").ParquetTable;
+const format = @import("lanceql.format");
+const meta = format.parquet_metadata;
 const DeltaTable = @import("lanceql.delta_table").DeltaTable;
 const IcebergTable = @import("lanceql.iceberg_table").IcebergTable;
 const ArrowTable = @import("lanceql.arrow_table").ArrowTable;
@@ -288,10 +290,12 @@ pub const Executor = struct {
             }
         };
         if (!codegen.hasInputColumns() and is_select_star) {
-            const schema = self.tbl().getSchema() orelse return error.NoSchema;
-            for (schema.fields) |field| {
-                if (type_map.get(field.name)) |col_type| {
-                    try codegen.addInputColumn(field.name, col_type);
+            // For SELECT *, add all columns from the type map (which was built from table schema)
+            const col_names_result = self.getColumnNamesWithOwnership() catch return error.NoSchema;
+            defer col_names_result.deinit(self.allocator);
+            for (col_names_result.names) |name| {
+                if (type_map.get(name)) |col_type| {
+                    try codegen.addInputColumn(name, col_type);
                 }
             }
         }
@@ -388,21 +392,81 @@ pub const Executor = struct {
             const col_idx = self.getPhysicalColumnIndex(col.name) orelse return error.ColumnNotFound;
             // Types should already be resolved by generateWithLayoutAndTypes
             data[i] = switch (col.col_type) {
-                .i64 => .{ .i64 = try self.tbl().readInt64Column(col_idx) },
-                .f64 => .{ .f64 = try self.tbl().readFloat64Column(col_idx) },
-                .i32 => .{ .i32 = try self.tbl().readInt32Column(col_idx) },
-                .f32 => .{ .f32 = try self.tbl().readFloat32Column(col_idx) },
-                .bool => .{ .bool_ = try self.tbl().readBoolColumn(col_idx) },
-                .string => .{ .string = try self.tbl().readStringColumn(col_idx) },
-                .timestamp_ns, .timestamp_us, .timestamp_ms, .timestamp_s => .{ .timestamp_ns = try self.tbl().readInt64Column(col_idx) },
-                .date32 => .{ .date32 = try self.tbl().readInt32Column(col_idx) },
-                .date64 => .{ .date64 = try self.tbl().readInt64Column(col_idx) },
-                .vec_f32 => .{ .vec_f32 = try self.tbl().readFloat32Column(col_idx) },
-                .vec_f64 => .{ .vec_f64 = try self.tbl().readFloat64Column(col_idx) },
-                else => .{ .f64 = try self.tbl().readFloat64Column(col_idx) }, // Default fallback
+                .i64 => .{ .i64 = try self.readInt64ColumnTyped(col_idx) },
+                .f64 => .{ .f64 = try self.readFloat64ColumnTyped(col_idx) },
+                .i32 => .{ .i32 = try self.readInt32ColumnTyped(col_idx) },
+                .f32 => .{ .f32 = try self.readFloat32ColumnTyped(col_idx) },
+                .bool => .{ .bool_ = try self.readBoolColumnTyped(col_idx) },
+                .string => .{ .string = try self.readStringColumnTyped(col_idx) },
+                .timestamp_ns, .timestamp_us, .timestamp_ms, .timestamp_s => .{ .timestamp_ns = try self.readInt64ColumnTyped(col_idx) },
+                .date32 => .{ .date32 = try self.readInt32ColumnTyped(col_idx) },
+                .date64 => .{ .date64 = try self.readInt64ColumnTyped(col_idx) },
+                .vec_f32 => .{ .vec_f32 = try self.readFloat32ColumnTyped(col_idx) },
+                .vec_f64 => .{ .vec_f64 = try self.readFloat64ColumnTyped(col_idx) },
+                else => .{ .f64 = try self.readFloat64ColumnTyped(col_idx) }, // Default fallback
             };
         }
         return data;
+    }
+
+    /// Read int64 column - handles typed tables (Parquet, Arrow, etc.) and Lance
+    fn readInt64ColumnTyped(self: *Self, col_idx: u32) ![]i64 {
+        inline for (typed_table_fields) |field| {
+            if (@field(self, field)) |t| {
+                return t.readInt64Column(col_idx);
+            }
+        }
+        return self.tbl().readInt64Column(col_idx);
+    }
+
+    /// Read float64 column - handles typed tables and Lance
+    fn readFloat64ColumnTyped(self: *Self, col_idx: u32) ![]f64 {
+        inline for (typed_table_fields) |field| {
+            if (@field(self, field)) |t| {
+                return t.readFloat64Column(col_idx);
+            }
+        }
+        return self.tbl().readFloat64Column(col_idx);
+    }
+
+    /// Read int32 column - handles typed tables and Lance
+    fn readInt32ColumnTyped(self: *Self, col_idx: u32) ![]i32 {
+        inline for (typed_table_fields) |field| {
+            if (@field(self, field)) |t| {
+                return t.readInt32Column(col_idx);
+            }
+        }
+        return self.tbl().readInt32Column(col_idx);
+    }
+
+    /// Read float32 column - handles typed tables and Lance
+    fn readFloat32ColumnTyped(self: *Self, col_idx: u32) ![]f32 {
+        inline for (typed_table_fields) |field| {
+            if (@field(self, field)) |t| {
+                return t.readFloat32Column(col_idx);
+            }
+        }
+        return self.tbl().readFloat32Column(col_idx);
+    }
+
+    /// Read bool column - handles typed tables and Lance
+    fn readBoolColumnTyped(self: *Self, col_idx: u32) ![]bool {
+        inline for (typed_table_fields) |field| {
+            if (@field(self, field)) |t| {
+                return t.readBoolColumn(col_idx);
+            }
+        }
+        return self.tbl().readBoolColumn(col_idx);
+    }
+
+    /// Read string column - handles typed tables and Lance
+    fn readStringColumnTyped(self: *Self, col_idx: u32) ![][]const u8 {
+        inline for (typed_table_fields) |field| {
+            if (@field(self, field)) |t| {
+                return t.readStringColumn(col_idx);
+            }
+        }
+        return self.tbl().readStringColumn(col_idx);
     }
 
     /// Free column data loaded for compiled execution
@@ -517,9 +581,16 @@ pub const Executor = struct {
 
     /// Get physical column index by name
     fn getPhysicalColumnIndex(self: *Self, name: []const u8) ?u32 {
+        // Handle typed tables (Parquet, Arrow, etc.)
+        inline for (typed_table_fields) |field| {
+            if (@field(self, field)) |t| {
+                return if (t.columnIndex(name)) |idx| @intCast(idx) else null;
+            }
+        }
+        // Handle Lance Table
         const schema = self.tbl().getSchema() orelse return null;
-        for (schema.fields, 0..) |field, i| {
-            if (std.mem.eql(u8, field.name, name)) {
+        for (schema.fields, 0..) |field_info, i| {
+            if (std.mem.eql(u8, field_info.name, name)) {
                 return @intCast(i);
             }
         }
@@ -528,10 +599,24 @@ pub const Executor = struct {
 
     /// Build a type map from the table schema
     fn buildSchemaTypeMap(self: *Self) !std.StringHashMap(plan_nodes.ColumnType) {
-        const schema = self.tbl().getSchema() orelse return error.NoSchema;
         var type_map = std.StringHashMap(plan_nodes.ColumnType).init(self.allocator);
         errdefer type_map.deinit();
 
+        // Handle typed tables (Parquet, Arrow, etc.)
+        inline for (typed_table_fields) |field| {
+            if (@field(self, field)) |t| {
+                const col_names = t.getColumnNames();
+                for (col_names, 0..) |name, idx| {
+                    const pq_type = t.getColumnType(idx);
+                    const col_type: plan_nodes.ColumnType = if (pq_type) |pt| mapParquetType(pt) else .unknown;
+                    try type_map.put(name, col_type);
+                }
+                return type_map;
+            }
+        }
+
+        // Handle Lance Table
+        const schema = self.tbl().getSchema() orelse return error.NoSchema;
         for (schema.fields) |field| {
             const lance_type = LanceColumnType.fromLogicalType(field.logical_type);
             // Map LanceColumnType to plan_nodes.ColumnType
@@ -553,6 +638,20 @@ pub const Executor = struct {
             try type_map.put(field.name, col_type);
         }
         return type_map;
+    }
+
+    /// Map Parquet Type to plan_nodes.ColumnType
+    fn mapParquetType(pt: meta.Type) plan_nodes.ColumnType {
+        return switch (pt) {
+            .int64 => .i64,
+            .int32 => .i32,
+            .double => .f64,
+            .float => .f32,
+            .byte_array, .fixed_len_byte_array => .string,
+            .boolean => .bool,
+            .int96 => .timestamp_ns, // INT96 is typically used for timestamps
+            _ => .unknown,
+        };
     }
 
     /// Convert output buffers to Result
@@ -730,13 +829,27 @@ pub const Executor = struct {
         return try self.tbl().rowCount(0);
     }
 
-    /// Get column names (works with Lance, Parquet, Delta, Iceberg, Arrow, Avro, ORC, or XLSX)
-    fn getColumnNames(self: *Self) ![][]const u8 {
-        inline for (typed_table_fields) |field| {
-            if (@field(self, field)) |t| return t.getColumnNames();
+    /// Column names result with ownership info
+    const ColumnNamesResult = struct {
+        names: [][]const u8,
+        owned: bool, // If true, caller must free with freeColumnNames
+
+        fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+            if (self.owned) {
+                allocator.free(self.names);
+            }
         }
-        return try self.tbl().columnNames();
+    };
+
+    /// Get column names (works with Lance, Parquet, Delta, Iceberg, Arrow, Avro, ORC, or XLSX)
+    /// Returns ownership info - caller must call deinit() on result
+    fn getColumnNamesWithOwnership(self: *Self) !ColumnNamesResult {
+        inline for (typed_table_fields) |field| {
+            if (@field(self, field)) |t| return .{ .names = t.getColumnNames(), .owned = false };
+        }
+        return .{ .names = try self.tbl().columnNames(), .owned = true };
     }
+
 
     /// Get physical column ID by name (works with Lance, Parquet, Delta, Iceberg, Arrow, Avro, ORC, or XLSX)
     fn getPhysicalColumnId(self: *Self, name: []const u8) ?u32 {
@@ -1880,11 +1993,10 @@ pub const Executor = struct {
             if (isWindowFunction(&item.expr)) continue;
 
             if (item.expr == .column and std.mem.eql(u8, item.expr.column.name, "*")) {
-                const col_names = try self.getColumnNames();
-                // Only Lance allocates column names, other table types return stored slices
-                defer if (!self.hasTypedTable()) self.allocator.free(col_names);
+                const col_names_result = try self.getColumnNamesWithOwnership();
+                defer col_names_result.deinit(self.allocator);
 
-                for (col_names) |col_name| {
+                for (col_names_result.names) |col_name| {
                     // Look up the physical column ID from the name
                     // The physical column ID maps to the column metadata index
                     const physical_col_id = self.getPhysicalColumnId(col_name) orelse return error.ColumnNotFound;
