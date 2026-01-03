@@ -92,29 +92,28 @@ pub fn run(allocator: std.mem.Allocator, query: []const u8, opts: BenchmarkOptio
     std.debug.print("Table: {s} ({d} columns)\n", .{ table_path, num_cols });
     std.debug.print("Warmup: {d}, Iterations: {d}\n\n", .{ opts.warmup, opts.iterations });
 
-    // Warmup
+    // Create single executor (reused across iterations to benefit from compiled query cache)
+    var exec = executor.Executor.initWithAnyTable(&table, allocator);
+    defer exec.deinit();
+
+    // Warmup (also populates compiled query cache)
     for (0..opts.warmup) |_| {
-        var exec = executor.Executor.initWithAnyTable(&table, allocator);
         var result = exec.execute(&stmt.select, &[_]ast.Value{}) catch continue;
         result.deinit();
-        exec.deinit();
     }
 
-    // Benchmark
+    // Benchmark (uses cached compiled queries - no compile overhead)
     var times = try allocator.alloc(u64, opts.iterations);
     defer allocator.free(times);
 
     for (0..opts.iterations) |i| {
         var timer = try std.time.Timer.start();
-        var exec = executor.Executor.initWithAnyTable(&table, allocator);
         var result = exec.execute(&stmt.select, &[_]ast.Value{}) catch {
             times[i] = 0;
-            exec.deinit();
             continue;
         };
         times[i] = timer.read();
         result.deinit();
-        exec.deinit();
     }
 
     // Calculate stats

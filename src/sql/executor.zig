@@ -56,6 +56,21 @@ pub const JoinedData = result_types.JoinedData;
 pub const TableSource = result_types.TableSource;
 pub const LanceColumnType = result_types.LanceColumnType;
 
+/// Cached compiled query - holds JIT context and compiled function
+const CompiledQuery = struct {
+    jit_ctx: metal0_jit.JitContext,
+    compiled_ptr: ?*const anyopaque,
+    input_columns: []fused_codegen.ColumnInfo,
+    output_columns: []fused_codegen.ColumnInfo,
+    needs_string_arena: bool,
+
+    fn deinit(self: *CompiledQuery, allocator: std.mem.Allocator) void {
+        self.jit_ctx.deinit();
+        allocator.free(self.input_columns);
+        allocator.free(self.output_columns);
+    }
+};
+
 /// SQL Query Executor
 pub const Executor = struct {
     /// Default table (used when FROM is a simple table name or not specified)
@@ -87,6 +102,8 @@ pub const Executor = struct {
     /// Cache for @logic_table method batch results
     /// Key: "ClassName.methodName", Value: results array
     method_results_cache: std.StringHashMap([]const f64),
+    /// Cache for compiled queries - key is query hash
+    compiled_query_cache: std.AutoHashMap(u64, CompiledQuery),
 
     /// Enable compiled query execution (fused compilation)
     compiled_execution_enabled: bool = true,
@@ -113,6 +130,7 @@ pub const Executor = struct {
             .active_source = null,
             .tables = std.StringHashMap(*Table).init(allocator),
             .method_results_cache = std.StringHashMap([]const f64).init(allocator),
+            .compiled_query_cache = std.AutoHashMap(u64, CompiledQuery).init(allocator),
         };
     }
 
@@ -327,24 +345,61 @@ pub const Executor = struct {
         }
 
         var gen_result = try codegen.generateWithLayoutAndTypes(&plan, &type_map);
-        defer gen_result.layout.deinit(); // Free the layout slices
-        // Note: gen_result.source is owned by codegen and freed in deinit()
+        const needs_string_arena = codegen.needsStringArena();
 
-        // 4. JIT compile to native code
-        var jit_ctx = metal0_jit.JitContext.init(self.allocator);
-        defer jit_ctx.deinit(); // This handles cleanup of compiled functions
+        // Hash the generated source to use as cache key
+        const query_hash = std.hash.Wyhash.hash(0, gen_result.source);
 
-        const compiled = try jit_ctx.compileZigSource(gen_result.source, "fused_query");
+        // Check compiled query cache
+        const cached_query = self.compiled_query_cache.get(query_hash);
+
+        // Get compiled function - either from cache or compile new
+        const compiled_ptr: *const anyopaque = if (cached_query) |cached| blk: {
+            // Cache hit - free the gen_result layout since we'll use cached layout
+            gen_result.layout.deinit();
+            break :blk cached.compiled_ptr orelse return error.CompiledFunctionNull;
+        } else blk: {
+            // Cache miss - compile and store
+            var jit_ctx = metal0_jit.JitContext.init(self.allocator);
+            errdefer jit_ctx.deinit();
+
+            const compiled = try jit_ctx.compileZigSource(gen_result.source, "fused_query");
+
+            // Copy layout info for cache (gen_result.layout will be freed after this function)
+            const input_cols = try self.allocator.dupe(fused_codegen.ColumnInfo, gen_result.layout.input_columns);
+            errdefer self.allocator.free(input_cols);
+            const output_cols = try self.allocator.dupe(fused_codegen.ColumnInfo, gen_result.layout.output_columns);
+            errdefer self.allocator.free(output_cols);
+
+            // Store in cache
+            try self.compiled_query_cache.put(query_hash, .{
+                .jit_ctx = jit_ctx,
+                .compiled_ptr = compiled.ptr,
+                .input_columns = input_cols,
+                .output_columns = output_cols,
+                .needs_string_arena = needs_string_arena,
+            });
+
+            // Free gen_result layout since we copied it
+            gen_result.layout.deinit();
+
+            break :blk compiled.ptr orelse return error.CompiledFunctionNull;
+        };
+
+        // Get layout from cache (guaranteed to exist now)
+        const cached = self.compiled_query_cache.get(query_hash).?;
+        const input_columns = cached.input_columns;
+        const output_columns = cached.output_columns;
 
         // 4. Load column data based on layout
         const row_count = try self.getRowCount();
-        const column_data = try self.loadColumnDataForLayout(gen_result.layout.input_columns);
+        const column_data = try self.loadColumnDataForLayout(input_columns);
         defer self.freeCompiledColumnData(column_data);
 
         // 5. Build runtime columns struct (input)
         var columns = try RuntimeColumns.buildInput(
             self.allocator,
-            gen_result.layout.input_columns,
+            input_columns,
             column_data,
             row_count,
         );
@@ -353,13 +408,13 @@ pub const Executor = struct {
         // 6. Allocate output buffers
         var output = try RuntimeColumns.buildOutput(
             self.allocator,
-            gen_result.layout.output_columns,
+            output_columns,
             row_count,
         );
         defer output.deinit();
 
         // 7. Allocate string arena if needed (must outlive output extraction)
-        const string_arena: ?[]u8 = if (codegen.needsStringArena())
+        const string_arena: ?[]u8 = if (cached.needs_string_arena)
             try self.allocator.alloc(u8, row_count * 1024) // 1KB per row
         else
             null;
@@ -368,11 +423,11 @@ pub const Executor = struct {
         // 8. Call compiled function
         const result_count = if (string_arena) |arena| blk: {
             const FusedQueryFnWithArena = *const fn (*anyopaque, *anyopaque, [*]u8) callconv(std.builtin.CallingConvention.c) usize;
-            const func: FusedQueryFnWithArena = @ptrCast(@alignCast(compiled.ptr));
+            const func: FusedQueryFnWithArena = @ptrCast(@alignCast(compiled_ptr));
             break :blk func(columns.asPtr(), output.asPtr(), arena.ptr);
         } else blk: {
             const FusedQueryFn = *const fn (*anyopaque, *anyopaque) callconv(std.builtin.CallingConvention.c) usize;
-            const func: FusedQueryFn = @ptrCast(@alignCast(compiled.ptr));
+            const func: FusedQueryFn = @ptrCast(@alignCast(compiled_ptr));
             break :blk func(columns.asPtr(), output.asPtr());
         };
 
@@ -939,6 +994,14 @@ pub const Executor = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.method_results_cache.deinit();
+
+        // Free compiled query cache
+        var cache_iter = self.compiled_query_cache.valueIterator();
+        while (cache_iter.next()) |cached| {
+            var query = cached;
+            query.deinit(self.allocator);
+        }
+        self.compiled_query_cache.deinit();
 
         // Clean up registered tables map (tables are owned by caller, just deinit the map)
         self.tables.deinit();
