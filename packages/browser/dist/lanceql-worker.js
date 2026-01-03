@@ -36,14 +36,20 @@ async function decryptData(encrypted, cryptoKey) {
 }
 
 // src/worker/worker-store.js
-var gpuTransformer2 = null;
+var gpuTransformer = null;
 var gpuTransformerPromise = null;
-var embeddingCache2 = /* @__PURE__ */ new Map();
+var embeddingCache = /* @__PURE__ */ new Map();
 function setGPUTransformer(transformer) {
-  gpuTransformer2 = transformer;
+  gpuTransformer = transformer;
 }
 function setGPUTransformerPromise(promise) {
   gpuTransformerPromise = promise;
+}
+function getEmbeddingCache() {
+  return embeddingCache;
+}
+function getGPUTransformerState() {
+  return gpuTransformer;
 }
 var WorkerStore = class {
   constructor(name, options = {}) {
@@ -183,8 +189,8 @@ var WorkerStore = class {
       const item = value[i];
       const itemText = this._extractText(item);
       const cacheKey = `${this.name}:${key}:${itemText}`;
-      if (embeddingCache2.has(cacheKey)) {
-        const cachedVec = embeddingCache2.get(cacheKey);
+      if (embeddingCache.has(cacheKey)) {
+        const cachedVec = embeddingCache.get(cacheKey);
         const score = this._cosineSimilarity(queryVec, cachedVec);
         scored.push({ item, score });
       } else {
@@ -205,7 +211,7 @@ var WorkerStore = class {
         const itemText = textsToEmbed[j];
         const itemVec = itemVecs[j];
         const cacheKey = `${this.name}:${key}:${itemText}`;
-        embeddingCache2.set(cacheKey, itemVec);
+        embeddingCache.set(cacheKey, itemVec);
         const score = this._cosineSimilarity(queryVec, itemVec);
         scored.push({ item, score });
       }
@@ -214,23 +220,23 @@ var WorkerStore = class {
   }
   async enableSemanticSearch(options = {}) {
     const { model = "minilm", onProgress } = options;
-    if (!gpuTransformer2) {
+    if (!gpuTransformer) {
       if (!gpuTransformerPromise) {
         gpuTransformerPromise = this._initGPUTransformer();
         setGPUTransformerPromise(gpuTransformerPromise);
       }
-      gpuTransformer2 = await gpuTransformerPromise;
-      setGPUTransformer(gpuTransformer2);
+      gpuTransformer = await gpuTransformerPromise;
+      setGPUTransformer(gpuTransformer);
     }
-    if (!gpuTransformer2) {
+    if (!gpuTransformer) {
       return null;
     }
-    const modelConfig = await gpuTransformer2.loadModel(model, onProgress);
+    const modelConfig = await gpuTransformer.loadModel(model, onProgress);
     this._embedder = {
       model,
       dimensions: modelConfig.hiddenSize,
-      embed: async (text) => gpuTransformer2.encodeText(text, model),
-      embedBatch: async (texts) => gpuTransformer2.encodeTextBatch(texts, model)
+      embed: async (text) => gpuTransformer.encodeText(text, model),
+      embedBatch: async (texts) => gpuTransformer.encodeTextBatch(texts, model)
     };
     return {
       model,
@@ -259,8 +265,8 @@ var WorkerStore = class {
     }
   }
   disableSemanticSearch() {
-    if (this._embedder && gpuTransformer2) {
-      gpuTransformer2.unloadModel(this._embedder.model);
+    if (this._embedder && gpuTransformer) {
+      gpuTransformer.unloadModel(this._embedder.model);
       this._embedder = null;
     }
   }
@@ -4042,20 +4048,22 @@ async function executeNearSearch(rows, nearCondition, limit) {
   const column = typeof nearCondition.column === "string" ? nearCondition.column : nearCondition.column.column;
   const text = nearCondition.text;
   const topK = nearCondition.topK || limit || 10;
-  if (!gpuTransformer) {
+  const gpuTransformer2 = getGPUTransformerState();
+  if (!gpuTransformer2) {
     throw new Error("NEAR requires a text encoder model. Load a model first with store.loadModel()");
   }
   let queryVec;
   try {
-    const models = gpuTransformer.getLoadedModels?.() || [];
+    const models = gpuTransformer2.getLoadedModels?.() || [];
     if (models.length === 0) {
       throw new Error("No text encoder model loaded");
     }
-    queryVec = await gpuTransformer.encodeText(text, models[0]);
+    queryVec = await gpuTransformer2.encodeText(text, models[0]);
   } catch (e) {
     throw new Error(`NEAR failed to encode query: ${e.message}`);
   }
   const scored = [];
+  const embeddingCache2 = getEmbeddingCache();
   for (const row of rows) {
     const colValue = row[column];
     if (Array.isArray(colValue) && typeof colValue[0] === "number") {
@@ -4063,11 +4071,11 @@ async function executeNearSearch(rows, nearCondition, limit) {
       scored.push({ row, score });
     } else if (typeof colValue === "string") {
       const cacheKey = `sql:${column}:${colValue}`;
-      let itemVec = embeddingCache.get(cacheKey);
+      let itemVec = embeddingCache2.get(cacheKey);
       if (!itemVec) {
-        const models = gpuTransformer.getLoadedModels?.() || [];
-        itemVec = await gpuTransformer.encodeText(colValue, models[0]);
-        embeddingCache.set(cacheKey, itemVec);
+        const models = gpuTransformer2.getLoadedModels?.() || [];
+        itemVec = await gpuTransformer2.encodeText(colValue, models[0]);
+        embeddingCache2.set(cacheKey, itemVec);
       }
       const score = cosineSimilarity(queryVec, itemVec);
       scored.push({ row, score });

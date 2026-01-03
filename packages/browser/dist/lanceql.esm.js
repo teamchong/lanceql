@@ -120,6 +120,157 @@ var init_metadata_cache = __esm({
   }
 });
 
+// src/client/cache/lru-cache.js
+var LRUCache2, LANCE_MAGIC2;
+var init_lru_cache = __esm({
+  "src/client/cache/lru-cache.js"() {
+    LRUCache2 = class {
+      constructor(options = {}) {
+        this.maxSize = options.maxSize ?? 50 * 1024 * 1024;
+        this.currentSize = 0;
+        this.cache = /* @__PURE__ */ new Map();
+        this._head = null;
+        this._tail = null;
+      }
+      /**
+       * Get item from cache - O(1)
+       * @param {string} key - Cache key
+       * @returns {*} Cached data or undefined
+       */
+      get(key) {
+        const node = this.cache.get(key);
+        if (node) {
+          this._moveToHead(node);
+          return node.data;
+        }
+        return void 0;
+      }
+      /**
+       * Delete item from cache - O(1)
+       */
+      delete(key) {
+        const node = this.cache.get(key);
+        if (node) {
+          this._removeNode(node);
+          this.cache.delete(key);
+          this.currentSize -= node.size;
+          return true;
+        }
+        return false;
+      }
+      /**
+       * Set item in cache with explicit size
+       * @param {string} key - Cache key
+       * @param {*} data - Data to cache
+       * @param {number} size - Size in bytes (optional, auto-calculated if not provided)
+       */
+      set(key, data, size = null) {
+        return this.put(key, data, size);
+      }
+      /**
+       * Put item in cache - O(1) amortized
+       * @param {string} key - Cache key
+       * @param {*} data - Data to cache
+       * @param {number} explicitSize - Optional explicit size in bytes
+       */
+      put(key, data, explicitSize = null) {
+        const existing = this.cache.get(key);
+        if (existing) {
+          this._removeNode(existing);
+          this.currentSize -= existing.size;
+          this.cache.delete(key);
+        }
+        let size = explicitSize;
+        if (size === null) {
+          if (data === null || data === void 0) {
+            size = 0;
+          } else if (data.byteLength !== void 0) {
+            size = data.byteLength;
+          } else if (typeof data === "string") {
+            size = data.length * 2;
+          } else if (typeof data === "object") {
+            size = JSON.stringify(data).length * 2;
+          } else {
+            size = 8;
+          }
+        }
+        while (this.currentSize + size > this.maxSize && this._tail) {
+          this._evictTail();
+        }
+        if (size > this.maxSize) {
+          return;
+        }
+        const node = { key, data, size, prev: null, next: null };
+        this._addToHead(node);
+        this.cache.set(key, node);
+        this.currentSize += size;
+      }
+      /** Add node to head of list (MRU position) - O(1) */
+      _addToHead(node) {
+        node.prev = null;
+        node.next = this._head;
+        if (this._head) {
+          this._head.prev = node;
+        }
+        this._head = node;
+        if (!this._tail) {
+          this._tail = node;
+        }
+      }
+      /** Remove node from list - O(1) */
+      _removeNode(node) {
+        if (node.prev) {
+          node.prev.next = node.next;
+        } else {
+          this._head = node.next;
+        }
+        if (node.next) {
+          node.next.prev = node.prev;
+        } else {
+          this._tail = node.prev;
+        }
+        node.prev = null;
+        node.next = null;
+      }
+      /** Move existing node to head (MRU) - O(1) */
+      _moveToHead(node) {
+        if (node === this._head) return;
+        this._removeNode(node);
+        this._addToHead(node);
+      }
+      /** Evict tail node (LRU) - O(1) */
+      _evictTail() {
+        if (!this._tail) return;
+        const node = this._tail;
+        this._removeNode(node);
+        this.cache.delete(node.key);
+        this.currentSize -= node.size;
+      }
+      /**
+       * Clear entire cache
+       */
+      clear() {
+        this.cache.clear();
+        this._head = null;
+        this._tail = null;
+        this.currentSize = 0;
+      }
+      /**
+       * Get cache stats
+       */
+      stats() {
+        return {
+          entries: this.cache.size,
+          currentSize: this.currentSize,
+          maxSize: this.maxSize,
+          utilization: (this.currentSize / this.maxSize * 100).toFixed(1) + "%"
+        };
+      }
+    };
+    LANCE_MAGIC2 = new Uint8Array([76, 65, 78, 67]);
+  }
+});
+
 // src/client/cache/hot-tier-cache.js
 function getHotTierCache() {
   if (!_hotTierCache) _hotTierCache = new HotTierCache();
@@ -142,6 +293,24 @@ var init_hot_tier_cache = __esm({
           bytesFromNetwork: 0
         };
         this._metaCache = /* @__PURE__ */ new Map();
+        this._metaCacheOrder = [];
+        this.maxMetaCacheEntries = options.maxMetaCacheEntries || 100;
+      }
+      /**
+       * Add to metadata cache with LRU eviction
+       * @private
+       */
+      _setMetaCache(url, data) {
+        const existingIdx = this._metaCacheOrder.indexOf(url);
+        if (existingIdx !== -1) {
+          this._metaCacheOrder.splice(existingIdx, 1);
+        }
+        while (this._metaCacheOrder.length >= this.maxMetaCacheEntries) {
+          const oldestUrl = this._metaCacheOrder.shift();
+          this._metaCache.delete(oldestUrl);
+        }
+        this._metaCache.set(url, data);
+        this._metaCacheOrder.push(url);
       }
       /**
        * Initialize the cache (lazy initialization)
@@ -246,13 +415,13 @@ var init_hot_tier_cache = __esm({
             const dataPath = this._getCachePath(url, "/data.lance");
             const data2 = await this.storage.load(dataPath);
             if (data2 && data2.byteLength > end) {
-              this._metaCache.set(url, { meta, fullFileData: data2 });
+              this._setMetaCache(url, { meta, fullFileData: data2 });
               this._stats.hits++;
               this._stats.bytesFromCache += end - start + 1;
               return data2.slice(start, end + 1).buffer;
             }
           }
-          this._metaCache.set(url, { meta: cached ? meta : null, fullFileData: null });
+          this._setMetaCache(url, { meta: cached ? meta : null, fullFileData: null });
         }
         this._stats.misses++;
         const data = await this._fetchRange(url, start, end);
@@ -508,16 +677,17 @@ var init_accelerator = __esm({
       /**
        * Batch cosine similarity using WebGPU.
        * @param {Float32Array} queryVec - Query vector (dim)
-       * @param {Float32Array[]} vectors - Array of candidate vectors
+       * @param {Float32Array|Float32Array[]} vectors - Candidate vectors (flat or array of arrays)
        * @param {boolean} normalized - Whether vectors are L2-normalized
+       * @param {boolean} preFlattened - If true, vectors is a flat Float32Array
        * @returns {Promise<Float32Array>} Similarity scores
        */
-      async batchCosineSimilarity(queryVec, vectors, normalized = true) {
+      async batchCosineSimilarity(queryVec, vectors, normalized = true, preFlattened = false) {
         if (!this.available || vectors.length === 0) {
           return null;
         }
         const dim = queryVec.length;
-        const numVectors = vectors.length;
+        const numVectors = preFlattened ? vectors.length / dim : vectors.length;
         const vectorsBufferSize = numVectors * dim * 4;
         const maxBufferSize = this.device.limits?.maxStorageBufferBindingSize || 134217728;
         if (vectorsBufferSize > maxBufferSize) {
@@ -547,11 +717,15 @@ var init_accelerator = __esm({
         });
         this.device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([dim, numVectors]));
         this.device.queue.writeBuffer(queryBuffer, 0, queryVec);
-        const flatVectors = new Float32Array(numVectors * dim);
-        for (let i = 0; i < numVectors; i++) {
-          flatVectors.set(vectors[i], i * dim);
+        if (preFlattened) {
+          this.device.queue.writeBuffer(vectorsBuffer, 0, vectors);
+        } else {
+          const flatVectors = new Float32Array(numVectors * dim);
+          for (let i = 0; i < numVectors; i++) {
+            flatVectors.set(vectors[i], i * dim);
+          }
+          this.device.queue.writeBuffer(vectorsBuffer, 0, flatVectors);
         }
-        this.device.queue.writeBuffer(vectorsBuffer, 0, flatVectors);
         const bindGroup = this.device.createBindGroup({
           layout: this.pipeline.getBindGroupLayout(0),
           entries: [
@@ -1778,33 +1952,38 @@ async function loadPartitionIndex(index) {
 }
 async function fetchPartitionData(index, partitionIndices, dim = 384, onProgress = null) {
   if (!index.hasPartitionIndex || !index.partitionVectorsUrl) return null;
-  const allRowIds = [];
-  const allVectors = [];
   let totalBytesToFetch = 0;
   let bytesLoaded = 0;
   const uncachedPartitions = [];
   const cachedResults = /* @__PURE__ */ new Map();
+  if (!index._partitionCache) {
+    index._partitionCache = new LRUCache2({ maxSize: PARTITION_CACHE_SIZE });
+  }
   for (const p of partitionIndices) {
-    if (index._partitionCache?.has(p)) {
-      cachedResults.set(p, index._partitionCache.get(p));
+    const cached = index._partitionCache.get(p);
+    if (cached !== void 0) {
+      cachedResults.set(p, cached);
     } else {
       uncachedPartitions.push(p);
       totalBytesToFetch += index.partitionOffsets[p + 1] - index.partitionOffsets[p];
     }
   }
   if (uncachedPartitions.length === 0) {
-    for (const p of partitionIndices) {
-      const result = cachedResults.get(p);
-      allRowIds.push(...result.rowIds);
-      allVectors.push(...result.vectors);
-    }
-    if (onProgress) onProgress(100, 100);
-    return { rowIds: allRowIds, vectors: allVectors };
+    return assembleResults(partitionIndices, cachedResults, dim, onProgress);
   }
-  if (!index._partitionCache) index._partitionCache = /* @__PURE__ */ new Map();
-  const PARALLEL_LIMIT = 6;
-  for (let i = 0; i < uncachedPartitions.length; i += PARALLEL_LIMIT) {
-    const batch = uncachedPartitions.slice(i, i + PARALLEL_LIMIT);
+  if (!index._fetchStats) {
+    index._fetchStats = {
+      concurrency: 6,
+      recentLatencies: [],
+      // Rolling window of last 10 batches
+      minConcurrency: 2,
+      maxConcurrency: 12
+    };
+  }
+  const stats = index._fetchStats;
+  for (let i = 0; i < uncachedPartitions.length; i += stats.concurrency) {
+    const batch = uncachedPartitions.slice(i, i + stats.concurrency);
+    const batchStart = performance.now();
     const results = await Promise.all(batch.map(async (p) => {
       const startOffset = index.partitionOffsets[p];
       const endOffset = index.partitionOffsets[p + 1];
@@ -1820,30 +1999,61 @@ async function fetchPartitionData(index, partitionIndices, dim = 384, onProgress
         const rowIdsEnd = 4 + rowCount * 4;
         const rowIds = new Uint32Array(data.slice(4, rowIdsEnd));
         const vectorsFlat = new Float32Array(data.slice(rowIdsEnd));
-        const vectors = [];
-        for (let j = 0; j < rowCount; j++) {
-          vectors.push(vectorsFlat.slice(j * dim, (j + 1) * dim));
-        }
         bytesLoaded += byteSize;
         if (onProgress) onProgress(bytesLoaded, totalBytesToFetch);
-        return { p, rowIds: Array.from(rowIds), vectors };
+        return { p, rowIds: Array.from(rowIds), vectors: vectorsFlat, numVectors: rowCount };
       } catch {
         return { p, rowIds: [], vectors: [] };
       }
     }));
     for (const result of results) {
-      index._partitionCache.set(result.p, { rowIds: result.rowIds, vectors: result.vectors });
-      cachedResults.set(result.p, { rowIds: result.rowIds, vectors: result.vectors });
+      const data = {
+        rowIds: result.rowIds,
+        vectors: result.vectors,
+        numVectors: result.numVectors ?? result.rowIds.length
+      };
+      const size = result.rowIds.length * 4 + (result.vectors.byteLength || result.vectors.length * 4);
+      index._partitionCache.set(result.p, data, size);
+      cachedResults.set(result.p, data);
+    }
+    const batchLatency = performance.now() - batchStart;
+    stats.recentLatencies.push(batchLatency);
+    if (stats.recentLatencies.length > 10) stats.recentLatencies.shift();
+    const avgLatency = stats.recentLatencies.reduce((a, b) => a + b, 0) / stats.recentLatencies.length;
+    if (avgLatency < 50 && stats.concurrency < stats.maxConcurrency) {
+      stats.concurrency++;
+    } else if (avgLatency > 200 && stats.concurrency > stats.minConcurrency) {
+      stats.concurrency--;
     }
   }
+  return assembleResults(partitionIndices, cachedResults, dim, onProgress);
+}
+function assembleResults(partitionIndices, cachedResults, dim, onProgress) {
+  let totalRowIds = 0;
+  let totalVectorElements = 0;
   for (const p of partitionIndices) {
     const result = cachedResults.get(p);
     if (result) {
-      allRowIds.push(...result.rowIds);
-      allVectors.push(...result.vectors);
+      totalRowIds += result.rowIds.length;
+      totalVectorElements += result.vectors.length;
     }
   }
-  return { rowIds: allRowIds, vectors: allVectors };
+  const allRowIds = new Array(totalRowIds);
+  const allVectors = new Float32Array(totalVectorElements);
+  let rowIdOffset = 0;
+  let vectorOffset = 0;
+  for (const p of partitionIndices) {
+    const result = cachedResults.get(p);
+    if (result) {
+      for (let i = 0; i < result.rowIds.length; i++) {
+        allRowIds[rowIdOffset++] = result.rowIds[i];
+      }
+      allVectors.set(result.vectors, vectorOffset);
+      vectorOffset += result.vectors.length;
+    }
+  }
+  if (onProgress) onProgress(100, 100);
+  return { rowIds: allRowIds, vectors: allVectors, preFlattened: true };
 }
 async function prefetchAllRowIds(index) {
   if (!index.auxiliaryUrl || !index._auxBufferOffsets) return;
@@ -1937,12 +2147,45 @@ function getPartitionRowCount(index, partitionIndices) {
   }
   return total;
 }
+var PARTITION_CACHE_SIZE;
 var init_ivf_partitions = __esm({
   "src/client/search/ivf-partitions.js"() {
+    init_lru_cache();
+    PARTITION_CACHE_SIZE = 50 * 1024 * 1024;
   }
 });
 
 // src/client/search/ivf-index.js
+function quickselectTopK(arr, k) {
+  if (k >= arr.length) return arr;
+  if (k <= 0) return [];
+  let left = 0;
+  let right = arr.length - 1;
+  while (left < right) {
+    const mid = left + right >> 1;
+    if (arr[mid].score > arr[left].score) swap(arr, left, mid);
+    if (arr[right].score > arr[left].score) swap(arr, left, right);
+    if (arr[mid].score > arr[right].score) swap(arr, mid, right);
+    const pivot = arr[right].score;
+    let i = left;
+    for (let j = left; j < right; j++) {
+      if (arr[j].score >= pivot) {
+        swap(arr, i, j);
+        i++;
+      }
+    }
+    swap(arr, i, right);
+    if (i === k - 1) break;
+    if (i < k - 1) left = i + 1;
+    else right = i - 1;
+  }
+  return arr.slice(0, k);
+}
+function swap(arr, i, j) {
+  const tmp = arr[i];
+  arr[i] = arr[j];
+  arr[j] = tmp;
+}
 var IVFIndex;
 var init_ivf_index = __esm({
   "src/client/search/ivf-index.js"() {
@@ -1962,6 +2205,7 @@ var init_ivf_index = __esm({
         this.hasPartitionIndex = false;
         this._rowIdCache = null;
         this._rowIdCacheReady = false;
+        this._accessCounts = /* @__PURE__ */ new Map();
       }
       static async tryLoad(datasetBaseUrl) {
         if (!datasetBaseUrl) return null;
@@ -2027,21 +2271,50 @@ var init_ivf_index = __esm({
         if (!this.centroids || queryVec.length !== this.dimension) return [];
         nprobe = Math.min(nprobe, this.numPartitions);
         const distances = new Array(this.numPartitions);
+        let normA = 0;
+        for (let i = 0; i < this.dimension; i++) {
+          normA += queryVec[i] * queryVec[i];
+        }
+        const sqrtNormA = Math.sqrt(normA);
         for (let p = 0; p < this.numPartitions; p++) {
           const start = p * this.dimension;
-          let dot = 0, normA = 0, normB = 0;
+          let dot = 0, normB = 0;
           for (let i = 0; i < this.dimension; i++) {
-            const a = queryVec[i];
             const b = this.centroids[start + i];
-            dot += a * b;
-            normA += a * a;
+            dot += queryVec[i] * b;
             normB += b * b;
           }
-          const denom = Math.sqrt(normA) * Math.sqrt(normB);
+          const denom = sqrtNormA * Math.sqrt(normB);
           distances[p] = { idx: p, score: denom === 0 ? 0 : dot / denom };
         }
-        distances.sort((a, b) => b.score - a.score);
-        return distances.slice(0, nprobe).map((d) => d.idx);
+        const topK = quickselectTopK(distances, nprobe);
+        const partitionIndices = topK.map((d) => d.idx);
+        for (const idx of partitionIndices) {
+          this._accessCounts.set(idx, (this._accessCounts.get(idx) || 0) + 1);
+        }
+        return partitionIndices;
+      }
+      /**
+       * Prefetch frequently accessed partitions into cache.
+       * Call after several searches to warm the cache with hot partitions.
+       * @param {number} topN - Number of top partitions to prefetch (default 10)
+       * @param {number} minAccesses - Minimum access count to be considered hot (default 3)
+       */
+      async prefetchHotPartitions(topN = 10, minAccesses = 3) {
+        if (!this._accessCounts || this._accessCounts.size === 0) return;
+        const hotPartitions = [...this._accessCounts.entries()].filter(([_, count]) => count >= minAccesses).sort((a, b) => b[1] - a[1]).slice(0, topN).map(([p]) => p);
+        if (hotPartitions.length === 0) return;
+        await this.fetchPartitionData(hotPartitions, this.dimension);
+      }
+      /**
+       * Get access statistics for debugging/monitoring.
+       */
+      getAccessStats() {
+        return {
+          totalPartitions: this.numPartitions,
+          accessedPartitions: this._accessCounts.size,
+          topPartitions: [...this._accessCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10)
+        };
       }
     };
   }
@@ -3483,31 +3756,52 @@ async function ivfIndexSearch(dataset, queryVec, topK, vectorColIdx, nprobe, onP
   if (!partitionData || partitionData.rowIds.length === 0) {
     throw new Error("IVF index not available. This dataset requires ivf_vectors.bin for efficient search.");
   }
-  const { rowIds, vectors } = partitionData;
-  const scores = new Float32Array(vectors.length);
+  const { rowIds, vectors, preFlattened } = partitionData;
   const dim = queryVec.length;
+  const numVectors = preFlattened ? vectors.length / dim : vectors.length;
+  const scores = new Float32Array(numVectors);
   const accelerator = getWebGPUAccelerator();
   if (accelerator.isAvailable()) {
     const maxBatch = accelerator.getMaxVectorsPerBatch(dim);
-    let gpuProcessed = 0;
-    let wasmProcessed = 0;
-    for (let start = 0; start < vectors.length; start += maxBatch) {
-      const end = Math.min(start + maxBatch, vectors.length);
-      const chunk = vectors.slice(start, end);
-      try {
-        const chunkScores = await accelerator.batchCosineSimilarity(queryVec, chunk, true);
-        if (chunkScores) {
-          scores.set(chunkScores, start);
-          gpuProcessed += chunk.length;
-          continue;
+    if (preFlattened) {
+      for (let vecStart = 0; vecStart < numVectors; vecStart += maxBatch) {
+        const vecEnd = Math.min(vecStart + maxBatch, numVectors);
+        const batchCount = vecEnd - vecStart;
+        const chunk = vectors.subarray(vecStart * dim, vecEnd * dim);
+        try {
+          const chunkScores = await accelerator.batchCosineSimilarity(queryVec, chunk, true, true);
+          if (chunkScores) {
+            scores.set(chunkScores, vecStart);
+            continue;
+          }
+        } catch (e) {
         }
-      } catch (e) {
+        if (dataset.lanceql?.batchCosineSimilarityFlat) {
+          const chunkScores = dataset.lanceql.batchCosineSimilarityFlat(queryVec, chunk, dim, true);
+          scores.set(chunkScores, vecStart);
+        } else {
+          for (let i = 0; i < batchCount; i++) {
+            const offset = i * dim;
+            let dot = 0;
+            for (let k = 0; k < dim; k++) {
+              dot += queryVec[k] * chunk[offset + k];
+            }
+            scores[vecStart + i] = dot;
+          }
+        }
       }
-      if (dataset.lanceql?.batchCosineSimilarity) {
-        const chunkScores = dataset.lanceql.batchCosineSimilarity(queryVec, chunk, true);
-        scores.set(chunkScores, start);
-        wasmProcessed += chunk.length;
-      } else {
+    } else {
+      for (let start = 0; start < numVectors; start += maxBatch) {
+        const end = Math.min(start + maxBatch, numVectors);
+        const chunk = vectors.slice(start, end);
+        try {
+          const chunkScores = await accelerator.batchCosineSimilarity(queryVec, chunk, true, false);
+          if (chunkScores) {
+            scores.set(chunkScores, start);
+            continue;
+          }
+        } catch (e) {
+        }
         for (let i = 0; i < chunk.length; i++) {
           const vec = chunk[i];
           if (!vec || vec.length !== dim) continue;
@@ -3517,15 +3811,20 @@ async function ivfIndexSearch(dataset, queryVec, topK, vectorColIdx, nprobe, onP
           }
           scores[start + i] = dot;
         }
-        wasmProcessed += chunk.length;
       }
     }
   } else {
-    if (dataset.lanceql?.batchCosineSimilarity) {
-      const allScores = dataset.lanceql.batchCosineSimilarity(queryVec, vectors, true);
-      scores.set(allScores);
+    if (preFlattened) {
+      for (let i = 0; i < numVectors; i++) {
+        const offset = i * dim;
+        let dot = 0;
+        for (let k = 0; k < dim; k++) {
+          dot += queryVec[k] * vectors[offset + k];
+        }
+        scores[i] = dot;
+      }
     } else {
-      for (let i = 0; i < vectors.length; i++) {
+      for (let i = 0; i < numVectors; i++) {
         const vec = vectors[i];
         if (!vec || vec.length !== dim) continue;
         let dot = 0;
@@ -3537,12 +3836,12 @@ async function ivfIndexSearch(dataset, queryVec, topK, vectorColIdx, nprobe, onP
     }
   }
   if (onProgress) onProgress(90, 100);
-  const allResults = [];
+  const allResults = new Array(rowIds.length);
   for (let i = 0; i < rowIds.length; i++) {
-    allResults.push({ index: rowIds[i], score: scores[i] });
+    allResults[i] = { index: rowIds[i], score: scores[i] };
   }
-  allResults.sort((a, b) => b.score - a.score);
   const finalK = Math.min(topK, allResults.length);
+  quickselectTopK2(allResults, finalK);
   if (onProgress) onProgress(100, 100);
   return {
     indices: allResults.slice(0, finalK).map((r) => r.index),
@@ -3550,6 +3849,34 @@ async function ivfIndexSearch(dataset, queryVec, topK, vectorColIdx, nprobe, onP
     usedIndex: true,
     searchedRows: rowIds.length
   };
+}
+function quickselectTopK2(arr, k) {
+  if (k >= arr.length || k <= 0) return;
+  let left = 0;
+  let right = arr.length - 1;
+  while (left < right) {
+    const mid = left + right >> 1;
+    if (arr[mid].score > arr[left].score) swap2(arr, left, mid);
+    if (arr[right].score > arr[left].score) swap2(arr, left, right);
+    if (arr[mid].score > arr[right].score) swap2(arr, mid, right);
+    const pivot = arr[right].score;
+    let i = left;
+    for (let j = left; j < right; j++) {
+      if (arr[j].score >= pivot) {
+        swap2(arr, i, j);
+        i++;
+      }
+    }
+    swap2(arr, i, right);
+    if (i === k - 1) break;
+    if (i < k - 1) left = i + 1;
+    else right = i - 1;
+  }
+}
+function swap2(arr, i, j) {
+  const tmp = arr[i];
+  arr[i] = arr[j];
+  arr[j] = tmp;
 }
 function findVectorColumn(dataset) {
   if (!dataset._schema) return -1;
@@ -5573,111 +5900,7 @@ var init_lanceql = __esm({
 
 // src/client/index.js
 init_metadata_cache();
-
-// src/client/cache/lru-cache.js
-var LRUCache2 = class {
-  constructor(options = {}) {
-    this.maxSize = options.maxSize ?? 50 * 1024 * 1024;
-    this.currentSize = 0;
-    this.cache = /* @__PURE__ */ new Map();
-    this._accessCounter = 0;
-  }
-  /**
-   * Get item from cache
-   * @param {string} key - Cache key
-   * @returns {Uint8Array|null}
-   */
-  get(key) {
-    const entry = this.cache.get(key);
-    if (entry) {
-      entry.lastAccess = ++this._accessCounter;
-      return entry.data;
-    }
-    return void 0;
-  }
-  delete(key) {
-    const entry = this.cache.get(key);
-    if (entry) {
-      this.currentSize -= entry.size;
-      this.cache.delete(key);
-      return true;
-    }
-    return false;
-  }
-  /**
-   * Put item in cache
-   * @param {string} key - Cache key
-   * @param {Uint8Array} data - Data to cache
-   */
-  put(key, data) {
-    if (this.cache.has(key)) {
-      this.currentSize -= this.cache.get(key).size;
-      this.cache.delete(key);
-    }
-    let size = 0;
-    if (data === null || data === void 0) {
-      size = 0;
-    } else if (data.byteLength !== void 0) {
-      size = data.byteLength;
-    } else if (typeof data === "string") {
-      size = data.length * 2;
-    } else if (typeof data === "object") {
-      size = JSON.stringify(data).length * 2;
-    } else {
-      size = 8;
-    }
-    while (this.currentSize + size > this.maxSize && this.cache.size > 0) {
-      this._evictOldest();
-    }
-    if (size > this.maxSize) {
-      return;
-    }
-    this.cache.set(key, {
-      data,
-      size,
-      lastAccess: ++this._accessCounter
-    });
-    this.currentSize += size;
-  }
-  /**
-   * Evict oldest entry
-   */
-  _evictOldest() {
-    let oldestKey = null;
-    let oldestTime = Infinity;
-    for (const [key, entry] of this.cache) {
-      if (entry.lastAccess < oldestTime) {
-        oldestTime = entry.lastAccess;
-        oldestKey = key;
-      }
-    }
-    if (oldestKey) {
-      this.currentSize -= this.cache.get(oldestKey).size;
-      this.cache.delete(oldestKey);
-    }
-  }
-  /**
-   * Clear entire cache
-   */
-  clear() {
-    this.cache.clear();
-    this.currentSize = 0;
-  }
-  /**
-   * Get cache stats
-   */
-  stats() {
-    return {
-      entries: this.cache.size,
-      currentSize: this.currentSize,
-      maxSize: this.maxSize,
-      utilization: (this.currentSize / this.maxSize * 100).toFixed(1) + "%"
-    };
-  }
-};
-var LANCE_MAGIC2 = new Uint8Array([76, 65, 78, 67]);
-
-// src/client/index.js
+init_lru_cache();
 init_hot_tier_cache();
 init_accelerator();
 
@@ -9533,16 +9756,16 @@ async function executeBM25Search(executor, nearInfo, totalRows) {
   }
   const queryTokens = tokenize(text);
   if (queryTokens.length === 0) return [];
-  const cacheKey = `fts_${colIdx}`;
-  if (!executor._ftsIndexCache) executor._ftsIndexCache = /* @__PURE__ */ new Map();
-  let index = executor._ftsIndexCache.get(cacheKey);
+  const cacheKey = `fts_${colIdx}_${totalRows}`;
+  if (!executor.file._ftsIndexCache) executor.file._ftsIndexCache = /* @__PURE__ */ new Map();
+  let index = executor.file._ftsIndexCache.get(cacheKey);
   if (!index) {
     index = await buildFTSIndex(
       (idx, indices) => executor.readColumnData(idx, indices),
       colIdx,
       totalRows
     );
-    executor._ftsIndexCache.set(cacheKey, index);
+    executor.file._ftsIndexCache.set(cacheKey, index);
   }
   const scores = computeBM25Scores(queryTokens, index);
   return topKByScore(scores, limit);
@@ -9669,6 +9892,7 @@ function getFrameBounds(frame, partition, currentIdx) {
   let endIdx = currentIdx;
   const start = frame.start || { type: "UNBOUNDED PRECEDING" };
   const startType = start.type.replace(" ", "_").toUpperCase();
+  const startOffset = Number(start.offset ?? start.value ?? 1) || 1;
   switch (startType) {
     case "UNBOUNDED_PRECEDING":
       startIdx = 0;
@@ -9677,14 +9901,15 @@ function getFrameBounds(frame, partition, currentIdx) {
       startIdx = currentIdx;
       break;
     case "PRECEDING":
-      startIdx = Math.max(0, currentIdx - (start.offset || start.value || 1));
+      startIdx = Math.max(0, currentIdx - startOffset);
       break;
     case "FOLLOWING":
-      startIdx = Math.min(n - 1, currentIdx + (start.offset || start.value || 1));
+      startIdx = Math.min(n - 1, currentIdx + startOffset);
       break;
   }
   const end = frame.end || { type: "CURRENT ROW" };
   const endType = end.type.replace(" ", "_").toUpperCase();
+  const endOffset = Number(end.offset ?? end.value ?? 1) || 1;
   switch (endType) {
     case "UNBOUNDED_FOLLOWING":
       endIdx = n - 1;
@@ -9693,10 +9918,10 @@ function getFrameBounds(frame, partition, currentIdx) {
       endIdx = currentIdx;
       break;
     case "PRECEDING":
-      endIdx = Math.max(0, currentIdx - (end.offset || end.value || 1));
+      endIdx = Math.max(0, currentIdx - endOffset);
       break;
     case "FOLLOWING":
-      endIdx = Math.min(n - 1, currentIdx + (end.offset || end.value || 1));
+      endIdx = Math.min(n - 1, currentIdx + endOffset);
       break;
   }
   if (startIdx > endIdx) [startIdx, endIdx] = [endIdx, startIdx];
@@ -9734,9 +9959,9 @@ function computeWindowFunction(funcName, args, over, rows, columnData, evaluateE
           break;
         }
         case "NTILE": {
-          const n = args[0]?.value || 1;
-          const bucketSize = Math.ceil(partition.length / n);
-          results[rowIdx] = Math.floor(i / bucketSize) + 1;
+          const requestedN = Math.max(1, Number(args[0]?.value) || 1);
+          const n = Math.min(requestedN, partition.length);
+          results[rowIdx] = Math.floor(i * n / partition.length) + 1;
           break;
         }
         case "PERCENT_RANK": {
@@ -9801,9 +10026,12 @@ function computeWindowFunction(funcName, args, over, rows, columnData, evaluateE
           break;
         }
         case "NTH_VALUE": {
-          const n = args[1]?.value || 1;
-          if (n > 0 && n <= partition.length) {
-            const nthRowIdx = partition[n - 1].idx;
+          const n = Number(args[1]?.value) || 1;
+          const frame = over.frame || { type: "RANGE", start: { type: "UNBOUNDED_PRECEDING" }, end: { type: "CURRENT_ROW" } };
+          const [startIdx, endIdx] = getFrameBounds(frame, partition, i);
+          const frameSize = endIdx - startIdx + 1;
+          if (n > 0 && n <= frameSize) {
+            const nthRowIdx = partition[startIdx + n - 1].idx;
             results[rowIdx] = evaluateExpr2(args[0], columnData, nthRowIdx);
           } else {
             results[rowIdx] = null;
@@ -9829,7 +10057,8 @@ function computeWindowFunction(funcName, args, over, rows, columnData, evaluateE
             frameRowCount++;
             if (!isStar) {
               const val = evaluateExpr2(args[0], columnData, partition[j].idx);
-              if (val != null) values.push(Number(val));
+              const numVal = Number(val);
+              if (val != null && !isNaN(numVal)) values.push(numVal);
             }
           }
           let result = null;
@@ -9947,7 +10176,10 @@ function executeWindowFunctions(executor, ast, data, columnData, filteredIndices
     finalRows.sort((a, b) => {
       for (const ob of ast.orderBy) {
         const colIdx = colIdxMap[ob.column.toLowerCase()];
-        if (colIdx === void 0) continue;
+        if (colIdx === void 0) {
+          console.warn(`[SQLExecutor] ORDER BY column '${ob.column}' not found in result columns`);
+          continue;
+        }
         const valA = a[colIdx], valB = b[colIdx];
         const dir = ob.descending || ob.direction === "DESC" ? -1 : 1;
         if (valA == null && valB == null) continue;
@@ -10000,10 +10232,10 @@ async function evaluateSimpleFilter(executor, filter, totalRows, onProgress) {
       onProgress(`Filtering ${filter.column}... ${pct}%`, batchStart, totalRows);
     }
     const batchEnd = Math.min(batchStart + batchSize, totalRows);
-    const batchIndices2 = [];
-    for (let i = batchStart; i < batchEnd; i++) {
-      batchIndices2.push(i);
-    }
+    const batchIndices2 = Array.from(
+      { length: batchEnd - batchStart },
+      (_, i) => batchStart + i
+    );
     const colData = await executor.readColumnData(filter.colIdx, batchIndices2);
     for (let i = 0; i < batchIndices2.length; i++) {
       const val = colData[i];
@@ -10048,10 +10280,10 @@ async function evaluateComplexFilter(executor, whereExpr, totalRows, onProgress)
       onProgress(`Filtering rows...`, batchStart, totalRows);
     }
     const batchEnd = Math.min(batchStart + batchSize, totalRows);
-    const batchIndices2 = [];
-    for (let i = batchStart; i < batchEnd; i++) {
-      batchIndices2.push(i);
-    }
+    const batchIndices2 = Array.from(
+      { length: batchEnd - batchStart },
+      (_, i) => batchStart + i
+    );
     const batchData = {};
     for (const colName of neededCols) {
       const colIdx = executor.columnMap[colName.toLowerCase()];
@@ -10134,6 +10366,7 @@ function evaluateExpr(executor, expr, columnData, rowIdx) {
       const value = evaluateExpr(executor, expr.expr, columnData, rowIdx);
       const low = evaluateExpr(executor, expr.low, columnData, rowIdx);
       const high = evaluateExpr(executor, expr.high, columnData, rowIdx);
+      if (value == null || low == null || high == null) return null;
       return value >= low && value <= high;
     }
     case "like": {
@@ -10235,8 +10468,14 @@ function evaluateInMemoryExpr(expr, columnData, rowIdx) {
         case "LENGTH":
           return String(args[0]).length;
         case "SUBSTR":
-        case "SUBSTRING":
-          return String(args[0]).substring(args[1] - 1, args[2] ? args[1] - 1 + args[2] : void 0);
+        case "SUBSTRING": {
+          if (args[0] == null || args[1] == null) return null;
+          const start = Number(args[1]);
+          if (isNaN(start)) return null;
+          const len = args[2] != null ? Number(args[2]) : void 0;
+          if (len !== void 0 && (isNaN(len) || len < 0)) return null;
+          return String(args[0]).substring(start - 1, len !== void 0 ? start - 1 + len : void 0);
+        }
         case "COALESCE":
           return args.find((a) => a != null) ?? null;
         case "ABS":
@@ -10263,6 +10502,7 @@ function evaluateInMemoryExpr(expr, columnData, rowIdx) {
       const val = evaluateInMemoryExpr(expr.expr, columnData, rowIdx);
       const low = evaluateInMemoryExpr(expr.low, columnData, rowIdx);
       const high = evaluateInMemoryExpr(expr.high, columnData, rowIdx);
+      if (val == null || low == null || high == null) return null;
       return val >= low && val <= high;
     }
     case "like": {
@@ -10656,7 +10896,13 @@ function getAllGroupColumns(groupBy) {
   }
   return columns;
 }
+var MAX_POWERSET_COLUMNS = 12;
 function powerSet(arr) {
+  if (arr.length > MAX_POWERSET_COLUMNS) {
+    throw new Error(
+      `CUBE/ROLLUP power set limited to ${MAX_POWERSET_COLUMNS} columns (got ${arr.length}). This would generate ${Math.pow(2, arr.length)} groupings.`
+    );
+  }
   const result = [[]];
   for (const item of arr) {
     const len = result.length;
@@ -10946,8 +11192,9 @@ function executeGroupByAggregation(executor, ast, data, columnData, filteredIndi
     if (hasGroupByClause) {
       groupKey = ast.groupBy.map((expr) => {
         const colName = (expr.column || expr.name || "").toLowerCase();
-        return JSON.stringify(columnData[colName]?.[idx]);
-      }).join("|");
+        const val = columnData[colName]?.[idx];
+        return val == null ? "\0" : String(val);
+      }).join("");
     }
     if (!groups.has(groupKey)) {
       groups.set(groupKey, []);
@@ -11025,7 +11272,7 @@ function executeGroupByAggregation(executor, ast, data, columnData, filteredIndi
 
 // src/client/sql/executor-subquery.js
 function executeSubquery(executor, subqueryAst, outerColumnData, outerRowIdx) {
-  const resolvedAst = JSON.parse(JSON.stringify(subqueryAst));
+  const resolvedAst = structuredClone(subqueryAst);
   const subqueryTable = resolvedAst.from?.name || resolvedAst.from?.table;
   const correlatedColumns = findCorrelatedColumns(resolvedAst, subqueryTable);
   const correlationContext = {};
@@ -11224,13 +11471,14 @@ function executeOnInMemoryData(executor, ast, data) {
 
 // src/client/sql/executor.js
 var SQLExecutor = class {
-  constructor(file) {
+  constructor(file, options = {}) {
     this.file = file;
     this.columnMap = {};
     this.columnTypes = [];
     this._cteResults = /* @__PURE__ */ new Map();
     this._database = null;
     this._ftsIndexCache = null;
+    this._debug = options.debug ?? false;
     if (file.columnNames) {
       file.columnNames.forEach((name, idx) => {
         this.columnMap[name.toLowerCase()] = idx;
@@ -11403,11 +11651,13 @@ var SQLExecutor = class {
       } else {
         try {
           return await this.file.readStringsAtIndices(colIdx, indices);
-        } catch {
+        } catch (e) {
+          if (this._debug) console.warn(`[SQLExecutor] readColumnData col ${colIdx} fallback failed:`, e.message);
           return indices.map(() => null);
         }
       }
-    } catch {
+    } catch (e) {
+      if (this._debug) console.warn(`[SQLExecutor] readColumnData col ${colIdx} failed:`, e.message);
       return indices.map(() => null);
     }
   }

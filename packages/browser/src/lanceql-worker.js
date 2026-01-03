@@ -4042,16 +4042,16 @@ async function executeNearSearch(rows, nearCondition, limit) {
   const column = typeof nearCondition.column === "string" ? nearCondition.column : nearCondition.column.column;
   const text = nearCondition.text;
   const topK = nearCondition.topK || limit || 10;
-  if (!gpuTransformer) {
+  if (!gpuTransformer2) {
     throw new Error("NEAR requires a text encoder model. Load a model first with store.loadModel()");
   }
   let queryVec;
   try {
-    const models = gpuTransformer.getLoadedModels?.() || [];
+    const models = gpuTransformer2.getLoadedModels?.() || [];
     if (models.length === 0) {
       throw new Error("No text encoder model loaded");
     }
-    queryVec = await gpuTransformer.encodeText(text, models[0]);
+    queryVec = await gpuTransformer2.encodeText(text, models[0]);
   } catch (e) {
     throw new Error(`NEAR failed to encode query: ${e.message}`);
   }
@@ -4065,8 +4065,8 @@ async function executeNearSearch(rows, nearCondition, limit) {
       const cacheKey = `sql:${column}:${colValue}`;
       let itemVec = embeddingCache.get(cacheKey);
       if (!itemVec) {
-        const models = gpuTransformer.getLoadedModels?.() || [];
-        itemVec = await gpuTransformer.encodeText(colValue, models[0]);
+        const models = gpuTransformer2.getLoadedModels?.() || [];
+        itemVec = await gpuTransformer2.encodeText(colValue, models[0]);
         embeddingCache.set(cacheKey, itemVec);
       }
       const score = cosineSimilarity(queryVec, itemVec);

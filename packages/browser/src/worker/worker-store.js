@@ -21,6 +21,10 @@ export function getEmbeddingCache() {
     return embeddingCache;
 }
 
+export function getGPUTransformerState() {
+    return gpuTransformer;
+}
+
 export class WorkerStore {
     constructor(name, options = {}) {
         this.name = name;

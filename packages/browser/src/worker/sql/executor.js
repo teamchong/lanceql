@@ -4,6 +4,7 @@
 
 import { TokenType, SQLLexer } from './tokenizer.js';
 import { SQLParser } from './parser.js';
+import { getGPUTransformerState, getEmbeddingCache } from '../worker-store.js';
 
 function getColumnValue(row, column, tableAliases = {}) {
     if (typeof column === 'string') {
@@ -1479,6 +1480,7 @@ async function executeNearSearch(rows, nearCondition, limit) {
     const topK = nearCondition.topK || limit || 10;
 
     // Check if gpuTransformer is available and has a loaded model
+    const gpuTransformer = getGPUTransformerState();
     if (!gpuTransformer) {
         throw new Error('NEAR requires a text encoder model. Load a model first with store.loadModel()');
     }
@@ -1498,6 +1500,7 @@ async function executeNearSearch(rows, nearCondition, limit) {
 
     // Score each row
     const scored = [];
+    const embeddingCache = getEmbeddingCache();
     for (const row of rows) {
         const colValue = row[column];
 
