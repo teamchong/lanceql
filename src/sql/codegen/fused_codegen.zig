@@ -176,6 +176,12 @@ pub const FusedCodeGen = struct {
     /// Flag indicating this is a GROUP BY query
     has_group_by: bool,
 
+    /// HAVING clause expression (for GROUP BY filtering)
+    having_expr: ?*const ast.Expr,
+
+    /// DISTINCT flag - requires deduplication in output
+    has_distinct: bool,
+
     /// SIMD vector functions to generate (name -> op type)
     simd_functions: std.StringHashMap(SimdOp),
 
@@ -211,6 +217,8 @@ pub const FusedCodeGen = struct {
             .group_keys = .{},
             .aggregate_specs = .{},
             .has_group_by = false,
+            .having_expr = null,
+            .has_distinct = false,
             .simd_functions = std.StringHashMap(SimdOp).init(allocator),
             .join_info = null,
             .right_columns = std.StringHashMap(ColumnType).init(allocator),
@@ -466,6 +474,10 @@ pub const FusedCodeGen = struct {
             },
             .project => |project| {
                 try self.analyzePlan(project.input);
+                // Track DISTINCT flag
+                if (project.distinct) {
+                    self.has_distinct = true;
+                }
             },
             .compute => |compute| {
                 try self.analyzePlan(compute.input);
@@ -499,6 +511,11 @@ pub const FusedCodeGen = struct {
                     if (agg.input_col) |col| {
                         try self.addInputColumn(col.column, col.col_type);
                     }
+                }
+
+                // Capture HAVING clause expression
+                if (group_by.having) |having| {
+                    self.having_expr = having;
                 }
             },
             .sort => |sort| {
@@ -863,7 +880,9 @@ pub const FusedCodeGen = struct {
                 .first_value => try self.genWindowFirstLastValue(spec, true),
                 .last_value => try self.genWindowFirstLastValue(spec, false),
                 .ntile => try self.genWindowNtile(spec),
-                else => {}, // nth_value, percent_rank, cume_dist not yet supported
+                .nth_value => try self.genWindowNthValue(spec),
+                .percent_rank => try self.genWindowPercentRank(spec),
+                .cume_dist => try self.genWindowCumeDist(spec),
             }
         }
     }
@@ -1237,6 +1256,440 @@ pub const FusedCodeGen = struct {
         try self.write("}\n\n");
     }
 
+    /// Generate NTH_VALUE window function
+    fn genWindowNthValue(self: *Self, spec: WindowFuncInfo) CodeGenError!void {
+        const n: i64 = spec.offset; // The N value (1-based)
+
+        try self.fmt("fn computeWindow_{s}(columns: *const Columns, results: []i64) void {{\n", .{spec.name});
+        self.indent += 1;
+
+        // Create index array
+        try self.writeIndent();
+        try self.write("var indices: [4096]u32 = undefined;\n");
+        try self.writeIndent();
+        try self.write("var idx: u32 = 0;\n");
+        try self.writeIndent();
+        try self.write("while (idx < columns.len) : (idx += 1) indices[idx] = idx;\n\n");
+
+        // Generate sort
+        if (spec.partition_cols.len > 0 or spec.order_cols.len > 0) {
+            try self.genWindowSort(spec);
+        }
+
+        // Compute NTH_VALUE per partition
+        try self.writeIndent();
+        if (spec.partition_cols.len > 0) {
+            try self.fmt("var current_partition: i64 = columns.{s}[indices[0]];\n", .{spec.partition_cols[0]});
+            try self.writeIndent();
+            try self.write("var partition_start: usize = 0;\n\n");
+
+            try self.writeIndent();
+            try self.write("for (indices[0..columns.len], 0..) |i, pos| {\n");
+            self.indent += 1;
+            try self.writeIndent();
+            try self.fmt("if (columns.{s}[i] != current_partition) {{\n", .{spec.partition_cols[0]});
+            self.indent += 1;
+
+            // End of partition - compute nth value for previous partition
+            try self.writeIndent();
+            try self.write("const part_size = pos - partition_start;\n");
+            try self.writeIndent();
+            try self.fmt("const nth_val: i64 = if ({d} <= part_size) blk: {{\n", .{n});
+            self.indent += 1;
+            try self.writeIndent();
+            try self.fmt("const nth_idx = indices[partition_start + {d} - 1];\n", .{n});
+            try self.writeIndent();
+            if (spec.order_cols.len > 0) {
+                try self.fmt("break :blk columns.{s}[nth_idx];\n", .{spec.order_cols[0]});
+            } else {
+                try self.write("break :blk 0;\n");
+            }
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}} else 0;\n"); // NULL represented as 0
+
+            try self.writeIndent();
+            try self.write("for (indices[partition_start..pos]) |pi| results[pi] = nth_val;\n");
+
+            // Start new partition
+            try self.writeIndent();
+            try self.fmt("current_partition = columns.{s}[i];\n", .{spec.partition_cols[0]});
+            try self.writeIndent();
+            try self.write("partition_start = pos;\n");
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+
+            // Handle last partition
+            try self.writeIndent();
+            try self.write("const part_size = columns.len - partition_start;\n");
+            try self.writeIndent();
+            try self.fmt("const nth_val: i64 = if ({d} <= part_size) blk: {{\n", .{n});
+            self.indent += 1;
+            try self.writeIndent();
+            try self.fmt("const nth_idx = indices[partition_start + {d} - 1];\n", .{n});
+            try self.writeIndent();
+            if (spec.order_cols.len > 0) {
+                try self.fmt("break :blk columns.{s}[nth_idx];\n", .{spec.order_cols[0]});
+            } else {
+                try self.write("break :blk 0;\n");
+            }
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}} else 0;\n");
+            try self.writeIndent();
+            try self.write("for (indices[partition_start..columns.len]) |pi| results[pi] = nth_val;\n");
+        } else {
+            // No partitions - compute nth value for all rows
+            try self.fmt("const nth_val: i64 = if ({d} <= columns.len) blk: {{\n", .{n});
+            self.indent += 1;
+            try self.writeIndent();
+            try self.fmt("const nth_idx = indices[{d} - 1];\n", .{n});
+            try self.writeIndent();
+            if (spec.order_cols.len > 0) {
+                try self.fmt("break :blk columns.{s}[nth_idx];\n", .{spec.order_cols[0]});
+            } else {
+                try self.write("break :blk 0;\n");
+            }
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}} else 0;\n");
+            try self.writeIndent();
+            try self.write("for (indices[0..columns.len]) |i| results[i] = nth_val;\n");
+        }
+
+        self.indent -= 1;
+        try self.write("}\n\n");
+    }
+
+    /// Generate PERCENT_RANK window function
+    /// Formula: (rank - 1) / (partition_size - 1), returns 0.0 if partition_size == 1
+    fn genWindowPercentRank(self: *Self, spec: WindowFuncInfo) CodeGenError!void {
+        try self.fmt("fn computeWindow_{s}(columns: *const Columns, results: []f64) void {{\n", .{spec.name});
+        self.indent += 1;
+
+        // Create index array
+        try self.writeIndent();
+        try self.write("var indices: [4096]u32 = undefined;\n");
+        try self.writeIndent();
+        try self.write("var idx: u32 = 0;\n");
+        try self.writeIndent();
+        try self.write("while (idx < columns.len) : (idx += 1) indices[idx] = idx;\n\n");
+
+        // Generate sort
+        if (spec.partition_cols.len > 0 or spec.order_cols.len > 0) {
+            try self.genWindowSort(spec);
+        }
+
+        // Compute PERCENT_RANK per partition
+        try self.writeIndent();
+        if (spec.partition_cols.len > 0) {
+            try self.fmt("var current_partition: i64 = columns.{s}[indices[0]];\n", .{spec.partition_cols[0]});
+            try self.writeIndent();
+            try self.write("var partition_start: usize = 0;\n");
+            try self.writeIndent();
+            try self.write("var current_rank: usize = 1;\n");
+            if (spec.order_cols.len > 0) {
+                try self.writeIndent();
+                try self.fmt("var prev_order_val: i64 = columns.{s}[indices[0]];\n", .{spec.order_cols[0]});
+            }
+            try self.write("\n");
+
+            try self.writeIndent();
+            try self.write("for (indices[0..columns.len], 0..) |i, pos| {\n");
+            self.indent += 1;
+
+            // Check partition change
+            try self.writeIndent();
+            try self.fmt("if (columns.{s}[i] != current_partition) {{\n", .{spec.partition_cols[0]});
+            self.indent += 1;
+            try self.writeIndent();
+            try self.fmt("current_partition = columns.{s}[i];\n", .{spec.partition_cols[0]});
+            try self.writeIndent();
+            try self.write("partition_start = pos;\n");
+            try self.writeIndent();
+            try self.write("current_rank = 1;\n");
+            if (spec.order_cols.len > 0) {
+                try self.writeIndent();
+                try self.fmt("prev_order_val = columns.{s}[i];\n", .{spec.order_cols[0]});
+            }
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("} else {\n");
+            self.indent += 1;
+
+            // Check order value change for rank update
+            if (spec.order_cols.len > 0) {
+                try self.writeIndent();
+                try self.fmt("if (columns.{s}[i] != prev_order_val) {{\n", .{spec.order_cols[0]});
+                self.indent += 1;
+                try self.writeIndent();
+                try self.write("current_rank = pos - partition_start + 1;\n");
+                try self.writeIndent();
+                try self.fmt("prev_order_val = columns.{s}[i];\n", .{spec.order_cols[0]});
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.write("}\n");
+            }
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+
+            // Calculate percent_rank for this row
+            try self.writeIndent();
+            try self.write("const part_size_so_far = pos - partition_start + 1;\n");
+            try self.writeIndent();
+            try self.write("_ = part_size_so_far;\n"); // Suppress unused warning
+            try self.writeIndent();
+            try self.write("results[i] = if (current_rank == 1) 0.0 else @as(f64, @floatFromInt(current_rank - 1));\n");
+
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+
+            // Second pass: divide by (partition_size - 1)
+            try self.writeIndent();
+            try self.fmt("current_partition = columns.{s}[indices[0]];\n", .{spec.partition_cols[0]});
+            try self.writeIndent();
+            try self.write("partition_start = 0;\n");
+            try self.writeIndent();
+            try self.write("for (indices[0..columns.len], 0..) |_, pos| {\n");
+            self.indent += 1;
+            try self.writeIndent();
+            try self.write("const i = indices[pos];\n");
+            try self.writeIndent();
+            try self.fmt("if (columns.{s}[i] != current_partition) {{\n", .{spec.partition_cols[0]});
+            self.indent += 1;
+            try self.writeIndent();
+            try self.write("const part_size = pos - partition_start;\n");
+            try self.writeIndent();
+            try self.write("const divisor: f64 = if (part_size <= 1) 1.0 else @floatFromInt(part_size - 1);\n");
+            try self.writeIndent();
+            try self.write("for (indices[partition_start..pos]) |pi| results[pi] /= divisor;\n");
+            try self.writeIndent();
+            try self.fmt("current_partition = columns.{s}[i];\n", .{spec.partition_cols[0]});
+            try self.writeIndent();
+            try self.write("partition_start = pos;\n");
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+            // Handle last partition
+            try self.writeIndent();
+            try self.write("const part_size = columns.len - partition_start;\n");
+            try self.writeIndent();
+            try self.write("const divisor: f64 = if (part_size <= 1) 1.0 else @floatFromInt(part_size - 1);\n");
+            try self.writeIndent();
+            try self.write("for (indices[partition_start..columns.len]) |pi| results[pi] /= divisor;\n");
+        } else {
+            // No partitions - compute for all rows
+            try self.writeIndent();
+            try self.write("const divisor: f64 = if (columns.len <= 1) 1.0 else @floatFromInt(columns.len - 1);\n");
+            try self.writeIndent();
+            try self.write("var current_rank: usize = 1;\n");
+            if (spec.order_cols.len > 0) {
+                try self.writeIndent();
+                try self.fmt("var prev_order_val: i64 = columns.{s}[indices[0]];\n", .{spec.order_cols[0]});
+            }
+            try self.writeIndent();
+            try self.write("for (indices[0..columns.len], 0..) |i, pos| {\n");
+            self.indent += 1;
+            if (spec.order_cols.len > 0) {
+                try self.writeIndent();
+                try self.fmt("if (columns.{s}[i] != prev_order_val) {{\n", .{spec.order_cols[0]});
+                self.indent += 1;
+                try self.writeIndent();
+                try self.write("current_rank = pos + 1;\n");
+                try self.writeIndent();
+                try self.fmt("prev_order_val = columns.{s}[i];\n", .{spec.order_cols[0]});
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.write("}\n");
+            }
+            try self.writeIndent();
+            try self.write("results[i] = @as(f64, @floatFromInt(current_rank - 1)) / divisor;\n");
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+        }
+
+        self.indent -= 1;
+        try self.write("}\n\n");
+    }
+
+    /// Generate CUME_DIST window function
+    /// Formula: (number of rows with value <= current row) / partition_size
+    fn genWindowCumeDist(self: *Self, spec: WindowFuncInfo) CodeGenError!void {
+        try self.fmt("fn computeWindow_{s}(columns: *const Columns, results: []f64) void {{\n", .{spec.name});
+        self.indent += 1;
+
+        // Create index array
+        try self.writeIndent();
+        try self.write("var indices: [4096]u32 = undefined;\n");
+        try self.writeIndent();
+        try self.write("var idx: u32 = 0;\n");
+        try self.writeIndent();
+        try self.write("while (idx < columns.len) : (idx += 1) indices[idx] = idx;\n\n");
+
+        // Generate sort
+        if (spec.partition_cols.len > 0 or spec.order_cols.len > 0) {
+            try self.genWindowSort(spec);
+        }
+
+        // Compute CUME_DIST per partition
+        try self.writeIndent();
+        if (spec.partition_cols.len > 0) {
+            try self.fmt("var current_partition: i64 = columns.{s}[indices[0]];\n", .{spec.partition_cols[0]});
+            try self.writeIndent();
+            try self.write("var partition_start: usize = 0;\n");
+            try self.writeIndent();
+            try self.write("var rows_up_to: usize = 1;\n");
+            if (spec.order_cols.len > 0) {
+                try self.writeIndent();
+                try self.fmt("var prev_order_val: i64 = columns.{s}[indices[0]];\n", .{spec.order_cols[0]});
+            }
+            try self.write("\n");
+
+            // First pass: compute rows_up_to for each position
+            try self.writeIndent();
+            try self.write("for (indices[0..columns.len], 0..) |i, pos| {\n");
+            self.indent += 1;
+
+            // Check partition change
+            try self.writeIndent();
+            try self.fmt("if (columns.{s}[i] != current_partition) {{\n", .{spec.partition_cols[0]});
+            self.indent += 1;
+            try self.writeIndent();
+            try self.fmt("current_partition = columns.{s}[i];\n", .{spec.partition_cols[0]});
+            try self.writeIndent();
+            try self.write("partition_start = pos;\n");
+            try self.writeIndent();
+            try self.write("rows_up_to = 1;\n");
+            if (spec.order_cols.len > 0) {
+                try self.writeIndent();
+                try self.fmt("prev_order_val = columns.{s}[i];\n", .{spec.order_cols[0]});
+            }
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("} else {\n");
+            self.indent += 1;
+
+            // Check order value change
+            if (spec.order_cols.len > 0) {
+                try self.writeIndent();
+                try self.fmt("if (columns.{s}[i] != prev_order_val) {{\n", .{spec.order_cols[0]});
+                self.indent += 1;
+                try self.writeIndent();
+                try self.write("rows_up_to = pos - partition_start + 1;\n");
+                try self.writeIndent();
+                try self.fmt("prev_order_val = columns.{s}[i];\n", .{spec.order_cols[0]});
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.write("} else {\n");
+                self.indent += 1;
+                try self.writeIndent();
+                try self.write("rows_up_to = pos - partition_start + 1;\n");
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.write("}\n");
+            } else {
+                try self.writeIndent();
+                try self.write("rows_up_to = pos - partition_start + 1;\n");
+            }
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+
+            // Store temporary rank (will normalize in second pass)
+            try self.writeIndent();
+            try self.write("results[i] = @floatFromInt(rows_up_to);\n");
+
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+
+            // Second pass: divide by partition_size
+            try self.writeIndent();
+            try self.fmt("current_partition = columns.{s}[indices[0]];\n", .{spec.partition_cols[0]});
+            try self.writeIndent();
+            try self.write("partition_start = 0;\n");
+            try self.writeIndent();
+            try self.write("for (indices[0..columns.len], 0..) |_, pos| {\n");
+            self.indent += 1;
+            try self.writeIndent();
+            try self.write("const i = indices[pos];\n");
+            try self.writeIndent();
+            try self.fmt("if (columns.{s}[i] != current_partition) {{\n", .{spec.partition_cols[0]});
+            self.indent += 1;
+            try self.writeIndent();
+            try self.write("const part_size: f64 = @floatFromInt(pos - partition_start);\n");
+            try self.writeIndent();
+            try self.write("for (indices[partition_start..pos]) |pi| results[pi] /= part_size;\n");
+            try self.writeIndent();
+            try self.fmt("current_partition = columns.{s}[i];\n", .{spec.partition_cols[0]});
+            try self.writeIndent();
+            try self.write("partition_start = pos;\n");
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+            // Handle last partition
+            try self.writeIndent();
+            try self.write("const part_size: f64 = @floatFromInt(columns.len - partition_start);\n");
+            try self.writeIndent();
+            try self.write("for (indices[partition_start..columns.len]) |pi| results[pi] /= part_size;\n");
+        } else {
+            // No partitions - compute for all rows
+            try self.writeIndent();
+            try self.write("const total: f64 = @floatFromInt(columns.len);\n");
+            try self.writeIndent();
+            try self.write("var rows_up_to: usize = 1;\n");
+            if (spec.order_cols.len > 0) {
+                try self.writeIndent();
+                try self.fmt("var prev_order_val: i64 = columns.{s}[indices[0]];\n", .{spec.order_cols[0]});
+            }
+            try self.writeIndent();
+            try self.write("for (indices[0..columns.len], 0..) |i, pos| {\n");
+            self.indent += 1;
+            if (spec.order_cols.len > 0) {
+                try self.writeIndent();
+                try self.fmt("if (columns.{s}[i] != prev_order_val) {{\n", .{spec.order_cols[0]});
+                self.indent += 1;
+                try self.writeIndent();
+                try self.write("rows_up_to = pos + 1;\n");
+                try self.writeIndent();
+                try self.fmt("prev_order_val = columns.{s}[i];\n", .{spec.order_cols[0]});
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.write("} else {\n");
+                self.indent += 1;
+                try self.writeIndent();
+                try self.write("rows_up_to = pos + 1;\n");
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.write("}\n");
+            } else {
+                try self.writeIndent();
+                try self.write("rows_up_to = pos + 1;\n");
+            }
+            try self.writeIndent();
+            try self.write("results[i] = @as(f64, @floatFromInt(rows_up_to)) / total;\n");
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+        }
+
+        self.indent -= 1;
+        try self.write("}\n\n");
+    }
+
     /// Generate sort context for window function
     fn genWindowSort(self: *Self, spec: WindowFuncInfo) CodeGenError!void {
         // Generate sort context struct
@@ -1331,6 +1784,16 @@ pub const FusedCodeGen = struct {
             try self.write("while (init_idx < columns.len) : (init_idx += 1) sorted_indices[init_idx] = init_idx;\n");
             try self.genSortContext();
             try self.write("\n");
+        }
+
+        // DISTINCT: Hash-based deduplication
+        if (self.has_distinct) {
+            try self.writeIndent();
+            try self.write("// DISTINCT: Hash-based deduplication\n");
+            try self.writeIndent();
+            try self.write("var seen_hashes: [65536]u64 = .{0} ** 65536;\n");
+            try self.writeIndent();
+            try self.write("var hash_occupied: [65536]bool = .{false} ** 65536;\n\n");
         }
 
         // Local variables
@@ -1584,19 +2047,32 @@ pub const FusedCodeGen = struct {
         try self.writeIndent();
         try self.write("}\n\n");
 
-        // Phase 3: Output results
+        // Phase 3: Output results (with optional HAVING filter)
         try self.writeIndent();
         try self.write("// Phase 3: Output group results\n");
         try self.writeIndent();
-        try self.write("var result_idx: usize = 0;\n");
+        try self.write("var output_count: usize = 0;\n");
         try self.writeIndent();
-        try self.write("while (result_idx < num_groups) : (result_idx += 1) {\n");
+        try self.write("var gi: usize = 0;\n");
+        try self.writeIndent();
+        try self.write("while (gi < num_groups) : (gi += 1) {\n");
         self.indent += 1;
+
+        // Apply HAVING filter if present
+        if (self.having_expr) |having| {
+            try self.writeIndent();
+            try self.write("// HAVING filter\n");
+            try self.writeIndent();
+            try self.write("if (");
+            try self.genHavingExpr(having);
+            try self.write(") {\n");
+            self.indent += 1;
+        }
 
         // Output group keys
         for (self.group_keys.items, 0..) |key, idx| {
             try self.writeIndent();
-            try self.fmt("output.{s}[result_idx] = group_key_{d}[result_idx];\n", .{ key.column, idx });
+            try self.fmt("output.{s}[output_count] = group_key_{d}[gi];\n", .{ key.column, idx });
         }
 
         // Output aggregates
@@ -1604,10 +2080,20 @@ pub const FusedCodeGen = struct {
             try self.writeIndent();
             if (agg.agg_type == .avg) {
                 // AVG = sum / count
-                try self.fmt("output.{s}[result_idx] = agg_{s}[result_idx] / @as(f64, @floatFromInt(agg_{s}_count[result_idx]));\n", .{ agg.name, agg.name, agg.name });
+                try self.fmt("output.{s}[output_count] = agg_{s}[gi] / @as(f64, @floatFromInt(agg_{s}_count[gi]));\n", .{ agg.name, agg.name, agg.name });
             } else {
-                try self.fmt("output.{s}[result_idx] = agg_{s}[result_idx];\n", .{ agg.name, agg.name });
+                try self.fmt("output.{s}[output_count] = agg_{s}[gi];\n", .{ agg.name, agg.name });
             }
+        }
+
+        try self.writeIndent();
+        try self.write("output_count += 1;\n");
+
+        // Close HAVING if block
+        if (self.having_expr != null) {
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
         }
 
         self.indent -= 1;
@@ -1616,7 +2102,7 @@ pub const FusedCodeGen = struct {
 
         // Return
         try self.writeIndent();
-        try self.write("return num_groups;\n");
+        try self.write("return output_count;\n");
 
         self.indent -= 1;
         try self.write("}\n");
@@ -1669,6 +2155,18 @@ pub const FusedCodeGen = struct {
         try self.writeIndent();
         try self.write("}\n\n");
 
+        // For LEFT/FULL JOIN, track which left rows have been matched
+        if (join.join_type == .left or join.join_type == .full) {
+            try self.writeIndent();
+            try self.write("var left_matched: [max_rows]bool = .{false} ** max_rows;\n");
+        }
+
+        // For RIGHT/FULL JOIN, track which right rows have been matched
+        if (join.join_type == .right or join.join_type == .full) {
+            try self.writeIndent();
+            try self.write("var right_matched: [max_rows]bool = .{false} ** max_rows;\n");
+        }
+
         // Phase 2: Probe with left input
         try self.writeIndent();
         try self.write("// Phase 2: Probe with left input\n");
@@ -1681,7 +2179,14 @@ pub const FusedCodeGen = struct {
         self.indent += 1;
 
         try self.writeIndent();
-        try self.fmt("const left_key = left_columns.{s}[li];\n\n", .{join.left_key.column});
+        try self.fmt("const left_key = left_columns.{s}[li];\n", .{join.left_key.column});
+
+        // For LEFT/FULL join, track if this left row matched anything
+        if (join.join_type == .left or join.join_type == .full) {
+            try self.writeIndent();
+            try self.write("var had_match: bool = false;\n");
+        }
+        try self.write("\n");
 
         // Linear probe (simple for now - can optimize with hash later)
         try self.writeIndent();
@@ -1696,7 +2201,18 @@ pub const FusedCodeGen = struct {
         try self.write("if (hash_keys[hi] == left_key) {\n");
         self.indent += 1;
         try self.writeIndent();
-        try self.write("const ri_match = hash_indices[hi];\n\n");
+        try self.write("const ri_match = hash_indices[hi];\n");
+
+        // Mark as matched for LEFT/RIGHT/FULL joins
+        if (join.join_type == .left or join.join_type == .full) {
+            try self.writeIndent();
+            try self.write("had_match = true;\n");
+        }
+        if (join.join_type == .right or join.join_type == .full) {
+            try self.writeIndent();
+            try self.write("right_matched[ri_match] = true;\n");
+        }
+        try self.write("\n");
 
         // Emit left columns
         try self.writeIndent();
@@ -1723,15 +2239,79 @@ pub const FusedCodeGen = struct {
         try self.writeIndent();
         try self.write("}\n");
 
-        // For LEFT JOIN, emit left rows with no match
+        // For LEFT/FULL JOIN, emit left rows with no match
         if (join.join_type == .left or join.join_type == .full) {
+            try self.write("\n");
             try self.writeIndent();
-            try self.write("// LEFT JOIN: emit unmatched left rows (not implemented yet)\n");
+            try self.write("// LEFT JOIN: emit unmatched left rows with NULL right columns\n");
+            try self.writeIndent();
+            try self.write("if (!had_match) {\n");
+            self.indent += 1;
+
+            // Emit left columns
+            var left_iter2 = self.input_columns.keyIterator();
+            while (left_iter2.next()) |key| {
+                try self.writeIndent();
+                try self.fmt("output.{s}[result_count] = left_columns.{s}[li];\n", .{ key.*, key.* });
+            }
+
+            // Emit NULL for right columns (use 0 as NULL marker)
+            var right_iter2 = self.right_columns.keyIterator();
+            while (right_iter2.next()) |key| {
+                try self.writeIndent();
+                try self.fmt("output.right_{s}[result_count] = 0; // NULL\n", .{key.*});
+            }
+
+            try self.writeIndent();
+            try self.write("result_count += 1;\n");
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
         }
 
         self.indent -= 1;
         try self.writeIndent();
-        try self.write("}\n\n");
+        try self.write("}\n");
+
+        // For RIGHT/FULL JOIN, emit unmatched right rows
+        if (join.join_type == .right or join.join_type == .full) {
+            try self.write("\n");
+            try self.writeIndent();
+            try self.write("// RIGHT JOIN: emit unmatched right rows with NULL left columns\n");
+            try self.writeIndent();
+            try self.write("var rj: usize = 0;\n");
+            try self.writeIndent();
+            try self.write("while (rj < right_columns.len) : (rj += 1) {\n");
+            self.indent += 1;
+            try self.writeIndent();
+            try self.write("if (!right_matched[rj]) {\n");
+            self.indent += 1;
+
+            // Emit NULL for left columns (use 0 as NULL marker)
+            var left_iter3 = self.input_columns.keyIterator();
+            while (left_iter3.next()) |key| {
+                try self.writeIndent();
+                try self.fmt("output.{s}[result_count] = 0; // NULL\n", .{key.*});
+            }
+
+            // Emit right columns
+            var right_iter3 = self.right_columns.keyIterator();
+            while (right_iter3.next()) |key| {
+                try self.writeIndent();
+                try self.fmt("output.right_{s}[result_count] = right_columns.{s}[rj];\n", .{ key.*, key.* });
+            }
+
+            try self.writeIndent();
+            try self.write("result_count += 1;\n");
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+        }
+
+        try self.write("\n");
 
         // Return
         try self.writeIndent();
@@ -1830,6 +2410,44 @@ pub const FusedCodeGen = struct {
 
     /// Generate row emission code
     fn genEmitRow(self: *Self) CodeGenError!void {
+        // DISTINCT: Compute hash and check for duplicates
+        if (self.has_distinct) {
+            try self.writeIndent();
+            try self.write("// Compute row hash for DISTINCT\n");
+            try self.writeIndent();
+            try self.write("var row_hash: u64 = 0;\n");
+
+            // Hash each column value
+            var iter_hash = self.input_columns.keyIterator();
+            while (iter_hash.next()) |key| {
+                try self.writeIndent();
+                try self.fmt("row_hash = row_hash *% 31 +% @as(u64, @bitCast(@as(i64, @intCast(columns.{s}[i]))));\n", .{key.*});
+            }
+
+            // Hash computed columns
+            var comp_iter_hash = self.computed_columns.keyIterator();
+            while (comp_iter_hash.next()) |key| {
+                try self.writeIndent();
+                try self.fmt("row_hash = row_hash *% 31 +% @as(u64, @bitCast(@as(i64, @intFromFloat({s}))));\n", .{key.*});
+            }
+
+            // Check if we've seen this hash before
+            try self.writeIndent();
+            try self.write("const slot = row_hash & 0xFFFF;\n");
+            try self.writeIndent();
+            try self.write("if (hash_occupied[slot] and seen_hashes[slot] == row_hash) {\n");
+            self.indent += 1;
+            try self.writeIndent();
+            try self.write("continue; // Skip duplicate\n");
+            self.indent -= 1;
+            try self.writeIndent();
+            try self.write("}\n");
+            try self.writeIndent();
+            try self.write("seen_hashes[slot] = row_hash;\n");
+            try self.writeIndent();
+            try self.write("hash_occupied[slot] = true;\n\n");
+        }
+
         // Emit each input column
         var iter = self.input_columns.keyIterator();
         while (iter.next()) |key| {
@@ -1999,6 +2617,106 @@ pub const FusedCodeGen = struct {
             .between => "/* BETWEEN */",
         };
         try self.write(op_str);
+    }
+
+    /// Generate HAVING expression code (references aggregate accumulators)
+    fn genHavingExpr(self: *Self, expr: *const ast.Expr) CodeGenError!void {
+        switch (expr.*) {
+            .value => |val| {
+                switch (val) {
+                    .null => try self.write("null"),
+                    .integer => |i| try self.fmt("{d}", .{i}),
+                    .float => |f| try self.fmt("{d}", .{f}),
+                    .string => |s| try self.fmt("\"{s}\"", .{s}),
+                    .blob => try self.write("\"\""),
+                    .parameter => |p| try self.fmt("params[{d}]", .{p}),
+                }
+            },
+            .column => |col| {
+                // In HAVING, column references are to aggregate results or group keys
+                // Check if it's an aggregate
+                var is_aggregate = false;
+                for (self.aggregate_specs.items) |agg| {
+                    if (std.mem.eql(u8, agg.name, col.name)) {
+                        if (agg.agg_type == .avg) {
+                            try self.fmt("(agg_{s}[gi] / @as(f64, @floatFromInt(agg_{s}_count[gi])))", .{ agg.name, agg.name });
+                        } else {
+                            try self.fmt("agg_{s}[gi]", .{agg.name});
+                        }
+                        is_aggregate = true;
+                        break;
+                    }
+                }
+                if (!is_aggregate) {
+                    // Check if it's a group key
+                    for (self.group_keys.items, 0..) |key, idx| {
+                        if (std.mem.eql(u8, key.column, col.name)) {
+                            try self.fmt("group_key_{d}[gi]", .{idx});
+                            is_aggregate = true;
+                            break;
+                        }
+                    }
+                }
+                if (!is_aggregate) {
+                    // Unknown column - just output the name
+                    try self.fmt("/* unknown: {s} */", .{col.name});
+                }
+            },
+            .binary => |bin| {
+                try self.write("(");
+                try self.genHavingExpr(bin.left);
+                try self.write(" ");
+                try self.genBinaryOp(bin.op);
+                try self.write(" ");
+                try self.genHavingExpr(bin.right);
+                try self.write(")");
+            },
+            .unary => |un| {
+                switch (un.op) {
+                    .not => {
+                        try self.write("!");
+                        try self.genHavingExpr(un.operand);
+                    },
+                    .minus => {
+                        try self.write("-");
+                        try self.genHavingExpr(un.operand);
+                    },
+                    .is_null => {
+                        try self.genHavingExpr(un.operand);
+                        try self.write(" == null");
+                    },
+                    .is_not_null => {
+                        try self.genHavingExpr(un.operand);
+                        try self.write(" != null");
+                    },
+                }
+            },
+            .call => |call| {
+                // Function call - could be an aggregate like COUNT(*), SUM(x), etc.
+                // Match by function name to find the aggregate
+                for (self.aggregate_specs.items) |spec| {
+                    if (std.mem.eql(u8, spec.name, call.name) or
+                        (std.mem.eql(u8, call.name, "COUNT") and spec.agg_type == .count) or
+                        (std.mem.eql(u8, call.name, "SUM") and spec.agg_type == .sum) or
+                        (std.mem.eql(u8, call.name, "AVG") and spec.agg_type == .avg) or
+                        (std.mem.eql(u8, call.name, "MIN") and spec.agg_type == .min) or
+                        (std.mem.eql(u8, call.name, "MAX") and spec.agg_type == .max))
+                    {
+                        if (spec.agg_type == .avg) {
+                            try self.fmt("(agg_{s}[gi] / @as(f64, @floatFromInt(agg_{s}_count[gi])))", .{ spec.name, spec.name });
+                        } else {
+                            try self.fmt("agg_{s}[gi]", .{spec.name});
+                        }
+                        return;
+                    }
+                }
+                // Not found - generate placeholder
+                try self.fmt("/* unknown function: {s} */", .{call.name});
+            },
+            else => {
+                try self.write("/* unsupported HAVING expr */");
+            },
+        }
     }
 
     // ========================================================================

@@ -385,6 +385,9 @@ pub const ProjectNode = struct {
 
     /// Expressions for each output column (for computed projections)
     expressions: ?[]const *const ast.Expr = null,
+
+    /// DISTINCT flag - remove duplicate rows
+    distinct: bool = false,
 };
 
 /// Compute node - evaluate expressions (including @logic_table methods)
