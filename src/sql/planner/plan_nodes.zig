@@ -69,7 +69,7 @@ pub const ColumnType = enum {
             .timestamp_ns, .timestamp_us, .timestamp_ms, .timestamp_s => "i64",
             .date32 => "i32",
             .date64 => "i64",
-            .unknown => "anytype",
+            .unknown => "f64", // Default to f64 for code generation
         };
     }
 

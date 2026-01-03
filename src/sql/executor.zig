@@ -261,19 +261,15 @@ pub const Executor = struct {
 
         // 2. Generate fused Zig code with layout metadata
         var codegen = fused_codegen.FusedCodeGen.init(self.allocator);
-        defer codegen.deinit();
+        defer codegen.deinit(); // This handles freeing the generated source code
         const gen_result = try codegen.generateWithLayout(&plan);
-        defer self.allocator.free(gen_result.source);
+        // Note: gen_result.source is owned by codegen and freed in deinit()
 
         // 3. JIT compile to native code
         var jit_ctx = metal0_jit.JitContext.init(self.allocator);
-        defer jit_ctx.deinit();
+        defer jit_ctx.deinit(); // This handles cleanup of compiled functions
 
         const compiled = try jit_ctx.compileZigSource(gen_result.source, "fused_query");
-        defer {
-            var c = compiled;
-            c.deinit();
-        }
 
         // 4. Load column data based on layout
         const row_count = try self.getRowCount();
@@ -326,6 +322,8 @@ pub const Executor = struct {
                 .timestamp_ns, .timestamp_us, .timestamp_ms, .timestamp_s => .{ .timestamp_ns = try self.tbl().readInt64Column(col_idx) },
                 .date32 => .{ .date32 = try self.tbl().readInt32Column(col_idx) },
                 .date64 => .{ .date64 = try self.tbl().readInt64Column(col_idx) },
+                .vec_f32 => .{ .vec_f32 = try self.tbl().readFloat32Column(col_idx) },
+                .vec_f64 => .{ .vec_f64 = try self.tbl().readFloat64Column(col_idx) },
                 else => .{ .f64 = try self.tbl().readFloat64Column(col_idx) }, // Default fallback
             };
         }
@@ -353,6 +351,8 @@ pub const Executor = struct {
                 .timestamp_ms => |s| self.allocator.free(s),
                 .date32 => |s| self.allocator.free(s),
                 .date64 => |s| self.allocator.free(s),
+                .vec_f32 => |s| self.allocator.free(s),
+                .vec_f64 => |s| self.allocator.free(s),
                 .empty => {},
             }
         }
@@ -432,6 +432,8 @@ pub const Executor = struct {
             .timestamp_ns, .timestamp_us, .timestamp_ms => |s| .{ .timestamp_ns = try self.allocator.dupe(i64, s[0..count]) },
             .date32 => |s| .{ .date32 = try self.allocator.dupe(i32, s[0..count]) },
             .date64 => |s| .{ .date64 = try self.allocator.dupe(i64, s[0..count]) },
+            .vec_f32 => |s| .{ .float32 = try self.allocator.dupe(f32, s[0..count]) },
+            .vec_f64 => |s| .{ .float64 = try self.allocator.dupe(f64, s[0..count]) },
             else => .{ .float64 = &[_]f64{} },
         };
     }

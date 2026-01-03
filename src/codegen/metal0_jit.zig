@@ -929,18 +929,28 @@ fn jitCompileSource(
 
     var child = std.process.Child.init(&argv, allocator);
     child.stderr_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
+    child.stdout_behavior = .Ignore;
 
     child.spawn() catch return error.CannotSpawnCompiler;
+
+    // Read stderr before waiting (required to prevent pipe deadlock)
+    var stderr_output: []u8 = &.{};
+    if (child.stderr) |stderr| {
+        stderr_output = stderr.readToEndAlloc(allocator, 64 * 1024) catch &.{};
+    }
+    defer if (stderr_output.len > 0) allocator.free(stderr_output);
+
     const result = child.wait() catch return error.CompilerFailed;
 
     // Clean up source file
     std.fs.cwd().deleteFile(src_path) catch {};
 
     if (result.Exited != 0) {
-        // Note: In Zig 0.15+, reading stderr requires a buffer and different API
-        // For now, just log that compilation failed
-        std.log.err("JIT compile failed with exit code {d}", .{result.Exited});
+        if (stderr_output.len > 0) {
+            std.log.err("JIT compile failed: {s}", .{stderr_output});
+        } else {
+            std.log.err("JIT compile failed with exit code {d}", .{result.Exited});
+        }
         return error.CompilationFailed;
     }
 

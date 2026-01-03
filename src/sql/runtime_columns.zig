@@ -44,6 +44,8 @@ pub const ColumnDataPtr = union(enum) {
     timestamp_ms: []i64,
     date32: []i32,
     date64: []i64,
+    vec_f32: []f32, // Flat array of f32 vector elements (row_count * dim)
+    vec_f64: []f64, // Flat array of f64 vector elements (row_count * dim)
     empty: void, // For unallocated output buffers
 
     /// Get the raw pointer value for embedding in struct buffer
@@ -66,6 +68,8 @@ pub const ColumnDataPtr = union(enum) {
             .timestamp_ms => |s| @intFromPtr(s.ptr),
             .date32 => |s| @intFromPtr(s.ptr),
             .date64 => |s| @intFromPtr(s.ptr),
+            .vec_f32 => |s| @intFromPtr(s.ptr),
+            .vec_f64 => |s| @intFromPtr(s.ptr),
             .empty => 0,
         };
     }
@@ -90,6 +94,8 @@ pub const ColumnDataPtr = union(enum) {
             .timestamp_ms => |s| s.len,
             .date32 => |s| s.len,
             .date64 => |s| s.len,
+            .vec_f32 => |s| s.len,
+            .vec_f64 => |s| s.len,
             .empty => 0,
         };
     }
@@ -229,6 +235,8 @@ fn allocateColumnBuffer(allocator: std.mem.Allocator, col_type: ColumnType, row_
         .timestamp_s => .{ .timestamp_ns = try allocator.alloc(i64, row_count) }, // Treat as ns
         .date32 => .{ .date32 = try allocator.alloc(i32, row_count) },
         .date64 => .{ .date64 = try allocator.alloc(i64, row_count) },
+        .vec_f32 => .{ .vec_f32 = try allocator.alloc(f32, row_count) },
+        .vec_f64 => .{ .vec_f64 = try allocator.alloc(f64, row_count) },
         .unknown => .{ .f64 = try allocator.alloc(f64, row_count) }, // Default to f64
         else => .{ .f64 = try allocator.alloc(f64, row_count) }, // Default for unsupported types
     };
@@ -254,6 +262,8 @@ fn freeColumnBuffer(allocator: std.mem.Allocator, col: ColumnDataPtr) void {
         .timestamp_ms => |s| allocator.free(s),
         .date32 => |s| allocator.free(s),
         .date64 => |s| allocator.free(s),
+        .vec_f32 => |s| allocator.free(s),
+        .vec_f64 => |s| allocator.free(s),
         .empty => {},
     }
 }
