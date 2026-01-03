@@ -194,7 +194,11 @@ pub const AggregateType = enum {
     min,
     max,
     stddev,
+    stddev_pop,
     variance,
+    var_pop,
+    median,
+    percentile,
     first,
     last,
     array_agg,
@@ -211,6 +215,8 @@ pub const AggregateSpec = struct {
     input_col: ?ColumnRef,
     /// DISTINCT flag
     distinct: bool = false,
+    /// Percentile value (0.0-1.0) for PERCENTILE function
+    percentile_value: f64 = 0.5,
 };
 
 /// Window function type

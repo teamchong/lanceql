@@ -149,11 +149,30 @@ pub const Planner = struct {
         self.plan_sources = sources_slice;
         self.plan_methods = methods_slice;
 
+        // Check if plan contains hash_join (not yet supported in compiled path)
+        const has_join = self.planContainsHashJoin(root);
+
         return QueryPlan{
             .root = root,
             .sources = sources_slice,
             .logic_table_methods = methods_slice,
-            .compilable = true, // All query types now support compilation
+            .compilable = !has_join, // JOINs use interpreted path for now
+            .non_compilable_reason = if (has_join) "hash_join not yet compiled" else null,
+        };
+    }
+
+    /// Check if a plan tree contains a hash_join node
+    fn planContainsHashJoin(self: *const Self, node: *const plan_nodes.PlanNode) bool {
+        return switch (node.*) {
+            .hash_join => true,
+            .scan => false,
+            .filter => |f| self.planContainsHashJoin(f.input),
+            .project => |p| self.planContainsHashJoin(p.input),
+            .compute => |c| self.planContainsHashJoin(c.input),
+            .group_by => |g| self.planContainsHashJoin(g.input),
+            .sort => |s| self.planContainsHashJoin(s.input),
+            .limit => |l| self.planContainsHashJoin(l.input),
+            .window => |w| self.planContainsHashJoin(w.input),
         };
     }
 
@@ -533,7 +552,13 @@ pub const Planner = struct {
                     std.mem.eql(u8, name, "MIN") or
                     std.mem.eql(u8, name, "MAX") or
                     std.mem.eql(u8, name, "STDDEV") or
-                    std.mem.eql(u8, name, "VARIANCE");
+                    std.mem.eql(u8, name, "STDDEV_SAMP") or
+                    std.mem.eql(u8, name, "STDDEV_POP") or
+                    std.mem.eql(u8, name, "VARIANCE") or
+                    std.mem.eql(u8, name, "VAR_SAMP") or
+                    std.mem.eql(u8, name, "VAR_POP") or
+                    std.mem.eql(u8, name, "MEDIAN") or
+                    std.mem.eql(u8, name, "PERCENTILE");
             },
             else => false,
         };
@@ -562,8 +587,18 @@ pub const Planner = struct {
                     .min
                 else if (std.mem.eql(u8, call.name, "MAX"))
                     .max
-                else if (std.mem.eql(u8, call.name, "STDDEV"))
+                else if (std.mem.eql(u8, call.name, "STDDEV") or std.mem.eql(u8, call.name, "STDDEV_SAMP"))
                     .stddev
+                else if (std.mem.eql(u8, call.name, "STDDEV_POP"))
+                    .stddev_pop
+                else if (std.mem.eql(u8, call.name, "VARIANCE") or std.mem.eql(u8, call.name, "VAR_SAMP"))
+                    .variance
+                else if (std.mem.eql(u8, call.name, "VAR_POP"))
+                    .var_pop
+                else if (std.mem.eql(u8, call.name, "MEDIAN"))
+                    .median
+                else if (std.mem.eql(u8, call.name, "PERCENTILE"))
+                    .percentile
                 else
                     .count;
 
@@ -577,11 +612,25 @@ pub const Planner = struct {
                     }
                 }
 
+                // Parse percentile value from second argument for PERCENTILE function
+                var percentile_value: f64 = 0.5;
+                if (agg_type == .percentile and call.args.len > 1) {
+                    if (call.args[1] == .value) {
+                        const val = call.args[1].value;
+                        if (val == .float) {
+                            percentile_value = val.float;
+                        } else if (val == .integer) {
+                            percentile_value = @floatFromInt(val.integer);
+                        }
+                    }
+                }
+
                 return .{
                     .name = alias orelse call.name,
                     .agg_type = agg_type,
                     .input_col = input_col,
                     .distinct = call.distinct,
+                    .percentile_value = percentile_value,
                 };
             },
             else => return PlannerError.UnsupportedExpression,

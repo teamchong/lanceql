@@ -233,7 +233,16 @@ pub const Executor = struct {
 
     /// Execute a query using fused compilation
     /// This generates and JIT-compiles a single function for the entire query
-    fn executeCompiled(self: *Self, stmt: *const SelectStmt) !Result {
+    fn executeCompiled(self: *Self, stmt: *const SelectStmt, params: []const Value) !Result {
+        // If we're querying a joined table, use the interpreted path for now
+        // (the join has already been materialized in resolveTableSource)
+        if (self.active_source) |source| {
+            if (source == .joined) {
+                // Fall back to executing on the joined data directly
+                return self.executeOnJoinedTable(stmt, params, source.joined);
+            }
+        }
+
         // 1. Plan the query
         var planner_inst = planner.Planner.init(self.allocator);
         defer planner_inst.deinit();
@@ -249,9 +258,69 @@ pub const Executor = struct {
         // 3. Generate fused Zig code with layout metadata and resolved types
         var codegen = fused_codegen.FusedCodeGen.init(self.allocator);
         defer codegen.deinit(); // This handles freeing the generated source code
+        codegen.setParams(params);
 
-        // 3a. Pre-execute any subqueries and pass results to codegen
+        // 3a. Check parameter bounds before generating code
+        const max_param = findMaxParamIndex(stmt);
+        if (max_param) |idx| {
+            if (idx >= params.len) return error.ParameterOutOfBounds;
+        }
+
+        // 3b. Pre-execute any subqueries and pass results to codegen
         try self.preExecuteSubqueries(stmt, &codegen);
+
+        // 3b. Analyze SELECT and WHERE expressions to extract column references
+        // This populates input_columns for code generation
+        for (stmt.columns) |col| {
+            try codegen.analyzeSelectExpr(&col.expr);
+        }
+        if (stmt.where) |where| {
+            try codegen.analyzeSelectExpr(&where);
+        }
+
+        // 3c. For SELECT *, add all table columns if none were found (in schema order)
+        // Only do this if the query is actually SELECT * (not aggregate-only queries like COUNT(*))
+        const is_select_star = blk: {
+            if (stmt.columns.len != 1) break :blk false;
+            switch (stmt.columns[0].expr) {
+                .column => |col| break :blk std.mem.eql(u8, col.name, "*"),
+                else => break :blk false,
+            }
+        };
+        if (!codegen.hasInputColumns() and is_select_star) {
+            const schema = self.tbl().getSchema() orelse return error.NoSchema;
+            for (schema.fields) |field| {
+                if (type_map.get(field.name)) |col_type| {
+                    try codegen.addInputColumn(field.name, col_type);
+                }
+            }
+        }
+
+        // 3d. Register SELECT expressions for inline computation
+        // Supports arithmetic expressions and function calls (LENGTH, ABS, UPPER, LOWER, etc.)
+        if (!is_select_star and !codegen.hasGroupBy() and !codegen.hasWindowSpecs()) {
+            var has_computation = false;
+            for (stmt.columns) |col| {
+                if (isArithmeticExpr(&col.expr) or hasFunctionCall(&col.expr)) {
+                    has_computation = true;
+                }
+            }
+            // Use select_exprs for arithmetic and function calls
+            if (has_computation) {
+                for (stmt.columns, 0..) |_, idx| {
+                    // IMPORTANT: Use indexed access to get stable pointer to expression
+                    // Using &col.expr would point to loop variable (same address each iteration)
+                    const col_ptr = &stmt.columns[idx];
+                    const name = col_ptr.alias orelse blk: {
+                        // Generate name for expressions without alias
+                        var name_buf: [32]u8 = undefined;
+                        break :blk std.fmt.bufPrint(&name_buf, "col_{d}", .{idx}) catch "col";
+                    };
+                    const col_type = inferExprType(&col_ptr.expr, &type_map);
+                    try codegen.addSelectExpr(name, &col_ptr.expr, col_type);
+                }
+            }
+        }
 
         var gen_result = try codegen.generateWithLayoutAndTypes(&plan, &type_map);
         defer gen_result.layout.deinit(); // Free the layout slices
@@ -285,12 +354,25 @@ pub const Executor = struct {
         );
         defer output.deinit();
 
-        // 7. Call compiled function
-        const FusedQueryFn = *const fn (*anyopaque, *anyopaque) callconv(std.builtin.CallingConvention.c) usize;
-        const func: FusedQueryFn = @ptrCast(@alignCast(compiled.ptr));
-        const result_count = func(columns.asPtr(), output.asPtr());
+        // 7. Allocate string arena if needed (must outlive output extraction)
+        const string_arena: ?[]u8 = if (codegen.needsStringArena())
+            try self.allocator.alloc(u8, row_count * 1024) // 1KB per row
+        else
+            null;
+        defer if (string_arena) |arena| self.allocator.free(arena);
 
-        // 8. Convert output to Result
+        // 8. Call compiled function
+        const result_count = if (string_arena) |arena| blk: {
+            const FusedQueryFnWithArena = *const fn (*anyopaque, *anyopaque, [*]u8) callconv(std.builtin.CallingConvention.c) usize;
+            const func: FusedQueryFnWithArena = @ptrCast(@alignCast(compiled.ptr));
+            break :blk func(columns.asPtr(), output.asPtr(), arena.ptr);
+        } else blk: {
+            const FusedQueryFn = *const fn (*anyopaque, *anyopaque) callconv(std.builtin.CallingConvention.c) usize;
+            const func: FusedQueryFn = @ptrCast(@alignCast(compiled.ptr));
+            break :blk func(columns.asPtr(), output.asPtr());
+        };
+
+        // 9. Convert output to Result
         return self.outputToResult(&output, result_count, stmt.columns);
     }
 
@@ -338,7 +420,12 @@ pub const Executor = struct {
                 .f64 => |s| self.allocator.free(s),
                 .f32 => |s| self.allocator.free(s),
                 .bool_ => |s| self.allocator.free(s),
-                .string => |s| self.allocator.free(s),
+                .string => |s| {
+                    // Free each individual string first
+                    for (s) |str| self.allocator.free(str);
+                    // Then free the outer slice
+                    self.allocator.free(s);
+                },
                 .timestamp_ns => |s| self.allocator.free(s),
                 .timestamp_us => |s| self.allocator.free(s),
                 .timestamp_ms => |s| self.allocator.free(s),
@@ -475,6 +562,34 @@ pub const Executor = struct {
         result_count: usize,
         select_list: []const ast.SelectItem,
     ) !Result {
+        // Handle SELECT * - check if first column is wildcard
+        const is_select_star = blk: {
+            if (select_list.len != 1) break :blk false;
+            switch (select_list[0].expr) {
+                .column => |col| break :blk std.mem.eql(u8, col.name, "*"),
+                else => break :blk false,
+            }
+        };
+
+        if (is_select_star) {
+            // Use output column names from layout
+            var columns = try self.allocator.alloc(Result.Column, output.column_data.len);
+            errdefer self.allocator.free(columns);
+
+            for (output.column_names, 0..) |name, i| {
+                columns[i] = .{
+                    .name = name,
+                    .data = try self.extractResultData(output.column_data[i], result_count),
+                };
+            }
+
+            return Result{
+                .columns = columns,
+                .row_count = result_count,
+                .allocator = self.allocator,
+            };
+        }
+
         var columns = try self.allocator.alloc(Result.Column, select_list.len);
         errdefer self.allocator.free(columns);
 
@@ -522,8 +637,12 @@ pub const Executor = struct {
             .bool_ => |s| .{ .bool_ = try self.allocator.dupe(bool, s[0..count]) },
             .string => |s| blk: {
                 var result = try self.allocator.alloc([]const u8, count);
+                errdefer self.allocator.free(result);
+                var allocated: usize = 0;
+                errdefer for (result[0..allocated]) |str| self.allocator.free(str);
                 for (s[0..count], 0..) |str, i| {
                     result[i] = try self.allocator.dupe(u8, str);
+                    allocated = i + 1;
                 }
                 break :blk .{ .string = result };
             },
@@ -1055,6 +1174,82 @@ pub const Executor = struct {
         return .{ .joined = joined_data };
     }
 
+    /// Execute a SELECT query on a materialized joined table
+    fn executeOnJoinedTable(self: *Self, stmt: *const SelectStmt, params: []const Value, joined_data: *JoinedData) !Result {
+        _ = params;
+
+        // Get row count from the joined data
+        const row_count = joined_data.row_count;
+
+        // Build result columns from SELECT list
+        var result_columns: std.ArrayList(Result.Column) = .{};
+        defer result_columns.deinit(self.allocator);
+
+        for (stmt.columns) |item| {
+            const col_name = switch (item.expr) {
+                .column => |col| blk: {
+                    // Handle qualified names: "a.id" -> "a_id"
+                    if (col.table) |table_name| {
+                        var name_buf: [64]u8 = undefined;
+                        const qualified = std.fmt.bufPrint(&name_buf, "{s}_{s}", .{ table_name, col.name }) catch col.name;
+                        break :blk qualified;
+                    }
+                    break :blk col.name;
+                },
+                else => continue, // Skip non-column expressions for now
+            };
+
+            const output_name = item.alias orelse switch (item.expr) {
+                .column => |col| col.name,
+                else => "expr",
+            };
+
+            // Look up the column in joined_data.columns
+            const col_data_opt = joined_data.columns.get(col_name) orelse blk: {
+                // Try without table qualifier
+                const simple_name = switch (item.expr) {
+                    .column => |col| col.name,
+                    else => break :blk null,
+                };
+                break :blk joined_data.columns.get(simple_name);
+            };
+
+            if (col_data_opt) |col_data| {
+                // Convert CachedColumn to Result.ColumnData
+                const result_data: Result.ColumnData = switch (col_data) {
+                    .int64 => |d| .{ .int64 = try self.allocator.dupe(i64, d) },
+                    .int32 => |d| .{ .int32 = try self.allocator.dupe(i32, d) },
+                    .float64 => |d| .{ .float64 = try self.allocator.dupe(f64, d) },
+                    .float32 => |d| .{ .float32 = try self.allocator.dupe(f32, d) },
+                    .bool_ => |d| .{ .bool_ = try self.allocator.dupe(bool, d) },
+                    .string => |d| blk: {
+                        const duped = try self.allocator.alloc([]const u8, d.len);
+                        for (d, 0..) |s, i| {
+                            duped[i] = try self.allocator.dupe(u8, s);
+                        }
+                        break :blk .{ .string = duped };
+                    },
+                    .timestamp_ns => |d| .{ .timestamp_ns = try self.allocator.dupe(i64, d) },
+                    .timestamp_us => |d| .{ .timestamp_us = try self.allocator.dupe(i64, d) },
+                    .timestamp_ms => |d| .{ .timestamp_ms = try self.allocator.dupe(i64, d) },
+                    .timestamp_s => |d| .{ .timestamp_s = try self.allocator.dupe(i64, d) },
+                    .date32 => |d| .{ .date32 = try self.allocator.dupe(i32, d) },
+                    .date64 => |d| .{ .date64 = try self.allocator.dupe(i64, d) },
+                };
+                try result_columns.append(self.allocator, Result.Column{
+                    .name = output_name,
+                    .data = result_data,
+                });
+            }
+        }
+
+        return Result{
+            .columns = try result_columns.toOwnedSlice(self.allocator),
+            .row_count = row_count,
+            .allocator = self.allocator,
+        };
+    }
+
     /// Extract left and right column names from JOIN ON condition
     fn extractJoinKeys(self: *Self, condition: ast.Expr) !struct { left_col: []const u8, right_col: []const u8 } {
         _ = self;
@@ -1245,81 +1440,12 @@ pub const Executor = struct {
             }
         }
 
-        // Try compiled execution first (fused code generation)
-        if (self.shouldCompile(stmt)) {
-            if (self.executeCompiled(stmt)) |result| {
-                // Handle set operations if present
-                if (stmt.set_operation) |set_op| {
-                    return self.executeSetOperation(result, set_op, params);
-                }
-                return result;
-            } else |_| {
-                // Fall through to interpreted path on compilation failure
-            }
-        }
+        // Execute compiled query
+        var result = try self.executeCompiled(stmt, params);
 
-        // Interpreted fallback (will be removed once compiled handles all cases)
-        if (stmt.where) |where_expr| {
-            var col_names = std.ArrayList([]const u8){};
-            defer col_names.deinit(self.allocator);
-
-            try self.extractColumnNames(&where_expr, &col_names);
-            try self.preloadColumns(col_names.items);
-        }
-
-        const indices = if (stmt.where) |where_expr|
-            try self.evaluateWhere(&where_expr, params)
-        else
-            try self.getAllIndices();
-
-        defer self.allocator.free(indices);
-
-        const has_group_by = stmt.group_by != null;
-        const has_aggregates = self.hasAggregates(stmt.columns);
-
-        if (has_group_by or has_aggregates) {
-            return self.executeWithGroupBy(stmt, indices);
-        }
-
-        var columns_list = std.ArrayList(Result.Column){};
-        errdefer {
-            for (columns_list.items) |*col| {
-                self.freeColumnData(&col.data);
-            }
-            columns_list.deinit(self.allocator);
-        }
-
-        const base_columns = try self.readColumns(stmt.columns, indices);
-        defer self.allocator.free(base_columns);
-        try columns_list.appendSlice(self.allocator, base_columns);
-
-        if (self.hasWindowFunctions(stmt.columns)) {
-            try self.evaluateWindowFunctions(&columns_list, stmt.columns, indices);
-        }
-
-        var columns = try columns_list.toOwnedSlice(self.allocator);
-        var row_count = indices.len;
-
-        if (stmt.distinct) {
-            const distinct_result = try result_ops.applyDistinct(self.allocator, columns);
-            columns = distinct_result.columns;
-            row_count = distinct_result.row_count;
-        }
-
-        if (stmt.order_by) |order_by| {
-            try result_ops.applyOrderBy(self.allocator, columns, order_by);
-        }
-
-        const final_row_count = result_ops.applyLimitOffset(self.allocator, columns, stmt.limit, stmt.offset);
-
-        var result = Result{
-            .columns = columns,
-            .row_count = final_row_count,
-            .allocator = self.allocator,
-        };
-
+        // Handle set operations (UNION/INTERSECT/EXCEPT) if present
         if (stmt.set_operation) |set_op| {
-            result = try self.executeSetOperation(result, set_op, params);
+            result = try self.executeSetOperation(result, set_op, &[_]Value{});
         }
 
         return result;
@@ -1940,5 +2066,162 @@ pub const Executor = struct {
     }
 
 };
+
+/// Check if an expression is a simple column reference (no computation needed)
+fn isSimpleColumnRef(expr: *const ast.Expr) bool {
+    return switch (expr.*) {
+        .column => true,
+        else => false,
+    };
+}
+
+/// Check if an expression contains arithmetic or string operations
+fn isArithmeticExpr(expr: *const ast.Expr) bool {
+    return switch (expr.*) {
+        .binary => |bin| switch (bin.op) {
+            .add, .subtract, .multiply, .divide, .concat => true,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// Check if an expression contains a function call (recursively)
+fn hasFunctionCall(expr: *const ast.Expr) bool {
+    return switch (expr.*) {
+        .call => true,
+        .binary => |bin| hasFunctionCall(bin.left) or hasFunctionCall(bin.right),
+        .unary => |un| hasFunctionCall(un.operand),
+        else => false,
+    };
+}
+
+/// Check if a function name is an aggregate function
+fn isAggregateFn(name: []const u8) bool {
+    const agg_funcs = [_][]const u8{
+        "COUNT",       "SUM",         "AVG",         "MIN",          "MAX",
+        "count",       "sum",         "avg",         "min",          "max",
+        "STDDEV",      "STDDEV_POP",  "STDDEV_SAMP", "VARIANCE",     "VAR_POP",
+        "VAR_SAMP",    "MEDIAN",      "PERCENTILE",  "PERCENTILE_CONT",
+        "stddev",      "stddev_pop",  "stddev_samp", "variance",     "var_pop",
+        "var_samp",    "median",      "percentile",  "percentile_cont",
+    };
+    for (agg_funcs) |func| {
+        if (std.mem.eql(u8, name, func)) return true;
+    }
+    return false;
+}
+
+/// Check if an expression contains only aggregate functions (no scalar functions)
+fn hasOnlyAggregateFunctions(expr: *const ast.Expr) bool {
+    return switch (expr.*) {
+        .call => |call| isAggregateFn(call.name),
+        .binary => |bin| hasOnlyAggregateFunctions(bin.left) and hasOnlyAggregateFunctions(bin.right),
+        .unary => |un| hasOnlyAggregateFunctions(un.operand),
+        .column, .value => true,
+        else => false,
+    };
+}
+
+/// Infer the result type of an expression
+fn inferExprType(expr: *const ast.Expr, type_map: *const std.StringHashMap(plan_nodes.ColumnType)) plan_nodes.ColumnType {
+    return switch (expr.*) {
+        .column => |col| type_map.get(col.name) orelse .unknown,
+        .value => |val| switch (val) {
+            .integer => .i64,
+            .float => .f64,
+            .string => .string,
+            .null, .blob, .parameter => .unknown,
+        },
+        .binary => |bin| {
+            // String concatenation returns string
+            if (bin.op == .concat) return .string;
+            // Arithmetic operations: promote to f64 if any operand is float
+            const left_type = inferExprType(bin.left, type_map);
+            const right_type = inferExprType(bin.right, type_map);
+            if (left_type == .f64 or right_type == .f64) return .f64;
+            if (left_type == .f32 or right_type == .f32) return .f64;
+            // Division always returns f64
+            if (bin.op == .divide) return .f64;
+            return .i64;
+        },
+        .unary => |un| inferExprType(un.operand, type_map),
+        .call => |func| {
+            // Infer function return type
+            const name = func.name;
+            if (std.mem.eql(u8, name, "COUNT")) return .i64;
+            if (std.mem.eql(u8, name, "SUM")) return .f64;
+            if (std.mem.eql(u8, name, "AVG")) return .f64;
+            if (std.mem.eql(u8, name, "MIN") or std.mem.eql(u8, name, "MAX")) {
+                if (func.args.len > 0) return inferExprType(&func.args[0], type_map);
+                return .f64;
+            }
+            if (std.mem.eql(u8, name, "LENGTH")) return .i64;
+            if (std.mem.eql(u8, name, "ABS")) return .f64;
+            if (std.mem.eql(u8, name, "UPPER") or std.mem.eql(u8, name, "LOWER")) return .string;
+            if (std.mem.eql(u8, name, "ROUND") or std.mem.eql(u8, name, "CEIL") or std.mem.eql(u8, name, "FLOOR")) return .f64;
+            // Date/time functions all return i64
+            if (std.mem.eql(u8, name, "YEAR") or std.mem.eql(u8, name, "MONTH") or std.mem.eql(u8, name, "DAY")) return .i64;
+            if (std.mem.eql(u8, name, "HOUR") or std.mem.eql(u8, name, "MINUTE") or std.mem.eql(u8, name, "SECOND")) return .i64;
+            if (std.mem.eql(u8, name, "DAYOFWEEK") or std.mem.eql(u8, name, "DAYOFYEAR")) return .i64;
+            if (std.mem.eql(u8, name, "DATE_TRUNC") or std.mem.eql(u8, name, "DATE_ADD") or std.mem.eql(u8, name, "EPOCH")) return .i64;
+            if (std.mem.eql(u8, name, "QUARTER")) return .i64;
+            return .f64; // Default to f64 for unknown functions
+        },
+        else => .f64, // Default to f64 for complex expressions
+    };
+}
+
+/// Find the maximum parameter index used in a SELECT statement
+/// Returns null if no parameters are used
+fn findMaxParamIndex(stmt: *const ast.SelectStmt) ?usize {
+    var max_idx: ?usize = null;
+
+    // Check WHERE clause
+    if (stmt.where) |*where| {
+        if (findMaxParamInExpr(where)) |idx| {
+            max_idx = if (max_idx) |m| @max(m, idx) else idx;
+        }
+    }
+
+    // Check SELECT columns
+    for (stmt.columns) |col| {
+        if (findMaxParamInExpr(&col.expr)) |idx| {
+            max_idx = if (max_idx) |m| @max(m, idx) else idx;
+        }
+    }
+
+    return max_idx;
+}
+
+/// Find the maximum parameter index in an expression tree
+fn findMaxParamInExpr(expr: *const ast.Expr) ?usize {
+    switch (expr.*) {
+        .value => |val| {
+            if (val == .parameter) return val.parameter;
+            return null;
+        },
+        .binary => |bin| {
+            const left = findMaxParamInExpr(bin.left);
+            const right = findMaxParamInExpr(bin.right);
+            if (left) |l| {
+                if (right) |r| return @max(l, r);
+                return l;
+            }
+            return right;
+        },
+        .unary => |un| return findMaxParamInExpr(un.operand),
+        .call => |func| {
+            var max_idx: ?usize = null;
+            for (func.args) |*arg| {
+                if (findMaxParamInExpr(arg)) |idx| {
+                    max_idx = if (max_idx) |m| @max(m, idx) else idx;
+                }
+            }
+            return max_idx;
+        },
+        else => return null,
+    }
+}
 
 // Tests are in tests/test_sql_executor.zig

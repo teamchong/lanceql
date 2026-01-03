@@ -109,6 +109,9 @@ pub const RuntimeColumns = struct {
     /// Column data pointers (kept alive during function call)
     column_data: []ColumnDataPtr,
 
+    /// Column names (for SELECT * output mapping)
+    column_names: []const []const u8,
+
     /// Row count
     row_count: usize,
 
@@ -150,9 +153,16 @@ pub const RuntimeColumns = struct {
         const len_offset = layout.len * ptr_size;
         @as(*usize, @ptrCast(@alignCast(buffer.ptr + len_offset))).* = row_count;
 
+        // Extract column names from layout
+        const column_names = try allocator.alloc([]const u8, layout.len);
+        for (layout, 0..) |col, i| {
+            column_names[i] = col.name;
+        }
+
         return Self{
             .buffer = buffer,
             .column_data = column_data,
+            .column_names = column_names,
             .row_count = row_count,
             .is_input = true,
             .allocator = allocator,
@@ -176,8 +186,10 @@ pub const RuntimeColumns = struct {
         var column_data = try allocator.alloc(ColumnDataPtr, layout.len);
 
         // Allocate output buffers for each column
+        const column_names = try allocator.alloc([]const u8, layout.len);
         for (layout, 0..) |col, i| {
             column_data[i] = try allocateColumnBuffer(allocator, col.col_type, max_rows);
+            column_names[i] = col.name;
             const ptr_value = column_data[i].rawPtr();
             const offset = col.offset;
             @as(*usize, @ptrCast(@alignCast(buffer.ptr + offset))).* = ptr_value;
@@ -186,6 +198,7 @@ pub const RuntimeColumns = struct {
         return Self{
             .buffer = buffer,
             .column_data = column_data,
+            .column_names = column_names,
             .row_count = max_rows,
             .is_input = false,
             .allocator = allocator,
@@ -210,6 +223,7 @@ pub const RuntimeColumns = struct {
             }
         }
         self.allocator.free(self.column_data);
+        self.allocator.free(self.column_names);
         self.allocator.free(self.buffer);
     }
 };
