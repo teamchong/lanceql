@@ -121,7 +121,11 @@ var init_metadata_cache = __esm({
 });
 
 // src/client/cache/hot-tier-cache.js
-var HotTierCache, hotTierCache;
+function getHotTierCache() {
+  if (!_hotTierCache) _hotTierCache = new HotTierCache();
+  return _hotTierCache;
+}
+var HotTierCache, _hotTierCache;
 var init_hot_tier_cache = __esm({
   "src/client/cache/hot-tier-cache.js"() {
     HotTierCache = class {
@@ -410,12 +414,16 @@ var init_hot_tier_cache = __esm({
         return merged;
       }
     };
-    hotTierCache = new HotTierCache();
+    _hotTierCache = null;
   }
 });
 
 // src/client/gpu/accelerator.js
-var WebGPUAccelerator, webgpuAccelerator2;
+function getWebGPUAccelerator() {
+  if (!_webgpuAccelerator) _webgpuAccelerator = new WebGPUAccelerator();
+  return _webgpuAccelerator;
+}
+var WebGPUAccelerator, _webgpuAccelerator;
 var init_accelerator = __esm({
   "src/client/gpu/accelerator.js"() {
     WebGPUAccelerator = class {
@@ -588,7 +596,7 @@ var init_accelerator = __esm({
         return Math.floor(maxBufferSize * 0.9 / (dim * 4));
       }
     };
-    webgpuAccelerator2 = new WebGPUAccelerator();
+    _webgpuAccelerator = null;
   }
 });
 
@@ -1226,10 +1234,721 @@ var init_lance_reader = __esm({
   }
 });
 
+// src/client/search/ivf-manifest.js
+async function findLatestManifestVersion(baseUrl) {
+  const checkVersions = [1, 5, 10, 20, 50, 100];
+  const checks = await Promise.all(
+    checkVersions.map(async (v) => {
+      try {
+        const response = await fetch(`${baseUrl}/_versions/${v}.manifest`, { method: "HEAD" });
+        return response.ok ? v : 0;
+      } catch {
+        return 0;
+      }
+    })
+  );
+  let highestFound = Math.max(...checks);
+  if (highestFound === 0) return null;
+  for (let v = highestFound + 1; v <= highestFound + 30; v++) {
+    try {
+      const response = await fetch(`${baseUrl}/_versions/${v}.manifest`, { method: "HEAD" });
+      if (response.ok) highestFound = v;
+      else break;
+    } catch {
+      break;
+    }
+  }
+  return highestFound;
+}
+function parseManifestForIndex(bytes) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset);
+  const chunk1Len = view.getUint32(0, true);
+  const chunk1Data = bytes.slice(4, 4 + chunk1Len);
+  let pos = 0;
+  let indexUuid = null;
+  let indexFieldId = null;
+  const readVarint = (data, startPos) => {
+    let result = 0, shift = 0, p = startPos;
+    while (p < data.length) {
+      const byte = data[p++];
+      result |= (byte & 127) << shift;
+      if ((byte & 128) === 0) break;
+      shift += 7;
+    }
+    return { value: result, pos: p };
+  };
+  while (pos < chunk1Data.length) {
+    const tagResult = readVarint(chunk1Data, pos);
+    pos = tagResult.pos;
+    const fieldNum = tagResult.value >> 3;
+    const wireType = tagResult.value & 7;
+    if (wireType === 2) {
+      const lenResult = readVarint(chunk1Data, pos);
+      pos = lenResult.pos;
+      const content = chunk1Data.slice(pos, pos + lenResult.value);
+      pos += lenResult.value;
+      if (fieldNum === 1) {
+        const parsed = parseIndexMetadata(content);
+        if (parsed?.uuid) {
+          indexUuid = parsed.uuid;
+          indexFieldId = parsed.fieldId;
+        }
+      }
+    } else if (wireType === 0) {
+      pos = readVarint(chunk1Data, pos).pos;
+    } else if (wireType === 5) {
+      pos += 4;
+    } else if (wireType === 1) {
+      pos += 8;
+    }
+  }
+  return indexUuid ? { uuid: indexUuid, fieldId: indexFieldId } : null;
+}
+function parseIndexMetadata(bytes) {
+  let pos = 0, uuid = null, fieldId = null;
+  const readVarint = () => {
+    let result = 0, shift = 0;
+    while (pos < bytes.length) {
+      const byte = bytes[pos++];
+      result |= (byte & 127) << shift;
+      if ((byte & 128) === 0) break;
+      shift += 7;
+    }
+    return result;
+  };
+  while (pos < bytes.length) {
+    const tag = readVarint();
+    const fieldNum = tag >> 3;
+    const wireType = tag & 7;
+    if (wireType === 2) {
+      const len = readVarint();
+      const content = bytes.slice(pos, pos + len);
+      pos += len;
+      if (fieldNum === 1) uuid = parseUuid(content);
+    } else if (wireType === 0) {
+      const val = readVarint();
+      if (fieldNum === 2) fieldId = val;
+    } else if (wireType === 5) {
+      pos += 4;
+    } else if (wireType === 1) {
+      pos += 8;
+    }
+  }
+  return { uuid, fieldId };
+}
+function parseUuid(bytes) {
+  let pos = 0;
+  while (pos < bytes.length) {
+    const tag = bytes[pos++];
+    const fieldNum = tag >> 3;
+    const wireType = tag & 7;
+    if (wireType === 2 && fieldNum === 1) {
+      const len = bytes[pos++];
+      const uuidBytes = bytes.slice(pos, pos + len);
+      const hex = Array.from(uuidBytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+    } else if (wireType === 0) {
+      while (pos < bytes.length && bytes[pos++] & 128) {
+      }
+    } else if (wireType === 5) {
+      pos += 4;
+    } else if (wireType === 1) {
+      pos += 8;
+    }
+  }
+  return null;
+}
+function parseIndexFile(bytes, indexInfo, IVFIndexClass) {
+  const index = new IVFIndexClass();
+  const ivfData = findIVFMessage(bytes);
+  if (ivfData) {
+    if (ivfData.centroids) {
+      index.centroids = ivfData.centroids.data;
+      index.numPartitions = ivfData.centroids.numPartitions;
+      index.dimension = ivfData.centroids.dimension;
+    }
+    if (ivfData.offsets?.length > 0) index.partitionOffsets = ivfData.offsets;
+    if (ivfData.lengths?.length > 0) index.partitionLengths = ivfData.lengths;
+  }
+  if (!index.centroids) {
+    let pos = 0;
+    const readVarint = () => {
+      let result = 0, shift = 0;
+      while (pos < bytes.length) {
+        const byte = bytes[pos++];
+        result |= (byte & 127) << shift;
+        if ((byte & 128) === 0) break;
+        shift += 7;
+      }
+      return result;
+    };
+    while (pos < bytes.length - 4) {
+      const tag = readVarint();
+      const wireType = tag & 7;
+      if (wireType === 2) {
+        const len = readVarint();
+        if (len > bytes.length - pos) break;
+        const content = bytes.slice(pos, pos + len);
+        pos += len;
+        if (len > 100 && len < 1e8) {
+          const centroids = tryParseCentroids(content);
+          if (centroids) {
+            index.centroids = centroids.data;
+            index.numPartitions = centroids.numPartitions;
+            index.dimension = centroids.dimension;
+          }
+        }
+      } else if (wireType === 0) {
+        readVarint();
+      } else if (wireType === 5) {
+        pos += 4;
+      } else if (wireType === 1) {
+        pos += 8;
+      }
+    }
+  }
+  return index.centroids ? index : null;
+}
+function findIVFMessage(bytes) {
+  let pos = 0, offsets = [], lengths = [], centroids = null;
+  const readVarint = () => {
+    let result = 0, shift = 0;
+    while (pos < bytes.length) {
+      const byte = bytes[pos++];
+      result |= (byte & 127) << shift;
+      if ((byte & 128) === 0) break;
+      shift += 7;
+    }
+    return result;
+  };
+  while (pos < bytes.length - 4) {
+    const startPos = pos;
+    const tag = readVarint();
+    const fieldNum = tag >> 3;
+    const wireType = tag & 7;
+    if (wireType === 2) {
+      const len = readVarint();
+      if (len > bytes.length - pos || len < 0) {
+        pos = startPos + 1;
+        continue;
+      }
+      const content = bytes.slice(pos, pos + len);
+      pos += len;
+      if (fieldNum === 2 && len % 8 === 0 && len > 0) {
+        const view = new DataView(content.buffer, content.byteOffset, len);
+        for (let i = 0; i < len / 8; i++) {
+          offsets.push(Number(view.getBigUint64(i * 8, true)));
+        }
+      } else if (fieldNum === 3) {
+        if (len % 4 === 0 && len > 0) {
+          const view = new DataView(content.buffer, content.byteOffset, len);
+          for (let i = 0; i < len / 4; i++) {
+            lengths.push(view.getUint32(i * 4, true));
+          }
+        } else {
+          let lpos = 0;
+          while (lpos < content.length) {
+            let val = 0, shift = 0;
+            while (lpos < content.length) {
+              const byte = content[lpos++];
+              val |= (byte & 127) << shift;
+              if ((byte & 128) === 0) break;
+              shift += 7;
+            }
+            lengths.push(val);
+          }
+        }
+      } else if (fieldNum === 4) {
+        centroids = tryParseCentroids(content);
+      } else if (len > 100) {
+        const nested = findIVFMessage(content);
+        if (nested?.centroids || nested?.offsets?.length > 0) {
+          if (nested.centroids && !centroids) centroids = nested.centroids;
+          if (nested.offsets?.length > offsets.length) offsets = nested.offsets;
+          if (nested.lengths?.length > lengths.length) lengths = nested.lengths;
+        }
+      }
+    } else if (wireType === 0) {
+      readVarint();
+    } else if (wireType === 5) {
+      pos += 4;
+    } else if (wireType === 1) {
+      pos += 8;
+    } else {
+      pos = startPos + 1;
+    }
+  }
+  return centroids || offsets.length > 0 || lengths.length > 0 ? { centroids, offsets, lengths } : null;
+}
+function tryParseCentroids(bytes) {
+  let pos = 0, shape = [], dataBytes = null, dataType = 2;
+  const readVarint = () => {
+    let result = 0, shift = 0;
+    while (pos < bytes.length) {
+      const byte = bytes[pos++];
+      result |= (byte & 127) << shift;
+      if ((byte & 128) === 0) break;
+      shift += 7;
+    }
+    return result;
+  };
+  while (pos < bytes.length) {
+    const tag = readVarint();
+    const fieldNum = tag >> 3;
+    const wireType = tag & 7;
+    if (wireType === 0) {
+      const val = readVarint();
+      if (fieldNum === 1) dataType = val;
+    } else if (wireType === 2) {
+      const len = readVarint();
+      const content = bytes.slice(pos, pos + len);
+      pos += len;
+      if (fieldNum === 2) {
+        let shapePos = 0;
+        while (shapePos < content.length) {
+          let val = 0, shift = 0;
+          while (shapePos < content.length) {
+            const byte = content[shapePos++];
+            val |= (byte & 127) << shift;
+            if ((byte & 128) === 0) break;
+            shift += 7;
+          }
+          shape.push(val);
+        }
+      } else if (fieldNum === 3) {
+        dataBytes = content;
+      }
+    } else if (wireType === 5) {
+      pos += 4;
+    } else if (wireType === 1) {
+      pos += 8;
+    }
+  }
+  if (shape.length >= 2 && dataBytes && dataType === 2) {
+    const numPartitions = shape[0];
+    const dimension = shape[1];
+    if (dataBytes.length === numPartitions * dimension * 4) {
+      return {
+        data: new Float32Array(dataBytes.buffer, dataBytes.byteOffset, numPartitions * dimension),
+        numPartitions,
+        dimension
+      };
+    }
+  }
+  return null;
+}
+var init_ivf_manifest = __esm({
+  "src/client/search/ivf-manifest.js"() {
+  }
+});
+
+// src/client/search/ivf-auxiliary.js
+async function loadAuxiliaryMetadata(index) {
+  let headResp;
+  try {
+    headResp = await fetch(index.auxiliaryUrl, { method: "HEAD" });
+  } catch {
+    return;
+  }
+  if (!headResp.ok) return;
+  const fileSize = parseInt(headResp.headers.get("content-length"));
+  if (!fileSize) return;
+  const footerResp = await fetch(index.auxiliaryUrl, {
+    headers: { "Range": `bytes=${fileSize - 40}-${fileSize - 1}` }
+  });
+  if (!footerResp.ok) return;
+  const footer = new Uint8Array(await footerResp.arrayBuffer());
+  const view = new DataView(footer.buffer, footer.byteOffset);
+  const colMetaStart = Number(view.getBigUint64(0, true));
+  const colMetaOffsetsStart = Number(view.getBigUint64(8, true));
+  const globalBuffOffsetsStart = Number(view.getBigUint64(16, true));
+  const numGlobalBuffers = view.getUint32(24, true);
+  const magic = new TextDecoder().decode(footer.slice(36, 40));
+  if (magic !== "LANC") return;
+  const gboSize = numGlobalBuffers * 16;
+  const gboResp = await fetch(index.auxiliaryUrl, {
+    headers: { "Range": `bytes=${globalBuffOffsetsStart}-${globalBuffOffsetsStart + gboSize - 1}` }
+  });
+  if (!gboResp.ok) return;
+  const gboData = new Uint8Array(await gboResp.arrayBuffer());
+  const gboView = new DataView(gboData.buffer, gboData.byteOffset);
+  const buffers = [];
+  for (let i = 0; i < numGlobalBuffers; i++) {
+    const offset = Number(gboView.getBigUint64(i * 16, true));
+    const length = Number(gboView.getBigUint64(i * 16 + 8, true));
+    buffers.push({ offset, length });
+  }
+  if (buffers.length < 2) return;
+  index._auxBuffers = buffers;
+  index._auxFileSize = fileSize;
+  const colMetaOffResp = await fetch(index.auxiliaryUrl, {
+    headers: { "Range": `bytes=${colMetaOffsetsStart}-${globalBuffOffsetsStart - 1}` }
+  });
+  if (!colMetaOffResp.ok) return;
+  const colMetaOffData = new Uint8Array(await colMetaOffResp.arrayBuffer());
+  if (colMetaOffData.length >= 32) {
+    const colView = new DataView(colMetaOffData.buffer, colMetaOffData.byteOffset);
+    const col0Pos = Number(colView.getBigUint64(0, true));
+    const col0Len = Number(colView.getBigUint64(8, true));
+    const col0MetaResp = await fetch(index.auxiliaryUrl, {
+      headers: { "Range": `bytes=${col0Pos}-${col0Pos + col0Len - 1}` }
+    });
+    if (col0MetaResp.ok) {
+      const col0Meta = new Uint8Array(await col0MetaResp.arrayBuffer());
+      parseColumnMetaForPartitions(index, col0Meta);
+    }
+  }
+}
+function parseColumnMetaForPartitions(index, bytes) {
+  let pos = 0;
+  const pages = [];
+  const readVarint = () => {
+    let result = 0, shift = 0;
+    while (pos < bytes.length) {
+      const byte = bytes[pos++];
+      result |= (byte & 127) << shift;
+      if ((byte & 128) === 0) break;
+      shift += 7;
+    }
+    return result;
+  };
+  while (pos < bytes.length) {
+    const tag = readVarint();
+    const fieldNum = tag >> 3;
+    const wireType = tag & 7;
+    if (wireType === 2) {
+      const len = readVarint();
+      if (len > bytes.length - pos) break;
+      const content = bytes.slice(pos, pos + len);
+      pos += len;
+      if (fieldNum === 2) {
+        const page = parsePageInfo(content);
+        if (page) pages.push(page);
+      }
+    } else if (wireType === 0) {
+      readVarint();
+    } else if (wireType === 5) {
+      pos += 4;
+    } else if (wireType === 1) {
+      pos += 8;
+    }
+  }
+  index._columnPages = pages;
+}
+function parsePageInfo(bytes) {
+  let pos = 0;
+  let numRows = 0;
+  const bufferOffsets = [];
+  const bufferSizes = [];
+  const readVarint = () => {
+    let result = 0, shift = 0;
+    while (pos < bytes.length) {
+      const byte = bytes[pos++];
+      result |= (byte & 127) << shift;
+      if ((byte & 128) === 0) break;
+      shift += 7;
+    }
+    return result;
+  };
+  while (pos < bytes.length) {
+    const tag = readVarint();
+    const fieldNum = tag >> 3;
+    const wireType = tag & 7;
+    if (wireType === 0) {
+      const val = readVarint();
+      if (fieldNum === 3) numRows = val;
+    } else if (wireType === 2) {
+      const len = readVarint();
+      const content = bytes.slice(pos, pos + len);
+      pos += len;
+      if (fieldNum === 1) {
+        let p = 0;
+        while (p < content.length) {
+          let val = 0n, shift = 0n;
+          while (p < content.length) {
+            const b = content[p++];
+            val |= BigInt(b & 127) << shift;
+            if ((b & 128) === 0) break;
+            shift += 7n;
+          }
+          bufferOffsets.push(Number(val));
+        }
+      }
+      if (fieldNum === 2) {
+        let p = 0;
+        while (p < content.length) {
+          let val = 0n, shift = 0n;
+          while (p < content.length) {
+            const b = content[p++];
+            val |= BigInt(b & 127) << shift;
+            if ((b & 128) === 0) break;
+            shift += 7n;
+          }
+          bufferSizes.push(Number(val));
+        }
+      }
+    } else if (wireType === 5) {
+      pos += 4;
+    } else if (wireType === 1) {
+      pos += 8;
+    }
+  }
+  return { numRows, bufferOffsets, bufferSizes };
+}
+function parseAuxiliaryPartitionInfo(index, bytes) {
+  let pos = 0;
+  const readVarint = () => {
+    let result = 0, shift = 0;
+    while (pos < bytes.length) {
+      const byte = bytes[pos++];
+      result |= (byte & 127) << shift;
+      if ((byte & 128) === 0) break;
+      shift += 7;
+    }
+    return result;
+  };
+  while (pos < bytes.length - 4) {
+    const tag = readVarint();
+    const fieldNum = tag >> 3;
+    const wireType = tag & 7;
+    if (wireType === 2) {
+      const len = readVarint();
+      if (len > bytes.length - pos) break;
+      const content = bytes.slice(pos, pos + len);
+      pos += len;
+      if (fieldNum === 2 && len > 100 && len < 2e3) {
+        const offsets = [];
+        let innerPos = 0;
+        while (innerPos < content.length) {
+          let val = 0, shift = 0;
+          while (innerPos < content.length) {
+            const byte = content[innerPos++];
+            val |= (byte & 127) << shift;
+            if ((byte & 128) === 0) break;
+            shift += 7;
+          }
+          offsets.push(val);
+        }
+        if (offsets.length === index.numPartitions) {
+          index.partitionOffsets = offsets;
+        }
+      } else if (fieldNum === 3 && len > 100 && len < 2e3) {
+        const lengths = [];
+        let innerPos = 0;
+        while (innerPos < content.length) {
+          let val = 0, shift = 0;
+          while (innerPos < content.length) {
+            const byte = content[innerPos++];
+            val |= (byte & 127) << shift;
+            if ((byte & 128) === 0) break;
+            shift += 7;
+          }
+          lengths.push(val);
+        }
+        if (lengths.length === index.numPartitions) {
+          index.partitionLengths = lengths;
+        }
+      }
+    } else if (wireType === 0) {
+      readVarint();
+    } else if (wireType === 1) {
+      pos += 8;
+    } else if (wireType === 5) {
+      pos += 4;
+    } else {
+      break;
+    }
+  }
+}
+var init_ivf_auxiliary = __esm({
+  "src/client/search/ivf-auxiliary.js"() {
+  }
+});
+
+// src/client/search/ivf-partitions.js
+async function loadPartitionIndex(index) {
+  const url = `${index.datasetBaseUrl}/ivf_vectors.bin`;
+  index.partitionVectorsUrl = url;
+  const headerResp = await fetch(url, { headers: { "Range": "bytes=0-2055" } });
+  if (!headerResp.ok) return;
+  const headerData = await headerResp.arrayBuffer();
+  const bigOffsets = new BigUint64Array(headerData);
+  index.partitionOffsets = Array.from(bigOffsets, (n) => Number(n));
+  index.hasPartitionIndex = true;
+}
+async function fetchPartitionData(index, partitionIndices, dim = 384, onProgress = null) {
+  if (!index.hasPartitionIndex || !index.partitionVectorsUrl) return null;
+  const allRowIds = [];
+  const allVectors = [];
+  let totalBytesToFetch = 0;
+  let bytesLoaded = 0;
+  const uncachedPartitions = [];
+  const cachedResults = /* @__PURE__ */ new Map();
+  for (const p of partitionIndices) {
+    if (index._partitionCache?.has(p)) {
+      cachedResults.set(p, index._partitionCache.get(p));
+    } else {
+      uncachedPartitions.push(p);
+      totalBytesToFetch += index.partitionOffsets[p + 1] - index.partitionOffsets[p];
+    }
+  }
+  if (uncachedPartitions.length === 0) {
+    for (const p of partitionIndices) {
+      const result = cachedResults.get(p);
+      allRowIds.push(...result.rowIds);
+      allVectors.push(...result.vectors);
+    }
+    if (onProgress) onProgress(100, 100);
+    return { rowIds: allRowIds, vectors: allVectors };
+  }
+  if (!index._partitionCache) index._partitionCache = /* @__PURE__ */ new Map();
+  const PARALLEL_LIMIT = 6;
+  for (let i = 0; i < uncachedPartitions.length; i += PARALLEL_LIMIT) {
+    const batch = uncachedPartitions.slice(i, i + PARALLEL_LIMIT);
+    const results = await Promise.all(batch.map(async (p) => {
+      const startOffset = index.partitionOffsets[p];
+      const endOffset = index.partitionOffsets[p + 1];
+      const byteSize = endOffset - startOffset;
+      try {
+        const resp = await fetch(index.partitionVectorsUrl, {
+          headers: { "Range": `bytes=${startOffset}-${endOffset - 1}` }
+        });
+        if (!resp.ok) return { p, rowIds: [], vectors: [] };
+        const data = await resp.arrayBuffer();
+        const view = new DataView(data);
+        const rowCount = view.getUint32(0, true);
+        const rowIdsEnd = 4 + rowCount * 4;
+        const rowIds = new Uint32Array(data.slice(4, rowIdsEnd));
+        const vectorsFlat = new Float32Array(data.slice(rowIdsEnd));
+        const vectors = [];
+        for (let j = 0; j < rowCount; j++) {
+          vectors.push(vectorsFlat.slice(j * dim, (j + 1) * dim));
+        }
+        bytesLoaded += byteSize;
+        if (onProgress) onProgress(bytesLoaded, totalBytesToFetch);
+        return { p, rowIds: Array.from(rowIds), vectors };
+      } catch {
+        return { p, rowIds: [], vectors: [] };
+      }
+    }));
+    for (const result of results) {
+      index._partitionCache.set(result.p, { rowIds: result.rowIds, vectors: result.vectors });
+      cachedResults.set(result.p, { rowIds: result.rowIds, vectors: result.vectors });
+    }
+  }
+  for (const p of partitionIndices) {
+    const result = cachedResults.get(p);
+    if (result) {
+      allRowIds.push(...result.rowIds);
+      allVectors.push(...result.vectors);
+    }
+  }
+  return { rowIds: allRowIds, vectors: allVectors };
+}
+async function prefetchAllRowIds(index) {
+  if (!index.auxiliaryUrl || !index._auxBufferOffsets) return;
+  if (index._rowIdCacheReady) return;
+  const totalRows = index.partitionLengths.reduce((a, b) => a + b, 0);
+  if (totalRows === 0) return;
+  const dataStart = index._auxBufferOffsets[1];
+  const totalBytes = totalRows * 8;
+  try {
+    const resp = await fetch(index.auxiliaryUrl, {
+      headers: { "Range": `bytes=${dataStart}-${dataStart + totalBytes - 1}` }
+    });
+    if (!resp.ok) return;
+    const data = new Uint8Array(await resp.arrayBuffer());
+    const view = new DataView(data.buffer, data.byteOffset);
+    index._rowIdCache = /* @__PURE__ */ new Map();
+    let globalRowIdx = 0;
+    for (let p = 0; p < index.partitionLengths.length; p++) {
+      const numRows = index.partitionLengths[p];
+      const partitionRows2 = [];
+      for (let i = 0; i < numRows; i++) {
+        const rowId = Number(view.getBigUint64(globalRowIdx * 8, true));
+        partitionRows2.push({
+          fragId: Math.floor(rowId / 4294967296),
+          rowOffset: rowId % 4294967296
+        });
+        globalRowIdx++;
+      }
+      index._rowIdCache.set(p, partitionRows2);
+    }
+    index._rowIdCacheReady = true;
+  } catch {
+  }
+}
+async function fetchPartitionRowIds(index, partitionIndices) {
+  if (index._rowIdCacheReady && index._rowIdCache) {
+    const results2 = [];
+    for (const p of partitionIndices) {
+      const cached = index._rowIdCache.get(p);
+      if (cached) {
+        for (const row of cached) {
+          results2.push({ ...row, partition: p });
+        }
+      }
+    }
+    return results2;
+  }
+  if (!index.auxiliaryUrl || !index._auxBufferOffsets) return null;
+  const rowRanges = [];
+  for (const p of partitionIndices) {
+    if (p < index.partitionOffsets.length) {
+      rowRanges.push({
+        partition: p,
+        startRow: index.partitionOffsets[p],
+        numRows: index.partitionLengths[p]
+      });
+    }
+  }
+  if (rowRanges.length === 0) return [];
+  const results = [];
+  const dataStart = index._auxBufferOffsets[1];
+  for (const range of rowRanges) {
+    const byteStart = dataStart + range.startRow * 8;
+    const byteEnd = byteStart + range.numRows * 8 - 1;
+    try {
+      const resp = await fetch(index.auxiliaryUrl, {
+        headers: { "Range": `bytes=${byteStart}-${byteEnd}` }
+      });
+      if (!resp.ok) continue;
+      const data = new Uint8Array(await resp.arrayBuffer());
+      const view = new DataView(data.buffer, data.byteOffset);
+      for (let i = 0; i < range.numRows; i++) {
+        const rowId = Number(view.getBigUint64(i * 8, true));
+        results.push({
+          fragId: Math.floor(rowId / 4294967296),
+          rowOffset: rowId % 4294967296,
+          partition: range.partition
+        });
+      }
+    } catch {
+    }
+  }
+  return results;
+}
+function getPartitionRowCount(index, partitionIndices) {
+  let total = 0;
+  for (const p of partitionIndices) {
+    if (p < index.partitionLengths.length) {
+      total += index.partitionLengths[p];
+    }
+  }
+  return total;
+}
+var init_ivf_partitions = __esm({
+  "src/client/search/ivf-partitions.js"() {
+  }
+});
+
 // src/client/search/ivf-index.js
 var IVFIndex;
 var init_ivf_index = __esm({
   "src/client/search/ivf-index.js"() {
+    init_ivf_manifest();
+    init_ivf_auxiliary();
+    init_ivf_partitions();
     IVFIndex = class _IVFIndex {
       constructor() {
         this.centroids = null;
@@ -1244,963 +1963,76 @@ var init_ivf_index = __esm({
         this._rowIdCache = null;
         this._rowIdCacheReady = false;
       }
-      /**
-       * Try to load IVF index from a Lance dataset.
-       * Index structure: dataset.lance/_indices/<uuid>/index.idx
-       * @param {string} datasetBaseUrl - Base URL of dataset (e.g., https://host/data.lance)
-       * @returns {Promise<IVFIndex|null>}
-       */
       static async tryLoad(datasetBaseUrl) {
         if (!datasetBaseUrl) return null;
         try {
-          const manifestVersion = await _IVFIndex._findLatestManifestVersion(datasetBaseUrl);
-          console.log(`[IVFIndex] Manifest version: ${manifestVersion}`);
+          const manifestVersion = await findLatestManifestVersion(datasetBaseUrl);
           if (!manifestVersion) return null;
           const manifestUrl = `${datasetBaseUrl}/_versions/${manifestVersion}.manifest`;
           const manifestResp = await fetch(manifestUrl);
-          if (!manifestResp.ok) {
-            console.log(`[IVFIndex] Failed to fetch manifest: ${manifestResp.status}`);
-            return null;
-          }
+          if (!manifestResp.ok) return null;
           const manifestData = await manifestResp.arrayBuffer();
-          const indexInfo = _IVFIndex._parseManifestForIndex(new Uint8Array(manifestData));
-          console.log(`[IVFIndex] Index info:`, indexInfo);
-          if (!indexInfo || !indexInfo.uuid) {
-            console.log("[IVFIndex] No index UUID found in manifest");
-            return null;
-          }
-          console.log(`[IVFIndex] Found index UUID: ${indexInfo.uuid}`);
+          const indexInfo = parseManifestForIndex(new Uint8Array(manifestData));
+          if (!indexInfo?.uuid) return null;
           const indexUrl = `${datasetBaseUrl}/_indices/${indexInfo.uuid}/index.idx`;
           const indexResp = await fetch(indexUrl);
-          if (!indexResp.ok) {
-            console.warn("[IVFIndex] index.idx not found");
-            return null;
-          }
+          if (!indexResp.ok) return null;
           const indexData = await indexResp.arrayBuffer();
-          const index = _IVFIndex._parseIndexFile(new Uint8Array(indexData), indexInfo);
+          const index = parseIndexFile(new Uint8Array(indexData), indexInfo, _IVFIndex);
           if (!index) return null;
           index.auxiliaryUrl = `${datasetBaseUrl}/_indices/${indexInfo.uuid}/auxiliary.idx`;
           index.datasetBaseUrl = datasetBaseUrl;
           try {
-            await index._loadAuxiliaryMetadata();
-          } catch (e) {
-            console.warn("[IVFIndex] Failed to load auxiliary metadata:", e);
-          }
-          console.log(`[IVFIndex] Loaded: ${index.numPartitions} partitions, dim=${index.dimension}`);
-          if (index.partitionLengths.length > 0) {
-            const totalRows = index.partitionLengths.reduce((a, b) => a + b, 0);
-            console.log(`[IVFIndex] Partition info: ${totalRows.toLocaleString()} total rows`);
+            await loadAuxiliaryMetadata(index);
+          } catch {
           }
           try {
-            await index._loadPartitionIndex();
-          } catch (e) {
-            console.warn("[IVFIndex] Failed to load partition index:", e);
+            await loadPartitionIndex(index);
+          } catch {
           }
           try {
-            await index.prefetchAllRowIds();
-          } catch (e) {
-            console.warn("[IVFIndex] Failed to prefetch row IDs:", e);
+            await prefetchAllRowIds(index);
+          } catch {
           }
           return index;
-        } catch (e) {
-          console.warn("[IVFIndex] Failed to load:", e);
+        } catch {
           return null;
         }
       }
-      /**
-       * Load partition-organized vectors index from ivf_vectors.bin.
-       * This file contains:
-       *   - Header: 257 uint64 byte offsets (2056 bytes)
-       *   - Per partition: [row_count: uint32][row_ids: uint32 × n][vectors: float32 × n × 384]
-       * @private
-       */
       async _loadPartitionIndex() {
-        const url = `${this.datasetBaseUrl}/ivf_vectors.bin`;
-        this.partitionVectorsUrl = url;
-        const headerResp = await fetch(url, {
-          headers: { "Range": "bytes=0-2055" }
-        });
-        if (!headerResp.ok) {
-          console.log("[IVFIndex] ivf_vectors.bin not found, IVF search disabled");
-          return;
-        }
-        const headerData = await headerResp.arrayBuffer();
-        const bigOffsets = new BigUint64Array(headerData);
-        this.partitionOffsets = Array.from(bigOffsets, (n) => Number(n));
-        this.hasPartitionIndex = true;
-        console.log(`[IVFIndex] Loaded partition vectors index: 256 partitions`);
+        return loadPartitionIndex(this);
       }
-      /**
-       * Fetch partition data (row IDs and vectors) directly from ivf_vectors.bin.
-       * Uses OPFS cache for instant subsequent searches.
-       * Each partition contains: [row_count: uint32][row_ids: uint32 × n][vectors: float32 × n × dim]
-       * @param {number[]} partitionIndices - Partition indices to fetch
-       * @param {number} dim - Vector dimension (default 384)
-       * @param {function} onProgress - Progress callback (bytesLoaded, totalBytes)
-       * @returns {Promise<{rowIds: number[], vectors: Float32Array[]}>}
-       */
-      async fetchPartitionData(partitionIndices, dim = 384, onProgress = null) {
-        if (!this.hasPartitionIndex || !this.partitionVectorsUrl) {
-          return null;
-        }
-        const allRowIds = [];
-        const allVectors = [];
-        let totalBytesToFetch = 0;
-        let bytesLoaded = 0;
-        const uncachedPartitions = [];
-        const cachedResults = /* @__PURE__ */ new Map();
-        for (const p of partitionIndices) {
-          if (this._partitionCache?.has(p)) {
-            cachedResults.set(p, this._partitionCache.get(p));
-          } else {
-            uncachedPartitions.push(p);
-            const startOffset = this.partitionOffsets[p];
-            const endOffset = this.partitionOffsets[p + 1];
-            totalBytesToFetch += endOffset - startOffset;
-          }
-        }
-        if (uncachedPartitions.length === 0) {
-          console.log(`[IVFIndex] All ${partitionIndices.length} partitions from cache`);
-          for (const p of partitionIndices) {
-            const result = cachedResults.get(p);
-            allRowIds.push(...result.rowIds);
-            allVectors.push(...result.vectors);
-          }
-          if (onProgress) onProgress(100, 100);
-          return { rowIds: allRowIds, vectors: allVectors };
-        }
-        console.log(`[IVFIndex] Fetching ${uncachedPartitions.length}/${partitionIndices.length} partitions, ${(totalBytesToFetch / 1024 / 1024).toFixed(1)} MB`);
-        if (!this._partitionCache) {
-          this._partitionCache = /* @__PURE__ */ new Map();
-        }
-        const PARALLEL_LIMIT = 6;
-        for (let i = 0; i < uncachedPartitions.length; i += PARALLEL_LIMIT) {
-          const batch = uncachedPartitions.slice(i, i + PARALLEL_LIMIT);
-          const results = await Promise.all(batch.map(async (p) => {
-            const startOffset = this.partitionOffsets[p];
-            const endOffset = this.partitionOffsets[p + 1];
-            const byteSize = endOffset - startOffset;
-            try {
-              const resp = await fetch(this.partitionVectorsUrl, {
-                headers: { "Range": `bytes=${startOffset}-${endOffset - 1}` }
-              });
-              if (!resp.ok) {
-                console.warn(`[IVFIndex] Partition ${p} fetch failed: ${resp.status}`);
-                return { p, rowIds: [], vectors: [] };
-              }
-              const data = await resp.arrayBuffer();
-              const view = new DataView(data);
-              const rowCount = view.getUint32(0, true);
-              const rowIdsStart = 4;
-              const rowIdsEnd = rowIdsStart + rowCount * 4;
-              const vectorsStart = rowIdsEnd;
-              const rowIds = new Uint32Array(data.slice(rowIdsStart, rowIdsEnd));
-              const vectorsFlat = new Float32Array(data.slice(vectorsStart));
-              const vectors = [];
-              for (let j = 0; j < rowCount; j++) {
-                vectors.push(vectorsFlat.slice(j * dim, (j + 1) * dim));
-              }
-              bytesLoaded += byteSize;
-              if (onProgress) onProgress(bytesLoaded, totalBytesToFetch);
-              return { p, rowIds: Array.from(rowIds), vectors };
-            } catch (e) {
-              console.warn(`[IVFIndex] Error fetching partition ${p}:`, e);
-              return { p, rowIds: [], vectors: [] };
-            }
-          }));
-          for (const result of results) {
-            const { p, rowIds, vectors } = result;
-            this._partitionCache.set(p, { rowIds, vectors });
-            cachedResults.set(p, { rowIds, vectors });
-          }
-        }
-        for (const p of partitionIndices) {
-          const result = cachedResults.get(p);
-          if (result) {
-            allRowIds.push(...result.rowIds);
-            allVectors.push(...result.vectors);
-          }
-        }
-        console.log(`[IVFIndex] Loaded ${allRowIds.length.toLocaleString()} vectors from ${partitionIndices.length} partitions`);
-        return { rowIds: allRowIds, vectors: allVectors };
+      fetchPartitionData(partitionIndices, dim = 384, onProgress = null) {
+        return fetchPartitionData(this, partitionIndices, dim, onProgress);
       }
-      /**
-       * Find latest manifest version using binary search.
-       * @private
-       */
-      static async _findLatestManifestVersion(baseUrl) {
-        const checkVersions = [1, 5, 10, 20, 50, 100];
-        const checks = await Promise.all(
-          checkVersions.map(async (v) => {
-            try {
-              const url = `${baseUrl}/_versions/${v}.manifest`;
-              const response = await fetch(url, { method: "HEAD" });
-              return response.ok ? v : 0;
-            } catch {
-              return 0;
-            }
-          })
-        );
-        let highestFound = Math.max(...checks);
-        if (highestFound === 0) return null;
-        for (let v = highestFound + 1; v <= highestFound + 30; v++) {
-          try {
-            const url = `${baseUrl}/_versions/${v}.manifest`;
-            const response = await fetch(url, { method: "HEAD" });
-            if (response.ok) {
-              highestFound = v;
-            } else {
-              break;
-            }
-          } catch {
-            break;
-          }
-        }
-        return highestFound;
-      }
-      /**
-       * Load partition metadata from auxiliary.idx.
-       * Uses HTTP range request to fetch only the metadata section.
-       * @private
-       */
       async _loadAuxiliaryMetadata() {
-        let headResp;
-        try {
-          headResp = await fetch(this.auxiliaryUrl, { method: "HEAD" });
-        } catch (e) {
-          console.warn("[IVFIndex] HEAD request failed for auxiliary.idx:", e.message);
-          return;
-        }
-        if (!headResp.ok) return;
-        const fileSize = parseInt(headResp.headers.get("content-length"));
-        if (!fileSize) return;
-        const footerResp = await fetch(this.auxiliaryUrl, {
-          headers: { "Range": `bytes=${fileSize - 40}-${fileSize - 1}` }
-        });
-        if (!footerResp.ok) return;
-        const footer = new Uint8Array(await footerResp.arrayBuffer());
-        const view = new DataView(footer.buffer, footer.byteOffset);
-        const colMetaStart = Number(view.getBigUint64(0, true));
-        const colMetaOffsetsStart = Number(view.getBigUint64(8, true));
-        const globalBuffOffsetsStart = Number(view.getBigUint64(16, true));
-        const numGlobalBuffers = view.getUint32(24, true);
-        const numColumns = view.getUint32(28, true);
-        const magic = new TextDecoder().decode(footer.slice(36, 40));
-        if (magic !== "LANC") {
-          console.warn("[IVFIndex] Invalid auxiliary.idx magic");
-          return;
-        }
-        console.log(`[IVFIndex] Footer: colMetaStart=${colMetaStart}, colMetaOffsetsStart=${colMetaOffsetsStart}, globalBuffOffsetsStart=${globalBuffOffsetsStart}, numGlobalBuffers=${numGlobalBuffers}, numColumns=${numColumns}`);
-        const gboSize = numGlobalBuffers * 16;
-        const gboResp = await fetch(this.auxiliaryUrl, {
-          headers: { "Range": `bytes=${globalBuffOffsetsStart}-${globalBuffOffsetsStart + gboSize - 1}` }
-        });
-        if (!gboResp.ok) return;
-        const gboData = new Uint8Array(await gboResp.arrayBuffer());
-        const gboView = new DataView(gboData.buffer, gboData.byteOffset);
-        const buffers = [];
-        for (let i = 0; i < numGlobalBuffers; i++) {
-          const offset = Number(gboView.getBigUint64(i * 16, true));
-          const length = Number(gboView.getBigUint64(i * 16 + 8, true));
-          buffers.push({ offset, length });
-        }
-        console.log(`[IVFIndex] Buffers:`, buffers);
-        if (buffers.length < 2) return;
-        this._auxBuffers = buffers;
-        this._auxFileSize = fileSize;
-        const colMetaOffResp = await fetch(this.auxiliaryUrl, {
-          headers: { "Range": `bytes=${colMetaOffsetsStart}-${globalBuffOffsetsStart - 1}` }
-        });
-        if (!colMetaOffResp.ok) return;
-        const colMetaOffData = new Uint8Array(await colMetaOffResp.arrayBuffer());
-        if (colMetaOffData.length >= 32) {
-          const colView = new DataView(colMetaOffData.buffer, colMetaOffData.byteOffset);
-          const col0Pos = Number(colView.getBigUint64(0, true));
-          const col0Len = Number(colView.getBigUint64(8, true));
-          console.log(`[IVFIndex] Column 0 (_rowid) metadata at ${col0Pos}, len=${col0Len}`);
-          const col0MetaResp = await fetch(this.auxiliaryUrl, {
-            headers: { "Range": `bytes=${col0Pos}-${col0Pos + col0Len - 1}` }
-          });
-          if (col0MetaResp.ok) {
-            const col0Meta = new Uint8Array(await col0MetaResp.arrayBuffer());
-            this._parseColumnMetaForPartitions(col0Meta);
-          }
-        }
+        return loadAuxiliaryMetadata(this);
       }
-      /**
-       * Parse column metadata to extract partition (page) boundaries.
-       * @private
-       */
       _parseColumnMetaForPartitions(bytes) {
-        let pos = 0;
-        const pages = [];
-        const readVarint = () => {
-          let result = 0;
-          let shift = 0;
-          while (pos < bytes.length) {
-            const byte = bytes[pos++];
-            result |= (byte & 127) << shift;
-            if ((byte & 128) === 0) break;
-            shift += 7;
-          }
-          return result;
-        };
-        while (pos < bytes.length) {
-          const tag = readVarint();
-          const fieldNum = tag >> 3;
-          const wireType = tag & 7;
-          if (wireType === 2) {
-            const len = readVarint();
-            if (len > bytes.length - pos) break;
-            const content = bytes.slice(pos, pos + len);
-            pos += len;
-            if (fieldNum === 2) {
-              const page = this._parsePageInfo(content);
-              if (page) pages.push(page);
-            }
-          } else if (wireType === 0) {
-            readVarint();
-          } else if (wireType === 5) {
-            pos += 4;
-          } else if (wireType === 1) {
-            pos += 8;
-          }
-        }
-        console.log(`[IVFIndex] Found ${pages.length} column pages`);
-        this._columnPages = pages;
-        let totalRows = 0;
-        for (const page of pages) {
-          totalRows += page.numRows;
-        }
-        console.log(`[IVFIndex] Column has ${totalRows} total rows`);
+        return parseColumnMetaForPartitions(this, bytes);
       }
-      /**
-       * Parse PageInfo protobuf.
-       * @private
-       */
-      _parsePageInfo(bytes) {
-        let pos = 0;
-        let numRows = 0;
-        const bufferOffsets = [];
-        const bufferSizes = [];
-        const readVarint = () => {
-          let result = 0;
-          let shift = 0;
-          while (pos < bytes.length) {
-            const byte = bytes[pos++];
-            result |= (byte & 127) << shift;
-            if ((byte & 128) === 0) break;
-            shift += 7;
-          }
-          return result;
-        };
-        while (pos < bytes.length) {
-          const tag = readVarint();
-          const fieldNum = tag >> 3;
-          const wireType = tag & 7;
-          if (wireType === 0) {
-            const val = readVarint();
-            if (fieldNum === 3) numRows = val;
-          } else if (wireType === 2) {
-            const len = readVarint();
-            const content = bytes.slice(pos, pos + len);
-            pos += len;
-            if (fieldNum === 1) {
-              let p = 0;
-              while (p < content.length) {
-                let val = 0n;
-                let shift = 0n;
-                while (p < content.length) {
-                  const b = content[p++];
-                  val |= BigInt(b & 127) << shift;
-                  if ((b & 128) === 0) break;
-                  shift += 7n;
-                }
-                bufferOffsets.push(Number(val));
-              }
-            }
-            if (fieldNum === 2) {
-              let p = 0;
-              while (p < content.length) {
-                let val = 0n;
-                let shift = 0n;
-                while (p < content.length) {
-                  const b = content[p++];
-                  val |= BigInt(b & 127) << shift;
-                  if ((b & 128) === 0) break;
-                  shift += 7n;
-                }
-                bufferSizes.push(Number(val));
-              }
-            }
-          } else if (wireType === 5) {
-            pos += 4;
-          } else if (wireType === 1) {
-            pos += 8;
-          }
-        }
-        return { numRows, bufferOffsets, bufferSizes };
-      }
-      /**
-       * Parse partition offsets and lengths from auxiliary.idx metadata.
-       * @private
-       */
       _parseAuxiliaryPartitionInfo(bytes) {
-        let pos = 0;
-        const readVarint = () => {
-          let result = 0;
-          let shift = 0;
-          while (pos < bytes.length) {
-            const byte = bytes[pos++];
-            result |= (byte & 127) << shift;
-            if ((byte & 128) === 0) break;
-            shift += 7;
-          }
-          return result;
-        };
-        while (pos < bytes.length - 4) {
-          const tag = readVarint();
-          const fieldNum = tag >> 3;
-          const wireType = tag & 7;
-          if (wireType === 2) {
-            const len = readVarint();
-            if (len > bytes.length - pos) break;
-            const content = bytes.slice(pos, pos + len);
-            pos += len;
-            if (fieldNum === 2 && len > 100 && len < 2e3) {
-              const offsets = [];
-              let innerPos = 0;
-              while (innerPos < content.length) {
-                let val = 0, shift = 0;
-                while (innerPos < content.length) {
-                  const byte = content[innerPos++];
-                  val |= (byte & 127) << shift;
-                  if ((byte & 128) === 0) break;
-                  shift += 7;
-                }
-                offsets.push(val);
-              }
-              if (offsets.length === this.numPartitions) {
-                this.partitionOffsets = offsets;
-                console.log(`[IVFIndex] Loaded ${offsets.length} partition offsets`);
-              }
-            } else if (fieldNum === 3 && len > 100 && len < 2e3) {
-              const lengths = [];
-              let innerPos = 0;
-              while (innerPos < content.length) {
-                let val = 0, shift = 0;
-                while (innerPos < content.length) {
-                  const byte = content[innerPos++];
-                  val |= (byte & 127) << shift;
-                  if ((byte & 128) === 0) break;
-                  shift += 7;
-                }
-                lengths.push(val);
-              }
-              if (lengths.length === this.numPartitions) {
-                this.partitionLengths = lengths;
-                console.log(`[IVFIndex] Loaded ${lengths.length} partition lengths`);
-              }
-            }
-          } else if (wireType === 0) {
-            readVarint();
-          } else if (wireType === 1) {
-            pos += 8;
-          } else if (wireType === 5) {
-            pos += 4;
-          } else {
-            break;
-          }
-        }
+        return parseAuxiliaryPartitionInfo(this, bytes);
       }
-      /**
-       * Prefetch ALL row IDs from auxiliary.idx into memory.
-       * This is called once during index loading to avoid HTTP requests during search.
-       * @returns {Promise<void>}
-       */
       async prefetchAllRowIds() {
-        if (!this.auxiliaryUrl || !this._auxBufferOffsets) {
-          console.log("[IVFIndex] No auxiliary.idx available for prefetch");
-          return;
-        }
-        if (this._rowIdCacheReady) {
-          console.log("[IVFIndex] Row IDs already prefetched");
-          return;
-        }
-        const totalRows = this.partitionLengths.reduce((a, b) => a + b, 0);
-        if (totalRows === 0) {
-          console.log("[IVFIndex] No rows to prefetch");
-          return;
-        }
-        console.log(`[IVFIndex] Prefetching ${totalRows.toLocaleString()} row IDs...`);
-        const startTime = performance.now();
-        const dataStart = this._auxBufferOffsets[1];
-        const totalBytes = totalRows * 8;
-        try {
-          const resp = await fetch(this.auxiliaryUrl, {
-            headers: { "Range": `bytes=${dataStart}-${dataStart + totalBytes - 1}` }
-          });
-          if (!resp.ok) {
-            throw new Error(`HTTP ${resp.status}`);
-          }
-          const data = new Uint8Array(await resp.arrayBuffer());
-          const view = new DataView(data.buffer, data.byteOffset);
-          this._rowIdCache = /* @__PURE__ */ new Map();
-          let globalRowIdx = 0;
-          for (let p = 0; p < this.partitionLengths.length; p++) {
-            const numRows = this.partitionLengths[p];
-            const partitionRows2 = [];
-            for (let i = 0; i < numRows; i++) {
-              const rowId = Number(view.getBigUint64(globalRowIdx * 8, true));
-              const fragId = Math.floor(rowId / 4294967296);
-              const rowOffset = rowId % 4294967296;
-              partitionRows2.push({ fragId, rowOffset });
-              globalRowIdx++;
-            }
-            this._rowIdCache.set(p, partitionRows2);
-          }
-          this._rowIdCacheReady = true;
-          const elapsed = performance.now() - startTime;
-          console.log(`[IVFIndex] Prefetched ${totalRows.toLocaleString()} row IDs in ${elapsed.toFixed(0)}ms (${(totalBytes / 1024 / 1024).toFixed(1)}MB)`);
-        } catch (e) {
-          console.warn("[IVFIndex] Failed to prefetch row IDs:", e);
-        }
+        return prefetchAllRowIds(this);
       }
-      /**
-       * Fetch row IDs for specified partitions.
-       * Uses prefetched cache if available (instant), otherwise fetches from network.
-       *
-       * @param {number[]} partitionIndices - Partition indices to fetch
-       * @returns {Promise<Array<{fragId: number, rowOffset: number}>>}
-       */
-      async fetchPartitionRowIds(partitionIndices) {
-        if (this._rowIdCacheReady && this._rowIdCache) {
-          const results2 = [];
-          for (const p of partitionIndices) {
-            const cached = this._rowIdCache.get(p);
-            if (cached) {
-              for (const row of cached) {
-                results2.push({ ...row, partition: p });
-              }
-            }
-          }
-          return results2;
-        }
-        if (!this.auxiliaryUrl || !this._auxBufferOffsets) {
-          return null;
-        }
-        const rowRanges = [];
-        for (const p of partitionIndices) {
-          if (p < this.partitionOffsets.length) {
-            const startRow = this.partitionOffsets[p];
-            const numRows = this.partitionLengths[p];
-            rowRanges.push({ partition: p, startRow, numRows });
-          }
-        }
-        if (rowRanges.length === 0) return [];
-        const results = [];
-        const dataStart = this._auxBufferOffsets[1];
-        for (const range of rowRanges) {
-          const byteStart = dataStart + range.startRow * 8;
-          const byteEnd = byteStart + range.numRows * 8 - 1;
-          try {
-            const resp = await fetch(this.auxiliaryUrl, {
-              headers: { "Range": `bytes=${byteStart}-${byteEnd}` }
-            });
-            if (!resp.ok) continue;
-            const data = new Uint8Array(await resp.arrayBuffer());
-            const view = new DataView(data.buffer, data.byteOffset);
-            for (let i = 0; i < range.numRows; i++) {
-              const rowId = Number(view.getBigUint64(i * 8, true));
-              const fragId = Math.floor(rowId / 4294967296);
-              const rowOffset = rowId % 4294967296;
-              results.push({ fragId, rowOffset, partition: range.partition });
-            }
-          } catch (e) {
-            console.warn(`[IVFIndex] Error fetching partition ${range.partition}:`, e);
-          }
-        }
-        return results;
+      fetchPartitionRowIds(partitionIndices) {
+        return fetchPartitionRowIds(this, partitionIndices);
       }
-      /**
-       * Get estimated number of rows to search for given partitions.
-       */
       getPartitionRowCount(partitionIndices) {
-        let total = 0;
-        for (const p of partitionIndices) {
-          if (p < this.partitionLengths.length) {
-            total += this.partitionLengths[p];
-          }
-        }
-        return total;
+        return getPartitionRowCount(this, partitionIndices);
       }
-      /**
-       * Parse manifest to find vector index info.
-       * @private
-       */
-      static _parseManifestForIndex(bytes) {
-        const view = new DataView(bytes.buffer, bytes.byteOffset);
-        const chunk1Len = view.getUint32(0, true);
-        const chunk1Data = bytes.slice(4, 4 + chunk1Len);
-        let pos = 0;
-        let indexUuid = null;
-        let indexFieldId = null;
-        const readVarint = (data, startPos) => {
-          let result = 0;
-          let shift = 0;
-          let p = startPos;
-          while (p < data.length) {
-            const byte = data[p++];
-            result |= (byte & 127) << shift;
-            if ((byte & 128) === 0) break;
-            shift += 7;
-          }
-          return { value: result, pos: p };
-        };
-        while (pos < chunk1Data.length) {
-          const tagResult = readVarint(chunk1Data, pos);
-          pos = tagResult.pos;
-          const fieldNum = tagResult.value >> 3;
-          const wireType = tagResult.value & 7;
-          if (wireType === 2) {
-            const lenResult = readVarint(chunk1Data, pos);
-            pos = lenResult.pos;
-            const content = chunk1Data.slice(pos, pos + lenResult.value);
-            pos += lenResult.value;
-            if (fieldNum === 1) {
-              const parsed = _IVFIndex._parseIndexMetadata(content);
-              if (parsed && parsed.uuid) {
-                indexUuid = parsed.uuid;
-                indexFieldId = parsed.fieldId;
-              }
-            }
-          } else if (wireType === 0) {
-            const r = readVarint(chunk1Data, pos);
-            pos = r.pos;
-          } else if (wireType === 5) {
-            pos += 4;
-          } else if (wireType === 1) {
-            pos += 8;
-          }
-        }
-        return indexUuid ? { uuid: indexUuid, fieldId: indexFieldId } : null;
-      }
-      /**
-       * Parse IndexMetadata protobuf message.
-       * @private
-       */
-      static _parseIndexMetadata(bytes) {
-        let pos = 0;
-        let uuid = null;
-        let fieldId = null;
-        const readVarint = () => {
-          let result = 0;
-          let shift = 0;
-          while (pos < bytes.length) {
-            const byte = bytes[pos++];
-            result |= (byte & 127) << shift;
-            if ((byte & 128) === 0) break;
-            shift += 7;
-          }
-          return result;
-        };
-        while (pos < bytes.length) {
-          const tag = readVarint();
-          const fieldNum = tag >> 3;
-          const wireType = tag & 7;
-          if (wireType === 2) {
-            const len = readVarint();
-            const content = bytes.slice(pos, pos + len);
-            pos += len;
-            if (fieldNum === 1) {
-              uuid = _IVFIndex._parseUuid(content);
-            }
-          } else if (wireType === 0) {
-            const val = readVarint();
-            if (fieldNum === 2) {
-              fieldId = val;
-            }
-          } else if (wireType === 5) {
-            pos += 4;
-          } else if (wireType === 1) {
-            pos += 8;
-          }
-        }
-        return { uuid, fieldId };
-      }
-      /**
-       * Parse UUID protobuf message.
-       * @private
-       */
-      static _parseUuid(bytes) {
-        let pos = 0;
-        while (pos < bytes.length) {
-          const tag = bytes[pos++];
-          const fieldNum = tag >> 3;
-          const wireType = tag & 7;
-          if (wireType === 2 && fieldNum === 1) {
-            const len = bytes[pos++];
-            const uuidBytes = bytes.slice(pos, pos + len);
-            const hex = Array.from(uuidBytes).map((b) => b.toString(16).padStart(2, "0")).join("");
-            return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
-          } else if (wireType === 0) {
-            while (pos < bytes.length && bytes[pos++] & 128) {
-            }
-          } else if (wireType === 5) {
-            pos += 4;
-          } else if (wireType === 1) {
-            pos += 8;
-          }
-        }
-        return null;
-      }
-      /**
-       * Parse IVF index file.
-       * Index file contains VectorIndex protobuf with IVF stage.
-       * IVF message structure:
-       *   field 1: repeated float centroids (deprecated)
-       *   field 2: repeated uint64 offsets - byte offset of each partition
-       *   field 3: repeated uint32 lengths - number of records per partition
-       *   field 4: Tensor centroids_tensor - centroids as tensor
-       *   field 5: optional double loss
-       * @private
-       */
-      static _parseIndexFile(bytes, indexInfo) {
-        const index = new _IVFIndex();
-        const ivfData = _IVFIndex._findIVFMessage(bytes);
-        if (ivfData) {
-          if (ivfData.centroids) {
-            index.centroids = ivfData.centroids.data;
-            index.numPartitions = ivfData.centroids.numPartitions;
-            index.dimension = ivfData.centroids.dimension;
-          }
-          if (ivfData.offsets && ivfData.offsets.length > 0) {
-            index.partitionOffsets = ivfData.offsets;
-          }
-          if (ivfData.lengths && ivfData.lengths.length > 0) {
-            index.partitionLengths = ivfData.lengths;
-          }
-        }
-        if (!index.centroids) {
-          let pos = 0;
-          const readVarint = () => {
-            let result = 0;
-            let shift = 0;
-            while (pos < bytes.length) {
-              const byte = bytes[pos++];
-              result |= (byte & 127) << shift;
-              if ((byte & 128) === 0) break;
-              shift += 7;
-            }
-            return result;
-          };
-          while (pos < bytes.length - 4) {
-            const tag = readVarint();
-            const fieldNum = tag >> 3;
-            const wireType = tag & 7;
-            if (wireType === 2) {
-              const len = readVarint();
-              if (len > bytes.length - pos) break;
-              const content = bytes.slice(pos, pos + len);
-              pos += len;
-              if (len > 100 && len < 1e8) {
-                const centroids = _IVFIndex._tryParseCentroids(content);
-                if (centroids) {
-                  index.centroids = centroids.data;
-                  index.numPartitions = centroids.numPartitions;
-                  index.dimension = centroids.dimension;
-                }
-              }
-            } else if (wireType === 0) {
-              readVarint();
-            } else if (wireType === 5) {
-              pos += 4;
-            } else if (wireType === 1) {
-              pos += 8;
-            }
-          }
-        }
-        return index.centroids ? index : null;
-      }
-      /**
-       * Find and parse IVF message within index file bytes.
-       * Recursively searches nested protobuf messages.
-       * @private
-       */
-      static _findIVFMessage(bytes) {
-        let pos = 0;
-        let offsets = [];
-        let lengths = [];
-        let centroids = null;
-        const readVarint = () => {
-          let result = 0;
-          let shift = 0;
-          while (pos < bytes.length) {
-            const byte = bytes[pos++];
-            result |= (byte & 127) << shift;
-            if ((byte & 128) === 0) break;
-            shift += 7;
-          }
-          return result;
-        };
-        const readFixed64 = () => {
-          if (pos + 8 > bytes.length) return 0n;
-          const view = new DataView(bytes.buffer, bytes.byteOffset + pos, 8);
-          pos += 8;
-          return view.getBigUint64(0, true);
-        };
-        const readFixed32 = () => {
-          if (pos + 4 > bytes.length) return 0;
-          const view = new DataView(bytes.buffer, bytes.byteOffset + pos, 4);
-          pos += 4;
-          return view.getUint32(0, true);
-        };
-        while (pos < bytes.length - 4) {
-          const startPos = pos;
-          const tag = readVarint();
-          const fieldNum = tag >> 3;
-          const wireType = tag & 7;
-          if (wireType === 2) {
-            const len = readVarint();
-            if (len > bytes.length - pos || len < 0) {
-              pos = startPos + 1;
-              continue;
-            }
-            const content = bytes.slice(pos, pos + len);
-            pos += len;
-            if (fieldNum === 2) {
-              if (len % 8 === 0 && len > 0) {
-                const numOffsets = len / 8;
-                const view = new DataView(content.buffer, content.byteOffset, len);
-                for (let i = 0; i < numOffsets; i++) {
-                  offsets.push(Number(view.getBigUint64(i * 8, true)));
-                }
-              }
-            } else if (fieldNum === 3) {
-              if (len % 4 === 0 && len > 0) {
-                const numLengths = len / 4;
-                const view = new DataView(content.buffer, content.byteOffset, len);
-                for (let i = 0; i < numLengths; i++) {
-                  lengths.push(view.getUint32(i * 4, true));
-                }
-              } else {
-                let lpos = 0;
-                while (lpos < content.length) {
-                  let val = 0, shift = 0;
-                  while (lpos < content.length) {
-                    const byte = content[lpos++];
-                    val |= (byte & 127) << shift;
-                    if ((byte & 128) === 0) break;
-                    shift += 7;
-                  }
-                  lengths.push(val);
-                }
-              }
-            } else if (fieldNum === 4) {
-              centroids = _IVFIndex._tryParseCentroids(content);
-            } else if (len > 100) {
-              const nested = _IVFIndex._findIVFMessage(content);
-              if (nested && (nested.centroids || nested.offsets?.length > 0)) {
-                if (nested.centroids && !centroids) centroids = nested.centroids;
-                if (nested.offsets?.length > offsets.length) offsets = nested.offsets;
-                if (nested.lengths?.length > lengths.length) lengths = nested.lengths;
-              }
-            }
-          } else if (wireType === 0) {
-            readVarint();
-          } else if (wireType === 5) {
-            pos += 4;
-          } else if (wireType === 1) {
-            pos += 8;
-          } else {
-            pos = startPos + 1;
-          }
-        }
-        if (centroids || offsets.length > 0 || lengths.length > 0) {
-          return { centroids, offsets, lengths };
-        }
-        return null;
-      }
-      /**
-       * Try to parse centroids from a Tensor message.
-       * @private
-       */
-      static _tryParseCentroids(bytes) {
-        let pos = 0;
-        let shape = [];
-        let dataBytes = null;
-        let dataType = 2;
-        const readVarint = () => {
-          let result = 0;
-          let shift = 0;
-          while (pos < bytes.length) {
-            const byte = bytes[pos++];
-            result |= (byte & 127) << shift;
-            if ((byte & 128) === 0) break;
-            shift += 7;
-          }
-          return result;
-        };
-        while (pos < bytes.length) {
-          const tag = readVarint();
-          const fieldNum = tag >> 3;
-          const wireType = tag & 7;
-          if (wireType === 0) {
-            const val = readVarint();
-            if (fieldNum === 1) dataType = val;
-          } else if (wireType === 2) {
-            const len = readVarint();
-            const content = bytes.slice(pos, pos + len);
-            pos += len;
-            if (fieldNum === 2) {
-              let shapePos = 0;
-              while (shapePos < content.length) {
-                let val = 0, shift = 0;
-                while (shapePos < content.length) {
-                  const byte = content[shapePos++];
-                  val |= (byte & 127) << shift;
-                  if ((byte & 128) === 0) break;
-                  shift += 7;
-                }
-                shape.push(val);
-              }
-            } else if (fieldNum === 3) {
-              dataBytes = content;
-            }
-          } else if (wireType === 5) {
-            pos += 4;
-          } else if (wireType === 1) {
-            pos += 8;
-          }
-        }
-        if (shape.length >= 2 && dataBytes && dataType === 2) {
-          const numPartitions = shape[0];
-          const dimension = shape[1];
-          if (dataBytes.length === numPartitions * dimension * 4) {
-            const data = new Float32Array(dataBytes.buffer, dataBytes.byteOffset, numPartitions * dimension);
-            return { data, numPartitions, dimension };
-          }
-        }
-        return null;
-      }
-      /**
-       * Find the nearest partitions to a query vector.
-       * @param {Float32Array} queryVec - Query vector
-       * @param {number} nprobe - Number of partitions to search
-       * @returns {number[]} - Indices of nearest partitions
-       */
       findNearestPartitions(queryVec, nprobe = 10) {
-        if (!this.centroids || queryVec.length !== this.dimension) {
-          return [];
-        }
+        if (!this.centroids || queryVec.length !== this.dimension) return [];
         nprobe = Math.min(nprobe, this.numPartitions);
         const distances = new Array(this.numPartitions);
         for (let p = 0; p < this.numPartitions; p++) {
-          const centroidStart = p * this.dimension;
+          const start = p * this.dimension;
           let dot = 0, normA = 0, normB = 0;
           for (let i = 0; i < this.dimension; i++) {
             const a = queryVec[i];
-            const b = this.centroids[centroidStart + i];
+            const b = this.centroids[start + i];
             dot += a * b;
             normA += a * a;
             normB += b * b;
@@ -3016,11 +2848,8 @@ async function vectorSearch(file, colIdx, queryVec, topK = 10, onProgress = null
 async function vectorSearchWithIndex(file, colIdx, queryVec, topK, nprobe, onProgress) {
   if (onProgress) onProgress(0, 100);
   const partitions = file._ivfIndex.findNearestPartitions(queryVec, nprobe);
-  const estimatedRows = file._ivfIndex.getPartitionRowCount(partitions);
-  console.log(`[IVFSearch] Searching ${partitions.length} partitions (~${estimatedRows.toLocaleString()} rows)`);
   const rowIdMappings = await file._ivfIndex.fetchPartitionRowIds(partitions);
   if (rowIdMappings && rowIdMappings.length > 0) {
-    console.log(`[IVFSearch] Fetched ${rowIdMappings.length} row ID mappings`);
     return await searchWithRowIdMappings(file, colIdx, queryVec, topK, rowIdMappings, onProgress);
   }
   throw new Error("Failed to fetch row IDs from IVF index. Dataset may be missing auxiliary.idx or ivf_partitions.bin.");
@@ -3034,7 +2863,6 @@ async function searchWithRowIdMappings(file, colIdx, queryVec, topK, rowIdMappin
     }
     byFragment.get(mapping.fragId).push(mapping.rowOffset);
   }
-  console.log(`[IVFSearch] Fetching from ${byFragment.size} fragments`);
   const allVectors = [];
   const allIndices = [];
   let processed = 0;
@@ -3052,12 +2880,11 @@ async function searchWithRowIdMappings(file, colIdx, queryVec, topK, rowIdMappin
     }
   }
   let scores;
-  if (webgpuAccelerator2.isAvailable()) {
-    console.log(`[IVFSearch] Computing similarity for ${allVectors.length} vectors via WebGPU`);
-    scores = await webgpuAccelerator2.batchCosineSimilarity(queryVec, allVectors, true);
+  const accelerator = getWebGPUAccelerator();
+  if (accelerator.isAvailable()) {
+    scores = await accelerator.batchCosineSimilarity(queryVec, allVectors, true);
   }
   if (!scores) {
-    console.log(`[IVFSearch] Computing similarity for ${allVectors.length} vectors via WASM SIMD`);
     scores = file.lanceql.batchCosineSimilarity(queryVec, allVectors, true);
   }
   const topResults = [];
@@ -3165,11 +2992,9 @@ async function readRows(file, { offset = 0, limit = 50, columns = null } = {}) {
           const vectors = await file.readVectorsAtIndices(colIdx, indices);
           return Array.isArray(vectors) ? vectors : Array.from(vectors);
         default:
-          console.warn(`[LanceQL] Unknown column type: ${type}, trying as string`);
           return await file.readStringsAtIndices(colIdx, indices);
       }
-    } catch (e) {
-      console.warn(`[LanceQL] Error reading column ${colIdx} (${type}):`, e.message);
+    } catch {
       return indices.map(() => null);
     }
   });
@@ -3321,8 +3146,9 @@ var init_remote_file = __esm({
         if (start < 0 || end < start || end >= this.size) {
           console.error(`Invalid range: ${start}-${end}, file size: ${this.size}`);
         }
-        if (hotTierCache.enabled) {
-          const data2 = await hotTierCache.getRange(this.url, start, end, this.size);
+        const cache = getHotTierCache();
+        if (cache.enabled) {
+          const data2 = await cache.getRange(this.url, start, end, this.size);
           if (this._onFetch) {
             this._onFetch(data2.byteLength, 1);
           }
@@ -3631,7 +3457,6 @@ async function vectorSearch2(dataset, colIdx, queryVec, topK = 10, onProgress = 
     throw new Error("No vector column found in dataset");
   }
   const dim = queryVec.length;
-  console.log(`[VectorSearch] Query dim=${dim}, topK=${topK}, fragments=${dataset._fragments.length}, hasIndex=${dataset.hasIndex()}`);
   if (!dataset.hasIndex()) {
     throw new Error("No IVF index found. Vector search requires an IVF index for efficient querying.");
   }
@@ -3641,12 +3466,10 @@ async function vectorSearch2(dataset, colIdx, queryVec, topK = 10, onProgress = 
   if (!dataset._ivfIndex.hasPartitionIndex) {
     throw new Error("IVF partition index (ivf_partitions.bin) not found. Required for efficient search.");
   }
-  console.log(`[VectorSearch] Using IVF index (nprobe=${nprobe})`);
   return await ivfIndexSearch(dataset, queryVec, topK, vectorColIdx, nprobe, onProgress);
 }
 async function ivfIndexSearch(dataset, queryVec, topK, vectorColIdx, nprobe, onProgress) {
   const partitions = dataset._ivfIndex.findNearestPartitions(queryVec, nprobe);
-  console.log(`[VectorSearch] Searching ${partitions.length} partitions:`, partitions);
   const partitionData = await dataset._ivfIndex.fetchPartitionData(
     partitions,
     dataset._ivfIndex.dimension,
@@ -3663,15 +3486,16 @@ async function ivfIndexSearch(dataset, queryVec, topK, vectorColIdx, nprobe, onP
   const { rowIds, vectors } = partitionData;
   const scores = new Float32Array(vectors.length);
   const dim = queryVec.length;
-  if (webgpuAccelerator2.isAvailable()) {
-    const maxBatch = webgpuAccelerator2.getMaxVectorsPerBatch(dim);
+  const accelerator = getWebGPUAccelerator();
+  if (accelerator.isAvailable()) {
+    const maxBatch = accelerator.getMaxVectorsPerBatch(dim);
     let gpuProcessed = 0;
     let wasmProcessed = 0;
     for (let start = 0; start < vectors.length; start += maxBatch) {
       const end = Math.min(start + maxBatch, vectors.length);
       const chunk = vectors.slice(start, end);
       try {
-        const chunkScores = await webgpuAccelerator2.batchCosineSimilarity(queryVec, chunk, true);
+        const chunkScores = await accelerator.batchCosineSimilarity(queryVec, chunk, true);
         if (chunkScores) {
           scores.set(chunkScores, start);
           gpuProcessed += chunk.length;
@@ -3696,9 +3520,7 @@ async function ivfIndexSearch(dataset, queryVec, topK, vectorColIdx, nprobe, onP
         wasmProcessed += chunk.length;
       }
     }
-    console.log(`[VectorSearch] Processed ${vectors.length.toLocaleString()} vectors: ${gpuProcessed.toLocaleString()} WebGPU, ${wasmProcessed.toLocaleString()} WASM SIMD`);
   } else {
-    console.log(`[VectorSearch] Computing similarities for ${rowIds.length.toLocaleString()} vectors via WASM SIMD`);
     if (dataset.lanceql?.batchCosineSimilarity) {
       const allScores = dataset.lanceql.batchCosineSimilarity(queryVec, vectors, true);
       scores.set(allScores);
@@ -3837,7 +3659,6 @@ function prefetchNextPage(dataset, offset, limit, columns) {
   }
   const prefetchPromise = readRows2(dataset, { offset, limit, columns, _isPrefetch: true }).then((result) => {
     dataset._prefetchCache.set(cacheKey, result);
-    console.log(`[LanceQL] Prefetched rows ${offset}-${offset + limit}`);
   }).catch(() => {
   });
   dataset._prefetchCache.set(cacheKey, prefetchPromise);
@@ -3845,16 +3666,11 @@ function prefetchNextPage(dataset, offset, limit, columns) {
 async function readStringsAtIndices2(dataset, colIdx, indices) {
   const groups = groupIndicesByFragment(dataset, indices);
   const results = /* @__PURE__ */ new Map();
-  console.log(`[ReadStrings] Reading ${indices.length} strings from col ${colIdx}`);
-  console.log(`[ReadStrings] First 5 indices: ${indices.slice(0, 5)}`);
-  console.log(`[ReadStrings] Fragment groups: ${Array.from(groups.keys())}`);
   const fetchPromises = [];
   for (const [fragIdx, group] of groups) {
     fetchPromises.push((async () => {
       const file = await dataset.openFragment(fragIdx);
-      console.log(`[ReadStrings] Fragment ${fragIdx}: reading ${group.localIndices.length} strings, first local indices: ${group.localIndices.slice(0, 3)}`);
       const data = await file.readStringsAtIndices(colIdx, group.localIndices);
-      console.log(`[ReadStrings] Fragment ${fragIdx}: got ${data.length} strings, first 3: ${data.slice(0, 3).map((s) => s?.slice(0, 20) + "...")}`);
       for (let i = 0; i < group.globalIndices.length; i++) {
         results.set(group.globalIndices[i], data[i]);
       }
@@ -4046,7 +3862,6 @@ var init_remote_dataset = __esm({
         if (!options.skipCache) {
           const cached = await metadataCache2.get(cacheKey);
           if (cached && cached.schema && cached.fragments) {
-            console.log(`[LanceQL Dataset] Using cached metadata for ${baseUrl}`);
             dataset._schema = cached.schema;
             dataset._fragments = cached.fragments;
             dataset._numColumns = cached.schema.length;
@@ -4090,10 +3905,8 @@ var init_remote_dataset = __esm({
           }
           const sidecar = await response.json();
           if (!sidecar.schema || !sidecar.fragments) {
-            console.warn("[LanceQL Dataset] Invalid sidecar format");
             return false;
           }
-          console.log(`[LanceQL Dataset] Loaded sidecar manifest`);
           this._schema = sidecar.schema.map((col) => ({
             name: col.name,
             id: col.index,
@@ -4133,8 +3946,7 @@ var init_remote_dataset = __esm({
         const prefetchPromises = this._fragments.map(
           (_, idx) => this.openFragment(idx).catch(() => null)
         );
-        Promise.all(prefetchPromises).then(() => {
-          console.log(`[LanceQL Dataset] Prefetched ${this._fragments.length} fragment(s)`);
+        Promise.all(prefetchPromises).catch(() => {
         });
       }
       /**
@@ -4149,15 +3961,8 @@ var init_remote_dataset = __esm({
        */
       async _tryLoadIndex() {
         try {
-          console.log(`[LanceQL Dataset] Trying to load IVF index from ${this.baseUrl}`);
           this._ivfIndex = await IVFIndex.tryLoad(this.baseUrl);
-          if (this._ivfIndex) {
-            console.log(`[LanceQL Dataset] IVF index loaded: ${this._ivfIndex.numPartitions} partitions, dim=${this._ivfIndex.dimension}`);
-          } else {
-            console.log("[LanceQL Dataset] IVF index not found or failed to parse");
-          }
-        } catch (e) {
-          console.log("[LanceQL Dataset] No IVF index found:", e.message);
+        } catch {
           this._ivfIndex = null;
         }
       }
@@ -4218,9 +4023,7 @@ var init_remote_dataset = __esm({
         }
         this._version = manifestVersion;
         this._latestVersion = this._requestedVersion ? null : manifestVersion;
-        console.log(`[LanceQL Dataset] Loading manifest v${manifestVersion}${this._requestedVersion ? " (time-travel)" : ""}...`);
         this._parseManifest(manifestData);
-        console.log(`[LanceQL Dataset] Loaded: ${this._fragments.length} fragments, ${this._totalRows.toLocaleString()} rows, ${this._numColumns} columns`);
       }
       /**
        * Get list of available versions.
@@ -4407,10 +4210,6 @@ var init_remote_dataset = __esm({
         this._fragments = fragments;
         this._numColumns = fields.length;
         this._totalRows = fragments.reduce((sum, f) => sum + f.numRows, 0);
-        const deletedCount = fragments.reduce((sum, f) => sum + (f.deletionFile?.numDeletedRows || 0), 0);
-        if (deletedCount > 0) {
-          console.log(`[LanceQL Dataset] Has ${deletedCount} deleted rows across fragments`);
-        }
       }
       /**
        * Parse DeletionFile protobuf message.
@@ -4726,23 +4525,14 @@ var init_local_database = __esm({
           prePartitionedLeft = null
           // Optional: pre-partitioned left metadata for semi-join optimization
         } = options;
-        console.log(`[OPFSJoin] Starting OPFS-backed hash join (${joinType})`);
-        console.log(`[OPFSJoin] Session: ${this.sessionId}`);
-        console.log(`[OPFSJoin] Partitions: ${this.numPartitions}`);
         try {
           let leftMeta;
           if (prePartitionedLeft) {
-            console.log(`[OPFSJoin] Phase 1: Using pre-partitioned left table (semi-join optimization)`);
             leftMeta = prePartitionedLeft;
           } else {
-            console.log(`[OPFSJoin] Phase 1: Partitioning left table...`);
             leftMeta = await this._partitionToOPFS(leftStream, leftKey, "left");
           }
-          console.log(`[OPFSJoin] Left table: ${leftMeta.totalRows} rows in ${leftMeta.partitionsUsed.size} partitions`);
-          console.log(`[OPFSJoin] Phase 2: Partitioning right table...`);
           const rightMeta = await this._partitionToOPFS(rightStream, rightKey, "right");
-          console.log(`[OPFSJoin] Right table: ${rightMeta.totalRows} rows in ${rightMeta.partitionsUsed.size} partitions`);
-          console.log(`[OPFSJoin] Phase 3: Joining partitions (${joinType})...`);
           let totalYielded = 0;
           const leftNulls = new Array(leftMeta.columns.length).fill(null);
           const rightNulls = new Array(rightMeta.columns.length).fill(null);
@@ -4756,7 +4546,6 @@ var init_local_database = __esm({
             }
           };
           if (joinType === "CROSS") {
-            console.log(`[OPFSJoin] CROSS JOIN: computing cartesian product`);
             const chunk = [];
             for (const leftPartitionId of leftMeta.partitionsUsed) {
               const leftPartition = await this._loadPartition("left", leftPartitionId, leftMeta.columns);
@@ -4780,7 +4569,6 @@ var init_local_database = __esm({
             if (chunk.length > 0) {
               yield { columns: resultColumns, rows: chunk };
             }
-            console.log(`[OPFSJoin] CROSS JOIN complete: ${totalYielded} result rows`);
             return;
           }
           const leftKeyIndex = leftMeta.columns.indexOf(leftKey);
@@ -4791,7 +4579,6 @@ var init_local_database = __esm({
           const bothSidesPartitions = new Set(
             [...leftMeta.partitionsUsed].filter((p) => rightMeta.partitionsUsed.has(p))
           );
-          console.log(`[OPFSJoin] Partitions with both sides: ${bothSidesPartitions.size}`);
           for (const partitionId of bothSidesPartitions) {
             if (totalYielded >= limit) break;
             const leftPartition = await this._loadPartition("left", partitionId, leftMeta.columns);
@@ -4886,8 +4673,6 @@ var init_local_database = __esm({
               }
             }
           }
-          console.log(`[OPFSJoin] ${joinType} JOIN complete: ${totalYielded} result rows`);
-          console.log(`[OPFSJoin] Stats:`, this.getStats());
         } finally {
           await this.cleanup();
         }
@@ -5010,9 +4795,7 @@ var init_local_database = __esm({
       async cleanup() {
         try {
           await this.storage.deleteDir(this.basePath);
-          console.log(`[OPFSJoin] Cleaned up temp files: ${this.basePath}`);
-        } catch (e) {
-          console.warn(`[OPFSJoin] Cleanup failed:`, e);
+        } catch {
         }
       }
     };
@@ -5229,6 +5012,7 @@ __export(lanceql_exports, {
 var LocalSQLParser, E, D, _w, _m, _p, _M, _g, _ensure, _x, readStr, readBytes, LanceFileWriter, wasmUtils, _createLanceqlMethods, LanceQL;
 var init_lanceql = __esm({
   "src/client/wasm/lanceql.js"() {
+    init_accelerator();
     LocalSQLParser = class {
       constructor(tokens) {
         this.tokens = tokens;
@@ -5689,7 +5473,7 @@ var init_lanceql = __esm({
        * @returns {Promise<RemoteLanceFile>}
        */
       async openUrl(url) {
-        await webgpuAccelerator.init();
+        await getWebGPUAccelerator().init();
         return await RemoteLanceFile.open(proxy, url);
       },
       /**
@@ -5700,7 +5484,7 @@ var init_lanceql = __esm({
        * @returns {Promise<RemoteLanceDataset>}
        */
       async openDataset(baseUrl, options = {}) {
-        await webgpuAccelerator.init();
+        await getWebGPUAccelerator().init();
         return await RemoteLanceDataset.open(proxy, baseUrl, options);
       },
       /**
@@ -5792,10 +5576,11 @@ init_metadata_cache();
 
 // src/client/cache/lru-cache.js
 var LRUCache2 = class {
-  constructor(maxSize = 50 * 1024 * 1024) {
-    this.maxSize = maxSize;
+  constructor(options = {}) {
+    this.maxSize = options.maxSize ?? 50 * 1024 * 1024;
     this.currentSize = 0;
     this.cache = /* @__PURE__ */ new Map();
+    this._accessCounter = 0;
   }
   /**
    * Get item from cache
@@ -5805,10 +5590,19 @@ var LRUCache2 = class {
   get(key) {
     const entry = this.cache.get(key);
     if (entry) {
-      entry.lastAccess = Date.now();
+      entry.lastAccess = ++this._accessCounter;
       return entry.data;
     }
-    return null;
+    return void 0;
+  }
+  delete(key) {
+    const entry = this.cache.get(key);
+    if (entry) {
+      this.currentSize -= entry.size;
+      this.cache.delete(key);
+      return true;
+    }
+    return false;
   }
   /**
    * Put item in cache
@@ -5820,7 +5614,18 @@ var LRUCache2 = class {
       this.currentSize -= this.cache.get(key).size;
       this.cache.delete(key);
     }
-    const size = data.byteLength;
+    let size = 0;
+    if (data === null || data === void 0) {
+      size = 0;
+    } else if (data.byteLength !== void 0) {
+      size = data.byteLength;
+    } else if (typeof data === "string") {
+      size = data.length * 2;
+    } else if (typeof data === "object") {
+      size = JSON.stringify(data).length * 2;
+    } else {
+      size = 8;
+    }
     while (this.currentSize + size > this.maxSize && this.cache.size > 0) {
       this._evictOldest();
     }
@@ -5830,7 +5635,7 @@ var LRUCache2 = class {
     this.cache.set(key, {
       data,
       size,
-      lastAccess: Date.now()
+      lastAccess: ++this._accessCounter
     });
     this.currentSize += size;
   }
@@ -6034,7 +5839,11 @@ fn max_f(@builtin(local_invocation_id) l: vec3<u32>) {
     return s;
   }
 };
-var gpuAggregator = new GPUAggregator();
+var _gpuAggregator = null;
+function getGPUAggregator() {
+  if (!_gpuAggregator) _gpuAggregator = new GPUAggregator();
+  return _gpuAggregator;
+}
 
 // src/client/gpu/joiner.js
 var GPUJoiner = class {
@@ -6259,7 +6068,11 @@ fn init_t(@builtin(global_invocation_id) g: vec3<u32>) {
     return p;
   }
 };
-var gpuJoiner = new GPUJoiner();
+var _gpuJoiner = null;
+function getGPUJoiner() {
+  if (!_gpuJoiner) _gpuJoiner = new GPUJoiner();
+  return _gpuJoiner;
+}
 
 // src/client/gpu/sorter.js
 var GPUSorter = class {
@@ -6449,7 +6262,11 @@ fn init_idx(@builtin(global_invocation_id) g: vec3<u32>) {
     return p;
   }
 };
-var gpuSorter = new GPUSorter();
+var _gpuSorter = null;
+function getGPUSorter() {
+  if (!_gpuSorter) _gpuSorter = new GPUSorter();
+  return _gpuSorter;
+}
 
 // src/client/gpu/grouper.js
 var GPUGrouper = class {
@@ -6693,7 +6510,11 @@ fn f2s(f: f32) -> u32 { let b = bitcast<u32>(f); return select(b ^ 0x80000000u, 
     return p;
   }
 };
-var gpuGrouper = new GPUGrouper();
+var _gpuGrouper = null;
+function getGPUGrouper() {
+  if (!_gpuGrouper) _gpuGrouper = new GPUGrouper();
+  return _gpuGrouper;
+}
 
 // src/client/gpu/vector-search.js
 var GPUVectorSearch = class {
@@ -6883,7 +6704,11 @@ var GPUVectorSearch = class {
     return buf;
   }
 };
-var gpuVectorSearch2 = new GPUVectorSearch();
+var _gpuVectorSearch = null;
+function getGPUVectorSearch() {
+  if (!_gpuVectorSearch) _gpuVectorSearch = new GPUVectorSearch();
+  return _gpuVectorSearch;
+}
 
 // src/client/index.js
 init_opfs();
@@ -7849,6 +7674,491 @@ var SQLLexer = class {
   }
 };
 
+// src/client/sql/parser-expr.js
+function parseExpr(parser) {
+  return parseOrExpr(parser);
+}
+function parseOrExpr(parser) {
+  let left = parseAndExpr(parser);
+  while (parser.match(TokenType2.OR)) {
+    const right = parseAndExpr(parser);
+    left = { type: "binary", op: "OR", left, right };
+  }
+  return left;
+}
+function parseAndExpr(parser) {
+  let left = parseNotExpr(parser);
+  while (parser.match(TokenType2.AND)) {
+    const right = parseNotExpr(parser);
+    left = { type: "binary", op: "AND", left, right };
+  }
+  return left;
+}
+function parseNotExpr(parser) {
+  if (parser.match(TokenType2.NOT)) {
+    const operand = parseNotExpr(parser);
+    return { type: "unary", op: "NOT", operand };
+  }
+  return parseCmpExpr(parser);
+}
+function parseCmpExpr(parser) {
+  let left = parseAddExpr(parser);
+  if (parser.match(TokenType2.IS)) {
+    const negated = !!parser.match(TokenType2.NOT);
+    parser.expect(TokenType2.NULL);
+    return {
+      type: "binary",
+      op: negated ? "!=" : "==",
+      left,
+      right: { type: "literal", value: null }
+    };
+  }
+  if (parser.match(TokenType2.IN)) {
+    parser.expect(TokenType2.LPAREN);
+    if (parser.check(TokenType2.SELECT)) {
+      const subquery = parser.parseSelect(true);
+      parser.expect(TokenType2.RPAREN);
+      return { type: "in", expr: left, values: [{ type: "subquery", query: subquery }] };
+    }
+    const values = [];
+    values.push(parsePrimary(parser));
+    while (parser.match(TokenType2.COMMA)) {
+      values.push(parsePrimary(parser));
+    }
+    parser.expect(TokenType2.RPAREN);
+    return { type: "in", expr: left, values };
+  }
+  if (parser.match(TokenType2.BETWEEN)) {
+    const low = parseAddExpr(parser);
+    parser.expect(TokenType2.AND);
+    const high = parseAddExpr(parser);
+    return { type: "between", expr: left, low, high };
+  }
+  if (parser.match(TokenType2.LIKE)) {
+    const pattern = parsePrimary(parser);
+    return { type: "like", expr: left, pattern };
+  }
+  if (parser.match(TokenType2.NEAR)) {
+    const text = parsePrimary(parser);
+    return { type: "near", column: left, text };
+  }
+  const opMap = {
+    [TokenType2.EQ]: "==",
+    [TokenType2.NE]: "!=",
+    [TokenType2.LT]: "<",
+    [TokenType2.LE]: "<=",
+    [TokenType2.GT]: ">",
+    [TokenType2.GE]: ">="
+  };
+  const opToken = parser.match(TokenType2.EQ, TokenType2.NE, TokenType2.LT, TokenType2.LE, TokenType2.GT, TokenType2.GE);
+  if (opToken) {
+    const right = parseAddExpr(parser);
+    return { type: "binary", op: opMap[opToken.type], left, right };
+  }
+  return left;
+}
+function parseAddExpr(parser) {
+  let left = parseMulExpr(parser);
+  while (true) {
+    const opToken = parser.match(TokenType2.PLUS, TokenType2.MINUS);
+    if (!opToken) break;
+    const right = parseMulExpr(parser);
+    left = { type: "binary", op: opToken.value, left, right };
+  }
+  return left;
+}
+function parseMulExpr(parser) {
+  let left = parseUnaryExpr(parser);
+  while (true) {
+    const opToken = parser.match(TokenType2.STAR, TokenType2.SLASH);
+    if (!opToken) break;
+    const right = parseUnaryExpr(parser);
+    left = { type: "binary", op: opToken.value, left, right };
+  }
+  return left;
+}
+function parseUnaryExpr(parser) {
+  if (parser.match(TokenType2.MINUS)) {
+    const operand = parseUnaryExpr(parser);
+    return { type: "unary", op: "-", operand };
+  }
+  return parsePrimary(parser);
+}
+function parsePrimary(parser) {
+  if (parser.match(TokenType2.NULL)) {
+    return { type: "literal", value: null };
+  }
+  if (parser.match(TokenType2.TRUE)) {
+    return { type: "literal", value: true };
+  }
+  if (parser.match(TokenType2.FALSE)) {
+    return { type: "literal", value: false };
+  }
+  if (parser.match(TokenType2.ARRAY)) {
+    let result = parseArrayLiteral(parser);
+    while (parser.check(TokenType2.LBRACKET)) {
+      parser.advance();
+      const index = parseExpr(parser);
+      parser.expect(TokenType2.RBRACKET);
+      result = { type: "subscript", array: result, index };
+    }
+    return result;
+  }
+  if (parser.check(TokenType2.LBRACKET)) {
+    let result = parseArrayLiteral(parser);
+    while (parser.check(TokenType2.LBRACKET)) {
+      parser.advance();
+      const index = parseExpr(parser);
+      parser.expect(TokenType2.RBRACKET);
+      result = { type: "subscript", array: result, index };
+    }
+    return result;
+  }
+  if (parser.check(TokenType2.NUMBER)) {
+    const value = parser.advance().value;
+    return { type: "literal", value: parseFloat(value) };
+  }
+  if (parser.check(TokenType2.STRING)) {
+    const value = parser.advance().value;
+    return { type: "literal", value };
+  }
+  const windowFuncTokens = [
+    TokenType2.ROW_NUMBER,
+    TokenType2.RANK,
+    TokenType2.DENSE_RANK,
+    TokenType2.NTILE,
+    TokenType2.LAG,
+    TokenType2.LEAD,
+    TokenType2.FIRST_VALUE,
+    TokenType2.LAST_VALUE,
+    TokenType2.NTH_VALUE,
+    TokenType2.PERCENT_RANK,
+    TokenType2.CUME_DIST
+  ];
+  if (windowFuncTokens.some((t) => parser.check(t))) {
+    const name = parser.advance().type;
+    parser.expect(TokenType2.LPAREN);
+    const args = [];
+    if (!parser.check(TokenType2.RPAREN)) {
+      args.push(parseExpr(parser));
+      while (parser.match(TokenType2.COMMA)) {
+        args.push(parseExpr(parser));
+      }
+    }
+    parser.expect(TokenType2.RPAREN);
+    const over = parser.parseOverClause();
+    return { type: "call", name, args, distinct: false, over };
+  }
+  if (parser.check(TokenType2.IDENTIFIER) || parser.check(TokenType2.COUNT, TokenType2.SUM, TokenType2.AVG, TokenType2.MIN, TokenType2.MAX, TokenType2.GROUPING)) {
+    const name = parser.advance().value;
+    if (parser.match(TokenType2.LPAREN)) {
+      let distinct = !!parser.match(TokenType2.DISTINCT);
+      const args = [];
+      if (!parser.check(TokenType2.RPAREN)) {
+        if (parser.check(TokenType2.STAR)) {
+          parser.advance();
+          args.push({ type: "star" });
+        } else {
+          args.push(parseExpr(parser));
+          while (parser.match(TokenType2.COMMA)) {
+            args.push(parseExpr(parser));
+          }
+        }
+      }
+      parser.expect(TokenType2.RPAREN);
+      let over = null;
+      if (parser.check(TokenType2.OVER)) {
+        over = parser.parseOverClause();
+      }
+      return { type: "call", name: name.toUpperCase(), args, distinct, over };
+    }
+    if (parser.match(TokenType2.DOT)) {
+      const table = name;
+      const token = parser.advance();
+      const column = token.value || token.type.toLowerCase();
+      return { type: "column", table, column };
+    }
+    let result = { type: "column", column: name };
+    if (parser.check(TokenType2.LBRACKET)) {
+      parser.advance();
+      const index = parseExpr(parser);
+      parser.expect(TokenType2.RBRACKET);
+      result = { type: "subscript", array: result, index };
+    }
+    return result;
+  }
+  if (parser.match(TokenType2.LPAREN)) {
+    if (parser.check(TokenType2.SELECT)) {
+      const subquery = parser.parseSelect(true);
+      parser.expect(TokenType2.RPAREN);
+      return { type: "subquery", query: subquery };
+    }
+    const expr = parseExpr(parser);
+    parser.expect(TokenType2.RPAREN);
+    return expr;
+  }
+  if (parser.match(TokenType2.STAR)) {
+    return { type: "star" };
+  }
+  throw new Error(`Unexpected token: ${parser.current().type} (${parser.current().value})`);
+}
+function parseValue(parser) {
+  if (parser.match(TokenType2.NULL)) {
+    return { type: "null", value: null };
+  }
+  if (parser.match(TokenType2.TRUE)) {
+    return { type: "boolean", value: true };
+  }
+  if (parser.match(TokenType2.FALSE)) {
+    return { type: "boolean", value: false };
+  }
+  if (parser.check(TokenType2.NUMBER)) {
+    const token = parser.advance();
+    const value = token.value.includes(".") ? parseFloat(token.value) : parseInt(token.value, 10);
+    return { type: "number", value };
+  }
+  if (parser.check(TokenType2.STRING)) {
+    const token = parser.advance();
+    return { type: "string", value: token.value };
+  }
+  if (parser.check(TokenType2.MINUS)) {
+    parser.advance();
+    const token = parser.expect(TokenType2.NUMBER);
+    const value = token.value.includes(".") ? -parseFloat(token.value) : -parseInt(token.value, 10);
+    return { type: "number", value };
+  }
+  if (parser.check(TokenType2.LBRACKET)) {
+    return parseArrayLiteral(parser);
+  }
+  throw new Error(`Expected value, got ${parser.current().type}`);
+}
+function parseArrayLiteral(parser) {
+  parser.expect(TokenType2.LBRACKET);
+  const elements = [];
+  if (!parser.check(TokenType2.RBRACKET)) {
+    elements.push(parseExpr(parser));
+    while (parser.match(TokenType2.COMMA)) {
+      elements.push(parseExpr(parser));
+    }
+  }
+  parser.expect(TokenType2.RBRACKET);
+  return { type: "array", elements };
+}
+
+// src/client/sql/parser-advanced.js
+function parseWithClause(parser) {
+  parser.expect(TokenType2.WITH);
+  const isRecursive = !!parser.match(TokenType2.RECURSIVE);
+  const ctes = [];
+  do {
+    const name = parser.expect(TokenType2.IDENTIFIER).value;
+    let columns = [];
+    if (parser.match(TokenType2.LPAREN)) {
+      columns.push(parser.expect(TokenType2.IDENTIFIER).value);
+      while (parser.match(TokenType2.COMMA)) {
+        columns.push(parser.expect(TokenType2.IDENTIFIER).value);
+      }
+      parser.expect(TokenType2.RPAREN);
+    }
+    parser.expect(TokenType2.AS);
+    parser.expect(TokenType2.LPAREN);
+    const body = parseCteBody(parser, isRecursive);
+    parser.expect(TokenType2.RPAREN);
+    ctes.push({
+      name,
+      columns,
+      body,
+      recursive: isRecursive
+    });
+  } while (parser.match(TokenType2.COMMA));
+  return ctes;
+}
+function parseCteBody(parser, isRecursive) {
+  const anchor = parser.parseSelect(true, true);
+  if (isRecursive && parser.match(TokenType2.UNION)) {
+    parser.expect(TokenType2.ALL);
+    const recursive = parser.parseSelect(true, true);
+    return {
+      type: "RECURSIVE_CTE",
+      anchor,
+      recursive
+    };
+  }
+  return anchor;
+}
+function parseGroupByList(parser) {
+  const items = [];
+  do {
+    if (parser.match(TokenType2.ROLLUP)) {
+      parser.expect(TokenType2.LPAREN);
+      const columns = parseColumnList(parser);
+      parser.expect(TokenType2.RPAREN);
+      items.push({ type: "ROLLUP", columns });
+    } else if (parser.match(TokenType2.CUBE)) {
+      parser.expect(TokenType2.LPAREN);
+      const columns = parseColumnList(parser);
+      parser.expect(TokenType2.RPAREN);
+      items.push({ type: "CUBE", columns });
+    } else if (parser.match(TokenType2.GROUPING)) {
+      parser.expect(TokenType2.SETS);
+      parser.expect(TokenType2.LPAREN);
+      const sets = parseGroupingSets(parser);
+      parser.expect(TokenType2.RPAREN);
+      items.push({ type: "GROUPING_SETS", sets });
+    } else {
+      items.push({ type: "COLUMN", column: parser.expect(TokenType2.IDENTIFIER).value });
+    }
+  } while (parser.match(TokenType2.COMMA));
+  return items;
+}
+function parseGroupingSets(parser) {
+  const sets = [];
+  do {
+    parser.expect(TokenType2.LPAREN);
+    if (parser.check(TokenType2.RPAREN)) {
+      sets.push([]);
+    } else {
+      sets.push(parseColumnList(parser));
+    }
+    parser.expect(TokenType2.RPAREN);
+  } while (parser.match(TokenType2.COMMA));
+  return sets;
+}
+function parseColumnList(parser) {
+  const columns = [parser.expect(TokenType2.IDENTIFIER).value];
+  while (parser.match(TokenType2.COMMA)) {
+    columns.push(parser.expect(TokenType2.IDENTIFIER).value);
+  }
+  return columns;
+}
+function parseOverClause(parser) {
+  parser.expect(TokenType2.OVER);
+  parser.expect(TokenType2.LPAREN);
+  const over = { partitionBy: [], orderBy: [], frame: null };
+  if (parser.match(TokenType2.PARTITION)) {
+    parser.expect(TokenType2.BY);
+    over.partitionBy.push(parser.parseExpr());
+    while (parser.match(TokenType2.COMMA)) {
+      over.partitionBy.push(parser.parseExpr());
+    }
+  }
+  if (parser.match(TokenType2.ORDER)) {
+    parser.expect(TokenType2.BY);
+    over.orderBy = parser.parseOrderByList();
+  }
+  if (parser.check(TokenType2.ROWS) || parser.check(TokenType2.RANGE)) {
+    over.frame = parseFrameClause(parser);
+  }
+  parser.expect(TokenType2.RPAREN);
+  return over;
+}
+function parseFrameClause(parser) {
+  const frameType = parser.advance().type;
+  const frame = { type: frameType, start: null, end: null };
+  if (parser.match(TokenType2.BETWEEN)) {
+    frame.start = parseFrameBound(parser);
+    parser.expect(TokenType2.AND);
+    frame.end = parseFrameBound(parser);
+  } else {
+    frame.start = parseFrameBound(parser);
+    frame.end = { type: "CURRENT ROW" };
+  }
+  return frame;
+}
+function parseFrameBound(parser) {
+  if (parser.match(TokenType2.UNBOUNDED)) {
+    if (parser.match(TokenType2.PRECEDING)) {
+      return { type: "UNBOUNDED PRECEDING" };
+    } else if (parser.match(TokenType2.FOLLOWING)) {
+      return { type: "UNBOUNDED FOLLOWING" };
+    }
+    throw new Error("Expected PRECEDING or FOLLOWING after UNBOUNDED");
+  }
+  if (parser.match(TokenType2.CURRENT)) {
+    parser.expect(TokenType2.ROW);
+    return { type: "CURRENT ROW" };
+  }
+  if (parser.check(TokenType2.NUMBER)) {
+    const n = parseInt(parser.advance().value, 10);
+    if (parser.match(TokenType2.PRECEDING)) {
+      return { type: "PRECEDING", offset: n };
+    } else if (parser.match(TokenType2.FOLLOWING)) {
+      return { type: "FOLLOWING", offset: n };
+    }
+    throw new Error("Expected PRECEDING or FOLLOWING after number");
+  }
+  throw new Error("Invalid frame bound");
+}
+function parsePivotClause(parser, parsePrimaryFn) {
+  parser.expect(TokenType2.LPAREN);
+  const aggFunc = parsePrimaryFn(parser);
+  if (aggFunc.type !== "call") {
+    throw new Error("PIVOT requires an aggregate function (e.g., SUM, COUNT, AVG)");
+  }
+  parser.expect(TokenType2.FOR);
+  const forColumn = parser.expect(TokenType2.IDENTIFIER).value;
+  parser.expect(TokenType2.IN);
+  parser.expect(TokenType2.LPAREN);
+  const inValues = [];
+  inValues.push(parsePrimaryFn(parser).value);
+  while (parser.match(TokenType2.COMMA)) {
+    inValues.push(parsePrimaryFn(parser).value);
+  }
+  parser.expect(TokenType2.RPAREN);
+  parser.expect(TokenType2.RPAREN);
+  return {
+    aggregate: aggFunc,
+    forColumn,
+    inValues
+  };
+}
+function parseUnpivotClause(parser) {
+  parser.expect(TokenType2.LPAREN);
+  const valueColumn = parser.expect(TokenType2.IDENTIFIER).value;
+  parser.expect(TokenType2.FOR);
+  const nameColumn = parser.expect(TokenType2.IDENTIFIER).value;
+  parser.expect(TokenType2.IN);
+  parser.expect(TokenType2.LPAREN);
+  const inColumns = [];
+  inColumns.push(parser.expect(TokenType2.IDENTIFIER).value);
+  while (parser.match(TokenType2.COMMA)) {
+    inColumns.push(parser.expect(TokenType2.IDENTIFIER).value);
+  }
+  parser.expect(TokenType2.RPAREN);
+  parser.expect(TokenType2.RPAREN);
+  return {
+    valueColumn,
+    nameColumn,
+    inColumns
+  };
+}
+function parseNearClause(parser) {
+  let column = null;
+  let query = null;
+  let searchRow = null;
+  let topK = 20;
+  let encoder = "minilm";
+  if (parser.check(TokenType2.IDENTIFIER)) {
+    const ident = parser.advance().value;
+    if (parser.check(TokenType2.STRING) || parser.check(TokenType2.NUMBER)) {
+      column = ident;
+    } else {
+      throw new Error(`NEAR requires quoted text or row number. Did you mean: NEAR '${ident}'?`);
+    }
+  }
+  if (parser.check(TokenType2.STRING)) {
+    query = parser.advance().value;
+  } else if (parser.check(TokenType2.NUMBER)) {
+    searchRow = parseInt(parser.advance().value, 10);
+  } else {
+    throw new Error("NEAR requires a quoted text string or row number");
+  }
+  if (parser.match(TokenType2.TOPK)) {
+    topK = parseInt(parser.expect(TokenType2.NUMBER).value, 10);
+  }
+  return { query, searchRow, column, topK, encoder };
+}
+
 // src/client/sql/parser.js
 var SQLParser = class {
   constructor(tokens) {
@@ -7891,7 +8201,7 @@ var SQLParser = class {
     }
     let ctes = [];
     if (this.check(TokenType2.WITH)) {
-      ctes = this.parseWithClause();
+      ctes = parseWithClause(this);
     }
     if (this.check(TokenType2.SELECT)) {
       const result = this.parseSelect();
@@ -7912,53 +8222,6 @@ var SQLParser = class {
     }
   }
   /**
-   * Parse WITH clause (Common Table Expressions)
-   * Syntax: WITH [RECURSIVE] name [(columns)] AS (subquery) [, ...]
-   */
-  parseWithClause() {
-    this.expect(TokenType2.WITH);
-    const isRecursive = !!this.match(TokenType2.RECURSIVE);
-    const ctes = [];
-    do {
-      const name = this.expect(TokenType2.IDENTIFIER).value;
-      let columns = [];
-      if (this.match(TokenType2.LPAREN)) {
-        columns.push(this.expect(TokenType2.IDENTIFIER).value);
-        while (this.match(TokenType2.COMMA)) {
-          columns.push(this.expect(TokenType2.IDENTIFIER).value);
-        }
-        this.expect(TokenType2.RPAREN);
-      }
-      this.expect(TokenType2.AS);
-      this.expect(TokenType2.LPAREN);
-      const body = this.parseCteBody(isRecursive);
-      this.expect(TokenType2.RPAREN);
-      ctes.push({
-        name,
-        columns,
-        body,
-        recursive: isRecursive
-      });
-    } while (this.match(TokenType2.COMMA));
-    return ctes;
-  }
-  /**
-   * Parse CTE body which may contain UNION ALL for recursive CTEs
-   */
-  parseCteBody(isRecursive) {
-    const anchor = this.parseSelect(true, true);
-    if (isRecursive && this.match(TokenType2.UNION)) {
-      this.expect(TokenType2.ALL);
-      const recursive = this.parseSelect(true, true);
-      return {
-        type: "RECURSIVE_CTE",
-        anchor,
-        recursive
-      };
-    }
-    return anchor;
-  }
-  /**
    * Parse SELECT statement
    * @param {boolean} isSubquery - If true, don't require EOF at end (for subqueries)
    * @param {boolean} noSetOps - If true, don't parse set operations (for CTE body parsing)
@@ -7977,48 +8240,11 @@ var SQLParser = class {
     }
     let pivot = null;
     if (this.match(TokenType2.PIVOT)) {
-      this.expect(TokenType2.LPAREN);
-      const aggFunc = this.parsePrimary();
-      if (aggFunc.type !== "call") {
-        throw new Error("PIVOT requires an aggregate function (e.g., SUM, COUNT, AVG)");
-      }
-      this.expect(TokenType2.FOR);
-      const forColumn = this.expect(TokenType2.IDENTIFIER).value;
-      this.expect(TokenType2.IN);
-      this.expect(TokenType2.LPAREN);
-      const inValues = [];
-      inValues.push(this.parsePrimary().value);
-      while (this.match(TokenType2.COMMA)) {
-        inValues.push(this.parsePrimary().value);
-      }
-      this.expect(TokenType2.RPAREN);
-      this.expect(TokenType2.RPAREN);
-      pivot = {
-        aggregate: aggFunc,
-        forColumn,
-        inValues
-      };
+      pivot = parsePivotClause(this, parsePrimary);
     }
     let unpivot = null;
     if (this.match(TokenType2.UNPIVOT)) {
-      this.expect(TokenType2.LPAREN);
-      const valueColumn = this.expect(TokenType2.IDENTIFIER).value;
-      this.expect(TokenType2.FOR);
-      const nameColumn = this.expect(TokenType2.IDENTIFIER).value;
-      this.expect(TokenType2.IN);
-      this.expect(TokenType2.LPAREN);
-      const inColumns = [];
-      inColumns.push(this.expect(TokenType2.IDENTIFIER).value);
-      while (this.match(TokenType2.COMMA)) {
-        inColumns.push(this.expect(TokenType2.IDENTIFIER).value);
-      }
-      this.expect(TokenType2.RPAREN);
-      this.expect(TokenType2.RPAREN);
-      unpivot = {
-        valueColumn,
-        nameColumn,
-        inColumns
-      };
+      unpivot = parseUnpivotClause(this);
     }
     let where = null;
     if (this.match(TokenType2.WHERE)) {
@@ -8027,7 +8253,7 @@ var SQLParser = class {
     let groupBy = [];
     if (this.match(TokenType2.GROUP)) {
       this.expect(TokenType2.BY);
-      groupBy = this.parseGroupByList();
+      groupBy = parseGroupByList(this);
     }
     let having = null;
     if (this.match(TokenType2.HAVING)) {
@@ -8039,30 +8265,7 @@ var SQLParser = class {
     }
     let search = null;
     if (this.match(TokenType2.NEAR)) {
-      let column = null;
-      let query = null;
-      let searchRow = null;
-      let topK = 20;
-      let encoder = "minilm";
-      if (this.check(TokenType2.IDENTIFIER)) {
-        const ident = this.advance().value;
-        if (this.check(TokenType2.STRING) || this.check(TokenType2.NUMBER)) {
-          column = ident;
-        } else {
-          throw new Error(`NEAR requires quoted text or row number. Did you mean: NEAR '${ident}'?`);
-        }
-      }
-      if (this.check(TokenType2.STRING)) {
-        query = this.advance().value;
-      } else if (this.check(TokenType2.NUMBER)) {
-        searchRow = parseInt(this.advance().value, 10);
-      } else {
-        throw new Error("NEAR requires a quoted text string or row number");
-      }
-      if (this.match(TokenType2.TOPK)) {
-        topK = parseInt(this.expect(TokenType2.NUMBER).value, 10);
-      }
-      search = { query, searchRow, column, topK, encoder };
+      search = parseNearClause(this);
     }
     const baseAst = {
       type: "SELECT",
@@ -8145,7 +8348,6 @@ var SQLParser = class {
   }
   /**
    * Parse INSERT statement
-   * Syntax: INSERT INTO table_name [(col1, col2, ...)] VALUES (val1, val2, ...), ...
    */
   parseInsert() {
     this.expect(TokenType2.INSERT);
@@ -8165,71 +8367,17 @@ var SQLParser = class {
     do {
       this.expect(TokenType2.LPAREN);
       const values = [];
-      values.push(this.parseValue());
+      values.push(parseValue(this));
       while (this.match(TokenType2.COMMA)) {
-        values.push(this.parseValue());
+        values.push(parseValue(this));
       }
       this.expect(TokenType2.RPAREN);
       rows.push(values);
     } while (this.match(TokenType2.COMMA));
-    return {
-      type: "INSERT",
-      table,
-      columns,
-      rows
-    };
-  }
-  /**
-   * Parse a single value (number, string, null, true, false)
-   */
-  parseValue() {
-    if (this.match(TokenType2.NULL)) {
-      return { type: "null", value: null };
-    }
-    if (this.match(TokenType2.TRUE)) {
-      return { type: "boolean", value: true };
-    }
-    if (this.match(TokenType2.FALSE)) {
-      return { type: "boolean", value: false };
-    }
-    if (this.check(TokenType2.NUMBER)) {
-      const token = this.advance();
-      const value = token.value.includes(".") ? parseFloat(token.value) : parseInt(token.value, 10);
-      return { type: "number", value };
-    }
-    if (this.check(TokenType2.STRING)) {
-      const token = this.advance();
-      return { type: "string", value: token.value };
-    }
-    if (this.check(TokenType2.MINUS)) {
-      this.advance();
-      const token = this.expect(TokenType2.NUMBER);
-      const value = token.value.includes(".") ? -parseFloat(token.value) : -parseInt(token.value, 10);
-      return { type: "number", value };
-    }
-    if (this.check(TokenType2.LBRACKET)) {
-      return this.parseArrayLiteral();
-    }
-    throw new Error(`Expected value, got ${this.current().type}`);
-  }
-  /**
-   * Parse array literal: [1, 2, 3] or ARRAY[1, 2, 3]
-   */
-  parseArrayLiteral() {
-    this.expect(TokenType2.LBRACKET);
-    const elements = [];
-    if (!this.check(TokenType2.RBRACKET)) {
-      elements.push(this.parseExpr());
-      while (this.match(TokenType2.COMMA)) {
-        elements.push(this.parseExpr());
-      }
-    }
-    this.expect(TokenType2.RBRACKET);
-    return { type: "array", elements };
+    return { type: "INSERT", table, columns, rows };
   }
   /**
    * Parse UPDATE statement
-   * Syntax: UPDATE table_name SET col1 = val1, col2 = val2 [WHERE condition]
    */
   parseUpdate() {
     this.expect(TokenType2.UPDATE);
@@ -8239,23 +8387,17 @@ var SQLParser = class {
     do {
       const column = this.expect(TokenType2.IDENTIFIER).value;
       this.expect(TokenType2.EQ);
-      const value = this.parseValue();
+      const value = parseValue(this);
       assignments.push({ column, value });
     } while (this.match(TokenType2.COMMA));
     let where = null;
     if (this.match(TokenType2.WHERE)) {
       where = this.parseExpr();
     }
-    return {
-      type: "UPDATE",
-      table,
-      assignments,
-      where
-    };
+    return { type: "UPDATE", table, assignments, where };
   }
   /**
    * Parse DELETE statement
-   * Syntax: DELETE FROM table_name [WHERE condition]
    */
   parseDelete() {
     this.expect(TokenType2.DELETE);
@@ -8265,15 +8407,10 @@ var SQLParser = class {
     if (this.match(TokenType2.WHERE)) {
       where = this.parseExpr();
     }
-    return {
-      type: "DELETE",
-      table,
-      where
-    };
+    return { type: "DELETE", table, where };
   }
   /**
    * Parse CREATE TABLE statement
-   * Syntax: CREATE TABLE [IF NOT EXISTS] table_name (col1 TYPE, col2 TYPE, ...)
    */
   parseCreateTable() {
     this.expect(TokenType2.CREATE);
@@ -8319,16 +8456,10 @@ var SQLParser = class {
       columns.push({ name, dataType, primaryKey, vectorDim });
     } while (this.match(TokenType2.COMMA));
     this.expect(TokenType2.RPAREN);
-    return {
-      type: "CREATE_TABLE",
-      table,
-      columns,
-      ifNotExists
-    };
+    return { type: "CREATE_TABLE", table, columns, ifNotExists };
   }
   /**
    * Parse DROP TABLE statement
-   * Syntax: DROP TABLE [IF EXISTS] table_name
    */
   parseDropTable() {
     this.expect(TokenType2.DROP);
@@ -8339,11 +8470,7 @@ var SQLParser = class {
       ifExists = true;
     }
     const table = this.expect(TokenType2.IDENTIFIER).value;
-    return {
-      type: "DROP_TABLE",
-      table,
-      ifExists
-    };
+    return { type: "DROP_TABLE", table, ifExists };
   }
   parseSelectList() {
     const items = [this.parseSelectItem()];
@@ -8366,10 +8493,7 @@ var SQLParser = class {
     return { type: "expr", expr, alias };
   }
   /**
-   * Parse FROM clause - supports:
-   * - table_name (identifier)
-   * - read_lance('url') (function call)
-   * - 'url.lance' (string literal, auto-detect)
+   * Parse FROM clause
    */
   parseFromClause() {
     let from = null;
@@ -8415,13 +8539,7 @@ var SQLParser = class {
     return from;
   }
   /**
-   * Parse JOIN clause - supports:
-   * - JOIN table ON condition
-   * - INNER JOIN table ON condition
-   * - LEFT JOIN table ON condition
-   * - RIGHT JOIN table ON condition
-   * - FULL OUTER JOIN table ON condition
-   * - CROSS JOIN table
+   * Parse JOIN clause
    */
   parseJoinClause() {
     let joinType = "INNER";
@@ -8453,65 +8571,7 @@ var SQLParser = class {
       this.expect(TokenType2.ON);
       on = this.parseExpr();
     }
-    return {
-      type: joinType,
-      table,
-      alias,
-      on
-    };
-  }
-  parseColumnList() {
-    const columns = [this.expect(TokenType2.IDENTIFIER).value];
-    while (this.match(TokenType2.COMMA)) {
-      columns.push(this.expect(TokenType2.IDENTIFIER).value);
-    }
-    return columns;
-  }
-  /**
-   * Parse GROUP BY list with support for ROLLUP, CUBE, GROUPING SETS
-   * Returns array of items, each with { type, column/columns/sets }
-   */
-  parseGroupByList() {
-    const items = [];
-    do {
-      if (this.match(TokenType2.ROLLUP)) {
-        this.expect(TokenType2.LPAREN);
-        const columns = this.parseColumnList();
-        this.expect(TokenType2.RPAREN);
-        items.push({ type: "ROLLUP", columns });
-      } else if (this.match(TokenType2.CUBE)) {
-        this.expect(TokenType2.LPAREN);
-        const columns = this.parseColumnList();
-        this.expect(TokenType2.RPAREN);
-        items.push({ type: "CUBE", columns });
-      } else if (this.match(TokenType2.GROUPING)) {
-        this.expect(TokenType2.SETS);
-        this.expect(TokenType2.LPAREN);
-        const sets = this.parseGroupingSets();
-        this.expect(TokenType2.RPAREN);
-        items.push({ type: "GROUPING_SETS", sets });
-      } else {
-        items.push({ type: "COLUMN", column: this.expect(TokenType2.IDENTIFIER).value });
-      }
-    } while (this.match(TokenType2.COMMA));
-    return items;
-  }
-  /**
-   * Parse the sets inside GROUPING SETS(...)
-   * Each set is (col1, col2) or () for grand total
-   */
-  parseGroupingSets() {
-    const sets = [];
-    do {
-      this.expect(TokenType2.LPAREN);
-      if (this.check(TokenType2.RPAREN)) {
-        sets.push([]);
-      } else {
-        sets.push(this.parseColumnList());
-      }
-      this.expect(TokenType2.RPAREN);
-    } while (this.match(TokenType2.COMMA));
-    return sets;
+    return { type: joinType, table, alias, on };
   }
   parseOrderByList() {
     const items = [this.parseOrderByItem()];
@@ -8530,317 +8590,23 @@ var SQLParser = class {
     }
     return { column, descending };
   }
-  // Expression parsing with precedence
+  // Expression parsing - delegate to parser-expr.js
   parseExpr() {
-    return this.parseOrExpr();
+    return parseExpr(this);
   }
-  parseOrExpr() {
-    let left = this.parseAndExpr();
-    while (this.match(TokenType2.OR)) {
-      const right = this.parseAndExpr();
-      left = { type: "binary", op: "OR", left, right };
-    }
-    return left;
-  }
-  parseAndExpr() {
-    let left = this.parseNotExpr();
-    while (this.match(TokenType2.AND)) {
-      const right = this.parseNotExpr();
-      left = { type: "binary", op: "AND", left, right };
-    }
-    return left;
-  }
-  parseNotExpr() {
-    if (this.match(TokenType2.NOT)) {
-      const operand = this.parseNotExpr();
-      return { type: "unary", op: "NOT", operand };
-    }
-    return this.parseCmpExpr();
-  }
-  parseCmpExpr() {
-    let left = this.parseAddExpr();
-    if (this.match(TokenType2.IS)) {
-      const negated = !!this.match(TokenType2.NOT);
-      this.expect(TokenType2.NULL);
-      return {
-        type: "binary",
-        op: negated ? "!=" : "==",
-        left,
-        right: { type: "literal", value: null }
-      };
-    }
-    if (this.match(TokenType2.IN)) {
-      this.expect(TokenType2.LPAREN);
-      if (this.check(TokenType2.SELECT)) {
-        const subquery = this.parseSelect(true);
-        this.expect(TokenType2.RPAREN);
-        return { type: "in", expr: left, values: [{ type: "subquery", query: subquery }] };
-      }
-      const values = [];
-      values.push(this.parsePrimary());
-      while (this.match(TokenType2.COMMA)) {
-        values.push(this.parsePrimary());
-      }
-      this.expect(TokenType2.RPAREN);
-      return { type: "in", expr: left, values };
-    }
-    if (this.match(TokenType2.BETWEEN)) {
-      const low = this.parseAddExpr();
-      this.expect(TokenType2.AND);
-      const high = this.parseAddExpr();
-      return { type: "between", expr: left, low, high };
-    }
-    if (this.match(TokenType2.LIKE)) {
-      const pattern = this.parsePrimary();
-      return { type: "like", expr: left, pattern };
-    }
-    if (this.match(TokenType2.NEAR)) {
-      const text = this.parsePrimary();
-      return { type: "near", column: left, text };
-    }
-    const opMap = {
-      [TokenType2.EQ]: "==",
-      [TokenType2.NE]: "!=",
-      [TokenType2.LT]: "<",
-      [TokenType2.LE]: "<=",
-      [TokenType2.GT]: ">",
-      [TokenType2.GE]: ">="
-    };
-    const opToken = this.match(TokenType2.EQ, TokenType2.NE, TokenType2.LT, TokenType2.LE, TokenType2.GT, TokenType2.GE);
-    if (opToken) {
-      const right = this.parseAddExpr();
-      return { type: "binary", op: opMap[opToken.type], left, right };
-    }
-    return left;
-  }
-  parseAddExpr() {
-    let left = this.parseMulExpr();
-    while (true) {
-      const opToken = this.match(TokenType2.PLUS, TokenType2.MINUS);
-      if (!opToken) break;
-      const right = this.parseMulExpr();
-      left = { type: "binary", op: opToken.value, left, right };
-    }
-    return left;
-  }
-  parseMulExpr() {
-    let left = this.parseUnaryExpr();
-    while (true) {
-      const opToken = this.match(TokenType2.STAR, TokenType2.SLASH);
-      if (!opToken) break;
-      const right = this.parseUnaryExpr();
-      left = { type: "binary", op: opToken.value, left, right };
-    }
-    return left;
-  }
-  parseUnaryExpr() {
-    if (this.match(TokenType2.MINUS)) {
-      const operand = this.parseUnaryExpr();
-      return { type: "unary", op: "-", operand };
-    }
-    return this.parsePrimary();
-  }
-  parsePrimary() {
-    if (this.match(TokenType2.NULL)) {
-      return { type: "literal", value: null };
-    }
-    if (this.match(TokenType2.TRUE)) {
-      return { type: "literal", value: true };
-    }
-    if (this.match(TokenType2.FALSE)) {
-      return { type: "literal", value: false };
-    }
-    if (this.match(TokenType2.ARRAY)) {
-      let result = this.parseArrayLiteral();
-      while (this.check(TokenType2.LBRACKET)) {
-        this.advance();
-        const index = this.parseExpr();
-        this.expect(TokenType2.RBRACKET);
-        result = { type: "subscript", array: result, index };
-      }
-      return result;
-    }
-    if (this.check(TokenType2.LBRACKET)) {
-      let result = this.parseArrayLiteral();
-      while (this.check(TokenType2.LBRACKET)) {
-        this.advance();
-        const index = this.parseExpr();
-        this.expect(TokenType2.RBRACKET);
-        result = { type: "subscript", array: result, index };
-      }
-      return result;
-    }
-    if (this.check(TokenType2.NUMBER)) {
-      const value = this.advance().value;
-      return { type: "literal", value: parseFloat(value) };
-    }
-    if (this.check(TokenType2.STRING)) {
-      const value = this.advance().value;
-      return { type: "literal", value };
-    }
-    const windowFuncTokens = [
-      TokenType2.ROW_NUMBER,
-      TokenType2.RANK,
-      TokenType2.DENSE_RANK,
-      TokenType2.NTILE,
-      TokenType2.LAG,
-      TokenType2.LEAD,
-      TokenType2.FIRST_VALUE,
-      TokenType2.LAST_VALUE,
-      TokenType2.NTH_VALUE,
-      TokenType2.PERCENT_RANK,
-      TokenType2.CUME_DIST
-    ];
-    if (windowFuncTokens.some((t) => this.check(t))) {
-      const name = this.advance().type;
-      this.expect(TokenType2.LPAREN);
-      const args = [];
-      if (!this.check(TokenType2.RPAREN)) {
-        args.push(this.parseExpr());
-        while (this.match(TokenType2.COMMA)) {
-          args.push(this.parseExpr());
-        }
-      }
-      this.expect(TokenType2.RPAREN);
-      const over = this.parseOverClause();
-      return { type: "call", name, args, distinct: false, over };
-    }
-    if (this.check(TokenType2.IDENTIFIER) || this.check(TokenType2.COUNT, TokenType2.SUM, TokenType2.AVG, TokenType2.MIN, TokenType2.MAX, TokenType2.GROUPING)) {
-      const name = this.advance().value;
-      if (this.match(TokenType2.LPAREN)) {
-        let distinct = !!this.match(TokenType2.DISTINCT);
-        const args = [];
-        if (!this.check(TokenType2.RPAREN)) {
-          if (this.check(TokenType2.STAR)) {
-            this.advance();
-            args.push({ type: "star" });
-          } else {
-            args.push(this.parseExpr());
-            while (this.match(TokenType2.COMMA)) {
-              args.push(this.parseExpr());
-            }
-          }
-        }
-        this.expect(TokenType2.RPAREN);
-        let over = null;
-        if (this.check(TokenType2.OVER)) {
-          over = this.parseOverClause();
-        }
-        return { type: "call", name: name.toUpperCase(), args, distinct, over };
-      }
-      if (this.match(TokenType2.DOT)) {
-        const table = name;
-        const token = this.advance();
-        const column = token.value || token.type.toLowerCase();
-        return { type: "column", table, column };
-      }
-      let result = { type: "column", column: name };
-      if (this.check(TokenType2.LBRACKET)) {
-        this.advance();
-        const index = this.parseExpr();
-        this.expect(TokenType2.RBRACKET);
-        result = { type: "subscript", array: result, index };
-      }
-      return result;
-    }
-    if (this.match(TokenType2.LPAREN)) {
-      if (this.check(TokenType2.SELECT)) {
-        const subquery = this.parseSelect(true);
-        this.expect(TokenType2.RPAREN);
-        return { type: "subquery", query: subquery };
-      }
-      const expr = this.parseExpr();
-      this.expect(TokenType2.RPAREN);
-      return expr;
-    }
-    if (this.match(TokenType2.STAR)) {
-      return { type: "star" };
-    }
-    throw new Error(`Unexpected token: ${this.current().type} (${this.current().value})`);
-  }
-  /**
-   * Parse OVER clause for window functions
-   * Syntax: OVER ([PARTITION BY expr, ...] [ORDER BY expr [ASC|DESC], ...] [frame_clause])
-   */
+  // Window function OVER clause - delegate to parser-advanced.js
   parseOverClause() {
-    this.expect(TokenType2.OVER);
-    this.expect(TokenType2.LPAREN);
-    const over = { partitionBy: [], orderBy: [], frame: null };
-    if (this.match(TokenType2.PARTITION)) {
-      this.expect(TokenType2.BY);
-      over.partitionBy.push(this.parseExpr());
-      while (this.match(TokenType2.COMMA)) {
-        over.partitionBy.push(this.parseExpr());
-      }
-    }
-    if (this.match(TokenType2.ORDER)) {
-      this.expect(TokenType2.BY);
-      over.orderBy = this.parseOrderByList();
-    }
-    if (this.check(TokenType2.ROWS) || this.check(TokenType2.RANGE)) {
-      over.frame = this.parseFrameClause();
-    }
-    this.expect(TokenType2.RPAREN);
-    return over;
-  }
-  /**
-   * Parse frame clause for window functions
-   * Syntax: ROWS|RANGE BETWEEN frame_start AND frame_end
-   *         or: ROWS|RANGE frame_start
-   */
-  parseFrameClause() {
-    const frameType = this.advance().type;
-    const frame = { type: frameType, start: null, end: null };
-    if (this.match(TokenType2.BETWEEN)) {
-      frame.start = this.parseFrameBound();
-      this.expect(TokenType2.AND);
-      frame.end = this.parseFrameBound();
-    } else {
-      frame.start = this.parseFrameBound();
-      frame.end = { type: "CURRENT ROW" };
-    }
-    return frame;
-  }
-  /**
-   * Parse a frame bound
-   * Options: UNBOUNDED PRECEDING, UNBOUNDED FOLLOWING, CURRENT ROW, N PRECEDING, N FOLLOWING
-   */
-  parseFrameBound() {
-    if (this.match(TokenType2.UNBOUNDED)) {
-      if (this.match(TokenType2.PRECEDING)) {
-        return { type: "UNBOUNDED PRECEDING" };
-      } else if (this.match(TokenType2.FOLLOWING)) {
-        return { type: "UNBOUNDED FOLLOWING" };
-      }
-      throw new Error("Expected PRECEDING or FOLLOWING after UNBOUNDED");
-    }
-    if (this.match(TokenType2.CURRENT)) {
-      this.expect(TokenType2.ROW);
-      return { type: "CURRENT ROW" };
-    }
-    if (this.check(TokenType2.NUMBER)) {
-      const n = parseInt(this.advance().value, 10);
-      if (this.match(TokenType2.PRECEDING)) {
-        return { type: "PRECEDING", offset: n };
-      } else if (this.match(TokenType2.FOLLOWING)) {
-        return { type: "FOLLOWING", offset: n };
-      }
-      throw new Error("Expected PRECEDING or FOLLOWING after number");
-    }
-    throw new Error("Invalid frame bound");
+    return parseOverClause(this);
   }
 };
 
-// src/client/sql/query-planner.js
+// src/client/sql/statistics-manager.js
 var StatisticsManager = class {
   constructor() {
     this._cache = /* @__PURE__ */ new Map();
     this._opfsRoot = null;
     this._computing = /* @__PURE__ */ new Map();
   }
-  /**
-   * Get OPFS directory for statistics cache
-   */
   async _getStatsDir() {
     if (this._opfsRoot) return this._opfsRoot;
     if (typeof navigator === "undefined" || !navigator.storage?.getDirectory) {
@@ -8850,14 +8616,10 @@ var StatisticsManager = class {
       const opfsRoot = await navigator.storage.getDirectory();
       this._opfsRoot = await opfsRoot.getDirectoryHandle("lanceql-stats", { create: true });
       return this._opfsRoot;
-    } catch (e) {
-      console.warn("[StatisticsManager] OPFS not available:", e);
+    } catch {
       return null;
     }
   }
-  /**
-   * Get cache key for a dataset
-   */
   _getCacheKey(datasetUrl) {
     let hash = 0;
     for (let i = 0; i < datasetUrl.length; i++) {
@@ -8866,9 +8628,6 @@ var StatisticsManager = class {
     }
     return `stats_${Math.abs(hash).toString(16)}`;
   }
-  /**
-   * Load cached statistics from OPFS
-   */
   async loadFromCache(datasetUrl, version) {
     const cacheKey = this._getCacheKey(datasetUrl);
     if (this._cache.has(cacheKey)) {
@@ -8893,9 +8652,6 @@ var StatisticsManager = class {
       return null;
     }
   }
-  /**
-   * Save statistics to OPFS cache
-   */
   async saveToCache(datasetUrl, version, statistics) {
     const cacheKey = this._getCacheKey(datasetUrl);
     const cacheData = {
@@ -8903,7 +8659,6 @@ var StatisticsManager = class {
       version,
       timestamp: Date.now(),
       columns: statistics.columns,
-      // Map serialized as object
       fragments: statistics.fragments || null
     };
     this._cache.set(cacheKey, cacheData);
@@ -8914,19 +8669,9 @@ var StatisticsManager = class {
       const writable = await fileHandle.createWritable();
       await writable.write(JSON.stringify(cacheData));
       await writable.close();
-    } catch (e) {
-      console.warn("[StatisticsManager] Failed to persist stats:", e);
+    } catch {
     }
   }
-  /**
-   * Get statistics for a column, computing if necessary.
-   *
-   * @param {RemoteLanceDataset} dataset - The dataset
-   * @param {string} columnName - Column name
-   * @param {object} options - Options
-   * @param {number} [options.sampleSize] - Max rows to sample (default: 100000)
-   * @returns {Promise<ColumnStatistics>}
-   */
   async getColumnStats(dataset, columnName, options = {}) {
     const datasetUrl = dataset.baseUrl;
     const version = dataset._version;
@@ -8951,9 +8696,6 @@ var StatisticsManager = class {
       this._computing.delete(computeKey);
     }
   }
-  /**
-   * Compute statistics for a column by streaming through data.
-   */
   async _computeColumnStats(dataset, columnName, sampleSize) {
     const colIdx = dataset.schema.findIndex((c) => c.name === columnName);
     if (colIdx === -1) {
@@ -8994,17 +8736,11 @@ var StatisticsManager = class {
           }
         }
         rowsProcessed += values.length;
-      } catch (e) {
-        console.warn(`[StatisticsManager] Error reading fragment ${fragIdx}:`, e);
+      } catch {
       }
     }
-    console.log(`[StatisticsManager] Computed stats for ${columnName}: min=${stats.min}, max=${stats.max}, nulls=${stats.nullCount}/${stats.rowCount}`);
     return stats;
   }
-  /**
-   * Compute statistics for all filter columns in a query plan.
-   * This is called before query execution to enable pruning.
-   */
   async precomputeForPlan(dataset, plan) {
     const filterColumns = /* @__PURE__ */ new Set();
     for (const filter of plan.pushedFilters || []) {
@@ -9013,10 +8749,7 @@ var StatisticsManager = class {
       if (filter.right?.column) filterColumns.add(filter.right.column);
     }
     const statsPromises = Array.from(filterColumns).map(
-      (col) => this.getColumnStats(dataset, col).catch((e) => {
-        console.warn(`[StatisticsManager] Failed to compute stats for ${col}:`, e);
-        return null;
-      })
+      (col) => this.getColumnStats(dataset, col).catch(() => null)
     );
     const results = await Promise.all(statsPromises);
     const statsMap = /* @__PURE__ */ new Map();
@@ -9025,10 +8758,6 @@ var StatisticsManager = class {
     });
     return statsMap;
   }
-  /**
-   * Check if a filter can be satisfied by a fragment's statistics.
-   * Returns false if we can definitively skip this fragment.
-   */
   canMatchFragment(fragmentStats, filter) {
     if (!fragmentStats || !filter) return true;
     const colStats = fragmentStats[filter.column];
@@ -9058,14 +8787,9 @@ var StatisticsManager = class {
     }
     return true;
   }
-  /**
-   * Compute per-fragment statistics for a column.
-   * This enables fine-grained fragment pruning.
-   */
   async getFragmentStats(dataset, columnName, fragmentIndex) {
     const datasetUrl = dataset.baseUrl;
     const version = dataset._version;
-    const cacheKey = `${datasetUrl}:frag${fragmentIndex}:${columnName}`;
     const cached = await this.loadFromCache(datasetUrl, version);
     if (cached?.fragments?.[fragmentIndex]?.[columnName]) {
       return cached.fragments[fragmentIndex][columnName];
@@ -9105,15 +8829,10 @@ var StatisticsManager = class {
       existing.fragments[fragmentIndex][columnName] = stats;
       await this.saveToCache(datasetUrl, version, existing);
       return stats;
-    } catch (e) {
-      console.warn(`[StatisticsManager] Error computing fragment ${fragmentIndex} stats:`, e);
+    } catch {
       return null;
     }
   }
-  /**
-   * Get fragments that might match a filter based on statistics.
-   * Returns indices of fragments that can't be pruned.
-   */
   async getPrunableFragments(dataset, filters) {
     if (!filters || filters.length === 0 || !dataset._fragments) {
       return null;
@@ -9141,7 +8860,6 @@ var StatisticsManager = class {
         fragmentsPruned++;
       }
     }
-    console.log(`[StatisticsManager] Fragment pruning: ${fragmentsPruned}/${numFragments} fragments pruned`);
     return {
       matchingFragments,
       fragmentsPruned,
@@ -9150,6 +8868,8 @@ var StatisticsManager = class {
   }
 };
 var statisticsManager = new StatisticsManager();
+
+// src/client/sql/cost-model.js
 var CostModel = class {
   constructor(options = {}) {
     this.isRemote = options.isRemote ?? true;
@@ -9160,9 +8880,6 @@ var CostModel = class {
     this.hashProbeCostPerRow = options.hashProbeCostPerRow ?? 5e-3;
     this.memoryLimitMB = options.memoryLimitMB ?? 512;
   }
-  /**
-   * Estimate cost of scanning a table/fragment
-   */
   estimateScanCost(rowCount, columnBytes, selectivity = 1) {
     const bytesToFetch = rowCount * columnBytes * selectivity;
     const networkCost = this.isRemote ? this.rttLatency + bytesToFetch / (this.bandwidthMBps * 1024 * 1024) * 1e3 : 0.1;
@@ -9175,9 +8892,6 @@ var CostModel = class {
       rowsToScan: rowCount * selectivity
     };
   }
-  /**
-   * Estimate cost of a hash join
-   */
   estimateJoinCost(leftRows, rightRows, leftBytes, rightBytes, joinSelectivity = 0.1) {
     const buildRows = Math.min(leftRows, rightRows);
     const buildBytes = buildRows < leftRows ? leftBytes : rightBytes;
@@ -9196,9 +8910,6 @@ var CostModel = class {
       outputRows: Math.round(leftRows * rightRows * joinSelectivity)
     };
   }
-  /**
-   * Estimate cost of an aggregation
-   */
   estimateAggregateCost(inputRows, groupCount, aggCount) {
     const hashGroupCost = inputRows * this.hashBuildCostPerRow;
     const aggComputeCost = inputRows * aggCount * 1e-4;
@@ -9207,9 +8918,6 @@ var CostModel = class {
       outputRows: groupCount
     };
   }
-  /**
-   * Compare two plan costs and recommend the better one
-   */
   comparePlans(planA, planB) {
     const costA = planA.totalCost || this.estimatePlanCost(planA);
     const costB = planB.totalCost || this.estimatePlanCost(planB);
@@ -9220,9 +8928,6 @@ var CostModel = class {
       savings: Math.abs(costA.totalMs - costB.totalMs)
     };
   }
-  /**
-   * Estimate total cost of a query plan
-   */
   estimatePlanCost(plan) {
     let totalMs = 0;
     let totalBytes = 0;
@@ -9275,28 +8980,209 @@ var CostModel = class {
     };
   }
 };
-var QueryPlanner = class {
-  constructor() {
-    this.debug = true;
+
+// src/client/sql/planner-single.js
+function planSingleTable(planner, ast) {
+  const plan = {
+    type: ast.type,
+    scanColumns: [],
+    pushedFilters: [],
+    postFilters: [],
+    aggregations: [],
+    groupBy: [],
+    having: null,
+    orderBy: [],
+    limit: ast.limit || null,
+    offset: ast.offset || 0,
+    projection: [],
+    canUseStatistics: false,
+    canStreamResults: true,
+    estimatedSelectivity: 1
+  };
+  const neededColumns = /* @__PURE__ */ new Set();
+  if (ast.columns === "*" || Array.isArray(ast.columns) && ast.columns.some((c) => c.type === "star")) {
+    plan.projection = ["*"];
+    plan.canStreamResults = false;
+  } else if (Array.isArray(ast.columns)) {
+    for (const col of ast.columns) {
+      collectColumnsFromSelectItem(col, neededColumns, plan);
+    }
   }
-  /**
-   * Generate physical execution plan from logical AST
-   * @param {Object} ast - Parsed SQL AST
-   * @param {Object} context - Table names and aliases
-   * @returns {Object} Physical execution plan
-   */
+  if (ast.where) {
+    collectColumnsFromExpr(ast.where, neededColumns);
+    analyzeFilterPushdown(ast.where, plan);
+  }
+  if (ast.groupBy && ast.groupBy.length > 0) {
+    for (const groupExpr of ast.groupBy) {
+      collectColumnsFromExpr(groupExpr, neededColumns);
+      plan.groupBy.push(groupExpr);
+    }
+  }
+  if (ast.having) {
+    collectColumnsFromExpr(ast.having, neededColumns);
+    plan.having = ast.having;
+  }
+  if (ast.orderBy && ast.orderBy.length > 0) {
+    for (const orderItem of ast.orderBy) {
+      collectColumnsFromExpr(orderItem.expr || orderItem, neededColumns);
+      plan.orderBy.push(orderItem);
+    }
+  }
+  plan.scanColumns = Array.from(neededColumns);
+  plan.estimatedSelectivity = estimateSelectivity(plan.pushedFilters);
+  plan.canUseStatistics = plan.pushedFilters.some(
+    (f) => f.type === "range" || f.type === "equality"
+  );
+  return plan;
+}
+function collectColumnsFromSelectItem(item, columns, plan) {
+  if (item.type === "star") {
+    plan.projection.push("*");
+    return;
+  }
+  if (item.type === "expr") {
+    const expr = item.expr;
+    if (expr.type === "call") {
+      const funcName = expr.name.toUpperCase();
+      const aggFuncs = ["COUNT", "SUM", "AVG", "MIN", "MAX", "STDDEV", "STDDEV_SAMP", "STDDEV_POP", "VARIANCE", "VAR_SAMP", "VAR_POP", "MEDIAN", "STRING_AGG", "GROUP_CONCAT"];
+      if (aggFuncs.includes(funcName)) {
+        const agg = {
+          type: funcName,
+          column: null,
+          alias: item.alias || `${funcName}(${expr.args[0]?.name || "*"})`,
+          distinct: expr.distinct || false
+        };
+        if (expr.args && expr.args.length > 0) {
+          const arg = expr.args[0];
+          if (arg.type === "column") {
+            agg.column = arg.name || arg.column;
+            columns.add(agg.column);
+          } else if (arg.type !== "star") {
+            collectColumnsFromExpr(arg, columns);
+          }
+        }
+        plan.aggregations.push(agg);
+        plan.projection.push({ type: "aggregation", index: plan.aggregations.length - 1 });
+        return;
+      }
+    }
+    collectColumnsFromExpr(expr, columns);
+    plan.projection.push({
+      type: "column",
+      expr,
+      alias: item.alias
+    });
+  }
+}
+function collectColumnsFromExpr(expr, columns) {
+  if (!expr) return;
+  if (expr.type === "column") {
+    columns.add(expr.name || expr.column);
+  } else if (expr.type === "binary") {
+    collectColumnsFromExpr(expr.left, columns);
+    collectColumnsFromExpr(expr.right, columns);
+  } else if (expr.type === "call") {
+    for (const arg of expr.args || []) {
+      collectColumnsFromExpr(arg, columns);
+    }
+  } else if (expr.type === "unary") {
+    collectColumnsFromExpr(expr.operand, columns);
+  }
+}
+function analyzeFilterPushdown(expr, plan) {
+  if (!expr) return;
+  if (expr.type === "binary") {
+    if (isPushableFilter(expr)) {
+      plan.pushedFilters.push(classifyFilter(expr));
+    } else if (expr.op === "AND") {
+      analyzeFilterPushdown(expr.left, plan);
+      analyzeFilterPushdown(expr.right, plan);
+    } else if (expr.op === "OR") {
+      const leftPushable = isPushableFilter(expr.left);
+      const rightPushable = isPushableFilter(expr.right);
+      if (leftPushable && rightPushable) {
+        plan.pushedFilters.push({
+          type: "or",
+          left: classifyFilter(expr.left),
+          right: classifyFilter(expr.right)
+        });
+      } else {
+        plan.postFilters.push(expr);
+      }
+    } else {
+      plan.postFilters.push(expr);
+    }
+  } else {
+    plan.postFilters.push(expr);
+  }
+}
+function isPushableFilter(expr) {
+  if (expr.type !== "binary") return false;
+  const compOps = ["=", "==", "!=", "<>", "<", "<=", ">", ">=", "LIKE", "IN", "BETWEEN"];
+  if (!compOps.includes(expr.op.toUpperCase())) return false;
+  const leftIsCol = expr.left.type === "column";
+  const rightIsCol = expr.right?.type === "column";
+  const leftIsLiteral = expr.left.type === "literal" || expr.left.type === "list";
+  const rightIsLiteral = expr.right?.type === "literal" || expr.right?.type === "list";
+  return leftIsCol && rightIsLiteral || rightIsCol && leftIsLiteral;
+}
+function classifyFilter(expr) {
+  const leftIsCol = expr.left.type === "column";
+  const column = leftIsCol ? expr.left.name || expr.left.column : expr.right.name || expr.right.column;
+  const value = leftIsCol ? expr.right.value : expr.left.value;
+  const op = expr.op.toUpperCase();
+  if (op === "=" || op === "==") {
+    return { type: "equality", column, value, op: "=" };
+  } else if (op === "!=" || op === "<>") {
+    return { type: "inequality", column, value, op: "!=" };
+  } else if (["<", "<=", ">", ">="].includes(op)) {
+    return { type: "range", column, value, op };
+  } else if (op === "LIKE") {
+    return { type: "like", column, pattern: value };
+  } else if (op === "IN") {
+    const values = expr.right.type === "list" ? expr.right.values : [expr.right.value];
+    return { type: "in", column, values };
+  } else if (op === "BETWEEN") {
+    return { type: "between", column, low: expr.right.low, high: expr.right.high };
+  }
+  return { type: "unknown", expr };
+}
+function estimateSelectivity(filters) {
+  if (filters.length === 0) return 1;
+  let selectivity = 1;
+  for (const f of filters) {
+    switch (f.type) {
+      case "equality":
+        selectivity *= 0.1;
+        break;
+      case "range":
+        selectivity *= 0.3;
+        break;
+      case "in":
+        selectivity *= Math.min(0.5, f.values.length * 0.05);
+        break;
+      case "like":
+        selectivity *= f.pattern.startsWith("%") ? 0.5 : 0.2;
+        break;
+      default:
+        selectivity *= 0.5;
+    }
+  }
+  return Math.max(0.01, selectivity);
+}
+
+// src/client/sql/query-planner.js
+var QueryPlanner = class {
   plan(ast, context) {
     const { leftTableName, leftAlias, rightTableName, rightAlias } = context;
     const columnAnalysis = this._analyzeColumns(ast, context);
     const filterAnalysis = this._analyzeFilters(ast, context);
     const fetchEstimate = this._estimateFetchSize(ast, filterAnalysis);
-    const plan = {
-      // Step 1: Scan left table
+    return {
       leftScan: {
         table: leftTableName,
         alias: leftAlias,
         columns: columnAnalysis.left.all,
-        // Deduplicated list
         filters: filterAnalysis.left,
         limit: fetchEstimate.left,
         purpose: {
@@ -9305,60 +9191,36 @@ var QueryPlanner = class {
           result: columnAnalysis.left.result
         }
       },
-      // Step 2: Scan right table
       rightScan: {
         table: rightTableName,
         alias: rightAlias,
         columns: columnAnalysis.right.all,
         filters: filterAnalysis.right,
         filterByJoinKeys: true,
-        // Will add IN clause dynamically
         purpose: {
           join: columnAnalysis.right.join,
           where: columnAnalysis.right.where,
           result: columnAnalysis.right.result
         }
       },
-      // Step 3: Join strategy
       join: {
         type: ast.joins[0].type,
         leftKey: columnAnalysis.joinKeys.left,
         rightKey: columnAnalysis.joinKeys.right,
         algorithm: "HASH_JOIN"
-        // Could be SORT_MERGE or NESTED_LOOP in future
       },
-      // Step 4: Final projection
       projection: columnAnalysis.resultColumns,
-      // Step 5: Limit
       limit: ast.limit || null,
       offset: ast.offset || 0
     };
-    if (this.debug) {
-      this._logPlan(plan, ast);
-    }
-    return plan;
   }
-  /**
-   * Analyze which columns are needed from each table
-   */
+  planSingleTable(ast) {
+    return planSingleTable(this, ast);
+  }
   _analyzeColumns(ast, context) {
     const { leftAlias, rightAlias } = context;
-    const left = {
-      join: /* @__PURE__ */ new Set(),
-      // Columns needed for JOIN key
-      where: /* @__PURE__ */ new Set(),
-      // Columns needed for WHERE filter
-      result: /* @__PURE__ */ new Set(),
-      // Columns needed in final result
-      all: []
-      // Deduplicated union of above
-    };
-    const right = {
-      join: /* @__PURE__ */ new Set(),
-      where: /* @__PURE__ */ new Set(),
-      result: /* @__PURE__ */ new Set(),
-      all: []
-    };
+    const left = { join: /* @__PURE__ */ new Set(), where: /* @__PURE__ */ new Set(), result: /* @__PURE__ */ new Set(), all: [] };
+    const right = { join: /* @__PURE__ */ new Set(), where: /* @__PURE__ */ new Set(), result: /* @__PURE__ */ new Set(), all: [] };
     for (const item of ast.columns) {
       if (item.type === "star") {
         left.result.add("*");
@@ -9367,33 +9229,21 @@ var QueryPlanner = class {
         const col = item.expr;
         const table = col.table || null;
         const column = col.column;
-        if (!table || table === leftAlias) {
-          left.result.add(column);
-        }
-        if (!table || table === rightAlias) {
-          right.result.add(column);
-        }
+        if (!table || table === leftAlias) left.result.add(column);
+        if (!table || table === rightAlias) right.result.add(column);
       }
     }
     const join = ast.joins[0];
     const joinKeys = this._extractJoinKeys(join.on, leftAlias, rightAlias);
-    if (joinKeys.left) {
-      left.join.add(joinKeys.left);
-    }
-    if (joinKeys.right) {
-      right.join.add(joinKeys.right);
-    }
+    if (joinKeys.left) left.join.add(joinKeys.left);
+    if (joinKeys.right) right.join.add(joinKeys.right);
     if (ast.where) {
       this._extractWhereColumns(ast.where, leftAlias, rightAlias, left.where, right.where);
     }
     left.all = [.../* @__PURE__ */ new Set([...left.join, ...left.where, ...left.result])];
     right.all = [.../* @__PURE__ */ new Set([...right.join, ...right.where, ...right.result])];
-    if (left.result.has("*")) {
-      left.all = ["*"];
-    }
-    if (right.result.has("*")) {
-      right.all = ["*"];
-    }
+    if (left.result.has("*")) left.all = ["*"];
+    if (right.result.has("*")) right.all = ["*"];
     const resultColumns = [];
     for (const item of ast.columns) {
       if (item.type === "star") {
@@ -9401,60 +9251,33 @@ var QueryPlanner = class {
       } else if (item.type === "expr" && item.expr.type === "column") {
         const col = item.expr;
         const alias = item.alias || `${col.table || ""}.${col.column}`.replace(/^\./, "");
-        resultColumns.push({
-          table: col.table,
-          column: col.column,
-          alias
-        });
+        resultColumns.push({ table: col.table, column: col.column, alias });
       }
     }
-    return {
-      left,
-      right,
-      joinKeys,
-      resultColumns
-    };
+    return { left, right, joinKeys, resultColumns };
   }
-  /**
-   * Extract join keys from ON condition
-   */
   _extractJoinKeys(onExpr, leftAlias, rightAlias) {
-    if (!onExpr || onExpr.type !== "binary") {
-      return { left: null, right: null };
-    }
+    if (!onExpr || onExpr.type !== "binary") return { left: null, right: null };
     const leftCol = onExpr.left;
     const rightCol = onExpr.right;
-    let leftKey = null;
-    let rightKey = null;
+    let leftKey = null, rightKey = null;
     if (leftCol.type === "column") {
-      if (!leftCol.table || leftCol.table === leftAlias) {
-        leftKey = leftCol.column;
-      } else if (leftCol.table === rightAlias) {
-        rightKey = leftCol.column;
-      }
+      if (!leftCol.table || leftCol.table === leftAlias) leftKey = leftCol.column;
+      else if (leftCol.table === rightAlias) rightKey = leftCol.column;
     }
     if (rightCol.type === "column") {
-      if (!rightCol.table || rightCol.table === leftAlias) {
-        leftKey = rightCol.column;
-      } else if (rightCol.table === rightAlias) {
-        rightKey = rightCol.column;
-      }
+      if (!rightCol.table || rightCol.table === leftAlias) leftKey = rightCol.column;
+      else if (rightCol.table === rightAlias) rightKey = rightCol.column;
     }
     return { left: leftKey, right: rightKey };
   }
-  /**
-   * Extract columns referenced in WHERE clause
-   */
   _extractWhereColumns(expr, leftAlias, rightAlias, leftCols, rightCols) {
     if (!expr) return;
     if (expr.type === "column") {
       const table = expr.table;
       const column = expr.column;
-      if (!table || table === leftAlias) {
-        leftCols.add(column);
-      } else if (table === rightAlias) {
-        rightCols.add(column);
-      }
+      if (!table || table === leftAlias) leftCols.add(column);
+      else if (table === rightAlias) rightCols.add(column);
     } else if (expr.type === "binary") {
       this._extractWhereColumns(expr.left, leftAlias, rightAlias, leftCols, rightCols);
       this._extractWhereColumns(expr.right, leftAlias, rightAlias, leftCols, rightCols);
@@ -9462,22 +9285,14 @@ var QueryPlanner = class {
       this._extractWhereColumns(expr.expr, leftAlias, rightAlias, leftCols, rightCols);
     }
   }
-  /**
-   * Analyze and separate filters by table (for pushdown)
-   */
   _analyzeFilters(ast, context) {
     const { leftAlias, rightAlias } = context;
-    const left = [];
-    const right = [];
-    const join = [];
+    const left = [], right = [], join = [];
     if (ast.where) {
       this._separateFilters(ast.where, leftAlias, rightAlias, left, right, join);
     }
     return { left, right, join };
   }
-  /**
-   * Separate WHERE filters by which table they reference
-   */
   _separateFilters(expr, leftAlias, rightAlias, leftFilters, rightFilters, joinFilters) {
     if (!expr) return;
     if (expr.type === "binary" && expr.op === "AND") {
@@ -9487,18 +9302,12 @@ var QueryPlanner = class {
     }
     const tables = this._getReferencedTables(expr, leftAlias, rightAlias);
     if (tables.size === 1) {
-      if (tables.has(leftAlias)) {
-        leftFilters.push(expr);
-      } else if (tables.has(rightAlias)) {
-        rightFilters.push(expr);
-      }
+      if (tables.has(leftAlias)) leftFilters.push(expr);
+      else if (tables.has(rightAlias)) rightFilters.push(expr);
     } else if (tables.size > 1) {
       joinFilters.push(expr);
     }
   }
-  /**
-   * Get which tables an expression references
-   */
   _getReferencedTables(expr, leftAlias, rightAlias) {
     const tables = /* @__PURE__ */ new Set();
     const walk = (e) => {
@@ -9519,9 +9328,7 @@ var QueryPlanner = class {
       } else if (e.type === "unary") {
         walk(e.operand);
       } else if (e.type === "call") {
-        for (const arg of e.args || []) {
-          walk(arg);
-        }
+        for (const arg of e.args || []) walk(arg);
       } else if (e.type === "in") {
         walk(e.expr);
         for (const v of e.values || []) walk(v);
@@ -9537,383 +9344,15 @@ var QueryPlanner = class {
     walk(expr);
     return tables;
   }
-  /**
-   * Estimate how many rows to fetch from each table
-   *
-   * Need to over-fetch because:
-   * - WHERE filters reduce rows
-   * - JOIN reduces rows
-   * - Want to ensure we get LIMIT rows after all filtering
-   */
   _estimateFetchSize(ast, filterAnalysis) {
     const requestedLimit = ast.limit || 1e3;
     const leftSelectivity = filterAnalysis.left.length > 0 ? 0.5 : 1;
-    const rightSelectivity = filterAnalysis.right.length > 0 ? 0.5 : 1;
     const joinSelectivity = 0.7;
     const safetyFactor = 2.5;
     const leftFetch = Math.ceil(
       requestedLimit / (leftSelectivity * joinSelectivity) * safetyFactor
     );
-    const rightFetch = null;
-    return {
-      left: Math.min(leftFetch, 1e4),
-      // Cap at 10K for safety
-      right: rightFetch
-    };
-  }
-  /**
-   * Log the query plan for debugging
-   */
-  _logPlan(plan, ast) {
-    console.log("\n" + "=".repeat(60));
-    console.log("\u{1F4CB} QUERY EXECUTION PLAN");
-    console.log("=".repeat(60));
-    console.log("\n\u{1F50D} Original Query:");
-    console.log(`  SELECT: ${ast.columns.length} columns`);
-    console.log(`  FROM: ${plan.leftScan.table} AS ${plan.leftScan.alias}`);
-    console.log(`  JOIN: ${plan.rightScan.table} AS ${plan.rightScan.alias}`);
-    console.log(`  WHERE: ${ast.where ? "yes" : "no"}`);
-    console.log(`  LIMIT: ${ast.limit || "none"}`);
-    console.log("\n\u{1F4CA} Physical Plan:");
-    console.log("\n  Step 1: SCAN LEFT TABLE");
-    console.log(`    Table: ${plan.leftScan.table}`);
-    console.log(`    Columns: [${plan.leftScan.columns.join(", ")}]`);
-    console.log(`      - Join keys: [${[...plan.leftScan.purpose.join].join(", ")}]`);
-    console.log(`      - Filter cols: [${[...plan.leftScan.purpose.where].join(", ")}]`);
-    console.log(`      - Result cols: [${[...plan.leftScan.purpose.result].join(", ")}]`);
-    console.log(`    Filters: ${plan.leftScan.filters.length} pushed down`);
-    plan.leftScan.filters.forEach((f, i) => {
-      console.log(`      ${i + 1}. ${this._formatFilter(f)}`);
-    });
-    console.log(`    Limit: ${plan.leftScan.limit} rows (over-fetch for safety)`);
-    console.log("\n  Step 2: BUILD HASH TABLE");
-    console.log(`    Index by: ${plan.join.leftKey}`);
-    console.log(`    Keep: [${plan.leftScan.columns.join(", ")}]`);
-    console.log("\n  Step 3: SCAN RIGHT TABLE");
-    console.log(`    Table: ${plan.rightScan.table}`);
-    console.log(`    Columns: [${plan.rightScan.columns.join(", ")}]`);
-    console.log(`      - Join keys: [${[...plan.rightScan.purpose.join].join(", ")}]`);
-    console.log(`      - Filter cols: [${[...plan.rightScan.purpose.where].join(", ")}]`);
-    console.log(`      - Result cols: [${[...plan.rightScan.purpose.result].join(", ")}]`);
-    console.log(`    Filters: ${plan.rightScan.filters.length} pushed down`);
-    plan.rightScan.filters.forEach((f, i) => {
-      console.log(`      ${i + 1}. ${this._formatFilter(f)}`);
-    });
-    console.log(`    Dynamic filter: ${plan.join.rightKey} IN (keys from left)`);
-    console.log("\n  Step 4: HASH JOIN");
-    console.log(`    Algorithm: ${plan.join.algorithm}`);
-    console.log(`    Condition: ${plan.join.leftKey} = ${plan.join.rightKey}`);
-    console.log("\n  Step 5: PROJECT");
-    console.log(`    Result columns: ${plan.projection.length}`);
-    plan.projection.forEach((col, i) => {
-      if (col === "*") {
-        console.log(`      ${i + 1}. *`);
-      } else {
-        console.log(`      ${i + 1}. ${col.table}.${col.column} AS ${col.alias}`);
-      }
-    });
-    console.log("\n  Step 6: LIMIT");
-    console.log(`    Rows: ${plan.limit || "none"}`);
-    console.log("\n\u{1F4A1} Optimization Summary:");
-    const leftTotal = plan.leftScan.columns.length;
-    const rightTotal = plan.rightScan.columns.length;
-    console.log(`  - Fetch ${leftTotal} cols from left (not all columns)`);
-    console.log(`  - Fetch ${rightTotal} cols from right (not all columns)`);
-    console.log(`  - Push down ${plan.leftScan.filters.length + plan.rightScan.filters.length} filters`);
-    console.log(`  - Over-fetch left by ${(plan.leftScan.limit / (ast.limit || 1)).toFixed(1)}x for safety`);
-    console.log("\n" + "=".repeat(60) + "\n");
-  }
-  /**
-   * Format filter expression for logging
-   */
-  _formatFilter(expr) {
-    if (!expr) return "null";
-    if (expr.type === "binary") {
-      const left = this._formatFilter(expr.left);
-      const right = this._formatFilter(expr.right);
-      return `${left} ${expr.op} ${right}`;
-    } else if (expr.type === "column") {
-      return expr.table ? `${expr.table}.${expr.column}` : expr.column;
-    } else if (expr.type === "literal") {
-      return JSON.stringify(expr.value);
-    } else if (expr.type === "call") {
-      const args = (expr.args || []).map((a) => this._formatFilter(a)).join(", ");
-      return `${expr.name}(${args})`;
-    }
-    return JSON.stringify(expr);
-  }
-  /**
-   * Generate optimized plan for single-table queries (SELECT, aggregations).
-   * This is the key optimization that makes us better than DuckDB for remote data:
-   *
-   * DuckDB approach (local-first):
-   *   1. Load data into memory
-   *   2. Build indexes
-   *   3. Execute query
-   *
-   * LanceQL approach (remote-first):
-   *   1. Analyze query to determine minimum columns needed
-   *   2. Use Lance column statistics to skip entire chunks
-   *   3. Stream only matching rows, never load full table
-   *   4. Apply projections at the data source
-   *
-   * @param {Object} ast - Parsed SQL AST
-   * @returns {Object} Physical execution plan
-   */
-  planSingleTable(ast) {
-    const plan = {
-      type: ast.type,
-      // Phase 1: Determine columns to fetch
-      scanColumns: [],
-      // Phase 2: Filters to push down (executed at data source)
-      pushedFilters: [],
-      // Phase 3: Filters that must be evaluated after fetch
-      postFilters: [],
-      // Phase 4: Aggregations (if any)
-      aggregations: [],
-      // Phase 5: GROUP BY (if any)
-      groupBy: [],
-      // Phase 6: HAVING (if any)
-      having: null,
-      // Phase 7: ORDER BY (if any)
-      orderBy: [],
-      // Phase 8: LIMIT/OFFSET
-      limit: ast.limit || null,
-      offset: ast.offset || 0,
-      // Phase 9: Final projection
-      projection: [],
-      // Optimization flags
-      canUseStatistics: false,
-      canStreamResults: true,
-      estimatedSelectivity: 1
-    };
-    const neededColumns = /* @__PURE__ */ new Set();
-    if (ast.columns === "*" || Array.isArray(ast.columns) && ast.columns.some((c) => c.type === "star")) {
-      plan.projection = ["*"];
-      plan.canStreamResults = false;
-    } else if (Array.isArray(ast.columns)) {
-      for (const col of ast.columns) {
-        this._collectColumnsFromSelectItem(col, neededColumns, plan);
-      }
-    }
-    if (ast.where) {
-      this._collectColumnsFromExpr(ast.where, neededColumns);
-      this._analyzeFilterPushdown(ast.where, plan);
-    }
-    if (ast.groupBy && ast.groupBy.length > 0) {
-      for (const groupExpr of ast.groupBy) {
-        this._collectColumnsFromExpr(groupExpr, neededColumns);
-        plan.groupBy.push(groupExpr);
-      }
-    }
-    if (ast.having) {
-      this._collectColumnsFromExpr(ast.having, neededColumns);
-      plan.having = ast.having;
-    }
-    if (ast.orderBy && ast.orderBy.length > 0) {
-      for (const orderItem of ast.orderBy) {
-        this._collectColumnsFromExpr(orderItem.expr || orderItem, neededColumns);
-        plan.orderBy.push(orderItem);
-      }
-    }
-    plan.scanColumns = Array.from(neededColumns);
-    plan.estimatedSelectivity = this._estimateSelectivity(plan.pushedFilters);
-    plan.canUseStatistics = plan.pushedFilters.some(
-      (f) => f.type === "range" || f.type === "equality"
-    );
-    if (this.debug) {
-      this._logSingleTablePlan(plan, ast);
-    }
-    return plan;
-  }
-  /**
-   * Collect columns from a SELECT item
-   */
-  _collectColumnsFromSelectItem(item, columns, plan) {
-    if (item.type === "star") {
-      plan.projection.push("*");
-      return;
-    }
-    if (item.type === "expr") {
-      const expr = item.expr;
-      if (expr.type === "call") {
-        const funcName = expr.name.toUpperCase();
-        const aggFuncs = ["COUNT", "SUM", "AVG", "MIN", "MAX", "STDDEV", "STDDEV_SAMP", "STDDEV_POP", "VARIANCE", "VAR_SAMP", "VAR_POP", "MEDIAN", "STRING_AGG", "GROUP_CONCAT"];
-        if (aggFuncs.includes(funcName)) {
-          const agg = {
-            type: funcName,
-            column: null,
-            alias: item.alias || `${funcName}(${expr.args[0]?.name || "*"})`,
-            distinct: expr.distinct || false
-          };
-          if (expr.args && expr.args.length > 0) {
-            const arg = expr.args[0];
-            if (arg.type === "column") {
-              agg.column = arg.name || arg.column;
-              columns.add(agg.column);
-            } else if (arg.type !== "star") {
-              this._collectColumnsFromExpr(arg, columns);
-            }
-          }
-          plan.aggregations.push(agg);
-          plan.projection.push({ type: "aggregation", index: plan.aggregations.length - 1 });
-          return;
-        }
-      }
-      this._collectColumnsFromExpr(expr, columns);
-      plan.projection.push({
-        type: "column",
-        expr,
-        alias: item.alias
-      });
-    }
-  }
-  /**
-   * Collect column names from an expression
-   */
-  _collectColumnsFromExpr(expr, columns) {
-    if (!expr) return;
-    if (expr.type === "column") {
-      columns.add(expr.name || expr.column);
-    } else if (expr.type === "binary") {
-      this._collectColumnsFromExpr(expr.left, columns);
-      this._collectColumnsFromExpr(expr.right, columns);
-    } else if (expr.type === "call") {
-      for (const arg of expr.args || []) {
-        this._collectColumnsFromExpr(arg, columns);
-      }
-    } else if (expr.type === "unary") {
-      this._collectColumnsFromExpr(expr.operand, columns);
-    }
-  }
-  /**
-   * Analyze WHERE clause for filter pushdown opportunities.
-   *
-   * Pushable filters (can be evaluated at data source):
-   * - Simple comparisons: col > 5, col = 'foo', col BETWEEN 1 AND 10
-   * - IN clauses: col IN (1, 2, 3)
-   * - LIKE patterns: col LIKE 'prefix%' (prefix only)
-   *
-   * Non-pushable filters (must evaluate after fetch):
-   * - Complex expressions: col1 + col2 > 10
-   * - Functions: UPPER(col) = 'FOO'
-   * - Cross-column comparisons: col1 > col2
-   */
-  _analyzeFilterPushdown(expr, plan) {
-    if (!expr) return;
-    if (expr.type === "binary") {
-      if (this._isPushableFilter(expr)) {
-        plan.pushedFilters.push(this._classifyFilter(expr));
-      } else if (expr.op === "AND") {
-        this._analyzeFilterPushdown(expr.left, plan);
-        this._analyzeFilterPushdown(expr.right, plan);
-      } else if (expr.op === "OR") {
-        const leftPushable = this._isPushableFilter(expr.left);
-        const rightPushable = this._isPushableFilter(expr.right);
-        if (leftPushable && rightPushable) {
-          plan.pushedFilters.push({
-            type: "or",
-            left: this._classifyFilter(expr.left),
-            right: this._classifyFilter(expr.right)
-          });
-        } else {
-          plan.postFilters.push(expr);
-        }
-      } else {
-        plan.postFilters.push(expr);
-      }
-    } else {
-      plan.postFilters.push(expr);
-    }
-  }
-  /**
-   * Check if a filter can be pushed down to data source
-   */
-  _isPushableFilter(expr) {
-    if (expr.type !== "binary") return false;
-    const compOps = ["=", "==", "!=", "<>", "<", "<=", ">", ">=", "LIKE", "IN", "BETWEEN"];
-    if (!compOps.includes(expr.op.toUpperCase())) return false;
-    const leftIsCol = expr.left.type === "column";
-    const rightIsCol = expr.right?.type === "column";
-    const leftIsLiteral = expr.left.type === "literal" || expr.left.type === "list";
-    const rightIsLiteral = expr.right?.type === "literal" || expr.right?.type === "list";
-    return leftIsCol && rightIsLiteral || rightIsCol && leftIsLiteral;
-  }
-  /**
-   * Classify a filter for optimization
-   */
-  _classifyFilter(expr) {
-    const leftIsCol = expr.left.type === "column";
-    const column = leftIsCol ? expr.left.name || expr.left.column : expr.right.name || expr.right.column;
-    const value = leftIsCol ? expr.right.value : expr.left.value;
-    const op = expr.op.toUpperCase();
-    if (op === "=" || op === "==") {
-      return { type: "equality", column, value, op: "=" };
-    } else if (op === "!=" || op === "<>") {
-      return { type: "inequality", column, value, op: "!=" };
-    } else if (["<", "<=", ">", ">="].includes(op)) {
-      return { type: "range", column, value, op };
-    } else if (op === "LIKE") {
-      return { type: "like", column, pattern: value };
-    } else if (op === "IN") {
-      const values = expr.right.type === "list" ? expr.right.values : [expr.right.value];
-      return { type: "in", column, values };
-    } else if (op === "BETWEEN") {
-      return { type: "between", column, low: expr.right.low, high: expr.right.high };
-    }
-    return { type: "unknown", expr };
-  }
-  /**
-   * Estimate selectivity of filters (what % of rows will pass)
-   */
-  _estimateSelectivity(filters) {
-    if (filters.length === 0) return 1;
-    let selectivity = 1;
-    for (const f of filters) {
-      switch (f.type) {
-        case "equality":
-          selectivity *= 0.1;
-          break;
-        case "range":
-          selectivity *= 0.3;
-          break;
-        case "in":
-          selectivity *= Math.min(0.5, f.values.length * 0.05);
-          break;
-        case "like":
-          selectivity *= f.pattern.startsWith("%") ? 0.5 : 0.2;
-          break;
-        default:
-          selectivity *= 0.5;
-      }
-    }
-    return Math.max(0.01, selectivity);
-  }
-  /**
-   * Log single-table query plan
-   */
-  _logSingleTablePlan(plan, ast) {
-    console.log("\n" + "=".repeat(60));
-    console.log("\u{1F4CB} SINGLE-TABLE QUERY PLAN");
-    console.log("=".repeat(60));
-    console.log("\n\u{1F50D} Query Analysis:");
-    console.log(`  Type: ${plan.type}`);
-    console.log(`  Aggregations: ${plan.aggregations.length}`);
-    console.log(`  Group By: ${plan.groupBy.length} columns`);
-    console.log(`  Order By: ${plan.orderBy.length} columns`);
-    console.log(`  Limit: ${plan.limit || "none"}`);
-    console.log("\n\u{1F4CA} Scan Strategy:");
-    console.log(`  Columns to fetch: [${plan.scanColumns.join(", ")}]`);
-    console.log(`  Pushed filters: ${plan.pushedFilters.length}`);
-    plan.pushedFilters.forEach((f, i) => {
-      console.log(`    ${i + 1}. ${f.type}: ${f.column} ${f.op || ""} ${JSON.stringify(f.value || f.values || f.pattern || "")}`);
-    });
-    console.log(`  Post-fetch filters: ${plan.postFilters.length}`);
-    console.log("\n\u{1F4A1} Optimizations:");
-    console.log(`  Can use column statistics: ${plan.canUseStatistics}`);
-    console.log(`  Can stream results: ${plan.canStreamResults}`);
-    console.log(`  Estimated selectivity: ${(plan.estimatedSelectivity * 100).toFixed(1)}%`);
-    console.log("\n" + "=".repeat(60) + "\n");
+    return { left: Math.min(leftFetch, 1e4), right: null };
   }
 };
 
@@ -10845,35 +10284,35 @@ function evaluateInMemoryExpr(expr, columnData, rowIdx) {
       return null;
   }
 }
-function collectColumnsFromExpr(expr, columns) {
+function collectColumnsFromExpr2(expr, columns) {
   if (!expr) return;
   switch (expr.type) {
     case "column":
       columns.add(expr.name.toLowerCase());
       break;
     case "binary":
-      collectColumnsFromExpr(expr.left, columns);
-      collectColumnsFromExpr(expr.right, columns);
+      collectColumnsFromExpr2(expr.left, columns);
+      collectColumnsFromExpr2(expr.right, columns);
       break;
     case "unary":
-      collectColumnsFromExpr(expr.operand, columns);
+      collectColumnsFromExpr2(expr.operand, columns);
       break;
     case "call":
       for (const arg of expr.args || []) {
-        collectColumnsFromExpr(arg, columns);
+        collectColumnsFromExpr2(arg, columns);
       }
       break;
     case "in":
-      collectColumnsFromExpr(expr.expr, columns);
+      collectColumnsFromExpr2(expr.expr, columns);
       break;
     case "between":
-      collectColumnsFromExpr(expr.expr, columns);
+      collectColumnsFromExpr2(expr.expr, columns);
       break;
     case "like":
-      collectColumnsFromExpr(expr.expr, columns);
+      collectColumnsFromExpr2(expr.expr, columns);
       break;
     case "near":
-      collectColumnsFromExpr(expr.column, columns);
+      collectColumnsFromExpr2(expr.column, columns);
       break;
   }
 }
@@ -11608,16 +11047,13 @@ function executeSubquery(executor, subqueryAst, outerColumnData, outerRowIdx) {
     try {
       const result = executor._database._executeSingleTable(resolvedAst);
       if (result && result.then) {
-        console.warn("[SQLExecutor] Async subquery in expression context - consider using CTE");
         return null;
       }
       return result?.rows?.[0]?.[0] ?? null;
-    } catch (e) {
-      console.warn("[SQLExecutor] Subquery execution failed:", e.message);
+    } catch {
       return null;
     }
   }
-  console.warn("[SQLExecutor] Subquery execution requires LanceDatabase context");
   return null;
 }
 function findCorrelatedColumns(ast, subqueryTable) {
@@ -11933,15 +11369,15 @@ var SQLExecutor = class {
       if (item.type === "star") {
         (this.file.columnNames || []).forEach((n) => columns.add(n.toLowerCase()));
       } else {
-        collectColumnsFromExpr(item.expr, columns);
+        collectColumnsFromExpr2(item.expr, columns);
       }
     }
-    if (ast.where) collectColumnsFromExpr(ast.where, columns);
+    if (ast.where) collectColumnsFromExpr2(ast.where, columns);
     for (const ob of ast.orderBy || []) columns.add(ob.column.toLowerCase());
     return Array.from(columns);
   }
   collectColumnsFromExpr(expr, columns) {
-    collectColumnsFromExpr(expr, columns);
+    collectColumnsFromExpr2(expr, columns);
   }
   resolveOutputColumns(ast) {
     return ast.columns;
@@ -12268,6 +11704,7 @@ var SQLExecutor = class {
 };
 
 // src/client/lance/lance-file.js
+init_accelerator();
 var LanceFile2 = class {
   constructor(lanceql, data) {
     this.lanceql = lanceql;
@@ -13101,21 +12538,19 @@ var LanceFile2 = class {
     const dim = queryVec.length;
     const info = this.getVectorInfo(colIdx);
     const numRows = info.rows;
-    if (webgpuAccelerator.isAvailable()) {
+    const accelerator = getWebGPUAccelerator();
+    if (accelerator.isAvailable()) {
       if (onProgress) onProgress(0, numRows);
-      console.log(`[LanceFile.vectorSearch] Reading ${numRows} vectors...`);
       const allVectors2 = this.readAllVectors(colIdx);
       if (onProgress) onProgress(numRows, numRows);
-      console.log(`[LanceFile.vectorSearch] Computing similarity for ${allVectors2.length} vectors via WebGPU`);
-      const scores2 = await webgpuAccelerator.batchCosineSimilarity(queryVec, allVectors2, true);
-      return await gpuVectorSearch.topK(scores2, null, topK, true);
+      const scores2 = await accelerator.batchCosineSimilarity(queryVec, allVectors2, true);
+      return await getGPUVectorSearch().topK(scores2, null, topK, true);
     }
-    console.log(`[LanceFile.vectorSearch] Using WASM SIMD`);
     if (onProgress) onProgress(0, numRows);
     const allVectors = this.readAllVectors(colIdx);
     if (onProgress) onProgress(numRows, numRows);
     const scores = this.lanceql.batchCosineSimilarity(queryVec, allVectors, true);
-    return await gpuVectorSearch.topK(scores, null, topK, true);
+    return await getGPUVectorSearch().topK(scores, null, topK, true);
   }
   // ========================================================================
   // DataFrame-like API
@@ -13296,7 +12731,7 @@ var RemoteLanceData = class extends LanceDataBase {
   }
   async open() {
     await loadDeps();
-    const cacheInfo = await hotTierCache.getCacheInfo(this.url);
+    const cacheInfo = await getHotTierCache().getCacheInfo(this.url);
     if (cacheInfo && cacheInfo.complete) {
       this.type = "cached";
       this.cachedPath = cacheInfo.path;
@@ -13363,15 +12798,16 @@ var RemoteLanceData = class extends LanceDataBase {
     return this.type === "cached";
   }
   async prefetch() {
-    await hotTierCache.cache(this.url);
-    const cacheInfo = await hotTierCache.getCacheInfo(this.url);
+    const cache = getHotTierCache();
+    await cache.cache(this.url);
+    const cacheInfo = await cache.getCacheInfo(this.url);
     if (cacheInfo && cacheInfo.complete) {
       this.type = "cached";
       this.cachedPath = cacheInfo.path;
     }
   }
   async evict() {
-    await hotTierCache.evict(this.url);
+    await getHotTierCache().evict(this.url);
     this.type = "remote";
     this.cachedPath = null;
   }
@@ -14352,13 +13788,11 @@ init_ivf_index();
 init_local_database();
 init_opfs();
 async function executeJoin(db, ast) {
-  console.log("[LanceDatabase] Executing JOIN query:", ast);
   const leftTableName = ast.from.name || ast.from.table;
   const leftAlias = ast.from.alias || leftTableName;
   if (ast.from.alias) {
     db.aliases.set(ast.from.alias, leftTableName);
   }
-  console.log(`[LanceDatabase] Processing ${ast.joins.length} JOIN(s)`);
   let currentResult = null;
   let currentAlias = leftAlias;
   let currentTableName = leftTableName;
@@ -14370,7 +13804,6 @@ async function executeJoin(db, ast) {
     if (join.alias) {
       db.aliases.set(join.alias, rightTableName);
     }
-    console.log(`[LanceDatabase] JOIN ${i + 1}/${ast.joins.length}: ${currentTableName} (${currentAlias}) ${join.type} ${rightTableName} (${rightAlias})`);
     const rightDataset = db.getTable(rightTableName);
     const singleJoinAst = {
       ...ast,
@@ -14416,7 +13849,6 @@ async function hashJoin(db, leftDataset, rightDataset, ast, context) {
     rightKey = null;
     leftSQL = `SELECT * FROM ${leftTableName}`;
     rightSQL = `SELECT * FROM ${rightTableName}`;
-    console.log("[LanceDatabase] CROSS JOIN - no keys, cartesian product");
   } else {
     const planner = new QueryPlanner();
     plan = planner.plan(ast, context);
@@ -14439,23 +13871,18 @@ async function hashJoin(db, leftDataset, rightDataset, ast, context) {
     }
     rightSQL = `SELECT ${rightColsWithKey.join(", ")} FROM ${rightTableName}${rightWhereClause}`;
   }
-  console.log("[LanceDatabase] OPFS-backed hash join starting...");
-  console.log("[LanceDatabase] Left query:", leftSQL);
   await opfsStorage2.open();
   const joinExecutor = new OPFSJoinExecutor(opfsStorage2);
   const leftExecutor = new SQLExecutor(leftDataset);
   const rightExecutor = new SQLExecutor(rightDataset);
   const leftStream = leftExecutor.executeStream(leftSQL);
   const leftMeta = await joinExecutor._partitionToOPFS(leftStream, leftKey, "left", true);
-  console.log(`[LanceDatabase] Left partitioned: ${leftMeta.totalRows} rows, ${leftMeta.collectedKeys?.size || 0} unique keys`);
   let optimizedRightSQL = rightSQL;
   const maxKeysForInClause = 1e3;
   if (leftMeta.collectedKeys && leftMeta.collectedKeys.size > 0 && leftMeta.collectedKeys.size <= maxKeysForInClause) {
     const inClause = buildInClause(rightKey, leftMeta.collectedKeys);
     optimizedRightSQL = appendWhereClause(rightSQL, inClause);
-    console.log(`[LanceDatabase] Semi-join optimization: added IN clause with ${leftMeta.collectedKeys.size} keys`);
   }
-  console.log("[LanceDatabase] Right query:", optimizedRightSQL);
   const rightStream = rightExecutor.executeStream(optimizedRightSQL);
   const results = [];
   let resultColumns = null;
@@ -14486,7 +13913,6 @@ async function hashJoin(db, leftDataset, rightDataset, ast, context) {
     throw e;
   }
   const stats = joinExecutor.getStats();
-  console.log("[LanceDatabase] OPFS Join Stats:", stats);
   if (!resultColumns || results.length === 0) {
     return { columns: [], rows: [], total: 0, opfsStats: stats };
   }
@@ -14536,7 +13962,6 @@ async function hashJoinWithInMemoryLeft(db, leftResult, rightDataset, ast, conte
       rightKey = leftCol;
     }
   }
-  console.log(`[LanceDatabase] Multi-JOIN: left in-memory (${leftResult.rows.length} rows), right: ${rightTableName}`);
   let rightSQL = `SELECT * FROM ${rightTableName}`;
   const maxKeysForInClause = 1e3;
   if (leftKey && joinType !== "CROSS") {
@@ -14552,7 +13977,6 @@ async function hashJoinWithInMemoryLeft(db, leftResult, rightDataset, ast, conte
       if (leftKeys.size > 0 && leftKeys.size <= maxKeysForInClause) {
         const inClause = buildInClause(rightKey, leftKeys);
         rightSQL = appendWhereClause(rightSQL, inClause);
-        console.log(`[LanceDatabase] Multi-JOIN semi-join: ${leftKeys.size} keys`);
       }
     }
   }
@@ -14665,7 +14089,6 @@ function filterToSQL(expr) {
     if (expr.op === "NOT") return `NOT ${operand}`;
     return `${expr.op}${operand}`;
   }
-  console.warn("[LanceDB] Unknown filter expression type:", expr.type);
   return "";
 }
 function applyProjection(rows, allColumns, projection, leftAlias, rightAlias) {
@@ -16401,7 +15824,6 @@ export {
   GPUVectorSearch,
   HotTierCache,
   IVFIndex,
-  Store as KeyValueStore,
   LRUCache2 as LRUCache,
   LanceData,
   LanceDataBase,
@@ -16428,8 +15850,6 @@ export {
   SQLLexer,
   SQLParser,
   SharedVectorStore,
-  Database as SqlJsDatabase,
-  Statement as SqlJsStatement,
   Statement,
   StatisticsManager,
   Store,
@@ -16437,12 +15857,16 @@ export {
   Vault,
   WebGPUAccelerator,
   WorkerPool,
-  lanceStore as createStore,
   LanceQL as default,
-  hotTierCache,
+  getGPUAggregator,
+  getGPUGrouper,
+  getGPUJoiner,
+  getGPUSorter,
+  getGPUVectorSearch,
+  getHotTierCache,
+  getWebGPUAccelerator,
   lanceStore,
   vault,
-  wasmUtils,
-  webgpuAccelerator2 as webgpuAccelerator
+  wasmUtils
 };
 //# sourceMappingURL=lanceql.esm.js.map
