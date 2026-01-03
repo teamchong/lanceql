@@ -51,6 +51,35 @@ pub const CodeGenError = error{
     InvalidPlan,
 };
 
+// ============================================================================
+// Column Layout Types - for runtime struct building
+// ============================================================================
+
+/// Information about a column in the generated struct
+pub const ColumnInfo = struct {
+    name: []const u8,
+    col_type: ColumnType,
+    offset: usize, // Byte offset in struct
+};
+
+/// Layout metadata for generated Columns and OutputBuffers structs
+pub const ColumnLayout = struct {
+    /// Input columns in declaration order
+    input_columns: []const ColumnInfo,
+    /// Output columns (input + computed) in declaration order
+    output_columns: []const ColumnInfo,
+    /// Total size of Columns struct (including len field)
+    columns_size: usize,
+    /// Total size of OutputBuffers struct
+    output_size: usize,
+};
+
+/// Result of generateWithLayout
+pub const GenerateResult = struct {
+    source: []const u8,
+    layout: ColumnLayout,
+};
+
 /// Fused code generator
 pub const FusedCodeGen = struct {
     allocator: std.mem.Allocator,
@@ -64,8 +93,14 @@ pub const FusedCodeGen = struct {
     /// Input columns referenced
     input_columns: std.StringHashMap(ColumnType),
 
+    /// Input columns in declaration order (for layout)
+    input_column_order: std.ArrayList(ColumnInfo),
+
     /// Computed columns (from @logic_table methods)
     computed_columns: std.StringHashMap([]const u8),
+
+    /// Computed columns in declaration order (for layout)
+    computed_column_order: std.ArrayList(ColumnInfo),
 
     /// Counter for unique variable names
     var_counter: u32,
@@ -78,7 +113,9 @@ pub const FusedCodeGen = struct {
             .code = std.ArrayList(u8).init(allocator),
             .indent = 0,
             .input_columns = std.StringHashMap(ColumnType).init(allocator),
+            .input_column_order = std.ArrayList(ColumnInfo).init(allocator),
             .computed_columns = std.StringHashMap([]const u8).init(allocator),
+            .computed_column_order = std.ArrayList(ColumnInfo).init(allocator),
             .var_counter = 0,
         };
     }
@@ -86,7 +123,9 @@ pub const FusedCodeGen = struct {
     pub fn deinit(self: *Self) void {
         self.code.deinit();
         self.input_columns.deinit();
+        self.input_column_order.deinit();
         self.computed_columns.deinit();
+        self.computed_column_order.deinit();
     }
 
     /// Main entry point: generate fused code from query plan
@@ -103,12 +142,84 @@ pub const FusedCodeGen = struct {
         return self.code.items;
     }
 
+    /// Generate fused code with layout metadata for runtime struct building
+    pub fn generateWithLayout(self: *Self, plan: *const QueryPlan) CodeGenError!GenerateResult {
+        // Generate the source code first
+        const source = try self.generate(plan);
+
+        // Build layout from collected column info
+        const layout = try self.buildLayout();
+
+        return GenerateResult{
+            .source = source,
+            .layout = layout,
+        };
+    }
+
+    /// Build layout metadata from collected columns
+    fn buildLayout(self: *Self) CodeGenError!ColumnLayout {
+        const ptr_size: usize = @sizeOf(usize); // Size of a pointer (8 bytes on 64-bit)
+
+        // Calculate input column offsets
+        var input_cols = self.allocator.alloc(ColumnInfo, self.input_column_order.items.len) catch
+            return CodeGenError.OutOfMemory;
+        var offset: usize = 0;
+        for (self.input_column_order.items, 0..) |col, i| {
+            input_cols[i] = .{
+                .name = col.name,
+                .col_type = col.col_type,
+                .offset = offset,
+            };
+            offset += ptr_size;
+        }
+        // Add len field offset
+        const columns_size = offset + ptr_size;
+
+        // Calculate output column offsets (input columns + computed columns)
+        const output_count = self.input_column_order.items.len + self.computed_column_order.items.len;
+        var output_cols = self.allocator.alloc(ColumnInfo, output_count) catch
+            return CodeGenError.OutOfMemory;
+
+        offset = 0;
+        for (self.input_column_order.items, 0..) |col, i| {
+            output_cols[i] = .{
+                .name = col.name,
+                .col_type = col.col_type,
+                .offset = offset,
+            };
+            offset += ptr_size;
+        }
+        for (self.computed_column_order.items, 0..) |col, i| {
+            output_cols[self.input_column_order.items.len + i] = .{
+                .name = col.name,
+                .col_type = col.col_type,
+                .offset = offset,
+            };
+            offset += ptr_size;
+        }
+        const output_size = offset;
+
+        return ColumnLayout{
+            .input_columns = input_cols,
+            .output_columns = output_cols,
+            .columns_size = columns_size,
+            .output_size = output_size,
+        };
+    }
+
     /// Analyze plan to collect column references and types
     fn analyzePlan(self: *Self, node: *const PlanNode) CodeGenError!void {
         switch (node.*) {
             .scan => |scan| {
                 for (scan.columns) |col| {
+                    // Track in HashMap for fast lookup
                     self.input_columns.put(col.column, col.col_type) catch return CodeGenError.OutOfMemory;
+                    // Track in order for layout
+                    self.input_column_order.append(.{
+                        .name = col.column,
+                        .col_type = col.col_type,
+                        .offset = 0, // Will be calculated in buildLayout
+                    }) catch return CodeGenError.OutOfMemory;
                 }
             },
             .filter => |filter| {
@@ -122,7 +233,14 @@ pub const FusedCodeGen = struct {
                 try self.analyzePlan(compute.input);
                 for (compute.expressions) |expr| {
                     if (expr.inlined_body) |body| {
+                        // Track in HashMap for fast lookup
                         self.computed_columns.put(expr.name, body) catch return CodeGenError.OutOfMemory;
+                        // Track in order for layout (computed columns default to f64)
+                        self.computed_column_order.append(.{
+                            .name = expr.name,
+                            .col_type = .f64,
+                            .offset = 0, // Will be calculated in buildLayout
+                        }) catch return CodeGenError.OutOfMemory;
                     }
                 }
             },

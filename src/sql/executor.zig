@@ -32,6 +32,9 @@ pub const group_eval = @import("group_eval.zig");
 pub const planner = @import("planner/planner.zig");
 pub const fused_codegen = @import("codegen/fused_codegen.zig");
 const metal0_jit = @import("lanceql.codegen");
+const runtime_columns = @import("runtime_columns.zig");
+const RuntimeColumns = runtime_columns.RuntimeColumns;
+const ColumnDataPtr = runtime_columns.ColumnDataPtr;
 
 const Expr = ast.Expr;
 const SelectStmt = ast.SelectStmt;
@@ -254,34 +257,181 @@ pub const Executor = struct {
         // Check if plan is compilable (has inlined bodies, no unsupported ops)
         if (!plan.compilable) return error.NotImplemented;
 
-        // 2. Generate fused Zig code
+        // 2. Generate fused Zig code with layout metadata
         var codegen = fused_codegen.FusedCodeGen.init(self.allocator);
         defer codegen.deinit();
-        const zig_source = try codegen.generate(plan);
-        defer self.allocator.free(zig_source);
+        const gen_result = try codegen.generateWithLayout(plan);
+        defer self.allocator.free(gen_result.source);
 
         // 3. JIT compile to native code
         var jit_ctx = metal0_jit.JitContext.init(self.allocator);
         defer jit_ctx.deinit();
 
-        const compiled = try jit_ctx.compileZigSource(zig_source, "fused_query");
+        const compiled = try jit_ctx.compileZigSource(gen_result.source, "fused_query");
         defer {
             var c = compiled;
             c.deinit();
         }
 
-        // 4. Prepare column data (load into contiguous arrays)
+        // 4. Load column data based on layout
         const row_count = try self.getRowCount();
+        const column_data = try self.loadColumnDataForLayout(gen_result.layout.input_columns);
+        defer self.freeCompiledColumnData(column_data);
 
-        // For now, fall back to interpreted execution
-        // Full column data preparation requires:
-        // - Building Columns struct matching generated code
-        // - Allocating output buffers
-        // - Calling compiled function via function pointer
-        // This is deferred to integration phase
-        _ = row_count;
+        // 5. Build runtime columns struct (input)
+        var columns = try RuntimeColumns.buildInput(
+            self.allocator,
+            gen_result.layout.input_columns,
+            column_data,
+            row_count,
+        );
+        defer columns.deinit();
 
-        return error.NotImplemented;
+        // 6. Allocate output buffers
+        var output = try RuntimeColumns.buildOutput(
+            self.allocator,
+            gen_result.layout.output_columns,
+            row_count,
+        );
+        defer output.deinit();
+
+        // 7. Call compiled function
+        const FusedQueryFn = *const fn (*anyopaque, *anyopaque) callconv(.C) usize;
+        const func: FusedQueryFn = @ptrCast(compiled.ptr);
+        const result_count = func(columns.asPtr(), output.asPtr());
+
+        // 8. Convert output to Result
+        return self.outputToResult(&output, result_count, stmt.columns);
+    }
+
+    /// Load column data based on layout for compiled execution
+    fn loadColumnDataForLayout(
+        self: *Self,
+        layout: []const fused_codegen.ColumnInfo,
+    ) ![]ColumnDataPtr {
+        var data = try self.allocator.alloc(ColumnDataPtr, layout.len);
+        errdefer self.allocator.free(data);
+
+        for (layout, 0..) |col, i| {
+            const col_idx = self.getPhysicalColumnIndex(col.name) orelse return error.ColumnNotFound;
+            data[i] = switch (col.col_type) {
+                .i64 => .{ .i64 = try self.tbl().readInt64Column(col_idx) },
+                .f64 => .{ .f64 = try self.tbl().readFloat64Column(col_idx) },
+                .i32 => .{ .i32 = try self.tbl().readInt32Column(col_idx) },
+                .f32 => .{ .f32 = try self.tbl().readFloat32Column(col_idx) },
+                .bool => .{ .bool_ = try self.tbl().readBoolColumn(col_idx) },
+                .string => .{ .string = try self.tbl().readStringColumn(col_idx) },
+                .timestamp_ns, .timestamp_us, .timestamp_ms, .timestamp_s => .{ .timestamp_ns = try self.tbl().readTimestampNsColumn(col_idx) },
+                .date32 => .{ .date32 = try self.tbl().readDate32Column(col_idx) },
+                .date64 => .{ .date64 = try self.tbl().readDate64Column(col_idx) },
+                else => .{ .f64 = try self.tbl().readFloat64Column(col_idx) }, // Default fallback
+            };
+        }
+        return data;
+    }
+
+    /// Free column data loaded for compiled execution
+    fn freeCompiledColumnData(self: *Self, data: []ColumnDataPtr) void {
+        for (data) |col| {
+            switch (col) {
+                .i64 => |s| self.allocator.free(s),
+                .i32 => |s| self.allocator.free(s),
+                .i16 => |s| self.allocator.free(s),
+                .i8 => |s| self.allocator.free(s),
+                .u64 => |s| self.allocator.free(s),
+                .u32 => |s| self.allocator.free(s),
+                .u16 => |s| self.allocator.free(s),
+                .u8 => |s| self.allocator.free(s),
+                .f64 => |s| self.allocator.free(s),
+                .f32 => |s| self.allocator.free(s),
+                .bool_ => |s| self.allocator.free(s),
+                .string => |s| self.allocator.free(s),
+                .timestamp_ns => |s| self.allocator.free(s),
+                .timestamp_us => |s| self.allocator.free(s),
+                .timestamp_ms => |s| self.allocator.free(s),
+                .date32 => |s| self.allocator.free(s),
+                .date64 => |s| self.allocator.free(s),
+                .empty => {},
+            }
+        }
+        self.allocator.free(data);
+    }
+
+    /// Get physical column index by name
+    fn getPhysicalColumnIndex(self: *Self, name: []const u8) ?u32 {
+        const schema = self.tbl().getSchema() catch return null;
+        for (schema.fields, 0..) |field, i| {
+            if (std.mem.eql(u8, field.name, name)) {
+                return @intCast(i);
+            }
+        }
+        return null;
+    }
+
+    /// Convert output buffers to Result
+    fn outputToResult(
+        self: *Self,
+        output: *RuntimeColumns,
+        result_count: usize,
+        select_list: []const ast.SelectItem,
+    ) !Result {
+        var columns = try self.allocator.alloc(Result.Column, select_list.len);
+        errdefer self.allocator.free(columns);
+
+        for (select_list, 0..) |item, i| {
+            const name = item.alias orelse blk: {
+                // Extract column name from expression
+                if (item.expr.* == .column) {
+                    break :blk item.expr.column.name;
+                } else if (item.expr.* == .method_call) {
+                    break :blk item.expr.method_call.method;
+                } else {
+                    break :blk "?column?";
+                }
+            };
+
+            // Copy output data up to result_count
+            if (i < output.column_data.len) {
+                columns[i] = .{
+                    .name = try self.allocator.dupe(u8, name),
+                    .data = try self.extractResultData(output.column_data[i], result_count),
+                };
+            } else {
+                // Column not in output - should not happen
+                columns[i] = .{
+                    .name = try self.allocator.dupe(u8, name),
+                    .data = .{ .float64 = &[_]f64{} },
+                };
+            }
+        }
+
+        return Result{
+            .columns = columns,
+            .row_count = result_count,
+            .allocator = self.allocator,
+        };
+    }
+
+    /// Extract result data from column data pointer
+    fn extractResultData(self: *Self, col: ColumnDataPtr, count: usize) !Result.ColumnData {
+        return switch (col) {
+            .i64 => |s| .{ .int64 = try self.allocator.dupe(i64, s[0..count]) },
+            .i32 => |s| .{ .int32 = try self.allocator.dupe(i32, s[0..count]) },
+            .f64 => |s| .{ .float64 = try self.allocator.dupe(f64, s[0..count]) },
+            .f32 => |s| .{ .float32 = try self.allocator.dupe(f32, s[0..count]) },
+            .bool_ => |s| .{ .bool_ = try self.allocator.dupe(bool, s[0..count]) },
+            .string => |s| blk: {
+                var result = try self.allocator.alloc([]const u8, count);
+                for (s[0..count], 0..) |str, i| {
+                    result[i] = try self.allocator.dupe(u8, str);
+                }
+                break :blk .{ .string = result };
+            },
+            .timestamp_ns, .timestamp_us, .timestamp_ms => |s| .{ .timestamp_ns = try self.allocator.dupe(i64, s[0..count]) },
+            .date32 => |s| .{ .date32 = try self.allocator.dupe(i32, s[0..count]) },
+            .date64 => |s| .{ .date64 = try self.allocator.dupe(i64, s[0..count]) },
+            else => .{ .float64 = &[_]f64{} },
+        };
     }
 
     /// Register a table by name for use in JOINs and multi-table queries
