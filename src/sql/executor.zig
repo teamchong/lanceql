@@ -86,7 +86,7 @@ pub const Executor = struct {
     method_results_cache: std.StringHashMap([]const f64),
 
     /// Enable compiled query execution (fused compilation)
-    compiled_execution_enabled: bool = false,
+    compiled_execution_enabled: bool = true,
 
     /// Minimum row count to trigger compilation (below this, interpretation is faster)
     compile_threshold: usize = 10_000,
@@ -213,7 +213,9 @@ pub const Executor = struct {
 
         // Check row count threshold
         if (self.table) |t| {
-            if (t.row_count >= self.compile_threshold) return true;
+            if (t.rowCount(0)) |count| {
+                if (count >= self.compile_threshold) return true;
+            } else |_| {}
         }
 
         return false;
@@ -260,7 +262,7 @@ pub const Executor = struct {
         // 2. Generate fused Zig code with layout metadata
         var codegen = fused_codegen.FusedCodeGen.init(self.allocator);
         defer codegen.deinit();
-        const gen_result = try codegen.generateWithLayout(plan);
+        const gen_result = try codegen.generateWithLayout(&plan);
         defer self.allocator.free(gen_result.source);
 
         // 3. JIT compile to native code
@@ -296,8 +298,8 @@ pub const Executor = struct {
         defer output.deinit();
 
         // 7. Call compiled function
-        const FusedQueryFn = *const fn (*anyopaque, *anyopaque) callconv(.C) usize;
-        const func: FusedQueryFn = @ptrCast(compiled.ptr);
+        const FusedQueryFn = *const fn (*anyopaque, *anyopaque) callconv(std.builtin.CallingConvention.c) usize;
+        const func: FusedQueryFn = @ptrCast(@alignCast(compiled.ptr));
         const result_count = func(columns.asPtr(), output.asPtr());
 
         // 8. Convert output to Result
@@ -321,9 +323,9 @@ pub const Executor = struct {
                 .f32 => .{ .f32 = try self.tbl().readFloat32Column(col_idx) },
                 .bool => .{ .bool_ = try self.tbl().readBoolColumn(col_idx) },
                 .string => .{ .string = try self.tbl().readStringColumn(col_idx) },
-                .timestamp_ns, .timestamp_us, .timestamp_ms, .timestamp_s => .{ .timestamp_ns = try self.tbl().readTimestampNsColumn(col_idx) },
-                .date32 => .{ .date32 = try self.tbl().readDate32Column(col_idx) },
-                .date64 => .{ .date64 = try self.tbl().readDate64Column(col_idx) },
+                .timestamp_ns, .timestamp_us, .timestamp_ms, .timestamp_s => .{ .timestamp_ns = try self.tbl().readInt64Column(col_idx) },
+                .date32 => .{ .date32 = try self.tbl().readInt32Column(col_idx) },
+                .date64 => .{ .date64 = try self.tbl().readInt64Column(col_idx) },
                 else => .{ .f64 = try self.tbl().readFloat64Column(col_idx) }, // Default fallback
             };
         }
@@ -359,7 +361,7 @@ pub const Executor = struct {
 
     /// Get physical column index by name
     fn getPhysicalColumnIndex(self: *Self, name: []const u8) ?u32 {
-        const schema = self.tbl().getSchema() catch return null;
+        const schema = self.tbl().getSchema() orelse return null;
         for (schema.fields, 0..) |field, i| {
             if (std.mem.eql(u8, field.name, name)) {
                 return @intCast(i);
@@ -381,9 +383,9 @@ pub const Executor = struct {
         for (select_list, 0..) |item, i| {
             const name = item.alias orelse blk: {
                 // Extract column name from expression
-                if (item.expr.* == .column) {
+                if (item.expr == .column) {
                     break :blk item.expr.column.name;
-                } else if (item.expr.* == .method_call) {
+                } else if (item.expr == .method_call) {
                     break :blk item.expr.method_call.method;
                 } else {
                     break :blk "?column?";
@@ -1140,6 +1142,19 @@ pub const Executor = struct {
             if (!has_typed_table) {
                 self.active_source = null;
                 self.table = original_table;
+            }
+        }
+
+        // Try compiled execution first if enabled and query qualifies
+        if (self.shouldCompile(stmt)) {
+            if (self.executeCompiled(stmt)) |result| {
+                return result;
+            } else |err| {
+                // Fall back to interpreted on compilation failure
+                switch (err) {
+                    error.NotImplemented => {}, // Expected fallback
+                    else => {}, // Log and continue with interpreted path
+                }
             }
         }
 

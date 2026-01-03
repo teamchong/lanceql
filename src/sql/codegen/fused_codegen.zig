@@ -110,22 +110,22 @@ pub const FusedCodeGen = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .code = std.ArrayList(u8).init(allocator),
+            .code = .{},
             .indent = 0,
             .input_columns = std.StringHashMap(ColumnType).init(allocator),
-            .input_column_order = std.ArrayList(ColumnInfo).init(allocator),
+            .input_column_order = .{},
             .computed_columns = std.StringHashMap([]const u8).init(allocator),
-            .computed_column_order = std.ArrayList(ColumnInfo).init(allocator),
+            .computed_column_order = .{},
             .var_counter = 0,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.code.deinit();
+        self.code.deinit(self.allocator);
         self.input_columns.deinit();
-        self.input_column_order.deinit();
+        self.input_column_order.deinit(self.allocator);
         self.computed_columns.deinit();
-        self.computed_column_order.deinit();
+        self.computed_column_order.deinit(self.allocator);
     }
 
     /// Main entry point: generate fused code from query plan
@@ -215,7 +215,7 @@ pub const FusedCodeGen = struct {
                     // Track in HashMap for fast lookup
                     self.input_columns.put(col.column, col.col_type) catch return CodeGenError.OutOfMemory;
                     // Track in order for layout
-                    self.input_column_order.append(.{
+                    self.input_column_order.append(self.allocator, .{
                         .name = col.column,
                         .col_type = col.col_type,
                         .offset = 0, // Will be calculated in buildLayout
@@ -236,7 +236,7 @@ pub const FusedCodeGen = struct {
                         // Track in HashMap for fast lookup
                         self.computed_columns.put(expr.name, body) catch return CodeGenError.OutOfMemory;
                         // Track in order for layout (computed columns default to f64)
-                        self.computed_column_order.append(.{
+                        self.computed_column_order.append(self.allocator, .{
                             .name = expr.name,
                             .col_type = .f64,
                             .offset = 0, // Will be calculated in buildLayout
@@ -621,18 +621,18 @@ pub const FusedCodeGen = struct {
     // ========================================================================
 
     fn write(self: *Self, s: []const u8) CodeGenError!void {
-        self.code.appendSlice(s) catch return CodeGenError.OutOfMemory;
+        self.code.appendSlice(self.allocator, s) catch return CodeGenError.OutOfMemory;
     }
 
     fn writeIndent(self: *Self) CodeGenError!void {
         var i: u32 = 0;
         while (i < self.indent) : (i += 1) {
-            self.code.appendSlice("    ") catch return CodeGenError.OutOfMemory;
+            self.code.appendSlice(self.allocator, "    ") catch return CodeGenError.OutOfMemory;
         }
     }
 
     fn fmt(self: *Self, comptime format: []const u8, args: anytype) CodeGenError!void {
-        const writer = self.code.writer();
+        const writer = self.code.writer(self.allocator);
         writer.print(format, args) catch return CodeGenError.OutOfMemory;
     }
 };

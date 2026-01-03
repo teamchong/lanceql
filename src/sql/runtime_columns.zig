@@ -126,7 +126,7 @@ pub const RuntimeColumns = struct {
         // Buffer size = (num columns * ptr_size) + ptr_size (for len field)
         const buffer_size = (layout.len * ptr_size) + ptr_size;
 
-        const buffer = try allocator.alignedAlloc(u8, 8, buffer_size);
+        const buffer = try allocator.alignedAlloc(u8, .@"8", buffer_size);
         @memset(buffer, 0);
 
         // Copy data array
@@ -164,7 +164,7 @@ pub const RuntimeColumns = struct {
         // Buffer size = num columns * ptr_size (no len field in OutputBuffers)
         const buffer_size = layout.len * ptr_size;
 
-        const buffer = try allocator.alignedAlloc(u8, 8, buffer_size);
+        const buffer = try allocator.alignedAlloc(u8, .@"8", buffer_size);
         @memset(buffer, 0);
 
         var column_data = try allocator.alloc(ColumnDataPtr, layout.len);

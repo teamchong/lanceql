@@ -90,7 +90,7 @@ pub const Planner = struct {
             .allocator = allocator,
             .builder = PlanBuilder.init(allocator),
             .table_sources = std.StringHashMap(TableSourceInfo).init(allocator),
-            .method_calls = std.ArrayList(MethodCallRef).init(allocator),
+            .method_calls = .{},
             .column_bindings = std.StringHashMap(ColumnRef).init(allocator),
             .arena = std.heap.ArenaAllocator.init(allocator),
         };
@@ -98,7 +98,7 @@ pub const Planner = struct {
 
     pub fn deinit(self: *Self) void {
         self.table_sources.deinit();
-        self.method_calls.deinit();
+        self.method_calls.deinit(self.allocator);
         self.column_bindings.deinit();
         self.arena.deinit();
     }
@@ -115,16 +115,16 @@ pub const Planner = struct {
         const root = try self.buildPlanTree(stmt);
 
         // 4. Collect all sources and methods
-        var sources = std.ArrayList(TableSourceInfo).init(self.allocator);
+        var sources: std.ArrayList(TableSourceInfo) = .{};
         var iter = self.table_sources.valueIterator();
         while (iter.next()) |source| {
-            sources.append(source.*) catch return PlannerError.OutOfMemory;
+            sources.append(self.allocator, source.*) catch return PlannerError.OutOfMemory;
         }
 
         // Build logic table method list
-        var methods = std.ArrayList(LogicTableMethodInfo).init(self.allocator);
+        var methods: std.ArrayList(LogicTableMethodInfo) = .{};
         for (self.method_calls.items) |mc| {
-            methods.append(.{
+            methods.append(self.allocator, .{
                 .name = mc.method,
                 .class_name = mc.object, // Will be resolved later
                 .column_deps = &.{},
@@ -134,8 +134,8 @@ pub const Planner = struct {
 
         return QueryPlan{
             .root = root,
-            .sources = sources.toOwnedSlice() catch return PlannerError.OutOfMemory,
-            .logic_table_methods = methods.toOwnedSlice() catch return PlannerError.OutOfMemory,
+            .sources = sources.toOwnedSlice(self.allocator) catch return PlannerError.OutOfMemory,
+            .logic_table_methods = methods.toOwnedSlice(self.allocator) catch return PlannerError.OutOfMemory,
             .compilable = true,
         };
     }
@@ -231,7 +231,7 @@ pub const Planner = struct {
                 // Check if object is a known logic_table alias
                 if (self.table_sources.get(mc.object)) |source| {
                     if (source.source_type == .logic_table) {
-                        self.method_calls.append(.{
+                        self.method_calls.append(self.allocator, .{
                             .object = mc.object,
                             .method = mc.method,
                             .expr = expr,
@@ -409,10 +409,10 @@ pub const Planner = struct {
         _ = stmt;
         const aa = self.arena.allocator();
 
-        var compute_exprs = std.ArrayList(ComputeExpr).init(aa);
+        var compute_exprs: std.ArrayList(ComputeExpr) = .{};
 
         for (self.method_calls.items) |mc| {
-            compute_exprs.append(.{
+            compute_exprs.append(aa, .{
                 .name = mc.method,
                 .expr = mc.expr,
                 .deps = &.{}, // Will be resolved
@@ -427,7 +427,7 @@ pub const Planner = struct {
         node.* = .{
             .compute = .{
                 .input = input,
-                .expressions = compute_exprs.toOwnedSlice() catch return PlannerError.OutOfMemory,
+                .expressions = compute_exprs.toOwnedSlice(aa) catch return PlannerError.OutOfMemory,
                 .output_columns = input.getOutputColumns(),
             },
         };
@@ -470,13 +470,13 @@ pub const Planner = struct {
     fn buildGroupByNode(self: *Self, input: *const PlanNode, stmt: *const ast.SelectStmt) PlannerError!*const PlanNode {
         const aa = self.arena.allocator();
 
-        var group_keys = std.ArrayList(ColumnRef).init(aa);
-        var aggregates = std.ArrayList(AggregateSpec).init(aa);
+        var group_keys: std.ArrayList(ColumnRef) = .{};
+        var aggregates: std.ArrayList(AggregateSpec) = .{};
 
         // Extract group by columns
         if (stmt.group_by) |group_by| {
             for (group_by.columns) |col| {
-                group_keys.append(.{
+                group_keys.append(aa, .{
                     .table = null,
                     .column = col,
                 }) catch return PlannerError.OutOfMemory;
@@ -487,7 +487,7 @@ pub const Planner = struct {
         for (stmt.columns) |col| {
             if (self.isAggregate(&col.expr)) {
                 const agg = try self.extractAggregate(&col.expr, col.alias);
-                aggregates.append(agg) catch return PlannerError.OutOfMemory;
+                aggregates.append(aa, agg) catch return PlannerError.OutOfMemory;
             }
         }
 
@@ -495,8 +495,8 @@ pub const Planner = struct {
         node.* = .{
             .group_by = .{
                 .input = input,
-                .group_keys = group_keys.toOwnedSlice() catch return PlannerError.OutOfMemory,
-                .aggregates = aggregates.toOwnedSlice() catch return PlannerError.OutOfMemory,
+                .group_keys = group_keys.toOwnedSlice(aa) catch return PlannerError.OutOfMemory,
+                .aggregates = aggregates.toOwnedSlice(aa) catch return PlannerError.OutOfMemory,
                 .having = if (stmt.group_by) |gb| if (gb.having) |*h| h else null else null,
                 .output_columns = &.{},
             },
@@ -575,7 +575,7 @@ pub const Planner = struct {
     fn buildProjectNode(self: *Self, input: *const PlanNode, columns: []const ast.SelectItem, aa: std.mem.Allocator) PlannerError!*const PlanNode {
         _ = self;
 
-        var output_cols = std.ArrayList(ColumnRef).init(aa);
+        var output_cols: std.ArrayList(ColumnRef) = .{};
 
         for (columns) |col| {
             const col_ref = switch (col.expr) {
@@ -596,14 +596,14 @@ pub const Planner = struct {
                     .column = col.alias orelse "expr",
                 },
             };
-            output_cols.append(col_ref) catch return PlannerError.OutOfMemory;
+            output_cols.append(aa, col_ref) catch return PlannerError.OutOfMemory;
         }
 
         const node = aa.create(PlanNode) catch return PlannerError.OutOfMemory;
         node.* = .{
             .project = .{
                 .input = input,
-                .output_columns = output_cols.toOwnedSlice() catch return PlannerError.OutOfMemory,
+                .output_columns = output_cols.toOwnedSlice(aa) catch return PlannerError.OutOfMemory,
             },
         };
         return node;
@@ -613,9 +613,9 @@ pub const Planner = struct {
     fn buildSortNode(self: *Self, input: *const PlanNode, order_by: []const ast.OrderBy) PlannerError!*const PlanNode {
         const aa = self.arena.allocator();
 
-        var specs = std.ArrayList(OrderBySpec).init(aa);
+        var specs: std.ArrayList(OrderBySpec) = .{};
         for (order_by) |ob| {
-            specs.append(.{
+            specs.append(aa, .{
                 .column = .{ .table = null, .column = ob.column },
                 .direction = ob.direction,
             }) catch return PlannerError.OutOfMemory;
@@ -625,7 +625,7 @@ pub const Planner = struct {
         node.* = .{
             .sort = .{
                 .input = input,
-                .order_by = specs.toOwnedSlice() catch return PlannerError.OutOfMemory,
+                .order_by = specs.toOwnedSlice(aa) catch return PlannerError.OutOfMemory,
             },
         };
         return node;
