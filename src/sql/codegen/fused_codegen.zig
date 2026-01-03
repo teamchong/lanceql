@@ -2116,7 +2116,7 @@ pub const FusedCodeGen = struct {
         try self.writeIndent();
         try self.write("// Phase 1: Group keys and aggregate accumulators\n");
         try self.writeIndent();
-        try self.write("const max_groups: usize = 4096;\n");
+        try self.write("const max_groups: usize = 65536;\n");
         try self.writeIndent();
         try self.write("var num_groups: usize = 0;\n\n");
 
