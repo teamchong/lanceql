@@ -72,6 +72,13 @@ pub const ColumnLayout = struct {
     columns_size: usize,
     /// Total size of OutputBuffers struct
     output_size: usize,
+    /// Allocator used to create the slices
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *ColumnLayout) void {
+        self.allocator.free(self.input_columns);
+        self.allocator.free(self.output_columns);
+    }
 };
 
 /// Result of generateWithLayout
@@ -105,6 +112,9 @@ pub const FusedCodeGen = struct {
     /// Counter for unique variable names
     var_counter: u32,
 
+    /// Analyzed plan (stored for generateCode)
+    analyzed_plan: ?*const QueryPlan,
+
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator) Self {
@@ -117,6 +127,7 @@ pub const FusedCodeGen = struct {
             .computed_columns = std.StringHashMap([]const u8).init(allocator),
             .computed_column_order = .{},
             .var_counter = 0,
+            .analyzed_plan = null,
         };
     }
 
@@ -128,10 +139,15 @@ pub const FusedCodeGen = struct {
         self.computed_column_order.deinit(self.allocator);
     }
 
-    /// Main entry point: generate fused code from query plan
-    pub fn generate(self: *Self, plan: *const QueryPlan) CodeGenError![]const u8 {
-        // Analyze plan to collect column info
+    /// Analyze plan to collect column info (call before updateColumnTypes)
+    pub fn analyze(self: *Self, plan: *const QueryPlan) CodeGenError!void {
         try self.analyzePlan(plan.root);
+        self.analyzed_plan = plan;
+    }
+
+    /// Generate code after analysis (and optional updateColumnTypes)
+    pub fn generateCode(self: *Self) CodeGenError![]const u8 {
+        const plan = self.analyzed_plan orelse return CodeGenError.InvalidPlan;
 
         // Generate code
         try self.genHeader();
@@ -142,12 +158,69 @@ pub const FusedCodeGen = struct {
         return self.code.items;
     }
 
+    /// Main entry point: generate fused code from query plan
+    /// (For backwards compatibility - use analyze + updateColumnTypes + generateCode for type resolution)
+    pub fn generate(self: *Self, plan: *const QueryPlan) CodeGenError![]const u8 {
+        // Analyze plan to collect column info
+        try self.analyze(plan);
+        // Generate code
+        return self.generateCode();
+    }
+
+    /// Update column types based on type map
+    /// Call this after analyze but before generateCode if column types are unknown
+    pub fn updateColumnTypes(self: *Self, type_map: *const std.StringHashMap(ColumnType)) void {
+        // Update input_columns HashMap
+        var iter = self.input_columns.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.* == .unknown) {
+                if (type_map.get(entry.key_ptr.*)) |actual_type| {
+                    entry.value_ptr.* = actual_type;
+                }
+            }
+        }
+
+        // Update input_column_order ArrayList
+        for (self.input_column_order.items) |*col| {
+            if (col.col_type == .unknown) {
+                if (type_map.get(col.name)) |actual_type| {
+                    col.col_type = actual_type;
+                }
+            }
+        }
+    }
+
     /// Generate fused code with layout metadata for runtime struct building
     pub fn generateWithLayout(self: *Self, plan: *const QueryPlan) CodeGenError!GenerateResult {
         // Generate the source code first
         const source = try self.generate(plan);
 
         // Build layout from collected column info
+        const layout = try self.buildLayout();
+
+        return GenerateResult{
+            .source = source,
+            .layout = layout,
+        };
+    }
+
+    /// Generate fused code with type resolution from schema
+    /// This is the preferred method when column types need to be resolved from table schema
+    pub fn generateWithLayoutAndTypes(
+        self: *Self,
+        plan: *const QueryPlan,
+        type_map: *const std.StringHashMap(ColumnType),
+    ) CodeGenError!GenerateResult {
+        // Step 1: Analyze to collect column info
+        try self.analyze(plan);
+
+        // Step 2: Resolve unknown types from schema
+        self.updateColumnTypes(type_map);
+
+        // Step 3: Generate code with resolved types
+        const source = try self.generateCode();
+
+        // Step 4: Build layout
         const layout = try self.buildLayout();
 
         return GenerateResult{
@@ -204,6 +277,7 @@ pub const FusedCodeGen = struct {
             .output_columns = output_cols,
             .columns_size = columns_size,
             .output_size = output_size,
+            .allocator = self.allocator,
         };
     }
 
@@ -270,6 +344,12 @@ pub const FusedCodeGen = struct {
                 // Add to input columns if not already present
                 if (!self.input_columns.contains(col.name)) {
                     self.input_columns.put(col.name, .unknown) catch return CodeGenError.OutOfMemory;
+                    // Also add to order list for layout building
+                    self.input_column_order.append(self.allocator, .{
+                        .name = col.name,
+                        .col_type = .unknown,
+                        .offset = 0,
+                    }) catch return CodeGenError.OutOfMemory;
                 }
             },
             .binary => |bin| {
@@ -462,11 +542,9 @@ pub const FusedCodeGen = struct {
                 // Process input
                 try self.genPlanNodeBody(limit.input);
             },
-            else => {
-                // For unsupported nodes, just process input if available
-                if (node.getInput()) |input| {
-                    try self.genPlanNodeBody(input);
-                }
+            .group_by, .sort, .window, .hash_join => {
+                // These nodes require interpreted execution
+                return CodeGenError.UnsupportedPlanNode;
             },
         }
     }

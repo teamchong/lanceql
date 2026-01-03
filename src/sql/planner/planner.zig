@@ -68,9 +68,6 @@ const MethodCallRef = struct {
 pub const Planner = struct {
     allocator: std.mem.Allocator,
 
-    /// Plan builder helper
-    builder: PlanBuilder,
-
     /// Table alias -> source mapping
     table_sources: std.StringHashMap(TableSourceInfo),
 
@@ -83,12 +80,17 @@ pub const Planner = struct {
     /// Arena for plan node allocations
     arena: std.heap.ArenaAllocator,
 
+    /// Plan sources slice (for cleanup)
+    plan_sources: ?[]const TableSourceInfo = null,
+
+    /// Plan methods slice (for cleanup)
+    plan_methods: ?[]const LogicTableMethodInfo = null,
+
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .builder = PlanBuilder.init(allocator),
             .table_sources = std.StringHashMap(TableSourceInfo).init(allocator),
             .method_calls = .{},
             .column_bindings = std.StringHashMap(ColumnRef).init(allocator),
@@ -97,6 +99,10 @@ pub const Planner = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Free plan slices if allocated
+        if (self.plan_sources) |s| self.allocator.free(s);
+        if (self.plan_methods) |m| self.allocator.free(m);
+
         self.table_sources.deinit();
         self.method_calls.deinit(self.allocator);
         self.column_bindings.deinit();
@@ -132,11 +138,22 @@ pub const Planner = struct {
             }) catch return PlannerError.OutOfMemory;
         }
 
+        // GROUP BY queries require interpreted execution (aggregation not yet compiled)
+        const has_group_by = stmt.group_by != null;
+
+        // Convert to owned slices and free the ArrayList buffers
+        const sources_slice = sources.toOwnedSlice(self.allocator) catch return PlannerError.OutOfMemory;
+        const methods_slice = methods.toOwnedSlice(self.allocator) catch return PlannerError.OutOfMemory;
+
+        // Store slices for cleanup in deinit
+        self.plan_sources = sources_slice;
+        self.plan_methods = methods_slice;
+
         return QueryPlan{
             .root = root,
-            .sources = sources.toOwnedSlice(self.allocator) catch return PlannerError.OutOfMemory,
-            .logic_table_methods = methods.toOwnedSlice(self.allocator) catch return PlannerError.OutOfMemory,
-            .compilable = true,
+            .sources = sources_slice,
+            .logic_table_methods = methods_slice,
+            .compilable = !has_group_by,
         };
     }
 

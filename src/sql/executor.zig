@@ -30,6 +30,7 @@ pub const group_eval = @import("group_eval.zig");
 
 // Fused query compilation (optional)
 pub const planner = @import("planner/planner.zig");
+pub const plan_nodes = @import("planner/plan_nodes.zig");
 pub const fused_codegen = @import("codegen/fused_codegen.zig");
 const metal0_jit = @import("lanceql.codegen");
 const runtime_columns = @import("runtime_columns.zig");
@@ -259,13 +260,18 @@ pub const Executor = struct {
         // Check if plan is compilable (has inlined bodies, no unsupported ops)
         if (!plan.compilable) return error.NotImplemented;
 
-        // 2. Generate fused Zig code with layout metadata
+        // 2. Build type map from table schema for type resolution
+        var type_map = self.buildSchemaTypeMap() catch return error.NoSchema;
+        defer type_map.deinit();
+
+        // 3. Generate fused Zig code with layout metadata and resolved types
         var codegen = fused_codegen.FusedCodeGen.init(self.allocator);
         defer codegen.deinit(); // This handles freeing the generated source code
-        const gen_result = try codegen.generateWithLayout(&plan);
+        var gen_result = try codegen.generateWithLayoutAndTypes(&plan, &type_map);
+        defer gen_result.layout.deinit(); // Free the layout slices
         // Note: gen_result.source is owned by codegen and freed in deinit()
 
-        // 3. JIT compile to native code
+        // 4. JIT compile to native code
         var jit_ctx = metal0_jit.JitContext.init(self.allocator);
         defer jit_ctx.deinit(); // This handles cleanup of compiled functions
 
@@ -312,6 +318,7 @@ pub const Executor = struct {
 
         for (layout, 0..) |col, i| {
             const col_idx = self.getPhysicalColumnIndex(col.name) orelse return error.ColumnNotFound;
+            // Types should already be resolved by generateWithLayoutAndTypes
             data[i] = switch (col.col_type) {
                 .i64 => .{ .i64 = try self.tbl().readInt64Column(col_idx) },
                 .f64 => .{ .f64 = try self.tbl().readFloat64Column(col_idx) },
@@ -370,6 +377,35 @@ pub const Executor = struct {
         return null;
     }
 
+    /// Build a type map from the table schema
+    fn buildSchemaTypeMap(self: *Self) !std.StringHashMap(plan_nodes.ColumnType) {
+        const schema = self.tbl().getSchema() orelse return error.NoSchema;
+        var type_map = std.StringHashMap(plan_nodes.ColumnType).init(self.allocator);
+        errdefer type_map.deinit();
+
+        for (schema.fields) |field| {
+            const lance_type = LanceColumnType.fromLogicalType(field.logical_type);
+            // Map LanceColumnType to plan_nodes.ColumnType
+            const col_type: plan_nodes.ColumnType = switch (lance_type) {
+                .int64 => .i64,
+                .int32 => .i32,
+                .float64 => .f64,
+                .float32 => .f32,
+                .string => .string,
+                .bool_ => .bool,
+                .timestamp_ns => .timestamp_ns,
+                .timestamp_us => .timestamp_us,
+                .timestamp_ms => .timestamp_ms,
+                .timestamp_s => .timestamp_s,
+                .date32 => .date32,
+                .date64 => .date64,
+                .unsupported => .unknown,
+            };
+            try type_map.put(field.name, col_type);
+        }
+        return type_map;
+    }
+
     /// Convert output buffers to Result
     fn outputToResult(
         self: *Self,
@@ -395,13 +431,13 @@ pub const Executor = struct {
             // Copy output data up to result_count
             if (i < output.column_data.len) {
                 columns[i] = .{
-                    .name = try self.allocator.dupe(u8, name),
+                    .name = name, // Name comes from AST, no need to dupe
                     .data = try self.extractResultData(output.column_data[i], result_count),
                 };
             } else {
                 // Column not in output - should not happen
                 columns[i] = .{
-                    .name = try self.allocator.dupe(u8, name),
+                    .name = name, // Name comes from AST, no need to dupe
                     .data = .{ .float64 = &[_]f64{} },
                 };
             }
