@@ -40,7 +40,8 @@
     "build:js": "node esbuild.config.js",
     "build:legacy": "node scripts/build.js",
     "dev": "node esbuild.config.js --watch",
-    "test": "node --test test/*.test.js",
+    "test": "npx playwright test",
+    "test:e2e": "npx playwright test",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
