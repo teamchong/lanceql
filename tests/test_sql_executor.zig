@@ -15,10 +15,10 @@ const Value = ast.Value;
 // Test Fixtures
 // ============================================================================
 
-const int64_fixture = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
-const float64_fixture = @embedFile("fixtures/simple_float64.lance/data/101000000010001000111010eda0664313bd731181abf5bde4.lance");
-const mixed_fixture = @embedFile("fixtures/mixed_types.lance/data/11100100001000010010010060d60b4085bd08dcf790581192.lance");
-const sqlite_fixture = @embedFile("fixtures/better-sqlite3/simple.lance/data/1010001110011001100010108ba1604433ac0cda4c27f6809f.lance");
+const int64_fixture = @embedFile("fixtures/simple_int64.lance/data/001110111111001100101010e79bea45fd969c9e1da619850b.lance");
+const float64_fixture = @embedFile("fixtures/simple_float64.lance/data/111100011001011101011011e9643e40abbeac7897d4a95cc3.lance");
+const mixed_fixture = @embedFile("fixtures/mixed_types.lance/data/110101110101011000001010a45f35499b9af0396c9ed741b0.lance");
+const sqlite_fixture = @embedFile("fixtures/mixed_types.lance/data/110101110101011000001010a45f35499b9af0396c9ed741b0.lance");
 
 // ============================================================================
 // Test Context Helper
@@ -176,18 +176,18 @@ test "execute SELECT with mixed types" {
     try std.testing.expect(result.columns[2].data == .string);
 }
 
-test "execute SELECT * on better-sqlite3 fixture" {
+test "execute SELECT * on mixed_types fixture" {
     const allocator = std.testing.allocator;
 
-    // Read the better-sqlite3 simple fixture (has 'a' string and 'b' int64)
-    const data = @embedFile("fixtures/better-sqlite3/simple.lance/data/1010001110011001100010108ba1604433ac0cda4c27f6809f.lance");
+    // Read the mixed_types fixture (has 'id' int64, 'value' float64, 'name' string)
+    const data = @embedFile("fixtures/mixed_types.lance/data/110101110101011000001010a45f35499b9af0396c9ed741b0.lance");
 
     var table = try Table.init(allocator, data);
     defer table.deinit();
 
     // Verify schema
     const schema = table.schema orelse return error.NoSchema;
-    try std.testing.expectEqual(@as(usize, 2), schema.fields.len);
+    try std.testing.expectEqual(@as(usize, 3), schema.fields.len);
 
     // Parse SQL
     const sql = "SELECT * FROM table";
@@ -200,48 +200,30 @@ test "execute SELECT * on better-sqlite3 fixture" {
     var result = try executor.execute(&stmt.select, &[_]Value{});
     defer result.deinit();
 
-    // Debug output
-    std.debug.print("\nbetter-sqlite3 SELECT * result:\n", .{});
-    std.debug.print("  columns.len = {d}\n", .{result.columns.len});
-    std.debug.print("  row_count = {d}\n", .{result.row_count});
-    for (result.columns, 0..) |col, i| {
-        std.debug.print("  column[{d}]: name='{s}', type={s}\n", .{
-            i,
-            col.name,
-            switch (col.data) {
-                .int64 => "int64",
-                .int32 => "int32",
-                .float64 => "float64",
-                .float32 => "float32",
-                .bool_ => "bool",
-                .string => "string",
-                .timestamp_s => "timestamp_s",
-                .timestamp_ms => "timestamp_ms",
-                .timestamp_us => "timestamp_us",
-                .timestamp_ns => "timestamp_ns",
-                .date32 => "date32",
-                .date64 => "date64",
-            },
-        });
-    }
+    // Verify results - should have 3 columns
+    try std.testing.expectEqual(@as(usize, 3), result.columns.len);
+    try std.testing.expectEqual(@as(usize, 3), result.row_count);
 
-    // Verify results - should have 2 columns
-    try std.testing.expectEqual(@as(usize, 2), result.columns.len);
-    try std.testing.expectEqual(@as(usize, 10), result.row_count);
-
-    // Check column types (a is string, b is int64)
-    try std.testing.expect(result.columns[0].data == .string);
-    try std.testing.expect(result.columns[1].data == .int64);
-
-    // Check string values
-    const strings = result.columns[0].data.string;
-    try std.testing.expectEqualStrings("foo", strings[0]);
-    try std.testing.expectEqualStrings("bar", strings[1]);
+    // Check column types (id is int64, value is float64, name is string)
+    try std.testing.expect(result.columns[0].data == .int64);
+    try std.testing.expect(result.columns[1].data == .float64);
+    try std.testing.expect(result.columns[2].data == .string);
 
     // Check int values
-    const ints = result.columns[1].data.int64;
+    const ints = result.columns[0].data.int64;
     try std.testing.expectEqual(@as(i64, 1), ints[0]);
     try std.testing.expectEqual(@as(i64, 2), ints[1]);
+    try std.testing.expectEqual(@as(i64, 3), ints[2]);
+
+    // Check float values
+    const floats = result.columns[1].data.float64;
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), floats[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.5), floats[1], 0.001);
+
+    // Check string values
+    const strings = result.columns[2].data.string;
+    try std.testing.expectEqualStrings("alice", strings[0]);
+    try std.testing.expectEqualStrings("bob", strings[1]);
 }
 
 // ============================================================================
@@ -360,10 +342,10 @@ test "execute SELECT with GROUP BY" {
     try ctx.init(std.testing.allocator, sqlite_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT a, COUNT(*) FROM table GROUP BY a");
+    const result = try ctx.exec("SELECT name, COUNT(*) FROM table GROUP BY name");
 
     try std.testing.expectEqual(@as(usize, 2), result.columns.len);
-    try std.testing.expectEqual(@as(usize, 10), result.row_count);
+    try std.testing.expectEqual(@as(usize, 3), result.row_count);
     try std.testing.expect(result.columns[0].data == .string);
     try std.testing.expect(result.columns[1].data == .int64);
 
@@ -378,19 +360,19 @@ test "execute SELECT with GROUP BY and SUM" {
     try ctx.init(std.testing.allocator, sqlite_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT a, SUM(b) FROM table GROUP BY a");
+    const result = try ctx.exec("SELECT name, SUM(id) FROM table GROUP BY name");
 
     try std.testing.expectEqual(@as(usize, 2), result.columns.len);
-    try std.testing.expectEqual(@as(usize, 10), result.row_count);
+    try std.testing.expectEqual(@as(usize, 3), result.row_count);
     try std.testing.expect(result.columns[0].data == .string);
     try std.testing.expect(result.columns[1].data == .int64);
 
-    // Verify total sum of all SUM(b) values equals 1+2+3+...+10 = 55
+    // Verify total sum of all SUM(id) values equals 1+2+3 = 6
     var total: i64 = 0;
     for (result.columns[1].data.int64) |s| {
         total += s;
     }
-    try std.testing.expectEqual(@as(i64, 55), total);
+    try std.testing.expectEqual(@as(i64, 6), total);
 }
 
 // ============================================================================
@@ -498,16 +480,16 @@ test "execute SELECT with UPPER function" {
     try ctx.init(std.testing.allocator, sqlite_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT UPPER(a) AS upper_name FROM table LIMIT 3");
+    const result = try ctx.exec("SELECT UPPER(name) AS upper_name FROM table LIMIT 3");
 
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 3), result.row_count);
 
     try std.testing.expect(result.columns[0].data == .string);
     const values = result.columns[0].data.string;
-    try std.testing.expectEqualStrings("FOO", values[0]);
-    try std.testing.expectEqualStrings("BAR", values[1]);
-    try std.testing.expectEqualStrings("BAZ", values[2]);
+    try std.testing.expectEqualStrings("ALICE", values[0]);
+    try std.testing.expectEqualStrings("BOB", values[1]);
+    try std.testing.expectEqualStrings("CHARLIE", values[2]);
 }
 
 test "execute SELECT with LENGTH function" {
@@ -515,20 +497,20 @@ test "execute SELECT with LENGTH function" {
     try ctx.init(std.testing.allocator, sqlite_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT a, LENGTH(a) AS len FROM table LIMIT 3");
+    const result = try ctx.exec("SELECT name, LENGTH(name) AS len FROM table LIMIT 3");
 
     try std.testing.expectEqual(@as(usize, 2), result.columns.len);
     try std.testing.expectEqual(@as(usize, 3), result.row_count);
 
-    // First column is 'a' (string)
+    // First column is 'name' (string)
     try std.testing.expect(result.columns[0].data == .string);
 
     // Second column is 'len' (int64 from LENGTH)
     try std.testing.expect(result.columns[1].data == .int64);
     const lengths = result.columns[1].data.int64;
-    try std.testing.expectEqual(@as(i64, 3), lengths[0]); // "foo" = 3
-    try std.testing.expectEqual(@as(i64, 3), lengths[1]); // "bar" = 3
-    try std.testing.expectEqual(@as(i64, 3), lengths[2]); // "baz" = 3
+    try std.testing.expectEqual(@as(i64, 5), lengths[0]); // "alice" = 5
+    try std.testing.expectEqual(@as(i64, 3), lengths[1]); // "bob" = 3
+    try std.testing.expectEqual(@as(i64, 7), lengths[2]); // "charlie" = 7
 }
 
 test "execute SELECT with ABS function" {
@@ -557,16 +539,16 @@ test "execute SELECT with string concatenation" {
     try ctx.init(std.testing.allocator, sqlite_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT a || '_suffix' AS with_suffix FROM table LIMIT 3");
+    const result = try ctx.exec("SELECT name || '_suffix' AS with_suffix FROM table LIMIT 3");
 
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 3), result.row_count);
 
     try std.testing.expect(result.columns[0].data == .string);
     const values = result.columns[0].data.string;
-    try std.testing.expectEqualStrings("foo_suffix", values[0]);
-    try std.testing.expectEqualStrings("bar_suffix", values[1]);
-    try std.testing.expectEqualStrings("baz_suffix", values[2]);
+    try std.testing.expectEqualStrings("alice_suffix", values[0]);
+    try std.testing.expectEqualStrings("bob_suffix", values[1]);
+    try std.testing.expectEqualStrings("charlie_suffix", values[2]);
 }
 
 // ============================================================================
@@ -577,7 +559,7 @@ test "execute SELECT with single integer parameter" {
     const allocator = std.testing.allocator;
 
     // Open test Lance file (id column: 1, 2, 3, 4, 5)
-    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/001110111111001100101010e79bea45fd969c9e1da619850b.lance");
     var table = try Table.init(allocator, lance_data);
     defer table.deinit();
 
@@ -606,7 +588,7 @@ test "execute SELECT with multiple integer parameters" {
     const allocator = std.testing.allocator;
 
     // Open test Lance file (id column: 1, 2, 3, 4, 5)
-    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/001110111111001100101010e79bea45fd969c9e1da619850b.lance");
     var table = try Table.init(allocator, lance_data);
     defer table.deinit();
 
@@ -636,7 +618,7 @@ test "execute SELECT with float parameter" {
     const allocator = std.testing.allocator;
 
     // Open test Lance file with float64 (value: 1.5, 2.5, 3.5, 4.5, 5.5)
-    const lance_data = @embedFile("fixtures/simple_float64.lance/data/101000000010001000111010eda0664313bd731181abf5bde4.lance");
+    const lance_data = @embedFile("fixtures/simple_float64.lance/data/111100011001011101011011e9643e40abbeac7897d4a95cc3.lance");
     var table = try Table.init(allocator, lance_data);
     defer table.deinit();
 
@@ -666,26 +648,26 @@ test "execute SELECT with float parameter" {
 test "execute SELECT with string parameter" {
     const allocator = std.testing.allocator;
 
-    // Use better-sqlite3 fixture: a is strings, b=[1..10]
-    const data = @embedFile("fixtures/better-sqlite3/simple.lance/data/1010001110011001100010108ba1604433ac0cda4c27f6809f.lance");
+    // Use mixed_types fixture: id=[1,2,3], value=[1.5,2.5,3.5], name=["alice","bob","charlie"]
+    const data = @embedFile("fixtures/mixed_types.lance/data/110101110101011000001010a45f35499b9af0396c9ed741b0.lance");
 
     var table = try Table.init(allocator, data);
     defer table.deinit();
 
-    // Parse SQL: SELECT b FROM table WHERE a = ?
-    const sql = "SELECT b FROM table WHERE a = ?";
+    // Parse SQL: SELECT id FROM table WHERE name = ?
+    const sql = "SELECT id FROM table WHERE name = ?";
     var stmt = try parser.parseSQL(sql, allocator);
     defer ast.deinitSelectStmt(&stmt.select, allocator);
 
-    // Execute with parameter ['foo'] - should match the first row where a='foo'
+    // Execute with parameter ['alice'] - should match the first row where name='alice'
     var executor = Executor.init(&table, allocator);
     defer executor.deinit();
 
-    const params = [_]Value{Value{ .string = "foo" }};
+    const params = [_]Value{Value{ .string = "alice" }};
     var result = try executor.execute(&stmt.select, &params);
     defer result.deinit();
 
-    // Verify results - should have 1 row where a='foo' (first row, b=1)
+    // Verify results - should have 1 row where name='alice' (first row, id=1)
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 1), result.row_count);
 
@@ -697,7 +679,7 @@ test "parameter out of bounds returns error" {
     const allocator = std.testing.allocator;
 
     // Open test Lance file
-    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/001110111111001100101010e79bea45fd969c9e1da619850b.lance");
     var table = try Table.init(allocator, lance_data);
     defer table.deinit();
 
@@ -793,14 +775,14 @@ test "execute SELECT DISTINCT on strings" {
     try ctx.init(std.testing.allocator, sqlite_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT DISTINCT a FROM table");
+    const result = try ctx.exec("SELECT DISTINCT name FROM table");
 
     // Verify results - should have unique string values
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expect(result.columns[0].data == .string);
 
-    // The fixture has strings like "foo", "bar", "baz", etc.
-    try std.testing.expect(result.row_count > 0);
+    // The mixed_types fixture has 3 unique names: alice, bob, charlie
+    try std.testing.expectEqual(@as(usize, 3), result.row_count);
 }
 
 // =============================================================================
@@ -811,7 +793,7 @@ test "executor registerLogicTableAlias" {
     const allocator = std.testing.allocator;
 
     // Open test Lance file
-    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/001110111111001100101010e79bea45fd969c9e1da619850b.lance");
     var table = try Table.init(allocator, lance_data);
     defer table.deinit();
 
@@ -831,7 +813,7 @@ test "executor registerLogicTableAlias rejects duplicates" {
     const allocator = std.testing.allocator;
 
     // Open test Lance file
-    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/001110111111001100101010e79bea45fd969c9e1da619850b.lance");
     var table = try Table.init(allocator, lance_data);
     defer table.deinit();
 
@@ -1077,7 +1059,7 @@ test "execute INNER JOIN (self-join)" {
     const allocator = std.testing.allocator;
 
     // Use the same Lance file twice (self-join)
-    const lance_data = @embedFile("fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance");
+    const lance_data = @embedFile("fixtures/simple_int64.lance/data/001110111111001100101010e79bea45fd969c9e1da619850b.lance");
     var table1 = try Table.init(allocator, lance_data);
     defer table1.deinit();
     var table2 = try Table.init(allocator, lance_data);

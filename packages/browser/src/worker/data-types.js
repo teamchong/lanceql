@@ -210,6 +210,51 @@ export class LanceFileWriter {
         return new Uint8Array(buffer);
     }
 
+    /**
+     * Set columnar data directly (no row conversion needed)
+     * @param {Object} columnarData - { colName: Array }
+     */
+    setColumnarData(columnarData) {
+        const firstCol = Object.keys(columnarData)[0];
+        this.rowCount = columnarData[firstCol]?.length || 0;
+
+        for (const col of this.schema) {
+            const arr = columnarData[col.name];
+            if (!arr) continue;
+
+            const TypedArray = getTypedArrayForType(col.dataType);
+            if (TypedArray && TypedArray !== BigInt64Array && ArrayBuffer.isView(arr)) {
+                // Already a typed array - use directly
+                this.columns.set(col.name, {
+                    type: 'typed',
+                    dataType: col.dataType,
+                    data: arr,
+                    length: arr.length
+                });
+            } else if (TypedArray && TypedArray !== BigInt64Array) {
+                // Convert plain array to typed array
+                const typedArr = new TypedArray(arr.length);
+                for (let i = 0; i < arr.length; i++) {
+                    typedArr[i] = arr[i] ?? 0;
+                }
+                this.columns.set(col.name, {
+                    type: 'typed',
+                    dataType: col.dataType,
+                    data: typedArr,
+                    length: arr.length
+                });
+            } else {
+                // Plain array for strings and bigints
+                this.columns.set(col.name, {
+                    type: 'array',
+                    dataType: col.dataType,
+                    data: Array.isArray(arr) ? arr : Array.from(arr),
+                    length: arr.length
+                });
+            }
+        }
+    }
+
     build() {
         if (this._useBinary && this.rowCount > 0) {
             try {

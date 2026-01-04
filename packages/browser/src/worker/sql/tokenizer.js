@@ -208,6 +208,11 @@ export class SQLLexer {
             this.pos++;
         }
 
+        // Check if string was properly closed
+        if (this.pos >= this.sql.length) {
+            throw new Error(`Unclosed string literal starting at position ${this.pos - value.length - 1}`);
+        }
+
         this.pos++; // Skip closing quote
         return { type: TokenType.STRING, value };
     }

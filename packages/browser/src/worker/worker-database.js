@@ -125,8 +125,8 @@ export class WorkerDatabase {
                 __schema: table.schema
             };
             for (const c of table.schema) {
-                const type = c.dataType || c.type;
-                if (type === 'text' || type === 'string') {
+                const type = (c.dataType || c.type || '').toLowerCase();
+                if (type === 'text' || type === 'string' || type === 'varchar') {
                     cols[c.name] = new Array(initialCapacity);
                 } else {
                     cols[c.name] = new Float64Array(initialCapacity);
@@ -166,7 +166,8 @@ export class WorkerDatabase {
             colBuf.__rowId[len + i] = table.nextRowId++;
             for (const c of table.schema) {
                 const val = row[c.name];
-                colBuf[c.name][len + i] = val ?? (colBuf[c.name] instanceof Float64Array ? 0 : null);
+                // Use NaN to represent null in numeric typed arrays
+                colBuf[c.name][len + i] = val ?? (colBuf[c.name] instanceof Float64Array ? NaN : null);
             }
         }
         colBuf.__length = len + n;
@@ -258,14 +259,27 @@ export class WorkerDatabase {
         const table = this.tables.get(tableName);
         let deletedCount = 0;
 
-        // Delete from buffer
-        const buffer = this._writeBuffer.get(tableName);
-        if (buffer && buffer.length > 0) {
-            const originalLen = buffer.length;
-            const remaining = buffer.filter(row => !predicateFn(row));
-            buffer.length = 0;
-            buffer.push(...remaining);
-            deletedCount += (originalLen - remaining.length);
+        // Delete from columnar buffer (mark rows for deletion)
+        const colBuf = this._columnarBuffer.get(tableName);
+        const bufLen = colBuf?.__length || 0;
+        if (colBuf && bufLen > 0) {
+            const colNames = table.schema.map(c => c.name);
+            for (let i = 0; i < bufLen; i++) {
+                // Build row object for predicate evaluation
+                const row = { __rowId: colBuf.__rowId[i] };
+                for (const name of colNames) {
+                    const v = colBuf[name][i];
+                    row[name] = Number.isNaN(v) ? null : v;
+                }
+
+                if (predicateFn(row)) {
+                    // Mark row as deleted by adding to deletion vector
+                    if (!table.deletionVector.includes(colBuf.__rowId[i])) {
+                        table.deletionVector.push(colBuf.__rowId[i]);
+                        deletedCount++;
+                    }
+                }
+            }
         }
 
         // Delete from persisted fragments
@@ -344,13 +358,26 @@ export class WorkerDatabase {
         const table = this.tables.get(tableName);
         let updatedCount = 0;
 
-        // Update buffered rows
-        const buffer = this._writeBuffer.get(tableName);
-        if (buffer && buffer.length > 0) {
-            for (const row of buffer) {
+        // Update columnar buffer (where most recent data is stored)
+        const colBuf = this._columnarBuffer.get(tableName);
+        const bufLen = colBuf?.__length || 0;
+        if (colBuf && bufLen > 0) {
+            const colNames = table.schema.map(c => c.name);
+            for (let i = 0; i < bufLen; i++) {
+                // Build row object for predicate evaluation
+                const row = { __rowId: colBuf.__rowId[i] };
+                for (const name of colNames) {
+                    const v = colBuf[name][i];
+                    row[name] = Number.isNaN(v) ? null : v;
+                }
+
                 if (predicateFn(row)) {
+                    // Apply updates directly to columnar buffer
                     for (const [col, expr] of Object.entries(updateExprs)) {
-                        row[col] = evalExpr(expr, row);
+                        const newVal = evalExpr(expr, row);
+                        if (colBuf[col] !== undefined) {
+                            colBuf[col][i] = newVal ?? (colBuf[col] instanceof Float64Array ? NaN : null);
+                        }
                     }
                     updatedCount++;
                 }
@@ -486,7 +513,9 @@ export class WorkerDatabase {
                 if (deletedSet && deletedSet.has(colBuf.__rowId[i])) continue;
                 const row = { __rowId: colBuf.__rowId[i] };
                 for (const name of colNames) {
-                    row[name] = colBuf[name][i];
+                    const v = colBuf[name][i];
+                    // Convert NaN back to null (NaN represents null in typed arrays)
+                    row[name] = Number.isNaN(v) ? null : v;
                 }
                 allRows.push(row);
             }

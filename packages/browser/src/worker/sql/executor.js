@@ -75,6 +75,30 @@ function flattenJoinedRow(jr) {
     return flat;
 }
 
+// Normalize query result: ensure it has `rows` array (convert columnar format if needed)
+function normalizeResult(result) {
+    if (!result) return { rows: [], columns: [] };
+
+    // Already has rows - return as is
+    if (result.rows) return result;
+
+    // Columnar format - convert to rows
+    if (result._format === 'columnar' && result.data) {
+        const { columns, rowCount, data } = result;
+        const rows = [];
+        for (let i = 0; i < rowCount; i++) {
+            const row = {};
+            for (const colName of columns) {
+                row[colName] = data[colName]?.[i];
+            }
+            rows.push(row);
+        }
+        return { rows, columns };
+    }
+
+    return { rows: [], columns: result.columns || [] };
+}
+
 // Evaluate compound JOIN condition (supports AND/OR and multiple comparison operators)
 function evalJoinCondition(condition, leftRow, rightRow, tableAliases) {
     if (!condition) return true;
@@ -181,12 +205,13 @@ function evalWhereColumnar(where, cols, idx) {
         case 'IS NULL': {
             const col = typeof where.column === 'string' ? where.column : where.column.column;
             const v = cols[col]?.[idx];
-            return v === null || v === undefined;
+            // NaN represents null in typed arrays (NaN !== NaN, so use Number.isNaN)
+            return v === null || v === undefined || Number.isNaN(v);
         }
         case 'IS NOT NULL': {
             const col = typeof where.column === 'string' ? where.column : where.column.column;
             const v = cols[col]?.[idx];
-            return v !== null && v !== undefined;
+            return v !== null && v !== undefined && !Number.isNaN(v);
         }
         default: return true;
     }
@@ -1975,6 +2000,10 @@ async function executeAST(db, ast) {
         }
 
         case 'DELETE': {
+            // Check table exists
+            if (!db.tables.has(ast.table)) {
+                throw new Error(`Table '${ast.table}' does not exist`);
+            }
             invalidateCacheForTable(ast.table);
             // Handle DELETE with USING clause (JOIN-based delete)
             if (ast.using) {
@@ -2022,6 +2051,10 @@ async function executeAST(db, ast) {
         }
 
         case 'UPDATE': {
+            // Check table exists
+            if (!db.tables.has(ast.table)) {
+                throw new Error(`Table '${ast.table}' does not exist`);
+            }
             invalidateCacheForTable(ast.table);
             // Handle UPDATE with FROM clause (JOIN-based update)
             if (ast.from) {
@@ -2094,6 +2127,11 @@ async function executeAST(db, ast) {
         }
 
         case 'SELECT': {
+            // Check if main table exists (if not a subquery)
+            if (ast.table && !db.tables.has(ast.table)) {
+                throw new Error(`Table '${ast.table}' does not exist`);
+            }
+
             // Build table alias mapping and handle derived tables (subqueries)
             const tableAliases = {};
             const derivedTables = new Map();
@@ -2105,8 +2143,12 @@ async function executeAST(db, ast) {
                         const subResult = await executeAST(db, t.query);
                         derivedTables.set(t.alias, subResult.rows);
                         tableAliases[t.alias] = t.alias;
-                    } else if (t.alias) {
-                        tableAliases[t.alias] = t.name;
+                    } else {
+                        // Check table exists
+                        if (!db.tables.has(t.name)) {
+                            throw new Error(`Table '${t.name}' does not exist`);
+                        }
+                        if (t.alias) tableAliases[t.alias] = t.name;
                     }
                 }
             }
@@ -2116,8 +2158,12 @@ async function executeAST(db, ast) {
                         const subResult = await executeAST(db, j.table.query);
                         derivedTables.set(j.table.alias, subResult.rows);
                         tableAliases[j.table.alias] = j.table.alias;
-                    } else if (j.table.alias) {
-                        tableAliases[j.table.alias] = j.table.name;
+                    } else {
+                        // Check JOIN table exists
+                        if (!db.tables.has(j.table.name)) {
+                            throw new Error(`Table '${j.table.name}' does not exist`);
+                        }
+                        if (j.table.alias) tableAliases[j.table.alias] = j.table.name;
                     }
                 }
             }
@@ -2225,7 +2271,7 @@ async function executeAST(db, ast) {
                     // Returns columnar data directly without any processing
                     // ================================================================
                     const isSelectStar = ast.columns.length === 1 && ast.columns[0].type === 'star';
-                    const isSimpleSelect = isSelectStar && !ast.where && !ast.joins?.length && !ast.groupBy && !ast.orderBy;
+                    const isSimpleSelect = isSelectStar && !ast.where && !ast.joins?.length && !ast.groupBy && !ast.orderBy && !ast.distinct && ast.limit === undefined && ast.offset === undefined;
 
                     if (isSimpleSelect) {
                         // Return columnar data directly (zero processing overhead)
@@ -2244,7 +2290,7 @@ async function executeAST(db, ast) {
                     // For simple queries, work directly with columnar data
                     const hasComplexCols = ast.columns.some(c => c.type === 'function' || c.type === 'case' ||
                         c.type === 'arithmetic' || c.type === 'scalar_subquery');
-                    const needsRows = ast.orderBy || hasComplexCols;
+                    const needsRows = ast.orderBy || hasComplexCols || ast.distinct || ast.limit !== undefined || ast.offset !== undefined;
 
                     // Columnar JOIN + GROUP BY path (benchmark: JOIN customers orders)
                     if (hasSimpleJoin && !needsRows) {
@@ -2332,7 +2378,7 @@ async function executeAST(db, ast) {
                             }
 
                             // Build result rows
-                            const resultRows = [];
+                            let resultRows = [];
                             for (const [key, g] of groups) {
                                 const row = {};
                                 for (const col of ast.columns) {
@@ -2354,6 +2400,10 @@ async function executeAST(db, ast) {
                                     }
                                 }
                                 resultRows.push(row);
+                            }
+                            // Apply HAVING filter
+                            if (ast.having) {
+                                resultRows = resultRows.filter(row => evalHaving(ast.having, row));
                             }
                             return { rows: resultRows, columns: Object.keys(resultRows[0] || {}) };
                         }
@@ -2450,7 +2500,7 @@ async function executeAST(db, ast) {
                             }
 
                             // Build result rows from accumulated state
-                            const resultRows = [];
+                            let resultRows = [];
                             for (const [key, g] of groups) {
                                 const row = {};
                                 for (const col of ast.columns) {
@@ -2473,6 +2523,10 @@ async function executeAST(db, ast) {
                                     }
                                 }
                                 resultRows.push(row);
+                            }
+                            // Apply HAVING filter
+                            if (ast.having) {
+                                resultRows = resultRows.filter(row => evalHaving(ast.having, row));
                             }
                             return { rows: resultRows, columns: Object.keys(resultRows[0] || {}) };
                         }
@@ -2512,6 +2566,60 @@ async function executeAST(db, ast) {
                                                 case 'min': resultRow[aggName] = wasm.minFloat64Buffer(ptr, f64.length); break;
                                                 case 'max': resultRow[aggName] = wasm.maxFloat64Buffer(ptr, f64.length); break;
                                                 case 'avg': resultRow[aggName] = wasm.avgFloat64Buffer(ptr, f64.length); break;
+                                                // Advanced aggregates use JS fallback
+                                                case 'stddev': case 'stddev_samp': {
+                                                    const vals = Array.from(f64);
+                                                    if (vals.length < 2) { resultRow[aggName] = null; }
+                                                    else {
+                                                        const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                                                        let variance = 0;
+                                                        for (const v of vals) variance += (v - mean) ** 2;
+                                                        resultRow[aggName] = Math.sqrt(variance / (vals.length - 1));
+                                                    }
+                                                    break;
+                                                }
+                                                case 'stddev_pop': {
+                                                    const vals = Array.from(f64);
+                                                    if (vals.length === 0) { resultRow[aggName] = null; }
+                                                    else {
+                                                        const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                                                        let variance = 0;
+                                                        for (const v of vals) variance += (v - mean) ** 2;
+                                                        resultRow[aggName] = Math.sqrt(variance / vals.length);
+                                                    }
+                                                    break;
+                                                }
+                                                case 'variance': case 'var_samp': {
+                                                    const vals = Array.from(f64);
+                                                    if (vals.length < 2) { resultRow[aggName] = null; }
+                                                    else {
+                                                        const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                                                        let variance = 0;
+                                                        for (const v of vals) variance += (v - mean) ** 2;
+                                                        resultRow[aggName] = variance / (vals.length - 1);
+                                                    }
+                                                    break;
+                                                }
+                                                case 'var_pop': {
+                                                    const vals = Array.from(f64);
+                                                    if (vals.length === 0) { resultRow[aggName] = null; }
+                                                    else {
+                                                        const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                                                        let variance = 0;
+                                                        for (const v of vals) variance += (v - mean) ** 2;
+                                                        resultRow[aggName] = variance / vals.length;
+                                                    }
+                                                    break;
+                                                }
+                                                case 'median': {
+                                                    const vals = Array.from(f64).sort((a, b) => a - b);
+                                                    if (vals.length === 0) { resultRow[aggName] = null; }
+                                                    else {
+                                                        const mid = Math.floor(vals.length / 2);
+                                                        resultRow[aggName] = vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
+                                                    }
+                                                    break;
+                                                }
                                             }
                                         }
                                     } else if (colArr) {
@@ -2522,6 +2630,55 @@ async function executeAST(db, ast) {
                                             case 'min': resultRow[aggName] = Math.min(...vals); break;
                                             case 'max': resultRow[aggName] = Math.max(...vals); break;
                                             case 'avg': resultRow[aggName] = vals.reduce((a, b) => a + b, 0) / vals.length; break;
+                                            case 'stddev': case 'stddev_samp': {
+                                                if (vals.length < 2) { resultRow[aggName] = null; }
+                                                else {
+                                                    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                                                    let variance = 0;
+                                                    for (const v of vals) variance += (v - mean) ** 2;
+                                                    resultRow[aggName] = Math.sqrt(variance / (vals.length - 1));
+                                                }
+                                                break;
+                                            }
+                                            case 'stddev_pop': {
+                                                if (vals.length === 0) { resultRow[aggName] = null; }
+                                                else {
+                                                    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                                                    let variance = 0;
+                                                    for (const v of vals) variance += (v - mean) ** 2;
+                                                    resultRow[aggName] = Math.sqrt(variance / vals.length);
+                                                }
+                                                break;
+                                            }
+                                            case 'variance': case 'var_samp': {
+                                                if (vals.length < 2) { resultRow[aggName] = null; }
+                                                else {
+                                                    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                                                    let variance = 0;
+                                                    for (const v of vals) variance += (v - mean) ** 2;
+                                                    resultRow[aggName] = variance / (vals.length - 1);
+                                                }
+                                                break;
+                                            }
+                                            case 'var_pop': {
+                                                if (vals.length === 0) { resultRow[aggName] = null; }
+                                                else {
+                                                    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                                                    let variance = 0;
+                                                    for (const v of vals) variance += (v - mean) ** 2;
+                                                    resultRow[aggName] = variance / vals.length;
+                                                }
+                                                break;
+                                            }
+                                            case 'median': {
+                                                const sorted = vals.slice().sort((a, b) => a - b);
+                                                if (sorted.length === 0) { resultRow[aggName] = null; }
+                                                else {
+                                                    const mid = Math.floor(sorted.length / 2);
+                                                    resultRow[aggName] = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+                                                }
+                                                break;
+                                            }
                                         }
                                     }
                                 }
@@ -2530,35 +2687,56 @@ async function executeAST(db, ast) {
                         }
 
                         // SELECT * or specific columns - optimized row creation
-                        const { columns: colData, rowCount } = columnarData;
-                        const colNames = Object.keys(colData).filter(n => n !== '__rowId');
-                        const numCols = colNames.length;
+                        // Only use fast columnar path if no complex columns (functions, CASE, etc.)
+                        if (!needsRows) {
+                            const { columns: colData, rowCount } = columnarData;
 
-                        // Pre-extract column arrays to avoid repeated property lookups
-                        const colArrays = new Array(numCols);
-                        for (let j = 0; j < numCols; j++) {
-                            colArrays[j] = colData[colNames[j]];
+                            // Determine output columns based on SELECT list
+                            let colNames;
+                            if (ast.columns.some(c => c.type === 'star')) {
+                                // SELECT * - use all columns
+                                colNames = Object.keys(colData).filter(n => n !== '__rowId');
+                            } else {
+                                // Specific columns - extract only selected ones
+                                colNames = ast.columns.map(c => {
+                                    if (c.type === 'column') {
+                                        return typeof c.value === 'string' ? c.value : c.value.column;
+                                    }
+                                    return null;
+                                }).filter(n => n !== null && colData[n] !== undefined);
+                            }
+                            const numCols = colNames.length;
+
+                            // Pre-extract column arrays to avoid repeated property lookups
+                            const colArrays = new Array(numCols);
+                            for (let j = 0; j < numCols; j++) {
+                                colArrays[j] = colData[colNames[j]];
+                            }
+
+                            // Return columnar data directly - no row conversion!
+                            // The caller can convert to rows if needed
+                            return {
+                                _format: 'columnar',
+                                columns: colNames,
+                                rowCount: rowCount,
+                                data: Object.fromEntries(
+                                    colNames.map(name => [name, colArrays[colNames.indexOf(name)]])
+                                )
+                            };
                         }
-
-                        // Return columnar data directly - no row conversion!
-                        // The caller can convert to rows if needed
-                        return {
-                            _format: 'columnar',
-                            columns: colNames,
-                            rowCount: rowCount,
-                            data: Object.fromEntries(
-                                colNames.map(name => [name, colArrays[colNames.indexOf(name)]])
-                            )
-                        };
-                    } else {
-                        // Need rows for complex operations
+                    }
+                    // Need rows for complex operations (functions, CASE, arithmetic, etc.)
+                    // or fall through to process remaining data
+                    {
                         const { columns: colData, rowCount } = columnarData;
                         rows = new Array(rowCount);
                         const colNames = Object.keys(colData).filter(n => n !== '__rowId');
                         for (let i = 0; i < rowCount; i++) {
                             const row = {};
                             for (let j = 0; j < colNames.length; j++) {
-                                row[colNames[j]] = colData[colNames[j]][i];
+                                const v = colData[colNames[j]][i];
+                                // Convert NaN back to null (NaN is used to represent null in typed arrays)
+                                row[colNames[j]] = Number.isNaN(v) ? null : v;
                             }
                             row.__rowId = colData.__rowId ? colData.__rowId[i] : i;
                             rows[i] = row;
@@ -3051,7 +3229,9 @@ async function executeAST(db, ast) {
             if (ast.distinct) {
                 const seen = new Set();
                 rows = rows.filter(row => {
-                    const key = JSON.stringify(row);
+                    // Exclude __rowId when comparing for uniqueness
+                    const { __rowId, ...dataOnly } = row;
+                    const key = JSON.stringify(dataOnly);
                     if (seen.has(key)) return false;
                     seen.add(key);
                     return true;
@@ -3062,10 +3242,10 @@ async function executeAST(db, ast) {
         }
 
         case 'UNION': {
-            // Execute both sides recursively
-            const leftResult = await executeAST(db, ast.left);
-            const rightResult = await executeAST(db, ast.right);
-            let rows = [...leftResult.rows, ...rightResult.rows];
+            // Execute both sides recursively and normalize to row format
+            const leftNorm = normalizeResult(await executeAST(db, ast.left));
+            const rightNorm = normalizeResult(await executeAST(db, ast.right));
+            let rows = [...leftNorm.rows, ...rightNorm.rows];
 
             // UNION (without ALL) removes duplicates
             if (!ast.all) {
@@ -3078,14 +3258,15 @@ async function executeAST(db, ast) {
                 });
             }
 
-            return { rows, columns: leftResult.columns };
+            return { rows, columns: leftNorm.columns };
         }
 
         case 'INTERSECT': {
-            const leftResult = await executeAST(db, ast.left);
-            const rightResult = await executeAST(db, ast.right);
-            const rightKeys = new Set(rightResult.rows.map(r => JSON.stringify(r)));
-            let rows = leftResult.rows.filter(row => rightKeys.has(JSON.stringify(row)));
+            // Normalize to row format (handles columnar data)
+            const leftNorm = normalizeResult(await executeAST(db, ast.left));
+            const rightNorm = normalizeResult(await executeAST(db, ast.right));
+            const rightKeys = new Set(rightNorm.rows.map(r => JSON.stringify(r)));
+            let rows = leftNorm.rows.filter(row => rightKeys.has(JSON.stringify(row)));
 
             // INTERSECT (without ALL) removes duplicates
             if (!ast.all) {
@@ -3098,14 +3279,15 @@ async function executeAST(db, ast) {
                 });
             }
 
-            return { rows, columns: leftResult.columns };
+            return { rows, columns: leftNorm.columns };
         }
 
         case 'EXCEPT': {
-            const leftResult = await executeAST(db, ast.left);
-            const rightResult = await executeAST(db, ast.right);
-            const rightKeys = new Set(rightResult.rows.map(r => JSON.stringify(r)));
-            let rows = leftResult.rows.filter(row => !rightKeys.has(JSON.stringify(row)));
+            // Normalize to row format (handles columnar data)
+            const leftNorm = normalizeResult(await executeAST(db, ast.left));
+            const rightNorm = normalizeResult(await executeAST(db, ast.right));
+            const rightKeys = new Set(rightNorm.rows.map(r => JSON.stringify(r)));
+            let rows = leftNorm.rows.filter(row => !rightKeys.has(JSON.stringify(row)));
 
             // EXCEPT (without ALL) removes duplicates
             if (!ast.all) {
@@ -3118,7 +3300,7 @@ async function executeAST(db, ast) {
                 });
             }
 
-            return { rows, columns: leftResult.columns };
+            return { rows, columns: leftNorm.columns };
         }
 
         case 'WITH': {
@@ -3128,17 +3310,33 @@ async function executeAST(db, ast) {
             // Helper to create temp CTE table
             const createCteTable = (name, rows, columns) => {
                 const schema = columns.map(col => ({ name: col, type: 'TEXT' }));
-                const rowsWithId = rows.map((row, i) => ({ ...row, __rowId: i }));
                 db.tables.set(name, {
                     name,
                     schema,
                     fragments: [],
                     deletionVector: [],
-                    rowCount: rowsWithId.length,
-                    nextRowId: rowsWithId.length,
+                    rowCount: rows.length,
+                    nextRowId: rows.length,
                     isCTE: true
                 });
-                db._writeBuffer.set(name, rowsWithId);
+                // Create columnar buffer for CTE data
+                const capacity = Math.max(rows.length, 16);
+                const colBuf = {
+                    __rowId: new Float64Array(capacity),
+                    __length: rows.length,
+                    __capacity: capacity,
+                    __schema: schema
+                };
+                for (const col of columns) {
+                    colBuf[col] = new Array(capacity);
+                }
+                for (let i = 0; i < rows.length; i++) {
+                    colBuf.__rowId[i] = i;
+                    for (const col of columns) {
+                        colBuf[col][i] = rows[i][col];
+                    }
+                }
+                db._columnarBuffer.set(name, colBuf);
             };
 
             for (const cte of ast.ctes) {
@@ -3206,7 +3404,7 @@ async function executeAST(db, ast) {
                 // Clean up CTE tables
                 for (const name of cteNames) {
                     db.tables.delete(name);
-                    db._writeBuffer.delete(name);
+                    db._columnarBuffer.delete(name);
                 }
             }
         }

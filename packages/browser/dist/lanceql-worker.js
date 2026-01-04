@@ -840,8 +840,8 @@ var WorkerDatabase = class {
         __schema: table.schema
       };
       for (const c of table.schema) {
-        const type = c.dataType || c.type;
-        if (type === "text" || type === "string") {
+        const type = (c.dataType || c.type || "").toLowerCase();
+        if (type === "text" || type === "string" || type === "varchar") {
           cols[c.name] = new Array(initialCapacity);
         } else {
           cols[c.name] = new Float64Array(initialCapacity);
@@ -874,7 +874,7 @@ var WorkerDatabase = class {
       colBuf.__rowId[len + i] = table.nextRowId++;
       for (const c of table.schema) {
         const val = row[c.name];
-        colBuf[c.name][len + i] = val ?? (colBuf[c.name] instanceof Float64Array ? 0 : null);
+        colBuf[c.name][len + i] = val ?? (colBuf[c.name] instanceof Float64Array ? NaN : null);
       }
     }
     colBuf.__length = len + n;
@@ -942,13 +942,23 @@ var WorkerDatabase = class {
     }
     const table = this.tables.get(tableName);
     let deletedCount = 0;
-    const buffer = this._writeBuffer.get(tableName);
-    if (buffer && buffer.length > 0) {
-      const originalLen = buffer.length;
-      const remaining = buffer.filter((row) => !predicateFn(row));
-      buffer.length = 0;
-      buffer.push(...remaining);
-      deletedCount += originalLen - remaining.length;
+    const colBuf = this._columnarBuffer.get(tableName);
+    const bufLen = colBuf?.__length || 0;
+    if (colBuf && bufLen > 0) {
+      const colNames = table.schema.map((c) => c.name);
+      for (let i = 0; i < bufLen; i++) {
+        const row = { __rowId: colBuf.__rowId[i] };
+        for (const name of colNames) {
+          const v = colBuf[name][i];
+          row[name] = Number.isNaN(v) ? null : v;
+        }
+        if (predicateFn(row)) {
+          if (!table.deletionVector.includes(colBuf.__rowId[i])) {
+            table.deletionVector.push(colBuf.__rowId[i]);
+            deletedCount++;
+          }
+        }
+      }
     }
     for (const fragKey of table.fragments) {
       const fragData = await opfsStorage.load(fragKey);
@@ -1011,12 +1021,22 @@ var WorkerDatabase = class {
     }
     const table = this.tables.get(tableName);
     let updatedCount = 0;
-    const buffer = this._writeBuffer.get(tableName);
-    if (buffer && buffer.length > 0) {
-      for (const row of buffer) {
+    const colBuf = this._columnarBuffer.get(tableName);
+    const bufLen = colBuf?.__length || 0;
+    if (colBuf && bufLen > 0) {
+      const colNames = table.schema.map((c) => c.name);
+      for (let i = 0; i < bufLen; i++) {
+        const row = { __rowId: colBuf.__rowId[i] };
+        for (const name of colNames) {
+          const v = colBuf[name][i];
+          row[name] = Number.isNaN(v) ? null : v;
+        }
         if (predicateFn(row)) {
           for (const [col, expr] of Object.entries(updateExprs)) {
-            row[col] = evalExpr(expr, row);
+            const newVal = evalExpr(expr, row);
+            if (colBuf[col] !== void 0) {
+              colBuf[col][i] = newVal ?? (colBuf[col] instanceof Float64Array ? NaN : null);
+            }
           }
           updatedCount++;
         }
@@ -1121,7 +1141,8 @@ var WorkerDatabase = class {
         if (deletedSet && deletedSet.has(colBuf.__rowId[i])) continue;
         const row = { __rowId: colBuf.__rowId[i] };
         for (const name of colNames) {
-          row[name] = colBuf[name][i];
+          const v = colBuf[name][i];
+          row[name] = Number.isNaN(v) ? null : v;
         }
         allRows.push(row);
       }
@@ -1715,6 +1736,9 @@ var SQLLexer = class {
         value += this.sql[this.pos];
       }
       this.pos++;
+    }
+    if (this.pos >= this.sql.length) {
+      throw new Error(`Unclosed string literal starting at position ${this.pos - value.length - 1}`);
     }
     this.pos++;
     return { type: TokenType.STRING, value };
@@ -3138,6 +3162,23 @@ function flattenJoinedRow(jr) {
   }
   return flat;
 }
+function normalizeResult(result) {
+  if (!result) return { rows: [], columns: [] };
+  if (result.rows) return result;
+  if (result._format === "columnar" && result.data) {
+    const { columns, rowCount, data } = result;
+    const rows = [];
+    for (let i = 0; i < rowCount; i++) {
+      const row = {};
+      for (const colName of columns) {
+        row[colName] = data[colName]?.[i];
+      }
+      rows.push(row);
+    }
+    return { rows, columns };
+  }
+  return { rows: [], columns: result.columns || [] };
+}
 function evalJoinCondition(condition, leftRow, rightRow, tableAliases) {
   if (!condition) return true;
   if (condition.op === "AND") {
@@ -3235,12 +3276,12 @@ function evalWhereColumnar(where, cols, idx) {
     case "IS NULL": {
       const col = typeof where.column === "string" ? where.column : where.column.column;
       const v = cols[col]?.[idx];
-      return v === null || v === void 0;
+      return v === null || v === void 0 || Number.isNaN(v);
     }
     case "IS NOT NULL": {
       const col = typeof where.column === "string" ? where.column : where.column.column;
       const v = cols[col]?.[idx];
-      return v !== null && v !== void 0;
+      return v !== null && v !== void 0 && !Number.isNaN(v);
     }
     default:
       return true;
@@ -4914,6 +4955,9 @@ async function executeAST(db, ast) {
       return db.insert(ast.table, rows);
     }
     case "DELETE": {
+      if (!db.tables.has(ast.table)) {
+        throw new Error(`Table '${ast.table}' does not exist`);
+      }
       invalidateCacheForTable(ast.table);
       if (ast.using) {
         const mainRows = await db.select(ast.table, {});
@@ -4948,6 +4992,9 @@ async function executeAST(db, ast) {
       return db.delete(ast.table, predicate);
     }
     case "UPDATE": {
+      if (!db.tables.has(ast.table)) {
+        throw new Error(`Table '${ast.table}' does not exist`);
+      }
       invalidateCacheForTable(ast.table);
       if (ast.from) {
         const mainRows = await db.select(ast.table, {});
@@ -5007,6 +5054,9 @@ async function executeAST(db, ast) {
       return db.updateWithExpr(ast.table, ast.updates, predicate, (expr, row) => evaluateArithmeticExpr(expr, row, {}));
     }
     case "SELECT": {
+      if (ast.table && !db.tables.has(ast.table)) {
+        throw new Error(`Table '${ast.table}' does not exist`);
+      }
       const tableAliases = {};
       const derivedTables = /* @__PURE__ */ new Map();
       if (ast.tables) {
@@ -5015,8 +5065,11 @@ async function executeAST(db, ast) {
             const subResult = await executeAST(db, t.query);
             derivedTables.set(t.alias, subResult.rows);
             tableAliases[t.alias] = t.alias;
-          } else if (t.alias) {
-            tableAliases[t.alias] = t.name;
+          } else {
+            if (!db.tables.has(t.name)) {
+              throw new Error(`Table '${t.name}' does not exist`);
+            }
+            if (t.alias) tableAliases[t.alias] = t.name;
           }
         }
       }
@@ -5026,8 +5079,11 @@ async function executeAST(db, ast) {
             const subResult = await executeAST(db, j.table.query);
             derivedTables.set(j.table.alias, subResult.rows);
             tableAliases[j.table.alias] = j.table.alias;
-          } else if (j.table.alias) {
-            tableAliases[j.table.alias] = j.table.name;
+          } else {
+            if (!db.tables.has(j.table.name)) {
+              throw new Error(`Table '${j.table.name}' does not exist`);
+            }
+            if (j.table.alias) tableAliases[j.table.alias] = j.table.name;
           }
         }
       }
@@ -5097,7 +5153,7 @@ async function executeAST(db, ast) {
         columnarData = await db.selectColumnar(ast.table);
         if (columnarData && columnarData.rowCount > 0) {
           const isSelectStar = ast.columns.length === 1 && ast.columns[0].type === "star";
-          const isSimpleSelect = isSelectStar && !ast.where && !ast.joins?.length && !ast.groupBy && !ast.orderBy;
+          const isSimpleSelect = isSelectStar && !ast.where && !ast.joins?.length && !ast.groupBy && !ast.orderBy && !ast.distinct && ast.limit === void 0 && ast.offset === void 0;
           if (isSimpleSelect) {
             const { columns: cols, rowCount } = columnarData;
             const colNames = columnarData.schema.map((c) => c.name);
@@ -5109,7 +5165,7 @@ async function executeAST(db, ast) {
             };
           }
           const hasComplexCols = ast.columns.some((c) => c.type === "function" || c.type === "case" || c.type === "arithmetic" || c.type === "scalar_subquery");
-          const needsRows = ast.orderBy || hasComplexCols;
+          const needsRows = ast.orderBy || hasComplexCols || ast.distinct || ast.limit !== void 0 || ast.offset !== void 0;
           if (hasSimpleJoin && !needsRows) {
             const join = ast.joins[0];
             const rightTableName = join.table.alias || join.table.name;
@@ -5175,7 +5231,7 @@ async function executeAST(db, ast) {
                   }
                 }
               }
-              const resultRows = [];
+              let resultRows = [];
               for (const [key, g] of groups) {
                 const row = {};
                 for (const col of ast.columns) {
@@ -5207,6 +5263,9 @@ async function executeAST(db, ast) {
                   }
                 }
                 resultRows.push(row);
+              }
+              if (ast.having) {
+                resultRows = resultRows.filter((row) => evalHaving(ast.having, row));
               }
               return { rows: resultRows, columns: Object.keys(resultRows[0] || {}) };
             }
@@ -5282,7 +5341,7 @@ async function executeAST(db, ast) {
                   }
                 }
               }
-              const resultRows = [];
+              let resultRows = [];
               for (const [key, g] of groups) {
                 const row = {};
                 for (const col of ast.columns) {
@@ -5314,6 +5373,9 @@ async function executeAST(db, ast) {
                   }
                 }
                 resultRows.push(row);
+              }
+              if (ast.having) {
+                resultRows = resultRows.filter((row) => evalHaving(ast.having, row));
               }
               return { rows: resultRows, columns: Object.keys(resultRows[0] || {}) };
             }
@@ -5354,6 +5416,67 @@ async function executeAST(db, ast) {
                         case "avg":
                           resultRow[aggName] = wasm2.avgFloat64Buffer(ptr, f64.length);
                           break;
+                        // Advanced aggregates use JS fallback
+                        case "stddev":
+                        case "stddev_samp": {
+                          const vals = Array.from(f64);
+                          if (vals.length < 2) {
+                            resultRow[aggName] = null;
+                          } else {
+                            const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                            let variance = 0;
+                            for (const v of vals) variance += (v - mean) ** 2;
+                            resultRow[aggName] = Math.sqrt(variance / (vals.length - 1));
+                          }
+                          break;
+                        }
+                        case "stddev_pop": {
+                          const vals = Array.from(f64);
+                          if (vals.length === 0) {
+                            resultRow[aggName] = null;
+                          } else {
+                            const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                            let variance = 0;
+                            for (const v of vals) variance += (v - mean) ** 2;
+                            resultRow[aggName] = Math.sqrt(variance / vals.length);
+                          }
+                          break;
+                        }
+                        case "variance":
+                        case "var_samp": {
+                          const vals = Array.from(f64);
+                          if (vals.length < 2) {
+                            resultRow[aggName] = null;
+                          } else {
+                            const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                            let variance = 0;
+                            for (const v of vals) variance += (v - mean) ** 2;
+                            resultRow[aggName] = variance / (vals.length - 1);
+                          }
+                          break;
+                        }
+                        case "var_pop": {
+                          const vals = Array.from(f64);
+                          if (vals.length === 0) {
+                            resultRow[aggName] = null;
+                          } else {
+                            const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                            let variance = 0;
+                            for (const v of vals) variance += (v - mean) ** 2;
+                            resultRow[aggName] = variance / vals.length;
+                          }
+                          break;
+                        }
+                        case "median": {
+                          const vals = Array.from(f64).sort((a, b) => a - b);
+                          if (vals.length === 0) {
+                            resultRow[aggName] = null;
+                          } else {
+                            const mid = Math.floor(vals.length / 2);
+                            resultRow[aggName] = vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
+                          }
+                          break;
+                        }
                       }
                     }
                   } else if (colArr) {
@@ -5371,35 +5494,105 @@ async function executeAST(db, ast) {
                       case "avg":
                         resultRow[aggName] = vals.reduce((a, b) => a + b, 0) / vals.length;
                         break;
+                      case "stddev":
+                      case "stddev_samp": {
+                        if (vals.length < 2) {
+                          resultRow[aggName] = null;
+                        } else {
+                          const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                          let variance = 0;
+                          for (const v of vals) variance += (v - mean) ** 2;
+                          resultRow[aggName] = Math.sqrt(variance / (vals.length - 1));
+                        }
+                        break;
+                      }
+                      case "stddev_pop": {
+                        if (vals.length === 0) {
+                          resultRow[aggName] = null;
+                        } else {
+                          const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                          let variance = 0;
+                          for (const v of vals) variance += (v - mean) ** 2;
+                          resultRow[aggName] = Math.sqrt(variance / vals.length);
+                        }
+                        break;
+                      }
+                      case "variance":
+                      case "var_samp": {
+                        if (vals.length < 2) {
+                          resultRow[aggName] = null;
+                        } else {
+                          const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                          let variance = 0;
+                          for (const v of vals) variance += (v - mean) ** 2;
+                          resultRow[aggName] = variance / (vals.length - 1);
+                        }
+                        break;
+                      }
+                      case "var_pop": {
+                        if (vals.length === 0) {
+                          resultRow[aggName] = null;
+                        } else {
+                          const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+                          let variance = 0;
+                          for (const v of vals) variance += (v - mean) ** 2;
+                          resultRow[aggName] = variance / vals.length;
+                        }
+                        break;
+                      }
+                      case "median": {
+                        const sorted = vals.slice().sort((a, b) => a - b);
+                        if (sorted.length === 0) {
+                          resultRow[aggName] = null;
+                        } else {
+                          const mid = Math.floor(sorted.length / 2);
+                          resultRow[aggName] = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+                        }
+                        break;
+                      }
                     }
                   }
                 }
               }
               return { rows: [resultRow], columns: Object.keys(resultRow) };
             }
-            const { columns: colData, rowCount } = columnarData;
-            const colNames = Object.keys(colData).filter((n) => n !== "__rowId");
-            const numCols = colNames.length;
-            const colArrays = new Array(numCols);
-            for (let j = 0; j < numCols; j++) {
-              colArrays[j] = colData[colNames[j]];
+            if (!needsRows) {
+              const { columns: colData, rowCount } = columnarData;
+              let colNames;
+              if (ast.columns.some((c) => c.type === "star")) {
+                colNames = Object.keys(colData).filter((n) => n !== "__rowId");
+              } else {
+                colNames = ast.columns.map((c) => {
+                  if (c.type === "column") {
+                    return typeof c.value === "string" ? c.value : c.value.column;
+                  }
+                  return null;
+                }).filter((n) => n !== null && colData[n] !== void 0);
+              }
+              const numCols = colNames.length;
+              const colArrays = new Array(numCols);
+              for (let j = 0; j < numCols; j++) {
+                colArrays[j] = colData[colNames[j]];
+              }
+              return {
+                _format: "columnar",
+                columns: colNames,
+                rowCount,
+                data: Object.fromEntries(
+                  colNames.map((name) => [name, colArrays[colNames.indexOf(name)]])
+                )
+              };
             }
-            return {
-              _format: "columnar",
-              columns: colNames,
-              rowCount,
-              data: Object.fromEntries(
-                colNames.map((name) => [name, colArrays[colNames.indexOf(name)]])
-              )
-            };
-          } else {
+          }
+          {
             const { columns: colData, rowCount } = columnarData;
             rows = new Array(rowCount);
             const colNames = Object.keys(colData).filter((n) => n !== "__rowId");
             for (let i = 0; i < rowCount; i++) {
               const row = {};
               for (let j = 0; j < colNames.length; j++) {
-                row[colNames[j]] = colData[colNames[j]][i];
+                const v = colData[colNames[j]][i];
+                row[colNames[j]] = Number.isNaN(v) ? null : v;
               }
               row.__rowId = colData.__rowId ? colData.__rowId[i] : i;
               rows[i] = row;
@@ -5805,7 +5998,8 @@ async function executeAST(db, ast) {
       if (ast.distinct) {
         const seen = /* @__PURE__ */ new Set();
         rows = rows.filter((row) => {
-          const key = JSON.stringify(row);
+          const { __rowId, ...dataOnly } = row;
+          const key = JSON.stringify(dataOnly);
           if (seen.has(key)) return false;
           seen.add(key);
           return true;
@@ -5814,9 +6008,9 @@ async function executeAST(db, ast) {
       return { rows, columns: columnNames };
     }
     case "UNION": {
-      const leftResult = await executeAST(db, ast.left);
-      const rightResult = await executeAST(db, ast.right);
-      let rows = [...leftResult.rows, ...rightResult.rows];
+      const leftNorm = normalizeResult(await executeAST(db, ast.left));
+      const rightNorm = normalizeResult(await executeAST(db, ast.right));
+      let rows = [...leftNorm.rows, ...rightNorm.rows];
       if (!ast.all) {
         const seen = /* @__PURE__ */ new Set();
         rows = rows.filter((row) => {
@@ -5826,13 +6020,13 @@ async function executeAST(db, ast) {
           return true;
         });
       }
-      return { rows, columns: leftResult.columns };
+      return { rows, columns: leftNorm.columns };
     }
     case "INTERSECT": {
-      const leftResult = await executeAST(db, ast.left);
-      const rightResult = await executeAST(db, ast.right);
-      const rightKeys = new Set(rightResult.rows.map((r) => JSON.stringify(r)));
-      let rows = leftResult.rows.filter((row) => rightKeys.has(JSON.stringify(row)));
+      const leftNorm = normalizeResult(await executeAST(db, ast.left));
+      const rightNorm = normalizeResult(await executeAST(db, ast.right));
+      const rightKeys = new Set(rightNorm.rows.map((r) => JSON.stringify(r)));
+      let rows = leftNorm.rows.filter((row) => rightKeys.has(JSON.stringify(row)));
       if (!ast.all) {
         const seen = /* @__PURE__ */ new Set();
         rows = rows.filter((row) => {
@@ -5842,13 +6036,13 @@ async function executeAST(db, ast) {
           return true;
         });
       }
-      return { rows, columns: leftResult.columns };
+      return { rows, columns: leftNorm.columns };
     }
     case "EXCEPT": {
-      const leftResult = await executeAST(db, ast.left);
-      const rightResult = await executeAST(db, ast.right);
-      const rightKeys = new Set(rightResult.rows.map((r) => JSON.stringify(r)));
-      let rows = leftResult.rows.filter((row) => !rightKeys.has(JSON.stringify(row)));
+      const leftNorm = normalizeResult(await executeAST(db, ast.left));
+      const rightNorm = normalizeResult(await executeAST(db, ast.right));
+      const rightKeys = new Set(rightNorm.rows.map((r) => JSON.stringify(r)));
+      let rows = leftNorm.rows.filter((row) => !rightKeys.has(JSON.stringify(row)));
       if (!ast.all) {
         const seen = /* @__PURE__ */ new Set();
         rows = rows.filter((row) => {
@@ -5858,23 +6052,38 @@ async function executeAST(db, ast) {
           return true;
         });
       }
-      return { rows, columns: leftResult.columns };
+      return { rows, columns: leftNorm.columns };
     }
     case "WITH": {
       const cteNames = [];
       const createCteTable = (name, rows, columns) => {
         const schema = columns.map((col) => ({ name: col, type: "TEXT" }));
-        const rowsWithId = rows.map((row, i) => ({ ...row, __rowId: i }));
         db.tables.set(name, {
           name,
           schema,
           fragments: [],
           deletionVector: [],
-          rowCount: rowsWithId.length,
-          nextRowId: rowsWithId.length,
+          rowCount: rows.length,
+          nextRowId: rows.length,
           isCTE: true
         });
-        db._writeBuffer.set(name, rowsWithId);
+        const capacity = Math.max(rows.length, 16);
+        const colBuf = {
+          __rowId: new Float64Array(capacity),
+          __length: rows.length,
+          __capacity: capacity,
+          __schema: schema
+        };
+        for (const col of columns) {
+          colBuf[col] = new Array(capacity);
+        }
+        for (let i = 0; i < rows.length; i++) {
+          colBuf.__rowId[i] = i;
+          for (const col of columns) {
+            colBuf[col][i] = rows[i][col];
+          }
+        }
+        db._columnarBuffer.set(name, colBuf);
       };
       for (const cte of ast.ctes) {
         cteNames.push(cte.name);
@@ -5920,7 +6129,7 @@ async function executeAST(db, ast) {
       } finally {
         for (const name of cteNames) {
           db.tables.delete(name);
-          db._writeBuffer.delete(name);
+          db._columnarBuffer.delete(name);
         }
       }
     }

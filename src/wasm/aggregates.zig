@@ -237,3 +237,149 @@ export fn maxInt64Buffer(ptr: [*]const i64, len: usize) i64 {
     for (1..len) |i| if (ptr[i] > max_val) { max_val = ptr[i]; };
     return max_val;
 }
+
+// ============================================================================
+// Buffer-based Filtering (for WHERE clause acceleration)
+// op: 0=eq, 1=ne, 2=lt, 3=le, 4=gt, 5=ge
+// ============================================================================
+
+/// Filter float64 buffer, returns count of matching indices
+export fn filterFloat64Buffer(
+    data_ptr: [*]const f64,
+    len: usize,
+    op: u32,
+    value: f64,
+    out_indices: [*]u32,
+    max_indices: usize,
+) usize {
+    var out_count: usize = 0;
+
+    for (0..len) |i| {
+        if (out_count >= max_indices) break;
+        const v = data_ptr[i];
+        const matches = switch (op) {
+            0 => v == value,
+            1 => v != value,
+            2 => v < value,
+            3 => v <= value,
+            4 => v > value,
+            5 => v >= value,
+            else => false,
+        };
+        if (matches) {
+            out_indices[out_count] = @intCast(i);
+            out_count += 1;
+        }
+    }
+    return out_count;
+}
+
+/// Filter int32 buffer
+export fn filterInt32Buffer(
+    data_ptr: [*]const i32,
+    len: usize,
+    op: u32,
+    value: i32,
+    out_indices: [*]u32,
+    max_indices: usize,
+) usize {
+    var out_count: usize = 0;
+
+    for (0..len) |i| {
+        if (out_count >= max_indices) break;
+        const v = data_ptr[i];
+        const matches = switch (op) {
+            0 => v == value,
+            1 => v != value,
+            2 => v < value,
+            3 => v <= value,
+            4 => v > value,
+            5 => v >= value,
+            else => false,
+        };
+        if (matches) {
+            out_indices[out_count] = @intCast(i);
+            out_count += 1;
+        }
+    }
+    return out_count;
+}
+
+/// Filter with range (BETWEEN): returns indices where low <= val <= high
+export fn filterFloat64Range(
+    data_ptr: [*]const f64,
+    len: usize,
+    low: f64,
+    high: f64,
+    out_indices: [*]u32,
+    max_indices: usize,
+) usize {
+    var out_count: usize = 0;
+
+    for (0..len) |i| {
+        if (out_count >= max_indices) break;
+        const v = data_ptr[i];
+        if (v >= low and v <= high) {
+            out_indices[out_count] = @intCast(i);
+            out_count += 1;
+        }
+    }
+    return out_count;
+}
+
+/// AND two index arrays (intersection)
+export fn intersectIndices(
+    a: [*]const u32,
+    a_len: usize,
+    b: [*]const u32,
+    b_len: usize,
+    out: [*]u32,
+    max_out: usize,
+) usize {
+    // Simple O(n*m) for small arrays; could use hash set for large
+    var out_count: usize = 0;
+    for (0..a_len) |i| {
+        if (out_count >= max_out) break;
+        const a_val = a[i];
+        for (0..b_len) |j| {
+            if (b[j] == a_val) {
+                out[out_count] = a_val;
+                out_count += 1;
+                break;
+            }
+        }
+    }
+    return out_count;
+}
+
+/// OR two index arrays (union, deduplicated)
+export fn unionIndices(
+    a: [*]const u32,
+    a_len: usize,
+    b: [*]const u32,
+    b_len: usize,
+    out: [*]u32,
+    max_out: usize,
+) usize {
+    var out_count: usize = 0;
+
+    // Add all from a
+    for (0..a_len) |i| {
+        if (out_count >= max_out) break;
+        out[out_count] = a[i];
+        out_count += 1;
+    }
+
+    // Add from b if not already in out
+    outer: for (0..b_len) |i| {
+        if (out_count >= max_out) break;
+        const b_val = b[i];
+        for (0..out_count) |j| {
+            if (out[j] == b_val) continue :outer;
+        }
+        out[out_count] = b_val;
+        out_count += 1;
+    }
+
+    return out_count;
+}
