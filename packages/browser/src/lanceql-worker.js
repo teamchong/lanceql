@@ -478,36 +478,233 @@ var DataType = {
   BOOL: "bool",
   VECTOR: "vector"
 };
+var TYPE_INT32 = 1;
+var TYPE_INT64 = 2;
+var TYPE_FLOAT32 = 3;
+var TYPE_FLOAT64 = 4;
+var TYPE_STRING = 5;
+var TYPE_BOOL = 6;
+function getTypedArrayForType(dataType) {
+  switch (dataType) {
+    case "int32":
+    case "integer":
+      return Int32Array;
+    case "int64":
+      return BigInt64Array;
+    case "float32":
+    case "real":
+      return Float32Array;
+    case "float64":
+    case "double":
+      return Float64Array;
+    default:
+      return null;
+  }
+}
+function getTypeCode(dataType) {
+  switch (dataType) {
+    case "int32":
+    case "integer":
+      return TYPE_INT32;
+    case "int64":
+      return TYPE_INT64;
+    case "float32":
+    case "real":
+      return TYPE_FLOAT32;
+    case "float64":
+    case "double":
+      return TYPE_FLOAT64;
+    case "string":
+    case "text":
+      return TYPE_STRING;
+    case "bool":
+    case "boolean":
+      return TYPE_BOOL;
+    default:
+      return TYPE_STRING;
+  }
+}
 var LanceFileWriter = class {
   constructor(schema) {
     this.schema = schema;
     this.columns = /* @__PURE__ */ new Map();
     this.rowCount = 0;
+    this._useBinary = true;
   }
   addRows(rows) {
-    for (const row of rows) {
+    if (rows.length === 0) return;
+    if (this.rowCount === 0) {
       for (const col of this.schema) {
-        if (!this.columns.has(col.name)) {
-          this.columns.set(col.name, []);
+        const TypedArray = getTypedArrayForType(col.dataType);
+        if (TypedArray && TypedArray !== BigInt64Array) {
+          this.columns.set(col.name, {
+            type: "typed",
+            dataType: col.dataType,
+            data: new TypedArray(Math.max(rows.length, 1024)),
+            length: 0
+          });
+        } else {
+          this.columns.set(col.name, {
+            type: "array",
+            dataType: col.dataType,
+            data: [],
+            length: 0
+          });
         }
-        this.columns.get(col.name).push(row[col.name] ?? null);
       }
-      this.rowCount++;
     }
+    for (const col of this.schema) {
+      const column = this.columns.get(col.name);
+      if (column.type === "typed") {
+        const newLength = column.length + rows.length;
+        if (newLength > column.data.length) {
+          const newSize = Math.max(newLength, column.data.length * 2);
+          const newData = new column.data.constructor(newSize);
+          newData.set(column.data);
+          column.data = newData;
+        }
+        for (let i = 0; i < rows.length; i++) {
+          const val = rows[i][col.name];
+          column.data[column.length + i] = val ?? 0;
+        }
+        column.length += rows.length;
+      } else {
+        for (let i = 0; i < rows.length; i++) {
+          column.data.push(rows[i][col.name] ?? null);
+        }
+        column.length += rows.length;
+      }
+    }
+    this.rowCount += rows.length;
+  }
+  /**
+   * Build binary columnar format
+   * Format: [magic(4)] [version(4)] [numCols(4)] [rowCount(4)]
+   *         [colName1Len(4)] [colName1] [colType(1)] [colDataLen(4)] [colData]
+   *         ...
+   */
+  buildBinary() {
+    const chunks = [];
+    let totalSize = 16;
+    const columnChunks = [];
+    for (const col of this.schema) {
+      const column = this.columns.get(col.name);
+      const nameBytes = E.encode(col.name);
+      const typeCode = getTypeCode(col.dataType);
+      let dataBytes;
+      if (column.type === "typed") {
+        const trimmed = column.data.subarray(0, column.length);
+        dataBytes = new Uint8Array(trimmed.buffer, trimmed.byteOffset, trimmed.byteLength);
+      } else {
+        dataBytes = E.encode(JSON.stringify(column.data));
+      }
+      columnChunks.push({ nameBytes, typeCode, dataBytes, dataType: col.dataType });
+      totalSize += 4 + nameBytes.length + 1 + 4 + dataBytes.length;
+    }
+    const buffer = new ArrayBuffer(totalSize);
+    const view = new DataView(buffer);
+    const bytes = new Uint8Array(buffer);
+    let offset = 0;
+    view.setUint32(offset, 1279348291, false);
+    offset += 4;
+    view.setUint32(offset, 2, false);
+    offset += 4;
+    view.setUint32(offset, this.schema.length, false);
+    offset += 4;
+    view.setUint32(offset, this.rowCount, false);
+    offset += 4;
+    for (const chunk of columnChunks) {
+      view.setUint32(offset, chunk.nameBytes.length, false);
+      offset += 4;
+      bytes.set(chunk.nameBytes, offset);
+      offset += chunk.nameBytes.length;
+      view.setUint8(offset, chunk.typeCode);
+      offset += 1;
+      view.setUint32(offset, chunk.dataBytes.length, false);
+      offset += 4;
+      bytes.set(chunk.dataBytes, offset);
+      offset += chunk.dataBytes.length;
+    }
+    return new Uint8Array(buffer);
   }
   build() {
+    if (this._useBinary && this.rowCount > 0) {
+      try {
+        return this.buildBinary();
+      } catch (e) {
+        console.warn("[LanceFileWriter] Binary build failed, falling back to JSON:", e);
+      }
+    }
     const data = {
       format: "json",
       schema: this.schema,
       columns: {},
       rowCount: this.rowCount
     };
-    for (const [name, values] of this.columns) {
-      data.columns[name] = values;
+    for (const [name, column] of this.columns) {
+      if (column.type === "typed") {
+        data.columns[name] = Array.from(column.data.subarray(0, column.length));
+      } else {
+        data.columns[name] = column.data;
+      }
     }
     return E.encode(JSON.stringify(data));
   }
 };
+function parseBinaryColumnar(buffer) {
+  const view = new DataView(buffer.buffer || buffer);
+  const bytes = new Uint8Array(buffer.buffer || buffer);
+  let offset = 0;
+  const magic = view.getUint32(offset, false);
+  if (magic !== 1279348291) {
+    return null;
+  }
+  offset += 4;
+  const version = view.getUint32(offset, false);
+  offset += 4;
+  const numCols = view.getUint32(offset, false);
+  offset += 4;
+  const rowCount = view.getUint32(offset, false);
+  offset += 4;
+  const schema = [];
+  const columns = {};
+  for (let i = 0; i < numCols; i++) {
+    const nameLen = view.getUint32(offset, false);
+    offset += 4;
+    const name = D.decode(bytes.subarray(offset, offset + nameLen));
+    offset += nameLen;
+    const typeCode = view.getUint8(offset);
+    offset += 1;
+    const dataLen = view.getUint32(offset, false);
+    offset += 4;
+    const dataBytes = bytes.subarray(offset, offset + dataLen);
+    offset += dataLen;
+    let data, dataType;
+    switch (typeCode) {
+      case TYPE_INT32:
+        dataType = "int32";
+        data = new Int32Array(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength / 4);
+        break;
+      case TYPE_FLOAT32:
+        dataType = "float32";
+        data = new Float32Array(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength / 4);
+        break;
+      case TYPE_FLOAT64:
+        dataType = "float64";
+        data = new Float64Array(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength / 8);
+        break;
+      case TYPE_STRING:
+      case TYPE_BOOL:
+      default:
+        dataType = typeCode === TYPE_BOOL ? "bool" : "string";
+        data = JSON.parse(D.decode(dataBytes));
+        break;
+    }
+    schema.push({ name, dataType });
+    columns[name] = data;
+  }
+  return { schema, columns, rowCount, format: "binary" };
+}
 
 // src/worker/worker-database.js
 var scanStreams = /* @__PURE__ */ new Map();
@@ -842,6 +1039,10 @@ var WorkerDatabase = class {
   }
   _parseFragment(data, schema) {
     try {
+      const binary = parseBinaryColumnar(data);
+      if (binary) {
+        return this._parseBinaryColumnar(binary);
+      }
       const text = D.decode(data);
       const parsed = JSON.parse(text);
       if (parsed.format === "json" && parsed.columns) {
@@ -852,6 +1053,24 @@ var WorkerDatabase = class {
       console.warn("[WorkerDatabase] Failed to parse fragment:", e);
       return [];
     }
+  }
+  /**
+   * Parse binary columnar format - optimized for typed arrays
+   */
+  _parseBinaryColumnar(data) {
+    const { schema, columns, rowCount } = data;
+    const rows = new Array(rowCount);
+    const colNames = schema.map((c) => c.name);
+    const colArrays = colNames.map((name) => columns[name]);
+    const numCols = colNames.length;
+    for (let i = 0; i < rowCount; i++) {
+      const row = {};
+      for (let j = 0; j < numCols; j++) {
+        row[colNames[j]] = colArrays[j][i] ?? null;
+      }
+      rows[i] = row;
+    }
+    return rows;
   }
   _parseJsonColumnar(data) {
     const { schema, columns, rowCount } = data;

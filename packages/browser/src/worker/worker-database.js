@@ -3,7 +3,7 @@
  */
 
 import { opfsStorage } from './opfs-storage.js';
-import { DataType, LanceFileWriter, E, D } from './data-types.js';
+import { DataType, LanceFileWriter, E, D, parseBinaryColumnar } from './data-types.js';
 
 // Streaming scan state
 const scanStreams = new Map();
@@ -431,6 +431,13 @@ export class WorkerDatabase {
 
     _parseFragment(data, schema) {
         try {
+            // Try binary format first (faster)
+            const binary = parseBinaryColumnar(data);
+            if (binary) {
+                return this._parseBinaryColumnar(binary);
+            }
+
+            // Fall back to JSON
             const text = D.decode(data);
             const parsed = JSON.parse(text);
 
@@ -443,6 +450,30 @@ export class WorkerDatabase {
             console.warn('[WorkerDatabase] Failed to parse fragment:', e);
             return [];
         }
+    }
+
+    /**
+     * Parse binary columnar format - optimized for typed arrays
+     */
+    _parseBinaryColumnar(data) {
+        const { schema, columns, rowCount } = data;
+
+        // Pre-allocate array
+        const rows = new Array(rowCount);
+        const colNames = schema.map(c => c.name);
+        const colArrays = colNames.map(name => columns[name]);
+        const numCols = colNames.length;
+
+        // Build rows - typed arrays provide direct indexed access
+        for (let i = 0; i < rowCount; i++) {
+            const row = {};
+            for (let j = 0; j < numCols; j++) {
+                row[colNames[j]] = colArrays[j][i] ?? null;
+            }
+            rows[i] = row;
+        }
+
+        return rows;
     }
 
     _parseJsonColumnar(data) {
