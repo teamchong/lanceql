@@ -780,24 +780,31 @@ var WorkerDatabase = class {
     if (options.limit) {
       rows = rows.slice(0, options.limit);
     }
-    if (options.columns && options.columns.length > 0 && options.columns[0] !== "*") {
-      rows = rows.map((row) => {
+    const projectCols = options.columns && options.columns.length > 0 && options.columns[0] !== "*" ? options.columns : null;
+    const result = new Array(rows.length);
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      if (projectCols) {
         const projected = {};
-        for (const col of options.columns) {
+        for (const col of projectCols) {
           projected[col] = row[col];
         }
-        return projected;
-      });
+        result[i] = projected;
+      } else {
+        const { __rowId, ...rest } = row;
+        result[i] = rest;
+      }
     }
-    rows = rows.map((row) => {
-      const { __rowId, ...rest } = row;
-      return rest;
-    });
-    return rows;
+    return result;
   }
   async _readAllRows(tableName) {
     const table = this.tables.get(tableName);
-    const deletedSet = new Set(table.deletionVector);
+    const buffer = this._writeBuffer.get(tableName);
+    const hasDeleted = table.deletionVector.length > 0;
+    if (table.fragments.length === 0 && !hasDeleted && buffer) {
+      return buffer;
+    }
+    const deletedSet = hasDeleted ? new Set(table.deletionVector) : null;
     const allRows = [];
     for (const fragKey of table.fragments) {
       let rows = this._readCache.get(fragKey);
@@ -810,17 +817,24 @@ var WorkerDatabase = class {
           rows = [];
         }
       }
-      for (const row of rows) {
-        if (!deletedSet.has(row.__rowId)) {
-          allRows.push(row);
+      if (!deletedSet) {
+        allRows.push(...rows);
+      } else {
+        for (const row of rows) {
+          if (!deletedSet.has(row.__rowId)) {
+            allRows.push(row);
+          }
         }
       }
     }
-    const buffer = this._writeBuffer.get(tableName);
     if (buffer && buffer.length > 0) {
-      for (const row of buffer) {
-        if (!deletedSet.has(row.__rowId)) {
-          allRows.push(row);
+      if (!deletedSet) {
+        allRows.push(...buffer);
+      } else {
+        for (const row of buffer) {
+          if (!deletedSet.has(row.__rowId)) {
+            allRows.push(row);
+          }
         }
       }
     }
@@ -841,13 +855,16 @@ var WorkerDatabase = class {
   }
   _parseJsonColumnar(data) {
     const { schema, columns, rowCount } = data;
-    const rows = [];
+    const rows = new Array(rowCount);
+    const colNames = schema.map((c) => c.name);
+    const colArrays = colNames.map((name) => columns[name] || []);
+    const numCols = colNames.length;
     for (let i = 0; i < rowCount; i++) {
       const row = {};
-      for (const col of schema) {
-        row[col.name] = columns[col.name]?.[i] ?? null;
+      for (let j = 0; j < numCols; j++) {
+        row[colNames[j]] = colArrays[j][i] ?? null;
       }
-      rows.push(row);
+      rows[i] = row;
     }
     return rows;
   }
@@ -4393,34 +4410,95 @@ async function executeAST(db, ast) {
               }
             }
           } else {
-            for (const leftRow of rows) {
-              let matched = false;
+            const canUseHashJoin = join.on && join.on.op === "=" && join.on.left && join.on.right && (join.on.left.table || join.on.left.column) && (join.on.right.table || join.on.right.column);
+            if (canUseHashJoin && rightRows.length >= 10) {
+              const leftCond = join.on.left;
+              const rightCond = join.on.right;
+              const getColName = (cond) => cond.table ? `${cond.table}.${cond.column}` : cond.column;
+              const leftCondKey = getColName(leftCond);
+              const rightCondKey = getColName(rightCond);
+              const sampleLeft = rows.length > 0 ? rows[0] : {};
+              const sampleRight = rightRows.length > 0 ? rightRows[0] : {};
+              let leftCol, rightCol;
+              const leftColSimple = leftCond.column;
+              const rightColSimple = rightCond.column;
+              if (leftColSimple in sampleLeft || leftCondKey in sampleLeft) {
+                leftCol = leftColSimple in sampleLeft ? leftColSimple : leftCondKey;
+                rightCol = rightColSimple in sampleRight ? rightColSimple : rightCondKey;
+              } else {
+                leftCol = rightColSimple in sampleLeft ? rightColSimple : rightCondKey;
+                rightCol = leftColSimple in sampleRight ? leftColSimple : leftCondKey;
+              }
+              const hashMap = /* @__PURE__ */ new Map();
               for (let ri = 0; ri < rightRows.length; ri++) {
                 const rightRow = rightRows[ri];
-                if (evalJoinCondition(join.on, leftRow, rightRow, tableAliases)) {
-                  matched = true;
-                  matchedRightIndices.add(ri);
-                  const merged = { ...leftRow };
-                  for (const key of Object.keys(rightRow)) {
-                    if (!(key in merged)) merged[key] = rightRow[key];
-                    merged[`${rightTableName}.${key}`] = rightRow[key];
-                  }
-                  newRows.push(merged);
+                const key = rightRow[rightCol] ?? rightRow[rightCol.split(".").pop()];
+                if (key !== null && key !== void 0) {
+                  if (!hashMap.has(key)) hashMap.set(key, []);
+                  hashMap.get(key).push(ri);
                 }
               }
-              if (!matched && (join.type === "LEFT" || join.type === "FULL")) {
-                newRows.push({ ...leftRow });
-              }
-            }
-            if (join.type === "RIGHT" || join.type === "FULL") {
-              for (let ri = 0; ri < rightRows.length; ri++) {
-                if (!matchedRightIndices.has(ri)) {
-                  const merged = {};
-                  for (const key of Object.keys(rightRows[ri])) {
-                    merged[key] = rightRows[ri][key];
-                    merged[`${rightTableName}.${key}`] = rightRows[ri][key];
+              for (let li = 0; li < rows.length; li++) {
+                const leftRow = rows[li];
+                const key = leftRow[leftCol] ?? leftRow[leftCol.split(".").pop()];
+                const matches = hashMap.get(key);
+                if (matches) {
+                  for (const ri of matches) {
+                    matchedRightIndices.add(ri);
+                    const rightRow = rightRows[ri];
+                    const merged = { ...leftRow };
+                    for (const k of Object.keys(rightRow)) {
+                      if (!(k in merged)) merged[k] = rightRow[k];
+                      merged[`${rightTableName}.${k}`] = rightRow[k];
+                    }
+                    newRows.push(merged);
                   }
-                  newRows.push(merged);
+                } else if (join.type === "LEFT" || join.type === "FULL") {
+                  newRows.push({ ...leftRow });
+                }
+              }
+              if (join.type === "RIGHT" || join.type === "FULL") {
+                for (let ri = 0; ri < rightRows.length; ri++) {
+                  if (!matchedRightIndices.has(ri)) {
+                    const merged = {};
+                    for (const k of Object.keys(rightRows[ri])) {
+                      merged[k] = rightRows[ri][k];
+                      merged[`${rightTableName}.${k}`] = rightRows[ri][k];
+                    }
+                    newRows.push(merged);
+                  }
+                }
+              }
+            } else {
+              for (const leftRow of rows) {
+                let matched = false;
+                for (let ri = 0; ri < rightRows.length; ri++) {
+                  const rightRow = rightRows[ri];
+                  if (evalJoinCondition(join.on, leftRow, rightRow, tableAliases)) {
+                    matched = true;
+                    matchedRightIndices.add(ri);
+                    const merged = { ...leftRow };
+                    for (const key of Object.keys(rightRow)) {
+                      if (!(key in merged)) merged[key] = rightRow[key];
+                      merged[`${rightTableName}.${key}`] = rightRow[key];
+                    }
+                    newRows.push(merged);
+                  }
+                }
+                if (!matched && (join.type === "LEFT" || join.type === "FULL")) {
+                  newRows.push({ ...leftRow });
+                }
+              }
+              if (join.type === "RIGHT" || join.type === "FULL") {
+                for (let ri = 0; ri < rightRows.length; ri++) {
+                  if (!matchedRightIndices.has(ri)) {
+                    const merged = {};
+                    for (const key of Object.keys(rightRows[ri])) {
+                      merged[key] = rightRows[ri][key];
+                      merged[`${rightTableName}.${key}`] = rightRows[ri][key];
+                    }
+                    newRows.push(merged);
+                  }
                 }
               }
             }

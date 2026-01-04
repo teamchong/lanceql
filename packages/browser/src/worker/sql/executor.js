@@ -1919,39 +1919,118 @@ async function executeAST(db, ast) {
                         }
                     } else {
                         // INNER, LEFT, RIGHT, FULL JOINs with ON condition
-                        for (const leftRow of rows) {
-                            let matched = false;
+                        // Check if we can use hash join (simple equality condition)
+                        const canUseHashJoin = join.on && join.on.op === '=' &&
+                            join.on.left && join.on.right &&
+                            (join.on.left.table || join.on.left.column) &&
+                            (join.on.right.table || join.on.right.column);
+
+                        if (canUseHashJoin && rightRows.length >= 10) {
+                            // Hash join for better performance on larger tables
+                            const leftCond = join.on.left;
+                            const rightCond = join.on.right;
+
+                            // Get column names - try both with and without table prefix
+                            const getColName = (cond) => cond.table ? `${cond.table}.${cond.column}` : cond.column;
+                            const leftCondKey = getColName(leftCond);
+                            const rightCondKey = getColName(rightCond);
+
+                            // Determine which condition maps to which table by checking column existence
+                            const sampleLeft = rows.length > 0 ? rows[0] : {};
+                            const sampleRight = rightRows.length > 0 ? rightRows[0] : {};
+
+                            // Check which column exists in which table
+                            let leftCol, rightCol;
+                            const leftColSimple = leftCond.column;
+                            const rightColSimple = rightCond.column;
+
+                            if (leftColSimple in sampleLeft || leftCondKey in sampleLeft) {
+                                leftCol = leftColSimple in sampleLeft ? leftColSimple : leftCondKey;
+                                rightCol = rightColSimple in sampleRight ? rightColSimple : rightCondKey;
+                            } else {
+                                leftCol = rightColSimple in sampleLeft ? rightColSimple : rightCondKey;
+                                rightCol = leftColSimple in sampleRight ? leftColSimple : leftCondKey;
+                            }
+
+                            // Build hash map on right table
+                            const hashMap = new Map();
                             for (let ri = 0; ri < rightRows.length; ri++) {
                                 const rightRow = rightRows[ri];
-                                // Evaluate ON condition (supports compound AND/OR conditions)
-                                if (evalJoinCondition(join.on, leftRow, rightRow, tableAliases)) {
-                                    matched = true;
-                                    matchedRightIndices.add(ri);
-                                    // Merge rows - keep left row as-is, add right row with prefix
-                                    const merged = { ...leftRow };
-                                    for (const key of Object.keys(rightRow)) {
-                                        if (!(key in merged)) merged[key] = rightRow[key];
-                                        merged[`${rightTableName}.${key}`] = rightRow[key];
-                                    }
-                                    newRows.push(merged);
+                                const key = rightRow[rightCol] ?? rightRow[rightCol.split('.').pop()];
+                                if (key !== null && key !== undefined) {
+                                    if (!hashMap.has(key)) hashMap.set(key, []);
+                                    hashMap.get(key).push(ri);
                                 }
                             }
-                            // LEFT JOIN or FULL OUTER JOIN: include left row even if no match
-                            if (!matched && (join.type === 'LEFT' || join.type === 'FULL')) {
-                                newRows.push({ ...leftRow });
-                            }
-                        }
 
-                        // RIGHT JOIN or FULL OUTER JOIN: include unmatched right rows
-                        if (join.type === 'RIGHT' || join.type === 'FULL') {
-                            for (let ri = 0; ri < rightRows.length; ri++) {
-                                if (!matchedRightIndices.has(ri)) {
-                                    const merged = {};
-                                    for (const key of Object.keys(rightRows[ri])) {
-                                        merged[key] = rightRows[ri][key];
-                                        merged[`${rightTableName}.${key}`] = rightRows[ri][key];
+                            // Probe with left table
+                            for (let li = 0; li < rows.length; li++) {
+                                const leftRow = rows[li];
+                                const key = leftRow[leftCol] ?? leftRow[leftCol.split('.').pop()];
+                                const matches = hashMap.get(key);
+
+                                if (matches) {
+                                    for (const ri of matches) {
+                                        matchedRightIndices.add(ri);
+                                        const rightRow = rightRows[ri];
+                                        const merged = { ...leftRow };
+                                        for (const k of Object.keys(rightRow)) {
+                                            if (!(k in merged)) merged[k] = rightRow[k];
+                                            merged[`${rightTableName}.${k}`] = rightRow[k];
+                                        }
+                                        newRows.push(merged);
                                     }
-                                    newRows.push(merged);
+                                } else if (join.type === 'LEFT' || join.type === 'FULL') {
+                                    newRows.push({ ...leftRow });
+                                }
+                            }
+
+                            // RIGHT/FULL: add unmatched right rows
+                            if (join.type === 'RIGHT' || join.type === 'FULL') {
+                                for (let ri = 0; ri < rightRows.length; ri++) {
+                                    if (!matchedRightIndices.has(ri)) {
+                                        const merged = {};
+                                        for (const k of Object.keys(rightRows[ri])) {
+                                            merged[k] = rightRows[ri][k];
+                                            merged[`${rightTableName}.${k}`] = rightRows[ri][k];
+                                        }
+                                        newRows.push(merged);
+                                    }
+                                }
+                            }
+                        } else {
+                            // Nested loop for complex conditions or small tables
+                            for (const leftRow of rows) {
+                                let matched = false;
+                                for (let ri = 0; ri < rightRows.length; ri++) {
+                                    const rightRow = rightRows[ri];
+                                    if (evalJoinCondition(join.on, leftRow, rightRow, tableAliases)) {
+                                        matched = true;
+                                        matchedRightIndices.add(ri);
+                                        const merged = { ...leftRow };
+                                        for (const key of Object.keys(rightRow)) {
+                                            if (!(key in merged)) merged[key] = rightRow[key];
+                                            merged[`${rightTableName}.${key}`] = rightRow[key];
+                                        }
+                                        newRows.push(merged);
+                                    }
+                                }
+                                if (!matched && (join.type === 'LEFT' || join.type === 'FULL')) {
+                                    newRows.push({ ...leftRow });
+                                }
+                            }
+
+                            // RIGHT/FULL outer join unmatched
+                            if (join.type === 'RIGHT' || join.type === 'FULL') {
+                                for (let ri = 0; ri < rightRows.length; ri++) {
+                                    if (!matchedRightIndices.has(ri)) {
+                                        const merged = {};
+                                        for (const key of Object.keys(rightRows[ri])) {
+                                            merged[key] = rightRows[ri][key];
+                                            merged[`${rightTableName}.${key}`] = rightRows[ri][key];
+                                        }
+                                        newRows.push(merged);
+                                    }
                                 }
                             }
                         }

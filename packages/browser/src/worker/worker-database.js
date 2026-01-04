@@ -349,29 +349,42 @@ export class WorkerDatabase {
             rows = rows.slice(0, options.limit);
         }
 
-        // Column projection
-        if (options.columns && options.columns.length > 0 && options.columns[0] !== '*') {
-            rows = rows.map(row => {
+        // Column projection and __rowId removal in single pass
+        const projectCols = options.columns && options.columns.length > 0 && options.columns[0] !== '*'
+            ? options.columns
+            : null;
+
+        // Single pass: project columns and remove __rowId
+        const result = new Array(rows.length);
+        for (let i = 0; i < rows.length; i++) {
+            const row = rows[i];
+            if (projectCols) {
                 const projected = {};
-                for (const col of options.columns) {
+                for (const col of projectCols) {
                     projected[col] = row[col];
                 }
-                return projected;
-            });
+                result[i] = projected;
+            } else {
+                // Clone without __rowId
+                const { __rowId, ...rest } = row;
+                result[i] = rest;
+            }
         }
 
-        // Remove internal __rowId
-        rows = rows.map(row => {
-            const { __rowId, ...rest } = row;
-            return rest;
-        });
-
-        return rows;
+        return result;
     }
 
     async _readAllRows(tableName) {
         const table = this.tables.get(tableName);
-        const deletedSet = new Set(table.deletionVector);
+        const buffer = this._writeBuffer.get(tableName);
+        const hasDeleted = table.deletionVector.length > 0;
+
+        // Fast path: no persisted fragments, no deletions - just return buffer
+        if (table.fragments.length === 0 && !hasDeleted && buffer) {
+            return buffer;
+        }
+
+        const deletedSet = hasDeleted ? new Set(table.deletionVector) : null;
         const allRows = [];
 
         // Read from persisted fragments
@@ -388,19 +401,27 @@ export class WorkerDatabase {
                 }
             }
 
-            for (const row of rows) {
-                if (!deletedSet.has(row.__rowId)) {
-                    allRows.push(row);
+            // Optimize: if no deletions, push all at once
+            if (!deletedSet) {
+                allRows.push(...rows);
+            } else {
+                for (const row of rows) {
+                    if (!deletedSet.has(row.__rowId)) {
+                        allRows.push(row);
+                    }
                 }
             }
         }
 
         // Include buffered rows
-        const buffer = this._writeBuffer.get(tableName);
         if (buffer && buffer.length > 0) {
-            for (const row of buffer) {
-                if (!deletedSet.has(row.__rowId)) {
-                    allRows.push(row);
+            if (!deletedSet) {
+                allRows.push(...buffer);
+            } else {
+                for (const row of buffer) {
+                    if (!deletedSet.has(row.__rowId)) {
+                        allRows.push(row);
+                    }
                 }
             }
         }
@@ -426,14 +447,20 @@ export class WorkerDatabase {
 
     _parseJsonColumnar(data) {
         const { schema, columns, rowCount } = data;
-        const rows = [];
 
+        // Pre-allocate array for better performance
+        const rows = new Array(rowCount);
+        const colNames = schema.map(c => c.name);
+        const colArrays = colNames.map(name => columns[name] || []);
+        const numCols = colNames.length;
+
+        // Build rows with direct array access (faster than object property lookup)
         for (let i = 0; i < rowCount; i++) {
             const row = {};
-            for (const col of schema) {
-                row[col.name] = columns[col.name]?.[i] ?? null;
+            for (let j = 0; j < numCols; j++) {
+                row[colNames[j]] = colArrays[j][i] ?? null;
             }
-            rows.push(row);
+            rows[i] = row;
         }
 
         return rows;
