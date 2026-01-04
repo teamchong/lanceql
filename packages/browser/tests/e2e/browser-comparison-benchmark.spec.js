@@ -1,6 +1,9 @@
 /**
  * Browser Database Comparison Benchmarks
- * LanceQL vs sql.js vs DuckDB WASM
+ * LanceQL vs sql.js
+ *
+ * Note: LanceQL vs DuckDB WASM benchmarks are in run-comparison-benchmark.spec.js
+ * which runs directly in CI without HTML pages.
  */
 
 import { test, expect } from '@playwright/test';
@@ -56,108 +59,6 @@ test.describe('Browser Database Benchmarks', () => {
             console.log(`║ ${op} ║ ${sj} ║ ${lq} ║ ${w} ║`);
         }
         console.log('╚════════════════════════╩════════════╩════════════╩═══════════╝');
-
-        expect(results.length).toBeGreaterThan(0);
-    });
-
-    test('LanceQL vs DuckDB WASM (1K rows)', async ({ page }) => {
-        test.setTimeout(180000);
-
-        await page.goto('/examples/wasm/test-benchmark.html');
-
-        // Set row count
-        await page.selectOption('#rowCount', '1000');
-
-        // Run benchmarks
-        await page.click('#runBtn');
-
-        // Wait for completion or error
-        await page.waitForFunction(() => {
-            const status = document.getElementById('status');
-            return status && (status.textContent.includes('complete') || status.textContent.includes('Error'));
-        }, { timeout: 120000 });
-
-        const results = await page.evaluate(() => {
-            const rows = document.querySelectorAll('#resultsBody tr');
-            return Array.from(rows).map(row => {
-                const cells = row.querySelectorAll('td');
-                return {
-                    query: cells[0]?.textContent || '',
-                    rows: cells[1]?.textContent || '',
-                    lanceql: cells[2]?.textContent || '',
-                    duckdb: cells[3]?.textContent || '',
-                    ratio: cells[4]?.textContent || '',
-                    winner: cells[5]?.textContent || ''
-                };
-            });
-        });
-
-        console.log('\n╔══════════════════════════════════════════════════════════════════════╗');
-        console.log('║              LanceQL vs DuckDB WASM Benchmark Results                ║');
-        console.log('╠══════════════════╦═══════╦════════════╦════════════╦═══════╦═════════╣');
-        console.log('║ Query            ║ Rows  ║ LanceQL    ║ DuckDB     ║ Ratio ║ Winner  ║');
-        console.log('╠══════════════════╬═══════╬════════════╬════════════╬═══════╬═════════╣');
-        for (const r of results) {
-            const q = r.query.padEnd(16);
-            const rows = r.rows.padStart(5);
-            const lq = (r.lanceql + 'ms').padStart(10);
-            const dd = (r.duckdb + 'ms').padStart(10);
-            const ratio = r.ratio.padStart(5);
-            const w = r.winner.padEnd(7);
-            console.log(`║ ${q} ║ ${rows} ║ ${lq} ║ ${dd} ║ ${ratio} ║ ${w} ║`);
-        }
-        console.log('╚══════════════════╩═══════╩════════════╩════════════╩═══════╩═════════╝');
-
-        expect(results.length).toBeGreaterThan(0);
-    });
-
-    test('LanceQL vs DuckDB WASM (10K rows)', async ({ page }) => {
-        test.setTimeout(300000);
-
-        await page.goto('/examples/wasm/test-benchmark.html');
-
-        // Set row count to 10K
-        await page.selectOption('#rowCount', '10000');
-
-        // Run benchmarks
-        await page.click('#runBtn');
-
-        // Wait for completion or error
-        await page.waitForFunction(() => {
-            const status = document.getElementById('status');
-            return status && (status.textContent.includes('complete') || status.textContent.includes('Error'));
-        }, { timeout: 240000 });
-
-        const results = await page.evaluate(() => {
-            const rows = document.querySelectorAll('#resultsBody tr');
-            return Array.from(rows).map(row => {
-                const cells = row.querySelectorAll('td');
-                return {
-                    query: cells[0]?.textContent || '',
-                    rows: cells[1]?.textContent || '',
-                    lanceql: cells[2]?.textContent || '',
-                    duckdb: cells[3]?.textContent || '',
-                    ratio: cells[4]?.textContent || '',
-                    winner: cells[5]?.textContent || ''
-                };
-            });
-        });
-
-        console.log('\n╔══════════════════════════════════════════════════════════════════════╗');
-        console.log('║        LanceQL vs DuckDB WASM Benchmark Results (10K rows)          ║');
-        console.log('╠══════════════════╦═══════╦════════════╦════════════╦═══════╦═════════╣');
-        console.log('║ Query            ║ Rows  ║ LanceQL    ║ DuckDB     ║ Ratio ║ Winner  ║');
-        console.log('╠══════════════════╬═══════╬════════════╬════════════╬═══════╬═════════╣');
-        for (const r of results) {
-            const q = r.query.padEnd(16);
-            const rows = r.rows.padStart(5);
-            const lq = (r.lanceql + 'ms').padStart(10);
-            const dd = (r.duckdb + 'ms').padStart(10);
-            const ratio = r.ratio.padStart(5);
-            const w = r.winner.padEnd(7);
-            console.log(`║ ${q} ║ ${rows} ║ ${lq} ║ ${dd} ║ ${ratio} ║ ${w} ║`);
-        }
-        console.log('╚══════════════════╩═══════╩════════════╩════════════╩═══════╩═════════╝');
 
         expect(results.length).toBeGreaterThan(0);
     });

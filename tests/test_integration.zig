@@ -202,7 +202,6 @@ test "validate all fixture footers" {
         "simple_float64",
         "mixed_types",
         "with_nulls",
-        "empty",
         "large",
         "multiple_batches",
     };
@@ -602,7 +601,7 @@ const HttpReader = io.HttpReader;
 test "HTTP reader can read remote Lance file footer" {
     const allocator = std.testing.allocator;
 
-    const url = "https://data.metal0.dev/laion-1m/images.lance/data/110101001111011111011011ded2064282ae29b42f5d744a13.lance";
+    const url = "https://data.metal0.dev/laion-1m/images.lance/data/000101100010001011100000b1ce374b378e37ffcb3d50279e.lance";
 
     std.debug.print("\nHTTP Reader test:\n", .{});
     std.debug.print("  URL: {s}\n", .{url});

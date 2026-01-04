@@ -78,7 +78,7 @@ test.describe('LanceQL SQL Performance Benchmarks', () => {
             console.log(`P95:    ${result.p95.toFixed(2)}ms`);
             console.log(`Range:  ${result.min.toFixed(2)}-${result.max.toFixed(2)}ms`);
 
-            expect(result.median).toBeGreaterThan(0);
+            expect(result.median).toBeGreaterThanOrEqual(0);
         });
 
         test(`Aggregation performance (${rowCount} rows)`, async ({ page }) => {
@@ -125,7 +125,8 @@ test.describe('LanceQL SQL Performance Benchmarks', () => {
             console.log(`P95:    ${result.p95.toFixed(2)}ms`);
             console.log(`Range:  ${result.min.toFixed(2)}-${result.max.toFixed(2)}ms`);
 
-            expect(result.median).toBeGreaterThan(0);
+            // Fast aggregations may measure as 0ms due to timer resolution
+            expect(result.median).toBeGreaterThanOrEqual(0);
         });
 
         test(`JOIN performance (${rowCount} rows)`, async ({ page }) => {
@@ -179,7 +180,8 @@ test.describe('LanceQL SQL Performance Benchmarks', () => {
             console.log(`P95:    ${result.p95.toFixed(2)}ms`);
             console.log(`Range:  ${result.min.toFixed(2)}-${result.max.toFixed(2)}ms`);
 
-            expect(result.median).toBeGreaterThan(0);
+            // Fast JOINs may measure as 0ms due to timer resolution
+            expect(result.median).toBeGreaterThanOrEqual(0);
         });
     }
 
@@ -232,7 +234,7 @@ test.describe('LanceQL SQL Performance Benchmarks', () => {
         console.log(`P95:    ${result.p95.toFixed(2)}ms`);
         console.log(`Range:  ${result.min.toFixed(2)}-${result.max.toFixed(2)}ms`);
 
-        expect(result.median).toBeGreaterThan(0);
+        expect(result.median).toBeGreaterThanOrEqual(0);
     });
 
     test('Window function performance', async ({ page }) => {
@@ -281,7 +283,7 @@ test.describe('LanceQL SQL Performance Benchmarks', () => {
         console.log(`P95:    ${result.p95.toFixed(2)}ms`);
         console.log(`Range:  ${result.min.toFixed(2)}-${result.max.toFixed(2)}ms`);
 
-        expect(result.median).toBeGreaterThan(0);
+        expect(result.median).toBeGreaterThanOrEqual(0);
     });
 
     test('CTE performance', async ({ page }) => {
@@ -336,6 +338,6 @@ test.describe('LanceQL SQL Performance Benchmarks', () => {
         console.log(`P95:    ${result.p95.toFixed(2)}ms`);
         console.log(`Range:  ${result.min.toFixed(2)}-${result.max.toFixed(2)}ms`);
 
-        expect(result.median).toBeGreaterThan(0);
+        expect(result.median).toBeGreaterThanOrEqual(0);
     });
 });

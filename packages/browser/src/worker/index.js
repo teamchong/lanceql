@@ -13,7 +13,8 @@
 import { WorkerStore } from './worker-store.js';
 import { WorkerDatabase } from './worker-database.js';
 import { WorkerVault } from './worker-vault.js';
-import { executeSQL, evalWhere } from './sql/executor.js';
+import { evalWhere } from './sql/executor.js';
+import { getWasmSqlExecutor } from './wasm-sql-bridge.js';
 import { E } from './data-types.js';
 
 // ============================================================================
@@ -21,103 +22,74 @@ import { E } from './data-types.js';
 // ============================================================================
 
 /**
- * Check if a query can be executed in WASM for better performance
- * Returns true for simple SELECT queries on numeric-heavy tables
+ * Execute SQL query entirely in WASM using WasmSqlExecutor
+ * Supports full SQL: JOINs, CTEs, Window functions, Set operations
+ * @param {WorkerDatabase} db - Database instance
+ * @param {string} sql - SQL query
+ * @returns {Object} - Result with columnar format
  */
-function canUseWasmSql(sql) {
-    const upper = sql.toUpperCase().trim();
-    // Only handle simple SELECT queries for now
-    return upper.startsWith('SELECT') &&
-           !upper.includes('JOIN') &&  // JOINs need more work
-           !upper.includes('UNION');
+async function executeWasmSqlFull(db, sql) {
+    if (!wasm) {
+        throw new Error('WASM not loaded');
+    }
+
+    const executor = getWasmSqlExecutor();
+
+    // Extract all table names from SQL (FROM, JOIN, WITH clauses)
+    const tableNames = extractTableNames(sql);
+
+    // Register all tables with the executor
+    for (const tableName of tableNames) {
+        const table = db.tables.get(tableName);
+        if (!table) continue; // Table might be a CTE or not exist
+
+        // Get columnar data
+        const columnarData = await db.selectColumnar(tableName);
+        if (!columnarData || columnarData.rowCount === 0) continue;
+
+        const { columns: colData, rowCount } = columnarData;
+
+        // Register table with executor
+        executor.registerTable(tableName, colData, rowCount);
+    }
+
+    // Execute SQL in WASM
+    const result = executor.execute(sql);
+
+    // Clear registered tables for next query
+    executor.clear();
+
+    return result;
 }
 
 /**
- * Execute SQL query entirely in WASM with binary result transfer
- * @param {WorkerDatabase} db - Database instance
- * @param {string} sql - SQL query
- * @returns {Object} - Result with _format: 'wasm_binary'
+ * Extract all table names referenced in SQL query
  */
-async function executeWasmSql(db, sql) {
-    if (!wasm) return null;
+function extractTableNames(sql) {
+    const names = new Set();
+    const upper = sql.toUpperCase();
 
-    // Parse SQL to extract table name (simple extraction)
-    const match = sql.match(/FROM\s+(\w+)/i);
-    if (!match) return null;
-    const tableName = match[1];
+    // Match FROM tableName
+    const fromMatches = sql.matchAll(/FROM\s+(\w+)/gi);
+    for (const m of fromMatches) names.add(m[1].toLowerCase());
 
-    const table = db.tables.get(tableName);
-    if (!table) return null;
+    // Match JOIN tableName
+    const joinMatches = sql.matchAll(/JOIN\s+(\w+)/gi);
+    for (const m of joinMatches) names.add(m[1].toLowerCase());
 
-    // Get columnar data
-    const columnarData = await db.selectColumnar(tableName);
-    if (!columnarData || columnarData.rowCount === 0) return null;
+    // Match UPDATE tableName
+    const updateMatch = sql.match(/UPDATE\s+(\w+)/i);
+    if (updateMatch) names.add(updateMatch[1].toLowerCase());
 
-    const { columns: colData, rowCount, schema } = columnarData;
-    const colNames = schema.map(c => c.name);
+    // Match INSERT INTO tableName
+    const insertMatch = sql.match(/INSERT\s+INTO\s+(\w+)/i);
+    if (insertMatch) names.add(insertMatch[1].toLowerCase());
 
-    // Check if has ANY string columns - fall back to JS for now
-    // String encoding overhead negates transfer savings
-    for (const c of schema) {
-        const type = (c.type || c.dataType || '').toLowerCase();
-        if (type === 'text' || type === 'string') return null;
-    }
+    // Match DELETE FROM tableName
+    const deleteMatch = sql.match(/DELETE\s+FROM\s+(\w+)/i);
+    if (deleteMatch) names.add(deleteMatch[1].toLowerCase());
 
-    // Pack all numeric data into a single binary buffer for zero-copy transfer
-    const HEADER_SIZE = 32;
-    const COL_META_SIZE = 24;
-
-    // Calculate total size
-    let numericSize = 0;
-    const colMeta = [];
-    for (const name of colNames) {
-        const arr = colData[name];
-        if (ArrayBuffer.isView(arr)) {
-            colMeta.push({ name, size: arr.byteLength, elemSize: arr.BYTES_PER_ELEMENT || 8 });
-            numericSize += arr.byteLength;
-        }
-    }
-
-    const totalSize = HEADER_SIZE + COL_META_SIZE * colMeta.length + numericSize;
-    const buffer = new ArrayBuffer(totalSize);
-    const view = new DataView(buffer);
-    const u8 = new Uint8Array(buffer);
-
-    // Write header
-    view.setUint32(0, 1, true); // version
-    view.setUint32(4, colMeta.length, true); // column count
-    view.setBigUint64(8, BigInt(rowCount), true); // row count
-    view.setUint32(16, HEADER_SIZE, true); // header size
-    view.setUint32(20, HEADER_SIZE, true); // col meta offset
-    view.setUint32(24, HEADER_SIZE + COL_META_SIZE * colMeta.length, true); // data offset
-    view.setUint32(28, 0, true); // flags
-
-    // Write column metadata and copy data
-    let metaOffset = HEADER_SIZE;
-    let dataOffset = HEADER_SIZE + COL_META_SIZE * colMeta.length;
-
-    for (const meta of colMeta) {
-        const arr = colData[meta.name];
-        view.setUint32(metaOffset, 0, true); // type = numeric
-        view.setUint32(metaOffset + 4, meta.name.length, true);
-        view.setUint32(metaOffset + 8, dataOffset, true);
-        view.setBigUint64(metaOffset + 12, BigInt(meta.size), true);
-        view.setUint32(metaOffset + 20, meta.elemSize, true);
-
-        // Copy data
-        const src = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
-        u8.set(src, dataOffset);
-        dataOffset += meta.size;
-        metaOffset += COL_META_SIZE;
-    }
-
-    return {
-        _format: 'wasm_binary',
-        buffer,
-        columns: colNames,
-        rowCount,
-        schema
-    };
+    return Array.from(names);
 }
 
 // ============================================================================
@@ -653,17 +625,9 @@ async function handleMessage(port, data) {
             result = await db.select(args.tableName, options);
         } else if (method === 'db:exec') {
             const db = await getDatabase(args.db);
-            // Try WASM binary execution for simple SELECT queries (10x faster for large results)
-            if (canUseWasmSql(args.sql)) {
-                const wasmResult = await executeWasmSql(db, args.sql);
-                if (wasmResult) {
-                    result = wasmResult;
-                } else {
-                    result = await executeSQL(db, args.sql);
-                }
-            } else {
-                result = await executeSQL(db, args.sql);
-            }
+
+            // Execute SQL entirely in WASM
+            result = await executeWasmSqlFull(db, args.sql);
 
             // For large results, use lazy transfer - store data in worker, return handle
             if (result && result._format === 'columnar' && result.rowCount >= 1000) {

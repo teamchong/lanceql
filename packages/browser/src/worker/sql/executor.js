@@ -9,7 +9,7 @@
 import { TokenType, SQLLexer } from './tokenizer.js';
 import { SQLParser } from './parser.js';
 import { getGPUTransformerState, getEmbeddingCache } from '../worker-store.js';
-import { getWasm, getWasmMemory, loadFragmentToWasm, wasmAggregate as wasmAggregateFragment } from '../index.js';
+import { getWasm, getWasmMemory } from '../index.js';
 
 // Thresholds: WASM SIMD -> GPU
 const WASM_THRESHOLD = 100;     // Use WASM SIMD for 100+ rows (below is plain JS)
@@ -2169,84 +2169,6 @@ async function executeAST(db, ast) {
             }
 
             // ================================================================
-            // FAST PATH: Direct WASM aggregation (no row conversion)
-            // Conditions: no WHERE, no JOIN, only aggregate columns
-            // ================================================================
-            const isSimpleAggregate = !ast.where && !ast.joins?.length && !ast.groupBy &&
-                ast.columns.every(c => c.type === 'aggregate') &&
-                ast.table && !ast.tables?.[0]?.type;
-
-            if (isSimpleAggregate && db.getFragmentPaths) {
-                const fragPaths = db.getFragmentPaths(ast.table);
-                const hasBuffer = db.hasBufferedData?.(ast.table);
-
-                // Only use fast path if all data is persisted (no buffered data)
-                if (fragPaths.length > 0 && !hasBuffer) {
-                    try {
-                        const resultRow = {};
-                        let success = true;
-
-                        for (const col of ast.columns) {
-                            const func = col.func.toLowerCase();
-                            const arg = col.arg;
-                            const aggName = col.alias || `${col.func}(${arg === '*' ? '*' : (typeof arg === 'string' ? arg : arg.column)})`;
-
-                            if (func === 'count' && arg === '*') {
-                                // Count all rows across fragments
-                                let total = 0;
-                                for (const fragPath of fragPaths) {
-                                    const result = await wasmAggregateFragment(fragPath, 0, 'count');
-                                    if (result !== null) total += result;
-                                }
-                                resultRow[aggName] = total;
-                            } else if (['sum', 'min', 'max', 'avg'].includes(func)) {
-                                const colName = typeof arg === 'string' ? arg : arg.column;
-                                const colIdx = db.getColumnIndex(ast.table, colName);
-
-                                if (colIdx >= 0) {
-                                    // Aggregate across all fragments
-                                    let aggResult = func === 'min' ? Infinity : func === 'max' ? -Infinity : 0;
-                                    let totalCount = 0;
-
-                                    for (const fragPath of fragPaths) {
-                                        const result = await wasmAggregateFragment(fragPath, colIdx, func === 'avg' ? 'sum' : func);
-                                        const count = await wasmAggregateFragment(fragPath, 0, 'count');
-                                        if (result !== null && count !== null) {
-                                            if (func === 'sum' || func === 'avg') {
-                                                aggResult += result;
-                                            } else if (func === 'min') {
-                                                aggResult = Math.min(aggResult, result);
-                                            } else if (func === 'max') {
-                                                aggResult = Math.max(aggResult, result);
-                                            }
-                                            totalCount += count;
-                                        }
-                                    }
-
-                                    resultRow[aggName] = func === 'avg' && totalCount > 0
-                                        ? aggResult / totalCount
-                                        : aggResult;
-                                } else {
-                                    success = false;
-                                    break;
-                                }
-                            } else {
-                                success = false;
-                                break;
-                            }
-                        }
-
-                        if (success) {
-                            return { rows: [resultRow], columns: Object.keys(resultRow) };
-                        }
-                    } catch (e) {
-                        // Fall through to regular path
-                        console.warn('[Executor] WASM fast path failed:', e);
-                    }
-                }
-            }
-
-            // ================================================================
             // COLUMNAR PATH: Stay columnar, avoid row objects
             // ================================================================
             const mainTable = ast.tables?.[0];
@@ -2743,14 +2665,16 @@ async function executeAST(db, ast) {
                         }
                     }
                 } else {
-                    rows = [];
+                    // Columnar returned 0 rows - fall through to row-based select
+                    rows = await db.select(ast.table, {});
                 }
-            } else if (!mainTable) {
+            } else if (!mainTable && !ast.table) {
                 // No FROM clause - create a single empty row for expression evaluation
                 rows = [{}];
-            } else if (mainTable.type === 'subquery') {
+            } else if (mainTable?.type === 'subquery') {
                 rows = derivedTables.get(mainTable.alias) || [];
             } else {
+                // Use ast.table which is set for simple FROM clauses
                 rows = await db.select(ast.table, {});
             }
 

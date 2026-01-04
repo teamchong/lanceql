@@ -661,11 +661,13 @@ export class WorkerDatabase {
                 mergedColumns[name] = new Float64Array(0);
             } else if (arrays.length === 1) {
                 mergedColumns[name] = arrays[0];
-                if (name === colNames[0]) totalRows = arrays[0].length;
+                // Track totalRows from any column that has data
+                if (totalRows === 0) totalRows = arrays[0].length;
             } else {
                 // Merge multiple arrays
                 const totalLen = arrays.reduce((sum, a) => sum + a.length, 0);
-                if (name === colNames[0]) totalRows = totalLen;
+                // Track totalRows from any column that has data
+                if (totalRows === 0) totalRows = totalLen;
 
                 // Determine type from first array
                 const first = arrays[0];

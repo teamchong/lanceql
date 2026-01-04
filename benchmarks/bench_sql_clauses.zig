@@ -181,6 +181,104 @@ fn runSQLBenchmark(
     return .{ .rows_per_sec = rows_per_sec, .iterations = iterations, .success = true, .error_msg = null };
 }
 
+/// Run JOIN benchmark with two tables registered
+fn runJoinSQLBenchmark(
+    allocator: std.mem.Allocator,
+    orders_path: []const u8,
+    customers_path: []const u8,
+    sql: []const u8,
+    warmup_secs: i64,
+    bench_secs: i64,
+) BenchResult {
+    var iterations: u64 = 0;
+    var total_rows: u64 = 0;
+
+    // Warmup
+    const warmup_end = std.time.nanoTimestamp() + warmup_secs * 1_000_000_000;
+    while (std.time.nanoTimestamp() < warmup_end) {
+        // Read both files
+        const orders_bytes = readFileBytes(allocator, orders_path) catch {
+            return .{ .rows_per_sec = 0, .iterations = 0, .success = false, .error_msg = "failed to read orders" };
+        };
+        defer allocator.free(orders_bytes);
+
+        const customers_bytes = readFileBytes(allocator, customers_path) catch {
+            return .{ .rows_per_sec = 0, .iterations = 0, .success = false, .error_msg = "failed to read customers" };
+        };
+        defer allocator.free(customers_bytes);
+
+        // Create tables
+        var orders_table = Table.init(allocator, orders_bytes) catch {
+            return .{ .rows_per_sec = 0, .iterations = 0, .success = false, .error_msg = "failed to init orders table" };
+        };
+        defer orders_table.deinit();
+
+        var customers_table = Table.init(allocator, customers_bytes) catch {
+            return .{ .rows_per_sec = 0, .iterations = 0, .success = false, .error_msg = "failed to init customers table" };
+        };
+        defer customers_table.deinit();
+
+        // Create executor with orders as primary, register customers
+        var executor = Executor.init(&orders_table, allocator);
+        defer executor.deinit();
+        executor.registerTable("orders", &orders_table) catch {};
+        executor.registerTable("customers", &customers_table) catch {};
+
+        // Parse and execute
+        var stmt = parser.parseSQL(sql, allocator) catch {
+            return .{ .rows_per_sec = 0, .iterations = 0, .success = false, .error_msg = "failed to parse SQL" };
+        };
+        defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+        var result = executor.execute(&stmt.select, &[_]Value{}) catch {
+            return .{ .rows_per_sec = 0, .iterations = 0, .success = false, .error_msg = "failed to execute SQL" };
+        };
+        defer result.deinit();
+        std.mem.doNotOptimizeAway(&result);
+    }
+
+    // Benchmark
+    const benchmark_end_time = std.time.nanoTimestamp() + bench_secs * 1_000_000_000;
+    const start_time = std.time.nanoTimestamp();
+
+    while (std.time.nanoTimestamp() < benchmark_end_time) {
+        const orders_bytes = readFileBytes(allocator, orders_path) catch break;
+        defer allocator.free(orders_bytes);
+
+        const customers_bytes = readFileBytes(allocator, customers_path) catch break;
+        defer allocator.free(customers_bytes);
+
+        var orders_table = Table.init(allocator, orders_bytes) catch break;
+        defer orders_table.deinit();
+
+        var customers_table = Table.init(allocator, customers_bytes) catch break;
+        defer customers_table.deinit();
+
+        const row_count = orders_table.rowCount(0) catch 0;
+
+        var executor = Executor.init(&orders_table, allocator);
+        defer executor.deinit();
+        executor.registerTable("orders", &orders_table) catch {};
+        executor.registerTable("customers", &customers_table) catch {};
+
+        var stmt = parser.parseSQL(sql, allocator) catch break;
+        defer ast.deinitSelectStmt(&stmt.select, allocator);
+
+        var result = executor.execute(&stmt.select, &[_]Value{}) catch break;
+        defer result.deinit();
+
+        std.mem.doNotOptimizeAway(&result);
+        iterations += 1;
+        total_rows += row_count;
+    }
+
+    const elapsed_ns = std.time.nanoTimestamp() - start_time;
+    const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
+    const rows_per_sec = @as(f64, @floatFromInt(total_rows)) / elapsed_s;
+
+    return .{ .rows_per_sec = rows_per_sec, .iterations = iterations, .success = true, .error_msg = null };
+}
+
 /// Run benchmark using LazyTable (column-first I/O) - direct column access
 fn runLazyTableBenchmark(
     allocator: std.mem.Allocator,
@@ -952,16 +1050,35 @@ pub fn main() !void {
         std.debug.print("{s:<45} {s:>12} {s:>12} {s:>10}\n", .{ "Method", "Rows/sec", "Iterations", "Speedup" });
         std.debug.print("{s:<45} {s:>12} {s:>12} {s:>10}\n", .{ "-" ** 45, "-" ** 12, "-" ** 12, "-" ** 10 });
 
-        // Note: JOIN benchmarks need both tables registered with executor
-        // Current executor.init() only accepts one table, so we'd need multi-table support
-        // For now, skip LanceQL JOIN benchmark and only run DuckDB/Polars
-        std.debug.print("{s:<45} {s:>12} {s:>12} {s:>10}\n", .{
-            "LanceQL (JOIN via SQL executor)",
-            "TODO",
-            "-",
-            "-",
-        });
-        std.debug.print("         (Executor needs multi-table registration for JOIN)\n", .{});
+        // LanceQL JOIN benchmark with multi-table registration
+        var lanceql_join_rps: f64 = 0;
+        {
+            const result = runJoinSQLBenchmark(
+                allocator,
+                lance_file_path,
+                CUSTOMERS_LANCE_PATH,
+                "SELECT orders.customer_id, orders.amount, customers.name FROM orders INNER JOIN customers ON orders.customer_id = customers.id",
+                WARMUP_SECONDS,
+                BENCHMARK_SECONDS,
+            );
+
+            if (result.success) {
+                lanceql_join_rps = result.rows_per_sec;
+                std.debug.print("{s:<45} {d:>10.0}K {d:>12} {s:>10}\n", .{
+                    "LanceQL (JOIN via SQL executor)",
+                    result.rows_per_sec / 1000.0,
+                    result.iterations,
+                    "1.0x",
+                });
+            } else {
+                std.debug.print("{s:<45} {s:>12} {s:>12} {s:>10}\n", .{
+                    "LanceQL (JOIN via SQL executor)",
+                    result.error_msg orelse "error",
+                    "-",
+                    "-",
+                });
+            }
+        }
 
         var duckdb_join_rps: f64 = 0;
         if (has_duckdb) {
@@ -1127,6 +1244,6 @@ pub fn main() !void {
     std.debug.print("FILTER:    Uses real WHERE clause evaluation\n", .{});
     std.debug.print("AGGREGATE: Uses real aggregate accumulator\n", .{});
     std.debug.print("GROUP BY:  Uses efficient integer hashing (FNV-1a composite keys)\n", .{});
-    std.debug.print("JOIN:      TODO - needs multi-table executor support\n", .{});
+    std.debug.print("JOIN:      Uses real hash join with multi-table registration\n", .{});
     std.debug.print("\n", .{});
 }
