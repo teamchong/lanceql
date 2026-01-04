@@ -6,6 +6,7 @@
  * - LocalDatabase operations (SQL, Lance tables)
  * - WebGPU transformer (shared model for embeddings)
  *
+ * Uses Zig WASM for SIMD-accelerated aggregations (sum, min, max, avg).
  * Benefits: shared GPU model, responsive UI, efficient OPFS access via createSyncAccessHandle
  */
 
@@ -14,6 +15,37 @@ import { WorkerDatabase } from './worker-database.js';
 import { WorkerVault } from './worker-vault.js';
 import { executeSQL, evalWhere } from './sql/executor.js';
 import { E } from './data-types.js';
+
+// ============================================================================
+// WASM Module (Zig SIMD aggregations)
+// ============================================================================
+
+let wasm = null;
+let wasmMemory = null;
+
+async function loadWasm() {
+    if (wasm) return wasm;
+    try {
+        // Load WASM from same directory as worker
+        const response = await fetch(new URL('./lanceql.wasm', import.meta.url));
+        const bytes = await response.arrayBuffer();
+        const module = await WebAssembly.instantiate(bytes, {});
+        wasm = module.instance.exports;
+        wasmMemory = wasm.memory;
+        console.log('[LanceQLWorker] WASM loaded');
+        return wasm;
+    } catch (e) {
+        console.warn('[LanceQLWorker] WASM not available:', e.message);
+        return null;
+    }
+}
+
+// Export WASM for executor
+export function getWasm() { return wasm; }
+export function getWasmMemory() { return wasmMemory; }
+
+// Initialize WASM on load
+loadWasm();
 
 // ============================================================================
 // Shared State

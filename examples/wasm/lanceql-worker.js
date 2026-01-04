@@ -1,1 +1,1 @@
-../../packages/browser/src/lanceql-worker.js
+../../packages/browser/dist/lanceql-worker.js

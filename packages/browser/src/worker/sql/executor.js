@@ -1,69 +1,37 @@
 /**
  * SQL Executor - Execute parsed SQL AST
+ *
+ * Threshold-based optimization:
+ * - < 10K rows: Zig WASM with SIMD
+ * - >= 10K rows: WebGPU (JS API required)
  */
 
 import { TokenType, SQLLexer } from './tokenizer.js';
 import { SQLParser } from './parser.js';
 import { getGPUTransformerState, getEmbeddingCache } from '../worker-store.js';
+import { getWasm, getWasmMemory } from '../index.js';
 
-// GPU components (lazy-loaded with threshold-based optimization)
+// Thresholds: WASM SIMD -> GPU
+const WASM_THRESHOLD = 100;     // Use WASM SIMD for 100+ rows (below is plain JS)
+const GPU_THRESHOLD = 10000;    // Use GPU for 10K+ rows
+
+// GPU components (lazy-loaded, only for large datasets)
 let gpuAggregator = null;
-let gpuJoiner = null;
-let gpuGrouper = null;
 let gpuInitPromise = null;
 
-// Thresholds for GPU acceleration (typed arrays -> GPU)
-// GPU has overhead, so only use for larger datasets
-const GPU_AGG_ROWS = 10000;     // Use GPU for aggregation with 10K+ rows
-const GPU_JOIN_PRODUCT = 100000; // Use GPU for joins when left*right >= 100K
-const GPU_GROUP_ROWS = 10000;   // Use GPU for grouping with 10K+ rows
-
-async function initGPU() {
+async function getGPUAgg() {
+    if (gpuAggregator) return gpuAggregator;
     if (gpuInitPromise) return gpuInitPromise;
     gpuInitPromise = (async () => {
         try {
-            const webgpu = await import('../../webgpu/index.js');
-
-            // Initialize aggregator
-            const agg = webgpu.getGPUAggregator();
+            const { getGPUAggregator } = await import('../../webgpu/index.js');
+            const agg = getGPUAggregator();
             await agg.init();
             if (agg.available) gpuAggregator = agg;
-
-            // Initialize joiner
-            const joiner = webgpu.getGPUJoiner();
-            await joiner.init();
-            if (joiner.available) gpuJoiner = joiner;
-
-            // Initialize grouper
-            const grouper = webgpu.getGPUGrouper();
-            await grouper.init();
-            if (grouper.available) gpuGrouper = grouper;
-
-            console.log('[SQL Executor] GPU initialized:', {
-                aggregator: !!gpuAggregator,
-                joiner: !!gpuJoiner,
-                grouper: !!gpuGrouper
-            });
-        } catch (e) {
-            console.log('[SQL Executor] GPU not available:', e.message);
-        }
+        } catch (e) { /* GPU not available */ }
+        return gpuAggregator;
     })();
     return gpuInitPromise;
-}
-
-async function getGPUAgg() {
-    await initGPU();
-    return gpuAggregator;
-}
-
-async function getGPUJoiner() {
-    await initGPU();
-    return gpuJoiner;
-}
-
-async function getGPUGrouper() {
-    await initGPU();
-    return gpuGrouper;
 }
 
 function getColumnValue(row, column, tableAliases = {}) {
@@ -307,9 +275,44 @@ function typedMax(arr) {
     return max;
 }
 
-// Note: GPU_AGG_ROWS is defined at top of file (10000)
+/**
+ * Tiered aggregation: GPU → WASM SIMD → JS typed arrays
+ *
+ * Tier 1: GPU (10K+ rows, if WebGPU available)
+ * Tier 2: WASM SIMD (100+ rows, if WASM loaded)
+ * Tier 3: JS typed arrays (always available)
+ */
+function wasmAggregate(func, vals) {
+    const wasm = getWasm();
+    if (!wasm) return null;
 
-// Calculate aggregate function value (sync version for backward compat)
+    const mem = getWasmMemory();
+    const ptr = wasm.alloc(vals.length * 8);
+    if (!ptr) return null;
+
+    // Single copy to WASM heap, then SIMD operates in-place
+    new Float64Array(mem.buffer, ptr, vals.length).set(vals);
+
+    switch (func) {
+        case 'sum': return wasm.sumFloat64Buffer(ptr, vals.length);
+        case 'min': return wasm.minFloat64Buffer(ptr, vals.length);
+        case 'max': return wasm.maxFloat64Buffer(ptr, vals.length);
+        case 'avg': return wasm.avgFloat64Buffer(ptr, vals.length);
+        default: return null;
+    }
+}
+
+function jsAggregate(func, vals) {
+    switch (func) {
+        case 'sum': return typedSum(vals);
+        case 'min': return typedMin(vals);
+        case 'max': return typedMax(vals);
+        case 'avg': return vals.length > 0 ? typedSum(vals) / vals.length : null;
+        default: return null;
+    }
+}
+
+// Calculate aggregate: WASM SIMD (100+) → JS fallback
 function calculateAggregate(func, arg, rows) {
     if (rows.length === 0) return func === 'count' ? 0 : null;
 
@@ -321,21 +324,15 @@ function calculateAggregate(func, arg, rows) {
             let cnt = 0;
             for (let i = 0; i < rows.length; i++) if (rows[i][colName] != null) cnt++;
             return cnt;
-        case 'sum': {
+        case 'sum': case 'min': case 'max': case 'avg': {
             const vals = extractNumericValues(rows, colName);
-            return typedSum(vals);
-        }
-        case 'avg': {
-            const vals = extractNumericValues(rows, colName);
-            return vals.length > 0 ? typedSum(vals) / vals.length : null;
-        }
-        case 'min': {
-            const vals = extractNumericValues(rows, colName);
-            return typedMin(vals);
-        }
-        case 'max': {
-            const vals = extractNumericValues(rows, colName);
-            return typedMax(vals);
+            // Tier 2: WASM SIMD (100+ rows)
+            if (vals.length >= WASM_THRESHOLD) {
+                const r = wasmAggregate(func, vals);
+                if (r !== null) return r;
+            }
+            // Tier 3: JS typed arrays
+            return jsAggregate(func, vals);
         }
         case 'stddev': case 'stddev_samp': {
             const vals = extractNumericValues(rows, colName);
@@ -390,28 +387,26 @@ function calculateAggregate(func, arg, rows) {
     }
 }
 
-// Async version with GPU acceleration for large datasets
+// Async version with GPU acceleration for large datasets (10K+ rows)
 async function calculateAggregateAsync(func, arg, rows) {
     if (rows.length === 0) return func === 'count' ? 0 : null;
 
-    // Use GPU for large datasets with numeric aggregations (10K+ rows)
-    if (rows.length >= GPU_AGG_ROWS && (func === 'sum' || func === 'min' || func === 'max' || func === 'avg')) {
+    // GPU for very large datasets (10K+ rows)
+    if (rows.length >= GPU_THRESHOLD && (func === 'sum' || func === 'min' || func === 'max' || func === 'avg')) {
         const gpuAgg = await getGPUAgg();
         if (gpuAgg) {
             const colName = arg === '*' ? null : (typeof arg === 'string' ? arg : (arg.column || arg));
             const vals = extractNumericValues(rows, colName);
-            if (vals.length >= GPU_AGG_ROWS) {
-                switch (func) {
-                    case 'sum': return gpuAgg.sum(vals);
-                    case 'min': return gpuAgg.min(vals);
-                    case 'max': return gpuAgg.max(vals);
-                    case 'avg': return gpuAgg.avg(vals);
-                }
+            switch (func) {
+                case 'sum': return gpuAgg.sum(vals);
+                case 'min': return gpuAgg.min(vals);
+                case 'max': return gpuAgg.max(vals);
+                case 'avg': return gpuAgg.avg(vals);
             }
         }
     }
 
-    // Fallback to optimized typed arrays (CPU)
+    // WASM SIMD (100-10K rows) or JS typed arrays (< 100 rows)
     return calculateAggregate(func, arg, rows);
 }
 
