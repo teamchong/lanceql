@@ -61,7 +61,13 @@ function assertFloatArrayEqual(actual, expected, message, tolerance = 1e-6) {
 // Load WASM
 const wasmBytes = fs.readFileSync(WASM_PATH);
 const wasm = new WebAssembly.Instance(new WebAssembly.Module(wasmBytes), {
-    env: { log_value: () => {} }
+    env: {
+        log_value: () => {},
+        opfs_open: () => 0,
+        opfs_close: () => {},
+        opfs_size: () => 0,
+        opfs_read: () => 0,
+    }
 }).exports;
 
 // Helper to load a lance file
