@@ -6,26 +6,64 @@ import { TokenType, SQLLexer } from './tokenizer.js';
 import { SQLParser } from './parser.js';
 import { getGPUTransformerState, getEmbeddingCache } from '../worker-store.js';
 
-// GPU aggregator (lazy-loaded)
+// GPU components (lazy-loaded with threshold-based optimization)
 let gpuAggregator = null;
-let gpuAggregatorPromise = null;
+let gpuJoiner = null;
+let gpuGrouper = null;
+let gpuInitPromise = null;
+
+// Thresholds for GPU acceleration (typed arrays -> GPU)
+// GPU has overhead, so only use for larger datasets
+const GPU_AGG_ROWS = 10000;     // Use GPU for aggregation with 10K+ rows
+const GPU_JOIN_PRODUCT = 100000; // Use GPU for joins when left*right >= 100K
+const GPU_GROUP_ROWS = 10000;   // Use GPU for grouping with 10K+ rows
+
+async function initGPU() {
+    if (gpuInitPromise) return gpuInitPromise;
+    gpuInitPromise = (async () => {
+        try {
+            const webgpu = await import('../../webgpu/index.js');
+
+            // Initialize aggregator
+            const agg = webgpu.getGPUAggregator();
+            await agg.init();
+            if (agg.available) gpuAggregator = agg;
+
+            // Initialize joiner
+            const joiner = webgpu.getGPUJoiner();
+            await joiner.init();
+            if (joiner.available) gpuJoiner = joiner;
+
+            // Initialize grouper
+            const grouper = webgpu.getGPUGrouper();
+            await grouper.init();
+            if (grouper.available) gpuGrouper = grouper;
+
+            console.log('[SQL Executor] GPU initialized:', {
+                aggregator: !!gpuAggregator,
+                joiner: !!gpuJoiner,
+                grouper: !!gpuGrouper
+            });
+        } catch (e) {
+            console.log('[SQL Executor] GPU not available:', e.message);
+        }
+    })();
+    return gpuInitPromise;
+}
 
 async function getGPUAgg() {
-    if (gpuAggregator) return gpuAggregator;
-    if (gpuAggregatorPromise) return gpuAggregatorPromise;
-    gpuAggregatorPromise = (async () => {
-        try {
-            const { getGPUAggregator } = await import('../../webgpu/index.js');
-            const agg = getGPUAggregator();
-            await agg.init();
-            if (agg.available) {
-                gpuAggregator = agg;
-                return agg;
-            }
-        } catch (e) { /* WebGPU not available */ }
-        return null;
-    })();
-    return gpuAggregatorPromise;
+    await initGPU();
+    return gpuAggregator;
+}
+
+async function getGPUJoiner() {
+    await initGPU();
+    return gpuJoiner;
+}
+
+async function getGPUGrouper() {
+    await initGPU();
+    return gpuGrouper;
 }
 
 function getColumnValue(row, column, tableAliases = {}) {
@@ -269,8 +307,7 @@ function typedMax(arr) {
     return max;
 }
 
-// GPU threshold for aggregation
-const GPU_AGG_THRESHOLD = 5000;
+// Note: GPU_AGG_ROWS is defined at top of file (10000)
 
 // Calculate aggregate function value (sync version for backward compat)
 function calculateAggregate(func, arg, rows) {
@@ -357,13 +394,13 @@ function calculateAggregate(func, arg, rows) {
 async function calculateAggregateAsync(func, arg, rows) {
     if (rows.length === 0) return func === 'count' ? 0 : null;
 
-    // Use GPU for large datasets with numeric aggregations
-    if (rows.length >= GPU_AGG_THRESHOLD && (func === 'sum' || func === 'min' || func === 'max' || func === 'avg')) {
+    // Use GPU for large datasets with numeric aggregations (10K+ rows)
+    if (rows.length >= GPU_AGG_ROWS && (func === 'sum' || func === 'min' || func === 'max' || func === 'avg')) {
         const gpuAgg = await getGPUAgg();
         if (gpuAgg) {
             const colName = arg === '*' ? null : (typeof arg === 'string' ? arg : (arg.column || arg));
             const vals = extractNumericValues(rows, colName);
-            if (vals.length >= GPU_AGG_THRESHOLD) {
+            if (vals.length >= GPU_AGG_ROWS) {
                 switch (func) {
                     case 'sum': return gpuAgg.sum(vals);
                     case 'min': return gpuAgg.min(vals);
@@ -374,7 +411,7 @@ async function calculateAggregateAsync(func, arg, rows) {
         }
     }
 
-    // Fallback to CPU
+    // Fallback to optimized typed arrays (CPU)
     return calculateAggregate(func, arg, rows);
 }
 

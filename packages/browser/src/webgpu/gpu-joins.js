@@ -78,8 +78,8 @@ fn init_table(@builtin(global_invocation_id) gid: vec3<u32>) {
 `;
 
 // Minimum rows to benefit from GPU acceleration
-// Reduced from 10000 - GPU is faster even for medium joins (500+ rows each side)
-const GPU_JOIN_THRESHOLD = 500;
+// GPU has overhead - use hash join for medium data, GPU for large (100K+ combinations)
+const GPU_JOIN_THRESHOLD = 316; // 316*316 ≈ 100K
 
 /**
  * GPU Joiner for SQL hash join operations

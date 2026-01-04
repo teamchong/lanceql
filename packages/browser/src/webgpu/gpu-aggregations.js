@@ -98,7 +98,8 @@ fn reduce_max_final(@builtin(local_invocation_id) lid: vec3<u32>) {
 `;
 
 // Minimum rows to benefit from GPU acceleration
-const GPU_THRESHOLD = 1000;
+// GPU has overhead - use typed arrays for medium data, GPU for large
+const GPU_THRESHOLD = 10000;
 
 /**
  * GPU Aggregator for SQL operations

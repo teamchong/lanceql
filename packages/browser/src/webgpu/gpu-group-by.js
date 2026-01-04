@@ -115,6 +115,7 @@ fn init_agg(@builtin(global_invocation_id) g: vec3<u32>) {
 `;
 
 // Minimum rows to benefit from GPU acceleration
+// GPU has overhead - use hash grouping for medium data, GPU for large
 const GPU_GROUP_THRESHOLD = 10000;
 
 /**
