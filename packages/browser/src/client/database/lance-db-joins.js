@@ -141,7 +141,7 @@ export async function hashJoin(db, leftDataset, rightDataset, ast, context) {
     const leftMeta = await joinExecutor._partitionToOPFS(leftStream, leftKey, 'left', true);
 
     let optimizedRightSQL = rightSQL;
-    const maxKeysForInClause = 1000;
+    const maxKeysForInClause = 10000;  // Increased from 1000 for better semi-join optimization
     if (leftMeta.collectedKeys && leftMeta.collectedKeys.size > 0 &&
         leftMeta.collectedKeys.size <= maxKeysForInClause) {
         const inClause = buildInClause(rightKey, leftMeta.collectedKeys);

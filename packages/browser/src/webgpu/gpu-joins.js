@@ -78,7 +78,8 @@ fn init_table(@builtin(global_invocation_id) gid: vec3<u32>) {
 `;
 
 // Minimum rows to benefit from GPU acceleration
-const GPU_JOIN_THRESHOLD = 10000;
+// Reduced from 10000 - GPU is faster even for medium joins (500+ rows each side)
+const GPU_JOIN_THRESHOLD = 500;
 
 /**
  * GPU Joiner for SQL hash join operations
@@ -174,8 +175,8 @@ export class GPUJoiner {
         const leftKeys = this._extractKeys(leftRows, leftKey);
         const rightKeys = this._extractKeys(rightRows, rightKey);
 
-        // Hash table capacity (power of 2, at least 2x size)
-        const capacity = this._nextPowerOf2(rightSize * 2);
+        // Hash table capacity (power of 2, ~25% load factor for fewer collisions)
+        const capacity = this._nextPowerOf2(rightSize * 4);
         const maxMatches = Math.max(leftSize * 10, 100000); // Allow many-to-many
 
         // Create GPU buffers

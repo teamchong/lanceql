@@ -14234,7 +14234,7 @@ async function hashJoin(db, leftDataset, rightDataset, ast, context) {
   const leftStream = leftExecutor.executeStream(leftSQL);
   const leftMeta = await joinExecutor._partitionToOPFS(leftStream, leftKey, "left", true);
   let optimizedRightSQL = rightSQL;
-  const maxKeysForInClause = 1e3;
+  const maxKeysForInClause = 1e4;
   if (leftMeta.collectedKeys && leftMeta.collectedKeys.size > 0 && leftMeta.collectedKeys.size <= maxKeysForInClause) {
     const inClause = buildInClause(rightKey, leftMeta.collectedKeys);
     optimizedRightSQL = appendWhereClause(rightSQL, inClause);
