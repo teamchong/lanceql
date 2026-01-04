@@ -8,12 +8,12 @@
 import { GPUBufferManager, ModelWeightCache } from './gpu-buffers.js';
 import { GGUFLoader, resolveModelUrl } from './gguf-loader.js';
 
-// Import shader sources (will be inlined by bundler)
-import GEMM_SHADER from './shaders/gemm.wgsl?raw';
-import LAYERNORM_SHADER from './shaders/layernorm.wgsl?raw';
-import GELU_SHADER from './shaders/gelu.wgsl?raw';
-import EMBEDDING_SHADER from './shaders/embedding.wgsl?raw';
-import ATTENTION_SHADER from './shaders/attention.wgsl?raw';
+// Import shader sources (will be inlined by bundler with text loader)
+import GEMM_SHADER from './shaders/gemm.wgsl';
+import LAYERNORM_SHADER from './shaders/layernorm.wgsl';
+import GELU_SHADER from './shaders/gelu.wgsl';
+import EMBEDDING_SHADER from './shaders/embedding.wgsl';
+import ATTENTION_SHADER from './shaders/attention.wgsl';
 
 /**
  * WebGPU Transformer Encoder

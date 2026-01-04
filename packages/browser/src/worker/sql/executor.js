@@ -6,6 +6,28 @@ import { TokenType, SQLLexer } from './tokenizer.js';
 import { SQLParser } from './parser.js';
 import { getGPUTransformerState, getEmbeddingCache } from '../worker-store.js';
 
+// GPU aggregator (lazy-loaded)
+let gpuAggregator = null;
+let gpuAggregatorPromise = null;
+
+async function getGPUAgg() {
+    if (gpuAggregator) return gpuAggregator;
+    if (gpuAggregatorPromise) return gpuAggregatorPromise;
+    gpuAggregatorPromise = (async () => {
+        try {
+            const { getGPUAggregator } = await import('../../webgpu/index.js');
+            const agg = getGPUAggregator();
+            await agg.init();
+            if (agg.available) {
+                gpuAggregator = agg;
+                return agg;
+            }
+        } catch (e) { /* WebGPU not available */ }
+        return null;
+    })();
+    return gpuAggregatorPromise;
+}
+
 function getColumnValue(row, column, tableAliases = {}) {
     if (typeof column === 'string') {
         return row[column];
@@ -212,7 +234,45 @@ async function preExecuteSubqueries(where, db) {
     }
 }
 
-// Calculate aggregate function value
+// Extract numeric values from rows into typed array for fast aggregation
+function extractNumericValues(rows, colName) {
+    const n = rows.length;
+    const values = new Float64Array(n);
+    let count = 0;
+    for (let i = 0; i < n; i++) {
+        const val = rows[i][colName];
+        if (typeof val === 'number') {
+            values[count++] = val;
+        }
+    }
+    return count === n ? values : values.subarray(0, count);
+}
+
+// Fast typed array aggregations
+function typedSum(arr) {
+    let sum = 0;
+    for (let i = 0; i < arr.length; i++) sum += arr[i];
+    return sum;
+}
+
+function typedMin(arr) {
+    if (arr.length === 0) return null;
+    let min = arr[0];
+    for (let i = 1; i < arr.length; i++) if (arr[i] < min) min = arr[i];
+    return min;
+}
+
+function typedMax(arr) {
+    if (arr.length === 0) return null;
+    let max = arr[0];
+    for (let i = 1; i < arr.length; i++) if (arr[i] > max) max = arr[i];
+    return max;
+}
+
+// GPU threshold for aggregation
+const GPU_AGG_THRESHOLD = 5000;
+
+// Calculate aggregate function value (sync version for backward compat)
 function calculateAggregate(func, arg, rows) {
     if (rows.length === 0) return func === 'count' ? 0 : null;
 
@@ -221,70 +281,59 @@ function calculateAggregate(func, arg, rows) {
     switch (func) {
         case 'count':
             if (arg === '*') return rows.length;
-            return rows.filter(r => r[colName] != null).length;
+            let cnt = 0;
+            for (let i = 0; i < rows.length; i++) if (rows[i][colName] != null) cnt++;
+            return cnt;
         case 'sum': {
-            let sum = 0;
-            for (const row of rows) {
-                const val = row[colName];
-                if (typeof val === 'number') sum += val;
-            }
-            return sum;
+            const vals = extractNumericValues(rows, colName);
+            return typedSum(vals);
         }
         case 'avg': {
-            let sum = 0, count = 0;
-            for (const row of rows) {
-                const val = row[colName];
-                if (typeof val === 'number') {
-                    sum += val;
-                    count++;
-                }
-            }
-            return count > 0 ? sum / count : null;
+            const vals = extractNumericValues(rows, colName);
+            return vals.length > 0 ? typedSum(vals) / vals.length : null;
         }
         case 'min': {
-            let min = Infinity;
-            for (const row of rows) {
-                const val = row[colName];
-                if (val != null && val < min) min = val;
-            }
-            return min === Infinity ? null : min;
+            const vals = extractNumericValues(rows, colName);
+            return typedMin(vals);
         }
         case 'max': {
-            let max = -Infinity;
-            for (const row of rows) {
-                const val = row[colName];
-                if (val != null && val > max) max = val;
-            }
-            return max === -Infinity ? null : max;
+            const vals = extractNumericValues(rows, colName);
+            return typedMax(vals);
         }
         case 'stddev': case 'stddev_samp': {
-            const vals = rows.map(r => r[colName]).filter(v => v != null && typeof v === 'number');
+            const vals = extractNumericValues(rows, colName);
             if (vals.length < 2) return null;
-            const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
-            const variance = vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / (vals.length - 1);
-            return Math.sqrt(variance);
+            const mean = typedSum(vals) / vals.length;
+            let variance = 0;
+            for (let i = 0; i < vals.length; i++) variance += (vals[i] - mean) ** 2;
+            return Math.sqrt(variance / (vals.length - 1));
         }
         case 'stddev_pop': {
-            const vals = rows.map(r => r[colName]).filter(v => v != null && typeof v === 'number');
+            const vals = extractNumericValues(rows, colName);
             if (vals.length === 0) return null;
-            const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
-            const variance = vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / vals.length;
-            return Math.sqrt(variance);
+            const mean = typedSum(vals) / vals.length;
+            let variance = 0;
+            for (let i = 0; i < vals.length; i++) variance += (vals[i] - mean) ** 2;
+            return Math.sqrt(variance / vals.length);
         }
         case 'variance': case 'var_samp': {
-            const vals = rows.map(r => r[colName]).filter(v => v != null && typeof v === 'number');
+            const vals = extractNumericValues(rows, colName);
             if (vals.length < 2) return null;
-            const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
-            return vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / (vals.length - 1);
+            const mean = typedSum(vals) / vals.length;
+            let variance = 0;
+            for (let i = 0; i < vals.length; i++) variance += (vals[i] - mean) ** 2;
+            return variance / (vals.length - 1);
         }
         case 'var_pop': {
-            const vals = rows.map(r => r[colName]).filter(v => v != null && typeof v === 'number');
+            const vals = extractNumericValues(rows, colName);
             if (vals.length === 0) return null;
-            const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
-            return vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / vals.length;
+            const mean = typedSum(vals) / vals.length;
+            let variance = 0;
+            for (let i = 0; i < vals.length; i++) variance += (vals[i] - mean) ** 2;
+            return variance / vals.length;
         }
         case 'median': {
-            const vals = rows.map(r => r[colName]).filter(v => v != null && typeof v === 'number').sort((a, b) => a - b);
+            const vals = Array.from(extractNumericValues(rows, colName)).sort((a, b) => a - b);
             if (vals.length === 0) return null;
             const mid = Math.floor(vals.length / 2);
             return vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
@@ -292,12 +341,41 @@ function calculateAggregate(func, arg, rows) {
         case 'string_agg': case 'group_concat': {
             const actualCol = typeof arg === 'object' && arg.column ? arg.column : colName;
             const separator = typeof arg === 'object' && arg.separator != null ? arg.separator : ',';
-            const vals = rows.map(r => r[actualCol]).filter(v => v != null).map(String);
+            const vals = [];
+            for (let i = 0; i < rows.length; i++) {
+                const v = rows[i][actualCol];
+                if (v != null) vals.push(String(v));
+            }
             return vals.join(separator);
         }
         default:
             return null;
     }
+}
+
+// Async version with GPU acceleration for large datasets
+async function calculateAggregateAsync(func, arg, rows) {
+    if (rows.length === 0) return func === 'count' ? 0 : null;
+
+    // Use GPU for large datasets with numeric aggregations
+    if (rows.length >= GPU_AGG_THRESHOLD && (func === 'sum' || func === 'min' || func === 'max' || func === 'avg')) {
+        const gpuAgg = await getGPUAgg();
+        if (gpuAgg) {
+            const colName = arg === '*' ? null : (typeof arg === 'string' ? arg : (arg.column || arg));
+            const vals = extractNumericValues(rows, colName);
+            if (vals.length >= GPU_AGG_THRESHOLD) {
+                switch (func) {
+                    case 'sum': return gpuAgg.sum(vals);
+                    case 'min': return gpuAgg.min(vals);
+                    case 'max': return gpuAgg.max(vals);
+                    case 'avg': return gpuAgg.avg(vals);
+                }
+            }
+        }
+    }
+
+    // Fallback to CPU
+    return calculateAggregate(func, arg, rows);
 }
 
 // Evaluate arithmetic expression for a single row
@@ -1952,36 +2030,45 @@ async function executeAST(db, ast) {
                                 rightCol = leftColSimple in sampleRight ? leftColSimple : leftCondKey;
                             }
 
-                            // Build hash map on right table
+                            // Build hash map on right table (optimize key lookup)
                             const hashMap = new Map();
+                            const rightColFallback = rightCol.split('.').pop();
                             for (let ri = 0; ri < rightRows.length; ri++) {
                                 const rightRow = rightRows[ri];
-                                const key = rightRow[rightCol] ?? rightRow[rightCol.split('.').pop()];
+                                const key = rightRow[rightCol] ?? rightRow[rightColFallback];
                                 if (key !== null && key !== undefined) {
-                                    if (!hashMap.has(key)) hashMap.set(key, []);
-                                    hashMap.get(key).push(ri);
+                                    let bucket = hashMap.get(key);
+                                    if (!bucket) { bucket = []; hashMap.set(key, bucket); }
+                                    bucket.push(ri);
                                 }
                             }
+
+                            // Pre-extract right column keys for faster merging
+                            const rightKeys = rightRows.length > 0 ? Object.keys(rightRows[0]) : [];
+                            const leftColFallback = leftCol.split('.').pop();
 
                             // Probe with left table
                             for (let li = 0; li < rows.length; li++) {
                                 const leftRow = rows[li];
-                                const key = leftRow[leftCol] ?? leftRow[leftCol.split('.').pop()];
+                                const key = leftRow[leftCol] ?? leftRow[leftColFallback];
                                 const matches = hashMap.get(key);
 
                                 if (matches) {
-                                    for (const ri of matches) {
+                                    for (let mi = 0; mi < matches.length; mi++) {
+                                        const ri = matches[mi];
                                         matchedRightIndices.add(ri);
                                         const rightRow = rightRows[ri];
-                                        const merged = { ...leftRow };
-                                        for (const k of Object.keys(rightRow)) {
+                                        // Inline object merge for speed
+                                        const merged = Object.assign({}, leftRow);
+                                        for (let ki = 0; ki < rightKeys.length; ki++) {
+                                            const k = rightKeys[ki];
                                             if (!(k in merged)) merged[k] = rightRow[k];
                                             merged[`${rightTableName}.${k}`] = rightRow[k];
                                         }
                                         newRows.push(merged);
                                     }
                                 } else if (join.type === 'LEFT' || join.type === 'FULL') {
-                                    newRows.push({ ...leftRow });
+                                    newRows.push(Object.assign({}, leftRow));
                                 }
                             }
 
@@ -2000,15 +2087,18 @@ async function executeAST(db, ast) {
                             }
                         } else {
                             // Nested loop for complex conditions or small tables
-                            for (const leftRow of rows) {
+                            const rightKeysNL = rightRows.length > 0 ? Object.keys(rightRows[0]) : [];
+                            for (let li = 0; li < rows.length; li++) {
+                                const leftRow = rows[li];
                                 let matched = false;
                                 for (let ri = 0; ri < rightRows.length; ri++) {
                                     const rightRow = rightRows[ri];
                                     if (evalJoinCondition(join.on, leftRow, rightRow, tableAliases)) {
                                         matched = true;
                                         matchedRightIndices.add(ri);
-                                        const merged = { ...leftRow };
-                                        for (const key of Object.keys(rightRow)) {
+                                        const merged = Object.assign({}, leftRow);
+                                        for (let ki = 0; ki < rightKeysNL.length; ki++) {
+                                            const key = rightKeysNL[ki];
                                             if (!(key in merged)) merged[key] = rightRow[key];
                                             merged[`${rightTableName}.${key}`] = rightRow[key];
                                         }
@@ -2016,7 +2106,7 @@ async function executeAST(db, ast) {
                                     }
                                 }
                                 if (!matched && (join.type === 'LEFT' || join.type === 'FULL')) {
-                                    newRows.push({ ...leftRow });
+                                    newRows.push(Object.assign({}, leftRow));
                                 }
                             }
 
@@ -2627,4 +2717,4 @@ async function executeAST(db, ast) {
 // ============================================================================
 
 
-export { executeSQL, executeAST, evalWhere, getColumnValue, evaluateArithmeticExpr, calculateAggregate };
+export { executeSQL, executeAST, evalWhere, getColumnValue, evaluateArithmeticExpr, calculateAggregate, calculateAggregateAsync };

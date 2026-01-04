@@ -27,6 +27,9 @@ const commonOptions = {
     minify: isProduction,
     target: ['es2020'],
     logLevel: 'info',
+    loader: {
+        '.wgsl': 'text',  // Load WGSL shaders as text
+    },
 };
 
 async function build() {
