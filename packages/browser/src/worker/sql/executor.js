@@ -9,7 +9,7 @@
 import { TokenType, SQLLexer } from './tokenizer.js';
 import { SQLParser } from './parser.js';
 import { getGPUTransformerState, getEmbeddingCache } from '../worker-store.js';
-import { getWasm, getWasmMemory } from '../index.js';
+import { getWasm, getWasmMemory, loadFragmentToWasm, wasmAggregate as wasmAggregateFragment } from '../index.js';
 
 // Thresholds: WASM SIMD -> GPU
 const WASM_THRESHOLD = 100;     // Use WASM SIMD for 100+ rows (below is plain JS)
@@ -103,6 +103,92 @@ function evalJoinCondition(condition, leftRow, rightRow, tableAliases) {
         case '>': return leftVal > rightVal;
         case '>=': return leftVal >= rightVal;
         default: return false;
+    }
+}
+
+/**
+ * Columnar WHERE evaluation - no row object creation
+ * @param {Object} where - WHERE AST node
+ * @param {Object} cols - Column arrays { colName: Array }
+ * @param {number} idx - Row index
+ */
+function evalWhereColumnar(where, cols, idx) {
+    if (!where) return true;
+
+    const getVal = (ref) => {
+        if (ref && typeof ref === 'object' && ref.column) {
+            const arr = cols[ref.column];
+            return arr ? arr[idx] : undefined;
+        }
+        return ref;
+    };
+
+    switch (where.op) {
+        case 'AND': return evalWhereColumnar(where.left, cols, idx) && evalWhereColumnar(where.right, cols, idx);
+        case 'OR': return evalWhereColumnar(where.left, cols, idx) || evalWhereColumnar(where.right, cols, idx);
+        case '=': {
+            const col = typeof where.column === 'string' ? where.column : where.column.column;
+            return cols[col]?.[idx] === getVal(where.value);
+        }
+        case '!=': case '<>': {
+            const col = typeof where.column === 'string' ? where.column : where.column.column;
+            return cols[col]?.[idx] !== getVal(where.value);
+        }
+        case '<': {
+            const col = typeof where.column === 'string' ? where.column : where.column.column;
+            return cols[col]?.[idx] < getVal(where.value);
+        }
+        case '<=': {
+            const col = typeof where.column === 'string' ? where.column : where.column.column;
+            return cols[col]?.[idx] <= getVal(where.value);
+        }
+        case '>': {
+            const col = typeof where.column === 'string' ? where.column : where.column.column;
+            return cols[col]?.[idx] > getVal(where.value);
+        }
+        case '>=': {
+            const col = typeof where.column === 'string' ? where.column : where.column.column;
+            return cols[col]?.[idx] >= getVal(where.value);
+        }
+        case 'BETWEEN': {
+            const col = typeof where.column === 'string' ? where.column : where.column.column;
+            const v = cols[col]?.[idx];
+            return v >= where.low && v <= where.high;
+        }
+        case 'IN': {
+            const col = typeof where.column === 'string' ? where.column : where.column.column;
+            return where.values.includes(cols[col]?.[idx]);
+        }
+        case 'NOT IN': {
+            const col = typeof where.column === 'string' ? where.column : where.column.column;
+            return !where.values.includes(cols[col]?.[idx]);
+        }
+        case 'NOT BETWEEN': {
+            const col = typeof where.column === 'string' ? where.column : where.column.column;
+            const v = cols[col]?.[idx];
+            return v < where.low || v > where.high;
+        }
+        case 'LIKE': {
+            const col = typeof where.column === 'string' ? where.column : where.column.column;
+            const pattern = where.value.replace(/%/g, '.*').replace(/_/g, '.');
+            return new RegExp(`^${pattern}$`, 'i').test(cols[col]?.[idx]);
+        }
+        case 'NOT LIKE': {
+            const col = typeof where.column === 'string' ? where.column : where.column.column;
+            const pattern = where.value.replace(/%/g, '.*').replace(/_/g, '.');
+            return !new RegExp(`^${pattern}$`, 'i').test(cols[col]?.[idx]);
+        }
+        case 'IS NULL': {
+            const col = typeof where.column === 'string' ? where.column : where.column.column;
+            const v = cols[col]?.[idx];
+            return v === null || v === undefined;
+        }
+        case 'IS NOT NULL': {
+            const col = typeof where.column === 'string' ? where.column : where.column.column;
+            const v = cols[col]?.[idx];
+            return v !== null && v !== undefined;
+        }
+        default: return true;
     }
 }
 
@@ -1738,11 +1824,68 @@ function stringifyExpr(expr) {
     return JSON.stringify(expr);
 }
 
+// SQL parse cache (LRU, max 100 entries)
+const sqlParseCache = new Map();
+const SQL_CACHE_MAX = 100;
+
+// Query result cache (keyed by SQL + table version)
+const queryResultCache = new Map();
+const QUERY_CACHE_MAX = 50;
+
+// Invalidate cache for a table (called on INSERT, UPDATE, DELETE)
+function invalidateCacheForTable(tableName) {
+    for (const key of queryResultCache.keys()) {
+        // Cache key format: "sql|table:version"
+        if (key.includes(tableName + ':')) {
+            queryResultCache.delete(key);
+        }
+    }
+}
+
 async function executeSQL(db, sql) {
-    const lexer = new SQLLexer(sql);
-    const tokens = lexer.tokenize();
-    const parser = new SQLParser(tokens);
-    const ast = parser.parse();
+    // Check parse cache first
+    let ast = sqlParseCache.get(sql);
+    if (!ast) {
+        const lexer = new SQLLexer(sql);
+        const tokens = lexer.tokenize();
+        const parser = new SQLParser(tokens);
+        ast = parser.parse();
+
+        // Cache the AST (LRU eviction)
+        if (sqlParseCache.size >= SQL_CACHE_MAX) {
+            const first = sqlParseCache.keys().next().value;
+            sqlParseCache.delete(first);
+        }
+        sqlParseCache.set(sql, ast);
+    }
+
+    // For SELECT queries, check query result cache
+    // Only cache non-columnar results (columnar has Transferable arrays that get detached)
+    if (ast.type === 'SELECT' && ast.table) {
+        const table = db.tables?.get(ast.table);
+        if (table) {
+            const bufLen = db._columnarBuffer?.get(ast.table)?.__length || 0;
+            const tableVersion = `${ast.table}:${table.fragments?.length || 0}:${bufLen}:${table.deletionVector?.length || 0}`;
+            const cacheKey = sql + '|' + tableVersion;
+
+            const cached = queryResultCache.get(cacheKey);
+            if (cached) return cached;
+
+            const result = await executeAST(db, ast);
+
+            // Only cache row-based results (not columnar - those have Transferable arrays)
+            if (result && result._format !== 'columnar') {
+                // Cache result (LRU eviction)
+                if (queryResultCache.size >= QUERY_CACHE_MAX) {
+                    const first = queryResultCache.keys().next().value;
+                    queryResultCache.delete(first);
+                }
+                queryResultCache.set(cacheKey, result);
+            }
+            return result;
+        }
+    }
+
     return executeAST(db, ast);
 }
 
@@ -1757,6 +1900,7 @@ async function executeAST(db, ast) {
             return db.dropTable(ast.table, ast.ifExists);
 
         case 'INSERT': {
+            invalidateCacheForTable(ast.table);
             let rows = ast.rows || [];
 
             // Handle INSERT...SELECT
@@ -1831,6 +1975,7 @@ async function executeAST(db, ast) {
         }
 
         case 'DELETE': {
+            invalidateCacheForTable(ast.table);
             // Handle DELETE with USING clause (JOIN-based delete)
             if (ast.using) {
                 const mainRows = await db.select(ast.table, {});
@@ -1877,6 +2022,7 @@ async function executeAST(db, ast) {
         }
 
         case 'UPDATE': {
+            invalidateCacheForTable(ast.table);
             // Handle UPDATE with FROM clause (JOIN-based update)
             if (ast.from) {
                 const mainRows = await db.select(ast.table, {});
@@ -1976,11 +2122,452 @@ async function executeAST(db, ast) {
                 }
             }
 
-            // Fetch data from main table (or derived table)
-            // SELECT without FROM (e.g., SELECT 1+1, SELECT JSON_OBJECT(...)) returns single row
-            let rows;
+            // ================================================================
+            // FAST PATH: Direct WASM aggregation (no row conversion)
+            // Conditions: no WHERE, no JOIN, only aggregate columns
+            // ================================================================
+            const isSimpleAggregate = !ast.where && !ast.joins?.length && !ast.groupBy &&
+                ast.columns.every(c => c.type === 'aggregate') &&
+                ast.table && !ast.tables?.[0]?.type;
+
+            if (isSimpleAggregate && db.getFragmentPaths) {
+                const fragPaths = db.getFragmentPaths(ast.table);
+                const hasBuffer = db.hasBufferedData?.(ast.table);
+
+                // Only use fast path if all data is persisted (no buffered data)
+                if (fragPaths.length > 0 && !hasBuffer) {
+                    try {
+                        const resultRow = {};
+                        let success = true;
+
+                        for (const col of ast.columns) {
+                            const func = col.func.toLowerCase();
+                            const arg = col.arg;
+                            const aggName = col.alias || `${col.func}(${arg === '*' ? '*' : (typeof arg === 'string' ? arg : arg.column)})`;
+
+                            if (func === 'count' && arg === '*') {
+                                // Count all rows across fragments
+                                let total = 0;
+                                for (const fragPath of fragPaths) {
+                                    const result = await wasmAggregateFragment(fragPath, 0, 'count');
+                                    if (result !== null) total += result;
+                                }
+                                resultRow[aggName] = total;
+                            } else if (['sum', 'min', 'max', 'avg'].includes(func)) {
+                                const colName = typeof arg === 'string' ? arg : arg.column;
+                                const colIdx = db.getColumnIndex(ast.table, colName);
+
+                                if (colIdx >= 0) {
+                                    // Aggregate across all fragments
+                                    let aggResult = func === 'min' ? Infinity : func === 'max' ? -Infinity : 0;
+                                    let totalCount = 0;
+
+                                    for (const fragPath of fragPaths) {
+                                        const result = await wasmAggregateFragment(fragPath, colIdx, func === 'avg' ? 'sum' : func);
+                                        const count = await wasmAggregateFragment(fragPath, 0, 'count');
+                                        if (result !== null && count !== null) {
+                                            if (func === 'sum' || func === 'avg') {
+                                                aggResult += result;
+                                            } else if (func === 'min') {
+                                                aggResult = Math.min(aggResult, result);
+                                            } else if (func === 'max') {
+                                                aggResult = Math.max(aggResult, result);
+                                            }
+                                            totalCount += count;
+                                        }
+                                    }
+
+                                    resultRow[aggName] = func === 'avg' && totalCount > 0
+                                        ? aggResult / totalCount
+                                        : aggResult;
+                                } else {
+                                    success = false;
+                                    break;
+                                }
+                            } else {
+                                success = false;
+                                break;
+                            }
+                        }
+
+                        if (success) {
+                            return { rows: [resultRow], columns: Object.keys(resultRow) };
+                        }
+                    } catch (e) {
+                        // Fall through to regular path
+                        console.warn('[Executor] WASM fast path failed:', e);
+                    }
+                }
+            }
+
+            // ================================================================
+            // COLUMNAR PATH: Stay columnar, avoid row objects
+            // ================================================================
             const mainTable = ast.tables?.[0];
-            if (!mainTable) {
+
+            // Enable columnar for simple JOINs with GROUP BY aggregation
+            const hasSimpleJoin = ast.joins?.length === 1 &&
+                ast.joins[0].on?.op === '=' &&
+                ast.groupBy?.length > 0 &&
+                ast.columns.every(c => c.type === 'column' || c.type === 'aggregate');
+
+            const canUseColumnar = mainTable && mainTable.type !== 'subquery' &&
+                db.selectColumnar && (!ast.joins?.length || hasSimpleJoin);
+
+            let rows;
+            let columnarData = null;
+
+            if (canUseColumnar) {
+                columnarData = await db.selectColumnar(ast.table);
+                if (columnarData && columnarData.rowCount > 0) {
+                    // ================================================================
+                    // ULTRA-FAST PATH: SELECT * FROM table (no WHERE, no JOIN, no ORDER BY)
+                    // Returns columnar data directly without any processing
+                    // ================================================================
+                    const isSelectStar = ast.columns.length === 1 && ast.columns[0].type === 'star';
+                    const isSimpleSelect = isSelectStar && !ast.where && !ast.joins?.length && !ast.groupBy && !ast.orderBy;
+
+                    if (isSimpleSelect) {
+                        // Return columnar data directly (zero processing overhead)
+                        const { columns: cols, rowCount } = columnarData;
+                        const colNames = columnarData.schema.map(c => c.name);
+                        // DEBUG: Verify fast path is being used
+                        // console.log('[FastPath] SELECT * returning', rowCount, 'rows');
+                        return {
+                            _format: 'columnar',
+                            columns: colNames,
+                            rowCount: rowCount,
+                            data: Object.fromEntries(colNames.map(name => [name, cols[name]]))
+                        };
+                    }
+
+                    // For simple queries, work directly with columnar data
+                    const hasComplexCols = ast.columns.some(c => c.type === 'function' || c.type === 'case' ||
+                        c.type === 'arithmetic' || c.type === 'scalar_subquery');
+                    const needsRows = ast.orderBy || hasComplexCols;
+
+                    // Columnar JOIN + GROUP BY path (benchmark: JOIN customers orders)
+                    if (hasSimpleJoin && !needsRows) {
+                        const join = ast.joins[0];
+                        const rightTableName = join.table.alias || join.table.name;
+                        const rightColumnar = await db.selectColumnar(join.table.name);
+                        if (rightColumnar && rightColumnar.rowCount > 0) {
+                            const leftCols = columnarData.columns;
+                            const rightCols = rightColumnar.columns;
+
+                            // Determine join columns from ON condition
+                            const leftCond = join.on.left;
+                            const rightCond = join.on.right;
+                            const leftJoinCol = leftCond.column;
+                            const rightJoinCol = rightCond.column;
+
+                            // Check which side maps to which table
+                            let leftKey = leftJoinCol in leftCols ? leftJoinCol : rightJoinCol;
+                            let rightKey = leftJoinCol in rightCols ? leftJoinCol : rightJoinCol;
+
+                            // Build hash map on right table (dimension table, usually smaller)
+                            const rightKeyArr = rightCols[rightKey];
+                            const hashMap = new Map();
+                            for (let i = 0; i < rightColumnar.rowCount; i++) {
+                                const key = rightKeyArr[i];
+                                if (key !== null && key !== undefined) {
+                                    hashMap.set(key, i);
+                                }
+                            }
+
+                            // Identify GROUP BY column and aggregation columns
+                            const groupCol = typeof ast.groupBy[0] === 'string' ? ast.groupBy[0] : ast.groupBy[0].column;
+                            // groupCol might be prefixed like "c.name"
+                            const groupColSimple = groupCol.includes('.') ? groupCol.split('.')[1] : groupCol;
+
+                            // Single-pass: iterate left (fact) table, lookup right, aggregate
+                            const leftKeyArr = leftCols[leftKey];
+                            const groups = new Map();
+
+                            // Pre-identify aggregate columns
+                            const aggCols = ast.columns.filter(c => c.type === 'aggregate');
+                            const aggInfo = aggCols.map(col => {
+                                const func = col.func.toLowerCase();
+                                const arg = col.arg;
+                                let colName = arg === '*' ? null : (typeof arg === 'string' ? arg : arg.column);
+                                // Handle prefixed column like o.amount
+                                if (colName && colName.includes('.')) colName = colName.split('.')[1];
+                                const aggName = col.alias || `${col.func}(${arg === '*' ? '*' : colName})`;
+                                const colArr = colName ? (leftCols[colName] || rightCols[colName]) : null;
+                                return { func, colName, aggName, colArr };
+                            });
+
+                            // Find group column array (in right table)
+                            const groupArr = rightCols[groupColSimple] || rightCols[groupCol];
+
+                            for (let i = 0; i < columnarData.rowCount; i++) {
+                                const leftVal = leftKeyArr[i];
+                                const rightIdx = hashMap.get(leftVal);
+                                if (rightIdx === undefined) continue; // No match
+
+                                const groupKey = groupArr[rightIdx];
+                                let g = groups.get(groupKey);
+                                if (!g) {
+                                    g = { count: 0 };
+                                    for (const agg of aggInfo) {
+                                        if (agg.colName) {
+                                            g[agg.colName + '_sum'] = 0;
+                                            g[agg.colName + '_min'] = Infinity;
+                                            g[agg.colName + '_max'] = -Infinity;
+                                        }
+                                    }
+                                    groups.set(groupKey, g);
+                                }
+                                g.count++;
+                                for (const agg of aggInfo) {
+                                    if (agg.colArr) {
+                                        const v = agg.colArr[i];
+                                        if (typeof v === 'number') {
+                                            g[agg.colName + '_sum'] += v;
+                                            if (v < g[agg.colName + '_min']) g[agg.colName + '_min'] = v;
+                                            if (v > g[agg.colName + '_max']) g[agg.colName + '_max'] = v;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Build result rows
+                            const resultRows = [];
+                            for (const [key, g] of groups) {
+                                const row = {};
+                                for (const col of ast.columns) {
+                                    if (col.type === 'column') {
+                                        const colName = typeof col.value === 'string' ? col.value : col.value.column;
+                                        row[col.alias || colName] = key;
+                                    } else if (col.type === 'aggregate') {
+                                        const func = col.func.toLowerCase();
+                                        let colName = col.arg === '*' ? null : (typeof col.arg === 'string' ? col.arg : col.arg.column);
+                                        if (colName && colName.includes('.')) colName = colName.split('.')[1];
+                                        const aggName = col.alias || `${col.func}(${col.arg === '*' ? '*' : colName})`;
+                                        switch (func) {
+                                            case 'count': row[aggName] = g.count; break;
+                                            case 'sum': row[aggName] = g[colName + '_sum'] || 0; break;
+                                            case 'min': row[aggName] = g[colName + '_min'] === Infinity ? null : g[colName + '_min']; break;
+                                            case 'max': row[aggName] = g[colName + '_max'] === -Infinity ? null : g[colName + '_max']; break;
+                                            case 'avg': row[aggName] = g.count > 0 ? (g[colName + '_sum'] || 0) / g.count : null; break;
+                                        }
+                                    }
+                                }
+                                resultRows.push(row);
+                            }
+                            return { rows: resultRows, columns: Object.keys(resultRows[0] || {}) };
+                        }
+                    }
+
+                    // Columnar WHERE filter - use typed array scan
+                    if (ast.where && !hasComplexCols) {
+                        const { columns: cols, rowCount } = columnarData;
+                        const colNames = Object.keys(cols);
+
+                        // Pre-extract column arrays for fast access
+                        const colArrays = {};
+                        for (const name of colNames) colArrays[name] = cols[name];
+
+                        // Single pass filter with direct array access
+                        const validIndices = new Uint32Array(rowCount);
+                        let validCount = 0;
+
+                        for (let i = 0; i < rowCount; i++) {
+                            // Direct columnar access in evalWhere
+                            if (evalWhereColumnar(ast.where, colArrays, i)) {
+                                validIndices[validCount++] = i;
+                            }
+                        }
+
+                        // Create filtered columnar data
+                        const filteredCols = {};
+                        for (const name of colNames) {
+                            const arr = cols[name];
+                            if (ArrayBuffer.isView(arr)) {
+                                const filtered = new arr.constructor(validCount);
+                                for (let j = 0; j < validCount; j++) {
+                                    filtered[j] = arr[validIndices[j]];
+                                }
+                                filteredCols[name] = filtered;
+                            } else {
+                                const filtered = new Array(validCount);
+                                for (let j = 0; j < validCount; j++) {
+                                    filtered[j] = arr[validIndices[j]];
+                                }
+                                filteredCols[name] = filtered;
+                            }
+                        }
+                        columnarData = { schema: columnarData.schema, columns: filteredCols, rowCount: validCount };
+                    }
+
+                    // Columnar GROUP BY path - single-pass hash aggregation
+                    if (!needsRows && ast.groupBy && ast.groupBy.length === 1 &&
+                        ast.columns.every(c => c.type === 'aggregate' || c.type === 'column')) {
+                        const groupCol = typeof ast.groupBy[0] === 'string' ? ast.groupBy[0] : ast.groupBy[0].column;
+                        const groupArr = columnarData.columns[groupCol];
+
+                        if (groupArr) {
+                            // Identify which aggregations we need
+                            const aggCols = ast.columns.filter(c => c.type === 'aggregate');
+                            const aggInfo = aggCols.map(col => {
+                                const func = col.func.toLowerCase();
+                                const arg = col.arg;
+                                const colName = arg === '*' ? null : (typeof arg === 'string' ? arg : arg.column);
+                                const aggName = col.alias || `${col.func}(${arg === '*' ? '*' : colName})`;
+                                return { func, colName, aggName, colArr: colName ? columnarData.columns[colName] : null };
+                            });
+
+                            // Single-pass aggregation: accumulate running totals per group
+                            // groups: Map<key, { count, sums: { colName: sum }, mins: {...}, maxs: {...} }>
+                            const groups = new Map();
+                            const rowCount = columnarData.rowCount;
+
+                            for (let i = 0; i < rowCount; i++) {
+                                const key = groupArr[i];
+                                let g = groups.get(key);
+                                if (!g) {
+                                    g = { count: 0, sums: {}, mins: {}, maxs: {} };
+                                    for (const agg of aggInfo) {
+                                        if (agg.colName) {
+                                            g.sums[agg.colName] = 0;
+                                            g.mins[agg.colName] = Infinity;
+                                            g.maxs[agg.colName] = -Infinity;
+                                        }
+                                    }
+                                    groups.set(key, g);
+                                }
+                                g.count++;
+                                for (const agg of aggInfo) {
+                                    if (agg.colArr) {
+                                        const v = agg.colArr[i];
+                                        if (typeof v === 'number') {
+                                            g.sums[agg.colName] += v;
+                                            if (v < g.mins[agg.colName]) g.mins[agg.colName] = v;
+                                            if (v > g.maxs[agg.colName]) g.maxs[agg.colName] = v;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Build result rows from accumulated state
+                            const resultRows = [];
+                            for (const [key, g] of groups) {
+                                const row = {};
+                                for (const col of ast.columns) {
+                                    if (col.type === 'column') {
+                                        const colName = typeof col.value === 'string' ? col.value : col.value.column;
+                                        row[col.alias || colName] = key;
+                                    } else if (col.type === 'aggregate') {
+                                        const func = col.func.toLowerCase();
+                                        const arg = col.arg;
+                                        const colName = arg === '*' ? null : (typeof arg === 'string' ? arg : arg.column);
+                                        const aggName = col.alias || `${col.func}(${arg === '*' ? '*' : colName})`;
+
+                                        switch (func) {
+                                            case 'count': row[aggName] = g.count; break;
+                                            case 'sum': row[aggName] = g.sums[colName] || 0; break;
+                                            case 'min': row[aggName] = g.mins[colName] === Infinity ? null : g.mins[colName]; break;
+                                            case 'max': row[aggName] = g.maxs[colName] === -Infinity ? null : g.maxs[colName]; break;
+                                            case 'avg': row[aggName] = g.count > 0 ? (g.sums[colName] || 0) / g.count : null; break;
+                                        }
+                                    }
+                                }
+                                resultRows.push(row);
+                            }
+                            return { rows: resultRows, columns: Object.keys(resultRows[0] || {}) };
+                        }
+                    }
+
+                    if (!needsRows && !ast.groupBy && ast.columns.every(c => c.type === 'aggregate' || c.type === 'star' || c.type === 'column')) {
+                        // Pure columnar path - aggregates or simple column selection
+                        const wasm = getWasm();
+                        const mem = getWasmMemory();
+
+                        if (ast.columns.every(c => c.type === 'aggregate')) {
+                            // All aggregates - use WASM SIMD
+                            const resultRow = {};
+                            for (const col of ast.columns) {
+                                const func = col.func.toLowerCase();
+                                const arg = col.arg;
+                                const aggName = col.alias || `${col.func}(${arg === '*' ? '*' : (typeof arg === 'string' ? arg : arg.column)})`;
+
+                                if (func === 'count' && arg === '*') {
+                                    resultRow[aggName] = columnarData.rowCount;
+                                } else if (func === 'count') {
+                                    const colName = typeof arg === 'string' ? arg : arg.column;
+                                    const colArr = columnarData.columns[colName];
+                                    resultRow[aggName] = colArr ? colArr.length : 0;
+                                } else {
+                                    const colName = typeof arg === 'string' ? arg : arg.column;
+                                    const colArr = columnarData.columns[colName];
+                                    if (colArr && wasm && mem) {
+                                        // Use WASM SIMD
+                                        const ptr = wasm.alloc(colArr.length * 8);
+                                        if (ptr) {
+                                            const f64 = colArr instanceof Float64Array ? colArr :
+                                                new Float64Array(colArr);
+                                            new Float64Array(mem.buffer, ptr, f64.length).set(f64);
+                                            switch (func) {
+                                                case 'sum': resultRow[aggName] = wasm.sumFloat64Buffer(ptr, f64.length); break;
+                                                case 'min': resultRow[aggName] = wasm.minFloat64Buffer(ptr, f64.length); break;
+                                                case 'max': resultRow[aggName] = wasm.maxFloat64Buffer(ptr, f64.length); break;
+                                                case 'avg': resultRow[aggName] = wasm.avgFloat64Buffer(ptr, f64.length); break;
+                                            }
+                                        }
+                                    } else if (colArr) {
+                                        // JS fallback
+                                        const vals = Array.from(colArr);
+                                        switch (func) {
+                                            case 'sum': resultRow[aggName] = vals.reduce((a, b) => a + b, 0); break;
+                                            case 'min': resultRow[aggName] = Math.min(...vals); break;
+                                            case 'max': resultRow[aggName] = Math.max(...vals); break;
+                                            case 'avg': resultRow[aggName] = vals.reduce((a, b) => a + b, 0) / vals.length; break;
+                                        }
+                                    }
+                                }
+                            }
+                            return { rows: [resultRow], columns: Object.keys(resultRow) };
+                        }
+
+                        // SELECT * or specific columns - optimized row creation
+                        const { columns: colData, rowCount } = columnarData;
+                        const colNames = Object.keys(colData).filter(n => n !== '__rowId');
+                        const numCols = colNames.length;
+
+                        // Pre-extract column arrays to avoid repeated property lookups
+                        const colArrays = new Array(numCols);
+                        for (let j = 0; j < numCols; j++) {
+                            colArrays[j] = colData[colNames[j]];
+                        }
+
+                        // Return columnar data directly - no row conversion!
+                        // The caller can convert to rows if needed
+                        return {
+                            _format: 'columnar',
+                            columns: colNames,
+                            rowCount: rowCount,
+                            data: Object.fromEntries(
+                                colNames.map(name => [name, colArrays[colNames.indexOf(name)]])
+                            )
+                        };
+                    } else {
+                        // Need rows for complex operations
+                        const { columns: colData, rowCount } = columnarData;
+                        rows = new Array(rowCount);
+                        const colNames = Object.keys(colData).filter(n => n !== '__rowId');
+                        for (let i = 0; i < rowCount; i++) {
+                            const row = {};
+                            for (let j = 0; j < colNames.length; j++) {
+                                row[colNames[j]] = colData[colNames[j]][i];
+                            }
+                            row.__rowId = colData.__rowId ? colData.__rowId[i] : i;
+                            rows[i] = row;
+                        }
+                    }
+                } else {
+                    rows = [];
+                }
+            } else if (!mainTable) {
                 // No FROM clause - create a single empty row for expression evaluation
                 rows = [{}];
             } else if (mainTable.type === 'subquery') {

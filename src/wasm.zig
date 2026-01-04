@@ -2,8 +2,28 @@
 //!
 //! This module provides exported functions that can be called from JavaScript
 //! in the browser. Uses direct byte manipulation for WASM compatibility.
+//!
+//! OPFS Integration:
+//! WASM imports JS functions for synchronous OPFS access via FileSystemSyncAccessHandle.
+//! JS holds the sync access handles; WASM calls imported read/write functions.
 
 const std = @import("std");
+
+// ============================================================================
+// JS Imports for OPFS access (synchronous via FileSystemSyncAccessHandle)
+// ============================================================================
+
+/// JS provides these functions for synchronous OPFS file access in workers
+const js = struct {
+    /// Open file, returns handle ID (0 = error)
+    extern "env" fn opfs_open(path_ptr: [*]const u8, path_len: usize) u32;
+    /// Read from file at offset into buffer, returns bytes read
+    extern "env" fn opfs_read(handle: u32, buf_ptr: [*]u8, buf_len: usize, offset: u64) usize;
+    /// Get file size
+    extern "env" fn opfs_size(handle: u32) u64;
+    /// Close file handle
+    extern "env" fn opfs_close(handle: u32) void;
+};
 
 // ============================================================================
 // Module imports
@@ -22,6 +42,7 @@ const lance_writer = @import("wasm/lance_writer.zig");
 const fragment_reader = @import("wasm/fragment_reader.zig");
 const column_meta = @import("wasm/column_meta.zig");
 const aggregates = @import("wasm/aggregates.zig");
+const sql_executor = @import("wasm/sql_executor.zig");
 
 // Module exports are automatic via `pub export fn` in each module.
 // Force reference to ensure they're included in WASM binary:
@@ -39,6 +60,7 @@ comptime {
     _ = fragment_reader;
     _ = column_meta;
     _ = aggregates;
+    _ = sql_executor;
 }
 
 // ============================================================================
@@ -509,6 +531,137 @@ export fn readBoolAtIndices(
         }
     }
     return num_indices;
+}
+
+// ============================================================================
+// Direct OPFS Access (via JS sync access handles)
+// ============================================================================
+
+/// OPFS file state - loaded directly from OPFS without JS intermediary
+var opfs_handle: u32 = 0;
+var opfs_buffer: ?[]u8 = null;
+
+/// Open Lance file directly from OPFS path
+/// Path is relative to OPFS root (e.g., "mydb/mytable/frag_123.lance")
+export fn openFileFromOPFS(path_ptr: [*]const u8, path_len: usize) u32 {
+    // Close any existing file
+    if (opfs_handle != 0) {
+        js.opfs_close(opfs_handle);
+        opfs_handle = 0;
+    }
+    if (opfs_buffer) |buf| {
+        _ = buf; // Will be reused or reallocated
+    }
+
+    // Open file via JS
+    const handle = js.opfs_open(path_ptr, path_len);
+    if (handle == 0) return 0;
+
+    // Get file size
+    const size = js.opfs_size(handle);
+    if (size == 0 or size > 1024 * 1024 * 1024) { // Max 1GB
+        js.opfs_close(handle);
+        return 0;
+    }
+
+    const size_usize: usize = @intCast(size);
+
+    // Allocate buffer in WASM memory
+    const buf_ptr = wasmAlloc(size_usize) orelse {
+        js.opfs_close(handle);
+        return 0;
+    };
+
+    // Read entire file into WASM memory
+    const bytes_read = js.opfs_read(handle, buf_ptr, size_usize, 0);
+    if (bytes_read != size_usize) {
+        js.opfs_close(handle);
+        return 0;
+    }
+
+    opfs_handle = handle;
+    opfs_buffer = buf_ptr[0..size_usize];
+
+    // Parse as Lance file
+    if (isValidLanceFile(buf_ptr, size_usize) == 0) {
+        js.opfs_close(handle);
+        opfs_handle = 0;
+        return 0;
+    }
+
+    file_data = buf_ptr[0..size_usize];
+    const footer_start = size_usize - FOOTER_SIZE;
+    num_columns = readU32LE(buf_ptr[0..size_usize], footer_start + 28);
+    column_meta_offsets_start = readU64LE(buf_ptr[0..size_usize], footer_start + 8);
+    syncStateToModules();
+
+    return 1;
+}
+
+/// Close OPFS file
+export fn closeOPFSFile() void {
+    if (opfs_handle != 0) {
+        js.opfs_close(opfs_handle);
+        opfs_handle = 0;
+    }
+    opfs_buffer = null;
+    file_data = null;
+    num_columns = 0;
+    column_meta_offsets_start = 0;
+    syncStateToModules();
+}
+
+/// Aggregate directly from OPFS file (no row conversion)
+/// Returns sum of float64 column
+export fn opfsSumFloat64Column(col_idx: u32) f64 {
+    const buf = getColumnBuffer(col_idx) orelse return 0;
+    const row_count = buf.size / 8;
+    var sum: f64 = 0;
+    for (0..row_count) |i| sum += readF64LE(buf.data, buf.start + i * 8);
+    return sum;
+}
+
+/// Min of float64 column from OPFS
+export fn opfsMinFloat64Column(col_idx: u32) f64 {
+    const buf = getColumnBuffer(col_idx) orelse return 0;
+    const row_count = buf.size / 8;
+    if (row_count == 0) return 0;
+    var min_val: f64 = readF64LE(buf.data, buf.start);
+    for (1..row_count) |i| {
+        const val = readF64LE(buf.data, buf.start + i * 8);
+        if (val < min_val) min_val = val;
+    }
+    return min_val;
+}
+
+/// Max of float64 column from OPFS
+export fn opfsMaxFloat64Column(col_idx: u32) f64 {
+    const buf = getColumnBuffer(col_idx) orelse return 0;
+    const row_count = buf.size / 8;
+    if (row_count == 0) return 0;
+    var max_val: f64 = readF64LE(buf.data, buf.start);
+    for (1..row_count) |i| {
+        const val = readF64LE(buf.data, buf.start + i * 8);
+        if (val > max_val) max_val = val;
+    }
+    return max_val;
+}
+
+/// Average of float64 column from OPFS
+export fn opfsAvgFloat64Column(col_idx: u32) f64 {
+    const buf = getColumnBuffer(col_idx) orelse return 0;
+    const row_count = buf.size / 8;
+    if (row_count == 0) return 0;
+    var sum: f64 = 0;
+    for (0..row_count) |i| sum += readF64LE(buf.data, buf.start + i * 8);
+    return sum / @as(f64, @floatFromInt(row_count));
+}
+
+/// Count rows in current OPFS file
+export fn opfsCountRows() u64 {
+    if (file_data == null) return 0;
+    const buf = getColumnBuffer(0) orelse return 0;
+    return buf.rows;
 }
 
 

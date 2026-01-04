@@ -627,6 +627,45 @@ var LanceFileWriter = class {
     }
     return new Uint8Array(buffer);
   }
+  /**
+   * Set columnar data directly (no row conversion needed)
+   * @param {Object} columnarData - { colName: Array }
+   */
+  setColumnarData(columnarData) {
+    const firstCol = Object.keys(columnarData)[0];
+    this.rowCount = columnarData[firstCol]?.length || 0;
+    for (const col of this.schema) {
+      const arr = columnarData[col.name];
+      if (!arr) continue;
+      const TypedArray = getTypedArrayForType(col.dataType);
+      if (TypedArray && TypedArray !== BigInt64Array && ArrayBuffer.isView(arr)) {
+        this.columns.set(col.name, {
+          type: "typed",
+          dataType: col.dataType,
+          data: arr,
+          length: arr.length
+        });
+      } else if (TypedArray && TypedArray !== BigInt64Array) {
+        const typedArr = new TypedArray(arr.length);
+        for (let i = 0; i < arr.length; i++) {
+          typedArr[i] = arr[i] ?? 0;
+        }
+        this.columns.set(col.name, {
+          type: "typed",
+          dataType: col.dataType,
+          data: typedArr,
+          length: arr.length
+        });
+      } else {
+        this.columns.set(col.name, {
+          type: "array",
+          dataType: col.dataType,
+          data: Array.isArray(arr) ? arr : Array.from(arr),
+          length: arr.length
+        });
+      }
+    }
+  }
   build() {
     if (this._useBinary && this.rowCount > 0) {
       try {
@@ -717,8 +756,9 @@ var WorkerDatabase = class {
     this.manifestKey = `${name}/__manifest__`;
     this._writeBuffer = /* @__PURE__ */ new Map();
     this._flushTimer = null;
-    this._flushInterval = 1e3;
-    this._flushThreshold = 1e3;
+    this._flushInterval = 2e3;
+    this._flushThreshold = 1e4;
+    this._columnarBuffer = /* @__PURE__ */ new Map();
     this._flushing = false;
     this._readCache = /* @__PURE__ */ new Map();
   }
@@ -790,21 +830,60 @@ var WorkerDatabase = class {
       throw new Error(`Table '${tableName}' does not exist`);
     }
     const table = this.tables.get(tableName);
-    const rowsWithIds = rows.map((row) => ({
-      __rowId: table.nextRowId++,
-      ...row
-    }));
-    if (!this._writeBuffer.has(tableName)) {
-      this._writeBuffer.set(tableName, []);
+    const n = rows.length;
+    if (!this._columnarBuffer.has(tableName)) {
+      const initialCapacity = Math.max(1024, n * 2);
+      const cols = {
+        __rowId: new Float64Array(initialCapacity),
+        __length: 0,
+        __capacity: initialCapacity,
+        __schema: table.schema
+      };
+      for (const c of table.schema) {
+        const type = c.dataType || c.type;
+        if (type === "text" || type === "string") {
+          cols[c.name] = new Array(initialCapacity);
+        } else {
+          cols[c.name] = new Float64Array(initialCapacity);
+        }
+      }
+      this._columnarBuffer.set(tableName, cols);
     }
-    this._writeBuffer.get(tableName).push(...rowsWithIds);
-    table.rowCount += rows.length;
+    const colBuf = this._columnarBuffer.get(tableName);
+    let len = colBuf.__length;
+    let cap = colBuf.__capacity;
+    if (len + n > cap) {
+      const newCap = Math.max(cap * 2, len + n);
+      const newRowId = new Float64Array(newCap);
+      newRowId.set(colBuf.__rowId.subarray(0, len));
+      colBuf.__rowId = newRowId;
+      for (const c of table.schema) {
+        const old = colBuf[c.name];
+        if (old instanceof Float64Array) {
+          const newArr = new Float64Array(newCap);
+          newArr.set(old.subarray(0, len));
+          colBuf[c.name] = newArr;
+        } else {
+          colBuf[c.name].length = newCap;
+        }
+      }
+      colBuf.__capacity = newCap;
+    }
+    for (let i = 0; i < n; i++) {
+      const row = rows[i];
+      colBuf.__rowId[len + i] = table.nextRowId++;
+      for (const c of table.schema) {
+        const val = row[c.name];
+        colBuf[c.name][len + i] = val ?? (colBuf[c.name] instanceof Float64Array ? 0 : null);
+      }
+    }
+    colBuf.__length = len + n;
+    table.rowCount += n;
     this._scheduleFlush();
-    const bufferSize = this._writeBuffer.get(tableName).length;
-    if (bufferSize >= this._flushThreshold) {
+    if (colBuf.__length >= this._flushThreshold) {
       await this._flushTable(tableName);
     }
-    return { success: true, inserted: rows.length };
+    return { success: true, inserted: n };
   }
   _scheduleFlush() {
     if (this._flushTimer) return;
@@ -817,7 +896,7 @@ var WorkerDatabase = class {
     if (this._flushing) return;
     this._flushing = true;
     try {
-      const tables = [...this._writeBuffer.keys()];
+      const tables = [...this._columnarBuffer.keys()];
       for (const tableName of tables) {
         await this._flushTable(tableName);
       }
@@ -826,17 +905,31 @@ var WorkerDatabase = class {
     }
   }
   async _flushTable(tableName) {
-    const buffer = this._writeBuffer.get(tableName);
-    if (!buffer || buffer.length === 0) return;
+    const colBuf = this._columnarBuffer.get(tableName);
+    const bufLen = colBuf?.__length || 0;
+    if (!colBuf || bufLen === 0) return;
     const table = this.tables.get(tableName);
     if (!table) return;
-    const rowsToFlush = buffer.splice(0, buffer.length);
     const schemaWithRowId = [
-      { name: "__rowId", type: "int64", primaryKey: true },
-      ...table.schema.filter((c) => c.name !== "__rowId")
+      { name: "__rowId", type: "int64", dataType: "float64", primaryKey: true },
+      ...table.schema.filter((c) => c.name !== "__rowId").map((c) => ({
+        ...c,
+        dataType: c.dataType || c.type || "float64"
+      }))
     ];
+    const columnarData = {};
+    for (const col of schemaWithRowId) {
+      const arr = colBuf[col.name];
+      if (!arr) continue;
+      if (arr instanceof Float64Array) {
+        columnarData[col.name] = arr.subarray(0, bufLen);
+      } else {
+        columnarData[col.name] = arr.slice(0, bufLen);
+      }
+    }
+    colBuf.__length = 0;
     const writer = new LanceFileWriter(schemaWithRowId);
-    writer.addRows(rowsToFlush);
+    writer.setColumnarData(columnarData);
     const lanceData = writer.build();
     const fragKey = `${this.name}/${tableName}/frag_${Date.now()}_${Math.random().toString(36).slice(2)}.lance`;
     await opfsStorage.save(fragKey, lanceData);
@@ -996,11 +1089,8 @@ var WorkerDatabase = class {
   }
   async _readAllRows(tableName) {
     const table = this.tables.get(tableName);
-    const buffer = this._writeBuffer.get(tableName);
+    const colBuf = this._columnarBuffer.get(tableName);
     const hasDeleted = table.deletionVector.length > 0;
-    if (table.fragments.length === 0 && !hasDeleted && buffer) {
-      return buffer;
-    }
     const deletedSet = hasDeleted ? new Set(table.deletionVector) : null;
     const allRows = [];
     for (const fragKey of table.fragments) {
@@ -1024,15 +1114,16 @@ var WorkerDatabase = class {
         }
       }
     }
-    if (buffer && buffer.length > 0) {
-      if (!deletedSet) {
-        allRows.push(...buffer);
-      } else {
-        for (const row of buffer) {
-          if (!deletedSet.has(row.__rowId)) {
-            allRows.push(row);
-          }
+    const bufLen = colBuf?.__length || 0;
+    if (colBuf && bufLen > 0) {
+      const colNames = table.schema.map((c) => c.name);
+      for (let i = 0; i < bufLen; i++) {
+        if (deletedSet && deletedSet.has(colBuf.__rowId[i])) continue;
+        const row = { __rowId: colBuf.__rowId[i] };
+        for (const name of colNames) {
+          row[name] = colBuf[name][i];
         }
+        allRows.push(row);
       }
     }
     return allRows;
@@ -1053,6 +1144,159 @@ var WorkerDatabase = class {
       console.warn("[WorkerDatabase] Failed to parse fragment:", e);
       return [];
     }
+  }
+  /**
+   * Select data in COLUMNAR format (no row conversion).
+   * Returns { schema, columns: { colName: TypedArray }, rowCount }
+   */
+  async selectColumnar(tableName) {
+    const table = this.tables.get(tableName);
+    if (!table) return null;
+    const hasDeleted = table.deletionVector.length > 0;
+    const deletedSet = hasDeleted ? new Set(table.deletionVector) : null;
+    const allColumns = {};
+    const colNames = table.schema.map((c) => c.name);
+    for (const name of colNames) allColumns[name] = [];
+    allColumns.__rowId = [];
+    for (const fragKey of table.fragments) {
+      let binary = this._readCache.get(fragKey + ":columnar");
+      if (!binary) {
+        const fragData = await opfsStorage.load(fragKey);
+        if (!fragData) continue;
+        binary = parseBinaryColumnar(fragData);
+        if (binary) {
+          this._readCache.set(fragKey + ":columnar", binary);
+        }
+      }
+      if (!binary) continue;
+      const { columns, rowCount } = binary;
+      if (!deletedSet) {
+        for (const name of colNames) {
+          if (columns[name]) allColumns[name].push(columns[name]);
+        }
+        if (columns.__rowId) allColumns.__rowId.push(columns.__rowId);
+      } else {
+        const rowIds = columns.__rowId;
+        const validIndices = [];
+        for (let i = 0; i < rowCount; i++) {
+          if (!deletedSet.has(rowIds[i])) validIndices.push(i);
+        }
+        for (const name of colNames) {
+          if (columns[name]) {
+            const arr = columns[name];
+            const filtered = new arr.constructor(validIndices.length);
+            for (let j = 0; j < validIndices.length; j++) {
+              filtered[j] = arr[validIndices[j]];
+            }
+            allColumns[name].push(filtered);
+          }
+        }
+      }
+    }
+    const colBuf = this._columnarBuffer.get(tableName);
+    const bufLen = colBuf?.__length || 0;
+    if (colBuf && bufLen > 0) {
+      if (!deletedSet) {
+        for (const col of table.schema) {
+          const arr = colBuf[col.name];
+          if (!arr) continue;
+          if (arr instanceof Float64Array) {
+            const owned = new Float64Array(bufLen);
+            owned.set(arr.subarray(0, bufLen));
+            allColumns[col.name].push(owned);
+          } else {
+            allColumns[col.name].push(arr.slice(0, bufLen));
+          }
+        }
+        const ownedRowId = new Float64Array(bufLen);
+        ownedRowId.set(colBuf.__rowId.subarray(0, bufLen));
+        allColumns.__rowId.push(ownedRowId);
+      } else {
+        const validIndices = [];
+        for (let i = 0; i < bufLen; i++) {
+          if (!deletedSet.has(colBuf.__rowId[i])) validIndices.push(i);
+        }
+        const vLen = validIndices.length;
+        for (const col of table.schema) {
+          const arr = colBuf[col.name];
+          if (!arr) continue;
+          if (arr instanceof Float64Array) {
+            const filtered = new Float64Array(vLen);
+            for (let j = 0; j < vLen; j++) filtered[j] = arr[validIndices[j]];
+            allColumns[col.name].push(filtered);
+          } else {
+            allColumns[col.name].push(validIndices.map((i) => arr[i]));
+          }
+        }
+        const filteredRowId = new Float64Array(vLen);
+        for (let j = 0; j < vLen; j++) filteredRowId[j] = colBuf.__rowId[validIndices[j]];
+        allColumns.__rowId.push(filteredRowId);
+      }
+    }
+    const mergedColumns = {};
+    let totalRows = 0;
+    for (const name of [...colNames, "__rowId"]) {
+      const arrays = allColumns[name];
+      if (arrays.length === 0) {
+        mergedColumns[name] = new Float64Array(0);
+      } else if (arrays.length === 1) {
+        mergedColumns[name] = arrays[0];
+        if (name === colNames[0]) totalRows = arrays[0].length;
+      } else {
+        const totalLen = arrays.reduce((sum, a) => sum + a.length, 0);
+        if (name === colNames[0]) totalRows = totalLen;
+        const first = arrays[0];
+        const merged = ArrayBuffer.isView(first) ? new first.constructor(totalLen) : new Array(totalLen);
+        let offset = 0;
+        for (const arr of arrays) {
+          if (ArrayBuffer.isView(merged)) {
+            merged.set(arr, offset);
+          } else {
+            for (let i = 0; i < arr.length; i++) merged[offset + i] = arr[i];
+          }
+          offset += arr.length;
+        }
+        mergedColumns[name] = merged;
+      }
+    }
+    return { schema: table.schema, columns: mergedColumns, rowCount: totalRows };
+  }
+  /**
+   * Read column data directly (no row conversion) for fast aggregation.
+   * Returns typed array for numeric columns.
+   */
+  async _readColumn(tableName, colName) {
+    const table = this.tables.get(tableName);
+    if (!table) return null;
+    const buffer = this._writeBuffer.get(tableName);
+    const colData = [];
+    for (const fragKey of table.fragments) {
+      const fragData = await opfsStorage.load(fragKey);
+      if (!fragData) continue;
+      const binary = parseBinaryColumnar(fragData);
+      if (binary && binary.columns[colName]) {
+        const arr = binary.columns[colName];
+        if (arr.length > 0) colData.push(arr);
+      }
+    }
+    if (buffer && buffer.length > 0) {
+      const bufCol = new Float64Array(buffer.length);
+      for (let i = 0; i < buffer.length; i++) {
+        const v = buffer[i][colName];
+        bufCol[i] = typeof v === "number" ? v : 0;
+      }
+      colData.push(bufCol);
+    }
+    if (colData.length === 0) return new Float64Array(0);
+    if (colData.length === 1) return colData[0];
+    const totalLen = colData.reduce((sum, arr) => sum + arr.length, 0);
+    const merged = new Float64Array(totalLen);
+    let offset = 0;
+    for (const arr of colData) {
+      merged.set(arr, offset);
+      offset += arr.length;
+    }
+    return merged;
   }
   /**
    * Parse binary columnar format - optimized for typed arrays
@@ -1092,6 +1336,30 @@ var WorkerDatabase = class {
   }
   listTables() {
     return Array.from(this.tables.keys());
+  }
+  /**
+   * Get fragment paths for direct WASM access (no row conversion)
+   */
+  getFragmentPaths(tableName) {
+    const table = this.tables.get(tableName);
+    if (!table) return [];
+    return table.fragments;
+  }
+  /**
+   * Get column index by name for a table
+   */
+  getColumnIndex(tableName, colName) {
+    const table = this.tables.get(tableName);
+    if (!table) return -1;
+    const idx = table.schema.findIndex((c) => c.name === colName);
+    return idx >= 0 ? idx + 1 : -1;
+  }
+  /**
+   * Check if table has buffered (unflushed) data
+   */
+  hasBufferedData(tableName) {
+    const colBuf = this._columnarBuffer.get(tableName);
+    return colBuf && (colBuf.__length || 0) > 0;
   }
   async compact() {
     for (const [tableName, table] of this.tables) {
@@ -2836,6 +3104,7 @@ var SQLParser = class {
 };
 
 // src/worker/sql/executor.js
+var WASM_THRESHOLD = 100;
 function getColumnValue(row, column, tableAliases = {}) {
   if (typeof column === "string") {
     return row[column];
@@ -2894,6 +3163,87 @@ function evalJoinCondition(condition, leftRow, rightRow, tableAliases) {
       return leftVal >= rightVal;
     default:
       return false;
+  }
+}
+function evalWhereColumnar(where, cols, idx) {
+  if (!where) return true;
+  const getVal = (ref) => {
+    if (ref && typeof ref === "object" && ref.column) {
+      const arr = cols[ref.column];
+      return arr ? arr[idx] : void 0;
+    }
+    return ref;
+  };
+  switch (where.op) {
+    case "AND":
+      return evalWhereColumnar(where.left, cols, idx) && evalWhereColumnar(where.right, cols, idx);
+    case "OR":
+      return evalWhereColumnar(where.left, cols, idx) || evalWhereColumnar(where.right, cols, idx);
+    case "=": {
+      const col = typeof where.column === "string" ? where.column : where.column.column;
+      return cols[col]?.[idx] === getVal(where.value);
+    }
+    case "!=":
+    case "<>": {
+      const col = typeof where.column === "string" ? where.column : where.column.column;
+      return cols[col]?.[idx] !== getVal(where.value);
+    }
+    case "<": {
+      const col = typeof where.column === "string" ? where.column : where.column.column;
+      return cols[col]?.[idx] < getVal(where.value);
+    }
+    case "<=": {
+      const col = typeof where.column === "string" ? where.column : where.column.column;
+      return cols[col]?.[idx] <= getVal(where.value);
+    }
+    case ">": {
+      const col = typeof where.column === "string" ? where.column : where.column.column;
+      return cols[col]?.[idx] > getVal(where.value);
+    }
+    case ">=": {
+      const col = typeof where.column === "string" ? where.column : where.column.column;
+      return cols[col]?.[idx] >= getVal(where.value);
+    }
+    case "BETWEEN": {
+      const col = typeof where.column === "string" ? where.column : where.column.column;
+      const v = cols[col]?.[idx];
+      return v >= where.low && v <= where.high;
+    }
+    case "IN": {
+      const col = typeof where.column === "string" ? where.column : where.column.column;
+      return where.values.includes(cols[col]?.[idx]);
+    }
+    case "NOT IN": {
+      const col = typeof where.column === "string" ? where.column : where.column.column;
+      return !where.values.includes(cols[col]?.[idx]);
+    }
+    case "NOT BETWEEN": {
+      const col = typeof where.column === "string" ? where.column : where.column.column;
+      const v = cols[col]?.[idx];
+      return v < where.low || v > where.high;
+    }
+    case "LIKE": {
+      const col = typeof where.column === "string" ? where.column : where.column.column;
+      const pattern = where.value.replace(/%/g, ".*").replace(/_/g, ".");
+      return new RegExp(`^${pattern}$`, "i").test(cols[col]?.[idx]);
+    }
+    case "NOT LIKE": {
+      const col = typeof where.column === "string" ? where.column : where.column.column;
+      const pattern = where.value.replace(/%/g, ".*").replace(/_/g, ".");
+      return !new RegExp(`^${pattern}$`, "i").test(cols[col]?.[idx]);
+    }
+    case "IS NULL": {
+      const col = typeof where.column === "string" ? where.column : where.column.column;
+      const v = cols[col]?.[idx];
+      return v === null || v === void 0;
+    }
+    case "IS NOT NULL": {
+      const col = typeof where.column === "string" ? where.column : where.column.column;
+      const v = cols[col]?.[idx];
+      return v !== null && v !== void 0;
+    }
+    default:
+      return true;
   }
 }
 function evalWhere(where, row, tableAliases = {}) {
@@ -3011,78 +3361,125 @@ async function preExecuteSubqueries(where, db) {
     where.existsResult = result.rows.length > 0;
   }
 }
+function extractNumericValues(rows, colName) {
+  const n = rows.length;
+  const values = new Float64Array(n);
+  let count = 0;
+  for (let i = 0; i < n; i++) {
+    const val = rows[i][colName];
+    if (typeof val === "number") {
+      values[count++] = val;
+    }
+  }
+  return count === n ? values : values.subarray(0, count);
+}
+function typedSum(arr) {
+  let sum = 0;
+  for (let i = 0; i < arr.length; i++) sum += arr[i];
+  return sum;
+}
+function typedMin(arr) {
+  if (arr.length === 0) return null;
+  let min = arr[0];
+  for (let i = 1; i < arr.length; i++) if (arr[i] < min) min = arr[i];
+  return min;
+}
+function typedMax(arr) {
+  if (arr.length === 0) return null;
+  let max = arr[0];
+  for (let i = 1; i < arr.length; i++) if (arr[i] > max) max = arr[i];
+  return max;
+}
+function wasmAggregate2(func, vals) {
+  const wasm2 = getWasm();
+  if (!wasm2) return null;
+  const mem = getWasmMemory();
+  const ptr = wasm2.alloc(vals.length * 8);
+  if (!ptr) return null;
+  new Float64Array(mem.buffer, ptr, vals.length).set(vals);
+  switch (func) {
+    case "sum":
+      return wasm2.sumFloat64Buffer(ptr, vals.length);
+    case "min":
+      return wasm2.minFloat64Buffer(ptr, vals.length);
+    case "max":
+      return wasm2.maxFloat64Buffer(ptr, vals.length);
+    case "avg":
+      return wasm2.avgFloat64Buffer(ptr, vals.length);
+    default:
+      return null;
+  }
+}
+function jsAggregate(func, vals) {
+  switch (func) {
+    case "sum":
+      return typedSum(vals);
+    case "min":
+      return typedMin(vals);
+    case "max":
+      return typedMax(vals);
+    case "avg":
+      return vals.length > 0 ? typedSum(vals) / vals.length : null;
+    default:
+      return null;
+  }
+}
 function calculateAggregate(func, arg, rows) {
   if (rows.length === 0) return func === "count" ? 0 : null;
   const colName = arg === "*" ? null : typeof arg === "string" ? arg : arg.column || arg;
   switch (func) {
     case "count":
       if (arg === "*") return rows.length;
-      return rows.filter((r) => r[colName] != null).length;
-    case "sum": {
-      let sum = 0;
-      for (const row of rows) {
-        const val = row[colName];
-        if (typeof val === "number") sum += val;
-      }
-      return sum;
-    }
+      let cnt = 0;
+      for (let i = 0; i < rows.length; i++) if (rows[i][colName] != null) cnt++;
+      return cnt;
+    case "sum":
+    case "min":
+    case "max":
     case "avg": {
-      let sum = 0, count = 0;
-      for (const row of rows) {
-        const val = row[colName];
-        if (typeof val === "number") {
-          sum += val;
-          count++;
-        }
+      const vals = extractNumericValues(rows, colName);
+      if (vals.length >= WASM_THRESHOLD) {
+        const r = wasmAggregate2(func, vals);
+        if (r !== null) return r;
       }
-      return count > 0 ? sum / count : null;
-    }
-    case "min": {
-      let min = Infinity;
-      for (const row of rows) {
-        const val = row[colName];
-        if (val != null && val < min) min = val;
-      }
-      return min === Infinity ? null : min;
-    }
-    case "max": {
-      let max = -Infinity;
-      for (const row of rows) {
-        const val = row[colName];
-        if (val != null && val > max) max = val;
-      }
-      return max === -Infinity ? null : max;
+      return jsAggregate(func, vals);
     }
     case "stddev":
     case "stddev_samp": {
-      const vals = rows.map((r) => r[colName]).filter((v) => v != null && typeof v === "number");
+      const vals = extractNumericValues(rows, colName);
       if (vals.length < 2) return null;
-      const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
-      const variance = vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / (vals.length - 1);
-      return Math.sqrt(variance);
+      const mean = typedSum(vals) / vals.length;
+      let variance = 0;
+      for (let i = 0; i < vals.length; i++) variance += (vals[i] - mean) ** 2;
+      return Math.sqrt(variance / (vals.length - 1));
     }
     case "stddev_pop": {
-      const vals = rows.map((r) => r[colName]).filter((v) => v != null && typeof v === "number");
+      const vals = extractNumericValues(rows, colName);
       if (vals.length === 0) return null;
-      const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
-      const variance = vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / vals.length;
-      return Math.sqrt(variance);
+      const mean = typedSum(vals) / vals.length;
+      let variance = 0;
+      for (let i = 0; i < vals.length; i++) variance += (vals[i] - mean) ** 2;
+      return Math.sqrt(variance / vals.length);
     }
     case "variance":
     case "var_samp": {
-      const vals = rows.map((r) => r[colName]).filter((v) => v != null && typeof v === "number");
+      const vals = extractNumericValues(rows, colName);
       if (vals.length < 2) return null;
-      const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
-      return vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / (vals.length - 1);
+      const mean = typedSum(vals) / vals.length;
+      let variance = 0;
+      for (let i = 0; i < vals.length; i++) variance += (vals[i] - mean) ** 2;
+      return variance / (vals.length - 1);
     }
     case "var_pop": {
-      const vals = rows.map((r) => r[colName]).filter((v) => v != null && typeof v === "number");
+      const vals = extractNumericValues(rows, colName);
       if (vals.length === 0) return null;
-      const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
-      return vals.reduce((sum, v) => sum + Math.pow(v - mean, 2), 0) / vals.length;
+      const mean = typedSum(vals) / vals.length;
+      let variance = 0;
+      for (let i = 0; i < vals.length; i++) variance += (vals[i] - mean) ** 2;
+      return variance / vals.length;
     }
     case "median": {
-      const vals = rows.map((r) => r[colName]).filter((v) => v != null && typeof v === "number").sort((a, b) => a - b);
+      const vals = Array.from(extractNumericValues(rows, colName)).sort((a, b) => a - b);
       if (vals.length === 0) return null;
       const mid = Math.floor(vals.length / 2);
       return vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2;
@@ -3091,7 +3488,11 @@ function calculateAggregate(func, arg, rows) {
     case "group_concat": {
       const actualCol = typeof arg === "object" && arg.column ? arg.column : colName;
       const separator = typeof arg === "object" && arg.separator != null ? arg.separator : ",";
-      const vals = rows.map((r) => r[actualCol]).filter((v) => v != null).map(String);
+      const vals = [];
+      for (let i = 0; i < rows.length; i++) {
+        const v = rows[i][actualCol];
+        if (v != null) vals.push(String(v));
+      }
       return vals.join(separator);
     }
     default:
@@ -4398,11 +4799,49 @@ function stringifyExpr(expr) {
   }
   return JSON.stringify(expr);
 }
+var sqlParseCache = /* @__PURE__ */ new Map();
+var SQL_CACHE_MAX = 100;
+var queryResultCache = /* @__PURE__ */ new Map();
+var QUERY_CACHE_MAX = 50;
+function invalidateCacheForTable(tableName) {
+  for (const key of queryResultCache.keys()) {
+    if (key.includes(tableName + ":")) {
+      queryResultCache.delete(key);
+    }
+  }
+}
 async function executeSQL(db, sql) {
-  const lexer = new SQLLexer(sql);
-  const tokens = lexer.tokenize();
-  const parser = new SQLParser(tokens);
-  const ast = parser.parse();
+  let ast = sqlParseCache.get(sql);
+  if (!ast) {
+    const lexer = new SQLLexer(sql);
+    const tokens = lexer.tokenize();
+    const parser = new SQLParser(tokens);
+    ast = parser.parse();
+    if (sqlParseCache.size >= SQL_CACHE_MAX) {
+      const first = sqlParseCache.keys().next().value;
+      sqlParseCache.delete(first);
+    }
+    sqlParseCache.set(sql, ast);
+  }
+  if (ast.type === "SELECT" && ast.table) {
+    const table = db.tables?.get(ast.table);
+    if (table) {
+      const bufLen = db._columnarBuffer?.get(ast.table)?.__length || 0;
+      const tableVersion = `${ast.table}:${table.fragments?.length || 0}:${bufLen}:${table.deletionVector?.length || 0}`;
+      const cacheKey = sql + "|" + tableVersion;
+      const cached = queryResultCache.get(cacheKey);
+      if (cached) return cached;
+      const result = await executeAST(db, ast);
+      if (result && result._format !== "columnar") {
+        if (queryResultCache.size >= QUERY_CACHE_MAX) {
+          const first = queryResultCache.keys().next().value;
+          queryResultCache.delete(first);
+        }
+        queryResultCache.set(cacheKey, result);
+      }
+      return result;
+    }
+  }
   return executeAST(db, ast);
 }
 async function executeAST(db, ast) {
@@ -4413,6 +4852,7 @@ async function executeAST(db, ast) {
     case "DROP_TABLE":
       return db.dropTable(ast.table, ast.ifExists);
     case "INSERT": {
+      invalidateCacheForTable(ast.table);
       let rows = ast.rows || [];
       if (ast.select) {
         const selectResult = await executeAST(db, ast.select);
@@ -4474,6 +4914,7 @@ async function executeAST(db, ast) {
       return db.insert(ast.table, rows);
     }
     case "DELETE": {
+      invalidateCacheForTable(ast.table);
       if (ast.using) {
         const mainRows = await db.select(ast.table, {});
         const tableAliases = { [ast.alias || ast.table]: ast.table };
@@ -4507,6 +4948,7 @@ async function executeAST(db, ast) {
       return db.delete(ast.table, predicate);
     }
     case "UPDATE": {
+      invalidateCacheForTable(ast.table);
       if (ast.from) {
         const mainRows = await db.select(ast.table, {});
         const tableAliases = { [ast.alias || ast.table]: ast.table };
@@ -4589,9 +5031,384 @@ async function executeAST(db, ast) {
           }
         }
       }
-      let rows;
+      const isSimpleAggregate = !ast.where && !ast.joins?.length && !ast.groupBy && ast.columns.every((c) => c.type === "aggregate") && ast.table && !ast.tables?.[0]?.type;
+      if (isSimpleAggregate && db.getFragmentPaths) {
+        const fragPaths = db.getFragmentPaths(ast.table);
+        const hasBuffer = db.hasBufferedData?.(ast.table);
+        if (fragPaths.length > 0 && !hasBuffer) {
+          try {
+            const resultRow = {};
+            let success = true;
+            for (const col of ast.columns) {
+              const func = col.func.toLowerCase();
+              const arg = col.arg;
+              const aggName = col.alias || `${col.func}(${arg === "*" ? "*" : typeof arg === "string" ? arg : arg.column})`;
+              if (func === "count" && arg === "*") {
+                let total = 0;
+                for (const fragPath of fragPaths) {
+                  const result = await wasmAggregate(fragPath, 0, "count");
+                  if (result !== null) total += result;
+                }
+                resultRow[aggName] = total;
+              } else if (["sum", "min", "max", "avg"].includes(func)) {
+                const colName = typeof arg === "string" ? arg : arg.column;
+                const colIdx = db.getColumnIndex(ast.table, colName);
+                if (colIdx >= 0) {
+                  let aggResult = func === "min" ? Infinity : func === "max" ? -Infinity : 0;
+                  let totalCount = 0;
+                  for (const fragPath of fragPaths) {
+                    const result = await wasmAggregate(fragPath, colIdx, func === "avg" ? "sum" : func);
+                    const count = await wasmAggregate(fragPath, 0, "count");
+                    if (result !== null && count !== null) {
+                      if (func === "sum" || func === "avg") {
+                        aggResult += result;
+                      } else if (func === "min") {
+                        aggResult = Math.min(aggResult, result);
+                      } else if (func === "max") {
+                        aggResult = Math.max(aggResult, result);
+                      }
+                      totalCount += count;
+                    }
+                  }
+                  resultRow[aggName] = func === "avg" && totalCount > 0 ? aggResult / totalCount : aggResult;
+                } else {
+                  success = false;
+                  break;
+                }
+              } else {
+                success = false;
+                break;
+              }
+            }
+            if (success) {
+              return { rows: [resultRow], columns: Object.keys(resultRow) };
+            }
+          } catch (e) {
+            console.warn("[Executor] WASM fast path failed:", e);
+          }
+        }
+      }
       const mainTable = ast.tables?.[0];
-      if (!mainTable) {
+      const hasSimpleJoin = ast.joins?.length === 1 && ast.joins[0].on?.op === "=" && ast.groupBy?.length > 0 && ast.columns.every((c) => c.type === "column" || c.type === "aggregate");
+      const canUseColumnar = mainTable && mainTable.type !== "subquery" && db.selectColumnar && (!ast.joins?.length || hasSimpleJoin);
+      let rows;
+      let columnarData = null;
+      if (canUseColumnar) {
+        columnarData = await db.selectColumnar(ast.table);
+        if (columnarData && columnarData.rowCount > 0) {
+          const isSelectStar = ast.columns.length === 1 && ast.columns[0].type === "star";
+          const isSimpleSelect = isSelectStar && !ast.where && !ast.joins?.length && !ast.groupBy && !ast.orderBy;
+          if (isSimpleSelect) {
+            const { columns: cols, rowCount } = columnarData;
+            const colNames = columnarData.schema.map((c) => c.name);
+            return {
+              _format: "columnar",
+              columns: colNames,
+              rowCount,
+              data: Object.fromEntries(colNames.map((name) => [name, cols[name]]))
+            };
+          }
+          const hasComplexCols = ast.columns.some((c) => c.type === "function" || c.type === "case" || c.type === "arithmetic" || c.type === "scalar_subquery");
+          const needsRows = ast.orderBy || hasComplexCols;
+          if (hasSimpleJoin && !needsRows) {
+            const join = ast.joins[0];
+            const rightTableName = join.table.alias || join.table.name;
+            const rightColumnar = await db.selectColumnar(join.table.name);
+            if (rightColumnar && rightColumnar.rowCount > 0) {
+              const leftCols = columnarData.columns;
+              const rightCols = rightColumnar.columns;
+              const leftCond = join.on.left;
+              const rightCond = join.on.right;
+              const leftJoinCol = leftCond.column;
+              const rightJoinCol = rightCond.column;
+              let leftKey = leftJoinCol in leftCols ? leftJoinCol : rightJoinCol;
+              let rightKey = leftJoinCol in rightCols ? leftJoinCol : rightJoinCol;
+              const rightKeyArr = rightCols[rightKey];
+              const hashMap = /* @__PURE__ */ new Map();
+              for (let i = 0; i < rightColumnar.rowCount; i++) {
+                const key = rightKeyArr[i];
+                if (key !== null && key !== void 0) {
+                  hashMap.set(key, i);
+                }
+              }
+              const groupCol = typeof ast.groupBy[0] === "string" ? ast.groupBy[0] : ast.groupBy[0].column;
+              const groupColSimple = groupCol.includes(".") ? groupCol.split(".")[1] : groupCol;
+              const leftKeyArr = leftCols[leftKey];
+              const groups = /* @__PURE__ */ new Map();
+              const aggCols = ast.columns.filter((c) => c.type === "aggregate");
+              const aggInfo = aggCols.map((col) => {
+                const func = col.func.toLowerCase();
+                const arg = col.arg;
+                let colName = arg === "*" ? null : typeof arg === "string" ? arg : arg.column;
+                if (colName && colName.includes(".")) colName = colName.split(".")[1];
+                const aggName = col.alias || `${col.func}(${arg === "*" ? "*" : colName})`;
+                const colArr = colName ? leftCols[colName] || rightCols[colName] : null;
+                return { func, colName, aggName, colArr };
+              });
+              const groupArr = rightCols[groupColSimple] || rightCols[groupCol];
+              for (let i = 0; i < columnarData.rowCount; i++) {
+                const leftVal = leftKeyArr[i];
+                const rightIdx = hashMap.get(leftVal);
+                if (rightIdx === void 0) continue;
+                const groupKey = groupArr[rightIdx];
+                let g = groups.get(groupKey);
+                if (!g) {
+                  g = { count: 0 };
+                  for (const agg of aggInfo) {
+                    if (agg.colName) {
+                      g[agg.colName + "_sum"] = 0;
+                      g[agg.colName + "_min"] = Infinity;
+                      g[agg.colName + "_max"] = -Infinity;
+                    }
+                  }
+                  groups.set(groupKey, g);
+                }
+                g.count++;
+                for (const agg of aggInfo) {
+                  if (agg.colArr) {
+                    const v = agg.colArr[i];
+                    if (typeof v === "number") {
+                      g[agg.colName + "_sum"] += v;
+                      if (v < g[agg.colName + "_min"]) g[agg.colName + "_min"] = v;
+                      if (v > g[agg.colName + "_max"]) g[agg.colName + "_max"] = v;
+                    }
+                  }
+                }
+              }
+              const resultRows = [];
+              for (const [key, g] of groups) {
+                const row = {};
+                for (const col of ast.columns) {
+                  if (col.type === "column") {
+                    const colName = typeof col.value === "string" ? col.value : col.value.column;
+                    row[col.alias || colName] = key;
+                  } else if (col.type === "aggregate") {
+                    const func = col.func.toLowerCase();
+                    let colName = col.arg === "*" ? null : typeof col.arg === "string" ? col.arg : col.arg.column;
+                    if (colName && colName.includes(".")) colName = colName.split(".")[1];
+                    const aggName = col.alias || `${col.func}(${col.arg === "*" ? "*" : colName})`;
+                    switch (func) {
+                      case "count":
+                        row[aggName] = g.count;
+                        break;
+                      case "sum":
+                        row[aggName] = g[colName + "_sum"] || 0;
+                        break;
+                      case "min":
+                        row[aggName] = g[colName + "_min"] === Infinity ? null : g[colName + "_min"];
+                        break;
+                      case "max":
+                        row[aggName] = g[colName + "_max"] === -Infinity ? null : g[colName + "_max"];
+                        break;
+                      case "avg":
+                        row[aggName] = g.count > 0 ? (g[colName + "_sum"] || 0) / g.count : null;
+                        break;
+                    }
+                  }
+                }
+                resultRows.push(row);
+              }
+              return { rows: resultRows, columns: Object.keys(resultRows[0] || {}) };
+            }
+          }
+          if (ast.where && !hasComplexCols) {
+            const { columns: cols, rowCount } = columnarData;
+            const colNames = Object.keys(cols);
+            const colArrays = {};
+            for (const name of colNames) colArrays[name] = cols[name];
+            const validIndices = new Uint32Array(rowCount);
+            let validCount = 0;
+            for (let i = 0; i < rowCount; i++) {
+              if (evalWhereColumnar(ast.where, colArrays, i)) {
+                validIndices[validCount++] = i;
+              }
+            }
+            const filteredCols = {};
+            for (const name of colNames) {
+              const arr = cols[name];
+              if (ArrayBuffer.isView(arr)) {
+                const filtered = new arr.constructor(validCount);
+                for (let j = 0; j < validCount; j++) {
+                  filtered[j] = arr[validIndices[j]];
+                }
+                filteredCols[name] = filtered;
+              } else {
+                const filtered = new Array(validCount);
+                for (let j = 0; j < validCount; j++) {
+                  filtered[j] = arr[validIndices[j]];
+                }
+                filteredCols[name] = filtered;
+              }
+            }
+            columnarData = { schema: columnarData.schema, columns: filteredCols, rowCount: validCount };
+          }
+          if (!needsRows && ast.groupBy && ast.groupBy.length === 1 && ast.columns.every((c) => c.type === "aggregate" || c.type === "column")) {
+            const groupCol = typeof ast.groupBy[0] === "string" ? ast.groupBy[0] : ast.groupBy[0].column;
+            const groupArr = columnarData.columns[groupCol];
+            if (groupArr) {
+              const aggCols = ast.columns.filter((c) => c.type === "aggregate");
+              const aggInfo = aggCols.map((col) => {
+                const func = col.func.toLowerCase();
+                const arg = col.arg;
+                const colName = arg === "*" ? null : typeof arg === "string" ? arg : arg.column;
+                const aggName = col.alias || `${col.func}(${arg === "*" ? "*" : colName})`;
+                return { func, colName, aggName, colArr: colName ? columnarData.columns[colName] : null };
+              });
+              const groups = /* @__PURE__ */ new Map();
+              const rowCount = columnarData.rowCount;
+              for (let i = 0; i < rowCount; i++) {
+                const key = groupArr[i];
+                let g = groups.get(key);
+                if (!g) {
+                  g = { count: 0, sums: {}, mins: {}, maxs: {} };
+                  for (const agg of aggInfo) {
+                    if (agg.colName) {
+                      g.sums[agg.colName] = 0;
+                      g.mins[agg.colName] = Infinity;
+                      g.maxs[agg.colName] = -Infinity;
+                    }
+                  }
+                  groups.set(key, g);
+                }
+                g.count++;
+                for (const agg of aggInfo) {
+                  if (agg.colArr) {
+                    const v = agg.colArr[i];
+                    if (typeof v === "number") {
+                      g.sums[agg.colName] += v;
+                      if (v < g.mins[agg.colName]) g.mins[agg.colName] = v;
+                      if (v > g.maxs[agg.colName]) g.maxs[agg.colName] = v;
+                    }
+                  }
+                }
+              }
+              const resultRows = [];
+              for (const [key, g] of groups) {
+                const row = {};
+                for (const col of ast.columns) {
+                  if (col.type === "column") {
+                    const colName = typeof col.value === "string" ? col.value : col.value.column;
+                    row[col.alias || colName] = key;
+                  } else if (col.type === "aggregate") {
+                    const func = col.func.toLowerCase();
+                    const arg = col.arg;
+                    const colName = arg === "*" ? null : typeof arg === "string" ? arg : arg.column;
+                    const aggName = col.alias || `${col.func}(${arg === "*" ? "*" : colName})`;
+                    switch (func) {
+                      case "count":
+                        row[aggName] = g.count;
+                        break;
+                      case "sum":
+                        row[aggName] = g.sums[colName] || 0;
+                        break;
+                      case "min":
+                        row[aggName] = g.mins[colName] === Infinity ? null : g.mins[colName];
+                        break;
+                      case "max":
+                        row[aggName] = g.maxs[colName] === -Infinity ? null : g.maxs[colName];
+                        break;
+                      case "avg":
+                        row[aggName] = g.count > 0 ? (g.sums[colName] || 0) / g.count : null;
+                        break;
+                    }
+                  }
+                }
+                resultRows.push(row);
+              }
+              return { rows: resultRows, columns: Object.keys(resultRows[0] || {}) };
+            }
+          }
+          if (!needsRows && !ast.groupBy && ast.columns.every((c) => c.type === "aggregate" || c.type === "star" || c.type === "column")) {
+            const wasm2 = getWasm();
+            const mem = getWasmMemory();
+            if (ast.columns.every((c) => c.type === "aggregate")) {
+              const resultRow = {};
+              for (const col of ast.columns) {
+                const func = col.func.toLowerCase();
+                const arg = col.arg;
+                const aggName = col.alias || `${col.func}(${arg === "*" ? "*" : typeof arg === "string" ? arg : arg.column})`;
+                if (func === "count" && arg === "*") {
+                  resultRow[aggName] = columnarData.rowCount;
+                } else if (func === "count") {
+                  const colName = typeof arg === "string" ? arg : arg.column;
+                  const colArr = columnarData.columns[colName];
+                  resultRow[aggName] = colArr ? colArr.length : 0;
+                } else {
+                  const colName = typeof arg === "string" ? arg : arg.column;
+                  const colArr = columnarData.columns[colName];
+                  if (colArr && wasm2 && mem) {
+                    const ptr = wasm2.alloc(colArr.length * 8);
+                    if (ptr) {
+                      const f64 = colArr instanceof Float64Array ? colArr : new Float64Array(colArr);
+                      new Float64Array(mem.buffer, ptr, f64.length).set(f64);
+                      switch (func) {
+                        case "sum":
+                          resultRow[aggName] = wasm2.sumFloat64Buffer(ptr, f64.length);
+                          break;
+                        case "min":
+                          resultRow[aggName] = wasm2.minFloat64Buffer(ptr, f64.length);
+                          break;
+                        case "max":
+                          resultRow[aggName] = wasm2.maxFloat64Buffer(ptr, f64.length);
+                          break;
+                        case "avg":
+                          resultRow[aggName] = wasm2.avgFloat64Buffer(ptr, f64.length);
+                          break;
+                      }
+                    }
+                  } else if (colArr) {
+                    const vals = Array.from(colArr);
+                    switch (func) {
+                      case "sum":
+                        resultRow[aggName] = vals.reduce((a, b) => a + b, 0);
+                        break;
+                      case "min":
+                        resultRow[aggName] = Math.min(...vals);
+                        break;
+                      case "max":
+                        resultRow[aggName] = Math.max(...vals);
+                        break;
+                      case "avg":
+                        resultRow[aggName] = vals.reduce((a, b) => a + b, 0) / vals.length;
+                        break;
+                    }
+                  }
+                }
+              }
+              return { rows: [resultRow], columns: Object.keys(resultRow) };
+            }
+            const { columns: colData, rowCount } = columnarData;
+            const colNames = Object.keys(colData).filter((n) => n !== "__rowId");
+            const numCols = colNames.length;
+            const colArrays = new Array(numCols);
+            for (let j = 0; j < numCols; j++) {
+              colArrays[j] = colData[colNames[j]];
+            }
+            return {
+              _format: "columnar",
+              columns: colNames,
+              rowCount,
+              data: Object.fromEntries(
+                colNames.map((name) => [name, colArrays[colNames.indexOf(name)]])
+              )
+            };
+          } else {
+            const { columns: colData, rowCount } = columnarData;
+            rows = new Array(rowCount);
+            const colNames = Object.keys(colData).filter((n) => n !== "__rowId");
+            for (let i = 0; i < rowCount; i++) {
+              const row = {};
+              for (let j = 0; j < colNames.length; j++) {
+                row[colNames[j]] = colData[colNames[j]][i];
+              }
+              row.__rowId = colData.__rowId ? colData.__rowId[i] : i;
+              rows[i] = row;
+            }
+          }
+        } else {
+          rows = [];
+        }
+      } else if (!mainTable) {
         rows = [{}];
       } else if (mainTable.type === "subquery") {
         rows = derivedTables.get(mainTable.alias) || [];
@@ -4649,31 +5466,40 @@ async function executeAST(db, ast) {
                 rightCol = leftColSimple in sampleRight ? leftColSimple : leftCondKey;
               }
               const hashMap = /* @__PURE__ */ new Map();
+              const rightColFallback = rightCol.split(".").pop();
               for (let ri = 0; ri < rightRows.length; ri++) {
                 const rightRow = rightRows[ri];
-                const key = rightRow[rightCol] ?? rightRow[rightCol.split(".").pop()];
+                const key = rightRow[rightCol] ?? rightRow[rightColFallback];
                 if (key !== null && key !== void 0) {
-                  if (!hashMap.has(key)) hashMap.set(key, []);
-                  hashMap.get(key).push(ri);
+                  let bucket = hashMap.get(key);
+                  if (!bucket) {
+                    bucket = [];
+                    hashMap.set(key, bucket);
+                  }
+                  bucket.push(ri);
                 }
               }
+              const rightKeys = rightRows.length > 0 ? Object.keys(rightRows[0]) : [];
+              const leftColFallback = leftCol.split(".").pop();
               for (let li = 0; li < rows.length; li++) {
                 const leftRow = rows[li];
-                const key = leftRow[leftCol] ?? leftRow[leftCol.split(".").pop()];
+                const key = leftRow[leftCol] ?? leftRow[leftColFallback];
                 const matches = hashMap.get(key);
                 if (matches) {
-                  for (const ri of matches) {
+                  for (let mi = 0; mi < matches.length; mi++) {
+                    const ri = matches[mi];
                     matchedRightIndices.add(ri);
                     const rightRow = rightRows[ri];
-                    const merged = { ...leftRow };
-                    for (const k of Object.keys(rightRow)) {
+                    const merged = Object.assign({}, leftRow);
+                    for (let ki = 0; ki < rightKeys.length; ki++) {
+                      const k = rightKeys[ki];
                       if (!(k in merged)) merged[k] = rightRow[k];
                       merged[`${rightTableName}.${k}`] = rightRow[k];
                     }
                     newRows.push(merged);
                   }
                 } else if (join.type === "LEFT" || join.type === "FULL") {
-                  newRows.push({ ...leftRow });
+                  newRows.push(Object.assign({}, leftRow));
                 }
               }
               if (join.type === "RIGHT" || join.type === "FULL") {
@@ -4689,15 +5515,18 @@ async function executeAST(db, ast) {
                 }
               }
             } else {
-              for (const leftRow of rows) {
+              const rightKeysNL = rightRows.length > 0 ? Object.keys(rightRows[0]) : [];
+              for (let li = 0; li < rows.length; li++) {
+                const leftRow = rows[li];
                 let matched = false;
                 for (let ri = 0; ri < rightRows.length; ri++) {
                   const rightRow = rightRows[ri];
                   if (evalJoinCondition(join.on, leftRow, rightRow, tableAliases)) {
                     matched = true;
                     matchedRightIndices.add(ri);
-                    const merged = { ...leftRow };
-                    for (const key of Object.keys(rightRow)) {
+                    const merged = Object.assign({}, leftRow);
+                    for (let ki = 0; ki < rightKeysNL.length; ki++) {
+                      const key = rightKeysNL[ki];
                       if (!(key in merged)) merged[key] = rightRow[key];
                       merged[`${rightTableName}.${key}`] = rightRow[key];
                     }
@@ -4705,7 +5534,7 @@ async function executeAST(db, ast) {
                   }
                 }
                 if (!matched && (join.type === "LEFT" || join.type === "FULL")) {
-                  newRows.push({ ...leftRow });
+                  newRows.push(Object.assign({}, leftRow));
                 }
               }
               if (join.type === "RIGHT" || join.type === "FULL") {
@@ -5285,6 +6114,256 @@ var WorkerVault = class {
 };
 
 // src/worker/index.js
+function canUseWasmSql(sql) {
+  const upper = sql.toUpperCase().trim();
+  return upper.startsWith("SELECT") && !upper.includes("JOIN") && // JOINs need more work
+  !upper.includes("UNION");
+}
+async function executeWasmSql(db, sql) {
+  if (!wasm) return null;
+  const match = sql.match(/FROM\s+(\w+)/i);
+  if (!match) return null;
+  const tableName = match[1];
+  const table = db.tables.get(tableName);
+  if (!table) return null;
+  const columnarData = await db.selectColumnar(tableName);
+  if (!columnarData || columnarData.rowCount === 0) return null;
+  const { columns: colData, rowCount, schema } = columnarData;
+  const colNames = schema.map((c) => c.name);
+  for (const c of schema) {
+    const type = (c.type || c.dataType || "").toLowerCase();
+    if (type === "text" || type === "string") return null;
+  }
+  const HEADER_SIZE = 32;
+  const COL_META_SIZE = 24;
+  let numericSize = 0;
+  const colMeta = [];
+  for (const name of colNames) {
+    const arr = colData[name];
+    if (ArrayBuffer.isView(arr)) {
+      colMeta.push({ name, size: arr.byteLength, elemSize: arr.BYTES_PER_ELEMENT || 8 });
+      numericSize += arr.byteLength;
+    }
+  }
+  const totalSize = HEADER_SIZE + COL_META_SIZE * colMeta.length + numericSize;
+  const buffer = new ArrayBuffer(totalSize);
+  const view = new DataView(buffer);
+  const u8 = new Uint8Array(buffer);
+  view.setUint32(0, 1, true);
+  view.setUint32(4, colMeta.length, true);
+  view.setBigUint64(8, BigInt(rowCount), true);
+  view.setUint32(16, HEADER_SIZE, true);
+  view.setUint32(20, HEADER_SIZE, true);
+  view.setUint32(24, HEADER_SIZE + COL_META_SIZE * colMeta.length, true);
+  view.setUint32(28, 0, true);
+  let metaOffset = HEADER_SIZE;
+  let dataOffset = HEADER_SIZE + COL_META_SIZE * colMeta.length;
+  for (const meta of colMeta) {
+    const arr = colData[meta.name];
+    view.setUint32(metaOffset, 0, true);
+    view.setUint32(metaOffset + 4, meta.name.length, true);
+    view.setUint32(metaOffset + 8, dataOffset, true);
+    view.setBigUint64(metaOffset + 12, BigInt(meta.size), true);
+    view.setUint32(metaOffset + 20, meta.elemSize, true);
+    const src = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+    u8.set(src, dataOffset);
+    dataOffset += meta.size;
+    metaOffset += COL_META_SIZE;
+  }
+  return {
+    _format: "wasm_binary",
+    buffer,
+    columns: colNames,
+    rowCount,
+    schema
+  };
+}
+var wasm = null;
+var wasmMemory = null;
+var opfsHandles = /* @__PURE__ */ new Map();
+var nextHandleId = 1;
+async function getOPFSDir(pathParts) {
+  let current = await navigator.storage.getDirectory();
+  current = await current.getDirectoryHandle("lanceql", { create: true });
+  for (const part of pathParts) {
+    current = await current.getDirectoryHandle(part, { create: true });
+  }
+  return current;
+}
+function createWasmImports() {
+  return {
+    env: {
+      // Open file, returns handle ID (0 = error)
+      opfs_open: (pathPtr, pathLen) => {
+        try {
+          const pathBytes = new Uint8Array(wasmMemory.buffer, pathPtr, pathLen);
+          const path = new TextDecoder().decode(pathBytes);
+          const parts = path.split("/").filter((p) => p);
+          const fileName = parts.pop();
+          return 0;
+        } catch (e) {
+          return 0;
+        }
+      },
+      // Read from file at offset into buffer
+      opfs_read: (handle, bufPtr, bufLen, offset) => {
+        const accessHandle = opfsHandles.get(handle);
+        if (!accessHandle) return 0;
+        try {
+          const buf = new Uint8Array(wasmMemory.buffer, bufPtr, bufLen);
+          return accessHandle.read(buf, { at: Number(offset) });
+        } catch (e) {
+          return 0;
+        }
+      },
+      // Get file size
+      opfs_size: (handle) => {
+        const accessHandle = opfsHandles.get(handle);
+        if (!accessHandle) return BigInt(0);
+        try {
+          return BigInt(accessHandle.getSize());
+        } catch (e) {
+          return BigInt(0);
+        }
+      },
+      // Close file handle
+      opfs_close: (handle) => {
+        const accessHandle = opfsHandles.get(handle);
+        if (accessHandle) {
+          try {
+            accessHandle.close();
+          } catch (e) {
+          }
+          opfsHandles.delete(handle);
+        }
+      }
+    }
+  };
+}
+async function registerOPFSFile(path) {
+  try {
+    const parts = path.split("/").filter((p) => p);
+    const fileName = parts.pop();
+    const dir = await getOPFSDir(parts);
+    const fileHandle = await dir.getFileHandle(fileName);
+    const accessHandle = await fileHandle.createSyncAccessHandle();
+    const handleId = nextHandleId++;
+    opfsHandles.set(handleId, accessHandle);
+    return handleId;
+  } catch (e) {
+    console.warn("[LanceQLWorker] Failed to register OPFS file:", path, e);
+    return 0;
+  }
+}
+function closeOPFSFile(handleId) {
+  const accessHandle = opfsHandles.get(handleId);
+  if (accessHandle) {
+    try {
+      accessHandle.close();
+    } catch (e) {
+    }
+    opfsHandles.delete(handleId);
+  }
+}
+async function loadWasm() {
+  if (wasm) return wasm;
+  try {
+    const response = await fetch(new URL("./lanceql.wasm", import.meta.url));
+    const bytes = await response.arrayBuffer();
+    const imports = createWasmImports();
+    const module = await WebAssembly.instantiate(bytes, imports);
+    wasm = module.instance.exports;
+    wasmMemory = wasm.memory;
+    console.log("[LanceQLWorker] WASM loaded with OPFS support");
+    return wasm;
+  } catch (e) {
+    console.warn("[LanceQLWorker] WASM not available:", e.message);
+    return null;
+  }
+}
+function getWasm() {
+  return wasm;
+}
+function getWasmMemory() {
+  return wasmMemory;
+}
+var wasmBufferPtr = 0;
+var wasmBufferSize = 0;
+var MIN_BUFFER_SIZE = 1024 * 1024;
+function getWasmBuffer(size) {
+  if (!wasm) return 0;
+  if (size <= wasmBufferSize && wasmBufferPtr !== 0) {
+    return wasmBufferPtr;
+  }
+  const newSize = Math.max(size, MIN_BUFFER_SIZE);
+  const ptr = wasm.alloc(newSize);
+  if (ptr) {
+    wasmBufferPtr = ptr;
+    wasmBufferSize = newSize;
+  }
+  return ptr;
+}
+async function loadFragmentToWasm(fragPath) {
+  const w = await loadWasm();
+  if (!w) return 0;
+  try {
+    const parts = fragPath.split("/").filter((p) => p);
+    const fileName = parts.pop();
+    const dir = await getOPFSDir(parts);
+    const fileHandle = await dir.getFileHandle(fileName);
+    const accessHandle = await fileHandle.createSyncAccessHandle();
+    const size = accessHandle.getSize();
+    const ptr = getWasmBuffer(size);
+    if (!ptr) {
+      accessHandle.close();
+      return 0;
+    }
+    const wasmBuf = new Uint8Array(wasmMemory.buffer, ptr, size);
+    const bytesRead = accessHandle.read(wasmBuf, { at: 0 });
+    accessHandle.close();
+    if (bytesRead !== size) return 0;
+    return w.openFile(ptr, size);
+  } catch (e) {
+    console.warn("[LanceQLWorker] Failed to load fragment:", fragPath, e);
+    return 0;
+  }
+}
+var fragmentCache = /* @__PURE__ */ new Map();
+var CACHE_MAX_SIZE = 10;
+async function loadFragmentCached(fragPath) {
+  if (fragmentCache.has(fragPath)) {
+    return fragmentCache.get(fragPath);
+  }
+  const loaded = await loadFragmentToWasm(fragPath);
+  if (loaded) {
+    if (fragmentCache.size >= CACHE_MAX_SIZE) {
+      const first = fragmentCache.keys().next().value;
+      fragmentCache.delete(first);
+    }
+    fragmentCache.set(fragPath, loaded);
+  }
+  return loaded;
+}
+async function wasmAggregate(fragPath, colIdx, func) {
+  const loaded = await loadFragmentCached(fragPath);
+  if (!loaded) return null;
+  const w = wasm;
+  switch (func) {
+    case "sum":
+      return w.opfsSumFloat64Column(colIdx);
+    case "min":
+      return w.opfsMinFloat64Column(colIdx);
+    case "max":
+      return w.opfsMaxFloat64Column(colIdx);
+    case "avg":
+      return w.opfsAvgFloat64Column(colIdx);
+    case "count":
+      return Number(w.opfsCountRows());
+    default:
+      return null;
+  }
+}
+loadWasm();
 var stores = /* @__PURE__ */ new Map();
 var databases = /* @__PURE__ */ new Map();
 var vaultInstance = null;
@@ -5292,6 +6371,8 @@ var ports = /* @__PURE__ */ new Set();
 var sharedBuffer = null;
 var sharedOffset = 0;
 var SHARED_THRESHOLD = 1024;
+var cursors = /* @__PURE__ */ new Map();
+var nextCursorId = 1;
 async function getVault(encryptionConfig = null) {
   if (!vaultInstance) {
     vaultInstance = new WorkerVault();
@@ -5318,6 +6399,93 @@ async function getDatabase(name) {
   return databases.get(name);
 }
 function sendResponse(port, id, result) {
+  if (result && result._format === "wasm_binary") {
+    port.postMessage({
+      id,
+      result: {
+        _format: "wasm_binary",
+        buffer: result.buffer,
+        columns: result.columns,
+        rowCount: result.rowCount,
+        schema: result.schema
+      }
+    }, [result.buffer]);
+    return;
+  }
+  if (result && result._format === "columnar" && result.data) {
+    const colNames = result.columns;
+    const rowCount = result.rowCount;
+    if (rowCount < 1e3) {
+      const transferables2 = [];
+      const serializedData = {};
+      const usedBuffers = /* @__PURE__ */ new Set();
+      for (const name of colNames) {
+        const arr = result.data[name];
+        if (ArrayBuffer.isView(arr)) {
+          const isView = arr.byteOffset !== 0 || arr.byteLength < arr.buffer.byteLength;
+          const bufferAlreadyUsed = usedBuffers.has(arr.buffer);
+          if (isView || bufferAlreadyUsed) {
+            const copy = new arr.constructor(arr);
+            serializedData[name] = copy;
+            transferables2.push(copy.buffer);
+          } else {
+            serializedData[name] = arr;
+            transferables2.push(arr.buffer);
+            usedBuffers.add(arr.buffer);
+          }
+        } else {
+          serializedData[name] = arr;
+        }
+      }
+      port.postMessage({
+        id,
+        result: { _format: "columnar", columns: colNames, rowCount, data: serializedData }
+      }, transferables2);
+      return;
+    }
+    const typedCols = [];
+    const stringCols = [];
+    let numericBytes = 0;
+    for (const name of colNames) {
+      const arr = result.data[name];
+      if (ArrayBuffer.isView(arr)) {
+        typedCols.push({ name, arr });
+        numericBytes += arr.byteLength;
+      } else if (Array.isArray(arr)) {
+        stringCols.push({ name, arr });
+      }
+    }
+    const packedBuffer = numericBytes > 0 ? new ArrayBuffer(numericBytes) : null;
+    const colOffsets = {};
+    let offset = 0;
+    if (packedBuffer) {
+      const packedView = new Uint8Array(packedBuffer);
+      for (const { name, arr } of typedCols) {
+        const bytes = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+        packedView.set(bytes, offset);
+        colOffsets[name] = { offset, length: arr.length, type: arr.constructor.name };
+        offset += arr.byteLength;
+      }
+    }
+    const stringData = {};
+    for (const { name, arr } of stringCols) {
+      stringData[name] = arr;
+    }
+    const transferables = [];
+    if (packedBuffer) transferables.push(packedBuffer);
+    port.postMessage({
+      id,
+      result: {
+        _format: "packed",
+        columns: colNames,
+        rowCount,
+        packedBuffer,
+        colOffsets,
+        stringData
+      }
+    }, transferables);
+    return;
+  }
   if (sharedBuffer && result !== void 0) {
     const json = JSON.stringify(result);
     if (json.length > SHARED_THRESHOLD) {
@@ -5408,7 +6576,32 @@ async function handleMessage(port, data) {
       }
       result = await db.select(args.tableName, options);
     } else if (method === "db:exec") {
-      result = await executeSQL(await getDatabase(args.db), args.sql);
+      const db = await getDatabase(args.db);
+      if (canUseWasmSql(args.sql)) {
+        const wasmResult = await executeWasmSql(db, args.sql);
+        if (wasmResult) {
+          result = wasmResult;
+        } else {
+          result = await executeSQL(db, args.sql);
+        }
+      } else {
+        result = await executeSQL(db, args.sql);
+      }
+      if (result && result._format === "columnar" && result.rowCount >= 1e3) {
+        const cursorId = nextCursorId++;
+        cursors.set(cursorId, result);
+        result = {
+          _format: "cursor",
+          cursorId,
+          columns: result.columns,
+          rowCount: result.rowCount
+        };
+      }
+    } else if (method === "cursor:fetch") {
+      const cursor = cursors.get(args.cursorId);
+      if (!cursor) throw new Error("Cursor not found");
+      result = cursor;
+      cursors.delete(args.cursorId);
     } else if (method === "db:flush") {
       await (await getDatabase(args.db)).flush();
       result = true;
@@ -5440,6 +6633,16 @@ async function handleMessage(port, data) {
       result = await (await getVault()).has(args.key);
     } else if (method === "vault:exec") {
       result = await (await getVault()).exec(args.sql);
+      if (result && result._format === "columnar" && result.rowCount >= 1e3) {
+        const cursorId = nextCursorId++;
+        cursors.set(cursorId, result);
+        result = {
+          _format: "cursor",
+          cursorId,
+          columns: result.columns,
+          rowCount: result.rowCount
+        };
+      }
     } else {
       throw new Error(`Unknown method: ${method}`);
     }
@@ -5465,4 +6668,12 @@ self.onmessage = (e) => {
   handleMessage(self, e.data);
 };
 console.log("[LanceQLWorker] Initialized");
+export {
+  closeOPFSFile,
+  getWasm,
+  getWasmMemory,
+  loadFragmentToWasm,
+  registerOPFSFile,
+  wasmAggregate
+};
 //# sourceMappingURL=lanceql-worker.js.map

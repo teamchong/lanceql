@@ -5094,7 +5094,73 @@ function handleWorkerMessage(data, port, resolveReady) {
             } else if (data.error) {
                 pending.reject(new Error(data.error));
             } else {
-                pending.resolve(data.result);
+                let result = data.result;
+
+                // Handle packed columnar result (single buffer for typed arrays + string data)
+                if (result && result._format === 'packed') {
+                    const { columns, rowCount, packedBuffer, colOffsets, stringData } = result;
+                    const colData = { ...(stringData || {}) };
+
+                    if (packedBuffer && colOffsets) {
+                        const TypedArrayMap = {
+                            Float64Array, Float32Array, Int32Array, Int16Array, Int8Array,
+                            Uint32Array, Uint16Array, Uint8Array, BigInt64Array, BigUint64Array
+                        };
+
+                        for (const [name, info] of Object.entries(colOffsets)) {
+                            // Typed array - create view into buffer
+                            const TypedArr = TypedArrayMap[info.type] || Float64Array;
+                            colData[name] = new TypedArr(packedBuffer, info.offset, info.length);
+                        }
+                    }
+
+                    // Add lazy rows getter
+                    result.data = colData;
+                    result._format = 'columnar';
+                    Object.defineProperty(result, 'rows', {
+                        configurable: true,
+                        enumerable: true,
+                        get() {
+                            const rows = new Array(rowCount);
+                            const colArrays = columns.map(name => colData[name]);
+                            for (let i = 0; i < rowCount; i++) {
+                                const row = {};
+                                for (let j = 0; j < columns.length; j++) {
+                                    row[columns[j]] = colArrays[j][i];
+                                }
+                                rows[i] = row;
+                            }
+                            Object.defineProperty(this, 'rows', { value: rows, writable: false });
+                            return rows;
+                        }
+                    });
+                }
+
+                // Handle columnar result - add lazy rows getter for API compatibility
+                else if (result && result._format === 'columnar') {
+                    const { columns, rowCount, data: colData } = result;
+                    Object.defineProperty(result, 'rows', {
+                        configurable: true,
+                        enumerable: true,
+                        get() {
+                            // Lazy row materialization - only when accessed
+                            const rows = new Array(rowCount);
+                            const colArrays = columns.map(name => colData[name]);
+                            for (let i = 0; i < rowCount; i++) {
+                                const row = {};
+                                for (let j = 0; j < columns.length; j++) {
+                                    row[columns[j]] = colArrays[j][i];
+                                }
+                                rows[i] = row;
+                            }
+                            // Cache and replace getter with value
+                            Object.defineProperty(this, 'rows', { value: rows, writable: false });
+                            return rows;
+                        }
+                    });
+                }
+
+                pending.resolve(result);
             }
         }
     }

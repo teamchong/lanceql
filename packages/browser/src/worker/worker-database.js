@@ -4,6 +4,7 @@
 
 import { opfsStorage } from './opfs-storage.js';
 import { DataType, LanceFileWriter, E, D, parseBinaryColumnar } from './data-types.js';
+import { getWasm, getWasmMemory } from './index.js';
 
 // Streaming scan state
 const scanStreams = new Map();
@@ -19,8 +20,10 @@ export class WorkerDatabase {
         // Write buffer for fast inserts
         this._writeBuffer = new Map();
         this._flushTimer = null;
-        this._flushInterval = 1000;
-        this._flushThreshold = 1000;
+        this._flushInterval = 2000;       // Increased from 1000
+        this._flushThreshold = 10000;     // Increased from 1000 to reduce fragments
+        // Columnar write buffer: { colName: Array }
+        this._columnarBuffer = new Map();
         this._flushing = false;
 
         // Read cache
@@ -110,26 +113,72 @@ export class WorkerDatabase {
         }
 
         const table = this.tables.get(tableName);
+        const n = rows.length;
 
-        const rowsWithIds = rows.map(row => ({
-            __rowId: table.nextRowId++,
-            ...row,
-        }));
-
-        if (!this._writeBuffer.has(tableName)) {
-            this._writeBuffer.set(tableName, []);
+        // Initialize columnar buffer with pre-allocated typed arrays
+        if (!this._columnarBuffer.has(tableName)) {
+            const initialCapacity = Math.max(1024, n * 2);
+            const cols = {
+                __rowId: new Float64Array(initialCapacity),
+                __length: 0,
+                __capacity: initialCapacity,
+                __schema: table.schema
+            };
+            for (const c of table.schema) {
+                const type = c.dataType || c.type;
+                if (type === 'text' || type === 'string') {
+                    cols[c.name] = new Array(initialCapacity);
+                } else {
+                    cols[c.name] = new Float64Array(initialCapacity);
+                }
+            }
+            this._columnarBuffer.set(tableName, cols);
         }
-        this._writeBuffer.get(tableName).push(...rowsWithIds);
-        table.rowCount += rows.length;
 
+        const colBuf = this._columnarBuffer.get(tableName);
+        let len = colBuf.__length;
+        let cap = colBuf.__capacity;
+
+        // Grow arrays if needed
+        if (len + n > cap) {
+            const newCap = Math.max(cap * 2, len + n);
+            const newRowId = new Float64Array(newCap);
+            newRowId.set(colBuf.__rowId.subarray(0, len));
+            colBuf.__rowId = newRowId;
+
+            for (const c of table.schema) {
+                const old = colBuf[c.name];
+                if (old instanceof Float64Array) {
+                    const newArr = new Float64Array(newCap);
+                    newArr.set(old.subarray(0, len));
+                    colBuf[c.name] = newArr;
+                } else {
+                    // String array - just extend
+                    colBuf[c.name].length = newCap;
+                }
+            }
+            colBuf.__capacity = newCap;
+        }
+
+        // Append directly to typed arrays (fast!)
+        for (let i = 0; i < n; i++) {
+            const row = rows[i];
+            colBuf.__rowId[len + i] = table.nextRowId++;
+            for (const c of table.schema) {
+                const val = row[c.name];
+                colBuf[c.name][len + i] = val ?? (colBuf[c.name] instanceof Float64Array ? 0 : null);
+            }
+        }
+        colBuf.__length = len + n;
+
+        table.rowCount += n;
         this._scheduleFlush();
 
-        const bufferSize = this._writeBuffer.get(tableName).length;
-        if (bufferSize >= this._flushThreshold) {
+        if (colBuf.__length >= this._flushThreshold) {
             await this._flushTable(tableName);
         }
 
-        return { success: true, inserted: rows.length };
+        return { success: true, inserted: n };
     }
 
     _scheduleFlush() {
@@ -145,7 +194,7 @@ export class WorkerDatabase {
         this._flushing = true;
 
         try {
-            const tables = [...this._writeBuffer.keys()];
+            const tables = [...this._columnarBuffer.keys()];
             for (const tableName of tables) {
                 await this._flushTable(tableName);
             }
@@ -155,21 +204,43 @@ export class WorkerDatabase {
     }
 
     async _flushTable(tableName) {
-        const buffer = this._writeBuffer.get(tableName);
-        if (!buffer || buffer.length === 0) return;
+        const colBuf = this._columnarBuffer.get(tableName);
+        const bufLen = colBuf?.__length || 0;
+        if (!colBuf || bufLen === 0) return;
 
         const table = this.tables.get(tableName);
         if (!table) return;
 
-        const rowsToFlush = buffer.splice(0, buffer.length);
-
+        // Build schema with __rowId and correct types
         const schemaWithRowId = [
-            { name: '__rowId', type: 'int64', primaryKey: true },
-            ...table.schema.filter(c => c.name !== '__rowId')
+            { name: '__rowId', type: 'int64', dataType: 'float64', primaryKey: true },
+            ...table.schema.filter(c => c.name !== '__rowId').map(c => ({
+                ...c,
+                dataType: c.dataType || c.type || 'float64'
+            }))
         ];
 
+        // Already typed arrays - just slice to actual length (no copy needed for writing)
+        const columnarData = {};
+        for (const col of schemaWithRowId) {
+            const arr = colBuf[col.name];
+            if (!arr) continue;
+
+            if (arr instanceof Float64Array) {
+                // Typed array - slice to actual length
+                columnarData[col.name] = arr.subarray(0, bufLen);
+            } else {
+                // String array - slice to actual length
+                columnarData[col.name] = arr.slice(0, bufLen);
+            }
+        }
+
+        // Reset buffer length (reuse the pre-allocated arrays)
+        colBuf.__length = 0;
+
+        // Use setColumnarData - no row conversion!
         const writer = new LanceFileWriter(schemaWithRowId);
-        writer.addRows(rowsToFlush);
+        writer.setColumnarData(columnarData);
         const lanceData = writer.build();
 
         const fragKey = `${this.name}/${tableName}/frag_${Date.now()}_${Math.random().toString(36).slice(2)}.lance`;
@@ -376,14 +447,8 @@ export class WorkerDatabase {
 
     async _readAllRows(tableName) {
         const table = this.tables.get(tableName);
-        const buffer = this._writeBuffer.get(tableName);
+        const colBuf = this._columnarBuffer.get(tableName);
         const hasDeleted = table.deletionVector.length > 0;
-
-        // Fast path: no persisted fragments, no deletions - just return buffer
-        if (table.fragments.length === 0 && !hasDeleted && buffer) {
-            return buffer;
-        }
-
         const deletedSet = hasDeleted ? new Set(table.deletionVector) : null;
         const allRows = [];
 
@@ -413,16 +478,17 @@ export class WorkerDatabase {
             }
         }
 
-        // Include buffered rows
-        if (buffer && buffer.length > 0) {
-            if (!deletedSet) {
-                allRows.push(...buffer);
-            } else {
-                for (const row of buffer) {
-                    if (!deletedSet.has(row.__rowId)) {
-                        allRows.push(row);
-                    }
+        // Include columnar buffer (convert to rows for compatibility)
+        const bufLen = colBuf?.__length || 0;
+        if (colBuf && bufLen > 0) {
+            const colNames = table.schema.map(c => c.name);
+            for (let i = 0; i < bufLen; i++) {
+                if (deletedSet && deletedSet.has(colBuf.__rowId[i])) continue;
+                const row = { __rowId: colBuf.__rowId[i] };
+                for (const name of colNames) {
+                    row[name] = colBuf[name][i];
                 }
+                allRows.push(row);
             }
         }
 
@@ -450,6 +516,197 @@ export class WorkerDatabase {
             console.warn('[WorkerDatabase] Failed to parse fragment:', e);
             return [];
         }
+    }
+
+    /**
+     * Select data in COLUMNAR format (no row conversion).
+     * Returns { schema, columns: { colName: TypedArray }, rowCount }
+     */
+    async selectColumnar(tableName) {
+        const table = this.tables.get(tableName);
+        if (!table) return null;
+
+        const hasDeleted = table.deletionVector.length > 0;
+        const deletedSet = hasDeleted ? new Set(table.deletionVector) : null;
+
+        // Collect columnar data from all fragments
+        const allColumns = {};
+        const colNames = table.schema.map(c => c.name);
+        for (const name of colNames) allColumns[name] = [];
+        allColumns.__rowId = [];
+
+        // Read from persisted fragments - use cache, STAY COLUMNAR
+        for (const fragKey of table.fragments) {
+            // Check columnar cache first
+            let binary = this._readCache.get(fragKey + ':columnar');
+            if (!binary) {
+                const fragData = await opfsStorage.load(fragKey);
+                if (!fragData) continue;
+                binary = parseBinaryColumnar(fragData);
+                if (binary) {
+                    this._readCache.set(fragKey + ':columnar', binary);
+                }
+            }
+            if (!binary) continue;
+
+            const { columns, rowCount } = binary;
+
+            // If no deletions, append directly
+            if (!deletedSet) {
+                for (const name of colNames) {
+                    if (columns[name]) allColumns[name].push(columns[name]);
+                }
+                if (columns.__rowId) allColumns.__rowId.push(columns.__rowId);
+            } else {
+                // Filter by deletion vector - need to filter each column
+                const rowIds = columns.__rowId;
+                const validIndices = [];
+                for (let i = 0; i < rowCount; i++) {
+                    if (!deletedSet.has(rowIds[i])) validIndices.push(i);
+                }
+                for (const name of colNames) {
+                    if (columns[name]) {
+                        const arr = columns[name];
+                        const filtered = new arr.constructor(validIndices.length);
+                        for (let j = 0; j < validIndices.length; j++) {
+                            filtered[j] = arr[validIndices[j]];
+                        }
+                        allColumns[name].push(filtered);
+                    }
+                }
+            }
+        }
+
+        // Include columnar buffer directly - already typed arrays!
+        // Copy to owned arrays so Transferable works without extra copy in sendResponse
+        const colBuf = this._columnarBuffer.get(tableName);
+        const bufLen = colBuf?.__length || 0;
+        if (colBuf && bufLen > 0) {
+            if (!deletedSet) {
+                // No deletions - copy to fresh owned arrays
+                for (const col of table.schema) {
+                    const arr = colBuf[col.name];
+                    if (!arr) continue;
+                    if (arr instanceof Float64Array) {
+                        // Copy to owned array (enables zero-copy transfer)
+                        const owned = new Float64Array(bufLen);
+                        owned.set(arr.subarray(0, bufLen));
+                        allColumns[col.name].push(owned);
+                    } else {
+                        allColumns[col.name].push(arr.slice(0, bufLen));
+                    }
+                }
+                const ownedRowId = new Float64Array(bufLen);
+                ownedRowId.set(colBuf.__rowId.subarray(0, bufLen));
+                allColumns.__rowId.push(ownedRowId);
+            } else {
+                // Filter by deletion vector
+                const validIndices = [];
+                for (let i = 0; i < bufLen; i++) {
+                    if (!deletedSet.has(colBuf.__rowId[i])) validIndices.push(i);
+                }
+                const vLen = validIndices.length;
+                for (const col of table.schema) {
+                    const arr = colBuf[col.name];
+                    if (!arr) continue;
+                    if (arr instanceof Float64Array) {
+                        const filtered = new Float64Array(vLen);
+                        for (let j = 0; j < vLen; j++) filtered[j] = arr[validIndices[j]];
+                        allColumns[col.name].push(filtered);
+                    } else {
+                        allColumns[col.name].push(validIndices.map(i => arr[i]));
+                    }
+                }
+                const filteredRowId = new Float64Array(vLen);
+                for (let j = 0; j < vLen; j++) filteredRowId[j] = colBuf.__rowId[validIndices[j]];
+                allColumns.__rowId.push(filteredRowId);
+            }
+        }
+
+        // Merge arrays for each column
+        const mergedColumns = {};
+        let totalRows = 0;
+        for (const name of [...colNames, '__rowId']) {
+            const arrays = allColumns[name];
+            if (arrays.length === 0) {
+                mergedColumns[name] = new Float64Array(0);
+            } else if (arrays.length === 1) {
+                mergedColumns[name] = arrays[0];
+                if (name === colNames[0]) totalRows = arrays[0].length;
+            } else {
+                // Merge multiple arrays
+                const totalLen = arrays.reduce((sum, a) => sum + a.length, 0);
+                if (name === colNames[0]) totalRows = totalLen;
+
+                // Determine type from first array
+                const first = arrays[0];
+                const merged = ArrayBuffer.isView(first)
+                    ? new first.constructor(totalLen)
+                    : new Array(totalLen);
+
+                let offset = 0;
+                for (const arr of arrays) {
+                    if (ArrayBuffer.isView(merged)) {
+                        merged.set(arr, offset);
+                    } else {
+                        for (let i = 0; i < arr.length; i++) merged[offset + i] = arr[i];
+                    }
+                    offset += arr.length;
+                }
+                mergedColumns[name] = merged;
+            }
+        }
+
+        return { schema: table.schema, columns: mergedColumns, rowCount: totalRows };
+    }
+
+    /**
+     * Read column data directly (no row conversion) for fast aggregation.
+     * Returns typed array for numeric columns.
+     */
+    async _readColumn(tableName, colName) {
+        const table = this.tables.get(tableName);
+        if (!table) return null;
+
+        const buffer = this._writeBuffer.get(tableName);
+        const colData = [];
+
+        // Read from persisted fragments (columnar)
+        for (const fragKey of table.fragments) {
+            const fragData = await opfsStorage.load(fragKey);
+            if (!fragData) continue;
+
+            const binary = parseBinaryColumnar(fragData);
+            if (binary && binary.columns[colName]) {
+                // Direct typed array access - no row conversion!
+                const arr = binary.columns[colName];
+                if (arr.length > 0) colData.push(arr);
+            }
+        }
+
+        // Include buffered rows (need to extract column)
+        if (buffer && buffer.length > 0) {
+            const bufCol = new Float64Array(buffer.length);
+            for (let i = 0; i < buffer.length; i++) {
+                const v = buffer[i][colName];
+                bufCol[i] = typeof v === 'number' ? v : 0;
+            }
+            colData.push(bufCol);
+        }
+
+        // Merge all fragments into single typed array
+        if (colData.length === 0) return new Float64Array(0);
+        if (colData.length === 1) return colData[0];
+
+        // Merge multiple fragments
+        const totalLen = colData.reduce((sum, arr) => sum + arr.length, 0);
+        const merged = new Float64Array(totalLen);
+        let offset = 0;
+        for (const arr of colData) {
+            merged.set(arr, offset);
+            offset += arr.length;
+        }
+        return merged;
     }
 
     /**
@@ -503,6 +760,34 @@ export class WorkerDatabase {
 
     listTables() {
         return Array.from(this.tables.keys());
+    }
+
+    /**
+     * Get fragment paths for direct WASM access (no row conversion)
+     */
+    getFragmentPaths(tableName) {
+        const table = this.tables.get(tableName);
+        if (!table) return [];
+        return table.fragments;
+    }
+
+    /**
+     * Get column index by name for a table
+     */
+    getColumnIndex(tableName, colName) {
+        const table = this.tables.get(tableName);
+        if (!table) return -1;
+        // Schema includes __rowId at index 0
+        const idx = table.schema.findIndex(c => c.name === colName);
+        return idx >= 0 ? idx + 1 : -1; // +1 for __rowId
+    }
+
+    /**
+     * Check if table has buffered (unflushed) data
+     */
+    hasBufferedData(tableName) {
+        const colBuf = this._columnarBuffer.get(tableName);
+        return colBuf && (colBuf.__length || 0) > 0;
     }
 
     async compact() {
