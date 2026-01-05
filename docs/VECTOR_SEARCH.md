@@ -43,46 +43,43 @@ TOPK 50
 
 ### Basic Syntax
 
+LanceQL treats `NEAR` as a specialized operator within the standard `WHERE` clause. This allows for powerful combinations of filtering and vector search.
+
 ```sql
 SELECT * FROM table_source
-NEAR [column] query_text
-[TOPK n]
+WHERE [column] NEAR [vector_literal]
+LIMIT n
 ```
+
+*Note: The `LIMIT` clause determines the "k" in "Top-k".*
 
 ### Examples
 
 ```sql
--- Search using default vector column
-SELECT * FROM read_lance(FILE) NEAR 'cat playing'
+-- Search using raw vector literal
+SELECT * FROM read_lance(FILE) 
+WHERE embedding NEAR [0.1, 0.2, 0.3, ...] 
+LIMIT 20
 
--- Specify TOPK (default is 20)
-SELECT * FROM read_lance(FILE) NEAR 'cat playing' TOPK 50
+-- Find rows similar to another row (by ID)
+-- (Internal optimization fetches the vector for row 0)
+SELECT * FROM read_lance(FILE) 
+WHERE embedding NEAR 0 
+LIMIT 10
 
--- Specify vector column
-SELECT * FROM read_lance(FILE) NEAR embedding 'cat playing'
-
--- Search by row index (find similar to row 0)
-SELECT * FROM read_lance(FILE) NEAR 0 TOPK 10
-
--- Combine with WHERE
+-- Combine with standard filters (Hybrid Search)
 SELECT * FROM read_lance(FILE)
-WHERE category = 'pets'
-NEAR 'fluffy dog' TOPK 30
-
--- With ORDER BY (sorts within top K)
-SELECT * FROM read_lance(FILE)
-NEAR 'landscape photography'
-TOPK 100
-ORDER BY aesthetic_score DESC
+WHERE category = 'pets' AND embedding NEAR [0.1, ...]
+LIMIT 50
 ```
 
 ### Parameters
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `column` | Name of vector column | Auto-detected |
-| `query_text` | Text to search for | Required |
-| `TOPK n` | Number of results | 20 |
+| Parameter | Description |
+|-----------|-------------|
+| `column` | Name of vector column |
+| `vector_literal` | Array of floats `[1.0, 2.0]` or row ID (integer) |
+| `LIMIT n` | Number of results (Top-k) |
 
 ---
 

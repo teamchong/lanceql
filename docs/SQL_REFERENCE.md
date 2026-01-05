@@ -632,19 +632,25 @@ FROM read_lance('students.lance')
 
 ---
 
-## Vector Search (NEAR Clause)
+## Vector Search (NEAR Operator)
 
-LanceQL supports semantic search with the `NEAR` clause. See [Vector Search Guide](./VECTOR_SEARCH.md) for details.
+LanceQL supports semantic search using the `NEAR` operator within the `WHERE` clause.
+
+See [Vector Search Guide](./VECTOR_SEARCH.md) for full details.
 
 ```sql
--- Text search
-SELECT * FROM read_lance('images.lance') NEAR 'sunset beach' TOPK 20
+-- Search using vector literal
+SELECT * FROM read_lance('vectors.lance') 
+WHERE embedding NEAR [0.1, 0.2, ...] 
+LIMIT 20
 
--- Search specific column
-SELECT * FROM read_lance('images.lance') NEAR embedding 'cat playing'
+-- Find similar rows (by ID)
+SELECT * FROM read_lance('vectors.lance') 
+WHERE embedding NEAR 123 
+LIMIT 10
 
--- Combine with filters
-SELECT * FROM read_lance('images.lance')
-WHERE score > 0.5
-NEAR 'mountain landscape' TOPK 50
+-- Combine with standard filters
+SELECT * FROM read_lance('products.lance')
+WHERE category = 'electronics' AND description_vector NEAR [0.5, ...]
+LIMIT 50
 ```

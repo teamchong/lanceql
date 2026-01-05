@@ -24,16 +24,18 @@ A browser-based Lance file reader with SQL and vector search support. Query Lanc
 ## Features
 
 ### All Platforms
-- **Vector Search** - Semantic search with `NEAR` clause using MiniLM/CLIP embeddings
+- **Vector Search** - Semantic search using `WHERE column NEAR [vector]` syntax
 - **Time Travel** - Query historical versions with `read_lance(url, version)`
+- **Rich Zig Engine** - Core logic moves to Zig for maximum performance
 
 ### Browser (WASM + JavaScript)
-- **SQL** - `SELECT`, `WHERE`, `ORDER BY`, `LIMIT`, aggregations (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`)
+- **Hybrid Execution** - Automatically switches between Zig (SIMD) and WebGPU for massive datasets
+- **SQL** - Full SQL support powered by Zig parser and executor
 - **HTTP Range Requests** - Only fetch the bytes you need, not the entire file
 - **Local + Remote** - Drag & drop local files or load from URL
-- **DataFrame API** - `dataset.df().filter(...).select(...).limit(50)`
 
 ### Node.js/Python (Native)
+- **High Performance** - Uses native CPU instructions (AVX-512 where available)
 - **Full SQL** - `ORDER BY`, `GROUP BY`, `DISTINCT`, all aggregations
 - **Data Types** - int32/64, float32/64, bool, string, timestamp (s/ms/us/ns), date32/64
 - **Parameterized Queries** - Bind values with `?` placeholders
@@ -106,10 +108,16 @@ LIMIT 100
 -- Aggregations
 SELECT COUNT(*), AVG(aesthetic), MAX(aesthetic) FROM read_lance(FILE)
 
--- Vector search (see Vector Search Guide for more)
-SELECT * FROM read_lance(FILE) NEAR 'sunset beach' TOPK 20
-SELECT * FROM read_lance(FILE) NEAR embedding 'cat' TOPK 50
-SELECT * FROM read_lance(FILE) WHERE aesthetic > 0.5 NEAR 'beach' TOPK 30
+-- Vector search
+-- NEAR is now a standard operator in the WHERE clause
+SELECT * FROM read_lance(FILE) 
+WHERE embedding NEAR [0.1, 0.2, ...] 
+LIMIT 20
+
+-- Combined filters (pre-filtering supported)
+SELECT * FROM read_lance(FILE) 
+WHERE aesthetic > 0.5 AND embedding NEAR [0.1, 0.2, ...] 
+LIMIT 30
 ```
 
 See [Vector Search Guide](./docs/VECTOR_SEARCH.md) for IVF-PQ indices, encoders, and performance tuning.

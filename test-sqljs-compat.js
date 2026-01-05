@@ -192,7 +192,7 @@ async function runTests() {
     console.log('  const SQL = await initSqlJs();');
     console.log('  const db = new SQL.Database("mydb");');
     console.log('  await db.exec("CREATE TABLE docs (id INT, embedding VECTOR(384))");');
-    console.log('  await db.exec("SELECT * FROM docs NEAR embedding \'query\' TOPK 10");');
+    console.log('  await db.exec("SELECT * FROM docs WHERE embedding NEAR \'query\' LIMIT 10");');
 }
 
 runTests().catch(console.error);
