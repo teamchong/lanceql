@@ -1697,31 +1697,39 @@ function cosineSimilarity(a, b) {
 // Execute NEAR vector search
 async function executeNearSearch(rows, nearCondition, limit) {
     const column = typeof nearCondition.column === 'string' ? nearCondition.column : nearCondition.column.column;
-    const text = nearCondition.text;
+    const value = nearCondition.value || nearCondition.text; // Support both new 'value' and legacy 'text'
     const topK = nearCondition.topK || limit || 10;
-
-    // Check if gpuTransformer is available and has a loaded model
-    const gpuTransformer = getGPUTransformerState();
-    if (!gpuTransformer) {
-        throw new Error('NEAR requires a text encoder model. Load a model first with store.loadModel()');
-    }
 
     // Generate query embedding
     let queryVec;
-    try {
-        // Try to get any loaded model
-        const models = gpuTransformer.getLoadedModels?.() || [];
-        if (models.length === 0) {
-            throw new Error('No text encoder model loaded');
+
+    if (Array.isArray(value)) {
+        // Direct vector search
+        queryVec = value;
+    } else if (typeof value === 'string') {
+        // Text search - requires model
+        const gpuTransformer = getGPUTransformerState();
+        if (!gpuTransformer) {
+            throw new Error('NEAR with text requires a text encoder model. Load a model first with store.loadModel()');
         }
-        queryVec = await gpuTransformer.encodeText(text, models[0]);
-    } catch (e) {
-        throw new Error(`NEAR failed to encode query: ${e.message}`);
+        try {
+            const models = gpuTransformer.getLoadedModels?.() || [];
+            if (models.length === 0) {
+                throw new Error('No text encoder model loaded');
+            }
+            queryVec = await gpuTransformer.encodeText(value, models[0]);
+        } catch (e) {
+            throw new Error(`NEAR failed to encode query: ${e.message}`);
+        }
+    } else {
+        throw new Error('NEAR requires a text string or vector array');
     }
 
     // Score each row
     const scored = [];
     const embeddingCache = getEmbeddingCache();
+    const gpuTransformer = getGPUTransformerState(); // Re-fetch for text embedding inside loop if needed
+
     for (const row of rows) {
         const colValue = row[column];
 
@@ -1732,15 +1740,20 @@ async function executeNearSearch(rows, nearCondition, limit) {
         }
         // If column is text, we need to embed it (expensive)
         else if (typeof colValue === 'string') {
+            if (!gpuTransformer) continue; // Cannot embed text without transformer
             const cacheKey = `sql:${column}:${colValue}`;
             let itemVec = embeddingCache.get(cacheKey);
             if (!itemVec) {
                 const models = gpuTransformer.getLoadedModels?.() || [];
-                itemVec = await gpuTransformer.encodeText(colValue, models[0]);
-                embeddingCache.set(cacheKey, itemVec);
+                if (models.length > 0) {
+                    itemVec = await gpuTransformer.encodeText(colValue, models[0]);
+                    embeddingCache.set(cacheKey, itemVec);
+                }
             }
-            const score = cosineSimilarity(queryVec, itemVec);
-            scored.push({ row, score });
+            if (itemVec) {
+                const score = cosineSimilarity(queryVec, itemVec);
+                scored.push({ row, score });
+            }
         }
     }
 

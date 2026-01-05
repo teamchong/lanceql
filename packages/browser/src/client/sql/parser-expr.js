@@ -106,8 +106,8 @@ export function parseCmpExpr(parser) {
 
     // NEAR - vector similarity search in WHERE clause
     if (parser.match(TokenType.NEAR)) {
-        const text = parsePrimary(parser);
-        return { type: 'near', column: left, text };
+        const value = parsePrimary(parser);
+        return { type: 'near', column: left, value };
     }
 
     // Comparison operators

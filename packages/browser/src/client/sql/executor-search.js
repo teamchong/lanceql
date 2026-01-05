@@ -12,8 +12,9 @@ export function extractNearCondition(expr) {
 
     if (expr.type === 'near') {
         const columnName = expr.column?.name || expr.column;
-        const text = expr.text?.value || expr.text;
-        return { column: columnName, text, limit: 20 };
+        // Handle literal wrapper from parser-expr ({type: 'literal', value: ...})
+        const value = expr.value?.value ?? expr.value;
+        return { column: columnName, value, limit: 20 };
     }
 
     // Check AND/OR for NEAR condition
@@ -195,7 +196,7 @@ export async function buildFTSIndex(readColumnData, colIdx, totalRows) {
  * @returns {Promise<number[]>} - Matching row indices
  */
 export async function executeBM25Search(executor, nearInfo, totalRows) {
-    const { column, text, limit } = nearInfo;
+    const { column, value, limit } = nearInfo;
     const colIdx = executor.columnMap[column.toLowerCase()];
 
     if (colIdx === undefined) {
@@ -203,7 +204,7 @@ export async function executeBM25Search(executor, nearInfo, totalRows) {
     }
 
     // Step 1: Tokenize query
-    const queryTokens = tokenize(text);
+    const queryTokens = tokenize(value);
     if (queryTokens.length === 0) return [];
 
     // Step 2: Get or build inverted index for this column
@@ -237,7 +238,7 @@ export async function executeBM25Search(executor, nearInfo, totalRows) {
  */
 export async function executeNearSearch(executor, nearInfo, totalRows) {
     // Find vector column for the specified column
-    const { column, text, limit } = nearInfo;
+    const { column, value, limit } = nearInfo;
 
     // Look for embedding/vector column
     // Convention: embedding column is named 'embedding' or '<column>_embedding'
@@ -253,12 +254,19 @@ export async function executeNearSearch(executor, nearInfo, totalRows) {
         return await executeBM25Search(executor, nearInfo, totalRows);
     }
 
+    // Get vector column index
+    const vectorColIdx = executor.columnMap[vectorColName.toLowerCase()];
+    if (vectorColIdx === undefined) {
+        throw new Error(`Vector column '${vectorColName}' found but index missing`);
+    }
+
     // Use existing vector search infrastructure
     const topK = Math.min(limit, totalRows);
 
     try {
         // Call the file's vectorSearch method
-        const results = await executor.file.vectorSearch(text, topK);
+        // value can be a Float32Array/Array (vector) or string (if file supports embedding)
+        const results = await executor.file.vectorSearch(vectorColIdx, value, topK);
         return results.map(r => r.index);
     } catch (e) {
         console.error('[SQLExecutor] Vector search failed:', e);

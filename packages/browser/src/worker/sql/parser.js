@@ -1522,14 +1522,14 @@ class SQLParser {
         }
 
         // Handle NEAR (vector similarity search)
-        // Syntax: column NEAR 'text' [TOPK n]
+        // Syntax: column NEAR value [TOPK n]
         if (this.match(TokenType.NEAR)) {
-            const text = this.expect(TokenType.STRING).value;
+            const value = this.parseValue();
             let topK = null;
             if (this.match(TokenType.TOPK)) {
                 topK = parseInt(this.expect(TokenType.NUMBER).value, 10);
             }
-            return { op: 'NEAR', column, text, topK };
+            return { op: 'NEAR', column, value, topK };
         }
 
         let op;

@@ -95,6 +95,11 @@ pub const WhereClause = struct {
     // For NEAR (vector search)
     near_vector: [MAX_VECTOR_DIM]f32 = undefined,
     near_dim: usize = 0,
+    near_target_row: ?u32 = null,
+    // Runtime cache for NEAR results (indices that matched)
+    near_matches: ?[]const u32 = null, 
+    // Flag to indicate if this clause was a NEAR clause (internal use)
+    is_near_evaluated: bool = false,
 };
 
 /// Aggregate function
@@ -528,7 +533,39 @@ fn executeVectorSearch(table: *const TableInfo, near: *const WhereClause, limit:
     }
     const c = col orelse return 0;
     
-    const query_vec = near.near_vector[0..near.near_dim];
+    // Resolve query vector
+    var query_vec_buf: [MAX_VECTOR_DIM]f32 = undefined;
+    var query_vec: []const f32 = &[_]f32{};
+    var dim: usize = 0;
+
+    if (near.near_target_row) |row_id| {
+        // Fetch vector from row ID
+        // Find fragment containing row_id
+        var frag_idx: usize = 0;
+        var frag_start_row: u32 = 0;
+        var found = false;
+        
+        while (frag_idx < table.fragment_count) {
+            const frag = table.fragments[frag_idx].?;
+            const f_rows = @as(u32, @intCast(frag.getRowCount()));
+            if (row_id < frag_start_row + f_rows) {
+                // Found fragment
+                const rel_row = row_id - frag_start_row;
+                _ = frag.fragmentReadVectorAt(c.fragment_col_idx, rel_row, &query_vec_buf, MAX_VECTOR_DIM);
+                dim = c.vector_dim; // Assume same dim as column
+                query_vec = query_vec_buf[0..dim];
+                found = true;
+                break;
+            }
+            frag_start_row += f_rows;
+            frag_idx += 1;
+        }
+        if (!found) return 0; // Row not found
+    } else {
+        dim = near.near_dim;
+        query_vec = near.near_vector[0..dim];
+    }
+
     const top_k = if (limit > 0) limit else 10;
     
     // Top-K heaps (one per fragment + merge)
@@ -549,9 +586,9 @@ fn executeVectorSearch(table: *const TableInfo, near: *const WhereClause, limit:
         if (maybe_frag) |frag| {
             const row_count = frag.getRowCount();
             const col_idx = c.fragment_col_idx;
-            const dim = c.vector_dim;
+            const frag_dim = c.vector_dim;
             
-            if (dim != near.near_dim) {
+            if (frag_dim != near.near_dim) {
                 // Dimension mismatch, skip or error? Skip for now.
                 current_abs_idx += @intCast(row_count);
                 continue;
@@ -559,7 +596,7 @@ fn executeVectorSearch(table: *const TableInfo, near: *const WhereClause, limit:
             
             // Chunked read and search
             const CHUNK_SIZE = 256; // Smaller chunk for vectors (large size)
-            const buf_ptr = memory.wasmAlloc(CHUNK_SIZE * dim * 4) orelse return 0;
+            const buf_ptr = memory.wasmAlloc(CHUNK_SIZE * frag_dim * 4) orelse return 0;
             const buf = @as([*]f32, @ptrCast(@alignCast(buf_ptr)));
             
             var processed: usize = 0;
@@ -570,7 +607,7 @@ fn executeVectorSearch(table: *const TableInfo, near: *const WhereClause, limit:
                 var floats_read: usize = 0;
                 for (0..chunk_len) |i| {
                     const row = @as(u32, @intCast(processed + i));
-                    const n = frag.fragmentReadVectorAt(col_idx, row, buf + i * dim, dim);
+                    const n = frag.fragmentReadVectorAt(col_idx, row, buf + i * frag_dim, frag_dim);
                     floats_read += n;
                 }
                 
@@ -579,7 +616,7 @@ fn executeVectorSearch(table: *const TableInfo, near: *const WhereClause, limit:
                 _ = simd_search.vectorSearchBuffer(
                     buf,
                     chunk_len,
-                    dim,
+                    frag_dim,
                     query_vec.ptr,
                     top_k,
                     out_indices.ptr,
@@ -603,40 +640,51 @@ fn executeVectorSearch(table: *const TableInfo, near: *const WhereClause, limit:
     return result_count;
 }
 
-fn executeSelectQuery(table: *const TableInfo, query: *const ParsedQuery) !void {
+fn resolveNearClauses(table: *const TableInfo, where: *WhereClause, limit: usize) !void {
+    if (where.op == .near) {
+        if (!where.is_near_evaluated) {
+            const top_k = if (limit > 0) limit else 10;
+            const match_ptr = memory.wasmAlloc(top_k * 4) orelse return error.OutOfMemory;
+            const matches = @as([*]u32, @ptrCast(@alignCast(match_ptr)))[0..top_k];
+            
+            const count = try executeVectorSearch(table, where, limit, matches);
+            where.near_matches = matches[0..count];
+            where.is_near_evaluated = true;
+        }
+    } else {
+        if (where.left) |left| {
+            const mut_left = @constCast(left);
+            try resolveNearClauses(table, mut_left, limit);
+        }
+        if (where.right) |right| {
+            const mut_right = @constCast(right);
+            try resolveNearClauses(table, mut_right, limit);
+        }
+    }
+}
+
+fn executeSelectQuery(table: *const TableInfo, query: *ParsedQuery) !void {
     const row_count = table.row_count;
 
     // Apply WHERE filter
     var match_indices: [MAX_ROWS]u32 = undefined;
     var match_count: usize = 0;
 
-    // Check for NEAR clause
-    var near_clause: ?*const WhereClause = null;
+    // Resolve any NEAR clauses first (pre-calculate vector search results)
     if (query.where_clause) |*where| {
-        if (where.op == .near) {
-            near_clause = where;
-        } else if (where.op == .and_op) {
-            if (where.left) |l| { if (l.op == .near) near_clause = l; }
-            if (where.right) |r| { if (r.op == .near) near_clause = r; }
-        }
+        const limit = if (query.limit_value) |l| l else 10;
+        try resolveNearClauses(table, where, limit);
     }
 
-    if (near_clause) |near| {
-        // Execute vector search
-        const limit = if (query.limit_value) |l| l else 10;
-        match_count = try executeVectorSearch(table, near, limit, &match_indices);
-        // TODO: Apply other filters if any (post-filtering)
-    } else {
-        for (0..@min(row_count, MAX_ROWS)) |i| {
-            if (query.where_clause) |*where| {
-                if (evaluateWhere(table, where, @intCast(i))) {
-                    match_indices[match_count] = @intCast(i);
-                    match_count += 1;
-                }
-            } else {
+    for (0..@min(row_count, MAX_ROWS)) |i| {
+        if (query.where_clause) |*where| {
+            if (evaluateWhere(table, where, @intCast(i))) {
                 match_indices[match_count] = @intCast(i);
                 match_count += 1;
             }
+        } else {
+            match_indices[match_count] = @intCast(i);
+            match_count += 1;
         }
     }
 
@@ -3419,6 +3467,19 @@ fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
                 .near_vector = vec,
                 .near_dim = dim,
             };
+        } else {
+            // Check for NEAR <number> (row ID)
+            const num_start = pos.*;
+            while (pos.* < sql.len and std.ascii.isDigit(sql[pos.*])) pos.* += 1;
+            if (pos.* > num_start) {
+                if (std.fmt.parseInt(u32, sql[num_start..pos.*], 10)) |row_id| {
+                    return WhereClause{
+                        .op = .near,
+                        .column = column,
+                        .near_target_row = row_id,
+                    };
+                } else |_| {}
+            }
         }
     }
 
