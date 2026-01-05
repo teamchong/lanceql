@@ -28,6 +28,8 @@ export class WorkerDatabase {
 
         // Read cache
         this._readCache = new Map();
+        // Columnar merged cache: tableName -> { version: string, data: result }
+        this._columnarCache = new Map();
     }
 
     async open() {
@@ -74,6 +76,7 @@ export class WorkerDatabase {
             deletionVector: [],
             rowCount: 0,
             nextRowId: 0,
+            version: 0,
             createdAt: Date.now(),
         };
 
@@ -173,6 +176,7 @@ export class WorkerDatabase {
         colBuf.__length = len + n;
 
         table.rowCount += n;
+        table.version = (table.version || 0) + 1;
         this._scheduleFlush();
 
         if (colBuf.__length >= this._flushThreshold) {
@@ -297,6 +301,7 @@ export class WorkerDatabase {
         }
 
         table.rowCount -= deletedCount;
+        table.version = (table.version || 0) + 1;
         await this._saveManifest();
 
         return { success: true, deleted: deletedCount };
@@ -379,6 +384,7 @@ export class WorkerDatabase {
                             colBuf[col][i] = newVal ?? (colBuf[col] instanceof Float64Array ? NaN : null);
                         }
                     }
+                    table.version = (table.version || 0) + 1;
                     updatedCount++;
                 }
             }
@@ -555,6 +561,25 @@ export class WorkerDatabase {
         const table = this.tables.get(tableName);
         if (!table) return null;
 
+        // Version string based on table state and explicit version counter
+        const bufLen = this._columnarBuffer.get(tableName)?.__length || 0;
+        const version = `${table.fragments.length}:${bufLen}:${table.deletionVector.length}:${table.version || 0}`;
+
+        // Check cache
+        const cached = this._columnarCache.get(tableName);
+        if (cached && cached.version === version) {
+            // Need to return NEW views of the buffers so Transferable doesn't detach the cached buffers
+            const columns = {};
+            for (const [name, arr] of Object.entries(cached.data.columns)) {
+                if (ArrayBuffer.isView(arr)) {
+                    columns[name] = new arr.constructor(arr.buffer, arr.byteOffset, arr.length);
+                } else {
+                    columns[name] = arr; // Strings are just arrays
+                }
+            }
+            return { schema: table.schema, columns, rowCount: cached.data.rowCount };
+        }
+
         const hasDeleted = table.deletionVector.length > 0;
         const deletedSet = hasDeleted ? new Set(table.deletionVector) : null;
 
@@ -609,8 +634,8 @@ export class WorkerDatabase {
         // Include columnar buffer directly - already typed arrays!
         // Copy to owned arrays so Transferable works without extra copy in sendResponse
         const colBuf = this._columnarBuffer.get(tableName);
-        const bufLen = colBuf?.__length || 0;
-        if (colBuf && bufLen > 0) {
+        const bufLen2 = colBuf?.__length || 0;
+        if (colBuf && bufLen2 > 0) {
             if (!deletedSet) {
                 // No deletions - copy to fresh owned arrays
                 for (const col of table.schema) {
@@ -618,20 +643,20 @@ export class WorkerDatabase {
                     if (!arr) continue;
                     if (arr instanceof Float64Array) {
                         // Copy to owned array (enables zero-copy transfer)
-                        const owned = new Float64Array(bufLen);
-                        owned.set(arr.subarray(0, bufLen));
+                        const owned = new Float64Array(bufLen2);
+                        owned.set(arr.subarray(0, bufLen2));
                         allColumns[col.name].push(owned);
                     } else {
-                        allColumns[col.name].push(arr.slice(0, bufLen));
+                        allColumns[col.name].push(arr.slice(0, bufLen2));
                     }
                 }
-                const ownedRowId = new Float64Array(bufLen);
-                ownedRowId.set(colBuf.__rowId.subarray(0, bufLen));
+                const ownedRowId = new Float64Array(bufLen2);
+                ownedRowId.set(colBuf.__rowId.subarray(0, bufLen2));
                 allColumns.__rowId.push(ownedRowId);
             } else {
                 // Filter by deletion vector
                 const validIndices = [];
-                for (let i = 0; i < bufLen; i++) {
+                for (let i = 0; i < bufLen2; i++) {
                     if (!deletedSet.has(colBuf.__rowId[i])) validIndices.push(i);
                 }
                 const vLen = validIndices.length;
@@ -688,7 +713,9 @@ export class WorkerDatabase {
             }
         }
 
-        return { schema: table.schema, columns: mergedColumns, rowCount: totalRows };
+        const result = { schema: table.schema, columns: mergedColumns, rowCount: totalRows };
+        this._columnarCache.set(tableName, { version, data: result });
+        return result;
     }
 
     /**

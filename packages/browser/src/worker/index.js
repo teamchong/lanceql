@@ -13,8 +13,8 @@
 import { WorkerStore } from './worker-store.js';
 import { WorkerDatabase } from './worker-database.js';
 import { WorkerVault } from './worker-vault.js';
-import { evalWhere } from './sql/executor.js';
-import { getWasmSqlExecutor } from './wasm-sql-bridge.js';
+import { executeSQL, evalWhere } from './sql/executor.js';
+import { getWasmSqlExecutor, shouldUseWasmSql } from './wasm-sql-bridge.js';
 import { E } from './data-types.js';
 
 // ============================================================================
@@ -43,23 +43,22 @@ async function executeWasmSqlFull(db, sql) {
         const table = db.tables.get(tableName);
         if (!table) continue; // Table might be a CTE or not exist
 
+        // Version string based on table state: fragments, buffer length, and deletion vector
+        const bufLen = db._columnarBuffer?.get(tableName)?.__length || 0;
+        const version = `${tableName}:${table.fragments?.length || 0}:${bufLen}:${table.deletionVector?.length || 0}`;
+
         // Get columnar data
         const columnarData = await db.selectColumnar(tableName);
         if (!columnarData || columnarData.rowCount === 0) continue;
 
         const { columns: colData, rowCount } = columnarData;
 
-        // Register table with executor
-        executor.registerTable(tableName, colData, rowCount);
+        // Register table with executor (skips if version unchanged)
+        executor.registerTable(tableName, colData, rowCount, version);
     }
 
     // Execute SQL in WASM
-    const result = executor.execute(sql);
-
-    // Clear registered tables for next query
-    executor.clear();
-
-    return result;
+    return executor.execute(sql);
 }
 
 /**
@@ -600,7 +599,11 @@ async function handleMessage(port, data) {
         } else if (method === 'db:createTable') {
             result = await (await getDatabase(args.db)).createTable(args.tableName, args.columns, args.ifNotExists);
         } else if (method === 'db:dropTable') {
-            result = await (await getDatabase(args.db)).dropTable(args.tableName, args.ifExists);
+            const db = await getDatabase(args.db);
+            result = await db.dropTable(args.tableName, args.ifExists);
+            // Clear from WASM executor too
+            const nameBytes = E.encode(args.tableName);
+            getWasmSqlExecutor().clearTable(nameBytes, nameBytes.length);
         } else if (method === 'db:insert') {
             result = await (await getDatabase(args.db)).insert(args.tableName, args.rows);
         } else if (method === 'db:delete') {
@@ -626,8 +629,21 @@ async function handleMessage(port, data) {
         } else if (method === 'db:exec') {
             const db = await getDatabase(args.db);
 
-            // Execute SQL entirely in WASM
-            result = await executeWasmSqlFull(db, args.sql);
+            // Try WASM SQL executor first for SELECT queries on large tables
+            const tableNames = extractTableNames(args.sql);
+            const primaryTable = tableNames[0] ? db.tables.get(tableNames[0]) : null;
+            const rowCount = primaryTable ? primaryTable.rowCount : 0;
+
+            if (shouldUseWasmSql(args.sql, rowCount)) {
+                try {
+                    result = await executeWasmSqlFull(db, args.sql);
+                } catch (e) {
+                    console.warn('[LanceQLWorker] WASM SQL failed, falling back to JS:', e.message);
+                    result = await executeSQL(db, args.sql);
+                }
+            } else {
+                result = await executeSQL(db, args.sql);
+            }
 
             // For large results, use lazy transfer - store data in worker, return handle
             if (result && result._format === 'columnar' && result.rowCount >= 1000) {
@@ -678,7 +694,23 @@ async function handleMessage(port, data) {
         } else if (method === 'vault:has') {
             result = await (await getVault()).has(args.key);
         } else if (method === 'vault:exec') {
-            result = await (await getVault()).exec(args.sql);
+            const vault = await getVault();
+
+            // Try WASM SQL executor first for SELECT queries on large tables
+            const tableNames = extractTableNames(args.sql);
+            const primaryTable = tableNames[0] ? vault._db.tables.get(tableNames[0]) : null;
+            const rowCount = primaryTable ? primaryTable.rowCount : 0;
+
+            if (shouldUseWasmSql(args.sql, rowCount)) {
+                try {
+                    result = await executeWasmSqlFull(vault._db, args.sql);
+                } catch (e) {
+                    console.warn('[LanceQLWorker] Vault WASM SQL failed, falling back to JS:', e.message);
+                    result = await vault.exec(args.sql);
+                }
+            } else {
+                result = await vault.exec(args.sql);
+            }
 
             // For large results, use lazy transfer - store data in worker, return handle
             if (result && result._format === 'columnar' && result.rowCount >= 1000) {

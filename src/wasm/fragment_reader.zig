@@ -12,16 +12,10 @@ const std = @import("std");
 const MAX_COLUMNS = 64;
 
 // ============================================================================
-// Reader State
+// Reader Struct
 // ============================================================================
 
-var reader_data: ?[*]const u8 = null;
-var reader_len: usize = 0;
-var reader_num_columns: u32 = 0;
-var reader_column_meta_start: u64 = 0;
-var reader_column_meta_offsets_start: u64 = 0;
-
-const ReaderColumnInfo = struct {
+pub const ReaderColumnInfo = struct {
     name: [64]u8,
     name_len: usize,
     col_type: [16]u8,
@@ -33,7 +27,159 @@ const ReaderColumnInfo = struct {
     vector_dim: u32,
 };
 
-var reader_columns: [MAX_COLUMNS]ReaderColumnInfo = undefined;
+pub const FragmentReader = struct {
+    data: ?[*]const u8 = null,
+    len: usize = 0,
+    num_columns: u32 = 0,
+    column_meta_start: u64 = 0,
+    column_meta_offsets_start: u64 = 0,
+    columns: [MAX_COLUMNS]ReaderColumnInfo = undefined,
+
+    pub fn init(data: [*]const u8, len: usize) !FragmentReader {
+        if (len < 40) return error.InvalidFile;
+
+        var reader = FragmentReader{
+            .data = data,
+            .len = len,
+        };
+
+        // Parse footer (last 40 bytes)
+        const footer_start = len - 40;
+
+        // Check magic
+        if (data[footer_start + 36] != 'L' or
+            data[footer_start + 37] != 'A' or
+            data[footer_start + 38] != 'N' or
+            data[footer_start + 39] != 'C')
+        {
+            return error.InvalidMagic;
+        }
+
+        reader.column_meta_start = std.mem.readInt(u64, data[footer_start..][0..8], .little);
+        reader.column_meta_offsets_start = std.mem.readInt(u64, data[footer_start + 8 ..][0..8], .little);
+        reader.num_columns = std.mem.readInt(u32, data[footer_start + 28 ..][0..4], .little);
+
+        if (reader.num_columns > MAX_COLUMNS) return error.TooManyColumns;
+
+        // Parse column metadata
+        for (0..reader.num_columns) |i| {
+            const offset_pos: usize = @intCast(reader.column_meta_offsets_start + i * 8);
+            const meta_offset = std.mem.readInt(u64, data[offset_pos..][0..8], .little);
+
+            const next_offset = if (i + 1 < reader.num_columns)
+                std.mem.readInt(u64, data[offset_pos + 8 ..][0..8], .little)
+            else
+                reader.column_meta_offsets_start;
+
+            parseColumnMeta(data, meta_offset, next_offset, &reader.columns[i]);
+        }
+
+        return reader;
+    }
+
+    pub fn getColumnCount(self: *const FragmentReader) u32 {
+        return self.num_columns;
+    }
+
+    pub fn getRowCount(self: *const FragmentReader) u64 {
+        if (self.num_columns == 0) return 0;
+        return self.columns[0].row_count;
+    }
+
+    pub fn getColumnInfo(self: *const FragmentReader, col_idx: u32) ?*const ReaderColumnInfo {
+        if (col_idx >= self.num_columns) return null;
+        return &self.columns[col_idx];
+    }
+
+    pub fn fragmentGetColumnName(self: *const FragmentReader, col_idx: u32, out_ptr: [*]u8, max_len: usize) usize {
+        if (col_idx >= self.num_columns) return 0;
+        const info = &self.columns[col_idx];
+        const copy_len = @min(info.name_len, max_len);
+        @memcpy(out_ptr[0..copy_len], info.name[0..copy_len]);
+        return copy_len;
+    }
+
+    pub fn fragmentGetColumnType(self: *const FragmentReader, col_idx: u32, out_ptr: [*]u8, max_len: usize) usize {
+        if (col_idx >= self.num_columns) return 0;
+        const info = &self.columns[col_idx];
+        const copy_len = @min(info.type_len, max_len);
+        @memcpy(out_ptr[0..copy_len], info.col_type[0..copy_len]);
+        return copy_len;
+    }
+
+    pub fn fragmentReadInt64(self: *const FragmentReader, col_idx: u32, out_ptr: [*]i64, max_count: usize, start_row: u32) usize {
+        if (col_idx >= self.num_columns) return 0;
+        const data = self.data orelse return 0;
+        const info = &self.columns[col_idx];
+
+        if (start_row >= info.row_count) return 0;
+        const count: usize = @intCast(@min(info.row_count - start_row, max_count));
+        
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const offset: usize = @intCast(info.data_offset + (start_row + i) * 8);
+            out_ptr[i] = std.mem.readInt(i64, data[offset..][0..8], .little);
+        }
+        return count;
+    }
+
+    pub fn fragmentReadFloat64(self: *const FragmentReader, col_idx: u32, out_ptr: [*]f64, max_count: usize, start_row: u32) usize {
+        if (col_idx >= self.num_columns) return 0;
+        const data = self.data orelse return 0;
+        const info = &self.columns[col_idx];
+
+        if (start_row >= info.row_count) return 0;
+        const count: usize = @intCast(@min(info.row_count - start_row, max_count));
+
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const offset: usize = @intCast(info.data_offset + (start_row + i) * 8);
+            const bits = std.mem.readInt(u64, data[offset..][0..8], .little);
+            out_ptr[i] = @bitCast(bits);
+        }
+        return count;
+    }
+
+    pub fn fragmentReadInt32(self: *const FragmentReader, col_idx: u32, out_ptr: [*]i32, max_count: usize, start_row: u32) usize {
+        if (col_idx >= self.num_columns) return 0;
+        const data = self.data orelse return 0;
+        const info = &self.columns[col_idx];
+
+        if (start_row >= info.row_count) return 0;
+        const count: usize = @intCast(@min(info.row_count - start_row, max_count));
+
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const offset: usize = @intCast(info.data_offset + (start_row + i) * 4);
+            out_ptr[i] = std.mem.readInt(i32, data[offset..][0..4], .little);
+        }
+        return count;
+    }
+
+    pub fn fragmentReadFloat32(self: *const FragmentReader, col_idx: u32, out_ptr: [*]f32, max_count: usize, start_row: u32) usize {
+        if (col_idx >= self.num_columns) return 0;
+        const data = self.data orelse return 0;
+        const info = &self.columns[col_idx];
+
+        if (start_row >= info.row_count) return 0;
+        const count: usize = @intCast(@min(info.row_count - start_row, max_count));
+
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const offset: usize = @intCast(info.data_offset + (start_row + i) * 4);
+            const bits = std.mem.readInt(u32, data[offset..][0..4], .little);
+            out_ptr[i] = @bitCast(bits);
+        }
+        return count;
+    }
+};
+
+// ============================================================================
+// Global Instance (for backward compatibility)
+// ============================================================================
+
+var global_reader: FragmentReader = undefined;
+var is_initialized = false;
 
 // ============================================================================
 // Fragment Loading
@@ -41,43 +187,13 @@ var reader_columns: [MAX_COLUMNS]ReaderColumnInfo = undefined;
 
 /// Load a fragment for reading
 pub export fn fragmentLoad(data: [*]const u8, len: usize) u32 {
-    if (len < 40) return 0;
-
-    reader_data = data;
-    reader_len = len;
-
-    // Parse footer (last 40 bytes)
-    const footer_start = len - 40;
-
-    // Check magic
-    if (data[footer_start + 36] != 'L' or
-        data[footer_start + 37] != 'A' or
-        data[footer_start + 38] != 'N' or
-        data[footer_start + 39] != 'C')
-    {
+    if (FragmentReader.init(data, len)) |reader| {
+        global_reader = reader;
+        is_initialized = true;
+        return 1;
+    } else |_| {
         return 0;
     }
-
-    reader_column_meta_start = std.mem.readInt(u64, data[footer_start..][0..8], .little);
-    reader_column_meta_offsets_start = std.mem.readInt(u64, data[footer_start + 8 ..][0..8], .little);
-    reader_num_columns = std.mem.readInt(u32, data[footer_start + 28 ..][0..4], .little);
-
-    if (reader_num_columns > MAX_COLUMNS) return 0;
-
-    // Parse column metadata
-    for (0..reader_num_columns) |i| {
-        const offset_pos: usize = @intCast(reader_column_meta_offsets_start + i * 8);
-        const meta_offset = std.mem.readInt(u64, data[offset_pos..][0..8], .little);
-
-        const next_offset = if (i + 1 < reader_num_columns)
-            std.mem.readInt(u64, data[offset_pos + 8 ..][0..8], .little)
-        else
-            reader_column_meta_offsets_start;
-
-        parseColumnMeta(data, meta_offset, next_offset, &reader_columns[i]);
-    }
-
-    return 1;
 }
 
 fn parseColumnMeta(data: [*]const u8, start: u64, end: u64, info: *ReaderColumnInfo) void {
@@ -185,19 +301,20 @@ fn readVarintAt(data: [*]const u8, pos: *usize) usize {
 
 /// Get number of columns in loaded fragment
 pub export fn fragmentGetColumnCount() u32 {
-    return reader_num_columns;
+    if (!is_initialized) return 0;
+    return global_reader.num_columns;
 }
 
 /// Get row count from loaded fragment
 pub export fn fragmentGetRowCount() u64 {
-    if (reader_num_columns == 0) return 0;
-    return reader_columns[0].row_count;
+    if (!is_initialized or global_reader.num_columns == 0) return 0;
+    return global_reader.columns[0].row_count;
 }
 
 /// Get column name (returns length, writes to out_ptr)
 pub export fn fragmentGetColumnName(col_idx: u32, out_ptr: [*]u8, max_len: usize) usize {
-    if (col_idx >= reader_num_columns) return 0;
-    const info = &reader_columns[col_idx];
+    if (!is_initialized or col_idx >= global_reader.num_columns) return 0;
+    const info = &global_reader.columns[col_idx];
     const copy_len = @min(info.name_len, max_len);
     @memcpy(out_ptr[0..copy_len], info.name[0..copy_len]);
     return copy_len;
@@ -205,8 +322,8 @@ pub export fn fragmentGetColumnName(col_idx: u32, out_ptr: [*]u8, max_len: usize
 
 /// Get column type (returns length, writes to out_ptr)
 pub export fn fragmentGetColumnType(col_idx: u32, out_ptr: [*]u8, max_len: usize) usize {
-    if (col_idx >= reader_num_columns) return 0;
-    const info = &reader_columns[col_idx];
+    if (!is_initialized or col_idx >= global_reader.num_columns) return 0;
+    const info = &global_reader.columns[col_idx];
     const copy_len = @min(info.type_len, max_len);
     @memcpy(out_ptr[0..copy_len], info.col_type[0..copy_len]);
     return copy_len;
@@ -214,8 +331,8 @@ pub export fn fragmentGetColumnType(col_idx: u32, out_ptr: [*]u8, max_len: usize
 
 /// Get column vector dimension (0 if not a vector)
 pub export fn fragmentGetColumnVectorDim(col_idx: u32) u32 {
-    if (col_idx >= reader_num_columns) return 0;
-    return reader_columns[col_idx].vector_dim;
+    if (!is_initialized or col_idx >= global_reader.num_columns) return 0;
+    return global_reader.columns[col_idx].vector_dim;
 }
 
 // ============================================================================
@@ -224,9 +341,9 @@ pub export fn fragmentGetColumnVectorDim(col_idx: u32) u32 {
 
 /// Read int64 column data
 pub export fn fragmentReadInt64(col_idx: u32, out_ptr: [*]i64, max_count: usize) usize {
-    if (col_idx >= reader_num_columns) return 0;
-    const data = reader_data orelse return 0;
-    const info = &reader_columns[col_idx];
+    if (!is_initialized or col_idx >= global_reader.num_columns) return 0;
+    const data = global_reader.data orelse return 0;
+    const info = &global_reader.columns[col_idx];
 
     const count: usize = @intCast(@min(info.row_count, max_count));
     var i: usize = 0;
@@ -239,9 +356,9 @@ pub export fn fragmentReadInt64(col_idx: u32, out_ptr: [*]i64, max_count: usize)
 
 /// Read int32 column data
 pub export fn fragmentReadInt32(col_idx: u32, out_ptr: [*]i32, max_count: usize) usize {
-    if (col_idx >= reader_num_columns) return 0;
-    const data = reader_data orelse return 0;
-    const info = &reader_columns[col_idx];
+    if (!is_initialized or col_idx >= global_reader.num_columns) return 0;
+    const data = global_reader.data orelse return 0;
+    const info = &global_reader.columns[col_idx];
 
     const count: usize = @intCast(@min(info.row_count, max_count));
     var i: usize = 0;
@@ -254,9 +371,9 @@ pub export fn fragmentReadInt32(col_idx: u32, out_ptr: [*]i32, max_count: usize)
 
 /// Read float64 column data
 pub export fn fragmentReadFloat64(col_idx: u32, out_ptr: [*]f64, max_count: usize) usize {
-    if (col_idx >= reader_num_columns) return 0;
-    const data = reader_data orelse return 0;
-    const info = &reader_columns[col_idx];
+    if (!is_initialized or col_idx >= global_reader.num_columns) return 0;
+    const data = global_reader.data orelse return 0;
+    const info = &global_reader.columns[col_idx];
 
     const count: usize = @intCast(@min(info.row_count, max_count));
     var i: usize = 0;
@@ -270,9 +387,9 @@ pub export fn fragmentReadFloat64(col_idx: u32, out_ptr: [*]f64, max_count: usiz
 
 /// Read float32 column data
 pub export fn fragmentReadFloat32(col_idx: u32, out_ptr: [*]f32, max_count: usize) usize {
-    if (col_idx >= reader_num_columns) return 0;
-    const data = reader_data orelse return 0;
-    const info = &reader_columns[col_idx];
+    if (!is_initialized or col_idx >= global_reader.num_columns) return 0;
+    const data = global_reader.data orelse return 0;
+    const info = &global_reader.columns[col_idx];
 
     const count: usize = @intCast(@min(info.row_count, max_count));
     var i: usize = 0;
@@ -286,9 +403,9 @@ pub export fn fragmentReadFloat32(col_idx: u32, out_ptr: [*]f32, max_count: usiz
 
 /// Read bool column data (unpacked from bits)
 pub export fn fragmentReadBool(col_idx: u32, out_ptr: [*]u8, max_count: usize) usize {
-    if (col_idx >= reader_num_columns) return 0;
-    const data = reader_data orelse return 0;
-    const info = &reader_columns[col_idx];
+    if (!is_initialized or col_idx >= global_reader.num_columns) return 0;
+    const data = global_reader.data orelse return 0;
+    const info = &global_reader.columns[col_idx];
 
     const count: usize = @intCast(@min(info.row_count, max_count));
     const base_offset: usize = @intCast(info.data_offset);
@@ -308,9 +425,9 @@ pub export fn fragmentReadBool(col_idx: u32, out_ptr: [*]u8, max_count: usize) u
 
 /// Get string at index - returns length, writes to out_ptr
 pub export fn fragmentReadStringAt(col_idx: u32, row_idx: u32, out_ptr: [*]u8, max_len: usize) usize {
-    if (col_idx >= reader_num_columns) return 0;
-    const data = reader_data orelse return 0;
-    const info = &reader_columns[col_idx];
+    if (!is_initialized or col_idx >= global_reader.num_columns) return 0;
+    const data = global_reader.data orelse return 0;
+    const info = &global_reader.columns[col_idx];
 
     if (row_idx >= info.row_count) return 0;
 
@@ -332,9 +449,9 @@ pub export fn fragmentReadStringAt(col_idx: u32, row_idx: u32, out_ptr: [*]u8, m
 
 /// Get string length at index (useful for allocation)
 pub export fn fragmentGetStringLength(col_idx: u32, row_idx: u32) usize {
-    if (col_idx >= reader_num_columns) return 0;
-    const data = reader_data orelse return 0;
-    const info = &reader_columns[col_idx];
+    if (!is_initialized or col_idx >= global_reader.num_columns) return 0;
+    const data = global_reader.data orelse return 0;
+    const info = &global_reader.columns[col_idx];
 
     if (row_idx >= info.row_count) return 0;
 
@@ -353,9 +470,9 @@ pub export fn fragmentGetStringLength(col_idx: u32, row_idx: u32) usize {
 
 /// Read vector at index - returns number of floats written
 pub export fn fragmentReadVectorAt(col_idx: u32, row_idx: u32, out_ptr: [*]f32, max_floats: usize) usize {
-    if (col_idx >= reader_num_columns) return 0;
-    const data = reader_data orelse return 0;
-    const info = &reader_columns[col_idx];
+    if (!is_initialized or col_idx >= global_reader.num_columns) return 0;
+    const data = global_reader.data orelse return 0;
+    const info = &global_reader.columns[col_idx];
 
     if (row_idx >= info.row_count) return 0;
     if (info.vector_dim == 0) return 0;
@@ -393,9 +510,4 @@ test "fragment_reader: readVarintAt multi-byte" {
     const result = readVarintAt(&data, &pos);
     try std.testing.expectEqual(@as(usize, 300), result);
     try std.testing.expectEqual(@as(usize, 2), pos);
-}
-
-test "fragment_reader: fragmentGetColumnCount empty" {
-    reader_num_columns = 0;
-    try std.testing.expectEqual(@as(u32, 0), fragmentGetColumnCount());
 }

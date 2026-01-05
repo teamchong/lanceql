@@ -29,7 +29,7 @@ const ColumnType = {
  */
 export class WasmSqlExecutor {
     constructor() {
-        this._registered = new Map(); // tableName -> { columns: Map }
+        this._registered = new Map(); // tableName -> { version: string, columns: Set }
     }
 
     /**
@@ -37,10 +37,23 @@ export class WasmSqlExecutor {
      * @param {string} tableName
      * @param {Object} columns - Map of column name to typed array
      * @param {number} rowCount
+     * @param {string} version - Table version string to detect changes
      */
-    registerTable(tableName, columns, rowCount) {
+    registerTable(tableName, columns, rowCount, version = '') {
         const wasm = getWasm();
         if (!wasm) throw new Error('WASM not loaded');
+
+        // Check if table is already registered with the same version
+        const existing = this._registered.get(tableName);
+        if (existing && existing.version === version) {
+            return;
+        }
+
+        // Clear existing table in WASM if it exists
+        if (existing) {
+            const nameBytes = new TextEncoder().encode(tableName);
+            wasm.clearTable(nameBytes, nameBytes.length);
+        }
 
         const memory = getWasmMemory();
 
@@ -48,6 +61,8 @@ export class WasmSqlExecutor {
         const tableNameBytes = new TextEncoder().encode(tableName);
         const tableNamePtr = wasm.wasmAlloc(tableNameBytes.length);
         new Uint8Array(memory.buffer, tableNamePtr, tableNameBytes.length).set(tableNameBytes);
+
+        const registeredCols = new Set();
 
         // Register each column
         for (const [colName, data] of Object.entries(columns)) {
@@ -67,6 +82,7 @@ export class WasmSqlExecutor {
                     colNamePtr, colNameBytes.length,
                     dataPtr, data.length
                 );
+                registeredCols.add(colName);
             } else if (data instanceof BigInt64Array) {
                 // Convert to Int64 array
                 const dataPtr = wasm.allocInt64Buffer(data.length);
@@ -77,6 +93,7 @@ export class WasmSqlExecutor {
                     colNamePtr, colNameBytes.length,
                     dataPtr, data.length
                 );
+                registeredCols.add(colName);
             } else if (data instanceof Int32Array) {
                 // For int32, we need to add support in WASM
                 // For now, convert to Float64
@@ -91,6 +108,7 @@ export class WasmSqlExecutor {
                     colNamePtr, colNameBytes.length,
                     dataPtr, f64Data.length
                 );
+                registeredCols.add(colName);
             } else if (Array.isArray(data)) {
                 // String column - encode as offsets + data
                 const offsets = new Uint32Array(data.length);
@@ -130,10 +148,11 @@ export class WasmSqlExecutor {
                     colNamePtr, colNameBytes.length,
                     offsetsPtr, lengthsPtr, dataPtr, totalLen, data.length
                 );
+                registeredCols.add(colName);
             }
         }
 
-        this._registered.set(tableName, { columns: Object.keys(columns), rowCount });
+        this._registered.set(tableName, { version, columns: registeredCols, rowCount });
     }
 
     /**
@@ -181,6 +200,7 @@ export class WasmSqlExecutor {
      */
     _parseResult(buffer, ptr, size) {
         const view = new DataView(buffer, ptr, size);
+        const decoder = new TextDecoder();
 
         // Parse header
         const version = view.getUint32(0, true);
@@ -199,10 +219,12 @@ export class WasmSqlExecutor {
             throw new Error('WASM SQL execution returned error');
         }
 
+        // Extended header: names section offset at byte 32
+        const namesOffset = headerSize >= 36 ? view.getUint32(32, true) : 0;
+
         // Parse column metadata
         const columns = [];
         const colData = {};
-        let curDataOffset = dataOffset;
 
         for (let i = 0; i < columnCount; i++) {
             const metaPos = metaOffset + i * 16;
@@ -211,8 +233,14 @@ export class WasmSqlExecutor {
             const colNameLen = view.getUint32(metaPos + 8, true);
             const colDataOffset = view.getUint32(metaPos + 12, true);
 
-            // Column name (TODO: implement string table)
-            const colName = `col_${i}`;
+            // Read column name from names section if available
+            let colName;
+            if (namesOffset > 0 && colNameLen > 0) {
+                const nameBytes = new Uint8Array(buffer, ptr + namesOffset + colNameOffset, colNameLen);
+                colName = decoder.decode(nameBytes);
+            } else {
+                colName = `col_${i}`;
+            }
             columns.push(colName);
 
             // Parse column data based on type
@@ -329,8 +357,13 @@ export function shouldUseWasmSql(sql, rowCount) {
     // Check for simple patterns that WASM handles well
     const sqlUpper = sql.toUpperCase().trim();
 
-    // SELECT * FROM table
-    if (/^SELECT\s+\*\s+FROM\s+\w+(\s+WHERE|\s+LIMIT|\s*$)/i.test(sql)) {
+    // SELECT * FROM table (without WHERE is faster in JS via direct columnar return)
+    if (/^SELECT\s+\*\s+FROM\s+\w+\s*$/i.test(sql)) {
+        return false;
+    }
+
+    // SELECT * FROM table with WHERE/LIMIT
+    if (/^SELECT\s+\*\s+FROM\s+\w+(\s+WHERE|\s+LIMIT)/i.test(sql)) {
         return true;
     }
 
@@ -341,6 +374,11 @@ export function shouldUseWasmSql(sql, rowCount) {
 
     // Simple WHERE clause
     if (/WHERE\s+\w+\s*[<>=!]+\s*\d+/i.test(sql)) {
+        return true;
+    }
+
+    // Simple JOINs
+    if (/JOIN\s+\w+\s+ON/i.test(sql)) {
         return true;
     }
 

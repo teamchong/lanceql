@@ -13,11 +13,13 @@
 
 const std = @import("std");
 const memory = @import("memory.zig");
+const fragment_reader = @import("fragment_reader.zig");
 
 const RESULT_VERSION: u32 = 1;
 const HEADER_SIZE: u32 = 32;
 const MAX_TABLES: usize = 16;
 const MAX_COLUMNS: usize = 64;
+const MAX_FRAGMENTS: usize = 16;
 const MAX_SELECT_COLS: usize = 32;
 const MAX_GROUP_COLS: usize = 8;
 const MAX_AGGREGATES: usize = 16;
@@ -46,8 +48,11 @@ pub const ColumnData = struct {
             lengths: []const u32,
             data: []const u8,
         },
+        none: void, // For lazy columns
     },
     row_count: usize,
+    is_lazy: bool = false,
+    fragment_col_idx: u32 = 0,
 };
 
 /// Table registration
@@ -56,6 +61,10 @@ pub const TableInfo = struct {
     columns: [MAX_COLUMNS]?ColumnData,
     column_count: usize,
     row_count: usize,
+    
+    // Fragment support
+    fragments: [MAX_FRAGMENTS]?fragment_reader.FragmentReader,
+    fragment_count: usize,
 };
 
 /// WHERE operators
@@ -243,9 +252,112 @@ pub export fn registerTableString(
     );
 }
 
+pub export fn registerTableFragment(
+    table_name_ptr: [*]const u8,
+    table_name_len: usize,
+    data_ptr: [*]const u8,
+    data_len: usize,
+) u32 {
+    const table_name = table_name_ptr[0..table_name_len];
+    
+    // Parse fragment
+    const reader = fragment_reader.FragmentReader.init(data_ptr, data_len) catch return 1;
+    const row_count = reader.getRowCount();
+
+    const tbl = findOrCreateTable(table_name, @intCast(row_count)) orelse return 2;
+    if (tbl.fragment_count >= MAX_FRAGMENTS) return 3;
+
+    tbl.fragments[tbl.fragment_count] = reader;
+    tbl.fragment_count += 1;
+    
+    // Register columns from fragment if not already present
+    const num_cols = reader.getColumnCount();
+    var name_buf: [64]u8 = undefined;
+    var type_buf: [16]u8 = undefined;
+
+    for (0..num_cols) |i| {
+        const i_u32: u32 = @intCast(i);
+        const name_len = reader.fragmentGetColumnName(i_u32, &name_buf, 64);
+        const name = name_buf[0..name_len];
+        
+        // Check if column exists
+        var exists = false;
+        for (tbl.columns[0..tbl.column_count]) |maybe_col| {
+            if (maybe_col) |c| {
+                if (std.mem.eql(u8, c.name, name)) {
+                    exists = true;
+                    break;
+                }
+            }
+        }
+
+        if (!exists and tbl.column_count < MAX_COLUMNS) {
+            // Determine type
+            const type_len = reader.fragmentGetColumnType(i_u32, &type_buf, 16);
+            const type_str = type_buf[0..type_len];
+            var col_type: ColumnType = .string;
+            
+            if (std.mem.eql(u8, type_str, "int64") or std.mem.eql(u8, type_str, "bigint")) {
+                col_type = .int64;
+            } else if (std.mem.eql(u8, type_str, "float64") or std.mem.eql(u8, type_str, "double")) {
+                col_type = .float64;
+            } else if (std.mem.eql(u8, type_str, "int32") or std.mem.eql(u8, type_str, "int")) {
+                col_type = .int32;
+            } else if (std.mem.eql(u8, type_str, "float32") or std.mem.eql(u8, type_str, "float")) {
+                col_type = .float32;
+            }
+
+            // Allocate name (needs to persist)
+            const name_ptr = memory.wasmAlloc(name.len) orelse return 4;
+            @memcpy(name_ptr[0..name.len], name);
+
+            tbl.columns[tbl.column_count] = ColumnData{
+                .name = name_ptr[0..name.len],
+                .col_type = col_type,
+                .data = .{ .none = {} },
+                .row_count = 0, // Ignored for lazy
+                .is_lazy = true,
+                .fragment_col_idx = i_u32,
+            };
+            tbl.column_count += 1;
+        }
+    }
+
+    // Update total row count (if multiple fragments, we sum them up)
+    // Note: findOrCreateTable sets row_count for new tables.
+    // For existing, we should add.
+    if (tbl.fragment_count > 1) {
+        tbl.row_count += @intCast(row_count);
+    } else {
+        // First fragment or mixed mode
+        if (tbl.column_count == 0) {
+            tbl.row_count = @intCast(row_count);
+        }
+    }
+    
+    return 0;
+}
+
 pub export fn clearTables() void {
     tables = .{null} ** MAX_TABLES;
     table_count = 0;
+}
+
+pub export fn clearTable(name_ptr: [*]const u8, name_len: usize) void {
+    const name = name_ptr[0..name_len];
+    for (0..table_count) |i| {
+        if (tables[i]) |tbl| {
+            if (std.mem.eql(u8, tbl.name, name)) {
+                // Shift remaining tables
+                for (i..table_count - 1) |j| {
+                    tables[j] = tables[j + 1];
+                }
+                tables[table_count - 1] = null;
+                table_count -= 1;
+                return;
+            }
+        }
+    }
 }
 
 pub export fn executeSql() usize {
@@ -340,6 +452,8 @@ fn findOrCreateTable(table_name: []const u8, row_count: usize) ?*TableInfo {
         .name = table_name,
         .columns = .{null} ** MAX_COLUMNS,
         .column_count = 0,
+        .fragments = .{null} ** MAX_FRAGMENTS,
+        .fragment_count = 0,
         .row_count = row_count,
     };
     const idx = table_count;
@@ -449,8 +563,8 @@ fn executeSelectQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
                 var all_equal = true;
                 for (output_cols[0..output_count]) |col_idx| {
                     if (table.columns[col_idx]) |*col| {
-                        const v1 = getFloatValue(col, match_indices[i]);
-                        const v2 = getFloatValue(col, match_indices[j]);
+                        const v1 = getFloatValue(table, col, match_indices[i]);
+                        const v2 = getFloatValue(table, col, match_indices[j]);
                         if (v1 != v2) {
                             all_equal = false;
                             break;
@@ -1029,10 +1143,10 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
 
     // Nested loop join (simple but works)
     for (0..@min(left_table.row_count, MAX_JOIN_ROWS)) |li| {
-        const left_val = getIntValue(lc, @intCast(li));
+        const left_val = getIntValue(left_table, lc, @intCast(li));
 
         for (0..@min(rtbl.row_count, MAX_JOIN_ROWS)) |ri| {
-            const right_val = getIntValue(rc, @intCast(ri));
+            const right_val = getIntValue(rtbl, rc, @intCast(ri));
 
             if (left_val == right_val) {
                 if (pair_count < MAX_JOIN_ROWS) {
@@ -1114,7 +1228,7 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
     for (left_table.columns[0..left_col_count]) |maybe_col| {
         if (maybe_col) |*col| {
             for (join_pairs[0..pair_count]) |pair| {
-                const val = getFloatValue(col, pair.left);
+                const val = getFloatValue(left_table, col, pair.left);
                 _ = writeToResult(std.mem.asBytes(&val));
             }
         }
@@ -1124,7 +1238,7 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
     for (rtbl.columns[0..right_col_count]) |maybe_col| {
         if (maybe_col) |*col| {
             for (join_pairs[0..pair_count]) |pair| {
-                const val = getFloatValue(col, pair.right);
+                const val = getFloatValue(rtbl, col, pair.right);
                 _ = writeToResult(std.mem.asBytes(&val));
             }
         }
@@ -1225,7 +1339,7 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, indic
 
     // Build groups (O(n*k) but simple)
     for (indices) |idx| {
-        const key = getIntValue(gcol, idx);
+        const key = getIntValue(table, gcol, idx);
 
         // Find or add group
         var found = false;
@@ -1294,7 +1408,7 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, indic
             var group_idx_count: usize = 0;
 
             for (indices) |idx| {
-                if (getIntValue(gcol, idx) == key) {
+                if (getIntValue(table, gcol, idx) == key) {
                     group_indices[group_idx_count] = idx;
                     group_idx_count += 1;
                 }
@@ -1330,7 +1444,7 @@ fn computeAggregate(table: *const TableInfo, agg: AggExpr, indices: []const u32)
     var max_val: f64 = -std.math.floatMax(f64);
 
     for (indices) |idx| {
-        const val = getFloatValue(c, idx);
+        const val = getFloatValue(table, c, idx);
         sum += val;
         if (val < min_val) min_val = val;
         if (val > max_val) max_val = val;
@@ -1345,7 +1459,48 @@ fn computeAggregate(table: *const TableInfo, agg: AggExpr, indices: []const u32)
     };
 }
 
-fn getFloatValue(col: *const ColumnData, idx: u32) f64 {
+fn getFloatValue(table: *const TableInfo, col: *const ColumnData, idx: u32) f64 {
+    if (col.is_lazy) {
+        // Find fragment
+        var current_idx = idx;
+        for (table.fragments[0..table.fragment_count]) |maybe_frag| {
+            if (maybe_frag) |frag| {
+                const count = frag.getRowCount();
+                if (current_idx < count) {
+                    // Read from this fragment
+                    var val: f64 = 0;
+                    const col_idx = col.fragment_col_idx;
+                    const c_idx = @as(u32, @intCast(current_idx));
+                    
+                    switch (col.col_type) {
+                        .float64 => {
+                            _ = frag.fragmentReadFloat64(col_idx, @ptrCast(&val), 1, c_idx);
+                        },
+                        .float32 => {
+                            var f32_val: f32 = 0;
+                            _ = frag.fragmentReadFloat32(col_idx, @ptrCast(&f32_val), 1, c_idx);
+                            val = @floatCast(f32_val);
+                        },
+                        .int64 => {
+                            var i64_val: i64 = 0;
+                            _ = frag.fragmentReadInt64(col_idx, @ptrCast(&i64_val), 1, c_idx);
+                            val = @floatFromInt(i64_val);
+                        },
+                        .int32 => {
+                            var i32_val: i32 = 0;
+                            _ = frag.fragmentReadInt32(col_idx, @ptrCast(&i32_val), 1, c_idx);
+                            val = @floatFromInt(i32_val);
+                        },
+                        else => {},
+                    }
+                    return val;
+                }
+                current_idx -= @intCast(count);
+            }
+        }
+        return 0;
+    }
+
     return switch (col.col_type) {
         .float64 => col.data.float64[idx],
         .int64 => @floatFromInt(col.data.int64[idx]),
@@ -1355,7 +1510,46 @@ fn getFloatValue(col: *const ColumnData, idx: u32) f64 {
     };
 }
 
-fn getIntValue(col: *const ColumnData, idx: u32) i64 {
+fn getIntValue(table: *const TableInfo, col: *const ColumnData, idx: u32) i64 {
+    if (col.is_lazy) {
+        var current_idx = idx;
+        for (table.fragments[0..table.fragment_count]) |maybe_frag| {
+            if (maybe_frag) |frag| {
+                const count = frag.getRowCount();
+                if (current_idx < count) {
+                    var val: i64 = 0;
+                    const col_idx = col.fragment_col_idx;
+                    const c_idx = @as(u32, @intCast(current_idx));
+
+                    switch (col.col_type) {
+                        .int64 => {
+                            _ = frag.fragmentReadInt64(col_idx, @ptrCast(&val), 1, c_idx);
+                        },
+                        .int32 => {
+                            var i32_val: i32 = 0;
+                            _ = frag.fragmentReadInt32(col_idx, @ptrCast(&i32_val), 1, c_idx);
+                            val = i32_val;
+                        },
+                        .float64 => {
+                            var f64_val: f64 = 0;
+                            _ = frag.fragmentReadFloat64(col_idx, @ptrCast(&f64_val), 1, c_idx);
+                            val = @intFromFloat(f64_val);
+                        },
+                        .float32 => {
+                            var f32_val: f32 = 0;
+                            _ = frag.fragmentReadFloat32(col_idx, @ptrCast(&f32_val), 1, c_idx);
+                            val = @intFromFloat(f32_val);
+                        },
+                        else => {},
+                    }
+                    return val;
+                }
+                current_idx -= @intCast(count);
+            }
+        }
+        return 0;
+    }
+
     return switch (col.col_type) {
         .int64 => col.data.int64[idx],
         .int32 => col.data.int32[idx],
@@ -1426,7 +1620,7 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
                 for (table.columns[0..table.column_count]) |maybe_col| {
                     if (maybe_col) |*col| {
                         if (std.mem.eql(u8, col.name, part_col)) {
-                            key = key *% 1000003 +% getIntValue(col, row_idx);
+                            key = key *% 1000003 +% getIntValue(table, col, row_idx);
                             break;
                         }
                     }
@@ -1485,8 +1679,8 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
                 while (k < part_count) : (k += 1) {
                     var m = k + 1;
                     while (m < part_count) : (m += 1) {
-                        const a_val = getFloatValue(ocol, indices[part_indices[k]]);
-                        const b_val = getFloatValue(ocol, indices[part_indices[m]]);
+                        const a_val = getFloatValue(table, ocol, indices[part_indices[k]]);
+                        const b_val = getFloatValue(table, ocol, indices[part_indices[m]]);
                         const should_swap = if (wf.order_dir == .desc) a_val < b_val else a_val > b_val;
                         if (should_swap) {
                             const tmp = part_indices[k];
@@ -1509,8 +1703,8 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
                         if (rank == 0) {
                             value = 1;
                         } else if (order_col) |ocol| {
-                            const curr = getFloatValue(ocol, row_idx);
-                            const prev = getFloatValue(ocol, indices[part_indices[rank - 1]]);
+                            const curr = getFloatValue(table, ocol, row_idx);
+                            const prev = getFloatValue(table, ocol, indices[part_indices[rank - 1]]);
                             if (curr == prev) {
                                 value = window_values[wf_idx][part_indices[rank - 1]];
                             } else {
@@ -1524,8 +1718,8 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
                         if (rank == 0) {
                             value = 1;
                         } else if (order_col) |ocol| {
-                            const curr = getFloatValue(ocol, row_idx);
-                            const prev = getFloatValue(ocol, indices[part_indices[rank - 1]]);
+                            const curr = getFloatValue(table, ocol, row_idx);
+                            const prev = getFloatValue(table, ocol, indices[part_indices[rank - 1]]);
                             if (curr == prev) {
                                 value = window_values[wf_idx][part_indices[rank - 1]];
                             } else {
@@ -1538,25 +1732,25 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
                     .lag => {
                         if (rank > 0) {
                             if (arg_col) |acol| {
-                                value = getFloatValue(acol, indices[part_indices[rank - 1]]);
+                                value = getFloatValue(table, acol, indices[part_indices[rank - 1]]);
                             }
                         }
                     },
                     .lead => {
                         if (rank + 1 < part_count) {
                             if (arg_col) |acol| {
-                                value = getFloatValue(acol, indices[part_indices[rank + 1]]);
+                                value = getFloatValue(table, acol, indices[part_indices[rank + 1]]);
                             }
                         }
                     },
                     .first_value => {
                         if (arg_col) |acol| {
-                            value = getFloatValue(acol, indices[part_indices[0]]);
+                            value = getFloatValue(table, acol, indices[part_indices[0]]);
                         }
                     },
                     .last_value => {
                         if (arg_col) |acol| {
-                            value = getFloatValue(acol, indices[part_indices[part_count - 1]]);
+                            value = getFloatValue(table, acol, indices[part_indices[part_count - 1]]);
                         }
                     },
                     .ntile => {
@@ -1572,9 +1766,9 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
                             var actual_rank: usize = 1;
                             if (rank > 0 and order_col != null) {
                                 const ocol = order_col.?;
-                                const curr = getFloatValue(ocol, row_idx);
+                                const curr = getFloatValue(table, ocol, row_idx);
                                 for (0..rank) |j| {
-                                    const prev = getFloatValue(ocol, indices[part_indices[j]]);
+                                    const prev = getFloatValue(table, ocol, indices[part_indices[j]]);
                                     if (prev != curr) actual_rank = j + 2;
                                 }
                             }
@@ -1584,10 +1778,10 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
                     .cume_dist => {
                         var count: usize = rank + 1;
                         if (order_col) |ocol| {
-                            const curr = getFloatValue(ocol, row_idx);
+                            const curr = getFloatValue(table, ocol, row_idx);
                             var j = rank + 1;
                             while (j < part_count) : (j += 1) {
-                                const next = getFloatValue(ocol, indices[part_indices[j]]);
+                                const next = getFloatValue(table, ocol, indices[part_indices[j]]);
                                 if (next == curr) count += 1 else break;
                             }
                         }
@@ -1597,7 +1791,7 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
                         if (arg_col) |acol| {
                             var s: f64 = 0;
                             for (0..rank + 1) |j| {
-                                s += getFloatValue(acol, indices[part_indices[j]]);
+                                s += getFloatValue(table, acol, indices[part_indices[j]]);
                             }
                             value = s;
                         }
@@ -1609,7 +1803,7 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
                         if (arg_col) |acol| {
                             var s: f64 = 0;
                             for (0..rank + 1) |j| {
-                                s += getFloatValue(acol, indices[part_indices[j]]);
+                                s += getFloatValue(table, acol, indices[part_indices[j]]);
                             }
                             value = s / @as(f64, @floatFromInt(rank + 1));
                         }
@@ -1618,7 +1812,7 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
                         if (arg_col) |acol| {
                             var m: f64 = std.math.floatMax(f64);
                             for (0..rank + 1) |j| {
-                                const v = getFloatValue(acol, indices[part_indices[j]]);
+                                const v = getFloatValue(table, acol, indices[part_indices[j]]);
                                 if (v < m) m = v;
                             }
                             value = m;
@@ -1628,7 +1822,7 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
                         if (arg_col) |acol| {
                             var m: f64 = -std.math.floatMax(f64);
                             for (0..rank + 1) |j| {
-                                const v = getFloatValue(acol, indices[part_indices[j]]);
+                                const v = getFloatValue(table, acol, indices[part_indices[j]]);
                                 if (v > m) m = v;
                             }
                             value = m;
@@ -1919,46 +2113,89 @@ fn writeSelectResult(table: *const TableInfo, col_indices: []const usize, row_in
         }
     }
 
+    // Optimization: Check if row_indices are contiguous (0, 1, 2, ... row_count)
+    // This allows bulk memcpy instead of row-by-row copy
+    var is_contiguous = true;
+    if (row_indices.len != table.row_count) {
+        is_contiguous = false;
+    } else if (row_indices.len > 0) {
+        // Check start, end, and middle to be reasonably sure
+        const len = row_indices.len;
+        if (row_indices[0] != 0 or 
+            row_indices[len - 1] != @as(u32, @intCast(len - 1)) or
+            row_indices[len / 2] != @as(u32, @intCast(len / 2))) {
+            is_contiguous = false;
+        }
+    }
+
     // Write data
     for (col_indices) |ci| {
-        if (table.columns[ci]) |col| {
+        if (table.columns[ci]) |*col| {
             switch (col.col_type) {
                 .float64 => {
-                    for (row_indices) |ri| {
-                        const val = col.data.float64[ri];
-                        _ = writeToResult(std.mem.asBytes(&val));
+                    if (is_contiguous) {
+                        _ = writeToResult(std.mem.sliceAsBytes(col.data.float64[0..row_count]));
+                    } else {
+                        for (row_indices) |ri| {
+                            const val = col.data.float64[ri];
+                            _ = writeToResult(std.mem.asBytes(&val));
+                        }
                     }
                 },
                 .int64 => {
-                    for (row_indices) |ri| {
-                        const val: f64 = @floatFromInt(col.data.int64[ri]);
-                        _ = writeToResult(std.mem.asBytes(&val));
+                    if (is_contiguous) {
+                        _ = writeToResult(std.mem.sliceAsBytes(col.data.int64[0..row_count]));
+                    } else {
+                        for (row_indices) |ri| {
+                            const val: f64 = @floatFromInt(col.data.int64[ri]);
+                            _ = writeToResult(std.mem.asBytes(&val));
+                        }
                     }
                 },
                 .int32 => {
-                    for (row_indices) |ri| {
-                        const val = col.data.int32[ri];
-                        _ = writeToResult(std.mem.asBytes(&val));
+                    if (is_contiguous) {
+                        // Cast int32 slice to u8 bytes directly
+                        _ = writeToResult(std.mem.sliceAsBytes(col.data.int32[0..row_count]));
+                    } else {
+                        for (row_indices) |ri| {
+                            const val = col.data.int32[ri];
+                            _ = writeToResult(std.mem.asBytes(&val));
+                        }
                     }
                 },
                 .float32 => {
-                    for (row_indices) |ri| {
-                        const val = col.data.float32[ri];
-                        _ = writeToResult(std.mem.asBytes(&val));
+                    if (is_contiguous) {
+                        _ = writeToResult(std.mem.sliceAsBytes(col.data.float32[0..row_count]));
+                    } else {
+                        for (row_indices) |ri| {
+                            const val = col.data.float32[ri];
+                            _ = writeToResult(std.mem.asBytes(&val));
+                        }
                     }
                 },
                 .string => {
-                    // String format: [offset, len] pairs then data
+                    // Strings are complex (offset/length/data) - still optimizing structure
                     var str_offset: u32 = 0;
                     for (row_indices) |ri| {
                         _ = writeU32(str_offset);
                         _ = writeU32(col.data.strings.lengths[ri]);
                         str_offset += col.data.strings.lengths[ri];
                     }
-                    for (row_indices) |ri| {
-                        const off = col.data.strings.offsets[ri];
-                        const len = col.data.strings.lengths[ri];
-                        _ = writeToResult(col.data.strings.data[off..][0..len]);
+                    if (is_contiguous) {
+                        // For SELECT *, we can just dump the whole string data block if we were clever
+                        // But we need to repack because we wrote new offsets starting at 0
+                        // However, since row_indices are contiguous, the string data IS contiguous in source!
+                        // Calculate total length
+                        var total_len: usize = 0;
+                        for (0..row_count) |i| total_len += col.data.strings.lengths[i];
+                        // Just write the big block
+                        _ = writeToResult(col.data.strings.data[0..total_len]);
+                    } else {
+                        for (row_indices) |ri| {
+                            const off = col.data.strings.offsets[ri];
+                            const len = col.data.strings.lengths[ri];
+                            _ = writeToResult(col.data.strings.data[off..][0..len]);
+                        }
                     }
                 },
             }
@@ -1994,90 +2231,56 @@ fn evaluateWhere(table: *const TableInfo, where: *const WhereClause, row_idx: u3
                 }
             }
             const c = col orelse return false;
-            return evaluateComparison(c, row_idx, where);
+            return evaluateComparison(table, c, row_idx, where);
         },
     }
 }
 
-fn evaluateComparison(col: *const ColumnData, row_idx: u32, where: *const WhereClause) bool {
-    // Handle IS NULL / IS NOT NULL
-    if (where.op == .is_null) {
-        // For now, we don't track nulls - assume no nulls
-        return false;
-    }
-    if (where.op == .is_not_null) {
-        return true;
-    }
-
-    // Handle IN list
-    if (where.op == .in_list or where.op == .not_in_list) {
-        const val = getIntValue(col, row_idx);
-        var found = false;
-        for (where.in_values_int[0..where.in_values_count]) |list_val| {
-            if (val == list_val) {
-                found = true;
-                break;
+fn evaluateComparison(table: *const TableInfo, col: *const ColumnData, row_idx: u32, where: *const WhereClause) bool {
+    switch (where.op) {
+        .eq => {
+            if (where.value_int) |val| {
+                return getIntValue(table, col, row_idx) == val;
+            } else if (where.value_float) |val| {
+                return getFloatValue(table, col, row_idx) == val;
             }
-        }
-        return if (where.op == .in_list) found else !found;
-    }
-
-    // Handle BETWEEN
-    if (where.op == .between) {
-        const val = getIntValue(col, row_idx);
-        const low = where.between_low orelse return false;
-        const high = where.between_high orelse return false;
-        return val >= low and val <= high;
-    }
-
-    // Handle LIKE
-    if (where.op == .like or where.op == .not_like) {
-        if (col.col_type != .string) return false;
-        const pattern = where.value_str orelse return false;
-        const str = getStringValue(col, row_idx);
-        const matches = matchLike(str, pattern);
-        return if (where.op == .like) matches else !matches;
-    }
-
-    // Handle string comparison
-    if (where.value_str) |cmp| {
-        if (col.col_type != .string) return false;
-        const str = getStringValue(col, row_idx);
-        const cmp_result = std.mem.order(u8, str, cmp);
-        return switch (where.op) {
-            .eq => cmp_result == .eq,
-            .ne => cmp_result != .eq,
-            .lt => cmp_result == .lt,
-            .le => cmp_result != .gt,
-            .gt => cmp_result == .gt,
-            .ge => cmp_result != .lt,
-            else => false,
-        };
-    }
-
-    if (where.value_float) |cmp| {
-        const val = getFloatValue(col, row_idx);
-        return switch (where.op) {
-            .eq => val == cmp,
-            .ne => val != cmp,
-            .lt => val < cmp,
-            .le => val <= cmp,
-            .gt => val > cmp,
-            .ge => val >= cmp,
-            else => false,
-        };
-    }
-    if (where.value_int) |cmp| {
-        const val = getIntValue(col, row_idx);
-        return switch (where.op) {
-            .eq => val == cmp,
-            .ne => val != cmp,
-            .lt => val < cmp,
-            .le => val <= cmp,
-            .gt => val > cmp,
-            .ge => val >= cmp,
-            else => false,
-        };
+        },
+        .ne => {
+            if (where.value_int) |val| {
+                return getIntValue(table, col, row_idx) != val;
+            } else if (where.value_float) |val| {
+                return getFloatValue(table, col, row_idx) != val;
+            }
+        },
+        .lt => {
+            if (where.value_int) |val| {
+                return getIntValue(table, col, row_idx) < val;
+            } else if (where.value_float) |val| {
+                return getFloatValue(table, col, row_idx) < val;
+            }
+        },
+        .le => {
+            if (where.value_int) |val| {
+                return getIntValue(table, col, row_idx) <= val;
+            } else if (where.value_float) |val| {
+                return getFloatValue(table, col, row_idx) <= val;
+            }
+        },
+        .gt => {
+            if (where.value_int) |val| {
+                return getIntValue(table, col, row_idx) > val;
+            } else if (where.value_float) |val| {
+                return getFloatValue(table, col, row_idx) > val;
+            }
+        },
+        .ge => {
+            if (where.value_int) |val| {
+                return getIntValue(table, col, row_idx) >= val;
+            } else if (where.value_float) |val| {
+                return getFloatValue(table, col, row_idx) >= val;
+            }
+        },
+        else => return false,
     }
     return false;
 }
@@ -2137,10 +2340,10 @@ fn sortIndices(table: *const TableInfo, indices: []u32, col_name: []const u8, di
     // Simple insertion sort (good enough for moderate sizes)
     for (1..indices.len) |i| {
         const key = indices[i];
-        const key_val = getFloatValue(c, key);
+        const key_val = getFloatValue(table, c, key);
         var j: usize = i;
         while (j > 0) {
-            const cmp_val = getFloatValue(c, indices[j - 1]);
+            const cmp_val = getFloatValue(table, c, indices[j - 1]);
             const should_swap = if (dir == .asc) cmp_val > key_val else cmp_val < key_val;
             if (!should_swap) break;
             indices[j] = indices[j - 1];

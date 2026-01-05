@@ -761,6 +761,7 @@ var WorkerDatabase = class {
     this._columnarBuffer = /* @__PURE__ */ new Map();
     this._flushing = false;
     this._readCache = /* @__PURE__ */ new Map();
+    this._columnarCache = /* @__PURE__ */ new Map();
   }
   async open() {
     const manifestData = await opfsStorage.load(this.manifestKey);
@@ -801,6 +802,7 @@ var WorkerDatabase = class {
       deletionVector: [],
       rowCount: 0,
       nextRowId: 0,
+      version: 0,
       createdAt: Date.now()
     };
     this.tables.set(tableName, tableState);
@@ -879,6 +881,7 @@ var WorkerDatabase = class {
     }
     colBuf.__length = len + n;
     table.rowCount += n;
+    table.version = (table.version || 0) + 1;
     this._scheduleFlush();
     if (colBuf.__length >= this._flushThreshold) {
       await this._flushTable(tableName);
@@ -973,6 +976,7 @@ var WorkerDatabase = class {
       }
     }
     table.rowCount -= deletedCount;
+    table.version = (table.version || 0) + 1;
     await this._saveManifest();
     return { success: true, deleted: deletedCount };
   }
@@ -1038,6 +1042,7 @@ var WorkerDatabase = class {
               colBuf[col][i] = newVal ?? (colBuf[col] instanceof Float64Array ? NaN : null);
             }
           }
+          table.version = (table.version || 0) + 1;
           updatedCount++;
         }
       }
@@ -1173,6 +1178,20 @@ var WorkerDatabase = class {
   async selectColumnar(tableName) {
     const table = this.tables.get(tableName);
     if (!table) return null;
+    const bufLen = this._columnarBuffer.get(tableName)?.__length || 0;
+    const version = `${table.fragments.length}:${bufLen}:${table.deletionVector.length}:${table.version || 0}`;
+    const cached = this._columnarCache.get(tableName);
+    if (cached && cached.version === version) {
+      const columns = {};
+      for (const [name, arr] of Object.entries(cached.data.columns)) {
+        if (ArrayBuffer.isView(arr)) {
+          columns[name] = new arr.constructor(arr.buffer, arr.byteOffset, arr.length);
+        } else {
+          columns[name] = arr;
+        }
+      }
+      return { schema: table.schema, columns, rowCount: cached.data.rowCount };
+    }
     const hasDeleted = table.deletionVector.length > 0;
     const deletedSet = hasDeleted ? new Set(table.deletionVector) : null;
     const allColumns = {};
@@ -1215,26 +1234,26 @@ var WorkerDatabase = class {
       }
     }
     const colBuf = this._columnarBuffer.get(tableName);
-    const bufLen = colBuf?.__length || 0;
-    if (colBuf && bufLen > 0) {
+    const bufLen2 = colBuf?.__length || 0;
+    if (colBuf && bufLen2 > 0) {
       if (!deletedSet) {
         for (const col of table.schema) {
           const arr = colBuf[col.name];
           if (!arr) continue;
           if (arr instanceof Float64Array) {
-            const owned = new Float64Array(bufLen);
-            owned.set(arr.subarray(0, bufLen));
+            const owned = new Float64Array(bufLen2);
+            owned.set(arr.subarray(0, bufLen2));
             allColumns[col.name].push(owned);
           } else {
-            allColumns[col.name].push(arr.slice(0, bufLen));
+            allColumns[col.name].push(arr.slice(0, bufLen2));
           }
         }
-        const ownedRowId = new Float64Array(bufLen);
-        ownedRowId.set(colBuf.__rowId.subarray(0, bufLen));
+        const ownedRowId = new Float64Array(bufLen2);
+        ownedRowId.set(colBuf.__rowId.subarray(0, bufLen2));
         allColumns.__rowId.push(ownedRowId);
       } else {
         const validIndices = [];
-        for (let i = 0; i < bufLen; i++) {
+        for (let i = 0; i < bufLen2; i++) {
           if (!deletedSet.has(colBuf.__rowId[i])) validIndices.push(i);
         }
         const vLen = validIndices.length;
@@ -1280,7 +1299,9 @@ var WorkerDatabase = class {
         mergedColumns[name] = merged;
       }
     }
-    return { schema: table.schema, columns: mergedColumns, rowCount: totalRows };
+    const result = { schema: table.schema, columns: mergedColumns, rowCount: totalRows };
+    this._columnarCache.set(tableName, { version, data: result });
+    return result;
   }
   /**
    * Read column data directly (no row conversion) for fast aggregation.
@@ -6283,14 +6304,24 @@ var WasmSqlExecutor = class {
    * @param {string} tableName
    * @param {Object} columns - Map of column name to typed array
    * @param {number} rowCount
+   * @param {string} version - Table version string to detect changes
    */
-  registerTable(tableName, columns, rowCount) {
+  registerTable(tableName, columns, rowCount, version = "") {
     const wasm2 = getWasm();
     if (!wasm2) throw new Error("WASM not loaded");
+    const existing = this._registered.get(tableName);
+    if (existing && existing.version === version) {
+      return;
+    }
+    if (existing) {
+      const nameBytes = new TextEncoder().encode(tableName);
+      wasm2.clearTable(nameBytes, nameBytes.length);
+    }
     const memory = getWasmMemory();
     const tableNameBytes = new TextEncoder().encode(tableName);
     const tableNamePtr = wasm2.wasmAlloc(tableNameBytes.length);
     new Uint8Array(memory.buffer, tableNamePtr, tableNameBytes.length).set(tableNameBytes);
+    const registeredCols = /* @__PURE__ */ new Set();
     for (const [colName, data] of Object.entries(columns)) {
       if (colName.startsWith("__")) continue;
       const colNameBytes = new TextEncoder().encode(colName);
@@ -6307,6 +6338,7 @@ var WasmSqlExecutor = class {
           dataPtr,
           data.length
         );
+        registeredCols.add(colName);
       } else if (data instanceof BigInt64Array) {
         const dataPtr = wasm2.allocInt64Buffer(data.length);
         new BigInt64Array(memory.buffer, dataPtr, data.length).set(data);
@@ -6318,6 +6350,7 @@ var WasmSqlExecutor = class {
           dataPtr,
           data.length
         );
+        registeredCols.add(colName);
       } else if (data instanceof Int32Array) {
         const f64Data = new Float64Array(data.length);
         for (let i = 0; i < data.length; i++) f64Data[i] = data[i];
@@ -6331,6 +6364,7 @@ var WasmSqlExecutor = class {
           dataPtr,
           f64Data.length
         );
+        registeredCols.add(colName);
       } else if (Array.isArray(data)) {
         const offsets = new Uint32Array(data.length);
         const lengths = new Uint32Array(data.length);
@@ -6366,9 +6400,10 @@ var WasmSqlExecutor = class {
           totalLen,
           data.length
         );
+        registeredCols.add(colName);
       }
     }
-    this._registered.set(tableName, { columns: Object.keys(columns), rowCount });
+    this._registered.set(tableName, { version, columns: registeredCols, rowCount });
   }
   /**
    * Execute SQL and return result as columnar data
@@ -6401,6 +6436,7 @@ var WasmSqlExecutor = class {
    */
   _parseResult(buffer, ptr, size) {
     const view = new DataView(buffer, ptr, size);
+    const decoder = new TextDecoder();
     const version = view.getUint32(0, true);
     if (version !== RESULT_VERSION) {
       throw new Error(`Unsupported result version: ${version}`);
@@ -6414,16 +6450,22 @@ var WasmSqlExecutor = class {
     if (flags !== 0) {
       throw new Error("WASM SQL execution returned error");
     }
+    const namesOffset = headerSize >= 36 ? view.getUint32(32, true) : 0;
     const columns = [];
     const colData = {};
-    let curDataOffset = dataOffset;
     for (let i = 0; i < columnCount; i++) {
       const metaPos = metaOffset + i * 16;
       const colType = view.getUint32(metaPos, true);
       const colNameOffset = view.getUint32(metaPos + 4, true);
       const colNameLen = view.getUint32(metaPos + 8, true);
       const colDataOffset = view.getUint32(metaPos + 12, true);
-      const colName = `col_${i}`;
+      let colName;
+      if (namesOffset > 0 && colNameLen > 0) {
+        const nameBytes = new Uint8Array(buffer, ptr + namesOffset + colNameOffset, colNameLen);
+        colName = decoder.decode(nameBytes);
+      } else {
+        colName = `col_${i}`;
+      }
       columns.push(colName);
       const absDataOffset = dataOffset + colDataOffset;
       switch (colType) {
@@ -6507,6 +6549,26 @@ function getWasmSqlExecutor() {
   }
   return instance;
 }
+function shouldUseWasmSql(sql, rowCount) {
+  if (rowCount < 1e3) return false;
+  const sqlUpper = sql.toUpperCase().trim();
+  if (/^SELECT\s+\*\s+FROM\s+\w+\s*$/i.test(sql)) {
+    return false;
+  }
+  if (/^SELECT\s+\*\s+FROM\s+\w+(\s+WHERE|\s+LIMIT)/i.test(sql)) {
+    return true;
+  }
+  if (/^SELECT\s+(SUM|AVG|MIN|MAX|COUNT)\s*\(/i.test(sql)) {
+    return true;
+  }
+  if (/WHERE\s+\w+\s*[<>=!]+\s*\d+/i.test(sql)) {
+    return true;
+  }
+  if (/JOIN\s+\w+\s+ON/i.test(sql)) {
+    return true;
+  }
+  return false;
+}
 
 // src/worker/index.js
 async function executeWasmSqlFull(db, sql) {
@@ -6518,14 +6580,14 @@ async function executeWasmSqlFull(db, sql) {
   for (const tableName of tableNames) {
     const table = db.tables.get(tableName);
     if (!table) continue;
+    const bufLen = db._columnarBuffer?.get(tableName)?.__length || 0;
+    const version = `${tableName}:${table.fragments?.length || 0}:${bufLen}:${table.deletionVector?.length || 0}`;
     const columnarData = await db.selectColumnar(tableName);
     if (!columnarData || columnarData.rowCount === 0) continue;
     const { columns: colData, rowCount } = columnarData;
-    executor.registerTable(tableName, colData, rowCount);
+    executor.registerTable(tableName, colData, rowCount, version);
   }
-  const result = executor.execute(sql);
-  executor.clear();
-  return result;
+  return executor.execute(sql);
 }
 function extractTableNames(sql) {
   const names = /* @__PURE__ */ new Set();
@@ -6921,7 +6983,10 @@ async function handleMessage(port, data) {
     } else if (method === "db:createTable") {
       result = await (await getDatabase(args.db)).createTable(args.tableName, args.columns, args.ifNotExists);
     } else if (method === "db:dropTable") {
-      result = await (await getDatabase(args.db)).dropTable(args.tableName, args.ifExists);
+      const db = await getDatabase(args.db);
+      result = await db.dropTable(args.tableName, args.ifExists);
+      const nameBytes = E.encode(args.tableName);
+      getWasmSqlExecutor().clearTable(nameBytes, nameBytes.length);
     } else if (method === "db:insert") {
       result = await (await getDatabase(args.db)).insert(args.tableName, args.rows);
     } else if (method === "db:delete") {
@@ -6941,7 +7006,19 @@ async function handleMessage(port, data) {
       result = await db.select(args.tableName, options);
     } else if (method === "db:exec") {
       const db = await getDatabase(args.db);
-      result = await executeWasmSqlFull(db, args.sql);
+      const tableNames = extractTableNames(args.sql);
+      const primaryTable = tableNames[0] ? db.tables.get(tableNames[0]) : null;
+      const rowCount = primaryTable ? primaryTable.rowCount : 0;
+      if (shouldUseWasmSql(args.sql, rowCount)) {
+        try {
+          result = await executeWasmSqlFull(db, args.sql);
+        } catch (e) {
+          console.warn("[LanceQLWorker] WASM SQL failed, falling back to JS:", e.message);
+          result = await executeSQL(db, args.sql);
+        }
+      } else {
+        result = await executeSQL(db, args.sql);
+      }
       if (result && result._format === "columnar" && result.rowCount >= 1e3) {
         const cursorId = nextCursorId++;
         cursors.set(cursorId, result);
@@ -6987,7 +7064,20 @@ async function handleMessage(port, data) {
     } else if (method === "vault:has") {
       result = await (await getVault()).has(args.key);
     } else if (method === "vault:exec") {
-      result = await (await getVault()).exec(args.sql);
+      const vault = await getVault();
+      const tableNames = extractTableNames(args.sql);
+      const primaryTable = tableNames[0] ? vault._db.tables.get(tableNames[0]) : null;
+      const rowCount = primaryTable ? primaryTable.rowCount : 0;
+      if (shouldUseWasmSql(args.sql, rowCount)) {
+        try {
+          result = await executeWasmSqlFull(vault._db, args.sql);
+        } catch (e) {
+          console.warn("[LanceQLWorker] Vault WASM SQL failed, falling back to JS:", e.message);
+          result = await vault.exec(args.sql);
+        }
+      } else {
+        result = await vault.exec(args.sql);
+      }
       if (result && result._format === "columnar" && result.rowCount >= 1e3) {
         const cursorId = nextCursorId++;
         cursors.set(cursorId, result);
