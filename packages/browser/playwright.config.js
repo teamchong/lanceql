@@ -19,7 +19,13 @@ export default defineConfig({
       use: {
         ...devices['Desktop Chrome'],
         launchOptions: {
-          args: ['--disable-web-security', '--disable-features=IsolateOrigins,site-per-process'],
+          args: [
+            '--disable-web-security',
+            '--disable-features=IsolateOrigins,site-per-process',
+            '--enable-unsafe-webgpu',
+            '--use-gl=angle',
+            '--use-angle=vulkan'
+          ],
         },
       },
     },
