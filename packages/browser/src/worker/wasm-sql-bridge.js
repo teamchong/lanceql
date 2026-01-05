@@ -156,6 +156,52 @@ export class WasmSqlExecutor {
     }
 
     /**
+     * Register table from OPFS file paths
+     * @param {string} tableName
+     * @param {string[]} filePaths - Array of OPFS paths
+     * @param {string} version - Table version string
+     */
+    registerTableFromFiles(tableName, filePaths, version = '') {
+        const wasm = getWasm();
+        if (!wasm) throw new Error('WASM not loaded');
+
+        // Check if table is already registered with the same version
+        const existing = this._registered.get(tableName);
+        if (existing && existing.version === version) {
+            return;
+        }
+
+        // Clear existing table in WASM if it exists
+        if (existing) {
+            const nameBytes = new TextEncoder().encode(tableName);
+            wasm.clearTable(nameBytes, nameBytes.length);
+        }
+
+        const encoder = new TextEncoder();
+        const tableNameBytes = encoder.encode(tableName);
+        const tableNamePtr = wasm.wasmAlloc(tableNameBytes.length);
+        new Uint8Array(getWasmMemory().buffer, tableNamePtr, tableNameBytes.length).set(tableNameBytes);
+
+        // Register each fragment
+        for (const path of filePaths) {
+            const pathBytes = encoder.encode(path);
+            const pathPtr = wasm.wasmAlloc(pathBytes.length);
+            new Uint8Array(getWasmMemory().buffer, pathPtr, pathBytes.length).set(pathBytes);
+
+            const result = wasm.registerTableFromOPFS(
+                tableNamePtr, tableNameBytes.length,
+                pathPtr, pathBytes.length
+            );
+
+            if (result !== 0) {
+                console.warn(`Failed to register fragment ${path} for table ${tableName}: error ${result}`);
+            }
+        }
+
+        this._registered.set(tableName, { version, type: 'files' });
+    }
+
+    /**
      * Execute SQL and return result as columnar data
      * @param {string} sql - SQL query string
      * @returns {Object} - { columns: string[], rowCount: number, data: Object }

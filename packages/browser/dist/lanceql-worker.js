@@ -6406,6 +6406,43 @@ var WasmSqlExecutor = class {
     this._registered.set(tableName, { version, columns: registeredCols, rowCount });
   }
   /**
+   * Register table from OPFS file paths
+   * @param {string} tableName
+   * @param {string[]} filePaths - Array of OPFS paths
+   * @param {string} version - Table version string
+   */
+  registerTableFromFiles(tableName, filePaths, version = "") {
+    const wasm2 = getWasm();
+    if (!wasm2) throw new Error("WASM not loaded");
+    const existing = this._registered.get(tableName);
+    if (existing && existing.version === version) {
+      return;
+    }
+    if (existing) {
+      const nameBytes = new TextEncoder().encode(tableName);
+      wasm2.clearTable(nameBytes, nameBytes.length);
+    }
+    const encoder = new TextEncoder();
+    const tableNameBytes = encoder.encode(tableName);
+    const tableNamePtr = wasm2.wasmAlloc(tableNameBytes.length);
+    new Uint8Array(getWasmMemory().buffer, tableNamePtr, tableNameBytes.length).set(tableNameBytes);
+    for (const path of filePaths) {
+      const pathBytes = encoder.encode(path);
+      const pathPtr = wasm2.wasmAlloc(pathBytes.length);
+      new Uint8Array(getWasmMemory().buffer, pathPtr, pathBytes.length).set(pathBytes);
+      const result = wasm2.registerTableFromOPFS(
+        tableNamePtr,
+        tableNameBytes.length,
+        pathPtr,
+        pathBytes.length
+      );
+      if (result !== 0) {
+        console.warn(`Failed to register fragment ${path} for table ${tableName}: error ${result}`);
+      }
+    }
+    this._registered.set(tableName, { version, type: "files" });
+  }
+  /**
    * Execute SQL and return result as columnar data
    * @param {string} sql - SQL query string
    * @returns {Object} - { columns: string[], rowCount: number, data: Object }
@@ -6582,6 +6619,11 @@ async function executeWasmSqlFull(db, sql) {
     if (!table) continue;
     const bufLen = db._columnarBuffer?.get(tableName)?.__length || 0;
     const version = `${tableName}:${table.fragments?.length || 0}:${bufLen}:${table.deletionVector?.length || 0}`;
+    if (bufLen === 0 && table.fragments.length > 0) {
+      const fragments = db.getFragmentPaths(tableName);
+      executor.registerTableFromFiles(tableName, fragments, version);
+      continue;
+    }
     const columnarData = await db.selectColumnar(tableName);
     if (!columnarData || columnarData.rowCount === 0) continue;
     const { columns: colData, rowCount } = columnarData;

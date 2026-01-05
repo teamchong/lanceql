@@ -2045,6 +2045,84 @@ fn executeCTEQuery(sql: []const u8, outer_query: *const ParsedQuery, cte: *const
     }
 }
 
+fn copyLazyColumnRange(table: *const TableInfo, col: *const ColumnData, start_idx: u32, count: usize) !void {
+    var remaining = count;
+    var current_abs_idx = start_idx;
+    
+    // Find starting fragment
+    var frag_idx: usize = 0;
+    var frag_start_row: u32 = 0;
+    
+    while (frag_idx < table.fragment_count) {
+        const frag = table.fragments[frag_idx].?;
+        const f_rows = @as(u32, @intCast(frag.getRowCount()));
+        if (current_abs_idx < frag_start_row + f_rows) break;
+        frag_start_row += f_rows;
+        frag_idx += 1;
+    }
+    
+    const CHUNK_SIZE = 1024;
+    var buf_f64: [CHUNK_SIZE]f64 = undefined;
+    var buf_i64: [CHUNK_SIZE]i64 = undefined;
+    var buf_i32: [CHUNK_SIZE]i32 = undefined;
+    var buf_f32: [CHUNK_SIZE]f32 = undefined;
+    
+    while (remaining > 0 and frag_idx < table.fragment_count) {
+        const frag = table.fragments[frag_idx].?;
+        const f_rows = @as(u32, @intCast(frag.getRowCount()));
+        
+        // Calculate how many rows we can read from this fragment
+        const rel_start = current_abs_idx - frag_start_row;
+        const available_in_frag = f_rows - rel_start;
+        const to_read = @min(remaining, available_in_frag);
+        
+        // Process in chunks
+        var chunk_offset: u32 = 0;
+        while (chunk_offset < to_read) {
+            const chunk_len = @min(CHUNK_SIZE, to_read - chunk_offset);
+            const read_start = rel_start + chunk_offset;
+            
+            switch (col.col_type) {
+                .float64 => {
+                    const n = frag.fragmentReadFloat64(col.fragment_col_idx, @ptrCast(&buf_f64), chunk_len, read_start);
+                    _ = writeToResult(std.mem.sliceAsBytes(buf_f64[0..n]));
+                },
+                .int64 => {
+                    const n = frag.fragmentReadInt64(col.fragment_col_idx, @ptrCast(&buf_i64), chunk_len, read_start);
+                    _ = writeToResult(std.mem.sliceAsBytes(buf_i64[0..n]));
+                },
+                .int32 => {
+                    const n = frag.fragmentReadInt32(col.fragment_col_idx, @ptrCast(&buf_i32), chunk_len, read_start);
+                    _ = writeToResult(std.mem.sliceAsBytes(buf_i32[0..n]));
+                },
+                .float32 => {
+                    const n = frag.fragmentReadFloat32(col.fragment_col_idx, @ptrCast(&buf_f32), chunk_len, read_start);
+                    _ = writeToResult(std.mem.sliceAsBytes(buf_f32[0..n]));
+                },
+                .string => {
+                    // Strings are harder to batch because of variable length
+                    // Fallback to row-by-row for now
+                    for (0..chunk_len) |_| {
+                        // TODO: Optimize string batch reading
+                        // We are just writing dummy data if we don't implement this fully
+                        // But for now let's just loop
+                        // Actually, this branch is unreachable if we don't call copyLazyColumnRange for strings
+                        // (which we don't in writeSelectResult)
+                    }
+                },
+            }
+            
+            chunk_offset += @intCast(chunk_len);
+        }
+        
+        remaining -= to_read;
+        current_abs_idx += @intCast(to_read);
+        
+        frag_start_row += f_rows;
+        frag_idx += 1;
+    }
+}
+
 fn writeSelectResult(table: *const TableInfo, col_indices: []const usize, row_indices: []const u32, row_count: usize) !void {
     const col_count = col_indices.len;
 
@@ -2134,42 +2212,60 @@ fn writeSelectResult(table: *const TableInfo, col_indices: []const usize, row_in
             switch (col.col_type) {
                 .float64 => {
                     if (is_contiguous) {
-                        _ = writeToResult(std.mem.sliceAsBytes(col.data.float64[0..row_count]));
+                        if (col.is_lazy) {
+                            try copyLazyColumnRange(table, col, 0, row_count);
+                        } else {
+                            _ = writeToResult(std.mem.sliceAsBytes(col.data.float64[0..row_count]));
+                        }
                     } else {
                         for (row_indices) |ri| {
-                            const val = col.data.float64[ri];
+                            const val = getFloatValue(table, col, ri);
                             _ = writeToResult(std.mem.asBytes(&val));
                         }
                     }
                 },
                 .int64 => {
                     if (is_contiguous) {
-                        _ = writeToResult(std.mem.sliceAsBytes(col.data.int64[0..row_count]));
+                        if (col.is_lazy) {
+                            try copyLazyColumnRange(table, col, 0, row_count);
+                        } else {
+                            _ = writeToResult(std.mem.sliceAsBytes(col.data.int64[0..row_count]));
+                        }
                     } else {
                         for (row_indices) |ri| {
-                            const val: f64 = @floatFromInt(col.data.int64[ri]);
+                            const val: f64 = @floatFromInt(getIntValue(table, col, ri));
                             _ = writeToResult(std.mem.asBytes(&val));
                         }
                     }
                 },
                 .int32 => {
                     if (is_contiguous) {
-                        // Cast int32 slice to u8 bytes directly
-                        _ = writeToResult(std.mem.sliceAsBytes(col.data.int32[0..row_count]));
+                        if (col.is_lazy) {
+                            try copyLazyColumnRange(table, col, 0, row_count);
+                        } else {
+                            _ = writeToResult(std.mem.sliceAsBytes(col.data.int32[0..row_count]));
+                        }
                     } else {
                         for (row_indices) |ri| {
-                            const val = col.data.int32[ri];
-                            _ = writeToResult(std.mem.asBytes(&val));
+                            const val = getIntValue(table, col, ri);
+                            const val_i32: i32 = @intCast(val);
+                            _ = writeToResult(std.mem.asBytes(&val_i32));
                         }
                     }
                 },
                 .float32 => {
                     if (is_contiguous) {
-                        _ = writeToResult(std.mem.sliceAsBytes(col.data.float32[0..row_count]));
+                        if (col.is_lazy) {
+                            try copyLazyColumnRange(table, col, 0, row_count);
+                        }
+                        else {
+                            _ = writeToResult(std.mem.sliceAsBytes(col.data.float32[0..row_count]));
+                        }
                     } else {
                         for (row_indices) |ri| {
-                            const val = col.data.float32[ri];
-                            _ = writeToResult(std.mem.asBytes(&val));
+                            const val = getFloatValue(table, col, ri);
+                            const val_f32: f32 = @floatCast(val);
+                            _ = writeToResult(std.mem.asBytes(&val_f32));
                         }
                     }
                 },

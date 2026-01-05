@@ -664,4 +664,50 @@ export fn opfsCountRows() u64 {
     return buf.rows;
 }
 
+/// Register a table fragment directly from OPFS path
+/// Path is relative to OPFS root (e.g., "mydb/mytable/frag_123.lance")
+export fn registerTableFromOPFS(
+    table_name_ptr: [*]const u8,
+    table_name_len: usize,
+    path_ptr: [*]const u8,
+    path_len: usize,
+) u32 {
+    // Open file via JS
+    const handle = js.opfs_open(path_ptr, path_len);
+    if (handle == 0) return 1;
+
+    // Get file size
+    const size = js.opfs_size(handle);
+    if (size == 0) {
+        js.opfs_close(handle);
+        return 2;
+    }
+
+    const size_usize: usize = @intCast(size);
+
+    // Allocate buffer in WASM memory
+    // Note: This memory is effectively leaked into the table structure until table is cleared
+    // This is intentional as the table needs the data for execution
+    const buf_ptr = wasmAlloc(size_usize) orelse {
+        js.opfs_close(handle);
+        return 3;
+    };
+
+    // Read entire file into WASM memory
+    const bytes_read = js.opfs_read(handle, buf_ptr, size_usize, 0);
+    js.opfs_close(handle); // Close handle, we have the data
+
+    if (bytes_read != size_usize) {
+        return 4;
+    }
+
+    // Register with SQL executor
+    return sql_executor.registerTableFragment(
+        table_name_ptr,
+        table_name_len,
+        buf_ptr,
+        size_usize
+    );
+}
+
 

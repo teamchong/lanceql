@@ -47,7 +47,14 @@ async function executeWasmSqlFull(db, sql) {
         const bufLen = db._columnarBuffer?.get(tableName)?.__length || 0;
         const version = `${tableName}:${table.fragments?.length || 0}:${bufLen}:${table.deletionVector?.length || 0}`;
 
-        // Get columnar data
+        // If table has no buffered data (flushed), use file-based registration (Fastest)
+        if (bufLen === 0 && table.fragments.length > 0) {
+            const fragments = db.getFragmentPaths(tableName);
+            executor.registerTableFromFiles(tableName, fragments, version);
+            continue;
+        }
+
+        // Fallback to memory-based registration if we have buffered data
         const columnarData = await db.selectColumnar(tableName);
         if (!columnarData || columnarData.rowCount === 0) continue;
 
