@@ -14,6 +14,8 @@
 const std = @import("std");
 const memory = @import("memory.zig");
 const fragment_reader = @import("fragment_reader.zig");
+const aggregates = @import("aggregates.zig");
+const simd_search = @import("simd_search.zig");
 
 const RESULT_VERSION: u32 = 1;
 const HEADER_SIZE: u32 = 32;
@@ -24,6 +26,7 @@ const MAX_SELECT_COLS: usize = 32;
 const MAX_GROUP_COLS: usize = 8;
 const MAX_AGGREGATES: usize = 16;
 const MAX_ROWS: usize = 100000;
+const MAX_VECTOR_DIM: usize = 1536; // Support up to OpenAI embedding size
 
 /// Column types
 pub const ColumnType = enum(u32) {
@@ -53,6 +56,7 @@ pub const ColumnData = struct {
     row_count: usize,
     is_lazy: bool = false,
     fragment_col_idx: u32 = 0,
+    vector_dim: u32 = 0, // Dimension for vector columns
 };
 
 /// Table registration
@@ -68,7 +72,7 @@ pub const TableInfo = struct {
 };
 
 /// WHERE operators
-pub const WhereOp = enum { eq, ne, lt, le, gt, ge, and_op, or_op, in_list, not_in_list, in_subquery, exists, not_exists, like, not_like, between, is_null, is_not_null };
+pub const WhereOp = enum { eq, ne, lt, le, gt, ge, and_op, or_op, in_list, not_in_list, in_subquery, exists, not_exists, like, not_like, between, is_null, is_not_null, near };
 
 /// WHERE clause node
 pub const WhereClause = struct {
@@ -88,6 +92,9 @@ pub const WhereClause = struct {
     // For BETWEEN
     between_low: ?i64 = null,
     between_high: ?i64 = null,
+    // For NEAR (vector search)
+    near_vector: [MAX_VECTOR_DIM]f32 = undefined,
+    near_dim: usize = 0,
 };
 
 /// Aggregate function
@@ -307,6 +314,9 @@ pub export fn registerTableFragment(
                 col_type = .float32;
             }
 
+            // Check for vector dimension (from reader)
+            const dim = reader.fragmentGetColumnVectorDim(i_u32);
+
             // Allocate name (needs to persist)
             const name_ptr = memory.wasmAlloc(name.len) orelse return 4;
             @memcpy(name_ptr[0..name.len], name);
@@ -318,6 +328,7 @@ pub export fn registerTableFragment(
                 .row_count = 0, // Ignored for lazy
                 .is_lazy = true,
                 .fragment_col_idx = i_u32,
+                .vector_dim = dim,
             };
             tbl.column_count += 1;
         }
@@ -504,6 +515,94 @@ fn registerColumnString(table_name: []const u8, col_name: []const u8, offsets: [
 // Query Execution
 // ============================================================================
 
+fn executeVectorSearch(table: *const TableInfo, near: *const WhereClause, limit: usize, out_indices: []u32) !usize {
+    // Find column
+    var col: ?*const ColumnData = null;
+    for (table.columns[0..table.column_count]) |maybe_col| {
+        if (maybe_col) |*c| {
+            if (std.mem.eql(u8, c.name, near.column.?)) {
+                col = c;
+                break;
+            }
+        }
+    }
+    const c = col orelse return 0;
+    
+    const query_vec = near.near_vector[0..near.near_dim];
+    const top_k = if (limit > 0) limit else 10;
+    
+    // Top-K heaps (one per fragment + merge)
+    // For simplicity, we'll maintain one global top-k heap
+    // out_indices will store the indices, we need scores too
+    // We'll use a temporary buffer for scores
+    const scores_ptr = memory.wasmAlloc(top_k * 4) orelse return 0;
+    const scores = @as([*]f32, @ptrCast(@alignCast(scores_ptr)))[0..top_k];
+    
+    // Initialize scores
+    for (0..top_k) |i| scores[i] = -2.0;
+    for (0..top_k) |i| out_indices[i] = 0;
+    
+    var current_abs_idx: u32 = 0;
+    
+    // Iterate fragments
+    for (table.fragments[0..table.fragment_count]) |maybe_frag| {
+        if (maybe_frag) |frag| {
+            const row_count = frag.getRowCount();
+            const col_idx = c.fragment_col_idx;
+            const dim = c.vector_dim;
+            
+            if (dim != near.near_dim) {
+                // Dimension mismatch, skip or error? Skip for now.
+                current_abs_idx += @intCast(row_count);
+                continue;
+            }
+            
+            // Chunked read and search
+            const CHUNK_SIZE = 256; // Smaller chunk for vectors (large size)
+            const buf_ptr = memory.wasmAlloc(CHUNK_SIZE * dim * 4) orelse return 0;
+            const buf = @as([*]f32, @ptrCast(@alignCast(buf_ptr)));
+            
+            var processed: usize = 0;
+            while (processed < row_count) {
+                const chunk_len = @min(CHUNK_SIZE, row_count - processed);
+                
+                // Read vectors
+                var floats_read: usize = 0;
+                for (0..chunk_len) |i| {
+                    const row = @as(u32, @intCast(processed + i));
+                    const n = frag.fragmentReadVectorAt(col_idx, row, buf + i * dim, dim);
+                    floats_read += n;
+                }
+                
+                // Search chunk
+                // Use a modified vectorSearchBuffer that takes explicit start_index
+                _ = simd_search.vectorSearchBuffer(
+                    buf,
+                    chunk_len,
+                    dim,
+                    query_vec.ptr,
+                    top_k,
+                    out_indices.ptr,
+                    scores.ptr,
+                    1, // assume normalized
+                    current_abs_idx + @as(u32, @intCast(processed))
+                );
+                
+                processed += chunk_len;
+            }
+            
+            current_abs_idx += @intCast(row_count);
+        }
+    }
+    
+    // Count valid results
+    var result_count: usize = 0;
+    for (0..top_k) |i| {
+        if (scores[i] > -2.0) result_count += 1;
+    }
+    return result_count;
+}
+
 fn executeSelectQuery(table: *const TableInfo, query: *const ParsedQuery) !void {
     const row_count = table.row_count;
 
@@ -511,15 +610,33 @@ fn executeSelectQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
     var match_indices: [MAX_ROWS]u32 = undefined;
     var match_count: usize = 0;
 
-    for (0..@min(row_count, MAX_ROWS)) |i| {
-        if (query.where_clause) |*where| {
-            if (evaluateWhere(table, where, @intCast(i))) {
+    // Check for NEAR clause
+    var near_clause: ?*const WhereClause = null;
+    if (query.where_clause) |*where| {
+        if (where.op == .near) {
+            near_clause = where;
+        } else if (where.op == .and_op) {
+            if (where.left) |l| { if (l.op == .near) near_clause = l; }
+            if (where.right) |r| { if (r.op == .near) near_clause = r; }
+        }
+    }
+
+    if (near_clause) |near| {
+        // Execute vector search
+        const limit = if (query.limit_value) |l| l else 10;
+        match_count = try executeVectorSearch(table, near, limit, &match_indices);
+        // TODO: Apply other filters if any (post-filtering)
+    } else {
+        for (0..@min(row_count, MAX_ROWS)) |i| {
+            if (query.where_clause) |*where| {
+                if (evaluateWhere(table, where, @intCast(i))) {
+                    match_indices[match_count] = @intCast(i);
+                    match_count += 1;
+                }
+            } else {
                 match_indices[match_count] = @intCast(i);
                 match_count += 1;
             }
-        } else {
-            match_indices[match_count] = @intCast(i);
-            match_count += 1;
         }
     }
 
@@ -1421,7 +1538,109 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, indic
     }
 }
 
+fn computeLazyAggregate(table: *const TableInfo, col: *const ColumnData, agg: AggExpr, start_idx: u32, count: usize) f64 {
+    var remaining = count;
+    var current_abs_idx = start_idx;
+    
+    // Accumulators
+    var sum: f64 = 0;
+    var min_val: f64 = std.math.floatMax(f64);
+    var max_val: f64 = -std.math.floatMax(f64);
+    var total_count: f64 = 0;
+
+    // Find starting fragment
+    var frag_idx: usize = 0;
+    var frag_start_row: u32 = 0;
+    
+    while (frag_idx < table.fragment_count) {
+        const frag = table.fragments[frag_idx].?;
+        const f_rows = @as(u32, @intCast(frag.getRowCount()));
+        if (current_abs_idx < frag_start_row + f_rows) break;
+        frag_start_row += f_rows;
+        frag_idx += 1;
+    }
+    
+    const CHUNK_SIZE = 1024;
+    var buf_f64: [CHUNK_SIZE]f64 = undefined;
+    
+    while (remaining > 0 and frag_idx < table.fragment_count) {
+        const frag = table.fragments[frag_idx].?;
+        const f_rows = @as(u32, @intCast(frag.getRowCount()));
+        
+        const rel_start = current_abs_idx - frag_start_row;
+        const available_in_frag = f_rows - rel_start;
+        const to_read = @min(remaining, available_in_frag);
+        
+        var chunk_offset: u32 = 0;
+        while (chunk_offset < to_read) {
+            const chunk_len = @min(CHUNK_SIZE, to_read - chunk_offset);
+            const read_start = rel_start + chunk_offset;
+            
+            // Read chunk (convert to f64 if needed)
+            var n: usize = 0;
+            switch (col.col_type) {
+                .float64 => {
+                    n = frag.fragmentReadFloat64(col.fragment_col_idx, @ptrCast(&buf_f64), chunk_len, read_start);
+                },
+                .float32 => {
+                    var buf_f32: [CHUNK_SIZE]f32 = undefined;
+                    n = frag.fragmentReadFloat32(col.fragment_col_idx, @ptrCast(&buf_f32), chunk_len, read_start);
+                    for (0..n) |i| buf_f64[i] = @floatCast(buf_f32[i]);
+                },
+                .int64 => {
+                    var buf_i64: [CHUNK_SIZE]i64 = undefined;
+                    n = frag.fragmentReadInt64(col.fragment_col_idx, @ptrCast(&buf_i64), chunk_len, read_start);
+                    for (0..n) |i| buf_f64[i] = @floatFromInt(buf_i64[i]);
+                },
+                .int32 => {
+                    var buf_i32: [CHUNK_SIZE]i32 = undefined;
+                    n = frag.fragmentReadInt32(col.fragment_col_idx, @ptrCast(&buf_i32), chunk_len, read_start);
+                    for (0..n) |i| buf_f64[i] = @floatFromInt(buf_i32[i]);
+                },
+                else => {},
+            }
+
+            // SIMD Aggregation on chunk
+            const ptr = @as([*]const f64, @ptrCast(&buf_f64));
+            switch (agg.func) {
+                .sum, .avg => {
+                    sum += aggregates.sumFloat64Buffer(ptr, n);
+                    total_count += @floatFromInt(n);
+                },
+                .min => {
+                    const chunk_min = aggregates.minFloat64Buffer(ptr, n);
+                    if (chunk_min < min_val) min_val = chunk_min;
+                },
+                .max => {
+                    const chunk_max = aggregates.maxFloat64Buffer(ptr, n);
+                    if (chunk_max > max_val) max_val = chunk_max;
+                },
+                .count => total_count += @floatFromInt(n),
+            }
+            
+            chunk_offset += @intCast(chunk_len);
+        }
+        
+        remaining -= to_read;
+        current_abs_idx += @intCast(to_read);
+        frag_start_row += f_rows;
+        frag_idx += 1;
+    }
+
+    return switch (agg.func) {
+        .sum => sum,
+        .avg => if (total_count > 0) sum / total_count else 0,
+        .min => min_val,
+        .max => max_val,
+        .count => total_count,
+    };
+}
+
 fn computeAggregate(table: *const TableInfo, agg: AggExpr, indices: []const u32) f64 {
+    if (agg.func == .count and (std.mem.eql(u8, agg.column, "*") or agg.column.len == 0)) {
+        return @floatFromInt(indices.len);
+    }
+
     // Find column
     var col: ?*const ColumnData = null;
     for (table.columns[0..table.column_count]) |maybe_col| {
@@ -1432,12 +1651,42 @@ fn computeAggregate(table: *const TableInfo, agg: AggExpr, indices: []const u32)
             }
         }
     }
+    const c = col orelse return 0;
 
-    if (agg.func == .count) {
-        return @floatFromInt(indices.len);
+    // Check if indices are contiguous
+    var is_contiguous = true;
+    if (indices.len > 0) {
+        const len = indices.len;
+        if (indices[0] != 0 or 
+            indices[len - 1] != @as(u32, @intCast(len - 1)) or
+            indices[len / 2] != @as(u32, @intCast(len / 2))) {
+            is_contiguous = false;
+        }
+    } else {
+        is_contiguous = false;
     }
 
-    const c = col orelse return 0;
+    // Optimized paths
+    if (is_contiguous) {
+        if (c.is_lazy) {
+            return computeLazyAggregate(table, c, agg, 0, indices.len);
+        } else if (c.col_type == .float64) {
+            // SIMD on memory buffer
+            const ptr = c.data.float64.ptr;
+            const len = indices.len; // Using indices length as we assume contiguous from 0
+            // Wait, is it guaranteed to be 0..len? Indices are just a list. 
+            // is_contiguous checks if it looks like 0, 1, 2... N-1.
+            // But we must ensure N <= row_count.
+            // If it is 0..len-1, we can use slice 0..len
+            return switch (agg.func) {
+                .sum => aggregates.sumFloat64Buffer(ptr, len),
+                .avg => aggregates.avgFloat64Buffer(ptr, len),
+                .min => aggregates.minFloat64Buffer(ptr, len),
+                .max => aggregates.maxFloat64Buffer(ptr, len),
+                .count => @floatFromInt(len),
+            };
+        }
+    }
 
     var sum: f64 = 0;
     var min_val: f64 = std.math.floatMax(f64);
@@ -3127,6 +3376,48 @@ fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
                 .op = if (is_not) .not_like else .like,
                 .column = column,
                 .value_str = pattern,
+            };
+        }
+    }
+
+    // Check for NEAR
+    if (startsWithIC(sql[pos.*..], "NEAR")) {
+        pos.* += 4;
+        pos.* = skipWs(sql, pos.*);
+        
+        // Parse vector literal [1.0, 2.0, ...]
+        if (pos.* < sql.len and sql[pos.*] == '[') {
+            pos.* += 1;
+            var vec: [MAX_VECTOR_DIM]f32 = undefined;
+            var dim: usize = 0;
+            
+            while (pos.* < sql.len and dim < MAX_VECTOR_DIM) {
+                pos.* = skipWs(sql, pos.*);
+                if (pos.* < sql.len and sql[pos.*] == ']') {
+                    pos.* += 1;
+                    break;
+                }
+                
+                // Parse float
+                const num_start = pos.*;
+                if (sql[pos.*] == '-') pos.* += 1;
+                while (pos.* < sql.len and (std.ascii.isDigit(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+                if (pos.* > num_start) {
+                    if (std.fmt.parseFloat(f32, sql[num_start..pos.*])) |v| {
+                        vec[dim] = v;
+                        dim += 1;
+                    } else |_| {}
+                }
+                
+                pos.* = skipWs(sql, pos.*);
+                if (pos.* < sql.len and sql[pos.*] == ',') pos.* += 1;
+            }
+            
+            return WhereClause{
+                .op = .near,
+                .column = column,
+                .near_vector = vec,
+                .near_dim = dim,
             };
         }
     }

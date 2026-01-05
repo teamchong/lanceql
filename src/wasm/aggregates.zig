@@ -108,7 +108,7 @@ export fn avgFloat64Column(col_idx: u32) f64 {
 const Vec4f64 = @Vector(4, f64);
 
 /// Sum float64 buffer with SIMD acceleration
-export fn sumFloat64Buffer(ptr: [*]const f64, len: usize) f64 {
+pub export fn sumFloat64Buffer(ptr: [*]const f64, len: usize) f64 {
     if (len == 0) return 0;
 
     var sum: Vec4f64 = @splat(0);
@@ -132,7 +132,7 @@ export fn sumFloat64Buffer(ptr: [*]const f64, len: usize) f64 {
 }
 
 /// Min float64 buffer with SIMD acceleration
-export fn minFloat64Buffer(ptr: [*]const f64, len: usize) f64 {
+pub export fn minFloat64Buffer(ptr: [*]const f64, len: usize) f64 {
     if (len == 0) return 0;
 
     var min_vec: Vec4f64 = @splat(ptr[0]);
@@ -156,7 +156,7 @@ export fn minFloat64Buffer(ptr: [*]const f64, len: usize) f64 {
 }
 
 /// Max float64 buffer with SIMD acceleration
-export fn maxFloat64Buffer(ptr: [*]const f64, len: usize) f64 {
+pub export fn maxFloat64Buffer(ptr: [*]const f64, len: usize) f64 {
     if (len == 0) return 0;
 
     var max_vec: Vec4f64 = @splat(ptr[0]);
@@ -180,7 +180,7 @@ export fn maxFloat64Buffer(ptr: [*]const f64, len: usize) f64 {
 }
 
 /// Average float64 buffer
-export fn avgFloat64Buffer(ptr: [*]const f64, len: usize) f64 {
+pub export fn avgFloat64Buffer(ptr: [*]const f64, len: usize) f64 {
     if (len == 0) return 0;
     return sumFloat64Buffer(ptr, len) / @as(f64, @floatFromInt(len));
 }

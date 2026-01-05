@@ -123,6 +123,43 @@ pub const FragmentReader = struct {
         return count;
     }
 
+    pub fn fragmentReadStringAt(self: *const FragmentReader, col_idx: u32, row_idx: u32, out_ptr: [*]u8, max_len: usize) usize {
+        if (col_idx >= self.num_columns) return 0;
+        const data = self.data orelse return 0;
+        const info = &self.columns[col_idx];
+
+        if (row_idx >= info.row_count) return 0;
+
+        const offsets_size: usize = @intCast((info.row_count + 1) * 4);
+        const offsets_start: usize = @intCast(info.data_offset + info.data_size - offsets_size);
+        const data_start: usize = @intCast(info.data_offset);
+
+        const start_offset = std.mem.readInt(u32, data[offsets_start + row_idx * 4 ..][0..4], .little);
+        const end_offset = std.mem.readInt(u32, data[offsets_start + (row_idx + 1) * 4 ..][0..4], .little);
+
+        const str_len = end_offset - start_offset;
+        const copy_len = @min(str_len, max_len);
+
+        @memcpy(out_ptr[0..copy_len], data[data_start + start_offset ..][0..copy_len]);
+        return copy_len;
+    }
+
+    pub fn fragmentGetStringLength(self: *const FragmentReader, col_idx: u32, row_idx: u32) usize {
+        if (col_idx >= self.num_columns) return 0;
+        const data = self.data orelse return 0;
+        const info = &self.columns[col_idx];
+
+        if (row_idx >= info.row_count) return 0;
+
+        const offsets_size: usize = @intCast((info.row_count + 1) * 4);
+        const offsets_start: usize = @intCast(info.data_offset + info.data_size - offsets_size);
+
+        const start_offset = std.mem.readInt(u32, data[offsets_start + row_idx * 4 ..][0..4], .little);
+        const end_offset = std.mem.readInt(u32, data[offsets_start + (row_idx + 1) * 4 ..][0..4], .little);
+
+        return end_offset - start_offset;
+    }
+
     pub fn fragmentReadFloat64(self: *const FragmentReader, col_idx: u32, out_ptr: [*]f64, max_count: usize, start_row: u32) usize {
         if (col_idx >= self.num_columns) return 0;
         const data = self.data orelse return 0;
@@ -171,6 +208,31 @@ pub const FragmentReader = struct {
             out_ptr[i] = @bitCast(bits);
         }
         return count;
+    }
+
+    pub fn fragmentGetColumnVectorDim(self: *const FragmentReader, col_idx: u32) u32 {
+        if (col_idx >= self.num_columns) return 0;
+        return self.columns[col_idx].vector_dim;
+    }
+
+    pub fn fragmentReadVectorAt(self: *const FragmentReader, col_idx: u32, row_idx: u32, out_ptr: [*]f32, max_floats: usize) usize {
+        if (col_idx >= self.num_columns) return 0;
+        const data = self.data orelse return 0;
+        const info = &self.columns[col_idx];
+
+        if (row_idx >= info.row_count) return 0;
+        if (info.vector_dim == 0) return 0;
+
+        const dim = info.vector_dim;
+        const copy_count: usize = @min(dim, max_floats);
+        const base_offset: usize = @intCast(info.data_offset + row_idx * dim * 4);
+
+        var i: usize = 0;
+        while (i < copy_count) : (i += 1) {
+            const bits = std.mem.readInt(u32, data[base_offset + i * 4 ..][0..4], .little);
+            out_ptr[i] = @bitCast(bits);
+        }
+        return copy_count;
     }
 };
 
