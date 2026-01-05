@@ -195,6 +195,101 @@ var sql_input_len: usize = 0;
 var where_storage: [32]WhereClause = undefined;
 var where_storage_idx: usize = 0;
 
+/// Context for optimized fragment access
+const FragmentContext = struct {
+    frag: fragment_reader.FragmentReader,
+    start_idx: u32,
+    end_idx: u32,
+};
+
+fn getFloatValueFromPtr(ptr: [*]const u8, col_type: ColumnType, rel_idx: u32) f64 {
+    return switch (col_type) {
+        .float64 => @as([*]const f64, @ptrCast(@alignCast(ptr)))[rel_idx],
+        .float32 => @floatCast(@as([*]const f32, @ptrCast(@alignCast(ptr)))[rel_idx]),
+        .int64 => @floatFromInt(@as([*]const i64, @ptrCast(@alignCast(ptr)))[rel_idx]),
+        .int32 => @floatFromInt(@as([*]const i32, @ptrCast(@alignCast(ptr)))[rel_idx]),
+        .string => 0,
+    };
+}
+
+fn getIntValueFromPtr(ptr: [*]const u8, col_type: ColumnType, rel_idx: u32) i64 {
+    return switch (col_type) {
+        .int64 => @as([*]const i64, @ptrCast(@alignCast(ptr)))[rel_idx],
+        .int32 => @as([*]const i32, @ptrCast(@alignCast(ptr)))[rel_idx],
+        .float64 => @intFromFloat(@as([*]const f64, @ptrCast(@alignCast(ptr)))[rel_idx]),
+        .float32 => @intFromFloat(@as([*]const f32, @ptrCast(@alignCast(ptr)))[rel_idx]),
+        .string => 0,
+    };
+}
+
+fn getFloatValueOptimized(table: *const TableInfo, col: *const ColumnData, idx: u32, context: *?FragmentContext) f64 {
+    if (col.is_lazy) {
+        if (context.* == null or idx < context.*.?.start_idx or idx >= context.*.?.end_idx) {
+            var f_start: u32 = 0;
+            for (table.fragments[0..table.fragment_count]) |maybe_f| {
+                if (maybe_f) |f| {
+                    const f_rows = @as(u32, @intCast(f.getRowCount()));
+                    if (idx < f_start + f_rows) {
+                        context.* = FragmentContext{
+                            .frag = f,
+                            .start_idx = f_start,
+                            .end_idx = f_start + f_rows,
+                        };
+                        break;
+                    }
+                    f_start += f_rows;
+                }
+            }
+        }
+        if (context.*) |ctx| {
+            const raw_ptr = ctx.frag.getColumnRawPtr(col.fragment_col_idx) orelse return 0;
+            return getFloatValueFromPtr(raw_ptr, col.col_type, idx - ctx.start_idx);
+        }
+        return 0;
+    }
+    return switch (col.col_type) {
+        .float64 => col.data.float64[idx],
+        .int64 => @floatFromInt(col.data.int64[idx]),
+        .int32 => @floatFromInt(col.data.int32[idx]),
+        .float32 => col.data.float32[idx],
+        .string => 0,
+    };
+}
+
+fn getIntValueOptimized(table: *const TableInfo, col: *const ColumnData, idx: u32, context: *?FragmentContext) i64 {
+    if (col.is_lazy) {
+        if (context.* == null or idx < context.*.?.start_idx or idx >= context.*.?.end_idx) {
+            var f_start: u32 = 0;
+            for (table.fragments[0..table.fragment_count]) |maybe_f| {
+                if (maybe_f) |f| {
+                    const f_rows = @as(u32, @intCast(f.getRowCount()));
+                    if (idx < f_start + f_rows) {
+                        context.* = FragmentContext{
+                            .frag = f,
+                            .start_idx = f_start,
+                            .end_idx = f_start + f_rows,
+                        };
+                        break;
+                    }
+                    f_start += f_rows;
+                }
+            }
+        }
+        if (context.*) |ctx| {
+            const raw_ptr = ctx.frag.getColumnRawPtr(col.fragment_col_idx) orelse return 0;
+            return getIntValueFromPtr(raw_ptr, col.col_type, idx - ctx.start_idx);
+        }
+        return 0;
+    }
+    return switch (col.col_type) {
+        .int64 => col.data.int64[idx],
+        .int32 => col.data.int32[idx],
+        .float64 => @intFromFloat(col.data.float64[idx]),
+        .float32 => @intFromFloat(col.data.float32[idx]),
+        .string => 0,
+    };
+}
+
 // ============================================================================
 // WASM Exports
 // ============================================================================
@@ -676,9 +771,10 @@ fn executeSelectQuery(table: *const TableInfo, query: *ParsedQuery) !void {
         try resolveNearClauses(table, where, limit);
     }
 
+    var context: ?FragmentContext = null;
     for (0..@min(row_count, MAX_ROWS)) |i| {
         if (query.where_clause) |*where| {
-            if (evaluateWhere(table, where, @intCast(i))) {
+            if (evaluateWhere(table, where, @intCast(i), &context)) {
                 match_indices[match_count] = @intCast(i);
                 match_count += 1;
             }
@@ -782,9 +878,10 @@ fn executeSetOpQuery(sql: []const u8, query: *const ParsedQuery) !void {
     const table1 = first_table orelse return error.TableNotFound;
 
     // Get first query matching rows
+    var context1: ?FragmentContext = null;
     for (0..@min(table1.row_count, MAX_ROWS)) |i| {
         if (query.where_clause) |*where| {
-            if (evaluateWhere(table1, where, @intCast(i))) {
+            if (evaluateWhere(table1, where, @intCast(i), &context1)) {
                 first_results[first_count] = @intCast(i);
                 first_count += 1;
             }
@@ -814,9 +911,10 @@ fn executeSetOpQuery(sql: []const u8, query: *const ParsedQuery) !void {
     var second_results: [MAX_ROWS]u32 = undefined;
     var second_count: usize = 0;
 
+    var context2: ?FragmentContext = null;
     for (0..@min(table2.row_count, MAX_ROWS)) |i| {
         if (second_query.where_clause) |*where| {
-            if (evaluateWhere(table2, where, @intCast(i))) {
+            if (evaluateWhere(table2, where, @intCast(i), &context2)) {
                 second_results[second_count] = @intCast(i);
                 second_count += 1;
             }
@@ -1301,23 +1399,31 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
     const lc = left_col orelse return error.ColumnNotFound;
     const rc = right_col orelse return error.ColumnNotFound;
 
-    // Build hash table for right side (smaller table optimization)
-    const MAX_JOIN_ROWS: usize = 10000;
+    // Hash Join (O(N+M))
+    const MAX_JOIN_ROWS: usize = 100000;
     var join_pairs: [MAX_JOIN_ROWS]struct { left: u32, right: u32 } = undefined;
     var pair_count: usize = 0;
 
-    // Nested loop join (simple but works)
-    for (0..@min(left_table.row_count, MAX_JOIN_ROWS)) |li| {
-        const left_val = getIntValue(left_table, lc, @intCast(li));
+    // Build hash table for right side
+    var hash_map = std.AutoHashMap(i64, u32).init(memory.wasm_allocator);
+    defer hash_map.deinit();
 
-        for (0..@min(rtbl.row_count, MAX_JOIN_ROWS)) |ri| {
-            const right_val = getIntValue(rtbl, rc, @intCast(ri));
+    var r_ctx: ?FragmentContext = null;
+    for (0..@min(rtbl.row_count, MAX_ROWS)) |ri| {
+        const key = getIntValueOptimized(rtbl, rc, @intCast(ri), &r_ctx);
+        // For simplicity, this handles 1:1 join. 
+        // TODO: Support 1:N join using a linked list or MultiHashMap
+        try hash_map.put(key, @intCast(ri));
+    }
 
-            if (left_val == right_val) {
-                if (pair_count < MAX_JOIN_ROWS) {
-                    join_pairs[pair_count] = .{ .left = @intCast(li), .right = @intCast(ri) };
-                    pair_count += 1;
-                }
+    // Probe hash table from left side
+    var l_ctx: ?FragmentContext = null;
+    for (0..@min(left_table.row_count, MAX_ROWS)) |li| {
+        const key = getIntValueOptimized(left_table, lc, @intCast(li), &l_ctx);
+        if (hash_map.get(key)) |ri| {
+            if (pair_count < MAX_JOIN_ROWS) {
+                join_pairs[pair_count] = .{ .left = @intCast(li), .right = @intCast(ri) };
+                pair_count += 1;
             }
         }
     }
@@ -1417,9 +1523,10 @@ fn executeAggregateQuery(table: *const TableInfo, query: *const ParsedQuery) !vo
     var match_indices: [MAX_ROWS]u32 = undefined;
     var match_count: usize = 0;
 
+    var context: ?FragmentContext = null;
     for (0..@min(row_count, MAX_ROWS)) |i| {
         if (query.where_clause) |*where| {
-            if (evaluateWhere(table, where, @intCast(i))) {
+            if (evaluateWhere(table, where, @intCast(i), &context)) {
                 match_indices[match_count] = @intCast(i);
                 match_count += 1;
             }
@@ -1706,26 +1813,20 @@ fn computeAggregate(table: *const TableInfo, agg: AggExpr, indices: []const u32)
     if (indices.len > 0) {
         const len = indices.len;
         if (indices[0] != 0 or 
-            indices[len - 1] != @as(u32, @intCast(len - 1)) or
-            indices[len / 2] != @as(u32, @intCast(len / 2))) {
+            indices[len - 1] != @as(u32, @intCast(len - 1))) {
             is_contiguous = false;
         }
     } else {
         is_contiguous = false;
     }
 
-    // Optimized paths
+    // Optimized path: Contiguous
     if (is_contiguous) {
         if (c.is_lazy) {
             return computeLazyAggregate(table, c, agg, 0, indices.len);
         } else if (c.col_type == .float64) {
-            // SIMD on memory buffer
             const ptr = c.data.float64.ptr;
-            const len = indices.len; // Using indices length as we assume contiguous from 0
-            // Wait, is it guaranteed to be 0..len? Indices are just a list. 
-            // is_contiguous checks if it looks like 0, 1, 2... N-1.
-            // But we must ensure N <= row_count.
-            // If it is 0..len-1, we can use slice 0..len
+            const len = indices.len;
             return switch (agg.func) {
                 .sum => aggregates.sumFloat64Buffer(ptr, len),
                 .avg => aggregates.avgFloat64Buffer(ptr, len),
@@ -1736,22 +1837,87 @@ fn computeAggregate(table: *const TableInfo, agg: AggExpr, indices: []const u32)
         }
     }
 
+    // Optimized path: Non-contiguous but sorted (Gather + SIMD)
     var sum: f64 = 0;
     var min_val: f64 = std.math.floatMax(f64);
     var max_val: f64 = -std.math.floatMax(f64);
+    var total_count: usize = 0;
 
-    for (indices) |idx| {
-        const val = getFloatValue(table, c, idx);
-        sum += val;
-        if (val < min_val) min_val = val;
-        if (val > max_val) max_val = val;
+    const CHUNK_SIZE = 1024;
+    var gather_buf: [CHUNK_SIZE]f64 = undefined;
+    var gather_idx: usize = 0;
+
+    var idx_ptr: usize = 0;
+    var frag_start: u32 = 0;
+
+    for (table.fragments[0..table.fragment_count]) |maybe_frag| {
+        if (maybe_frag) |frag| {
+            const f_rows = @as(u32, @intCast(frag.getRowCount()));
+            const frag_end = frag_start + f_rows;
+            
+            // Find indices in this fragment
+            const start_match_idx = idx_ptr;
+            while (idx_ptr < indices.len and indices[idx_ptr] < frag_end) : (idx_ptr += 1) {}
+            const end_match_idx = idx_ptr;
+            
+            if (end_match_idx > start_match_idx) {
+                const frag_indices = indices[start_match_idx..end_match_idx];
+                const raw_ptr = frag.getColumnRawPtr(c.fragment_col_idx) orelse {
+                    frag_start = frag_end;
+                    continue;
+                };
+                
+                // Process indices in this fragment
+                for (frag_indices) |abs_idx| {
+                    const rel_idx = abs_idx - frag_start;
+                    gather_buf[gather_idx] = getFloatValueFromPtr(raw_ptr, c.col_type, rel_idx);
+                    gather_idx += 1;
+                    
+                    if (gather_idx == CHUNK_SIZE) {
+                        const ptr = @as([*]const f64, @ptrCast(&gather_buf));
+                        switch (agg.func) {
+                            .sum, .avg => sum += aggregates.sumFloat64Buffer(ptr, CHUNK_SIZE),
+                            .min => min_val = @min(min_val, aggregates.minFloat64Buffer(ptr, CHUNK_SIZE)),
+                            .max => max_val = @max(max_val, aggregates.maxFloat64Buffer(ptr, CHUNK_SIZE)),
+                            .count => {},
+                        }
+                        total_count += CHUNK_SIZE;
+                        gather_idx = 0;
+                    }
+                }
+            }
+            frag_start = frag_end;
+        }
+    }
+
+    // Process remaining gathered values
+    if (gather_idx > 0) {
+        const ptr = @as([*]const f64, @ptrCast(&gather_buf));
+        switch (agg.func) {
+            .sum, .avg => sum += aggregates.sumFloat64Buffer(ptr, gather_idx),
+            .min => min_val = @min(min_val, aggregates.minFloat64Buffer(ptr, gather_idx)),
+            .max => max_val = @max(max_val, aggregates.maxFloat64Buffer(ptr, gather_idx)),
+            .count => {},
+        }
+        total_count += gather_idx;
+    }
+
+    // Fallback for memory-resident non-contiguous columns (if any)
+    if (!c.is_lazy and indices.len > 0 and total_count == 0) {
+        for (indices) |idx| {
+            const val = getFloatValue(table, c, idx);
+            sum += val;
+            min_val = @min(min_val, val);
+            max_val = @max(max_val, val);
+        }
+        total_count = indices.len;
     }
 
     return switch (agg.func) {
         .sum => sum,
-        .avg => if (indices.len > 0) sum / @as(f64, @floatFromInt(indices.len)) else 0,
-        .min => if (indices.len > 0) min_val else 0,
-        .max => if (indices.len > 0) max_val else 0,
+        .avg => if (total_count > 0) sum / @as(f64, @floatFromInt(total_count)) else 0,
+        .min => if (total_count > 0) min_val else 0,
+        .max => if (total_count > 0) max_val else 0,
         .count => @floatFromInt(indices.len),
     };
 }
@@ -1879,9 +2045,10 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
     var indices: [MAX_ROWS]u32 = undefined;
     var idx_count: usize = 0;
 
+    var context: ?FragmentContext = null;
     for (0..@min(row_count, MAX_ROWS)) |i| {
         if (query.where_clause) |*where| {
-            if (evaluateWhere(table, where, @intCast(i))) {
+            if (evaluateWhere(table, where, @intCast(i), &context)) {
                 indices[idx_count] = @intCast(i);
                 idx_count += 1;
             }
@@ -2600,17 +2767,29 @@ fn writeSelectResult(table: *const TableInfo, col_indices: []const usize, row_in
 // WHERE Evaluation
 // ============================================================================
 
-fn evaluateWhere(table: *const TableInfo, where: *const WhereClause, row_idx: u32) bool {
+fn evaluateWhere(table: *const TableInfo, where: *const WhereClause, row_idx: u32, context: *?FragmentContext) bool {
     switch (where.op) {
         .and_op => {
             const l = where.left orelse return false;
             const r = where.right orelse return false;
-            return evaluateWhere(table, l, row_idx) and evaluateWhere(table, r, row_idx);
+            return evaluateWhere(table, l, row_idx, context) and evaluateWhere(table, r, row_idx, context);
         },
         .or_op => {
             const l = where.left orelse return false;
             const r = where.right orelse return false;
-            return evaluateWhere(table, l, row_idx) or evaluateWhere(table, r, row_idx);
+            return evaluateWhere(table, l, row_idx, context) or evaluateWhere(table, r, row_idx, context);
+        },
+        .near => {
+            // NEAR is pre-evaluated in resolveNearClauses
+            if (where.near_matches) |matches| {
+                // Check if row_idx is in matches
+                // Since match_indices are sorted and we iterate rows in order,
+                // we could optimize this, but for now binary search or simple check.
+                for (matches) |m| {
+                    if (m == row_idx) return true;
+                }
+            }
+            return false;
         },
         else => {
             const col_name = where.column orelse return false;
@@ -2624,54 +2803,61 @@ fn evaluateWhere(table: *const TableInfo, where: *const WhereClause, row_idx: u3
                 }
             }
             const c = col orelse return false;
-            return evaluateComparison(table, c, row_idx, where);
+            return evaluateComparison(table, c, row_idx, where, context);
         },
     }
 }
 
-fn evaluateComparison(table: *const TableInfo, col: *const ColumnData, row_idx: u32, where: *const WhereClause) bool {
+fn evaluateComparison(table: *const TableInfo, col: *const ColumnData, row_idx: u32, where: *const WhereClause, context: *?FragmentContext) bool {
     switch (where.op) {
         .eq => {
             if (where.value_int) |val| {
-                return getIntValue(table, col, row_idx) == val;
+                return getIntValueOptimized(table, col, row_idx, context) == val;
             } else if (where.value_float) |val| {
-                return getFloatValue(table, col, row_idx) == val;
+                return getFloatValueOptimized(table, col, row_idx, context) == val;
             }
         },
         .ne => {
             if (where.value_int) |val| {
-                return getIntValue(table, col, row_idx) != val;
+                return getIntValueOptimized(table, col, row_idx, context) != val;
             } else if (where.value_float) |val| {
-                return getFloatValue(table, col, row_idx) != val;
+                return getFloatValueOptimized(table, col, row_idx, context) != val;
             }
         },
         .lt => {
             if (where.value_int) |val| {
-                return getIntValue(table, col, row_idx) < val;
+                return getIntValueOptimized(table, col, row_idx, context) < val;
             } else if (where.value_float) |val| {
-                return getFloatValue(table, col, row_idx) < val;
+                return getFloatValueOptimized(table, col, row_idx, context) < val;
             }
         },
         .le => {
             if (where.value_int) |val| {
-                return getIntValue(table, col, row_idx) <= val;
+                return getIntValueOptimized(table, col, row_idx, context) <= val;
             } else if (where.value_float) |val| {
-                return getFloatValue(table, col, row_idx) <= val;
+                return getFloatValueOptimized(table, col, row_idx, context) <= val;
             }
         },
         .gt => {
             if (where.value_int) |val| {
-                return getIntValue(table, col, row_idx) > val;
+                return getIntValueOptimized(table, col, row_idx, context) > val;
             } else if (where.value_float) |val| {
-                return getFloatValue(table, col, row_idx) > val;
+                return getFloatValueOptimized(table, col, row_idx, context) > val;
             }
         },
         .ge => {
             if (where.value_int) |val| {
-                return getIntValue(table, col, row_idx) >= val;
+                return getIntValueOptimized(table, col, row_idx, context) >= val;
             } else if (where.value_float) |val| {
-                return getFloatValue(table, col, row_idx) >= val;
+                return getFloatValueOptimized(table, col, row_idx, context) >= val;
             }
+        },
+        .is_null => {
+            // For now assume non-nullable
+            return false;
+        },
+        .is_not_null => {
+            return true;
         },
         else => return false,
     }

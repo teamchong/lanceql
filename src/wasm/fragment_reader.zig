@@ -107,6 +107,13 @@ pub const FragmentReader = struct {
         return copy_len;
     }
 
+    pub fn getColumnRawPtr(self: *const FragmentReader, col_idx: u32) ?[*]const u8 {
+        if (col_idx >= self.num_columns) return null;
+        const data = self.data orelse return null;
+        const info = &self.columns[col_idx];
+        return data + @as(usize, @intCast(info.data_offset));
+    }
+
     pub fn fragmentReadInt64(self: *const FragmentReader, col_idx: u32, out_ptr: [*]i64, max_count: usize, start_row: u32) usize {
         if (col_idx >= self.num_columns) return 0;
         const data = self.data orelse return 0;

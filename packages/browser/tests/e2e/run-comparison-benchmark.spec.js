@@ -4,6 +4,30 @@
  */
 
 import { test, expect } from '@playwright/test';
+import fs from 'fs';
+import path from 'path';
+
+function saveResults(rowCount, results) {
+    if (process.env.CI) {
+        try {
+            const resultsPath = path.join(process.cwd(), 'benchmark-results.json');
+            let allResults = [];
+            if (fs.existsSync(resultsPath)) {
+                allResults = JSON.parse(fs.readFileSync(resultsPath, 'utf8'));
+            }
+            allResults.push({ 
+                rowCount, 
+                timestamp: new Date().toISOString(), 
+                commit: process.env.GITHUB_SHA || 'local',
+                results 
+            });
+            fs.writeFileSync(resultsPath, JSON.stringify(allResults, null, 2));
+            console.log(`Saved benchmark results to ${resultsPath}`);
+        } catch (e) {
+            console.error('Failed to save benchmark results:', e);
+        }
+    }
+}
 
 async function runBenchmark(page, rowCount) {
     // Use minimal HTML page just to load JS
@@ -148,17 +172,20 @@ async function runBenchmark(page, rowCount) {
 test('LanceQL vs DuckDB benchmark 1K', async ({ page }) => {
     test.setTimeout(300000);
     const results = await runBenchmark(page, 1000);
+    saveResults(1000, results);
     expect(results.length).toBeGreaterThan(0);
 });
 
 test('LanceQL vs DuckDB benchmark 10K', async ({ page }) => {
     test.setTimeout(300000);
     const results = await runBenchmark(page, 10000);
+    saveResults(10000, results);
     expect(results.length).toBeGreaterThan(0);
 });
 
 test('LanceQL vs DuckDB benchmark 100K', async ({ page }) => {
     test.setTimeout(600000);
     const results = await runBenchmark(page, 100000);
+    saveResults(100000, results);
     expect(results.length).toBeGreaterThan(0);
 });

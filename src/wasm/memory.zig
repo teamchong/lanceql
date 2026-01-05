@@ -9,8 +9,35 @@ const std = @import("std");
 // Bump Allocator
 // ============================================================================
 
-var heap: [1024 * 1024]u8 = undefined; // 1MB heap
+var heap: [64 * 1024 * 1024]u8 = undefined; // 64MB heap
 var heap_offset: usize = 0;
+
+/// WASM Allocator interface
+pub const wasm_allocator = std.mem.Allocator{
+    .ptr = undefined,
+    .vtable = &.{
+        .alloc = allocWrapper,
+        .resize = resizeWrapper,
+        .remap = remapWrapper,
+        .free = freeWrapper,
+    },
+};
+
+fn allocWrapper(_: *anyopaque, len: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+    return wasmAlloc(len);
+}
+
+fn resizeWrapper(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+    return false; // Bump allocator doesn't support resize
+}
+
+fn remapWrapper(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+    return null; // Bump allocator doesn't support remap
+}
+
+fn freeWrapper(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize) void {
+    // Bump allocator doesn't support individual frees
+}
 
 /// Allocate memory from the bump allocator (8-byte aligned)
 pub fn wasmAlloc(len: usize) ?[*]u8 {
