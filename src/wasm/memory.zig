@@ -1,74 +1,33 @@
-//! WASM Memory Management
-//!
-//! Simple bump allocator for WASM environment.
-//! No std.heap.wasm_allocator dependency for minimal binary size.
-
 const std = @import("std");
 
-// ============================================================================
-// Bump Allocator
-// ============================================================================
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub const wasm_allocator = gpa.allocator();
 
-var heap: [64 * 1024 * 1024]u8 = undefined; // 64MB heap
-var heap_offset: usize = 0;
-
-/// WASM Allocator interface
-pub const wasm_allocator = std.mem.Allocator{
-    .ptr = undefined,
-    .vtable = &.{
-        .alloc = allocWrapper,
-        .resize = resizeWrapper,
-        .remap = remapWrapper,
-        .free = freeWrapper,
-    },
-};
-
-fn allocWrapper(_: *anyopaque, len: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
-    return wasmAlloc(len);
-}
-
-fn resizeWrapper(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
-    return false; // Bump allocator doesn't support resize
-}
-
-fn remapWrapper(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
-    return null; // Bump allocator doesn't support remap
-}
-
-fn freeWrapper(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize) void {
-    // Bump allocator doesn't support individual frees
-}
-
-/// Allocate memory from the bump allocator (8-byte aligned)
+/// Allocate memory (8-byte aligned)
 pub fn wasmAlloc(len: usize) ?[*]u8 {
-    // Get current address and align it to 8 bytes
-    const heap_base = @intFromPtr(&heap[0]);
-    const current_addr = heap_base + heap_offset;
-    const aligned_addr = (current_addr + 7) & ~@as(usize, 7);
-    const padding = aligned_addr - current_addr;
-
-    heap_offset += padding;
-
-    const aligned_len = (len + 7) & ~@as(usize, 7); // 8-byte align length too
-    if (heap_offset + aligned_len > heap.len) return null;
-    const ptr: [*]u8 = @ptrCast(&heap[heap_offset]);
-    heap_offset += aligned_len;
-    return ptr;
+    const slice = wasm_allocator.alloc(u8, len) catch return null;
+    return slice.ptr;
 }
 
-/// Reset the bump allocator (free all memory)
+/// No-op as GPA doesn't support global reset, but we shouldn't need it if we free
 pub fn wasmReset() void {
-    heap_offset = 0;
+    // This was used for the bump allocator. 
+    // Now we rely on individual frees.
 }
 
-/// Get current heap usage
+/// Free memory (exported to JavaScript)
+pub export fn free(ptr: [*]u8, len: usize) void {
+    wasm_allocator.free(ptr[0..len]);
+}
+
+/// Get current heap usage (dummy as GPA doesn't track this easily)
 pub fn getHeapUsage() usize {
-    return heap_offset;
+    return 0;
 }
 
-/// Get total heap capacity
+/// Get total heap capacity (dummy)
 pub fn getHeapCapacity() usize {
-    return heap.len;
+    return 64 * 1024 * 1024;
 }
 
 // ============================================================================
@@ -78,13 +37,6 @@ pub fn getHeapCapacity() usize {
 /// Allocate memory (exported to JavaScript)
 pub export fn alloc(len: usize) ?[*]u8 {
     return wasmAlloc(len);
-}
-
-/// Free memory (no-op for bump allocator)
-pub export fn free(ptr: [*]u8, len: usize) void {
-    _ = ptr;
-    _ = len;
-    // Bump allocator doesn't support individual frees
 }
 
 // ============================================================================

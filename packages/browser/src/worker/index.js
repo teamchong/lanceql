@@ -15,8 +15,7 @@ import { WorkerDatabase } from './worker-database.js';
 import { WorkerVault } from './worker-vault.js';
 
 import { BufferPool } from './buffer-pool.js';
-import { executeSQL, evalWhere } from './sql/executor.js';
-import { getWasmSqlExecutor, shouldUseWasmSql } from './wasm-sql-bridge.js';
+import { getWasmSqlExecutor } from './wasm-sql-bridge.js';
 import { E } from './data-types.js';
 
 // ============================================================================
@@ -39,11 +38,19 @@ async function executeWasmSqlFull(db, sql) {
     const executor = getWasmSqlExecutor();
 
     // Extract all table names from SQL (FROM, JOIN, WITH clauses)
-    const tableNames = extractTableNames(sql);
+    const tableNames = executor.getTableNames(sql);
+    console.log(`[LanceQLWorker] executeWasmSqlFull: ${sql} -> tables: ${tableNames.join(',')}`);
+
+    // Register all tables with the executor
 
     // Register all tables with the executor
     // Reworked Logic Body
     for (const tableName of tableNames) {
+        // If table already exists in WASM (e.g. created via Zig DDL), don't overwrite it with stale DB data
+        const exists = executor.hasTable(tableName);
+        console.log(`[LanceQLWorker] Check hasTable '${tableName}': ${exists}`);
+        if (exists) continue;
+
         const table = db.tables.get(tableName);
         if (!table) continue;
 
@@ -88,35 +95,6 @@ async function executeWasmSqlFull(db, sql) {
     return executor.execute(sql);
 }
 
-/**
- * Extract all table names referenced in SQL query
- */
-function extractTableNames(sql) {
-    const names = new Set();
-    const upper = sql.toUpperCase();
-
-    // Match FROM tableName
-    const fromMatches = sql.matchAll(/FROM\s+(\w+)/gi);
-    for (const m of fromMatches) names.add(m[1].toLowerCase());
-
-    // Match JOIN tableName
-    const joinMatches = sql.matchAll(/JOIN\s+(\w+)/gi);
-    for (const m of joinMatches) names.add(m[1].toLowerCase());
-
-    // Match UPDATE tableName
-    const updateMatch = sql.match(/UPDATE\s+(\w+)/i);
-    if (updateMatch) names.add(updateMatch[1].toLowerCase());
-
-    // Match INSERT INTO tableName
-    const insertMatch = sql.match(/INSERT\s+INTO\s+(\w+)/i);
-    if (insertMatch) names.add(insertMatch[1].toLowerCase());
-
-    // Match DELETE FROM tableName
-    const deleteMatch = sql.match(/DELETE\s+FROM\s+(\w+)/i);
-    if (deleteMatch) names.add(deleteMatch[1].toLowerCase());
-
-    return Array.from(names);
-}
 
 // ============================================================================
 // WASM Module (Zig SIMD aggregations with direct OPFS access)
@@ -715,23 +693,13 @@ async function handleMessage(port, data) {
             const db = await getDatabase(args.db);
 
             // Try WASM SQL executor first for SELECT queries on large tables
-            const tableNames = extractTableNames(args.sql);
+            const executor = getWasmSqlExecutor();
+            const tableNames = executor.getTableNames(args.sql);
             const primaryTable = tableNames[0] ? db.tables.get(tableNames[0]) : null;
             const rowCount = primaryTable ? primaryTable.rowCount : 0;
 
-            console.log(`[LanceQLWorker] Query: "${args.sql}", rowCount: ${rowCount}, useWasm: ${shouldUseWasmSql(args.sql, rowCount)}`);
-            if (shouldUseWasmSql(args.sql, rowCount)) {
-                try {
-                    console.log('[LanceQLWorker] Attempting WASM SQL execution...');
-                    result = await executeWasmSqlFull(db, args.sql);
-                    console.log('[LanceQLWorker] WASM SQL execution successful');
-                } catch (e) {
-                    console.warn('[LanceQLWorker] WASM SQL failed, falling back to JS:', e.stack || e.message);
-                    result = await executeSQL(db, args.sql);
-                }
-            } else {
-                result = await executeSQL(db, args.sql);
-            }
+            // Always use WASM SQL executor (including DDL/DML)
+            result = await executeWasmSqlFull(db, args.sql);
 
             // For large results (>= 100k rows), use lazy transfer - store data in worker, return handle
             // This avoids blocking the main thread with massive message deserialization
@@ -788,20 +756,13 @@ async function handleMessage(port, data) {
             const vault = await getVault();
 
             // Try WASM SQL executor first for SELECT queries on large tables
-            const tableNames = extractTableNames(args.sql);
+            const executor = getWasmSqlExecutor();
+            const tableNames = executor.getTableNames(args.sql);
             const primaryTable = tableNames[0] ? vault._db.tables.get(tableNames[0]) : null;
             const rowCount = primaryTable ? primaryTable.rowCount : 0;
 
-            if (shouldUseWasmSql(args.sql, rowCount)) {
-                try {
-                    result = await executeWasmSqlFull(vault._db, args.sql);
-                } catch (e) {
-                    console.warn('[LanceQLWorker] Vault WASM SQL failed, falling back to JS:', e.message);
-                    result = await vault.exec(args.sql);
-                }
-            } else {
-                result = await vault.exec(args.sql);
-            }
+            // Always use WASM SQL executor (including DDL/DML)
+            result = await executeWasmSqlFull(vault._db, args.sql);
 
             // For large results (>= 100k rows), use lazy transfer
             if (result && result._format === 'columnar' && result.rowCount >= 100000) {

@@ -9,8 +9,6 @@
  */
 
 import { getWasm, getWasmMemory } from './index.js';
-import { SQLParser } from './sql/parser.js';
-import { SQLLexer } from './sql/tokenizer.js';
 
 // Result buffer format constants (must match sql_executor.zig)
 const RESULT_VERSION = 1;
@@ -32,6 +30,53 @@ const ColumnType = {
 export class WasmSqlExecutor {
     constructor() {
         this._registered = new Map(); // tableName -> { version: string, columns: Set }
+    }
+
+    /**
+     * Parse SQL in WASM to identify required table names
+     * @param {string} sql
+     * @returns {string[]}
+     */
+    getTableNames(sql) {
+        const wasm = getWasm();
+        if (!wasm) throw new Error('WASM not loaded');
+
+        const memory = getWasmMemory();
+
+        // Write SQL to WASM
+        const sqlBytes = new TextEncoder().encode(sql);
+        const sqlPtr = wasm.alloc(sqlBytes.length);
+        new Uint8Array(memory.buffer, sqlPtr, sqlBytes.length).set(sqlBytes);
+
+        // Call Zig to get comma-separated table names
+        const namesPtr = wasm.getTableNames(sqlPtr, sqlBytes.length);
+        if (namesPtr === 0) return [];
+
+        // Read result (null-terminated string)
+        const view = new Uint8Array(memory.buffer, namesPtr);
+        let len = 0;
+        while (view[len] !== 0 && len < 1024) len++;
+
+        const namesStr = new TextDecoder().decode(view.subarray(0, len));
+        return namesStr ? namesStr.split(',').filter(n => n) : [];
+    }
+
+    /**
+     * Check if table exists in WASM
+     * @param {string} tableName
+     * @returns {boolean}
+     */
+    hasTable(tableName) {
+        const wasm = getWasm();
+        if (!wasm) return false;
+
+        const memory = getWasmMemory();
+        const bytes = new TextEncoder().encode(tableName);
+        const ptr = wasm.alloc(bytes.length);
+        new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
+
+        const res = wasm.hasTable(ptr, bytes.length);
+        return res === 1;
     }
 
     /**
@@ -487,12 +532,6 @@ export class WasmSqlExecutor {
         this._registered.clear();
     }
 
-    /**
-     * Check if a table is registered
-     */
-    hasTable(tableName) {
-        return this._registered.has(tableName);
-    }
 }
 
 // Singleton instance
@@ -511,60 +550,3 @@ export function getWasmSqlExecutor() {
  * @param {number} rowCount - Estimated row count
  * @returns {boolean}
  */
-export function shouldUseWasmSql(sql, rowCount) {
-    // Use WASM for larger datasets where the overhead is worth it
-    if (rowCount < 100) return false;
-
-    try {
-        const lexer = new SQLLexer(sql);
-        const tokens = lexer.tokenize();
-        const parser = new SQLParser(tokens);
-        const ast = parser.parse();
-
-        // If not a SELECT statement (e.g. INSERT, UPDATE), default to WASM (or handle elsewhere)
-        // Currently we only route SELECTs here.
-        if (ast.type !== 'SELECT') {
-            return true;
-        }
-
-        // Complex clauses that benefit from WASM / are not supported by simple JS scan
-        if (ast.where || ast.having || ast.qualify) return true;
-        if (ast.joins && ast.joins.length > 0) return true;
-        if (ast.groupBy || ast.orderBy) return true;
-        if (ast.distinct) return true;
-        if (ast.union || ast.intersect || ast.except) return true;
-
-        // Check columns for aggregates or complex expressions
-        // Simple column access is fine for JS
-        for (const col of ast.columns) {
-            if (col.type === 'star') continue;
-
-            // If it's an aggregate or window function, use WASM
-            if (col.type === 'aggregate' || col.type === 'window') {
-                return true;
-            }
-
-            // If it's a scalar subquery or case expression, use WASM
-            if (col.type === 'scalar_subquery' || col.type === 'case') {
-                return true;
-            }
-
-            // Function call checking would go here if we had a generic function type
-        }
-
-        // Check for calculated fields in SELECT list (e.g. col1 + col2)
-        // The parser might represent these as expressions. 
-        // For now, if we've passed the above checks, it's likely a simple column selection.
-
-        // If we got here, it's a simple SELECT (columns) FROM table [LIMIT] [OFFSET]
-        // This is faster in JS via direct zero-copy pass-through
-        return false;
-
-    } catch (e) {
-        // If parsing fails (e.g. complex syntax not handled), default to WASM as safe fallback
-        // or potentially false if we think JS is safer? 
-        // WASM engine is generally more robust for full SQL support.
-        console.warn('Failed to parse SQL for routing, defaulting to WASM:', e);
-        return true;
-    }
-}

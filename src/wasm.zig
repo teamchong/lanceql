@@ -9,21 +9,8 @@
 
 const std = @import("std");
 
-// ============================================================================
-// JS Imports for OPFS access (synchronous via FileSystemSyncAccessHandle)
-// ============================================================================
-
-/// JS provides these functions for synchronous OPFS file access in workers
-const js = struct {
-    /// Open file, returns handle ID (0 = error)
-    extern "env" fn opfs_open(path_ptr: [*]const u8, path_len: usize) u32;
-    /// Read from file at offset into buffer, returns bytes read
-    extern "env" fn opfs_read(handle: u32, buf_ptr: [*]u8, buf_len: usize, offset: u64) usize;
-    /// Get file size
-    extern "env" fn opfs_size(handle: u32) u64;
-    /// Close file handle
-    extern "env" fn opfs_close(handle: u32) void;
-};
+const opfs = @import("wasm/opfs.zig");
+const js = opfs.js;
 
 // ============================================================================
 // Module imports
@@ -43,6 +30,7 @@ const fragment_reader = @import("wasm/fragment_reader.zig");
 const column_meta = @import("wasm/column_meta.zig");
 const aggregates = @import("wasm/aggregates.zig");
 const sql_executor = @import("wasm/sql_executor.zig");
+const buffer_pool = @import("wasm/buffer_pool.zig");
 
 // Module exports are automatic via `pub export fn` in each module.
 // Force reference to ensure they're included in WASM binary:
@@ -61,6 +49,7 @@ comptime {
     _ = column_meta;
     _ = aggregates;
     _ = sql_executor;
+    _ = buffer_pool;
 }
 
 // ============================================================================

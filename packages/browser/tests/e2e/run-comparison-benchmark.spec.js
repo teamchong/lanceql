@@ -15,11 +15,11 @@ function saveResults(rowCount, results) {
             if (fs.existsSync(resultsPath)) {
                 allResults = JSON.parse(fs.readFileSync(resultsPath, 'utf8'));
             }
-            allResults.push({ 
-                rowCount, 
-                timestamp: new Date().toISOString(), 
+            allResults.push({
+                rowCount,
+                timestamp: new Date().toISOString(),
                 commit: process.env.GITHUB_SHA || 'local',
-                results 
+                results
             });
             fs.writeFileSync(resultsPath, JSON.stringify(allResults, null, 2));
             console.log(`Saved benchmark results to ${resultsPath}`);
@@ -32,6 +32,13 @@ function saveResults(rowCount, results) {
 async function runBenchmark(page, rowCount) {
     // Use minimal HTML page just to load JS
     await page.goto('/examples/wasm/test-vault-sql.html');
+
+    // Pipe console logs to terminal for debugging
+    page.on('console', msg => {
+        const text = msg.text();
+        // filter out some noise if needed, but keep LanceQLWorker and Zig logs
+        console.log(`[Browser] ${msg.type()}: ${text}`);
+    });
 
     const results = await page.evaluate(async (rows) => {
         const { vault } = await import('./lanceql.js');
@@ -60,12 +67,21 @@ async function runBenchmark(page, rowCount) {
         await lanceVault.exec('CREATE TABLE bench_customers (id INTEGER, name TEXT)');
 
         const statuses = ['pending', 'shipped', 'delivered', 'cancelled'];
-        for (let i = 0; i < rows; i++) {
-            await lanceVault.exec(`INSERT INTO bench_orders VALUES (${i}, ${i % numCustomers}, ${(Math.random() * 1000).toFixed(2)}, '${statuses[i % 4]}')`);
+        const setupBatchSize = 1000;
+        console.log(`[Bench] Starting ${rows} setup for LanceQL...`);
+        for (let batch = 0; batch < rows; batch += setupBatchSize) {
+            const end = Math.min(batch + setupBatchSize, rows);
+            const values = [];
+            for (let i = batch; i < end; i++) {
+                values.push(`(${i}, ${i % numCustomers}, ${(Math.random() * 1000).toFixed(2)}, '${statuses[i % 4]}')`);
+            }
+            await lanceVault.exec(`INSERT INTO bench_orders VALUES ${values.join(',')}`);
+            if (batch % 10000 === 0) console.log(`[Bench] Inserted ${batch} rows...`);
         }
-        for (let i = 0; i < numCustomers; i++) {
-            await lanceVault.exec(`INSERT INTO bench_customers VALUES (${i}, 'Customer ${i}')`);
-        }
+        console.log(`[Bench] Finished ${rows} setup for LanceQL.`);
+
+        const customerValues = Array.from({ length: numCustomers }, (_, i) => `(${i}, 'Customer ${i}')`).join(',');
+        await lanceVault.exec(`INSERT INTO bench_customers VALUES ${customerValues}`);
 
         // DuckDB: Use batch INSERT with explicit columns to ensure proper column binding
         await duckConn.query(`CREATE TABLE bench_orders (id INTEGER, customer_id INTEGER, amount DOUBLE, status VARCHAR)`);
@@ -80,7 +96,6 @@ async function runBenchmark(page, rowCount) {
             await duckConn.query(`INSERT INTO bench_orders (id, customer_id, amount, status) VALUES ${values.join(',')}`);
         }
         await duckConn.query(`CREATE TABLE bench_customers (id INTEGER, name VARCHAR)`);
-        const customerValues = Array.from({length: numCustomers}, (_, i) => `(${i}, 'Customer ${i}')`).join(',');
         await duckConn.query(`INSERT INTO bench_customers (id, name) VALUES ${customerValues}`);
 
         async function benchmark(name, lanceSql, duckSql) {

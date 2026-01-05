@@ -59,8 +59,20 @@ var fragment_row_count: usize = 0;
 
 /// Initialize a new Lance file writer with capacity
 pub export fn writerInit(capacity: usize) u32 {
-    writer_buffer = wasmAlloc(capacity);
-    if (writer_buffer == null) return 0;
+    // Reuse existing buffer if large enough
+    if (writer_buffer != null and writer_buffer_len >= capacity) {
+        writer_offset = 0;
+        return 1;
+    }
+
+    // Free previous buffer
+    if (writer_buffer) |buf| {
+        memory.wasm_allocator.free(buf[0..writer_buffer_len]);
+        writer_buffer = null;
+    }
+
+    const slice = memory.wasm_allocator.alloc(u8, capacity) catch return 0;
+    writer_buffer = slice.ptr;
     writer_buffer_len = capacity;
     writer_offset = 0;
     return 1;
@@ -250,6 +262,10 @@ pub export fn fragmentAddInt64Column(
 ) u32 {
     if (fragment_column_count >= MAX_COLUMNS) return 0;
 
+    // Align to 8 bytes for Int64
+    const padding = (8 - (writer_offset % 8)) % 8;
+    writer_offset += padding;
+
     const data_offset = writer_offset;
     if (writerWriteInt64(values, count) == 0) return 0;
     const data_size = writer_offset - data_offset;
@@ -309,6 +325,10 @@ pub export fn fragmentAddFloat64Column(
     nullable: bool,
 ) u32 {
     if (fragment_column_count >= MAX_COLUMNS) return 0;
+
+    // Align to 8 bytes for Float64
+    const padding = (8 - (writer_offset % 8)) % 8;
+    writer_offset += padding;
 
     const data_offset = writer_offset;
     if (writerWriteFloat64(values, count) == 0) return 0;
@@ -379,8 +399,20 @@ pub export fn fragmentAddStringColumn(
     // Write string data
     if (writerWriteBytes(string_data, string_data_len) == 0) return 0;
 
-    // Write offsets (count + 1 values)
+    // Pad to 4-byte alignment for offsets
     const buf = writer_buffer orelse return 0;
+    const padding = (4 - (writer_offset % 4)) % 4;
+    var p: usize = 0;
+    while (p < padding) : (p += 1) {
+        if (writer_offset >= writer_buffer_len) return 0;
+        buf[writer_offset] = 0;
+        writer_offset += 1;
+    }
+
+    const offsets_start_in_file = writer_offset; // record this if needed, but we use data_size
+    _ = offsets_start_in_file;
+
+    // Write offsets (count + 1 values)
     const offsets_bytes = (count + 1) * 4;
     if (writer_offset + offsets_bytes > writer_buffer_len) return 0;
 
@@ -450,6 +482,10 @@ pub export fn fragmentAddVectorColumn(
 ) u32 {
     if (fragment_column_count >= MAX_COLUMNS) return 0;
     if (vector_dim == 0) return 0;
+
+    // Align to 4 bytes for Vector (Float32)
+    const padding = (4 - (writer_offset % 4)) % 4;
+    writer_offset += padding;
 
     const data_offset = writer_offset;
     if (writerWriteFloat32(values, total_floats) == 0) return 0;

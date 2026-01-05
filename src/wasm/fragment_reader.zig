@@ -4,6 +4,9 @@
 //! Parses the footer, column metadata, and provides typed column access.
 
 const std = @import("std");
+const memory = @import("memory.zig");
+const opfs = @import("opfs.zig");
+const js = opfs.js;
 
 // ============================================================================
 // Constants
@@ -25,6 +28,7 @@ pub const ReaderColumnInfo = struct {
     row_count: u64,
     data_size: u64,
     vector_dim: u32,
+    cached_data: ?[]u8 = null, // Cache for on-demand loading
 };
 
 pub const FragmentReader = struct {
@@ -34,6 +38,8 @@ pub const FragmentReader = struct {
     column_meta_start: u64 = 0,
     column_meta_offsets_start: u64 = 0,
     columns: [MAX_COLUMNS]ReaderColumnInfo = undefined,
+    opfs_handle: u32 = 0, // 0 means not an OPFS lazy handle
+    is_lazy: bool = false,
 
     pub fn init(data: [*]const u8, len: usize) !FragmentReader {
         if (len < 40) return error.InvalidFile;
@@ -72,6 +78,64 @@ pub const FragmentReader = struct {
                 reader.column_meta_offsets_start;
 
             parseColumnMeta(data, meta_offset, next_offset, &reader.columns[i]);
+        }
+
+        return reader;
+    }
+
+    /// Initialize a lazy reader from OPFS - only reads footer and metadata, not column data
+    pub fn initLazy(handle: u32) !FragmentReader {
+        if (handle == 0) return error.InvalidHandle;
+
+        const size = js.opfs_size(handle);
+        if (size < 40) return error.InvalidFile;
+
+        var reader = FragmentReader{
+            .opfs_handle = handle,
+            .is_lazy = true,
+            .len = @intCast(size),
+        };
+
+        // Read just the footer (40 bytes)
+        var footer_buf: [40]u8 = undefined;
+        const footer_offset = size - 40;
+        const bytes_read = js.opfs_read(handle, &footer_buf, 40, footer_offset);
+        if (bytes_read != 40) return error.ReadError;
+
+        // Check magic
+        if (footer_buf[36] != 'L' or footer_buf[37] != 'A' or footer_buf[38] != 'N' or footer_buf[39] != 'C') {
+            return error.InvalidMagic;
+        }
+
+        reader.column_meta_start = std.mem.readInt(u64, footer_buf[0..8], .little);
+        reader.column_meta_offsets_start = std.mem.readInt(u64, footer_buf[8..16], .little);
+        reader.num_columns = std.mem.readInt(u32, footer_buf[28..32], .little);
+
+        if (reader.num_columns > MAX_COLUMNS) return error.TooManyColumns;
+
+        // Read column metadata offsets
+        const offsets_size = reader.num_columns * 8;
+        const offsets_buf = memory.wasmAlloc(offsets_size) orelse return error.OutOfMemory;
+
+        const offsets_read = js.opfs_read(handle, offsets_buf, offsets_size, reader.column_meta_offsets_start);
+        if (offsets_read != offsets_size) return error.ReadError;
+
+        // Read each column's metadata
+        for (0..reader.num_columns) |i| {
+            const meta_offset = std.mem.readInt(u64, offsets_buf[i * 8 ..][0..8], .little);
+            const next_offset = if (i + 1 < reader.num_columns)
+                std.mem.readInt(u64, offsets_buf[(i + 1) * 8 ..][0..8], .little)
+            else
+                reader.column_meta_offsets_start;
+
+            const meta_size = next_offset - meta_offset;
+            if (meta_size > 4096) continue; // Skip unreasonably large metadata
+
+            const meta_buf = memory.wasmAlloc(@intCast(meta_size)) orelse continue;
+            const meta_read = js.opfs_read(handle, meta_buf, @intCast(meta_size), meta_offset);
+            if (meta_read != @as(usize, @intCast(meta_size))) continue;
+
+            parseColumnMetaFromBuf(meta_buf, @intCast(meta_size), &reader.columns[i]);
         }
 
         return reader;
@@ -116,11 +180,55 @@ pub const FragmentReader = struct {
         return copy_len;
     }
 
+    /// Get raw pointer to column data
+    /// For lazy readers, this returns null - use loadColumnData() first
     pub fn getColumnRawPtr(self: *const FragmentReader, col_idx: u32) ?[*]const u8 {
         if (col_idx >= self.num_columns) return null;
-        const data = self.data orelse return null;
-        const info = &self.columns[col_idx];
-        return data + @as(usize, @intCast(info.data_offset));
+
+        // Fast path: data already in memory
+        if (self.data) |data| {
+            const info = &self.columns[col_idx];
+            return data + @as(usize, @intCast(info.data_offset));
+        }
+
+        // Check if already cached
+        if (self.columns[col_idx].cached_data) |cached| {
+            return cached.ptr;
+        }
+
+        return null;
+    }
+
+    /// Load column data on-demand for lazy readers (mutable self required)
+    pub fn loadColumnData(self: *FragmentReader, col_idx: u32) ?[*]const u8 {
+        if (col_idx >= self.num_columns) return null;
+
+        // Already loaded?
+        if (self.data) |data| {
+            const info = &self.columns[col_idx];
+            return data + @as(usize, @intCast(info.data_offset));
+        }
+
+        if (self.columns[col_idx].cached_data) |cached| {
+            return cached.ptr;
+        }
+
+        // Lazy load from OPFS
+        if (self.is_lazy and self.opfs_handle != 0) {
+            const info = &self.columns[col_idx];
+            const size: usize = @intCast(info.data_size);
+            if (size == 0) return null;
+
+            const buf = memory.wasmAlloc(size) orelse return null;
+            const bytes_read = js.opfs_read(self.opfs_handle, buf, size, info.data_offset);
+            if (bytes_read != size) return null;
+
+            // Cache the loaded data
+            self.columns[col_idx].cached_data = buf[0..size];
+            return buf;
+        }
+
+        return null;
     }
 
     pub fn fragmentReadInt64(self: *const FragmentReader, col_idx: u32, out_ptr: [*]i64, max_count: usize, start_row: u32) usize {
@@ -371,6 +479,90 @@ fn readVarintAt(data: [*]const u8, pos: *usize) usize {
     }
 
     return value;
+}
+
+/// Parse column metadata from a buffer (used by lazy loading)
+fn parseColumnMetaFromBuf(data: [*]const u8, len: usize, info: *ReaderColumnInfo) void {
+    info.* = .{
+        .name = undefined,
+        .name_len = 0,
+        .col_type = undefined,
+        .type_len = 0,
+        .nullable = true,
+        .data_offset = 0,
+        .row_count = 0,
+        .data_size = 0,
+        .vector_dim = 0,
+        .cached_data = null,
+    };
+
+    var pos: usize = 0;
+    while (pos < len) {
+        const tag = data[pos];
+        pos += 1;
+
+        const field_num = tag >> 3;
+        const wire_type = tag & 0x7;
+
+        switch (field_num) {
+            1 => {
+                if (wire_type == 2) {
+                    const str_len = readVarintAt(data, &pos);
+                    const copy_len = @min(str_len, 64);
+                    @memcpy(info.name[0..copy_len], data[pos..][0..copy_len]);
+                    info.name_len = copy_len;
+                    pos += str_len;
+                }
+            },
+            2 => {
+                if (wire_type == 2) {
+                    const str_len = readVarintAt(data, &pos);
+                    const copy_len = @min(str_len, 16);
+                    @memcpy(info.col_type[0..copy_len], data[pos..][0..copy_len]);
+                    info.type_len = copy_len;
+                    pos += str_len;
+                }
+            },
+            3 => {
+                if (wire_type == 0) {
+                    info.nullable = readVarintAt(data, &pos) != 0;
+                }
+            },
+            4 => {
+                if (wire_type == 1) {
+                    info.data_offset = std.mem.readInt(u64, data[pos..][0..8], .little);
+                    pos += 8;
+                }
+            },
+            5 => {
+                if (wire_type == 0) {
+                    info.row_count = readVarintAt(data, &pos);
+                }
+            },
+            6 => {
+                if (wire_type == 0) {
+                    info.data_size = readVarintAt(data, &pos);
+                }
+            },
+            7 => {
+                if (wire_type == 0) {
+                    info.vector_dim = @intCast(readVarintAt(data, &pos));
+                }
+            },
+            else => {
+                if (wire_type == 0) {
+                    _ = readVarintAt(data, &pos);
+                } else if (wire_type == 1) {
+                    pos += 8;
+                } else if (wire_type == 2) {
+                    const skip_len = readVarintAt(data, &pos);
+                    pos += skip_len;
+                } else if (wire_type == 5) {
+                    pos += 4;
+                }
+            },
+        }
+    }
 }
 
 // ============================================================================

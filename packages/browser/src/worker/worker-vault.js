@@ -5,7 +5,6 @@
 import { opfsStorage } from './opfs-storage.js';
 import { encryptionKeys, importEncryptionKey, encryptData, decryptData } from './encryption.js';
 import { WorkerDatabase } from './worker-database.js';
-import { executeSQL } from './sql/executor.js';
 import { E, D } from './data-types.js';
 
 class WorkerVault {
@@ -113,10 +112,6 @@ class WorkerVault {
         return key in this._kv;
     }
 
-    async exec(sql) {
-        // Delegate SQL execution to embedded database
-        return executeSQL(this._db, sql);
-    }
 }
 
 // Vault singleton
