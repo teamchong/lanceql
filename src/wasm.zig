@@ -674,13 +674,13 @@ export fn registerTableFromOPFS(
 ) u32 {
     // Open file via JS
     const handle = js.opfs_open(path_ptr, path_len);
-    if (handle == 0) return 1;
+    if (handle == 0) return 101; // Specific code for open failure
 
     // Get file size
     const size = js.opfs_size(handle);
     if (size == 0) {
         js.opfs_close(handle);
-        return 2;
+        return 102;
     }
 
     const size_usize: usize = @intCast(size);
@@ -702,6 +702,15 @@ export fn registerTableFromOPFS(
     }
 
     // Register with SQL executor
+    if (size_usize >= 4 and buf_ptr[0] == 'L' and buf_ptr[1] == 'A' and buf_ptr[2] == 'N' and buf_ptr[3] == 'C') {
+        return sql_executor.registerTableSimpleBinary(
+            table_name_ptr,
+            table_name_len,
+            buf_ptr,
+            size_usize
+        );
+    }
+
     return sql_executor.registerTableFragment(
         table_name_ptr,
         table_name_len,

@@ -1,6 +1,7 @@
 /**
  * Vault - Encrypted key-value store and Table reference
  */
+import { workerRPC } from '../rpc/worker-rpc.js';
 
 class Vault {
     /**

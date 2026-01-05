@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>LanceQL JOIN Test</title>
+    <title>LanceQL JOIN Demo</title>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -13,7 +13,8 @@
             background: #0f172a;
             color: #e2e8f0;
         }
-        h1 { color: #3b82f6; }
+        h1 { color: #3b82f6; margin-bottom: 10px; }
+        .subtitle { color: #94a3b8; margin-bottom: 30px; }
         .test-section {
             background: #1e293b;
             border-radius: 8px;
@@ -23,6 +24,7 @@
         .test-section h2 {
             margin-top: 0;
             color: #60a5fa;
+            font-size: 1.2rem;
         }
         button {
             background: #3b82f6;
@@ -33,6 +35,7 @@
             cursor: pointer;
             margin: 5px;
             font-size: 14px;
+            font-weight: 500;
         }
         button:hover {
             background: #2563eb;
@@ -89,297 +92,328 @@
         }
         .code {
             background: #0f172a;
-            padding: 2px 6px;
+            padding: 4px 8px;
             border-radius: 3px;
             font-family: 'Courier New', monospace;
-            font-size: 12px;
+            font-size: 13px;
             color: #fbbf24;
+            display: block;
+            margin: 10px 0;
+            white-space: pre-wrap;
+        }
+        .schema {
+            background: #1e293b;
+            padding: 10px;
+            border-left: 3px solid #60a5fa;
+            margin: 10px 0;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+        }
+        .run-all {
+            background: #059669;
+            font-size: 16px;
+            padding: 12px 24px;
+        }
+        .run-all:hover {
+            background: #047857;
         }
     </style>
 </head>
 <body>
-    <h1>🧪 LanceQL JOIN Implementation Test</h1>
+    <h1>🔗 LanceQL JOIN Demo</h1>
+    <p class="subtitle">Row-based JOIN operations using vault with in-memory tables</p>
+
+    <button class="run-all" onclick="runAllTests()">▶ Run All Tests</button>
 
     <div class="test-section">
-        <h2>1. Initialize LanceQL</h2>
-        <button id="btn-init" onclick="testInit()">Load WASM Module</button>
+        <h2>1. Initialize Vault</h2>
+        <button id="btn-init" onclick="testInit()">Initialize Vault</button>
         <div id="status-init"></div>
     </div>
 
     <div class="test-section">
-        <h2>2. Test SQL Parser (JOIN Parsing)</h2>
-        <button id="btn-parser" onclick="testParser()" disabled>Test Parser</button>
-        <div id="status-parser"></div>
-        <pre id="result-parser"></pre>
+        <h2>2. Create Tables</h2>
+        <div class="schema">
+            CREATE TABLE customers (id INT, name TEXT, city TEXT)
+            CREATE TABLE orders (id INT, customer_id INT, product TEXT, amount FLOAT)
+        </div>
+        <button id="btn-create" onclick="testCreate()" disabled>Create Tables</button>
+        <div id="status-create"></div>
     </div>
 
     <div class="test-section">
-        <h2>3. Create LanceDatabase</h2>
-        <button id="btn-db" onclick="testDatabase()" disabled>Create Database</button>
-        <div id="status-db"></div>
+        <h2>3. Insert Sample Data</h2>
+        <button id="btn-insert" onclick="testInsert()" disabled>Insert Data</button>
+        <div id="status-insert"></div>
+        <div id="result-insert"></div>
     </div>
 
     <div class="test-section">
-        <h2>4. Register Single Table (No JOIN Test)</h2>
-        <button id="btn-register" onclick="testRegister()" disabled>Register Table</button>
-        <div id="status-register"></div>
+        <h2>4. INNER JOIN</h2>
+        <code class="code">SELECT c.name, c.city, o.product, o.amount
+FROM customers c
+JOIN orders o ON c.id = o.customer_id</code>
+        <button id="btn-inner-join" onclick="testInnerJoin()" disabled>Execute INNER JOIN</button>
+        <div id="status-inner-join"></div>
+        <div id="result-inner-join"></div>
     </div>
 
     <div class="test-section">
-        <h2>5. Execute Single Table Query</h2>
-        <button id="btn-single" onclick="testSingleQuery()" disabled>Query Single Table</button>
-        <div id="status-single"></div>
-        <div id="result-single"></div>
+        <h2>5. LEFT JOIN</h2>
+        <code class="code">SELECT c.name, c.city, o.product, o.amount
+FROM customers c
+LEFT JOIN orders o ON c.id = o.customer_id</code>
+        <button id="btn-left-join" onclick="testLeftJoin()" disabled>Execute LEFT JOIN</button>
+        <div id="status-left-join"></div>
+        <div id="result-left-join"></div>
     </div>
 
     <div class="test-section">
-        <h2>6. Mock JOIN Test (Same Table)</h2>
-        <p>Since we don't have multiple datasets yet, we'll test the JOIN logic by registering the same dataset twice with different names.</p>
-        <button id="btn-mock-join" onclick="testMockJoin()" disabled>Test Mock JOIN</button>
-        <div id="status-mock-join"></div>
-        <div id="result-mock-join"></div>
+        <h2>6. JOIN with WHERE and ORDER BY</h2>
+        <code class="code">SELECT c.name, o.product, o.amount
+FROM customers c
+JOIN orders o ON c.id = o.customer_id
+WHERE o.amount > 100
+ORDER BY o.amount DESC</code>
+        <button id="btn-complex-join" onclick="testComplexJoin()" disabled>Execute Complex JOIN</button>
+        <div id="status-complex-join"></div>
+        <div id="result-complex-join"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>7. JOIN with Aggregation</h2>
+        <code class="code">SELECT c.name, c.city, COUNT(*) as order_count, SUM(o.amount) as total_spent
+FROM customers c
+JOIN orders o ON c.id = o.customer_id
+GROUP BY c.name, c.city
+ORDER BY total_spent DESC</code>
+        <button id="btn-agg-join" onclick="testAggregationJoin()" disabled>Execute Aggregation JOIN</button>
+        <div id="status-agg-join"></div>
+        <div id="result-agg-join"></div>
     </div>
 
     <script type="module">
-        // Import from local lanceql.js (synced from packages/browser/src/lanceql.js)
-        import LanceQL, { SQLLexer, SQLParser, LanceDatabase } from './lanceql.js';
+        import { vault } from './lanceql.js';
 
-        window.LanceQL = LanceQL;
-        window.SQLLexer = SQLLexer;
-        window.SQLParser = SQLParser;
-        window.LanceDatabase = LanceDatabase;
+        let v = null;
 
-        window.lanceql = null;
-        window.db = null;
+        function setStatus(id, type, message) {
+            const el = document.getElementById(`status-${id}`);
+            el.className = `status ${type}`;
+            el.innerHTML = message;
+        }
+
+        function enableButton(id) {
+            document.getElementById(`btn-${id}`).disabled = false;
+        }
+
+        function renderTable(result) {
+            if (!result || !result.rows || result.rows.length === 0) {
+                return '<p style="color: #94a3b8;">No rows returned</p>';
+            }
+
+            let html = '<table><thead><tr>';
+            for (const col of result.columns) {
+                html += `<th>${col}</th>`;
+            }
+            html += '</tr></thead><tbody>';
+
+            for (const row of result.rows) {
+                html += '<tr>';
+                for (const val of row) {
+                    html += `<td>${val !== null && val !== undefined ? val : '<span style="color: #64748b;">NULL</span>'}</td>`;
+                }
+                html += '</tr>';
+            }
+            html += '</tbody></table>';
+
+            return html;
+        }
 
         window.testInit = async function() {
             const btn = document.getElementById('btn-init');
             const status = document.getElementById('status-init');
 
             btn.disabled = true;
-            status.innerHTML = '<div class="status loading">Loading WASM module...</div>';
+            status.innerHTML = '<div class="status loading">⏳ Initializing vault...</div>';
 
             try {
-                window.lanceql = await LanceQL.load('./lanceql.wasm');
-                const version = window.lanceql.getVersion();
-
-                status.innerHTML = `<div class="status success">✓ WASM loaded successfully! Version: ${version}</div>`;
-
-                // Enable next test
-                document.getElementById('btn-parser').disabled = false;
+                v = await vault();
+                status.innerHTML = '<div class="status success">✓ Vault initialized successfully!</div>';
+                enableButton('create');
             } catch (error) {
                 status.innerHTML = `<div class="status error">✗ Error: ${error.message}</div>`;
                 btn.disabled = false;
             }
         };
 
-        window.testParser = function() {
-            const status = document.getElementById('status-parser');
-            const result = document.getElementById('result-parser');
+        window.testCreate = async function() {
+            const btn = document.getElementById('btn-create');
+            const status = document.getElementById('status-create');
 
-            status.innerHTML = '<div class="status loading">Testing SQL parser with JOIN...</div>';
+            btn.disabled = true;
+            status.innerHTML = '<div class="status loading">⏳ Creating tables...</div>';
 
             try {
-                const sql = `
-                    SELECT i.url, c.text
-                    FROM images i
-                    JOIN captions c ON i.id = c.image_id
-                    WHERE i.aesthetic > 7.0
-                    LIMIT 20
+                await v.exec("CREATE TABLE customers (id INT, name TEXT, city TEXT)");
+                await v.exec("CREATE TABLE orders (id INT, customer_id INT, product TEXT, amount FLOAT)");
+
+                status.innerHTML = '<div class="status success">✓ Tables created: customers, orders</div>';
+                enableButton('insert');
+            } catch (error) {
+                status.innerHTML = `<div class="status error">✗ Error: ${error.message}</div>`;
+                btn.disabled = false;
+            }
+        };
+
+        window.testInsert = async function() {
+            const btn = document.getElementById('btn-insert');
+            const status = document.getElementById('status-insert');
+            const result = document.getElementById('result-insert');
+
+            btn.disabled = true;
+            status.innerHTML = '<div class="status loading">⏳ Inserting sample data...</div>';
+
+            try {
+                await v.exec("INSERT INTO customers VALUES (1, 'Alice', 'New York'), (2, 'Bob', 'Los Angeles'), (3, 'Charlie', 'Chicago'), (4, 'Diana', 'San Francisco'), (5, 'Eve', 'Seattle')");
+                await v.exec("INSERT INTO orders VALUES (1, 1, 'Laptop', 1200.00), (2, 1, 'Mouse', 25.00), (3, 2, 'Monitor', 350.00), (4, 3, 'Keyboard', 80.00), (5, 1, 'USB Cable', 15.00), (6, 4, 'Headphones', 150.00)");
+
+                const customers = await v.exec("SELECT * FROM customers");
+                const orders = await v.exec("SELECT * FROM orders");
+
+                status.innerHTML = `<div class="status success">✓ Inserted ${customers.rows.length} customers and ${orders.rows.length} orders</div>`;
+
+                result.innerHTML = `
+                    <h3 style="color: #60a5fa; margin-top: 15px;">Customers</h3>
+                    ${renderTable(customers)}
+                    <h3 style="color: #60a5fa; margin-top: 15px;">Orders</h3>
+                    ${renderTable(orders)}
                 `;
 
-                const lexer = new SQLLexer(sql);
-                const tokens = lexer.tokenize();
-                const parser = new SQLParser(tokens);
-                const ast = parser.parse();
-
-                status.innerHTML = '<div class="status success">✓ Parser successfully parsed JOIN query!</div>';
-                result.textContent = JSON.stringify(ast, null, 2);
-
-                // Check if joins array exists
-                if (ast.joins && ast.joins.length > 0) {
-                    status.innerHTML += `<div class="status success">✓ Found ${ast.joins.length} JOIN clause(s)</div>`;
-                    status.innerHTML += `<div class="status success">✓ JOIN type: ${ast.joins[0].type}</div>`;
-                    status.innerHTML += `<div class="status success">✓ ON condition: ${JSON.stringify(ast.joins[0].on)}</div>`;
-                }
-
-                // Enable next test
-                document.getElementById('btn-db').disabled = false;
-            } catch (error) {
-                status.innerHTML = `<div class="status error">✗ Parser error: ${error.message}</div>`;
-                result.textContent = error.stack;
-            }
-        };
-
-        window.testDatabase = function() {
-            const status = document.getElementById('status-db');
-
-            status.innerHTML = '<div class="status loading">Creating LanceDatabase...</div>';
-
-            try {
-                window.db = window.lanceql.createDatabase();
-
-                if (window.db && window.db instanceof LanceDatabase) {
-                    status.innerHTML = '<div class="status success">✓ LanceDatabase created successfully!</div>';
-                    status.innerHTML += `<div class="status success">✓ Database has register() method: ${typeof window.db.register === 'function'}</div>`;
-                    status.innerHTML += `<div class="status success">✓ Database has registerRemote() method: ${typeof window.db.registerRemote === 'function'}</div>`;
-                    status.innerHTML += `<div class="status success">✓ Database has executeSQL() method: ${typeof window.db.executeSQL === 'function'}</div>`;
-
-                    // Enable next test
-                    document.getElementById('btn-register').disabled = false;
-                } else {
-                    throw new Error('Created object is not a LanceDatabase instance');
-                }
-            } catch (error) {
-                status.innerHTML = `<div class="status error">✗ Error: ${error.message}</div>`;
-            }
-        };
-
-        window.testRegister = async function() {
-            const btn = document.getElementById('btn-register');
-            const status = document.getElementById('status-register');
-
-            btn.disabled = true;
-            status.innerHTML = '<div class="status loading">Registering dataset from CDN...</div>';
-
-            try {
-                await window.db.registerRemote('images', 'https://data.metal0.dev/laion-1m/images.lance');
-
-                status.innerHTML = '<div class="status success">✓ Dataset registered as "images"</div>';
-                status.innerHTML += '<div class="status success">✓ Table count: ' + window.db.tables.size + '</div>';
-
-                // Enable next tests
-                document.getElementById('btn-single').disabled = false;
-                document.getElementById('btn-mock-join').disabled = false;
+                enableButton('inner-join');
+                enableButton('left-join');
+                enableButton('complex-join');
+                enableButton('agg-join');
             } catch (error) {
                 status.innerHTML = `<div class="status error">✗ Error: ${error.message}</div>`;
                 btn.disabled = false;
             }
         };
 
-        window.testSingleQuery = async function() {
-            const btn = document.getElementById('btn-single');
-            const status = document.getElementById('status-single');
-            const result = document.getElementById('result-single');
+        window.testInnerJoin = async function() {
+            const btn = document.getElementById('btn-inner-join');
+            const status = document.getElementById('status-inner-join');
+            const result = document.getElementById('result-inner-join');
 
             btn.disabled = true;
-            status.innerHTML = '<div class="status loading">Executing single-table query...</div>';
+            status.innerHTML = '<div class="status loading">⏳ Executing INNER JOIN...</div>';
 
             try {
-                const sql = 'SELECT url, aesthetic FROM images WHERE aesthetic > 7.0 LIMIT 10';
-
+                const sql = "SELECT c.name, c.city, o.product, o.amount FROM customers c JOIN orders o ON c.id = o.customer_id";
                 const startTime = performance.now();
-                const results = await window.db.executeSQL(sql);
+                const res = await v.exec(sql);
                 const endTime = performance.now();
 
-                status.innerHTML = `<div class="status success">✓ Query executed in ${(endTime - startTime).toFixed(2)}ms</div>`;
-                status.innerHTML += `<div class="status success">✓ Returned ${results.rows.length} rows</div>`;
-                status.innerHTML += `<div class="status success">✓ Columns: ${results.columns.join(', ')}</div>`;
+                status.innerHTML = `<div class="status success">✓ INNER JOIN executed in ${(endTime - startTime).toFixed(2)}ms</div>`;
+                status.innerHTML += `<div class="status success">✓ Returned ${res.rows.length} rows (only customers with orders)</div>`;
 
-                // Render table
-                let html = '<table><thead><tr>';
-                for (const col of results.columns) {
-                    html += `<th>${col}</th>`;
-                }
-                html += '</tr></thead><tbody>';
-
-                for (const row of results.rows) {
-                    html += '<tr>';
-                    for (const val of row) {
-                        if (typeof val === 'string' && val.startsWith('http')) {
-                            html += `<td><a href="${val}" target="_blank" style="color: #60a5fa">${val.substring(0, 50)}...</a></td>`;
-                        } else {
-                            html += `<td>${val}</td>`;
-                        }
-                    }
-                    html += '</tr>';
-                }
-                html += '</tbody></table>';
-
-                result.innerHTML = html;
+                result.innerHTML = renderTable(res);
             } catch (error) {
                 status.innerHTML = `<div class="status error">✗ Error: ${error.message}</div>`;
-                result.innerHTML = `<pre>${error.stack}</pre>`;
             } finally {
                 btn.disabled = false;
             }
         };
 
-        window.testMockJoin = async function() {
-            const btn = document.getElementById('btn-mock-join');
-            const status = document.getElementById('status-mock-join');
-            const result = document.getElementById('result-mock-join');
+        window.testLeftJoin = async function() {
+            const btn = document.getElementById('btn-left-join');
+            const status = document.getElementById('status-left-join');
+            const result = document.getElementById('result-left-join');
 
             btn.disabled = true;
-            status.innerHTML = '<div class="status loading">Testing JOIN logic with mock setup...</div>';
+            status.innerHTML = '<div class="status loading">⏳ Executing LEFT JOIN...</div>';
 
             try {
-                // Register same dataset twice with different names
-                status.innerHTML += '<div class="status loading">Registering same dataset as "t1" and "t2"...</div>';
-
-                await window.db.registerRemote('t1', 'https://data.metal0.dev/laion-1m/images.lance');
-                await window.db.registerRemote('t2', 'https://data.metal0.dev/laion-1m/images.lance');
-
-                status.innerHTML += '<div class="status success">✓ Both tables registered</div>';
-
-                // Try a self-join (this will fail but tests JOIN parsing)
-                const sql = `
-                    SELECT t1.url, t1.aesthetic
-                    FROM t1
-                    JOIN t2 ON t1.url = t2.url
-                    LIMIT 5
-                `;
-
-                status.innerHTML += `<div class="status loading">Executing JOIN query...</div>`;
-                status.innerHTML += `<div class="status">SQL: <span class="code">${sql.trim()}</span></div>`;
-
+                const sql = "SELECT c.name, c.city, o.product, o.amount FROM customers c LEFT JOIN orders o ON c.id = o.customer_id";
                 const startTime = performance.now();
-                const results = await window.db.executeSQL(sql);
+                const res = await v.exec(sql);
                 const endTime = performance.now();
 
-                status.innerHTML += `<div class="status success">✓ JOIN query executed in ${(endTime - startTime).toFixed(2)}ms</div>`;
-                status.innerHTML += `<div class="status success">✓ Returned ${results.rows.length} rows</div>`;
-                status.innerHTML += `<div class="status success">✓ Columns: ${results.columns.join(', ')}</div>`;
+                status.innerHTML = `<div class="status success">✓ LEFT JOIN executed in ${(endTime - startTime).toFixed(2)}ms</div>`;
+                status.innerHTML += `<div class="status success">✓ Returned ${res.rows.length} rows (all customers, with NULL for no orders)</div>`;
 
-                // Render table
-                let html = '<table><thead><tr>';
-                for (const col of results.columns) {
-                    html += `<th>${col}</th>`;
-                }
-                html += '</tr></thead><tbody>';
-
-                for (const row of results.rows.slice(0, 10)) {
-                    html += '<tr>';
-                    for (const val of row) {
-                        if (typeof val === 'string' && val.startsWith('http')) {
-                            html += `<td><a href="${val}" target="_blank" style="color: #60a5fa">${val.substring(0, 50)}...</a></td>`;
-                        } else {
-                            html += `<td>${val}</td>`;
-                        }
-                    }
-                    html += '</tr>';
-                }
-                html += '</tbody></table>';
-
-                result.innerHTML = html;
-
-                status.innerHTML += '<div class="status success">✓✓✓ JOIN IMPLEMENTATION WORKS! ✓✓✓</div>';
+                result.innerHTML = renderTable(res);
             } catch (error) {
-                status.innerHTML += `<div class="status error">✗ JOIN Error: ${error.message}</div>`;
-                result.innerHTML = `<pre>${error.stack}</pre>`;
-
-                // Check if it's an expected error
-                if (error.message.includes('WHERE') || error.message.includes('IN')) {
-                    status.innerHTML += '<div class="status">Note: Error might be expected - checking JOIN logic...</div>';
-                }
+                status.innerHTML = `<div class="status error">✗ Error: ${error.message}</div>`;
             } finally {
                 btn.disabled = false;
             }
         };
 
-        // Auto-run init on load
+        window.testComplexJoin = async function() {
+            const btn = document.getElementById('btn-complex-join');
+            const status = document.getElementById('status-complex-join');
+            const result = document.getElementById('result-complex-join');
+
+            btn.disabled = true;
+            status.innerHTML = '<div class="status loading">⏳ Executing complex JOIN with WHERE and ORDER BY...</div>';
+
+            try {
+                const sql = "SELECT c.name, o.product, o.amount FROM customers c JOIN orders o ON c.id = o.customer_id WHERE o.amount > 100 ORDER BY o.amount DESC";
+                const startTime = performance.now();
+                const res = await v.exec(sql);
+                const endTime = performance.now();
+
+                status.innerHTML = `<div class="status success">✓ Complex JOIN executed in ${(endTime - startTime).toFixed(2)}ms</div>`;
+                status.innerHTML += `<div class="status success">✓ Returned ${res.rows.length} rows (filtered and sorted)</div>`;
+
+                result.innerHTML = renderTable(res);
+            } catch (error) {
+                status.innerHTML = `<div class="status error">✗ Error: ${error.message}</div>`;
+            } finally {
+                btn.disabled = false;
+            }
+        };
+
+        window.testAggregationJoin = async function() {
+            const btn = document.getElementById('btn-agg-join');
+            const status = document.getElementById('status-agg-join');
+            const result = document.getElementById('result-agg-join');
+
+            btn.disabled = true;
+            status.innerHTML = '<div class="status loading">⏳ Executing JOIN with aggregation...</div>';
+
+            try {
+                const sql = "SELECT c.name, c.city, COUNT(*) as order_count, SUM(o.amount) as total_spent FROM customers c JOIN orders o ON c.id = o.customer_id GROUP BY c.name, c.city ORDER BY total_spent DESC";
+                const startTime = performance.now();
+                const res = await v.exec(sql);
+                const endTime = performance.now();
+
+                status.innerHTML = `<div class="status success">✓ Aggregation JOIN executed in ${(endTime - startTime).toFixed(2)}ms</div>`;
+                status.innerHTML += `<div class="status success">✓ Returned ${res.rows.length} customers with order statistics</div>`;
+
+                result.innerHTML = renderTable(res);
+            } catch (error) {
+                status.innerHTML = `<div class="status error">✗ Error: ${error.message}</div>`;
+            } finally {
+                btn.disabled = false;
+            }
+        };
+
+        window.runAllTests = async function() {
+            await testInit();
+            if (v) {
+                await testCreate();
+                await testInsert();
+                await testInnerJoin();
+                await testLeftJoin();
+                await testComplexJoin();
+                await testAggregationJoin();
+            }
+        };
+
         window.addEventListener('load', () => {
-            console.log('Page loaded. Click "Load WASM Module" to start tests.');
+            console.log('JOIN demo loaded. Click "Initialize Vault" or "Run All Tests" to start.');
         });
     </script>
 </body>

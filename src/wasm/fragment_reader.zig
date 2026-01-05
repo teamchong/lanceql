@@ -77,6 +77,15 @@ pub const FragmentReader = struct {
         return reader;
     }
 
+    pub fn initDummy(row_count: u64) FragmentReader {
+        var reader = FragmentReader{
+            .len = 0,
+            .num_columns = 1,
+        };
+        reader.columns[0].row_count = row_count;
+        return reader;
+    }
+
     pub fn getColumnCount(self: *const FragmentReader) u32 {
         return self.num_columns;
     }

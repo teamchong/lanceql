@@ -4,7 +4,7 @@
 
 import { TokenType } from './tokenizer.js';
 
-class SQLParser {
+export class SQLParser {
     constructor(tokens) {
         this.tokens = tokens;
         this.pos = 0;
@@ -33,7 +33,7 @@ class SQLParser {
         const token = this.peek();
         const upper = keyword.toUpperCase();
         return token.type === TokenType[upper] ||
-               (token.type === TokenType.IDENTIFIER && token.value.toUpperCase() === upper);
+            (token.type === TokenType.IDENTIFIER && token.value.toUpperCase() === upper);
     }
 
     expect(type) {
@@ -409,11 +409,11 @@ class SQLParser {
 
             // Parse JOINs
             while (this.peek().type === TokenType.JOIN ||
-                   this.peek().type === TokenType.LEFT ||
-                   this.peek().type === TokenType.RIGHT ||
-                   this.peek().type === TokenType.INNER ||
-                   this.peek().type === TokenType.FULL ||
-                   this.peek().type === TokenType.CROSS) {
+                this.peek().type === TokenType.LEFT ||
+                this.peek().type === TokenType.RIGHT ||
+                this.peek().type === TokenType.INNER ||
+                this.peek().type === TokenType.FULL ||
+                this.peek().type === TokenType.CROSS) {
                 joins.push(this.parseJoin());
             }
             table = tables[0].name;
@@ -669,7 +669,7 @@ class SQLParser {
 
         // Check for window functions: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, NTILE, PERCENT_RANK, CUME_DIST, FIRST_VALUE, LAST_VALUE, NTH_VALUE
         const windowFuncs = [TokenType.ROW_NUMBER, TokenType.RANK, TokenType.DENSE_RANK, TokenType.LAG, TokenType.LEAD,
-                             TokenType.NTILE, TokenType.PERCENT_RANK, TokenType.CUME_DIST, TokenType.FIRST_VALUE, TokenType.LAST_VALUE, TokenType.NTH_VALUE];
+        TokenType.NTILE, TokenType.PERCENT_RANK, TokenType.CUME_DIST, TokenType.FIRST_VALUE, TokenType.LAST_VALUE, TokenType.NTH_VALUE];
         for (const funcType of windowFuncs) {
             if (this.match(funcType)) {
                 const funcName = funcType.toLowerCase();
@@ -850,32 +850,32 @@ class SQLParser {
 
         // Check for nested function call
         const scalarFuncs = ['COALESCE', 'NULLIF', 'UPPER', 'LOWER', 'LENGTH', 'SUBSTR', 'SUBSTRING',
-                            'TRIM', 'LTRIM', 'RTRIM', 'CONCAT', 'REPLACE', 'ABS', 'ROUND', 'CEIL',
-                            'CEILING', 'FLOOR', 'MOD', 'POWER', 'POW', 'SQRT',
-                            // Date/Time functions
-                            'NOW', 'CURRENT_DATE', 'CURRENT_TIME', 'CURRENT_TIMESTAMP',
-                            'DATE', 'TIME', 'STRFTIME', 'DATE_DIFF', 'DATE_ADD', 'DATE_SUB',
-                            'EXTRACT', 'YEAR', 'MONTH', 'DAY', 'HOUR', 'MINUTE', 'SECOND',
-                            // Additional string functions
-                            'SPLIT', 'LEFT', 'RIGHT', 'LPAD', 'RPAD', 'POSITION', 'INSTR', 'REPEAT', 'REVERSE',
-                            // Conditional functions
-                            'GREATEST', 'LEAST', 'IIF', 'IF',
-                            // Additional math functions
-                            'LOG', 'LOG10', 'LN', 'EXP', 'SIN', 'COS', 'TAN', 'ASIN', 'ACOS', 'ATAN', 'ATAN2',
-                            'PI', 'RANDOM', 'RAND', 'SIGN', 'DEGREES', 'RADIANS', 'TRUNCATE', 'TRUNC',
-                            // REGEXP functions
-                            'REGEXP_MATCHES', 'REGEXP_REPLACE', 'REGEXP_EXTRACT', 'REGEXP_SUBSTR',
-                            'REGEXP_SPLIT', 'REGEXP_COUNT',
-                            // JSON functions
-                            'JSON_EXTRACT', 'JSON_VALUE', 'JSON_OBJECT', 'JSON_ARRAY',
-                            'JSON_KEYS', 'JSON_LENGTH', 'JSON_TYPE', 'JSON_VALID',
-                            // Array functions
-                            'ARRAY_LENGTH', 'ARRAY_CONTAINS', 'ARRAY_POSITION', 'ARRAY_APPEND',
-                            'ARRAY_REMOVE', 'ARRAY_SLICE', 'ARRAY_CONCAT', 'UNNEST',
-                            // UUID functions
-                            'UUID', 'GEN_RANDOM_UUID', 'UUID_STRING', 'IS_UUID',
-                            // Binary/Bit functions
-                            'BIT_COUNT', 'HEX', 'UNHEX', 'ENCODE', 'DECODE'];
+            'TRIM', 'LTRIM', 'RTRIM', 'CONCAT', 'REPLACE', 'ABS', 'ROUND', 'CEIL',
+            'CEILING', 'FLOOR', 'MOD', 'POWER', 'POW', 'SQRT',
+            // Date/Time functions
+            'NOW', 'CURRENT_DATE', 'CURRENT_TIME', 'CURRENT_TIMESTAMP',
+            'DATE', 'TIME', 'STRFTIME', 'DATE_DIFF', 'DATE_ADD', 'DATE_SUB',
+            'EXTRACT', 'YEAR', 'MONTH', 'DAY', 'HOUR', 'MINUTE', 'SECOND',
+            // Additional string functions
+            'SPLIT', 'LEFT', 'RIGHT', 'LPAD', 'RPAD', 'POSITION', 'INSTR', 'REPEAT', 'REVERSE',
+            // Conditional functions
+            'GREATEST', 'LEAST', 'IIF', 'IF',
+            // Additional math functions
+            'LOG', 'LOG10', 'LN', 'EXP', 'SIN', 'COS', 'TAN', 'ASIN', 'ACOS', 'ATAN', 'ATAN2',
+            'PI', 'RANDOM', 'RAND', 'SIGN', 'DEGREES', 'RADIANS', 'TRUNCATE', 'TRUNC',
+            // REGEXP functions
+            'REGEXP_MATCHES', 'REGEXP_REPLACE', 'REGEXP_EXTRACT', 'REGEXP_SUBSTR',
+            'REGEXP_SPLIT', 'REGEXP_COUNT',
+            // JSON functions
+            'JSON_EXTRACT', 'JSON_VALUE', 'JSON_OBJECT', 'JSON_ARRAY',
+            'JSON_KEYS', 'JSON_LENGTH', 'JSON_TYPE', 'JSON_VALID',
+            // Array functions
+            'ARRAY_LENGTH', 'ARRAY_CONTAINS', 'ARRAY_POSITION', 'ARRAY_APPEND',
+            'ARRAY_REMOVE', 'ARRAY_SLICE', 'ARRAY_CONCAT', 'UNNEST',
+            // UUID functions
+            'UUID', 'GEN_RANDOM_UUID', 'UUID_STRING', 'IS_UUID',
+            // Binary/Bit functions
+            'BIT_COUNT', 'HEX', 'UNHEX', 'ENCODE', 'DECODE'];
         if (this.peek().type === TokenType.IDENTIFIER) {
             const funcName = this.peek().value.toUpperCase();
             if (scalarFuncs.includes(funcName)) {
@@ -1151,7 +1151,7 @@ class SQLParser {
 
         // Tokens that can also be function names (Date/Time: YEAR, MONTH, etc.; String: LEFT, RIGHT)
         const funcTokens = [TokenType.YEAR, TokenType.MONTH, TokenType.DAY, TokenType.HOUR, TokenType.MINUTE, TokenType.SECOND,
-                           TokenType.LEFT, TokenType.RIGHT];
+        TokenType.LEFT, TokenType.RIGHT];
         for (const funcType of funcTokens) {
             if (this.peek().type === funcType) {
                 const funcName = this.advance().type.toLowerCase();
@@ -1556,4 +1556,4 @@ class SQLParser {
 
 // SQL Executor helper - get column value from row
 
-export { SQLParser };
+

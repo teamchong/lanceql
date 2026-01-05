@@ -1,6 +1,7 @@
 /**
  * LocalDatabase - OPFS-backed local database with join optimization
  */
+import { workerRPC } from '../rpc/worker-rpc.js';
 
 class OPFSJoinExecutor {
     constructor(storage = opfsStorage) {
@@ -61,7 +62,7 @@ class OPFSJoinExecutor {
             ];
 
             // Helper to yield a chunk
-            const yieldChunk = function*(chunk) {
+            const yieldChunk = function* (chunk) {
                 if (chunk.length > 0) {
                     yield { columns: resultColumns, rows: chunk.splice(0) };
                 }

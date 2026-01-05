@@ -1,6 +1,7 @@
 /**
  * Store - Client-side key-value store (IndexedDB + OPFS)
  */
+import { workerRPC } from '../rpc/worker-rpc.js';
 
 class Store {
     /**
@@ -63,7 +64,7 @@ class Store {
         // Session mode cleanup
         if (this._sessionMode && typeof window !== 'undefined') {
             window.addEventListener('beforeunload', () => {
-                this.clear().catch(() => {});
+                this.clear().catch(() => { });
             });
         }
 
@@ -183,7 +184,7 @@ class Store {
      */
     subscribe(key, callback) {
         console.warn('[Store] subscribe() not yet implemented');
-        return () => {};
+        return () => { };
     }
 
     /**

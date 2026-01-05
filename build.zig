@@ -1013,6 +1013,7 @@ pub fn build(b: *std.Build) void {
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
+        .cpu_features_add = std.Target.wasm.featureSet(&.{.simd128}),
     });
 
     const wasm = b.addExecutable(.{

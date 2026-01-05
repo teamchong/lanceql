@@ -1641,7 +1641,6 @@
                         <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') NEAR 'cat'">NEAR 'cat'</button>
                         <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/translations.lance') LIMIT 50" title="Translations dataset">Translations</button>
                         <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance', 1) LIMIT 50">Version 1</button>
-                        <button class="sql-example" id="create-demo-join-table" title="Create small in-memory table for JOIN demo" style="background: #059669;">+ Demo JOIN Table</button>
                         <button class="sql-example copy-link-btn" id="copy-link-btn" title="Copy shareable link">
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
@@ -5852,59 +5851,6 @@
                 runSqlQuery();
             });
         });
-        
-        // Create demo JOIN table for testing
-        let demoTableDb = null;
-
-        async function createDemoJoinTable() {
-            const btn = document.getElementById('create-demo-join-table');
-            btn.disabled = true;
-            btn.textContent = 'Creating...';
-
-            try {
-                showStatus('Creating demo translations table...', 'info');
-
-                if (!demoTableDb) {
-                    demoTableDb = new LocalDatabase();
-                }
-
-                await demoTableDb.exec("CREATE TABLE IF NOT EXISTS translations (row_id INT, text_zh TEXT, text_es TEXT)");
-
-                const demoData = [];
-                for (let i = 0; i < 100; i++) {
-                    const zh = `[ZH] Translation ${i}`;
-                    const es = `[ES] Traducción ${i}`;
-                    demoData.push(`(${i}, '${zh}', '${es}')`);
-                }
-
-                const insertSql = `INSERT INTO translations VALUES ${demoData.join(', ')}`;
-                await demoTableDb.exec(insertSql);
-
-                registerTable('translations', {
-                    type: 'memory',
-                    database: demoTableDb,
-                    rows: 100,
-                    cols: 3
-                });
-
-                showStatus('Demo table created! Try: SELECT i.text, t.text_zh FROM read_lance(...) i JOIN translations t ON i.rowid = t.row_id LIMIT 10', 'success');
-
-                btn.textContent = '✓ Table Created';
-                btn.style.background = '#22c55e';
-
-                const sqlInput = document.getElementById('sql-input');
-                sqlInput.value = "SELECT i.text, i.aesthetic, t.text_zh, t.text_es\nFROM read_lance('https://data.metal0.dev/laion-1m/images.lance') i\nJOIN translations t ON i.rowid = t.row_id\nLIMIT 20";
-                document.getElementById('sql-highlight').innerHTML = highlightSQL(sqlInput.value) + '\n';
-
-            } catch (error) {
-                showStatus(`Error creating demo table: ${error.message}`, 'error');
-                btn.disabled = false;
-                btn.textContent = '+ Demo JOIN Table';
-                btn.style.background = '#059669';
-            }
-        }
-
-        document.getElementById('create-demo-join-table')?.addEventListener('click', createDemoJoinTable);
 
         // Initialize
         init();

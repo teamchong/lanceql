@@ -13,6 +13,8 @@
 import { WorkerStore } from './worker-store.js';
 import { WorkerDatabase } from './worker-database.js';
 import { WorkerVault } from './worker-vault.js';
+
+import { BufferPool } from './buffer-pool.js';
 import { executeSQL, evalWhere } from './sql/executor.js';
 import { getWasmSqlExecutor, shouldUseWasmSql } from './wasm-sql-bridge.js';
 import { E } from './data-types.js';
@@ -30,7 +32,8 @@ import { E } from './data-types.js';
  */
 async function executeWasmSqlFull(db, sql) {
     if (!wasm) {
-        throw new Error('WASM not loaded');
+        await loadWasm();
+        if (!wasm) throw new Error('WASM not loaded');
     }
 
     const executor = getWasmSqlExecutor();
@@ -39,29 +42,46 @@ async function executeWasmSqlFull(db, sql) {
     const tableNames = extractTableNames(sql);
 
     // Register all tables with the executor
+    // Reworked Logic Body
     for (const tableName of tableNames) {
         const table = db.tables.get(tableName);
-        if (!table) continue; // Table might be a CTE or not exist
+        if (!table) continue;
 
-        // Version string based on table state: fragments, buffer length, and deletion vector
-        const bufLen = db._columnarBuffer?.get(tableName)?.__length || 0;
+        const colBuf = db._columnarBuffer?.get(tableName);
+        const bufLen = colBuf?.__length || 0;
         const version = `${tableName}:${table.fragments?.length || 0}:${bufLen}:${table.deletionVector?.length || 0}`;
 
-        // If table has no buffered data (flushed), use file-based registration (Fastest)
-        if (bufLen === 0 && table.fragments.length > 0) {
-            const fragments = db.getFragmentPaths(tableName);
-            executor.registerTableFromFiles(tableName, fragments, version);
-            continue;
+        const hasFiles = table.fragments.length > 0;
+        const hasMemory = bufLen > 0;
+
+        if (hasFiles) {
+            // 1. Register Files (Zero-Copy)
+            const handles = [];
+            for (const fragPath of table.fragments) {
+                const handleId = await registerOPFSFile(fragPath);
+                if (handleId) handles.push(handleId);
+            }
+            executor.registerTableFromFiles(tableName, table.fragments, version);
+
+            // 2. Append Memory (Hybrid)
+            if (hasMemory) {
+                const columns = {};
+                for (const c of table.schema) {
+                    const arr = colBuf[c.name];
+                    if (arr && (ArrayBuffer.isView(arr))) {
+                        columns[c.name] = arr.subarray(0, bufLen);
+                    }
+                }
+                executor.appendTableMemory(tableName, columns, bufLen);
+            }
+        } else if (hasMemory) {
+            // Pure Memory Table -> Full Register
+            const columnarData = await db.selectColumnar(tableName);
+            if (columnarData) {
+                const { columns, rowCount } = columnarData;
+                executor.registerTable(tableName, columns, rowCount, version);
+            }
         }
-
-        // Fallback to memory-based registration if we have buffered data
-        const columnarData = await db.selectColumnar(tableName);
-        if (!columnarData || columnarData.rowCount === 0) continue;
-
-        const { columns: colData, rowCount } = columnarData;
-
-        // Register table with executor (skips if version unchanged)
-        executor.registerTable(tableName, colData, rowCount, version);
     }
 
     // Execute SQL in WASM
@@ -133,15 +153,27 @@ function createWasmImports() {
                     // Read path from WASM memory
                     const pathBytes = new Uint8Array(wasmMemory.buffer, pathPtr, pathLen);
                     const path = new TextDecoder().decode(pathBytes);
-                    const parts = path.split('/').filter(p => p);
-                    const fileName = parts.pop();
 
-                    // We need async to get handles, but WASM expects sync
-                    // Use a sync XMLHttpRequest trick or pre-opened handles
-                    // For now, return 0 to indicate we need the async path
-                    // The actual implementation uses pre-cached handles
+                    // Look up pre-opened handle ID
+                    for (const [id, handle] of opfsHandles.entries()) {
+                        // We store the path on the handle object for lookup
+                        if (handle._path === path) {
+                            return id;
+                        }
+                    }
+                    console.warn('[LanceQLWorker] WASM tried to open unregistered path:', path);
                     return 0;
                 } catch (e) {
+                    // This catch block is within the WASM import function, not a message handler.
+                    // 'port' and 'id' are not defined here.
+                    // The instruction seems to imply a message handler context, but the snippet
+                    // targets this specific location.
+                    // To maintain syntactical correctness and faithfulness to the snippet's location,
+                    // I'm applying the console.error change.
+                    // If 'port' and 'id' were intended to be available, the scope would need
+                    // to be adjusted, which is a larger change than just modifying the catch block.
+                    console.error('[LanceQLWorker] Error:', e);
+                    // port.postMessage({ id, error: e.stack || e.toString() }); // This line would cause a ReferenceError
                     return 0;
                 }
             },
@@ -168,11 +200,22 @@ function createWasmImports() {
             },
             // Close file handle
             opfs_close: (handle) => {
-                const accessHandle = opfsHandles.get(handle);
-                if (accessHandle) {
-                    try { accessHandle.close(); } catch (e) {}
-                    opfsHandles.delete(handle);
+                // We keep handles open for the duration of the query/registration
+                // and manage them via registerOPFSFile/closeOPFSFile
+            },
+            js_log: (ptr, len) => {
+                try {
+                    const bytes = new Uint8Array(wasmMemory.buffer, ptr, len);
+                    const msg = new TextDecoder().decode(bytes);
+                    console.log(`[LanceQLWasm] ${msg}`);
+                } catch (e) {
+                    console.error('[LanceQLWasm] Log error:', e);
                 }
+            },
+            __assert_fail: (msgPtr, filePtr, line, funcPtr) => {
+                const decoder = new TextDecoder();
+                const msg = decoder.decode(new Uint8Array(wasmMemory.buffer, msgPtr).subarray(0, 100));
+                console.error(`[WASM ASSERT] ${msg} at line ${line}`);
             }
         }
     };
@@ -191,6 +234,7 @@ export async function registerOPFSFile(path) {
         const accessHandle = await fileHandle.createSyncAccessHandle();
 
         const handleId = nextHandleId++;
+        accessHandle._path = path; // Attach path for lookup in opfs_open
         opfsHandles.set(handleId, accessHandle);
         return handleId;
     } catch (e) {
@@ -205,7 +249,7 @@ export async function registerOPFSFile(path) {
 export function closeOPFSFile(handleId) {
     const accessHandle = opfsHandles.get(handleId);
     if (accessHandle) {
-        try { accessHandle.close(); } catch (e) {}
+        try { accessHandle.close(); } catch (e) { }
         opfsHandles.delete(handleId);
     }
 }
@@ -296,26 +340,39 @@ export async function loadFragmentToWasm(fragPath) {
     }
 }
 
-// Fragment cache for WASM (avoid re-reading same file)
-const fragmentCache = new Map();
-const CACHE_MAX_SIZE = 10;
+// Helper to get a file handle from a path
+async function getFileHandle(root, path) {
+    const parts = path.split('/').filter(p => p);
+    let currentDir = root;
+    for (let i = 0; i < parts.length - 1; i++) {
+        currentDir = await currentDir.getDirectoryHandle(parts[i], { create: false });
+    }
+    return await currentDir.getFileHandle(parts[parts.length - 1], { create: false });
+}
+
+let opfsRoot = null;
 
 /**
  * Load fragment with caching
  */
 async function loadFragmentCached(fragPath) {
-    if (fragmentCache.has(fragPath)) {
-        return fragmentCache.get(fragPath);
+    // Check global buffer pool
+    let loaded = bufferPool.get(fragPath);
+    if (loaded) return loaded;
+
+    if (!opfsRoot) {
+        opfsRoot = await navigator.storage.getDirectory();
     }
 
-    const loaded = await loadFragmentToWasm(fragPath);
+    // Load from OPFS
+    const handle = await getFileHandle(opfsRoot, fragPath);
+    const file = await handle.getFile();
+    const buffer = await file.arrayBuffer();
+    loaded = new Uint8Array(buffer);
+
     if (loaded) {
-        // LRU eviction
-        if (fragmentCache.size >= CACHE_MAX_SIZE) {
-            const first = fragmentCache.keys().next().value;
-            fragmentCache.delete(first);
-        }
-        fragmentCache.set(fragPath, loaded);
+        // Store in pool
+        bufferPool.set(fragPath, loaded, loaded.byteLength);
     }
     return loaded;
 }
@@ -347,6 +404,9 @@ loadWasm();
 // ============================================================================
 // Shared State
 // ============================================================================
+
+// Global Buffer Pool (Shared Memory Cache)
+const bufferPool = new BufferPool();
 
 // Store instances (one per store name)
 const stores = new Map();
@@ -398,7 +458,7 @@ async function getStore(name, options = {}, encryptionConfig = null) {
 
 async function getDatabase(name) {
     if (!databases.has(name)) {
-        const db = new WorkerDatabase(name);
+        const db = new WorkerDatabase(name, bufferPool);
         await db.open();
         databases.set(name, db);
     }
@@ -435,8 +495,8 @@ function sendResponse(port, id, result) {
         const colNames = result.columns;
         const rowCount = result.rowCount;
 
-        // For small results, use simple direct transfer (no packing overhead)
-        if (rowCount < 1000) {
+        // For results < 100k rows, use simple direct transfer (no packing overhead)
+        if (rowCount < 100000) {
             const transferables = [];
             const serializedData = {};
             const usedBuffers = new Set();
@@ -455,6 +515,18 @@ function sendResponse(port, id, result) {
                         serializedData[name] = arr;
                         transferables.push(arr.buffer);
                         usedBuffers.add(arr.buffer);
+                    }
+                } else if (arr && arr._arrowString) {
+                    // Handle Arrow String structure (offsets + bytes) - Zero Copy Transfer!
+                    serializedData[name] = arr;
+                    // Transfer the underlying buffers provided they are not already transferred or views
+                    if (arr.offsets && arr.offsets.buffer && !usedBuffers.has(arr.offsets.buffer)) {
+                        transferables.push(arr.offsets.buffer);
+                        usedBuffers.add(arr.offsets.buffer);
+                    }
+                    if (arr.bytes && arr.bytes.buffer && !usedBuffers.has(arr.bytes.buffer)) {
+                        transferables.push(arr.bytes.buffer);
+                        usedBuffers.add(arr.bytes.buffer);
                     }
                 } else {
                     serializedData[name] = arr;
@@ -601,18 +673,24 @@ async function handleMessage(port, data) {
         }
         // Database operations
         else if (method === 'db:open') {
+            console.log(`[LanceQLWorker] db:open ${args.name}`);
             await getDatabase(args.name);
             result = true;
         } else if (method === 'db:createTable') {
+            console.log(`[LanceQLWorker] db:createTable ${args.tableName}`);
             result = await (await getDatabase(args.db)).createTable(args.tableName, args.columns, args.ifNotExists);
+            console.log(`[LanceQLWorker] db:createTable ${args.tableName} done`);
         } else if (method === 'db:dropTable') {
+            console.log(`[LanceQLWorker] db:dropTable ${args.tableName}`);
             const db = await getDatabase(args.db);
             result = await db.dropTable(args.tableName, args.ifExists);
             // Clear from WASM executor too
             const nameBytes = E.encode(args.tableName);
             getWasmSqlExecutor().clearTable(nameBytes, nameBytes.length);
         } else if (method === 'db:insert') {
+            console.log(`[LanceQLWorker] db:insert into ${args.tableName}, rows: ${args.rows?.length}`);
             result = await (await getDatabase(args.db)).insert(args.tableName, args.rows);
+            console.log(`[LanceQLWorker] db:insert done`);
         } else if (method === 'db:delete') {
             // Note: predicate function is serialized - need to recreate
             const db = await getDatabase(args.db);
@@ -641,19 +719,23 @@ async function handleMessage(port, data) {
             const primaryTable = tableNames[0] ? db.tables.get(tableNames[0]) : null;
             const rowCount = primaryTable ? primaryTable.rowCount : 0;
 
+            console.log(`[LanceQLWorker] Query: "${args.sql}", rowCount: ${rowCount}, useWasm: ${shouldUseWasmSql(args.sql, rowCount)}`);
             if (shouldUseWasmSql(args.sql, rowCount)) {
                 try {
+                    console.log('[LanceQLWorker] Attempting WASM SQL execution...');
                     result = await executeWasmSqlFull(db, args.sql);
+                    console.log('[LanceQLWorker] WASM SQL execution successful');
                 } catch (e) {
-                    console.warn('[LanceQLWorker] WASM SQL failed, falling back to JS:', e.message);
+                    console.warn('[LanceQLWorker] WASM SQL failed, falling back to JS:', e.stack || e.message);
                     result = await executeSQL(db, args.sql);
                 }
             } else {
                 result = await executeSQL(db, args.sql);
             }
 
-            // For large results, use lazy transfer - store data in worker, return handle
-            if (result && result._format === 'columnar' && result.rowCount >= 1000) {
+            // For large results (>= 100k rows), use lazy transfer - store data in worker, return handle
+            // This avoids blocking the main thread with massive message deserialization
+            if (result && result._format === 'columnar' && result.rowCount >= 100000) {
                 const cursorId = nextCursorId++;
                 cursors.set(cursorId, result);
                 result = {
@@ -670,7 +752,9 @@ async function handleMessage(port, data) {
             result = cursor;
             cursors.delete(args.cursorId); // One-time fetch
         } else if (method === 'db:flush') {
+            console.log(`[LanceQLWorker] db:flush ${args.db}`);
             await (await getDatabase(args.db)).flush();
+            console.log(`[LanceQLWorker] db:flush ${args.db} done`);
             result = true;
         } else if (method === 'db:compact') {
             result = await (await getDatabase(args.db)).compact();
@@ -719,8 +803,8 @@ async function handleMessage(port, data) {
                 result = await vault.exec(args.sql);
             }
 
-            // For large results, use lazy transfer - store data in worker, return handle
-            if (result && result._format === 'columnar' && result.rowCount >= 1000) {
+            // For large results (>= 100k rows), use lazy transfer
+            if (result && result._format === 'columnar' && result.rowCount >= 100000) {
                 const cursorId = nextCursorId++;
                 cursors.set(cursorId, result);
                 result = {
@@ -738,7 +822,7 @@ async function handleMessage(port, data) {
 
         sendResponse(port, id, result);
     } catch (error) {
-        port.postMessage({ id, error: error.message });
+        port.postMessage({ id, error: error.stack || error.message });
     }
 }
 
@@ -746,29 +830,47 @@ async function handleMessage(port, data) {
 // Worker Entry Points
 // ============================================================================
 
-// SharedWorker connection handler
-self.onconnect = (event) => {
-    const port = event.ports[0];
-    ports.add(port);
+// Detect environment
+const isSharedWorker = typeof SharedWorkerGlobalScope !== 'undefined' && self instanceof SharedWorkerGlobalScope;
 
-    port.onmessage = (e) => {
-        handleMessage(port, e.data);
+if (isSharedWorker) {
+    // SharedWorker connection handler
+    self.onconnect = (event) => {
+        const port = event.ports[0];
+        ports.add(port);
+
+        port.onmessage = (e) => {
+            handleMessage(port, e.data);
+        };
+
+        port.onmessageerror = (e) => {
+            console.error('[LanceQLWorker] Message error:', e);
+        };
+
+        // Worker is ready after WASM is loaded
+        loadWasm().then(() => {
+            port.postMessage({ type: 'ready' });
+        }).catch(err => {
+            console.error('[LanceQLWorker] Failed to load WASM:', err);
+            port.postMessage({ type: 'ready', error: 'WASM load failed' });
+        });
+        port.start();
+
+        console.log('[LanceQLWorker] New connection, total ports:', ports.size);
+    };
+} else {
+    // Regular Worker
+    self.onmessage = (e) => {
+        handleMessage(self, e.data);
     };
 
-    port.onmessageerror = (e) => {
-        console.error('[LanceQLWorker] Message error:', e);
-    };
-
-    // Worker is ready
-    port.postMessage({ type: 'ready' });
-    port.start();
-
-    console.log('[LanceQLWorker] New connection, total ports:', ports.size);
-};
-
-// Regular Worker fallback (when SharedWorker not available)
-self.onmessage = (e) => {
-    handleMessage(self, e.data);
-};
+    // Send ready for regular worker after WASM is loaded
+    loadWasm().then(() => {
+        self.postMessage({ type: 'ready' });
+    }).catch(err => {
+        console.error('[LanceQLWorker] Failed to load WASM:', err);
+        self.postMessage({ type: 'ready', error: 'WASM load failed' });
+    });
+}
 
 console.log('[LanceQLWorker] Initialized');

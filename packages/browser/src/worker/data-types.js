@@ -89,7 +89,7 @@ export class LanceFileWriter {
         if (this.rowCount === 0) {
             for (const col of this.schema) {
                 const TypedArray = getTypedArrayForType(col.dataType);
-                if (TypedArray && TypedArray !== BigInt64Array) {
+                if (TypedArray) {
                     // Pre-allocate typed array (will grow if needed)
                     this.columns.set(col.name, {
                         type: 'typed',
@@ -157,6 +157,7 @@ export class LanceFileWriter {
             const column = this.columns.get(col.name);
             const nameBytes = E.encode(col.name);
             const typeCode = getTypeCode(col.dataType);
+            // console.log(`[LanceFileWriter] col=${col.name} dataType=${col.dataType} typeCode=${typeCode}`);
 
             let dataBytes;
             if (column.type === 'typed') {
@@ -169,7 +170,11 @@ export class LanceFileWriter {
             }
 
             columnChunks.push({ nameBytes, typeCode, dataBytes, dataType: col.dataType });
-            totalSize += 4 + nameBytes.length + 1 + 4 + dataBytes.length;
+
+            // Calculate padding for this column's data
+            const currentOffsetWithoutPadding = totalSize + 4 + nameBytes.length + 1;
+            const padding = (8 - (currentOffsetWithoutPadding + 4) % 8) % 8;
+            totalSize += 4 + nameBytes.length + 1 + padding + 4 + dataBytes.length;
         }
 
         // Build binary buffer
@@ -200,6 +205,13 @@ export class LanceFileWriter {
             view.setUint8(offset, chunk.typeCode);
             offset += 1;
 
+            // Padding for 8-byte alignment of data
+            const padding = (8 - (offset + 4) % 8) % 8;
+            for (let i = 0; i < padding; i++) {
+                view.setUint8(offset + i, 0);
+            }
+            offset += padding;
+
             // Data
             view.setUint32(offset, chunk.dataBytes.length, false);
             offset += 4;
@@ -223,7 +235,7 @@ export class LanceFileWriter {
             if (!arr) continue;
 
             const TypedArray = getTypedArrayForType(col.dataType);
-            if (TypedArray && TypedArray !== BigInt64Array && ArrayBuffer.isView(arr)) {
+            if (TypedArray && ArrayBuffer.isView(arr)) {
                 // Already a typed array - use directly
                 this.columns.set(col.name, {
                     type: 'typed',
@@ -231,7 +243,7 @@ export class LanceFileWriter {
                     data: arr,
                     length: arr.length
                 });
-            } else if (TypedArray && TypedArray !== BigInt64Array) {
+            } else if (TypedArray) {
                 // Convert plain array to typed array
                 const typedArr = new TypedArray(arr.length);
                 for (let i = 0; i < arr.length; i++) {
@@ -321,6 +333,10 @@ export function parseBinaryColumnar(buffer) {
         const typeCode = view.getUint8(offset);
         offset += 1;
 
+        // Skip padding
+        const padding = (8 - (offset + 4) % 8) % 8;
+        offset += padding;
+
         // Data
         const dataLen = view.getUint32(offset, false);
         offset += 4;
@@ -329,25 +345,50 @@ export function parseBinaryColumnar(buffer) {
 
         // Parse based on type
         let data, dataType;
-        switch (typeCode) {
-            case TYPE_INT32:
-                dataType = 'int32';
-                data = new Int32Array(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength / 4);
-                break;
-            case TYPE_FLOAT32:
-                dataType = 'float32';
-                data = new Float32Array(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength / 4);
-                break;
-            case TYPE_FLOAT64:
-                dataType = 'float64';
-                data = new Float64Array(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength / 8);
-                break;
-            case TYPE_STRING:
-            case TYPE_BOOL:
-            default:
-                dataType = typeCode === TYPE_BOOL ? 'bool' : 'string';
-                data = JSON.parse(D.decode(dataBytes));
-                break;
+        try {
+            switch (typeCode) {
+                case TYPE_INT32:
+                    dataType = 'int32';
+                    if (dataBytes.byteOffset % 4 !== 0) {
+                        data = new Int32Array(dataBytes.slice().buffer);
+                    } else {
+                        data = new Int32Array(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength / 4);
+                    }
+                    break;
+                case TYPE_FLOAT32:
+                    dataType = 'float32';
+                    if (dataBytes.byteOffset % 4 !== 0) {
+                        data = new Float32Array(dataBytes.slice().buffer);
+                    } else {
+                        data = new Float32Array(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength / 4);
+                    }
+                    break;
+                case TYPE_FLOAT64:
+                    dataType = 'float64';
+                    if (dataBytes.byteOffset % 8 !== 0) {
+                        data = new Float64Array(dataBytes.slice().buffer);
+                    } else {
+                        data = new Float64Array(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength / 8);
+                    }
+                    break;
+                case TYPE_INT64:
+                    dataType = 'int64';
+                    if (dataBytes.byteOffset % 8 !== 0) {
+                        data = new BigInt64Array(dataBytes.slice().buffer);
+                    } else {
+                        data = new BigInt64Array(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength / 8);
+                    }
+                    break;
+                case TYPE_STRING:
+                case TYPE_BOOL:
+                default:
+                    dataType = typeCode === TYPE_BOOL ? 'bool' : 'string';
+                    data = JSON.parse(D.decode(dataBytes));
+                    break;
+            }
+        } catch (e) {
+            console.error(`[LanceQLWorker] Error parsing column '${name}' (type ${typeCode}, len ${dataLen}):`, e);
+            throw e;
         }
 
         schema.push({ name, dataType });

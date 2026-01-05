@@ -71,8 +71,8 @@ var WorkerStore = class {
       this._encryptionKeyId = keyId;
     }
     try {
-      const opfsRoot = await navigator.storage.getDirectory();
-      this._root = await opfsRoot.getDirectoryHandle(`lanceql-${this.name}`, { create: true });
+      const opfsRoot2 = await navigator.storage.getDirectory();
+      this._root = await opfsRoot2.getDirectoryHandle(`lanceql-${this.name}`, { create: true });
       this._ready = true;
     } catch (e) {
       console.error("[WorkerStore] Failed to open OPFS:", e);
@@ -360,8 +360,8 @@ var OPFSStorage = class {
     if (typeof navigator === "undefined" || !navigator.storage?.getDirectory) {
       throw new Error("OPFS not available");
     }
-    const opfsRoot = await navigator.storage.getDirectory();
-    this.root = await opfsRoot.getDirectoryHandle(this.rootDir, { create: true });
+    const opfsRoot2 = await navigator.storage.getDirectory();
+    this.root = await opfsRoot2.getDirectoryHandle(this.rootDir, { create: true });
     return this.root;
   }
   async open() {
@@ -536,7 +536,7 @@ var LanceFileWriter = class {
     if (this.rowCount === 0) {
       for (const col of this.schema) {
         const TypedArray = getTypedArrayForType(col.dataType);
-        if (TypedArray && TypedArray !== BigInt64Array) {
+        if (TypedArray) {
           this.columns.set(col.name, {
             type: "typed",
             dataType: col.dataType,
@@ -599,7 +599,9 @@ var LanceFileWriter = class {
         dataBytes = E.encode(JSON.stringify(column.data));
       }
       columnChunks.push({ nameBytes, typeCode, dataBytes, dataType: col.dataType });
-      totalSize += 4 + nameBytes.length + 1 + 4 + dataBytes.length;
+      const currentOffsetWithoutPadding = totalSize + 4 + nameBytes.length + 1;
+      const padding = (8 - (currentOffsetWithoutPadding + 4) % 8) % 8;
+      totalSize += 4 + nameBytes.length + 1 + padding + 4 + dataBytes.length;
     }
     const buffer = new ArrayBuffer(totalSize);
     const view = new DataView(buffer);
@@ -620,6 +622,11 @@ var LanceFileWriter = class {
       offset += chunk.nameBytes.length;
       view.setUint8(offset, chunk.typeCode);
       offset += 1;
+      const padding = (8 - (offset + 4) % 8) % 8;
+      for (let i = 0; i < padding; i++) {
+        view.setUint8(offset + i, 0);
+      }
+      offset += padding;
       view.setUint32(offset, chunk.dataBytes.length, false);
       offset += 4;
       bytes.set(chunk.dataBytes, offset);
@@ -638,14 +645,14 @@ var LanceFileWriter = class {
       const arr = columnarData[col.name];
       if (!arr) continue;
       const TypedArray = getTypedArrayForType(col.dataType);
-      if (TypedArray && TypedArray !== BigInt64Array && ArrayBuffer.isView(arr)) {
+      if (TypedArray && ArrayBuffer.isView(arr)) {
         this.columns.set(col.name, {
           type: "typed",
           dataType: col.dataType,
           data: arr,
           length: arr.length
         });
-      } else if (TypedArray && TypedArray !== BigInt64Array) {
+      } else if (TypedArray) {
         const typedArr = new TypedArray(arr.length);
         for (let i = 0; i < arr.length; i++) {
           typedArr[i] = arr[i] ?? 0;
@@ -714,30 +721,57 @@ function parseBinaryColumnar(buffer) {
     offset += nameLen;
     const typeCode = view.getUint8(offset);
     offset += 1;
+    const padding = (8 - (offset + 4) % 8) % 8;
+    offset += padding;
     const dataLen = view.getUint32(offset, false);
     offset += 4;
     const dataBytes = bytes.subarray(offset, offset + dataLen);
     offset += dataLen;
     let data, dataType;
-    switch (typeCode) {
-      case TYPE_INT32:
-        dataType = "int32";
-        data = new Int32Array(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength / 4);
-        break;
-      case TYPE_FLOAT32:
-        dataType = "float32";
-        data = new Float32Array(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength / 4);
-        break;
-      case TYPE_FLOAT64:
-        dataType = "float64";
-        data = new Float64Array(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength / 8);
-        break;
-      case TYPE_STRING:
-      case TYPE_BOOL:
-      default:
-        dataType = typeCode === TYPE_BOOL ? "bool" : "string";
-        data = JSON.parse(D.decode(dataBytes));
-        break;
+    try {
+      switch (typeCode) {
+        case TYPE_INT32:
+          dataType = "int32";
+          if (dataBytes.byteOffset % 4 !== 0) {
+            data = new Int32Array(dataBytes.slice().buffer);
+          } else {
+            data = new Int32Array(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength / 4);
+          }
+          break;
+        case TYPE_FLOAT32:
+          dataType = "float32";
+          if (dataBytes.byteOffset % 4 !== 0) {
+            data = new Float32Array(dataBytes.slice().buffer);
+          } else {
+            data = new Float32Array(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength / 4);
+          }
+          break;
+        case TYPE_FLOAT64:
+          dataType = "float64";
+          if (dataBytes.byteOffset % 8 !== 0) {
+            data = new Float64Array(dataBytes.slice().buffer);
+          } else {
+            data = new Float64Array(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength / 8);
+          }
+          break;
+        case TYPE_INT64:
+          dataType = "int64";
+          if (dataBytes.byteOffset % 8 !== 0) {
+            data = new BigInt64Array(dataBytes.slice().buffer);
+          } else {
+            data = new BigInt64Array(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength / 8);
+          }
+          break;
+        case TYPE_STRING:
+        case TYPE_BOOL:
+        default:
+          dataType = typeCode === TYPE_BOOL ? "bool" : "string";
+          data = JSON.parse(D.decode(dataBytes));
+          break;
+      }
+    } catch (e) {
+      console.error(`[LanceQLWorker] Error parsing column '${name}' (type ${typeCode}, len ${dataLen}):`, e);
+      throw e;
     }
     schema.push({ name, dataType });
     columns[name] = data;
@@ -745,15 +779,141 @@ function parseBinaryColumnar(buffer) {
   return { schema, columns, rowCount, format: "binary" };
 }
 
+// src/worker/buffer-pool.js
+var BufferPool = class {
+  /**
+   * @param {number} maxBytes - Maximum memory in bytes (default 512MB)
+   */
+  constructor(maxBytes = 512 * 1024 * 1024) {
+    this.maxBytes = maxBytes;
+    this.currentBytes = 0;
+    this.cache = /* @__PURE__ */ new Map();
+    this.head = null;
+    this.tail = null;
+  }
+  /**
+   * Get an item from the pool. Updates recency.
+   * @param {string} key
+   * @returns {any} value or undefined
+   */
+  get(key) {
+    const node = this.cache.get(key);
+    if (!node) return void 0;
+    this._moveToHead(node);
+    return node.value;
+  }
+  /**
+   * Add or update an item in the pool. Evicts if necessary.
+   * @param {string} key
+   * @param {any} value
+   * @param {number} size - Approximate size in bytes
+   */
+  set(key, value, size = 0) {
+    const existingNode = this.cache.get(key);
+    if (existingNode) {
+      this.currentBytes -= existingNode.size;
+      this.currentBytes += size;
+      existingNode.value = value;
+      existingNode.size = size;
+      this._moveToHead(existingNode);
+    } else {
+      const newNode = { key, value, size, prev: null, next: null };
+      this.cache.set(key, newNode);
+      this._addToHead(newNode);
+      this.currentBytes += size;
+    }
+    this._evictIfNeeded();
+  }
+  /**
+   * Check if a key exists without updating recency.
+   * @param {string} key
+   */
+  has(key) {
+    return this.cache.has(key);
+  }
+  /**
+   * Remove an item from the pool.
+   * @param {string} key
+   */
+  delete(key) {
+    const node = this.cache.get(key);
+    if (node) {
+      this._removeNode(node);
+      this.cache.delete(key);
+      this.currentBytes -= node.size;
+    }
+  }
+  /**
+   * Clear the pool.
+   */
+  clear() {
+    this.cache.clear();
+    this.head = null;
+    this.tail = null;
+    this.currentBytes = 0;
+  }
+  _moveToHead(node) {
+    if (node === this.head) return;
+    this._removeNode(node);
+    this._addToHead(node);
+  }
+  _addToHead(node) {
+    node.next = this.head;
+    node.prev = null;
+    if (this.head) {
+      this.head.prev = node;
+    }
+    this.head = node;
+    if (!this.tail) {
+      this.tail = node;
+    }
+  }
+  _removeNode(node) {
+    if (node.prev) {
+      node.prev.next = node.next;
+    } else {
+      this.head = node.next;
+    }
+    if (node.next) {
+      node.next.prev = node.prev;
+    } else {
+      this.tail = node.prev;
+    }
+  }
+  _evictIfNeeded() {
+    while (this.currentBytes > this.maxBytes && this.tail) {
+      const node = this.tail;
+      this._removeNode(node);
+      this.cache.delete(node.key);
+      this.currentBytes -= node.size;
+    }
+  }
+  /**
+   * Helper to estimate size of common objects
+   * @param {any} val
+   * @returns {number}
+   */
+  static estimateSize(val) {
+    if (!val) return 0;
+    if (val.byteLength) return val.byteLength;
+    if (Array.isArray(val)) {
+      return val.length * 100;
+    }
+    if (val.buffer && val.buffer.byteLength) return val.buffer.byteLength;
+    return 1e3;
+  }
+};
+
 // src/worker/worker-database.js
 var scanStreams = /* @__PURE__ */ new Map();
 var nextScanId = 1;
 var WorkerDatabase = class {
-  constructor(name) {
+  constructor(name, bufferPool2) {
     this.name = name;
     this.tables = /* @__PURE__ */ new Map();
     this.version = 0;
     this.manifestKey = `${name}/__manifest__`;
+    this.bufferPool = bufferPool2 || new BufferPool();
     this._writeBuffer = /* @__PURE__ */ new Map();
     this._flushTimer = null;
     this._flushInterval = 2e3;
@@ -845,6 +1005,8 @@ var WorkerDatabase = class {
         const type = (c.dataType || c.type || "").toLowerCase();
         if (type === "text" || type === "string" || type === "varchar") {
           cols[c.name] = new Array(initialCapacity);
+        } else if (type === "int64" || type === "bigint") {
+          cols[c.name] = new BigInt64Array(initialCapacity);
         } else {
           cols[c.name] = new Float64Array(initialCapacity);
         }
@@ -865,6 +1027,10 @@ var WorkerDatabase = class {
           const newArr = new Float64Array(newCap);
           newArr.set(old.subarray(0, len));
           colBuf[c.name] = newArr;
+        } else if (old instanceof BigInt64Array) {
+          const newArr = new BigInt64Array(newCap);
+          newArr.set(old.subarray(0, len));
+          colBuf[c.name] = newArr;
         } else {
           colBuf[c.name].length = newCap;
         }
@@ -875,8 +1041,14 @@ var WorkerDatabase = class {
       const row = rows[i];
       colBuf.__rowId[len + i] = table.nextRowId++;
       for (const c of table.schema) {
-        const val = row[c.name];
-        colBuf[c.name][len + i] = val ?? (colBuf[c.name] instanceof Float64Array ? NaN : null);
+        let val = row[c.name];
+        if (colBuf[c.name] instanceof Float64Array) {
+          colBuf[c.name][len + i] = val !== null && val !== void 0 ? Number(val) : NaN;
+        } else if (colBuf[c.name] instanceof BigInt64Array) {
+          colBuf[c.name][len + i] = val !== null && val !== void 0 ? BigInt(val) : 0n;
+        } else {
+          colBuf[c.name][len + i] = val ?? null;
+        }
       }
     }
     colBuf.__length = len + n;
@@ -915,16 +1087,23 @@ var WorkerDatabase = class {
     if (!table) return;
     const schemaWithRowId = [
       { name: "__rowId", type: "int64", dataType: "float64", primaryKey: true },
-      ...table.schema.filter((c) => c.name !== "__rowId").map((c) => ({
-        ...c,
-        dataType: c.dataType || c.type || "float64"
-      }))
+      ...table.schema.filter((c) => c.name !== "__rowId").map((c) => {
+        const type = (c.dataType || c.type || "").toLowerCase();
+        if (type === "int64" || type === "bigint") {
+          return { ...c, dataType: "int64" };
+        }
+        const isNumeric = type === "float64" || type === "float32" || type === "int32" || type === "integer" || type === "real" || type === "double";
+        return {
+          ...c,
+          dataType: isNumeric ? "float64" : c.dataType || c.type || "float64"
+        };
+      })
     ];
     const columnarData = {};
     for (const col of schemaWithRowId) {
       const arr = colBuf[col.name];
       if (!arr) continue;
-      if (arr instanceof Float64Array) {
+      if (arr instanceof Float64Array || arr instanceof BigInt64Array) {
         columnarData[col.name] = arr.subarray(0, bufLen);
       } else {
         columnarData[col.name] = arr.slice(0, bufLen);
@@ -1119,16 +1298,23 @@ var WorkerDatabase = class {
     const deletedSet = hasDeleted ? new Set(table.deletionVector) : null;
     const allRows = [];
     for (const fragKey of table.fragments) {
-      let rows = this._readCache.get(fragKey);
-      if (!rows) {
+      let binary = this.bufferPool.get(fragKey);
+      let rows = null;
+      if (!binary) {
         const fragData = await opfsStorage.load(fragKey);
         if (fragData) {
-          rows = this._parseFragment(fragData, table.schema);
-          this._readCache.set(fragKey, rows);
-        } else {
-          rows = [];
+          binary = parseBinaryColumnar(fragData);
+          if (binary) {
+            this.bufferPool.set(fragKey, binary, fragData.byteLength);
+          } else {
+            rows = this._parseFragment(fragData, table.schema);
+          }
         }
       }
+      if (binary && !rows) {
+        rows = this._hydrateRowsFromBinary(binary, table.schema);
+      }
+      rows = rows || [];
       if (!deletedSet) {
         allRows.push(...rows);
       } else {
@@ -1153,6 +1339,21 @@ var WorkerDatabase = class {
       }
     }
     return allRows;
+  }
+  _hydrateRowsFromBinary(binary, schema) {
+    const { columns, rowCount } = binary;
+    const colNames = schema.map((c) => c.name);
+    const rows = new Array(rowCount);
+    for (let i = 0; i < rowCount; i++) {
+      const row = { __rowId: columns.__rowId[i] };
+      for (const name of colNames) {
+        if (columns[name]) {
+          row[name] = columns[name][i];
+        }
+      }
+      rows[i] = row;
+    }
+    return rows;
   }
   _parseFragment(data, schema) {
     try {
@@ -1199,13 +1400,13 @@ var WorkerDatabase = class {
     for (const name of colNames) allColumns[name] = [];
     allColumns.__rowId = [];
     for (const fragKey of table.fragments) {
-      let binary = this._readCache.get(fragKey + ":columnar");
+      let binary = this.bufferPool.get(fragKey);
       if (!binary) {
         const fragData = await opfsStorage.load(fragKey);
         if (!fragData) continue;
         binary = parseBinaryColumnar(fragData);
         if (binary) {
-          this._readCache.set(fragKey + ":columnar", binary);
+          this.bufferPool.set(fragKey, binary, fragData.byteLength);
         }
       }
       if (!binary) continue;
@@ -3122,12 +3323,12 @@ var SQLParser = class {
       throw new Error("Expected BETWEEN, IN, or LIKE after NOT");
     }
     if (this.match(TokenType.NEAR)) {
-      const text = this.expect(TokenType.STRING).value;
+      const value2 = this.parseValue();
       let topK = null;
       if (this.match(TokenType.TOPK)) {
         topK = parseInt(this.expect(TokenType.NUMBER).value, 10);
       }
-      return { op: "NEAR", column, text, topK };
+      return { op: "NEAR", column, value: value2, topK };
     }
     let op;
     if (this.match(TokenType.EQ)) op = "=";
@@ -4745,39 +4946,51 @@ function cosineSimilarity(a, b) {
 }
 async function executeNearSearch(rows, nearCondition, limit) {
   const column = typeof nearCondition.column === "string" ? nearCondition.column : nearCondition.column.column;
-  const text = nearCondition.text;
+  const value = nearCondition.value || nearCondition.text;
   const topK = nearCondition.topK || limit || 10;
-  const gpuTransformer2 = getGPUTransformerState();
-  if (!gpuTransformer2) {
-    throw new Error("NEAR requires a text encoder model. Load a model first with store.loadModel()");
-  }
   let queryVec;
-  try {
-    const models = gpuTransformer2.getLoadedModels?.() || [];
-    if (models.length === 0) {
-      throw new Error("No text encoder model loaded");
+  if (Array.isArray(value)) {
+    queryVec = value;
+  } else if (typeof value === "string") {
+    const gpuTransformer3 = getGPUTransformerState();
+    if (!gpuTransformer3) {
+      throw new Error("NEAR with text requires a text encoder model. Load a model first with store.loadModel()");
     }
-    queryVec = await gpuTransformer2.encodeText(text, models[0]);
-  } catch (e) {
-    throw new Error(`NEAR failed to encode query: ${e.message}`);
+    try {
+      const models = gpuTransformer3.getLoadedModels?.() || [];
+      if (models.length === 0) {
+        throw new Error("No text encoder model loaded");
+      }
+      queryVec = await gpuTransformer3.encodeText(value, models[0]);
+    } catch (e) {
+      throw new Error(`NEAR failed to encode query: ${e.message}`);
+    }
+  } else {
+    throw new Error("NEAR requires a text string or vector array");
   }
   const scored = [];
   const embeddingCache2 = getEmbeddingCache();
+  const gpuTransformer2 = getGPUTransformerState();
   for (const row of rows) {
     const colValue = row[column];
     if (Array.isArray(colValue) && typeof colValue[0] === "number") {
       const score = cosineSimilarity(queryVec, colValue);
       scored.push({ row, score });
     } else if (typeof colValue === "string") {
+      if (!gpuTransformer2) continue;
       const cacheKey = `sql:${column}:${colValue}`;
       let itemVec = embeddingCache2.get(cacheKey);
       if (!itemVec) {
         const models = gpuTransformer2.getLoadedModels?.() || [];
-        itemVec = await gpuTransformer2.encodeText(colValue, models[0]);
-        embeddingCache2.set(cacheKey, itemVec);
+        if (models.length > 0) {
+          itemVec = await gpuTransformer2.encodeText(colValue, models[0]);
+          embeddingCache2.set(cacheKey, itemVec);
+        }
       }
-      const score = cosineSimilarity(queryVec, itemVec);
-      scored.push({ row, score });
+      if (itemVec) {
+        const score = cosineSimilarity(queryVec, itemVec);
+        scored.push({ row, score });
+      }
     }
   }
   scored.sort((a, b) => b.score - a.score);
@@ -6215,8 +6428,8 @@ var WorkerVault = class {
       this._encryptionKeyId = keyId;
     }
     try {
-      const opfsRoot = await navigator.storage.getDirectory();
-      this._root = await opfsRoot.getDirectoryHandle("vault", { create: true });
+      const opfsRoot2 = await navigator.storage.getDirectory();
+      this._root = await opfsRoot2.getDirectoryHandle("vault", { create: true });
       await this._loadKV();
       this._db = new WorkerDatabase("vault");
       await this._db.open();
@@ -6287,14 +6500,6 @@ var WorkerVault = class {
 };
 
 // src/worker/wasm-sql-bridge.js
-var RESULT_VERSION = 1;
-var ColumnType = {
-  INT64: 0,
-  FLOAT64: 1,
-  INT32: 2,
-  FLOAT32: 3,
-  STRING: 4
-};
 var WasmSqlExecutor = class {
   constructor() {
     this._registered = /* @__PURE__ */ new Map();
@@ -6319,13 +6524,13 @@ var WasmSqlExecutor = class {
     }
     const memory = getWasmMemory();
     const tableNameBytes = new TextEncoder().encode(tableName);
-    const tableNamePtr = wasm2.wasmAlloc(tableNameBytes.length);
+    const tableNamePtr = wasm2.alloc(tableNameBytes.length);
     new Uint8Array(memory.buffer, tableNamePtr, tableNameBytes.length).set(tableNameBytes);
     const registeredCols = /* @__PURE__ */ new Set();
     for (const [colName, data] of Object.entries(columns)) {
       if (colName.startsWith("__")) continue;
       const colNameBytes = new TextEncoder().encode(colName);
-      const colNamePtr = wasm2.wasmAlloc(colNameBytes.length);
+      const colNamePtr = wasm2.alloc(colNameBytes.length);
       new Uint8Array(memory.buffer, colNamePtr, colNameBytes.length).set(colNameBytes);
       if (data instanceof Float64Array) {
         const dataPtr = wasm2.allocFloat64Buffer(data.length);
@@ -6383,11 +6588,11 @@ var WasmSqlExecutor = class {
           stringData.set(bytes, offset);
           offset += bytes.length;
         }
-        const offsetsPtr = wasm2.wasmAlloc(offsets.byteLength);
+        const offsetsPtr = wasm2.alloc(offsets.byteLength);
         new Uint32Array(memory.buffer, offsetsPtr, offsets.length).set(offsets);
-        const lengthsPtr = wasm2.wasmAlloc(lengths.byteLength);
+        const lengthsPtr = wasm2.alloc(lengths.byteLength);
         new Uint32Array(memory.buffer, lengthsPtr, lengths.length).set(lengths);
-        const dataPtr = wasm2.wasmAlloc(stringData.length);
+        const dataPtr = wasm2.alloc(stringData.length);
         new Uint8Array(memory.buffer, dataPtr, stringData.length).set(stringData);
         wasm2.registerTableString(
           tableNamePtr,
@@ -6424,11 +6629,11 @@ var WasmSqlExecutor = class {
     }
     const encoder = new TextEncoder();
     const tableNameBytes = encoder.encode(tableName);
-    const tableNamePtr = wasm2.wasmAlloc(tableNameBytes.length);
+    const tableNamePtr = wasm2.alloc(tableNameBytes.length);
     new Uint8Array(getWasmMemory().buffer, tableNamePtr, tableNameBytes.length).set(tableNameBytes);
     for (const path of filePaths) {
       const pathBytes = encoder.encode(path);
-      const pathPtr = wasm2.wasmAlloc(pathBytes.length);
+      const pathPtr = wasm2.alloc(pathBytes.length);
       new Uint8Array(getWasmMemory().buffer, pathPtr, pathBytes.length).set(pathBytes);
       const result = wasm2.registerTableFromOPFS(
         tableNamePtr,
@@ -6441,6 +6646,75 @@ var WasmSqlExecutor = class {
       }
     }
     this._registered.set(tableName, { version, type: "files" });
+  }
+  /**
+   * Append in-memory batch to existing registered table (Hybrid Scan)
+   * @param {string} tableName
+   * @param {Object} columns - Map of column name to typed array
+   * @param {number} rowCount
+   */
+  appendTableMemory(tableName, columns, rowCount) {
+    const wasm2 = getWasm();
+    if (!wasm2) throw new Error("WASM not loaded");
+    const memory = getWasmMemory();
+    const tableNameBytes = new TextEncoder().encode(tableName);
+    const tableNamePtr = wasm2.alloc(tableNameBytes.length);
+    new Uint8Array(memory.buffer, tableNamePtr, tableNameBytes.length).set(tableNameBytes);
+    for (const [colName, data] of Object.entries(columns)) {
+      if (colName.startsWith("__")) continue;
+      const colNameBytes = new TextEncoder().encode(colName);
+      const colNamePtr = wasm2.alloc(colNameBytes.length);
+      new Uint8Array(memory.buffer, colNamePtr, colNameBytes.length).set(colNameBytes);
+      if (data instanceof Float64Array) {
+        const dataPtr = wasm2.allocFloat64Buffer(data.length);
+        new Float64Array(memory.buffer, dataPtr, data.length).set(data);
+        wasm2.appendTableMemory(
+          tableNamePtr,
+          tableNameBytes.length,
+          colNamePtr,
+          colNameBytes.length,
+          dataPtr,
+          4,
+          rowCount
+        );
+      } else if (data instanceof BigInt64Array) {
+        const dataPtr = wasm2.allocInt64Buffer(data.length);
+        new BigInt64Array(memory.buffer, dataPtr, data.length).set(data);
+        wasm2.appendTableMemory(
+          tableNamePtr,
+          tableNameBytes.length,
+          colNamePtr,
+          colNameBytes.length,
+          dataPtr,
+          2,
+          rowCount
+        );
+      } else if (data instanceof Int32Array) {
+        const dataPtr = wasm2.alloc(data.byteLength);
+        new Int32Array(memory.buffer, dataPtr, data.length).set(data);
+        wasm2.appendTableMemory(
+          tableNamePtr,
+          tableNameBytes.length,
+          colNamePtr,
+          colNameBytes.length,
+          dataPtr,
+          1,
+          rowCount
+        );
+      } else if (data instanceof Float32Array) {
+        const dataPtr = wasm2.alloc(data.byteLength);
+        new Float32Array(memory.buffer, dataPtr, data.length).set(data);
+        wasm2.appendTableMemory(
+          tableNamePtr,
+          tableNameBytes.length,
+          colNamePtr,
+          colNameBytes.length,
+          dataPtr,
+          3,
+          rowCount
+        );
+      }
+    }
   }
   /**
    * Execute SQL and return result as columnar data
@@ -6469,98 +6743,105 @@ var WasmSqlExecutor = class {
     return result;
   }
   /**
-   * Parse WASM result buffer into columnar data
+   * Parse WASM result buffer (Lance File/Fragment format)
    */
   _parseResult(buffer, ptr, size) {
     const view = new DataView(buffer, ptr, size);
     const decoder = new TextDecoder();
-    const version = view.getUint32(0, true);
-    if (version !== RESULT_VERSION) {
-      throw new Error(`Unsupported result version: ${version}`);
+    if (size < 40) throw new Error("Result too small for Lance footer");
+    const footerOffset = size - 40;
+    const magicVals = [
+      view.getUint8(footerOffset + 36),
+      view.getUint8(footerOffset + 37),
+      view.getUint8(footerOffset + 38),
+      view.getUint8(footerOffset + 39)
+    ];
+    const magic = String.fromCharCode(...magicVals);
+    if (magic !== "LANC") {
+      throw new Error("Invalid Lance Magic: " + magic);
     }
-    const columnCount = view.getUint32(4, true);
-    const rowCount = Number(view.getBigUint64(8, true));
-    const headerSize = view.getUint32(16, true);
-    const metaOffset = view.getUint32(20, true);
-    const dataOffset = view.getUint32(24, true);
-    const flags = view.getUint32(28, true);
-    if (flags !== 0) {
-      throw new Error("WASM SQL execution returned error");
-    }
-    const namesOffset = headerSize >= 36 ? view.getUint32(32, true) : 0;
+    const colMetaOffsetsStart = Number(view.getBigUint64(footerOffset + 8, true));
+    const numCols = view.getUint32(footerOffset + 28, true);
     const columns = [];
     const colData = {};
-    for (let i = 0; i < columnCount; i++) {
-      const metaPos = metaOffset + i * 16;
-      const colType = view.getUint32(metaPos, true);
-      const colNameOffset = view.getUint32(metaPos + 4, true);
-      const colNameLen = view.getUint32(metaPos + 8, true);
-      const colDataOffset = view.getUint32(metaPos + 12, true);
-      let colName;
-      if (namesOffset > 0 && colNameLen > 0) {
-        const nameBytes = new Uint8Array(buffer, ptr + namesOffset + colNameOffset, colNameLen);
-        colName = decoder.decode(nameBytes);
-      } else {
-        colName = `col_${i}`;
-      }
+    let resultRowCount = 0;
+    for (let i = 0; i < numCols; i++) {
+      const offsetPos = colMetaOffsetsStart + i * 8;
+      const metaPos = Number(view.getBigUint64(offsetPos, true));
+      let localOffset = metaPos;
+      view.getUint8(localOffset++);
+      const [nameLen, lenBytes] = this._readVarint(view, localOffset);
+      localOffset += lenBytes;
+      const nameBytes = new Uint8Array(buffer, ptr + localOffset, nameLen);
+      const colName = decoder.decode(nameBytes);
+      localOffset += nameLen;
       columns.push(colName);
-      const absDataOffset = dataOffset + colDataOffset;
-      switch (colType) {
-        case ColumnType.INT64: {
-          const arr = new BigInt64Array(buffer, ptr + absDataOffset, rowCount);
-          const f64Arr = new Float64Array(rowCount);
-          for (let j = 0; j < rowCount; j++) f64Arr[j] = Number(arr[j]);
-          colData[colName] = f64Arr;
-          break;
+      view.getUint8(localOffset++);
+      const [typeLen, typeLenBytes] = this._readVarint(view, localOffset);
+      localOffset += typeLenBytes;
+      const typeBytes = new Uint8Array(buffer, ptr + localOffset, typeLen);
+      const typeStr = decoder.decode(typeBytes);
+      localOffset += typeLen;
+      view.getUint8(localOffset++);
+      const [nullable, nullBytes] = this._readVarint(view, localOffset);
+      localOffset += nullBytes;
+      view.getUint8(localOffset++);
+      const dataOffset = Number(view.getBigUint64(localOffset, true));
+      localOffset += 8;
+      view.getUint8(localOffset++);
+      const [rowCount, rowBytes] = this._readVarint(view, localOffset);
+      localOffset += rowBytes;
+      resultRowCount = rowCount;
+      view.getUint8(localOffset++);
+      const [dataSize, sizeBytes] = this._readVarint(view, localOffset);
+      localOffset += sizeBytes;
+      const absDataOffset = ptr + dataOffset;
+      if (typeStr === "float64" || typeStr === "int64" || typeStr === "int32" || typeStr === "float32") {
+        if (typeStr === "float64") {
+          colData[colName] = new Float64Array(buffer, absDataOffset, rowCount).slice();
+        } else if (typeStr === "int64") {
+          const src = new BigInt64Array(buffer, absDataOffset, rowCount);
+          const dst = new Float64Array(rowCount);
+          for (let j = 0; j < rowCount; j++) dst[j] = Number(src[j]);
+          colData[colName] = dst;
+        } else if (typeStr === "int32") {
+          const src = new Int32Array(buffer, absDataOffset, rowCount);
+          const dst = new Float64Array(rowCount);
+          for (let j = 0; j < rowCount; j++) dst[j] = src[j];
+          colData[colName] = dst;
+        } else {
+          const src = new Float32Array(buffer, absDataOffset, rowCount);
+          const dst = new Float64Array(rowCount);
+          for (let j = 0; j < rowCount; j++) dst[j] = src[j];
+          colData[colName] = dst;
         }
-        case ColumnType.FLOAT64: {
-          colData[colName] = new Float64Array(buffer, ptr + absDataOffset, rowCount).slice();
-          break;
-        }
-        case ColumnType.INT32: {
-          const arr = new Int32Array(buffer, ptr + absDataOffset, rowCount);
-          const f64Arr = new Float64Array(rowCount);
-          for (let j = 0; j < rowCount; j++) f64Arr[j] = arr[j];
-          colData[colName] = f64Arr;
-          break;
-        }
-        case ColumnType.FLOAT32: {
-          const arr = new Float32Array(buffer, ptr + absDataOffset, rowCount);
-          const f64Arr = new Float64Array(rowCount);
-          for (let j = 0; j < rowCount; j++) f64Arr[j] = arr[j];
-          colData[colName] = f64Arr;
-          break;
-        }
-        case ColumnType.STRING: {
-          const offsetsAndLens = new Uint32Array(buffer, ptr + absDataOffset, rowCount * 2);
-          const strDataStart = absDataOffset + rowCount * 8;
-          let totalBytes = 0;
-          for (let j = 0; j < rowCount; j++) {
-            totalBytes += offsetsAndLens[j * 2 + 1];
-          }
-          const offsets = new Uint32Array(rowCount + 1);
-          const bytes = new Uint8Array(totalBytes);
-          let bytePos = 0;
-          for (let j = 0; j < rowCount; j++) {
-            offsets[j] = bytePos;
-            const strOffset = offsetsAndLens[j * 2];
-            const strLen = offsetsAndLens[j * 2 + 1];
-            const srcBytes = new Uint8Array(buffer, ptr + strDataStart + strOffset, strLen);
-            bytes.set(srcBytes, bytePos);
-            bytePos += strLen;
-          }
-          offsets[rowCount] = totalBytes;
-          colData[colName] = { _arrowString: true, offsets, bytes };
-          break;
-        }
+      } else if (typeStr === "string") {
+        const offsetsLen = (rowCount + 1) * 4;
+        const dataBytesLen = dataSize - offsetsLen;
+        const bytes = new Uint8Array(buffer, absDataOffset, dataBytesLen).slice();
+        const offsets = new Uint32Array(buffer, absDataOffset + dataBytesLen, rowCount + 1).slice();
+        colData[colName] = { _arrowString: true, offsets, bytes };
       }
     }
     return {
       _format: "columnar",
       columns,
-      rowCount,
+      rowCount: resultRowCount,
       data: colData
     };
+  }
+  _readVarint(view, offset) {
+    let result = 0;
+    let shift = 0;
+    let bytesRead = 0;
+    while (true) {
+      const byte = view.getUint8(offset + bytesRead);
+      bytesRead++;
+      result |= (byte & 127) << shift;
+      if ((byte & 128) === 0) break;
+      shift += 7;
+    }
+    return [result, bytesRead];
   }
   /**
    * Clear all registered tables
@@ -6587,47 +6868,76 @@ function getWasmSqlExecutor() {
   return instance;
 }
 function shouldUseWasmSql(sql, rowCount) {
-  if (rowCount < 1e3) return false;
-  const sqlUpper = sql.toUpperCase().trim();
-  if (/^SELECT\s+\*\s+FROM\s+\w+\s*$/i.test(sql)) {
+  if (rowCount < 100) return false;
+  try {
+    const lexer = new SQLLexer(sql);
+    const tokens = lexer.tokenize();
+    const parser = new SQLParser(tokens);
+    const ast = parser.parse();
+    if (ast.type !== "SELECT") {
+      return true;
+    }
+    if (ast.where || ast.having || ast.qualify) return true;
+    if (ast.joins && ast.joins.length > 0) return true;
+    if (ast.groupBy || ast.orderBy) return true;
+    if (ast.distinct) return true;
+    if (ast.union || ast.intersect || ast.except) return true;
+    for (const col of ast.columns) {
+      if (col.type === "star") continue;
+      if (col.type === "aggregate" || col.type === "window") {
+        return true;
+      }
+      if (col.type === "scalar_subquery" || col.type === "case") {
+        return true;
+      }
+    }
     return false;
-  }
-  if (/^SELECT\s+\*\s+FROM\s+\w+(\s+WHERE|\s+LIMIT)/i.test(sql)) {
+  } catch (e) {
+    console.warn("Failed to parse SQL for routing, defaulting to WASM:", e);
     return true;
   }
-  if (/^SELECT\s+(SUM|AVG|MIN|MAX|COUNT)\s*\(/i.test(sql)) {
-    return true;
-  }
-  if (/WHERE\s+\w+\s*[<>=!]+\s*\d+/i.test(sql)) {
-    return true;
-  }
-  if (/JOIN\s+\w+\s+ON/i.test(sql)) {
-    return true;
-  }
-  return false;
 }
 
 // src/worker/index.js
 async function executeWasmSqlFull(db, sql) {
   if (!wasm) {
-    throw new Error("WASM not loaded");
+    await loadWasm();
+    if (!wasm) throw new Error("WASM not loaded");
   }
   const executor = getWasmSqlExecutor();
   const tableNames = extractTableNames(sql);
   for (const tableName of tableNames) {
     const table = db.tables.get(tableName);
     if (!table) continue;
-    const bufLen = db._columnarBuffer?.get(tableName)?.__length || 0;
+    const colBuf = db._columnarBuffer?.get(tableName);
+    const bufLen = colBuf?.__length || 0;
     const version = `${tableName}:${table.fragments?.length || 0}:${bufLen}:${table.deletionVector?.length || 0}`;
-    if (bufLen === 0 && table.fragments.length > 0) {
-      const fragments = db.getFragmentPaths(tableName);
-      executor.registerTableFromFiles(tableName, fragments, version);
-      continue;
+    const hasFiles = table.fragments.length > 0;
+    const hasMemory = bufLen > 0;
+    if (hasFiles) {
+      const handles = [];
+      for (const fragPath of table.fragments) {
+        const handleId = await registerOPFSFile(fragPath);
+        if (handleId) handles.push(handleId);
+      }
+      executor.registerTableFromFiles(tableName, table.fragments, version);
+      if (hasMemory) {
+        const columns = {};
+        for (const c of table.schema) {
+          const arr = colBuf[c.name];
+          if (arr && ArrayBuffer.isView(arr)) {
+            columns[c.name] = arr.subarray(0, bufLen);
+          }
+        }
+        executor.appendTableMemory(tableName, columns, bufLen);
+      }
+    } else if (hasMemory) {
+      const columnarData = await db.selectColumnar(tableName);
+      if (columnarData) {
+        const { columns, rowCount } = columnarData;
+        executor.registerTable(tableName, columns, rowCount, version);
+      }
     }
-    const columnarData = await db.selectColumnar(tableName);
-    if (!columnarData || columnarData.rowCount === 0) continue;
-    const { columns: colData, rowCount } = columnarData;
-    executor.registerTable(tableName, colData, rowCount, version);
   }
   return executor.execute(sql);
 }
@@ -6666,10 +6976,15 @@ function createWasmImports() {
         try {
           const pathBytes = new Uint8Array(wasmMemory.buffer, pathPtr, pathLen);
           const path = new TextDecoder().decode(pathBytes);
-          const parts = path.split("/").filter((p) => p);
-          const fileName = parts.pop();
+          for (const [id, handle] of opfsHandles.entries()) {
+            if (handle._path === path) {
+              return id;
+            }
+          }
+          console.warn("[LanceQLWorker] WASM tried to open unregistered path:", path);
           return 0;
         } catch (e) {
+          console.error("[LanceQLWorker] Error:", e);
           return 0;
         }
       },
@@ -6696,14 +7011,20 @@ function createWasmImports() {
       },
       // Close file handle
       opfs_close: (handle) => {
-        const accessHandle = opfsHandles.get(handle);
-        if (accessHandle) {
-          try {
-            accessHandle.close();
-          } catch (e) {
-          }
-          opfsHandles.delete(handle);
+      },
+      js_log: (ptr, len) => {
+        try {
+          const bytes = new Uint8Array(wasmMemory.buffer, ptr, len);
+          const msg = new TextDecoder().decode(bytes);
+          console.log(`[LanceQLWasm] ${msg}`);
+        } catch (e) {
+          console.error("[LanceQLWasm] Log error:", e);
         }
+      },
+      __assert_fail: (msgPtr, filePtr, line, funcPtr) => {
+        const decoder = new TextDecoder();
+        const msg = decoder.decode(new Uint8Array(wasmMemory.buffer, msgPtr).subarray(0, 100));
+        console.error(`[WASM ASSERT] ${msg} at line ${line}`);
       }
     }
   };
@@ -6716,6 +7037,7 @@ async function registerOPFSFile(path) {
     const fileHandle = await dir.getFileHandle(fileName);
     const accessHandle = await fileHandle.createSyncAccessHandle();
     const handleId = nextHandleId++;
+    accessHandle._path = path;
     opfsHandles.set(handleId, accessHandle);
     return handleId;
   } catch (e) {
@@ -6796,19 +7118,27 @@ async function loadFragmentToWasm(fragPath) {
     return 0;
   }
 }
-var fragmentCache = /* @__PURE__ */ new Map();
-var CACHE_MAX_SIZE = 10;
-async function loadFragmentCached(fragPath) {
-  if (fragmentCache.has(fragPath)) {
-    return fragmentCache.get(fragPath);
+async function getFileHandle(root, path) {
+  const parts = path.split("/").filter((p) => p);
+  let currentDir = root;
+  for (let i = 0; i < parts.length - 1; i++) {
+    currentDir = await currentDir.getDirectoryHandle(parts[i], { create: false });
   }
-  const loaded = await loadFragmentToWasm(fragPath);
+  return await currentDir.getFileHandle(parts[parts.length - 1], { create: false });
+}
+var opfsRoot = null;
+async function loadFragmentCached(fragPath) {
+  let loaded = bufferPool.get(fragPath);
+  if (loaded) return loaded;
+  if (!opfsRoot) {
+    opfsRoot = await navigator.storage.getDirectory();
+  }
+  const handle = await getFileHandle(opfsRoot, fragPath);
+  const file = await handle.getFile();
+  const buffer = await file.arrayBuffer();
+  loaded = new Uint8Array(buffer);
   if (loaded) {
-    if (fragmentCache.size >= CACHE_MAX_SIZE) {
-      const first = fragmentCache.keys().next().value;
-      fragmentCache.delete(first);
-    }
-    fragmentCache.set(fragPath, loaded);
+    bufferPool.set(fragPath, loaded, loaded.byteLength);
   }
   return loaded;
 }
@@ -6832,6 +7162,7 @@ async function wasmAggregate2(fragPath, colIdx, func) {
   }
 }
 loadWasm();
+var bufferPool = new BufferPool();
 var stores = /* @__PURE__ */ new Map();
 var databases = /* @__PURE__ */ new Map();
 var vaultInstance = null;
@@ -6860,7 +7191,7 @@ async function getStore(name, options = {}, encryptionConfig = null) {
 }
 async function getDatabase(name) {
   if (!databases.has(name)) {
-    const db = new WorkerDatabase(name);
+    const db = new WorkerDatabase(name, bufferPool);
     await db.open();
     databases.set(name, db);
   }
@@ -6883,7 +7214,7 @@ function sendResponse(port, id, result) {
   if (result && result._format === "columnar" && result.data) {
     const colNames = result.columns;
     const rowCount = result.rowCount;
-    if (rowCount < 1e3) {
+    if (rowCount < 1e5) {
       const transferables2 = [];
       const serializedData = {};
       const usedBuffers = /* @__PURE__ */ new Set();
@@ -6900,6 +7231,16 @@ function sendResponse(port, id, result) {
             serializedData[name] = arr;
             transferables2.push(arr.buffer);
             usedBuffers.add(arr.buffer);
+          }
+        } else if (arr && arr._arrowString) {
+          serializedData[name] = arr;
+          if (arr.offsets && arr.offsets.buffer && !usedBuffers.has(arr.offsets.buffer)) {
+            transferables2.push(arr.offsets.buffer);
+            usedBuffers.add(arr.offsets.buffer);
+          }
+          if (arr.bytes && arr.bytes.buffer && !usedBuffers.has(arr.bytes.buffer)) {
+            transferables2.push(arr.bytes.buffer);
+            usedBuffers.add(arr.bytes.buffer);
           }
         } else {
           serializedData[name] = arr;
@@ -7020,17 +7361,23 @@ async function handleMessage(port, data) {
     } else if (method === "hasSemanticSearch") {
       result = (await getStore(args.name)).hasSemanticSearch();
     } else if (method === "db:open") {
+      console.log(`[LanceQLWorker] db:open ${args.name}`);
       await getDatabase(args.name);
       result = true;
     } else if (method === "db:createTable") {
+      console.log(`[LanceQLWorker] db:createTable ${args.tableName}`);
       result = await (await getDatabase(args.db)).createTable(args.tableName, args.columns, args.ifNotExists);
+      console.log(`[LanceQLWorker] db:createTable ${args.tableName} done`);
     } else if (method === "db:dropTable") {
+      console.log(`[LanceQLWorker] db:dropTable ${args.tableName}`);
       const db = await getDatabase(args.db);
       result = await db.dropTable(args.tableName, args.ifExists);
       const nameBytes = E.encode(args.tableName);
       getWasmSqlExecutor().clearTable(nameBytes, nameBytes.length);
     } else if (method === "db:insert") {
+      console.log(`[LanceQLWorker] db:insert into ${args.tableName}, rows: ${args.rows?.length}`);
       result = await (await getDatabase(args.db)).insert(args.tableName, args.rows);
+      console.log(`[LanceQLWorker] db:insert done`);
     } else if (method === "db:delete") {
       const db = await getDatabase(args.db);
       const predicate = args.where ? (row) => evalWhere(args.where, row) : () => true;
@@ -7051,17 +7398,20 @@ async function handleMessage(port, data) {
       const tableNames = extractTableNames(args.sql);
       const primaryTable = tableNames[0] ? db.tables.get(tableNames[0]) : null;
       const rowCount = primaryTable ? primaryTable.rowCount : 0;
+      console.log(`[LanceQLWorker] Query: "${args.sql}", rowCount: ${rowCount}, useWasm: ${shouldUseWasmSql(args.sql, rowCount)}`);
       if (shouldUseWasmSql(args.sql, rowCount)) {
         try {
+          console.log("[LanceQLWorker] Attempting WASM SQL execution...");
           result = await executeWasmSqlFull(db, args.sql);
+          console.log("[LanceQLWorker] WASM SQL execution successful");
         } catch (e) {
-          console.warn("[LanceQLWorker] WASM SQL failed, falling back to JS:", e.message);
+          console.warn("[LanceQLWorker] WASM SQL failed, falling back to JS:", e.stack || e.message);
           result = await executeSQL(db, args.sql);
         }
       } else {
         result = await executeSQL(db, args.sql);
       }
-      if (result && result._format === "columnar" && result.rowCount >= 1e3) {
+      if (result && result._format === "columnar" && result.rowCount >= 1e5) {
         const cursorId = nextCursorId++;
         cursors.set(cursorId, result);
         result = {
@@ -7077,7 +7427,9 @@ async function handleMessage(port, data) {
       result = cursor;
       cursors.delete(args.cursorId);
     } else if (method === "db:flush") {
+      console.log(`[LanceQLWorker] db:flush ${args.db}`);
       await (await getDatabase(args.db)).flush();
+      console.log(`[LanceQLWorker] db:flush ${args.db} done`);
       result = true;
     } else if (method === "db:compact") {
       result = await (await getDatabase(args.db)).compact();
@@ -7120,7 +7472,7 @@ async function handleMessage(port, data) {
       } else {
         result = await vault.exec(args.sql);
       }
-      if (result && result._format === "columnar" && result.rowCount >= 1e3) {
+      if (result && result._format === "columnar" && result.rowCount >= 1e5) {
         const cursorId = nextCursorId++;
         cursors.set(cursorId, result);
         result = {
@@ -7135,25 +7487,40 @@ async function handleMessage(port, data) {
     }
     sendResponse(port, id, result);
   } catch (error) {
-    port.postMessage({ id, error: error.message });
+    port.postMessage({ id, error: error.stack || error.message });
   }
 }
-self.onconnect = (event) => {
-  const port = event.ports[0];
-  ports.add(port);
-  port.onmessage = (e) => {
-    handleMessage(port, e.data);
+var isSharedWorker = typeof SharedWorkerGlobalScope !== "undefined" && self instanceof SharedWorkerGlobalScope;
+if (isSharedWorker) {
+  self.onconnect = (event) => {
+    const port = event.ports[0];
+    ports.add(port);
+    port.onmessage = (e) => {
+      handleMessage(port, e.data);
+    };
+    port.onmessageerror = (e) => {
+      console.error("[LanceQLWorker] Message error:", e);
+    };
+    loadWasm().then(() => {
+      port.postMessage({ type: "ready" });
+    }).catch((err) => {
+      console.error("[LanceQLWorker] Failed to load WASM:", err);
+      port.postMessage({ type: "ready", error: "WASM load failed" });
+    });
+    port.start();
+    console.log("[LanceQLWorker] New connection, total ports:", ports.size);
   };
-  port.onmessageerror = (e) => {
-    console.error("[LanceQLWorker] Message error:", e);
+} else {
+  self.onmessage = (e) => {
+    handleMessage(self, e.data);
   };
-  port.postMessage({ type: "ready" });
-  port.start();
-  console.log("[LanceQLWorker] New connection, total ports:", ports.size);
-};
-self.onmessage = (e) => {
-  handleMessage(self, e.data);
-};
+  loadWasm().then(() => {
+    self.postMessage({ type: "ready" });
+  }).catch((err) => {
+    console.error("[LanceQLWorker] Failed to load WASM:", err);
+    self.postMessage({ type: "ready", error: "WASM load failed" });
+  });
+}
 console.log("[LanceQLWorker] Initialized");
 export {
   closeOPFSFile,

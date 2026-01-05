@@ -242,7 +242,7 @@ class WebGPUAccelerator {
         const vectorsBufferSize = numVectors * dim * 4;
         const maxBufferSize = this.device.limits?.maxStorageBufferBindingSize || 134217728;
         if (vectorsBufferSize > maxBufferSize) {
-            console.warn(`[WebGPU] Buffer size ${(vectorsBufferSize/1024/1024).toFixed(1)}MB exceeds limit ${(maxBufferSize/1024/1024).toFixed(1)}MB, falling back`);
+            console.warn(`[WebGPU] Buffer size ${(vectorsBufferSize / 1024 / 1024).toFixed(1)}MB exceeds limit ${(maxBufferSize / 1024 / 1024).toFixed(1)}MB, falling back`);
             return null; // Caller should fallback to WASM
         }
 
@@ -1268,10 +1268,12 @@ class GPUVectorSearch {
         const vectorsBuffer = this._createStorage(flatVectors);
         const distanceBuffer = this.device.createBuffer({ size: numQueries * numVectors * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
         const readBuffer = this.device.createBuffer({ size: numQueries * numVectors * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-        const bindGroup = this.device.createBindGroup({ layout: this.pipelines.get('distance').getBindGroupLayout(0), entries: [
-            { binding: 0, resource: { buffer: paramsBuffer } }, { binding: 1, resource: { buffer: queryBuffer } },
-            { binding: 2, resource: { buffer: vectorsBuffer } }, { binding: 3, resource: { buffer: distanceBuffer } }
-        ]});
+        const bindGroup = this.device.createBindGroup({
+            layout: this.pipelines.get('distance').getBindGroupLayout(0), entries: [
+                { binding: 0, resource: { buffer: paramsBuffer } }, { binding: 1, resource: { buffer: queryBuffer } },
+                { binding: 2, resource: { buffer: vectorsBuffer } }, { binding: 3, resource: { buffer: distanceBuffer } }
+            ]
+        });
         const encoder = this.device.createCommandEncoder();
         const pass = encoder.beginComputePass();
         pass.setPipeline(this.pipelines.get('distance'));
@@ -1300,11 +1302,13 @@ class GPUVectorSearch {
         const inputIndicesBuffer = this._createStorage(indices);
         const intermediateScoresBuffer = this.device.createBuffer({ size: numCandidates * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
         const intermediateIndicesBuffer = this.device.createBuffer({ size: numCandidates * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-        const localBG = this.device.createBindGroup({ layout: this.pipelines.get('local_topk').getBindGroupLayout(0), entries: [
-            { binding: 0, resource: { buffer: paramsBuffer } }, { binding: 1, resource: { buffer: inputScoresBuffer } },
-            { binding: 2, resource: { buffer: inputIndicesBuffer } }, { binding: 3, resource: { buffer: intermediateScoresBuffer } },
-            { binding: 4, resource: { buffer: intermediateIndicesBuffer } }
-        ]});
+        const localBG = this.device.createBindGroup({
+            layout: this.pipelines.get('local_topk').getBindGroupLayout(0), entries: [
+                { binding: 0, resource: { buffer: paramsBuffer } }, { binding: 1, resource: { buffer: inputScoresBuffer } },
+                { binding: 2, resource: { buffer: inputIndicesBuffer } }, { binding: 3, resource: { buffer: intermediateScoresBuffer } },
+                { binding: 4, resource: { buffer: intermediateIndicesBuffer } }
+            ]
+        });
         let encoder = this.device.createCommandEncoder();
         let pass = encoder.beginComputePass();
         pass.setPipeline(this.pipelines.get('local_topk'));
@@ -1318,11 +1322,13 @@ class GPUVectorSearch {
         const finalIndicesBuffer = this.device.createBuffer({ size: k * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
         const readScoresBuffer = this.device.createBuffer({ size: k * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
         const readIndicesBuffer = this.device.createBuffer({ size: k * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-        const mergeBG = this.device.createBindGroup({ layout: this.pipelines.get('merge_topk').getBindGroupLayout(0), entries: [
-            { binding: 0, resource: { buffer: mergeParamsBuffer } }, { binding: 1, resource: { buffer: intermediateScoresBuffer } },
-            { binding: 2, resource: { buffer: intermediateIndicesBuffer } }, { binding: 3, resource: { buffer: finalScoresBuffer } },
-            { binding: 4, resource: { buffer: finalIndicesBuffer } }
-        ]});
+        const mergeBG = this.device.createBindGroup({
+            layout: this.pipelines.get('merge_topk').getBindGroupLayout(0), entries: [
+                { binding: 0, resource: { buffer: mergeParamsBuffer } }, { binding: 1, resource: { buffer: intermediateScoresBuffer } },
+                { binding: 2, resource: { buffer: intermediateIndicesBuffer } }, { binding: 3, resource: { buffer: finalScoresBuffer } },
+                { binding: 4, resource: { buffer: finalIndicesBuffer } }
+            ]
+        });
         encoder = this.device.createCommandEncoder();
         pass = encoder.beginComputePass();
         pass.setPipeline(this.pipelines.get('merge_topk'));
@@ -1337,7 +1343,7 @@ class GPUVectorSearch {
         const resultIndices = new Uint32Array(readIndicesBuffer.getMappedRange().slice(0));
         readScoresBuffer.unmap(); readIndicesBuffer.unmap();
         [paramsBuffer, inputScoresBuffer, inputIndicesBuffer, intermediateScoresBuffer, intermediateIndicesBuffer,
-         mergeParamsBuffer, finalScoresBuffer, finalIndicesBuffer, readScoresBuffer, readIndicesBuffer].forEach(b => b.destroy());
+            mergeParamsBuffer, finalScoresBuffer, finalIndicesBuffer, readScoresBuffer, readIndicesBuffer].forEach(b => b.destroy());
         return { indices: resultIndices, scores: resultScores };
     }
 
@@ -4061,7 +4067,7 @@ export class OPFSJoinExecutor {
             ];
 
             // Helper to yield a chunk
-            const yieldChunk = function*(chunk) {
+            const yieldChunk = function* (chunk) {
                 if (chunk.length > 0) {
                     yield { columns: resultColumns, rows: chunk.splice(0) };
                 }
@@ -5924,7 +5930,7 @@ export class Store {
         // Session mode cleanup
         if (this._sessionMode && typeof window !== 'undefined') {
             window.addEventListener('beforeunload', () => {
-                this.clear().catch(() => {});
+                this.clear().catch(() => { });
             });
         }
 
@@ -6044,7 +6050,7 @@ export class Store {
      */
     subscribe(key, callback) {
         console.warn('[Store] subscribe() not yet implemented');
-        return () => {};
+        return () => { };
     }
 
     /**
@@ -6793,10 +6799,28 @@ export class LanceQL {
     static async load(wasmPath = './lanceql.wasm') {
         const response = await fetch(wasmPath);
         const wasmBytes = await response.arrayBuffer();
-        const wasmModule = await WebAssembly.instantiate(wasmBytes, {});
+
+        // Provide minimal environment for WASM module
+        // OPFS mappings are mocked since they only work in Workers
+        const imports = {
+            env: {
+                memory: new WebAssembly.Memory({ initial: 5000 }), // 320MB to be safe
+                print: console.log,
+                console_log: console.log,
+                opfs_open: () => 0,
+                opfs_read: () => 0,
+                opfs_size: () => 0,
+                opfs_close: () => { },
+                __assert_fail: () => { },
+                // Move stack pointer to 200MB to avoid collision with 64MB heap + BSS
+                __stack_pointer: new WebAssembly.Global({ value: 'i32', mutable: true }, 200 * 1024 * 1024),
+            }
+        };
+
+        const wasmModule = await WebAssembly.instantiate(wasmBytes, imports);
 
         _w = wasmModule.instance.exports;
-        _m = _w.memory;
+        _m = _w.memory || imports.env.memory; // Use exported memory or imported one
 
         // Create Immer-style proxy that auto-marshals string/bytes arguments
         // Also includes high-level LanceQL methods
@@ -8757,12 +8781,12 @@ export class RemoteLanceFile {
         for (let i = 1; i <= sorted.length; i++) {
             // Check if we should end the current batch
             const endBatch = i === sorted.length ||
-                (sorted[i].idx - sorted[i-1].idx) * valueSize > gapThreshold;
+                (sorted[i].idx - sorted[i - 1].idx) * valueSize > gapThreshold;
 
             if (endBatch) {
                 batches.push({
                     startIdx: sorted[batchStart].idx,
-                    endIdx: sorted[i-1].idx,
+                    endIdx: sorted[i - 1].idx,
                     items: sorted.slice(batchStart, i)
                 });
                 batchStart = i;
@@ -9261,7 +9285,7 @@ export class RemoteLanceFile {
             const offsetBatches = [];
             let batchStart = 0;
             for (let i = 1; i <= items.length; i++) {
-                if (i === items.length || items[i].localIdx - items[i-1].localIdx > 100) {
+                if (i === items.length || items[i].localIdx - items[i - 1].localIdx > 100) {
                     offsetBatches.push(items.slice(batchStart, i));
                     batchStart = i;
                 }
@@ -9318,10 +9342,10 @@ export class RemoteLanceFile {
                 let dbStart = 0;
                 for (let i = 1; i <= stringRanges.length; i++) {
                     if (i === stringRanges.length ||
-                        stringRanges[i].start - stringRanges[i-1].end > 4096) {
+                        stringRanges[i].start - stringRanges[i - 1].end > 4096) {
                         dataBatches.push({
                             rangeStart: stringRanges[dbStart].start,
-                            rangeEnd: stringRanges[i-1].end,
+                            rangeEnd: stringRanges[i - 1].end,
                             items: stringRanges.slice(dbStart, i),
                             dataStart: stringRanges[dbStart].dataStart
                         });
@@ -9387,7 +9411,7 @@ export class RemoteLanceFile {
 
                 // Check if column name suggests it's a vector/embedding
                 const isEmbeddingName = schemaName.includes('embedding') || schemaName.includes('vector') ||
-                                        schemaName.includes('emb') || schemaName === 'vec';
+                    schemaName.includes('emb') || schemaName === 'vec';
 
                 // Map Lance/Arrow logical types to our types
                 if (schemaType.includes('utf8') || schemaType.includes('string') || schemaType.includes('large_utf8')) {
@@ -9434,7 +9458,7 @@ export class RemoteLanceFile {
 
             // Check if column name suggests it's a vector/embedding
             const isEmbeddingName = colName.includes('embedding') || colName.includes('vector') ||
-                                    colName.includes('emb') || colName === 'vec';
+                colName.includes('emb') || colName === 'vec';
 
             // Try string first - if we can read a valid string, it's a string column
             try {
@@ -10887,9 +10911,9 @@ export class IVFIndex {
                 // Convert to hex string with dashes (UUID format)
                 const hex = Array.from(uuidBytes).map(b => b.toString(16).padStart(2, '0')).join('');
                 // Format as UUID: 8-4-4-4-12
-                return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20,32)}`;
+                return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
             } else if (wireType === 0) {
-                while (pos < bytes.length && (bytes[pos++] & 0x80)) {}
+                while (pos < bytes.length && (bytes[pos++] & 0x80)) { }
             } else if (wireType === 5) {
                 pos += 4;
             } else if (wireType === 1) {
@@ -11799,8 +11823,8 @@ export class SQLParser {
         // JOIN clauses (one or more)
         const joins = [];
         while (this.check(TokenType.JOIN) || this.check(TokenType.INNER) ||
-               this.check(TokenType.LEFT) || this.check(TokenType.RIGHT) ||
-               this.check(TokenType.FULL) || this.check(TokenType.CROSS)) {
+            this.check(TokenType.LEFT) || this.check(TokenType.RIGHT) ||
+            this.check(TokenType.FULL) || this.check(TokenType.CROSS)) {
             joins.push(this.parseJoinClause());
         }
 
@@ -15052,8 +15076,8 @@ export class SQLExecutor {
                                 rank = j + 1;
                             }
                         }
-                        if (i > 0 && this._compareRowsByOrder(partition[i-1], partition[i], over.orderBy, columnData) === 0) {
-                            results[rowIdx] = results[partition[i-1].idx];
+                        if (i > 0 && this._compareRowsByOrder(partition[i - 1], partition[i], over.orderBy, columnData) === 0) {
+                            results[rowIdx] = results[partition[i - 1].idx];
                         } else {
                             results[rowIdx] = i + 1;
                         }
@@ -15064,10 +15088,10 @@ export class SQLExecutor {
                         // DENSE_RANK: same rank for ties, no gaps
                         if (i === 0) {
                             results[rowIdx] = 1;
-                        } else if (this._compareRowsByOrder(partition[i-1], partition[i], over.orderBy, columnData) === 0) {
-                            results[rowIdx] = results[partition[i-1].idx];
+                        } else if (this._compareRowsByOrder(partition[i - 1], partition[i], over.orderBy, columnData) === 0) {
+                            results[rowIdx] = results[partition[i - 1].idx];
                         } else {
-                            results[rowIdx] = results[partition[i-1].idx] + 1;
+                            results[rowIdx] = results[partition[i - 1].idx] + 1;
                         }
                         break;
                     }
@@ -16437,11 +16461,11 @@ export class SQLExecutor {
         if (expr.type === 'binary') {
             if (expr.op === 'AND') {
                 return this.evaluateWhereExprOnRow(expr.left, columns, row) &&
-                       this.evaluateWhereExprOnRow(expr.right, columns, row);
+                    this.evaluateWhereExprOnRow(expr.right, columns, row);
             }
             if (expr.op === 'OR') {
                 return this.evaluateWhereExprOnRow(expr.left, columns, row) ||
-                       this.evaluateWhereExprOnRow(expr.right, columns, row);
+                    this.evaluateWhereExprOnRow(expr.right, columns, row);
             }
 
             const leftVal = this._getValueFromExpr(expr.left, columns, row);
@@ -16565,7 +16589,7 @@ export class RemoteLanceDataset {
                 fragments: dataset._fragments,
                 version: dataset._version,
                 columnTypes: dataset._columnTypes || null
-            }).catch(() => {}); // Don't block on cache errors
+            }).catch(() => { }); // Don't block on cache errors
         }
 
         await dataset._tryLoadIndex();
@@ -17514,9 +17538,9 @@ export class RemoteLanceDataset {
         metadataCache.get(cacheKey).then(cached => {
             if (cached) {
                 cached.columnTypes = types;
-                metadataCache.set(cacheKey, cached).catch(() => {});
+                metadataCache.set(cacheKey, cached).catch(() => { });
             }
-        }).catch(() => {});
+        }).catch(() => { });
 
         return types;
     }
@@ -20711,7 +20735,7 @@ export class SharedVectorStore {
      */
     static isAvailable() {
         return typeof SharedArrayBuffer !== 'undefined' &&
-               typeof Atomics !== 'undefined';
+            typeof Atomics !== 'undefined';
     }
 
     /**
@@ -21024,7 +21048,7 @@ export class LanceData {
         // Helper to check if element has lq-* attributes
         const hasLqAttrs = (el) => {
             return el.hasAttribute?.('lq-query') || el.hasAttribute?.('lq-src') ||
-                   el.classList?.contains('lance-data');
+                el.classList?.contains('lance-data');
         };
 
         LanceData._observer = new MutationObserver((mutations) => {
@@ -21399,7 +21423,7 @@ export class LanceData {
         if (!str || typeof str !== 'string') return false;
         const lower = str.toLowerCase();
         return (lower.startsWith('http://') || lower.startsWith('https://')) &&
-               (lower.includes('.jpg') || lower.includes('.jpeg') || lower.includes('.png') ||
+            (lower.includes('.jpg') || lower.includes('.jpeg') || lower.includes('.png') ||
                 lower.includes('.gif') || lower.includes('.webp') || lower.includes('.svg'));
     }
 

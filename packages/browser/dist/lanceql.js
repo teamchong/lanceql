@@ -4819,6 +4819,286 @@ var init_remote_dataset = __esm({
   }
 });
 
+// src/client/rpc/worker-rpc.js
+function checkSharedArrayBuffer() {
+  try {
+    if (typeof SharedArrayBuffer !== "undefined" && typeof crossOriginIsolated !== "undefined" && crossOriginIsolated) {
+      _sharedBuffer = new SharedArrayBuffer(SHARED_BUFFER_SIZE);
+      _transferMode = "sharedBuffer";
+      console.log("[LanceQL] Using SharedArrayBuffer (zero-copy)");
+      return true;
+    }
+  } catch (e) {
+  }
+  try {
+    const test = new ArrayBuffer(8);
+    if (typeof ArrayBuffer.prototype.transfer !== "undefined" || true) {
+      _transferMode = "transfer";
+      console.log("[LanceQL] Using Transferable ArrayBuffers");
+      return false;
+    }
+  } catch (e) {
+  }
+  _transferMode = "clone";
+  console.log("[LanceQL] Using structured clone (fallback)");
+  return false;
+}
+function getLanceWorker() {
+  if (_lanceWorker) return _lanceWorkerReady;
+  checkSharedArrayBuffer();
+  _lanceWorkerReady = new Promise((resolve, reject) => {
+    console.log("[LanceQL] Using regular Worker for better logging");
+    try {
+      _lanceWorker = new Worker(
+        new URL("./lanceql-worker.js", import_meta.url),
+        { type: "module", name: "lanceql" }
+      );
+      _lanceWorker.onmessage = (e) => {
+        handleWorkerMessage(e.data, _lanceWorker, resolve);
+      };
+      _lanceWorker.onerror = (e) => {
+        console.error("[LanceQL] Worker error:", e);
+        reject(e);
+      };
+      if (_sharedBuffer) {
+        _lanceWorker.postMessage({
+          type: "initSharedBuffer",
+          buffer: _sharedBuffer
+        });
+      }
+    } catch (e) {
+      console.error("[LanceQL] Failed to create Worker:", e);
+      reject(e);
+    }
+  });
+  return _lanceWorkerReady;
+}
+function handleWorkerMessage(data, port, resolveReady) {
+  console.log("[LanceQL] Incoming worker message:", data.type || (data.id !== void 0 ? "RPC reply" : "unknown"));
+  if (data.type === "ready") {
+    console.log("[LanceQL] Worker ready, mode:", _transferMode);
+    resolveReady(port);
+    return;
+  }
+  if (data.id !== void 0) {
+    const pending = _pendingRequests.get(data.id);
+    if (pending) {
+      _pendingRequests.delete(data.id);
+      if (data.sharedOffset !== void 0 && _sharedBuffer) {
+        const view = new Uint8Array(_sharedBuffer, data.sharedOffset, data.sharedLength);
+        const result = JSON.parse(new TextDecoder().decode(view));
+        pending.resolve(result);
+      } else if (data.error) {
+        pending.reject(new Error(data.error));
+      } else {
+        let result = data.result;
+        if (result && result._format === "cursor") {
+          const { cursorId, columns, rowCount } = result;
+          result = {
+            _format: "columnar",
+            columns,
+            rowCount,
+            _cursorId: cursorId,
+            _fetched: false
+          };
+          Object.defineProperty(result, "data", {
+            configurable: true,
+            enumerable: true,
+            get() {
+              if (!this._fetched) {
+                console.warn("Cursor data accessed - fetching from worker");
+              }
+              return {};
+            }
+          });
+          Object.defineProperty(result, "rows", {
+            configurable: true,
+            enumerable: true,
+            get() {
+              return [];
+            }
+          });
+        } else if (result && result._format === "wasm_binary") {
+          const { buffer, columns, rowCount, schema } = result;
+          const view = new DataView(buffer);
+          const u8 = new Uint8Array(buffer);
+          const HEADER_SIZE = 32;
+          const COL_META_SIZE = 24;
+          const colData = {};
+          for (let i = 0; i < columns.length; i++) {
+            const metaOffset = HEADER_SIZE + i * COL_META_SIZE;
+            const colType = view.getUint32(metaOffset, true);
+            const dataOffset = view.getUint32(metaOffset + 8, true);
+            const dataSize = Number(view.getBigUint64(metaOffset + 12, true));
+            const elemSize = view.getUint32(metaOffset + 20, true);
+            const colName = columns[i];
+            if (colType === 0) {
+              const length = dataSize / elemSize;
+              colData[colName] = elemSize === 8 ? new Float64Array(buffer, dataOffset, length) : new Float32Array(buffer, dataOffset, length);
+            } else {
+              const offsetsStart = dataOffset;
+              const offsets = new Uint32Array(buffer, offsetsStart, rowCount);
+              const strDataStart = dataOffset + rowCount * 4;
+              const strDataSize = dataSize - rowCount * 4;
+              const strData = u8.subarray(strDataStart, strDataStart + strDataSize);
+              const decoder = new TextDecoder();
+              const strings = new Array(rowCount);
+              let decoded = false;
+              colData[colName] = new Proxy(strings, {
+                get(target, prop) {
+                  if (prop === "length") return rowCount;
+                  if (typeof prop === "string" && !isNaN(prop)) {
+                    if (!decoded) {
+                      for (let j = 0; j < rowCount; j++) {
+                        const start = offsets[j];
+                        const end = j < rowCount - 1 ? offsets[j + 1] : strDataSize;
+                        target[j] = decoder.decode(strData.subarray(start, end));
+                      }
+                      decoded = true;
+                    }
+                    return target[+prop];
+                  }
+                  if (prop === Symbol.iterator) {
+                    if (!decoded) {
+                      for (let j = 0; j < rowCount; j++) {
+                        const start = offsets[j];
+                        const end = j < rowCount - 1 ? offsets[j + 1] : strDataSize;
+                        target[j] = decoder.decode(strData.subarray(start, end));
+                      }
+                      decoded = true;
+                    }
+                    return () => target[Symbol.iterator]();
+                  }
+                  return target[prop];
+                }
+              });
+            }
+          }
+          result = {
+            _format: "columnar",
+            columns,
+            rowCount,
+            data: colData
+          };
+          Object.defineProperty(result, "rows", {
+            configurable: true,
+            enumerable: true,
+            get() {
+              const rows = new Array(rowCount);
+              const colArrays = columns.map((name) => colData[name]);
+              for (let i = 0; i < rowCount; i++) {
+                const row = {};
+                for (let j = 0; j < columns.length; j++) {
+                  row[columns[j]] = colArrays[j][i];
+                }
+                rows[i] = row;
+              }
+              Object.defineProperty(this, "rows", { value: rows, writable: false });
+              return rows;
+            }
+          });
+        } else if (result && result._format === "packed") {
+          const { columns, rowCount, packedBuffer, colOffsets, stringData } = result;
+          const colData = { ...stringData || {} };
+          if (packedBuffer && colOffsets) {
+            const TypedArrayMap = {
+              Float64Array,
+              Float32Array,
+              Int32Array,
+              Int16Array,
+              Int8Array,
+              Uint32Array,
+              Uint16Array,
+              Uint8Array,
+              BigInt64Array,
+              BigUint64Array
+            };
+            for (const [name, info] of Object.entries(colOffsets)) {
+              const TypedArr = TypedArrayMap[info.type] || Float64Array;
+              colData[name] = new TypedArr(packedBuffer, info.offset, info.length);
+            }
+          }
+          result.data = colData;
+          result._format = "columnar";
+          Object.defineProperty(result, "rows", {
+            configurable: true,
+            enumerable: true,
+            get() {
+              const rows = new Array(rowCount);
+              const colArrays = columns.map((name) => colData[name]);
+              for (let i = 0; i < rowCount; i++) {
+                const row = {};
+                for (let j = 0; j < columns.length; j++) {
+                  row[columns[j]] = colArrays[j][i];
+                }
+                rows[i] = row;
+              }
+              Object.defineProperty(this, "rows", { value: rows, writable: false });
+              return rows;
+            }
+          });
+        } else if (result && result._format === "columnar") {
+          const { columns, rowCount, data: colData } = result;
+          Object.defineProperty(result, "rows", {
+            configurable: true,
+            enumerable: true,
+            get() {
+              const rows = new Array(rowCount);
+              const colArrays = columns.map((name) => colData[name]);
+              for (let i = 0; i < rowCount; i++) {
+                const row = {};
+                for (let j = 0; j < columns.length; j++) {
+                  row[columns[j]] = colArrays[j][i];
+                }
+                rows[i] = row;
+              }
+              Object.defineProperty(this, "rows", { value: rows, writable: false });
+              return rows;
+            }
+          });
+        }
+        pending.resolve(result);
+      }
+    }
+  }
+}
+async function workerRPC(method, args) {
+  const port = await getLanceWorker();
+  const id = ++_requestId;
+  return new Promise((resolve, reject) => {
+    _pendingRequests.set(id, { resolve, reject });
+    const transferables = [];
+    if (_transferMode === "transfer" && args) {
+      for (const key of Object.keys(args)) {
+        const val = args[key];
+        if (val instanceof ArrayBuffer) {
+          transferables.push(val);
+        } else if (ArrayBuffer.isView(val)) {
+          transferables.push(val.buffer);
+        }
+      }
+    }
+    if (transferables.length > 0) {
+      port.postMessage({ id, method, args }, transferables);
+    } else {
+      port.postMessage({ id, method, args });
+    }
+  });
+}
+var import_meta, _lanceWorker, _lanceWorkerReady, _requestId, _pendingRequests, _transferMode, _sharedBuffer, SHARED_BUFFER_SIZE;
+var init_worker_rpc = __esm({
+  "src/client/rpc/worker-rpc.js"() {
+    import_meta = {};
+    _lanceWorker = null;
+    _lanceWorkerReady = null;
+    _requestId = 0;
+    _pendingRequests = /* @__PURE__ */ new Map();
+    _transferMode = "clone";
+    _sharedBuffer = null;
+    SHARED_BUFFER_SIZE = 16 * 1024 * 1024;
+  }
+});
+
 // src/client/database/local-database.js
 var local_database_exports = {};
 __export(local_database_exports, {
@@ -4828,6 +5108,7 @@ __export(local_database_exports, {
 var OPFSJoinExecutor, LocalDatabase;
 var init_local_database = __esm({
   "src/client/database/local-database.js"() {
+    init_worker_rpc();
     OPFSJoinExecutor = class {
       constructor(storage = opfsStorage) {
         this.storage = storage;
@@ -8034,8 +8315,8 @@ function parseCmpExpr(parser) {
     return { type: "like", expr: left, pattern };
   }
   if (parser.match(TokenType2.NEAR)) {
-    const text = parsePrimary(parser);
-    return { type: "near", column: left, text };
+    const value = parsePrimary(parser);
+    return { type: "near", column: left, value };
   }
   const opMap = {
     [TokenType2.EQ]: "==",
@@ -9656,8 +9937,8 @@ function extractNearCondition(expr) {
   if (!expr) return null;
   if (expr.type === "near") {
     const columnName = expr.column?.name || expr.column;
-    const text = expr.text?.value || expr.text;
-    return { column: columnName, text, limit: 20 };
+    const value = expr.value?.value ?? expr.value;
+    return { column: columnName, value, limit: 20 };
   }
   if (expr.type === "binary" && (expr.op === "AND" || expr.op === "OR")) {
     const leftNear = extractNearCondition(expr.left);
@@ -9821,12 +10102,12 @@ async function buildFTSIndex(readColumnData, colIdx, totalRows) {
   return index;
 }
 async function executeBM25Search(executor, nearInfo, totalRows) {
-  const { column, text, limit } = nearInfo;
+  const { column, value, limit } = nearInfo;
   const colIdx = executor.columnMap[column.toLowerCase()];
   if (colIdx === void 0) {
     throw new Error(`Column '${column}' not found for text search`);
   }
-  const queryTokens = tokenize(text);
+  const queryTokens = tokenize(value);
   if (queryTokens.length === 0) return [];
   const cacheKey = `fts_${colIdx}_${totalRows}`;
   if (!executor.file._ftsIndexCache) executor.file._ftsIndexCache = /* @__PURE__ */ new Map();
@@ -9843,16 +10124,20 @@ async function executeBM25Search(executor, nearInfo, totalRows) {
   return topKByScore(scores, limit);
 }
 async function executeNearSearch(executor, nearInfo, totalRows) {
-  const { column, text, limit } = nearInfo;
+  const { column, value, limit } = nearInfo;
   const vectorColName = executor.file.columnNames?.find(
     (n) => n === "embedding" || n === `${column}_embedding` || n.endsWith("_embedding") || n.endsWith("_vector")
   );
   if (!vectorColName) {
     return await executeBM25Search(executor, nearInfo, totalRows);
   }
+  const vectorColIdx = executor.columnMap[vectorColName.toLowerCase()];
+  if (vectorColIdx === void 0) {
+    throw new Error(`Vector column '${vectorColName}' found but index missing`);
+  }
   const topK = Math.min(limit, totalRows);
   try {
-    const results = await executor.file.vectorSearch(text, topK);
+    const results = await executor.file.vectorSearch(vectorColIdx, value, topK);
     return results.map((r) => r.index);
   } catch (e) {
     console.error("[SQLExecutor] Vector search failed:", e);
@@ -15568,6 +15853,7 @@ var SharedVectorStore = class _SharedVectorStore {
 };
 
 // src/client/store/store.js
+init_worker_rpc();
 var Store = class {
   /**
    * @param {string} name - Store name
@@ -15780,6 +16066,7 @@ async function lanceStore(name, options = {}) {
 }
 
 // src/client/store/vault.js
+init_worker_rpc();
 var Vault = class {
   /**
    * @param {Function|null} getEncryptionKey - Async callback returning encryption key

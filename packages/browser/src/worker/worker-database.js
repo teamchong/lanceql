@@ -5,17 +5,21 @@
 import { opfsStorage } from './opfs-storage.js';
 import { DataType, LanceFileWriter, E, D, parseBinaryColumnar } from './data-types.js';
 import { getWasm, getWasmMemory } from './index.js';
+import { BufferPool } from './buffer-pool.js';
 
 // Streaming scan state
 const scanStreams = new Map();
 let nextScanId = 1;
 
 export class WorkerDatabase {
-    constructor(name) {
+    constructor(name, bufferPool) {
         this.name = name;
         this.tables = new Map();
         this.version = 0;
         this.manifestKey = `${name}/__manifest__`;
+
+        // Use shared buffer pool or create local one
+        this.bufferPool = bufferPool || new BufferPool();
 
         // Write buffer for fast inserts
         this._writeBuffer = new Map();
@@ -131,6 +135,8 @@ export class WorkerDatabase {
                 const type = (c.dataType || c.type || '').toLowerCase();
                 if (type === 'text' || type === 'string' || type === 'varchar') {
                     cols[c.name] = new Array(initialCapacity);
+                } else if (type === 'int64' || type === 'bigint') {
+                    cols[c.name] = new BigInt64Array(initialCapacity);
                 } else {
                     cols[c.name] = new Float64Array(initialCapacity);
                 }
@@ -155,6 +161,10 @@ export class WorkerDatabase {
                     const newArr = new Float64Array(newCap);
                     newArr.set(old.subarray(0, len));
                     colBuf[c.name] = newArr;
+                } else if (old instanceof BigInt64Array) {
+                    const newArr = new BigInt64Array(newCap);
+                    newArr.set(old.subarray(0, len));
+                    colBuf[c.name] = newArr;
                 } else {
                     // String array - just extend
                     colBuf[c.name].length = newCap;
@@ -168,9 +178,15 @@ export class WorkerDatabase {
             const row = rows[i];
             colBuf.__rowId[len + i] = table.nextRowId++;
             for (const c of table.schema) {
-                const val = row[c.name];
+                let val = row[c.name];
                 // Use NaN to represent null in numeric typed arrays
-                colBuf[c.name][len + i] = val ?? (colBuf[c.name] instanceof Float64Array ? NaN : null);
+                if (colBuf[c.name] instanceof Float64Array) {
+                    colBuf[c.name][len + i] = (val !== null && val !== undefined) ? Number(val) : NaN;
+                } else if (colBuf[c.name] instanceof BigInt64Array) {
+                    colBuf[c.name][len + i] = (val !== null && val !== undefined) ? BigInt(val) : 0n;
+                } else {
+                    colBuf[c.name][len + i] = val ?? null;
+                }
             }
         }
         colBuf.__length = len + n;
@@ -219,10 +235,17 @@ export class WorkerDatabase {
         // Build schema with __rowId and correct types
         const schemaWithRowId = [
             { name: '__rowId', type: 'int64', dataType: 'float64', primaryKey: true },
-            ...table.schema.filter(c => c.name !== '__rowId').map(c => ({
-                ...c,
-                dataType: c.dataType || c.type || 'float64'
-            }))
+            ...table.schema.filter(c => c.name !== '__rowId').map(c => {
+                const type = (c.dataType || c.type || '').toLowerCase();
+                if (type === 'int64' || type === 'bigint') {
+                    return { ...c, dataType: 'int64' };
+                }
+                const isNumeric = type === 'float64' || type === 'float32' || type === 'int32' || type === 'integer' || type === 'real' || type === 'double';
+                return {
+                    ...c,
+                    dataType: isNumeric ? 'float64' : (c.dataType || c.type || 'float64')
+                };
+            })
         ];
 
         // Already typed arrays - just slice to actual length (no copy needed for writing)
@@ -231,7 +254,7 @@ export class WorkerDatabase {
             const arr = colBuf[col.name];
             if (!arr) continue;
 
-            if (arr instanceof Float64Array) {
+            if (arr instanceof Float64Array || arr instanceof BigInt64Array) {
                 // Typed array - slice to actual length
                 columnarData[col.name] = arr.subarray(0, bufLen);
             } else {
@@ -487,17 +510,32 @@ export class WorkerDatabase {
 
         // Read from persisted fragments
         for (const fragKey of table.fragments) {
-            let rows = this._readCache.get(fragKey);
+            // Check Buffer Pool for binary columnar data
+            let binary = this.bufferPool.get(fragKey);
+            let rows = null;
 
-            if (!rows) {
+            if (!binary) {
+                // Load from OPFS
                 const fragData = await opfsStorage.load(fragKey);
                 if (fragData) {
-                    rows = this._parseFragment(fragData, table.schema);
-                    this._readCache.set(fragKey, rows);
-                } else {
-                    rows = [];
+                    binary = parseBinaryColumnar(fragData);
+                    if (binary) {
+                        // Store in pool (approx size)
+                        this.bufferPool.set(fragKey, binary, fragData.byteLength);
+                    } else {
+                        // Fallback for JSON/Legacy
+                        rows = this._parseFragment(fragData, table.schema);
+                        // We don't cache legacy JSON rows in the pool to avoid complexity
+                    }
                 }
             }
+
+            // Hydrate rows from binary if available
+            if (binary && !rows) {
+                rows = this._hydrateRowsFromBinary(binary, table.schema);
+            }
+            // Ensure rows is an array
+            rows = rows || [];
 
             // Optimize: if no deletions, push all at once
             if (!deletedSet) {
@@ -528,6 +566,23 @@ export class WorkerDatabase {
         }
 
         return allRows;
+    }
+
+    _hydrateRowsFromBinary(binary, schema) {
+        const { columns, rowCount } = binary;
+        const colNames = schema.map(c => c.name);
+        const rows = new Array(rowCount);
+
+        for (let i = 0; i < rowCount; i++) {
+            const row = { __rowId: columns.__rowId[i] };
+            for (const name of colNames) {
+                if (columns[name]) {
+                    row[name] = columns[name][i];
+                }
+            }
+            rows[i] = row;
+        }
+        return rows;
     }
 
     _parseFragment(data, schema) {
@@ -591,14 +646,14 @@ export class WorkerDatabase {
 
         // Read from persisted fragments - use cache, STAY COLUMNAR
         for (const fragKey of table.fragments) {
-            // Check columnar cache first
-            let binary = this._readCache.get(fragKey + ':columnar');
+            // Check Buffer Pool
+            let binary = this.bufferPool.get(fragKey);
             if (!binary) {
                 const fragData = await opfsStorage.load(fragKey);
                 if (!fragData) continue;
                 binary = parseBinaryColumnar(fragData);
                 if (binary) {
-                    this._readCache.set(fragKey + ':columnar', binary);
+                    this.bufferPool.set(fragKey, binary, fragData.byteLength);
                 }
             }
             if (!binary) continue;
