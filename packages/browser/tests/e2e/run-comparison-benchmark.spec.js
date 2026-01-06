@@ -8,24 +8,22 @@ import fs from 'fs';
 import path from 'path';
 
 function saveResults(rowCount, results) {
-    if (process.env.CI) {
-        try {
-            const resultsPath = path.join(process.cwd(), 'benchmark-results.json');
-            let allResults = [];
-            if (fs.existsSync(resultsPath)) {
-                allResults = JSON.parse(fs.readFileSync(resultsPath, 'utf8'));
-            }
-            allResults.push({
-                rowCount,
-                timestamp: new Date().toISOString(),
-                commit: process.env.GITHUB_SHA || 'local',
-                results
-            });
-            fs.writeFileSync(resultsPath, JSON.stringify(allResults, null, 2));
-            console.log(`Saved benchmark results to ${resultsPath}`);
-        } catch (e) {
-            console.error('Failed to save benchmark results:', e);
+    try {
+        const resultsPath = path.join(process.cwd(), 'benchmark-results.json');
+        let allResults = [];
+        if (fs.existsSync(resultsPath)) {
+            allResults = JSON.parse(fs.readFileSync(resultsPath, 'utf8'));
         }
+        allResults.push({
+            rowCount,
+            timestamp: new Date().toISOString(),
+            commit: process.env.GITHUB_SHA || 'local',
+            results
+        });
+        fs.writeFileSync(resultsPath, JSON.stringify(allResults, null, 2));
+        console.log(`Saved benchmark results to ${resultsPath}`);
+    } catch (e) {
+        console.error('Failed to save benchmark results:', e);
     }
 }
 

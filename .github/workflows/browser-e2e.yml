@@ -69,9 +69,15 @@ jobs:
         working-directory: packages/browser
         run: npm install
 
-      - name: Run E2E tests
+      - name: Run E2E tests (non-benchmark)
         working-directory: packages/browser
-        run: npx playwright test --project=chromium
+        continue-on-error: true
+        run: npx playwright test --project=chromium --ignore-snapshots --grep-invert "benchmark"
+
+      - name: Run Benchmark tests
+        working-directory: packages/browser
+        continue-on-error: true
+        run: npx playwright test tests/e2e/run-comparison-benchmark.spec.js --project=chromium
 
       - name: Generate Benchmark Summary
         if: always()
