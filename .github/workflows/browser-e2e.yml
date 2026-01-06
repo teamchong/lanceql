@@ -73,6 +73,71 @@ jobs:
         working-directory: packages/browser
         run: npx playwright test --project=chromium
 
+      - name: Generate Benchmark Summary
+        if: always()
+        working-directory: packages/browser
+        run: |
+          echo "## 🏆 LanceQL vs DuckDB WASM Benchmark" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f benchmark-results.json ]; then
+            echo "### Performance Comparison" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # Parse and format results using Node.js
+            node -e "
+              const fs = require('fs');
+              const results = JSON.parse(fs.readFileSync('benchmark-results.json'));
+              
+              // Group by row count
+              const byRows = {};
+              for (const entry of results) {
+                byRows[entry.rowCount] = entry.results;
+              }
+              
+              // Output tables for each scale
+              for (const [rows, benchmarks] of Object.entries(byRows).sort((a,b) => a[0] - b[0])) {
+                const scale = rows >= 100000 ? '100K' : rows >= 10000 ? '10K' : '1K';
+                console.log('#### ' + scale + ' Rows');
+                console.log('');
+                console.log('| Query Type | LanceQL (ms) | DuckDB (ms) | Ratio | Winner |');
+                console.log('|------------|--------------|-------------|-------|--------|');
+                
+                let lanceWins = 0;
+                for (const b of benchmarks) {
+                  const winner = parseFloat(b.ratio) < 1 ? '**LanceQL** 🏆' : 'DuckDB';
+                  if (parseFloat(b.ratio) < 1) lanceWins++;
+                  console.log('| ' + b.query + ' | ' + b.lanceql + ' | ' + b.duckdb + ' | ' + b.ratio + ' | ' + winner + ' |');
+                }
+                console.log('');
+                
+                if (lanceWins === benchmarks.length) {
+                  console.log('> **Total Victory at ' + scale + ' scale!** 🎉');
+                  console.log('');
+                }
+              }
+              
+              // Overall summary
+              const allBenchmarks = results.flatMap(r => r.results);
+              const lanceWinCount = allBenchmarks.filter(b => parseFloat(b.ratio) < 1).length;
+              const total = allBenchmarks.length;
+              
+              console.log('### Overall Score');
+              console.log('');
+              console.log('**LanceQL wins ' + lanceWinCount + '/' + total + ' benchmarks** (' + Math.round(lanceWinCount/total*100) + '%)');
+              if (lanceWinCount === total) {
+                console.log('');
+                console.log('🏆 **TOTAL VICTORY: LanceQL beats DuckDB WASM at every scale for every query type!**');
+              }
+            " >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ Benchmark results not available" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*Commit: $GITHUB_SHA*" >> $GITHUB_STEP_SUMMARY
+
       - name: Upload Benchmark Results
         uses: actions/upload-artifact@v4
         if: always()
