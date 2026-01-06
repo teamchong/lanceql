@@ -2176,10 +2176,8 @@ async function executeWasmSqlFull(db, sql) {
   }
   const executor = getWasmSqlExecutor();
   const tableNames = executor.getTableNames(sql);
-  console.log(`[LanceQLWorker] executeWasmSqlFull: ${sql} -> tables: ${tableNames.join(",")}`);
   for (const tableName of tableNames) {
     const exists = executor.hasTable(tableName);
-    console.log(`[LanceQLWorker] Check hasTable '${tableName}': ${exists}`);
     if (exists) continue;
     const table = db.tables.get(tableName);
     if (!table) continue;
@@ -2272,13 +2270,6 @@ function createWasmImports() {
       opfs_close: (handle) => {
       },
       js_log: (ptr, len) => {
-        try {
-          const bytes = new Uint8Array(wasmMemory.buffer, ptr, len);
-          const msg = new TextDecoder().decode(bytes);
-          console.log(`[LanceQLWasm] ${msg}`);
-        } catch (e) {
-          console.error("[LanceQLWasm] Log error:", e);
-        }
       },
       __assert_fail: (msgPtr, filePtr, line, funcPtr) => {
         const decoder = new TextDecoder();
