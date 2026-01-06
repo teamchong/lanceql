@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -9,6 +10,7 @@
             box-sizing: border-box;
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
         }
+
         body {
             margin: 0;
             padding: 0;
@@ -16,6 +18,7 @@
             color: #e2e8f0;
             min-height: 100vh;
         }
+
         .container {
             max-width: 1200px;
             margin: 0 auto;
@@ -31,6 +34,7 @@
             border-bottom: 1px solid #334155;
             margin-bottom: 20px;
         }
+
         .logo {
             display: flex;
             align-items: center;
@@ -39,15 +43,18 @@
             font-weight: 700;
             color: #f8fafc;
         }
+
         .logo svg {
             width: 32px;
             height: 32px;
         }
+
         .version {
             font-size: 12px;
             color: #64748b;
             font-weight: normal;
         }
+
         .github-link {
             color: #94a3b8;
             text-decoration: none;
@@ -55,6 +62,7 @@
             align-items: center;
             gap: 6px;
         }
+
         .github-link:hover {
             color: #f8fafc;
         }
@@ -66,12 +74,14 @@
             padding: 15px;
             margin-bottom: 20px;
         }
+
         .tables-header {
             display: flex;
             justify-content: space-between;
             align-items: center;
             margin-bottom: 12px;
         }
+
         .tables-title {
             display: flex;
             align-items: center;
@@ -79,31 +89,37 @@
             font-weight: 600;
             color: #e2e8f0;
         }
+
         .tables-title svg {
             color: #3b82f6;
         }
+
         .tables-actions {
             display: flex;
             gap: 8px;
         }
+
         .tables-list {
             display: flex;
             flex-direction: column;
             gap: 8px;
             min-height: 40px;
         }
+
         .tables-empty {
             color: #64748b;
             font-size: 13px;
             text-align: center;
             padding: 20px;
         }
+
         .tables-empty code {
             background: #334155;
             padding: 2px 6px;
             border-radius: 4px;
             font-family: 'SF Mono', Monaco, monospace;
         }
+
         .table-item {
             display: flex;
             align-items: center;
@@ -114,24 +130,35 @@
             border: 1px solid #334155;
             transition: all 0.2s;
         }
+
         .table-item:hover {
             border-color: #475569;
         }
+
         .table-item.active {
             border-color: #3b82f6;
             background: rgba(59, 130, 246, 0.1);
         }
+
         .table-icon {
             color: #64748b;
             flex-shrink: 0;
         }
-        .table-icon.local { color: #4ade80; }
-        .table-icon.remote { color: #60a5fa; }
+
+        .table-icon.local {
+            color: #4ade80;
+        }
+
+        .table-icon.remote {
+            color: #60a5fa;
+        }
+
         .table-info {
             flex: 1;
             min-width: 0;
             overflow: hidden;
         }
+
         .table-name {
             font-weight: 600;
             color: #e2e8f0;
@@ -141,16 +168,19 @@
             text-overflow: ellipsis;
             white-space: nowrap;
         }
+
         .table-meta {
             font-size: 11px;
             color: #64748b;
             margin-top: 2px;
         }
+
         .table-actions {
             display: flex;
             gap: 4px;
             flex-shrink: 0;
         }
+
         .table-action-btn {
             padding: 4px 8px;
             background: #334155;
@@ -161,14 +191,17 @@
             cursor: pointer;
             transition: all 0.2s;
         }
+
         .table-action-btn:hover {
             background: #475569;
             color: #e2e8f0;
         }
+
         .table-action-btn.delete:hover {
             background: #ef4444;
             color: white;
         }
+
         .tables-drop-zone {
             display: none;
             align-items: center;
@@ -182,12 +215,15 @@
             font-size: 14px;
             margin-top: 12px;
         }
+
         .tables-section.dragover .tables-drop-zone {
             display: flex;
         }
+
         .tables-section.dragover .tables-list {
             opacity: 0.5;
         }
+
         /* Tabs */
         .tabs-container {
             background: #1e293b;
@@ -195,11 +231,13 @@
             overflow: hidden;
             margin-bottom: 20px;
         }
+
         .tabs-header {
             display: flex;
             background: #0f172a;
             border-bottom: 1px solid #334155;
         }
+
         .tab-btn {
             flex: 1;
             padding: 15px 20px;
@@ -215,19 +253,23 @@
             justify-content: center;
             gap: 8px;
         }
+
         .tab-btn:hover {
             color: #94a3b8;
-            background: rgba(255,255,255,0.05);
+            background: rgba(255, 255, 255, 0.05);
         }
+
         .tab-btn.active {
             color: #3b82f6;
             background: #1e293b;
             border-bottom: 2px solid #3b82f6;
         }
+
         .tab-content {
             display: none;
             padding: 20px;
         }
+
         .tab-content.active {
             display: block;
         }
@@ -236,12 +278,15 @@
         .sql-editor {
             position: relative;
         }
+
         .sql-editor-container {
             position: relative;
             width: 100%;
             height: 150px;
         }
-        .sql-highlight, .sql-textarea {
+
+        .sql-highlight,
+        .sql-textarea {
             position: absolute;
             top: 0;
             left: 0;
@@ -261,11 +306,13 @@
             tab-size: 4;
             -moz-tab-size: 4;
         }
+
         .sql-highlight {
             background: #0f172a;
             pointer-events: none;
             z-index: 1;
         }
+
         .sql-textarea {
             background: transparent;
             border-color: transparent;
@@ -275,29 +322,55 @@
             z-index: 2;
             -webkit-text-fill-color: transparent;
         }
+
         .sql-textarea:focus {
             outline: none;
         }
-        .sql-textarea:focus + .sql-highlight {
+
+        .sql-textarea:focus+.sql-highlight {
             border-color: #3b82f6;
         }
+
         /* SQL syntax highlighting colors */
         .sql-highlight span {
             font: inherit;
         }
-        .sql-keyword { color: #c084fc; }
-        .sql-function { color: #60a5fa; }
-        .sql-string { color: #4ade80; }
-        .sql-number { color: #fbbf24; }
-        .sql-operator { color: #f472b6; }
-        .sql-comment { color: #64748b; }
-        .sql-identifier { color: #e2e8f0; }
+
+        .sql-keyword {
+            color: #c084fc;
+        }
+
+        .sql-function {
+            color: #60a5fa;
+        }
+
+        .sql-string {
+            color: #4ade80;
+        }
+
+        .sql-number {
+            color: #fbbf24;
+        }
+
+        .sql-operator {
+            color: #f472b6;
+        }
+
+        .sql-comment {
+            color: #64748b;
+        }
+
+        .sql-identifier {
+            color: #e2e8f0;
+        }
+
         .sql-examples {
             margin-top: 10px;
             display: flex;
             gap: 10px;
             flex-wrap: wrap;
         }
+
         .sql-example {
             padding: 6px 12px;
             background: #334155;
@@ -308,10 +381,12 @@
             cursor: pointer;
             transition: all 0.2s;
         }
+
         .sql-example:hover {
             background: #475569;
             color: #e2e8f0;
         }
+
         .sql-example.copy-link-btn {
             background: #1e3a5f;
             color: #60a5fa;
@@ -319,6 +394,7 @@
             align-items: center;
             gap: 4px;
         }
+
         .sql-example.copy-link-btn:hover {
             background: #1e40af;
             color: #93c5fd;
@@ -330,6 +406,7 @@
             flex-direction: column;
             gap: 15px;
         }
+
         .df-step {
             display: flex;
             align-items: center;
@@ -338,6 +415,7 @@
             background: #0f172a;
             border-radius: 8px;
         }
+
         .df-step-num {
             width: 28px;
             height: 28px;
@@ -350,13 +428,16 @@
             font-weight: 600;
             flex-shrink: 0;
         }
+
         .df-step-label {
             width: 80px;
             color: #94a3b8;
             font-size: 14px;
             flex-shrink: 0;
         }
-        .df-step select, .df-step input {
+
+        .df-step select,
+        .df-step input {
             padding: 8px 12px;
             background: #1e293b;
             border: 1px solid #334155;
@@ -364,20 +445,26 @@
             color: #e2e8f0;
             font-size: 14px;
         }
-        .df-step select:focus, .df-step input:focus {
+
+        .df-step select:focus,
+        .df-step input:focus {
             outline: none;
             border-color: #3b82f6;
         }
+
         .df-step input[type="number"] {
             width: 100px;
         }
+
         /* DataFrame code editor - same overlay technique as SQL */
         .df-editor-container {
             position: relative;
             width: 100%;
             height: 300px;
         }
-        .df-highlight, .df-textarea {
+
+        .df-highlight,
+        .df-textarea {
             position: absolute;
             top: 0;
             left: 0;
@@ -397,14 +484,17 @@
             tab-size: 4;
             -moz-tab-size: 4;
         }
+
         .df-highlight {
             background: #0f172a;
             pointer-events: none;
             z-index: 1;
         }
+
         .df-highlight span {
             font: inherit;
         }
+
         .df-textarea {
             background: transparent;
             border-color: transparent;
@@ -414,18 +504,35 @@
             z-index: 2;
             -webkit-text-fill-color: transparent;
         }
+
         .df-textarea:focus {
             outline: none;
         }
-        .df-textarea:focus + .df-highlight {
+
+        .df-textarea:focus+.df-highlight {
             border-color: #3b82f6;
         }
+
         /* DataFrame syntax highlighting */
-        .df-keyword { color: #93c5fd; }
-        .df-string { color: #fcd34d; }
-        .df-number { color: #86efac; }
-        .df-method { color: #c4b5fd; }
-        .df-comment { color: #64748b; }
+        .df-keyword {
+            color: #93c5fd;
+        }
+
+        .df-string {
+            color: #fcd34d;
+        }
+
+        .df-number {
+            color: #86efac;
+        }
+
+        .df-method {
+            color: #c4b5fd;
+        }
+
+        .df-comment {
+            color: #64748b;
+        }
 
         /* Run button */
         .run-section {
@@ -433,6 +540,7 @@
             gap: 10px;
             margin-top: 15px;
         }
+
         .btn {
             padding: 12px 24px;
             border-radius: 8px;
@@ -444,25 +552,30 @@
             align-items: center;
             gap: 8px;
         }
+
         .btn-primary {
             background: #3b82f6;
             color: white;
             border: none;
         }
+
         .btn-primary:hover {
             background: #2563eb;
         }
+
         .btn-primary:disabled {
             background: #475569;
             cursor: not-allowed;
         }
+
         .btn-secondary {
             background: transparent;
             color: #94a3b8;
             border: 1px solid #475569;
         }
+
         .btn-secondary:hover {
-            background: rgba(255,255,255,0.05);
+            background: rgba(255, 255, 255, 0.05);
             color: #e2e8f0;
         }
 
@@ -472,6 +585,7 @@
             border-radius: 12px;
             overflow: hidden;
         }
+
         .results-header {
             display: flex;
             align-items: center;
@@ -480,6 +594,7 @@
             background: #0f172a;
             border-bottom: 1px solid #334155;
         }
+
         .results-header h3 {
             margin: 0;
             font-size: 16px;
@@ -487,24 +602,29 @@
             align-items: center;
             gap: 10px;
         }
+
         .results-count {
             font-size: 14px;
             color: #64748b;
         }
+
         .results-notice {
             font-size: 12px;
             padding: 4px 8px;
             border-radius: 4px;
             margin-left: 8px;
         }
+
         .results-notice.notice-success {
             color: #22c55e;
             background: rgba(34, 197, 94, 0.1);
         }
+
         .results-notice.notice-warning {
             color: #f59e0b;
             background: rgba(245, 158, 11, 0.1);
         }
+
         .dataset-hint {
             color: #94a3b8;
             font-size: 12px;
@@ -514,14 +634,17 @@
             margin-top: 10px;
             line-height: 1.4;
         }
+
         .dataset-hint strong {
             color: #e2e8f0;
         }
+
         .results-actions {
             display: flex;
             align-items: center;
             gap: 10px;
         }
+
         .export-btn {
             display: inline-flex;
             align-items: center;
@@ -535,13 +658,16 @@
             cursor: pointer;
             transition: all 0.15s ease;
         }
+
         .export-btn:hover {
             background: #334155;
             color: #e2e8f0;
         }
+
         .export-btn svg {
             opacity: 0.7;
         }
+
         .results-body {
             padding: 20px;
             height: calc(100vh - 200px);
@@ -556,6 +682,7 @@
             border-spacing: 0;
             font-size: 14px;
         }
+
         .data-table th {
             padding: 12px;
             text-align: left;
@@ -566,13 +693,15 @@
             top: -20px;
             z-index: 1;
         }
+
         .data-table td {
             padding: 12px;
             border-bottom: 1px solid #334155;
             color: #94a3b8;
         }
+
         .data-table tr:hover td {
-            background: rgba(255,255,255,0.02);
+            background: rgba(255, 255, 255, 0.02);
         }
 
         /* Cell formatting */
@@ -580,25 +709,30 @@
             color: #64748b;
             font-style: italic;
         }
+
         .empty-value {
             color: #64748b;
             font-style: italic;
             font-size: 12px;
         }
+
         .url-link {
             color: #60a5fa;
             text-decoration: none;
             word-break: break-all;
         }
+
         .url-link:hover {
             text-decoration: underline;
         }
+
         .image-cell {
             display: flex;
             flex-direction: column;
             gap: 4px;
             max-width: 150px;
         }
+
         .image-cell img {
             max-width: 100px;
             max-height: 60px;
@@ -606,15 +740,18 @@
             border-radius: 4px;
             background: #1e293b;
         }
+
         .image-cell img.placeholder {
             opacity: 0.6;
         }
+
         .image-cell .url-text {
             font-size: 11px;
             color: #64748b;
             text-decoration: none;
             word-break: break-all;
         }
+
         .image-cell .url-text:hover {
             color: #60a5fa;
         }
@@ -631,7 +768,8 @@
         }
 
         /* Vector and Hash badges */
-        .vector-badge, .hash-badge {
+        .vector-badge,
+        .hash-badge {
             display: inline-flex;
             align-items: center;
             gap: 4px;
@@ -640,17 +778,21 @@
             font-size: 11px;
             font-weight: 500;
         }
+
         .vector-badge {
             background: rgba(139, 92, 246, 0.2);
             color: #a78bfa;
             border: 1px solid rgba(139, 92, 246, 0.3);
         }
+
         .hash-badge {
             background: rgba(100, 116, 139, 0.2);
             color: #94a3b8;
             border: 1px solid rgba(100, 116, 139, 0.3);
         }
-        .vector-badge svg, .hash-badge svg {
+
+        .vector-badge svg,
+        .hash-badge svg {
             opacity: 0.8;
         }
 
@@ -664,10 +806,12 @@
             font-size: 12px;
             transition: all 0.15s ease;
         }
+
         .find-similar-btn:hover {
             background: rgba(139, 92, 246, 0.4);
             transform: scale(1.1);
         }
+
         .find-similar-btn:active {
             transform: scale(0.95);
         }
@@ -678,19 +822,23 @@
             grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
             gap: 15px;
         }
+
         .image-card {
             background: #0f172a;
             border-radius: 8px;
             overflow: hidden;
         }
+
         .image-card img {
             width: 100%;
             height: 150px;
             object-fit: cover;
         }
+
         .image-card-info {
             padding: 10px;
         }
+
         .image-card-info p {
             margin: 0;
             font-size: 12px;
@@ -706,15 +854,18 @@
             border-bottom: 1px solid #334155;
             overflow-x: auto;
         }
+
         .agg-item {
             text-align: center;
             min-width: 80px;
         }
+
         .agg-value {
             font-size: 20px;
             font-weight: 600;
             color: #3b82f6;
         }
+
         .agg-label {
             font-size: 11px;
             color: #64748b;
@@ -729,19 +880,23 @@
             margin-top: 15px;
             display: none;
         }
+
         .status.show {
             display: block;
         }
+
         .status.success {
             background: rgba(34, 197, 94, 0.1);
             border: 1px solid rgba(34, 197, 94, 0.3);
             color: #86efac;
         }
+
         .status.error {
             background: rgba(239, 68, 68, 0.1);
             border: 1px solid rgba(239, 68, 68, 0.3);
             color: #fca5a5;
         }
+
         .status.info {
             background: rgba(59, 130, 246, 0.1);
             border: 1px solid rgba(59, 130, 246, 0.3);
@@ -754,16 +909,19 @@
             padding: 60px 20px;
             color: #64748b;
         }
+
         .empty-state svg {
             width: 64px;
             height: 64px;
             margin-bottom: 15px;
             opacity: 0.5;
         }
+
         .empty-state h3 {
             margin: 0 0 10px 0;
             color: #94a3b8;
         }
+
         .empty-state p {
             margin: 0;
         }
@@ -780,8 +938,11 @@
             vertical-align: middle;
             margin-right: 6px;
         }
+
         @keyframes spin {
-            to { transform: rotate(360deg); }
+            to {
+                transform: rotate(360deg);
+            }
         }
 
         /* Progress bar */
@@ -789,15 +950,18 @@
             margin-top: 15px;
             display: none;
         }
+
         .progress-container.show {
             display: block;
         }
+
         .progress-bar {
             height: 6px;
             background: #334155;
             border-radius: 3px;
             overflow: hidden;
         }
+
         .progress-fill {
             height: 100%;
             background: linear-gradient(90deg, #3b82f6, #8b5cf6);
@@ -805,6 +969,7 @@
             transition: width 0.3s ease;
             width: 0%;
         }
+
         .progress-text {
             display: flex;
             justify-content: space-between;
@@ -823,19 +988,23 @@
             margin-top: 10px;
             font-size: 12px;
         }
+
         .network-stats.hidden {
             display: none;
         }
+
         .network-stat {
             display: flex;
             align-items: center;
             gap: 6px;
             color: #94a3b8;
         }
+
         .network-stat svg {
             width: 14px;
             height: 14px;
         }
+
         .network-stat strong {
             color: #3b82f6;
         }
@@ -847,6 +1016,7 @@
             gap: 8px;
             margin-top: 10px;
         }
+
         .column-chip {
             display: flex;
             align-items: center;
@@ -857,34 +1027,75 @@
             font-size: 11px;
             color: #94a3b8;
         }
+
         .column-chip .type {
             padding: 2px 6px;
             border-radius: 4px;
             font-size: 10px;
             font-weight: 500;
         }
-        .column-chip .type.string { background: #065f46; color: #6ee7b7; }
-        .column-chip .type.int64 { background: #1e40af; color: #93c5fd; }
-        .column-chip .type.int32 { background: #1e40af; color: #93c5fd; }
-        .column-chip .type.int16 { background: #1e40af; color: #93c5fd; }
-        .column-chip .type.int8 { background: #1e40af; color: #93c5fd; }
-        .column-chip .type.float64 { background: #7c2d12; color: #fdba74; }
-        .column-chip .type.float32 { background: #7c2d12; color: #fdba74; }
-        .column-chip .type.unknown { background: #374151; color: #9ca3af; }
-        .column-chip .type.vector { background: #7c3aed; color: #ddd6fe; }
+
+        .column-chip .type.string {
+            background: #065f46;
+            color: #6ee7b7;
+        }
+
+        .column-chip .type.int64 {
+            background: #1e40af;
+            color: #93c5fd;
+        }
+
+        .column-chip .type.int32 {
+            background: #1e40af;
+            color: #93c5fd;
+        }
+
+        .column-chip .type.int16 {
+            background: #1e40af;
+            color: #93c5fd;
+        }
+
+        .column-chip .type.int8 {
+            background: #1e40af;
+            color: #93c5fd;
+        }
+
+        .column-chip .type.float64 {
+            background: #7c2d12;
+            color: #fdba74;
+        }
+
+        .column-chip .type.float32 {
+            background: #7c2d12;
+            color: #fdba74;
+        }
+
+        .column-chip .type.unknown {
+            background: #374151;
+            color: #9ca3af;
+        }
+
+        .column-chip .type.vector {
+            background: #7c3aed;
+            color: #ddd6fe;
+        }
+
         .column-chip {
             cursor: pointer;
             transition: transform 0.1s, box-shadow 0.1s;
             position: relative;
         }
+
         .column-chip:hover {
             transform: translateY(-1px);
-            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
         }
+
         .column-chip.loading::after {
             content: '...';
             margin-left: 4px;
         }
+
         .column-stats-popup {
             position: fixed;
             background: #1e293b;
@@ -893,9 +1104,10 @@
             padding: 12px;
             z-index: 1000;
             min-width: 200px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
             font-size: 12px;
         }
+
         .column-stats-popup h4 {
             margin: 0 0 8px 0;
             color: #e2e8f0;
@@ -903,19 +1115,23 @@
             border-bottom: 1px solid #475569;
             padding-bottom: 6px;
         }
+
         .column-stats-popup .stat-row {
             display: flex;
             justify-content: space-between;
             padding: 3px 0;
             color: #94a3b8;
         }
+
         .column-stats-popup .stat-row .label {
             color: #64748b;
         }
+
         .column-stats-popup .stat-row .value {
             color: #e2e8f0;
             font-family: 'SF Mono', Monaco, monospace;
         }
+
         .column-stats-popup .close-btn {
             position: absolute;
             top: 8px;
@@ -927,6 +1143,7 @@
             font-size: 16px;
             line-height: 1;
         }
+
         .column-stats-popup .close-btn:hover {
             color: #e2e8f0;
         }
@@ -937,10 +1154,12 @@
             flex-direction: column;
             gap: 15px;
         }
+
         .vector-search-input {
             display: flex;
             gap: 10px;
         }
+
         .vector-search-input input {
             flex: 1;
             padding: 12px 15px;
@@ -950,24 +1169,30 @@
             color: #e2e8f0;
             font-size: 14px;
         }
+
         .vector-search-input input:focus {
             outline: none;
             border-color: #7c3aed;
         }
+
         .vector-search-input input::placeholder {
             color: #64748b;
         }
+
         .vector-config {
             display: flex;
             gap: 15px;
             align-items: center;
             flex-wrap: wrap;
         }
+
         .vector-config label {
             color: #94a3b8;
             font-size: 14px;
         }
-        .vector-config select, .vector-config input[type="number"] {
+
+        .vector-config select,
+        .vector-config input[type="number"] {
             padding: 8px 12px;
             background: #0f172a;
             border: 1px solid #334155;
@@ -975,14 +1200,17 @@
             color: #e2e8f0;
             font-size: 14px;
         }
+
         .vector-config input[type="number"] {
             width: 80px;
         }
+
         .search-examples {
             display: flex;
             gap: 8px;
             flex-wrap: wrap;
         }
+
         .search-example {
             padding: 6px 12px;
             background: #334155;
@@ -993,10 +1221,12 @@
             cursor: pointer;
             transition: all 0.2s;
         }
+
         .search-example:hover {
             background: #7c3aed;
             color: white;
         }
+
         .vector-notice {
             padding: 12px 15px;
             background: rgba(124, 58, 237, 0.1);
@@ -1012,12 +1242,14 @@
             padding-top: 20px;
             border-top: 1px solid #334155;
         }
+
         .clip-header {
             display: flex;
             align-items: center;
             justify-content: space-between;
             margin-bottom: 15px;
         }
+
         .clip-title {
             display: flex;
             align-items: center;
@@ -1026,6 +1258,7 @@
             font-weight: 500;
             color: #e2e8f0;
         }
+
         .clip-title .badge {
             font-size: 10px;
             padding: 2px 6px;
@@ -1033,12 +1266,15 @@
             color: white;
             border-radius: 4px;
         }
+
         .clip-title .badge.loading {
             background: #f59e0b;
         }
+
         .clip-title .badge.error {
             background: #ef4444;
         }
+
         .clip-load-btn {
             padding: 6px 12px;
             background: #334155;
@@ -1049,19 +1285,23 @@
             cursor: pointer;
             transition: all 0.2s;
         }
+
         .clip-load-btn:hover {
             background: #475569;
             color: #e2e8f0;
         }
+
         .clip-load-btn:disabled {
             opacity: 0.5;
             cursor: not-allowed;
         }
+
         .clip-text-input {
             display: flex;
             gap: 10px;
             margin-bottom: 10px;
         }
+
         .clip-text-input input {
             flex: 1;
             padding: 12px 15px;
@@ -1071,18 +1311,22 @@
             color: #e2e8f0;
             font-size: 14px;
         }
+
         .clip-text-input input:focus {
             outline: none;
             border-color: #22c55e;
         }
+
         .clip-text-input input::placeholder {
             color: #64748b;
         }
+
         .clip-examples {
             display: flex;
             gap: 8px;
             flex-wrap: wrap;
         }
+
         .clip-example {
             padding: 6px 12px;
             background: #334155;
@@ -1093,23 +1337,29 @@
             cursor: pointer;
             transition: all 0.2s;
         }
+
         .clip-example:hover {
             background: #22c55e;
             color: white;
         }
+
         .btn-clip-search {
             background: #22c55e !important;
         }
+
         .btn-clip-search:hover {
             background: #16a34a !important;
         }
+
         .btn-clip-search:disabled {
             background: #475569 !important;
         }
+
         .clip-mode-toggle {
             display: flex;
             align-items: center;
         }
+
         .clip-model-select {
             display: flex;
             align-items: center;
@@ -1117,6 +1367,7 @@
             font-size: 12px;
             color: #94a3b8;
         }
+
         .clip-model-select select {
             background: #1e293b;
             border: 1px solid #334155;
@@ -1125,6 +1376,7 @@
             padding: 4px 8px;
             font-size: 12px;
         }
+
         .toggle-label {
             display: flex;
             align-items: center;
@@ -1133,20 +1385,29 @@
             font-size: 12px;
             color: #94a3b8;
         }
+
         .toggle-label input[type="checkbox"] {
             width: 16px;
             height: 16px;
             cursor: pointer;
         }
+
         .clip-note {
             margin-top: 10px;
             color: #64748b;
             font-size: 11px;
         }
+
         @keyframes spin {
-            from { transform: rotate(0deg); }
-            to { transform: rotate(360deg); }
+            from {
+                transform: rotate(0deg);
+            }
+
+            to {
+                transform: rotate(360deg);
+            }
         }
+
         .animate-spin {
             animation: spin 1s linear infinite;
         }
@@ -1158,6 +1419,7 @@
             padding: 15px;
             margin-bottom: 20px;
         }
+
         .storage-header {
             display: flex;
             justify-content: space-between;
@@ -1165,6 +1427,7 @@
             margin-bottom: 12px;
             cursor: pointer;
         }
+
         .storage-title {
             display: flex;
             align-items: center;
@@ -1172,46 +1435,56 @@
             font-weight: 600;
             color: #e2e8f0;
         }
+
         .storage-title svg {
             color: #10b981;
         }
+
         .storage-toggle {
             color: #64748b;
             transition: transform 0.2s;
         }
+
         .storage-panel.collapsed .storage-toggle {
             transform: rotate(-90deg);
         }
+
         .storage-panel.collapsed .storage-content {
             display: none;
         }
+
         .storage-stats {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
             gap: 12px;
             margin-bottom: 15px;
         }
+
         .storage-stat {
             background: #0f172a;
             border-radius: 8px;
             padding: 12px;
             text-align: center;
         }
+
         .storage-stat-value {
             font-size: 20px;
             font-weight: 700;
             color: #e2e8f0;
         }
+
         .storage-stat-label {
             font-size: 11px;
             color: #64748b;
             margin-top: 4px;
         }
+
         .storage-files {
             max-height: 200px;
             overflow-y: auto;
             margin-bottom: 12px;
         }
+
         .storage-file-item {
             display: flex;
             align-items: center;
@@ -1221,23 +1494,28 @@
             border-radius: 6px;
             margin-bottom: 6px;
         }
+
         .storage-file-info {
             display: flex;
             align-items: center;
             gap: 8px;
         }
+
         .storage-file-icon {
             color: #10b981;
         }
+
         .storage-file-name {
             font-size: 13px;
             color: #e2e8f0;
             font-family: 'SF Mono', Monaco, monospace;
         }
+
         .storage-file-size {
             font-size: 11px;
             color: #64748b;
         }
+
         .storage-file-delete {
             padding: 4px 8px;
             background: transparent;
@@ -1246,14 +1524,17 @@
             cursor: pointer;
             border-radius: 4px;
         }
+
         .storage-file-delete:hover {
             background: #ef4444;
             color: white;
         }
+
         .storage-actions {
             display: flex;
             gap: 8px;
         }
+
         .storage-btn {
             padding: 8px 16px;
             border-radius: 6px;
@@ -1264,28 +1545,34 @@
             align-items: center;
             gap: 6px;
         }
+
         .storage-btn-clear {
             background: #dc2626;
             color: white;
             border: none;
         }
+
         .storage-btn-clear:hover {
             background: #b91c1c;
         }
+
         .storage-btn-refresh {
             background: #334155;
             color: #e2e8f0;
             border: none;
         }
+
         .storage-btn-refresh:hover {
             background: #475569;
         }
+
         .storage-empty {
             color: #64748b;
             font-size: 13px;
             text-align: center;
             padding: 20px;
         }
+
         .online-indicator {
             display: flex;
             align-items: center;
@@ -1296,16 +1583,19 @@
             background: rgba(16, 185, 129, 0.1);
             color: #10b981;
         }
+
         .online-indicator.offline {
             background: rgba(245, 158, 11, 0.1);
             color: #f59e0b;
         }
+
         .online-indicator-dot {
             width: 8px;
             height: 8px;
             border-radius: 50%;
             background: currentColor;
         }
+
         .cache-badge {
             font-size: 10px;
             padding: 2px 6px;
@@ -1314,6 +1604,7 @@
             color: #10b981;
             margin-left: 6px;
         }
+
         .save-local-btn {
             padding: 4px 10px;
             background: #065f46;
@@ -1327,14 +1618,17 @@
             gap: 4px;
             transition: all 0.2s;
         }
+
         .save-local-btn:hover {
             background: #047857;
             color: #6ee7b7;
         }
+
         .save-local-btn:disabled {
             opacity: 0.5;
             cursor: not-allowed;
         }
+
         .opfs-unsupported {
             font-size: 10px;
             padding: 2px 8px;
@@ -1343,25 +1637,30 @@
             color: #ef4444;
             margin-left: 8px;
         }
+
         .storage-panel.unsupported .storage-btn-clear,
         .storage-panel.unsupported .storage-btn-refresh {
             opacity: 0.5;
             cursor: not-allowed;
         }
+
         .storage-btn-session {
             background: #7c3aed;
             color: white;
             border: none;
         }
+
         .storage-btn-session:hover {
             background: #6d28d9;
         }
+
         /* Memory display */
         .memory-display {
             margin-top: 12px;
             padding-top: 12px;
             border-top: 1px solid #334155;
         }
+
         .memory-header {
             display: flex;
             justify-content: space-between;
@@ -1369,28 +1668,33 @@
             margin-bottom: 8px;
             font-size: 12px;
         }
+
         .memory-label {
             color: #94a3b8;
             display: flex;
             align-items: center;
             gap: 6px;
         }
+
         .memory-values {
             color: #e2e8f0;
             font-family: 'SF Mono', Monaco, monospace;
         }
+
         .memory-bar {
             height: 6px;
             background: #1e293b;
             border-radius: 3px;
             overflow: hidden;
         }
+
         .memory-bar-fill {
             height: 100%;
             background: #10b981;
             border-radius: 3px;
             transition: width 0.3s, background 0.3s;
         }
+
         .status-warning {
             background: rgba(245, 158, 11, 0.1);
             color: #f59e0b;
@@ -1398,45 +1702,130 @@
 
         /* Mobile responsive */
         @media (max-width: 768px) {
-            .container { padding: 8px; }
-            header { gap: 8px; }
-            .logo { font-size: 16px; }
-            .tables-section { padding: 12px; }
-            .tabs-header { flex-wrap: wrap; gap: 4px; }
-            .tab-btn { padding: 8px 10px; font-size: 12px; flex: 1; min-width: 100px; }
-            .tab-btn svg { display: none; }
-            .df-builder { flex-direction: column; gap: 12px; }
-            .df-step { min-width: 100%; flex-wrap: wrap; }
-            .df-step-num, .df-step-label { flex-shrink: 0; }
-            .df-step select, .df-step input { flex: 1; min-width: 150px; width: auto; }
-            .results-table { font-size: 11px; }
-            .results-table th, .results-table td { padding: 4px 6px; }
-            .clip-examples, .search-examples { flex-wrap: wrap; gap: 4px; }
-            .clip-example, .search-example { padding: 4px 8px; font-size: 11px; }
-            .vector-search-settings { flex-direction: column; gap: 8px; align-items: stretch; }
-            .vector-search-settings label { min-width: auto; }
-            .vector-search-settings select, .vector-search-settings input { width: 100%; }
-            .clip-text-input input { width: 100%; }
-            .run-section { justify-content: stretch; }
-            .run-section .btn { width: 100%; }
-            .column-chips { flex-wrap: wrap; }
+            .container {
+                padding: 8px;
+            }
+
+            header {
+                gap: 8px;
+            }
+
+            .logo {
+                font-size: 16px;
+            }
+
+            .tables-section {
+                padding: 12px;
+            }
+
+            .tabs-header {
+                flex-wrap: wrap;
+                gap: 4px;
+            }
+
+            .tab-btn {
+                padding: 8px 10px;
+                font-size: 12px;
+                flex: 1;
+                min-width: 100px;
+            }
+
+            .tab-btn svg {
+                display: none;
+            }
+
+            .df-builder {
+                flex-direction: column;
+                gap: 12px;
+            }
+
+            .df-step {
+                min-width: 100%;
+                flex-wrap: wrap;
+            }
+
+            .df-step-num,
+            .df-step-label {
+                flex-shrink: 0;
+            }
+
+            .df-step select,
+            .df-step input {
+                flex: 1;
+                min-width: 150px;
+                width: auto;
+            }
+
+            .results-table {
+                font-size: 11px;
+            }
+
+            .results-table th,
+            .results-table td {
+                padding: 4px 6px;
+            }
+
+            .clip-examples,
+            .search-examples {
+                flex-wrap: wrap;
+                gap: 4px;
+            }
+
+            .clip-example,
+            .search-example {
+                padding: 4px 8px;
+                font-size: 11px;
+            }
+
+            .vector-search-settings {
+                flex-direction: column;
+                gap: 8px;
+                align-items: stretch;
+            }
+
+            .vector-search-settings label {
+                min-width: auto;
+            }
+
+            .vector-search-settings select,
+            .vector-search-settings input {
+                width: 100%;
+            }
+
+            .clip-text-input input {
+                width: 100%;
+            }
+
+            .run-section {
+                justify-content: stretch;
+            }
+
+            .run-section .btn {
+                width: 100%;
+            }
+
+            .column-chips {
+                flex-wrap: wrap;
+            }
         }
     </style>
 </head>
+
 <body x-data>
     <div class="container">
         <header>
             <a href="./" class="logo" style="text-decoration: none; color: inherit;">
                 <svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <rect width="32" height="32" rx="8" fill="#3b82f6"/>
-                    <path d="M8 10h16v2H8v-2zm0 5h12v2H8v-2zm0 5h16v2H8v-2z" fill="white"/>
+                    <rect width="32" height="32" rx="8" fill="#3b82f6" />
+                    <path d="M8 10h16v2H8v-2zm0 5h12v2H8v-2zm0 5h16v2H8v-2z" fill="white" />
                 </svg>
                 LanceQL
                 <span class="version" id="version"></span>
             </a>
             <a href="https://github.com/teamchong/lanceql" class="github-link" target="_blank">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
-                    <path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 21.795 24 17.295 24 12c0-6.63-5.37-12-12-12"/>
+                    <path
+                        d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 21.795 24 17.295 24 12c0-6.63-5.37-12-12-12" />
                 </svg>
                 GitHub
             </a>
@@ -1447,17 +1836,18 @@
             <div class="tables-header">
                 <span class="tables-title">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                        <polyline points="14,2 14,8 20,8"/>
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                        <polyline points="14,2 14,8 20,8" />
                     </svg>
                     Tables
                 </span>
                 <div class="tables-actions">
                     <button class="btn btn-sm btn-primary" id="upload-btn" title="Upload .lance file">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                            <polyline points="17 8 12 3 7 8"/>
-                            <line x1="12" y1="3" x2="12" y2="15"/>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                            <polyline points="17 8 12 3 7 8" />
+                            <line x1="12" y1="3" x2="12" y2="15" />
                         </svg>
                         Upload
                     </button>
@@ -1467,43 +1857,44 @@
             </div>
             <div class="tables-list" id="tables-list">
                 <div class="tables-empty" id="tables-empty">
-                    <p>No tables loaded. Upload a .lance file or run a query with <code>read_lance('https://...')</code></p>
+                    <p>No tables loaded. Upload a .lance file or run a query with <code>read_lance('https://...')</code>
+                    </p>
                 </div>
                 <!-- Tables will be populated here -->
             </div>
             <div class="tables-drop-zone" id="tables-drop-zone">
                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                    <polyline points="17 8 12 3 7 8"/>
-                    <line x1="12" y1="3" x2="12" y2="15"/>
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                    <polyline points="17 8 12 3 7 8" />
+                    <line x1="12" y1="3" x2="12" y2="15" />
                 </svg>
                 <span>Drop .lance files here</span>
             </div>
             <div class="column-chips" id="column-chips"></div>
-            <div class="network-stats"
-                 :class="{ 'hidden': $store.app.bytesDownloaded === 0 }"
-                 id="network-stats">
+            <div class="network-stats" :class="{ 'hidden': $store.app.bytesDownloaded === 0 }" id="network-stats">
                 <div class="network-stat">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                        <polyline points="7 10 12 15 17 10"/>
-                        <line x1="12" y1="15" x2="12" y2="3"/>
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                        <polyline points="7 10 12 15 17 10" />
+                        <line x1="12" y1="15" x2="12" y2="3" />
                     </svg>
-                    <span>Downloaded: <strong x-text="$store.app.formatBytes($store.app.bytesDownloaded)">0 KB</strong></span>
+                    <span>Downloaded: <strong x-text="$store.app.formatBytes($store.app.bytesDownloaded)">0
+                            KB</strong></span>
                 </div>
                 <div class="network-stat">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <circle cx="12" cy="12" r="10"/>
-                        <polyline points="12 6 12 12 16 14"/>
+                        <circle cx="12" cy="12" r="10" />
+                        <polyline points="12 6 12 12 16 14" />
                     </svg>
                     <span>Requests: <strong x-text="$store.app.requests">0</strong></span>
                 </div>
                 <div class="network-stat" x-show="$store.app.opfsWritten > 0" style="color: #10b981;">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <rect x="3" y="3" width="18" height="18" rx="2"/>
-                        <path d="M9 3v18M3 9h18"/>
+                        <rect x="3" y="3" width="18" height="18" rx="2" />
+                        <path d="M9 3v18M3 9h18" />
                     </svg>
-                    <span>OPFS: <strong x-text="$store.app.formatBytes($store.app.opfsWritten)">0 KB</strong> written</span>
+                    <span>OPFS: <strong x-text="$store.app.formatBytes($store.app.opfsWritten)">0 KB</strong>
+                        written</span>
                 </div>
             </div>
             <div class="progress-container" id="progress-container">
@@ -1522,9 +1913,10 @@
             <div class="storage-header" onclick="toggleStoragePanel()">
                 <span class="storage-title">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
-                        <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
-                        <line x1="12" y1="22.08" x2="12" y2="12"/>
+                        <path
+                            d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+                        <polyline points="3.27 6.96 12 12.01 20.73 6.96" />
+                        <line x1="12" y1="22.08" x2="12" y2="12" />
                     </svg>
                     Local Storage (OPFS)
                     <span id="opfs-support-indicator"></span>
@@ -1533,8 +1925,9 @@
                         <span id="online-status">Online</span>
                     </span>
                 </span>
-                <svg class="storage-toggle" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <polyline points="6 9 12 15 18 9"/>
+                <svg class="storage-toggle" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                    stroke-width="2">
+                    <polyline points="6 9 12 15 18 9" />
                 </svg>
             </div>
             <div class="storage-content">
@@ -1557,23 +1950,29 @@
                 </div>
                 <div class="storage-actions">
                     <button class="storage-btn storage-btn-refresh" onclick="refreshStorageStats()">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M23 4v6h-6"/><path d="M1 20v-6h6"/>
-                            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <path d="M23 4v6h-6" />
+                            <path d="M1 20v-6h6" />
+                            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
                         </svg>
                         Refresh
                     </button>
                     <button class="storage-btn storage-btn-clear" onclick="clearAllStorage()">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <polyline points="3 6 5 6 21 6" />
+                            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
                         </svg>
                         Clear Cache
                     </button>
-                    <button class="storage-btn storage-btn-session" onclick="clearSession()" title="Clear all tables, cached files, and reset the demo">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
-                            <polyline points="16 17 21 12 16 7"/>
-                            <line x1="21" y1="12" x2="9" y2="12"/>
+                    <button class="storage-btn storage-btn-session" onclick="clearSession()"
+                        title="Clear all tables, cached files, and reset the demo">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                            <polyline points="16 17 21 12 16 7" />
+                            <line x1="21" y1="12" x2="9" y2="12" />
                         </svg>
                         Logout
                     </button>
@@ -1581,9 +1980,10 @@
                 <div class="memory-display">
                     <div class="memory-header">
                         <span class="memory-label">
-                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <rect x="2" y="6" width="20" height="12" rx="2"/>
-                                <path d="M6 12h.01M10 12h.01M14 12h.01M18 12h.01"/>
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <rect x="2" y="6" width="20" height="12" rx="2" />
+                                <path d="M6 12h.01M10 12h.01M14 12h.01M18 12h.01" />
                             </svg>
                             JS Heap Memory
                         </span>
@@ -1601,26 +2001,29 @@
         <!-- Query Interface -->
         <section class="tabs-container" id="query-section" x-show="$store.app.showQuery" style="display: none;">
             <div class="tabs-header">
-                <button class="tab-btn" :class="{ 'active': $store.app.activeTab === 'sql' }" @click="$store.app.activeTab = 'sql'" data-tab="sql">
+                <button class="tab-btn" :class="{ 'active': $store.app.activeTab === 'sql' }"
+                    @click="$store.app.activeTab = 'sql'" data-tab="sql">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <polyline points="16,18 22,12 16,6"/>
-                        <polyline points="8,6 2,12 8,18"/>
+                        <polyline points="16,18 22,12 16,6" />
+                        <polyline points="8,6 2,12 8,18" />
                     </svg>
                     SQL Query
                 </button>
-                <button class="tab-btn" :class="{ 'active': $store.app.activeTab === 'dataframe' }" @click="$store.app.activeTab = 'dataframe'" data-tab="dataframe">
+                <button class="tab-btn" :class="{ 'active': $store.app.activeTab === 'dataframe' }"
+                    @click="$store.app.activeTab = 'dataframe'" data-tab="dataframe">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <rect x="3" y="3" width="7" height="7"/>
-                        <rect x="14" y="3" width="7" height="7"/>
-                        <rect x="14" y="14" width="7" height="7"/>
-                        <rect x="3" y="14" width="7" height="7"/>
+                        <rect x="3" y="3" width="7" height="7" />
+                        <rect x="14" y="3" width="7" height="7" />
+                        <rect x="14" y="14" width="7" height="7" />
+                        <rect x="3" y="14" width="7" height="7" />
                     </svg>
                     DataFrame Builder
                 </button>
-                <button class="tab-btn" :class="{ 'active': $store.app.activeTab === 'vector' }" @click="$store.app.activeTab = 'vector'" data-tab="vector">
+                <button class="tab-btn" :class="{ 'active': $store.app.activeTab === 'vector' }"
+                    @click="$store.app.activeTab = 'vector'" data-tab="vector">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <circle cx="11" cy="11" r="8"/>
-                        <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                        <circle cx="11" cy="11" r="8" />
+                        <line x1="21" y1="21" x2="16.65" y2="16.65" />
                     </svg>
                     Vector Search
                 </button>
@@ -1630,22 +2033,40 @@
             <div class="tab-content" :class="{ 'active': $store.app.activeTab === 'sql' }" id="tab-sql">
                 <div class="sql-editor">
                     <div class="sql-editor-container">
-                        <textarea class="sql-textarea" id="sql-input" placeholder="SELECT * FROM read_lance('https://...') LIMIT 50">SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50</textarea>
+                        <textarea class="sql-textarea" id="sql-input"
+                            placeholder="SELECT * FROM read_lance('https://...') LIMIT 50">-- 🚀 Push-Down Filtering: Query 1M images, download only ~200KB (not 1.5GB!)
+SELECT url, text, aesthetic FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') 
+WHERE aesthetic > 0.7
+NEAR 'sunset on the beach' 
+LIMIT 20</textarea>
                         <div class="sql-highlight" id="sql-highlight" aria-hidden="true"></div>
                     </div>
                     <div class="sql-examples">
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50">First 50</button>
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') WHERE aesthetic > 0.5 LIMIT 50">aesthetic > 0.5</button>
-                        <button class="sql-example" data-sql="SELECT COUNT(*) FROM read_lance('https://data.metal0.dev/laion-1m/images.lance')">COUNT(*)</button>
-                        <button class="sql-example" data-sql="SELECT AVG(aesthetic), MIN(aesthetic), MAX(aesthetic) FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 10000">Stats 10K</button>
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') NEAR 'cat'">NEAR 'cat'</button>
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/translations.lance') LIMIT 50" title="Translations dataset">Translations</button>
-                        <button class="sql-example" data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance', 1) LIMIT 50">Version 1</button>
-                        <button class="sql-example" id="create-demo-join-table" title="Create small in-memory table for JOIN demo" style="background: #059669;">+ Demo JOIN Table</button>
+                        <button class="sql-example"
+                            data-sql="SELECT url, text, aesthetic FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') NEAR 'cat playing' LIMIT 20"
+                            style="background: #7c3aed;">🔮 NEAR 'cat'</button>
+                        <button class="sql-example"
+                            data-sql="SELECT i.text, i.aesthetic, t.text_zh, t.text_es FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') i JOIN translations t ON i.rowid = t.row_id LIMIT 20"
+                            style="background: #059669;">🔗 JOIN</button>
+                        <button class="sql-example"
+                            data-sql="SELECT SUM(aesthetic), AVG(aesthetic), MIN(aesthetic), MAX(aesthetic), COUNT(*) FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 100000"
+                            style="background: #ea580c;">📊 Stats 100K</button>
+                        <button class="sql-example"
+                            data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') WHERE aesthetic > 0.7 LIMIT 50">WHERE
+                            Filter</button>
+                        <button class="sql-example"
+                            data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50">First
+                            50</button>
+                        <button class="sql-example"
+                            data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/translations.lance') LIMIT 50">Translations</button>
+                        <button class="sql-example" id="create-demo-join-table"
+                            title="Create small in-memory table for JOIN demo" style="background: #334155;">+ Demo
+                            Table</button>
                         <button class="sql-example copy-link-btn" id="copy-link-btn" title="Copy shareable link">
-                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
-                                <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+                                <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
                             </svg>
                             Share
                         </button>
@@ -1660,7 +2081,7 @@
                         <template x-if="!$store.app.isLoading">
                             <span>
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-                                    <polygon points="5,3 19,12 5,21"/>
+                                    <polygon points="5,3 19,12 5,21" />
                                 </svg>
                                 Run Query
                             </span>
@@ -1675,7 +2096,8 @@
                     <div class="df-step">
                         <div class="df-step-num">1</div>
                         <div class="df-step-label">Search</div>
-                        <input type="text" id="df-search-query" placeholder="e.g. cat, sunset beach" style="width: 150px;">
+                        <input type="text" id="df-search-query" placeholder="e.g. cat, sunset beach"
+                            style="width: 150px;">
                         <select id="df-search-encoder" style="width: 200px;">
                             <option value="minilm">TEXT: MiniLM (87MB)</option>
                             <option value="clip-openai">IMAGE: CLIP OpenAI (122MB)</option>
@@ -1724,7 +2146,7 @@
                         <template x-if="!$store.app.isLoading">
                             <span>
                                 <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
-                                    <polygon points="5,3 19,12 5,21"/>
+                                    <polygon points="5,3 19,12 5,21" />
                                 </svg>
                                 Execute
                             </span>
@@ -1737,7 +2159,8 @@
             <div class="tab-content" :class="{ 'active': $store.app.activeTab === 'vector' }" id="tab-vector">
                 <div class="vector-search">
                     <div class="vector-notice">
-                        <strong>Semantic Search:</strong> Find similar images by searching with a reference image's embedding.
+                        <strong>Semantic Search:</strong> Find similar images by searching with a reference image's
+                        embedding.
                         Select a row index to use as query, or the search will use a random sample.
                     </div>
                     <div class="vector-config">
@@ -1747,8 +2170,7 @@
                         </select>
                         <label>Query Row:</label>
                         <input type="number" id="query-row" min="0" placeholder="Enter a row number"
-                               x-model="$store.app.queryRow"
-                               @input="$store.app.queryRow = $event.target.value">
+                            x-model="$store.app.queryRow" @input="$store.app.queryRow = $event.target.value">
                         <label>Top K:</label>
                         <input type="number" id="top-k" value="20" min="1" max="100">
                     </div>
@@ -1764,8 +2186,9 @@
                 <div class="clip-section" id="clip-section">
                     <div class="clip-header">
                         <div class="clip-title">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
                             </svg>
                             <span id="clip-search-title">Text Search</span>
                             <span class="badge" id="clip-status-badge">Ready</span>
@@ -1780,9 +2203,9 @@
                         </div>
                     </div>
                     <div class="clip-text-input">
-                        <input type="text" id="clip-text-input" placeholder="Search for text... (e.g., 'cat', 'sunset beach')"
-                               x-model="$store.app.searchText"
-                               @input="$store.app.searchText = $event.target.value">
+                        <input type="text" id="clip-text-input"
+                            placeholder="Search for text... (e.g., 'cat', 'sunset beach')"
+                            x-model="$store.app.searchText" @input="$store.app.searchText = $event.target.value">
                     </div>
                     <div class="clip-examples">
                         <button class="clip-example" data-text="car">car</button>
@@ -1796,29 +2219,31 @@
 
                 <div class="run-section">
                     <button class="btn btn-primary" id="run-vector-btn"
-                            :disabled="!$store.app.queryRow && !$store.app.searchText"
-                            style="background: #7c3aed;">
+                        :disabled="!$store.app.queryRow && !$store.app.searchText" style="background: #7c3aed;">
                         <template x-if="$store.app.isLoading">
-                            <span><span class="spinner"></span> <span x-text="$store.app.queryRow ? 'Searching Row...' : 'Searching Text...'"></span></span>
+                            <span><span class="spinner"></span> <span
+                                    x-text="$store.app.queryRow ? 'Searching Row...' : 'Searching Text...'"></span></span>
                         </template>
                         <template x-if="!$store.app.isLoading">
                             <span>
-                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                    <circle cx="11" cy="11" r="8"/>
-                                    <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                    stroke-width="2">
+                                    <circle cx="11" cy="11" r="8" />
+                                    <line x1="21" y1="21" x2="16.65" y2="16.65" />
                                 </svg>
-                                <span x-text="$store.app.queryRow ? 'Search by Row' : ($store.app.searchText ? 'Search by Text' : 'Search')"></span>
+                                <span
+                                    x-text="$store.app.queryRow ? 'Search by Row' : ($store.app.searchText ? 'Search by Text' : 'Search')"></span>
                             </span>
                         </template>
                     </button>
                 </div>
             </div>
 
-            <div class="status"
-                 :class="{ 'show': $store.app.statusMessage, [$store.app.statusType]: true }"
-                 id="query-status">
+            <div class="status" :class="{ 'show': $store.app.statusMessage, [$store.app.statusType]: true }"
+                id="query-status">
                 <span x-text="$store.app.statusMessage"></span>
-                <span x-show="$store.app.showResetLink" style="margin-left: 8px;">(<a href="./" style="color: inherit;">Restart</a>)</span>
+                <span x-show="$store.app.showResetLink" style="margin-left: 8px;">(<a href="./"
+                        style="color: inherit;">Restart</a>)</span>
             </div>
         </section>
 
@@ -1827,32 +2252,32 @@
             <div class="results-header">
                 <h3>
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <rect x="3" y="3" width="18" height="18" rx="2"/>
-                        <line x1="3" y1="9" x2="21" y2="9"/>
-                        <line x1="9" y1="21" x2="9" y2="9"/>
+                        <rect x="3" y="3" width="18" height="18" rx="2" />
+                        <line x1="3" y1="9" x2="21" y2="9" />
+                        <line x1="9" y1="21" x2="9" y2="9" />
                     </svg>
                     Results
                 </h3>
                 <div class="results-actions">
                     <span class="results-count" x-text="$store.app.resultsCount" id="results-count"></span>
-                    <span class="results-notice"
-                          :class="$store.app.resultsNoticeType"
-                          :style="{ display: $store.app.resultsNotice ? 'inline' : 'none' }"
-                          x-text="$store.app.resultsNotice"
-                          id="results-notice"></span>
+                    <span class="results-notice" :class="$store.app.resultsNoticeType"
+                        :style="{ display: $store.app.resultsNotice ? 'inline' : 'none' }"
+                        x-text="$store.app.resultsNotice" id="results-notice"></span>
                     <button class="export-btn" id="export-csv" title="Export as CSV">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                            <polyline points="7 10 12 15 17 10"/>
-                            <line x1="12" y1="15" x2="12" y2="3"/>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                            <polyline points="7 10 12 15 17 10" />
+                            <line x1="12" y1="15" x2="12" y2="3" />
                         </svg>
                         CSV
                     </button>
                     <button class="export-btn" id="export-json" title="Export as JSON">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                            <polyline points="7 10 12 15 17 10"/>
-                            <line x1="12" y1="15" x2="12" y2="3"/>
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                            stroke-width="2">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                            <polyline points="7 10 12 15 17 10" />
+                            <line x1="12" y1="15" x2="12" y2="3" />
                         </svg>
                         JSON
                     </button>
@@ -1860,9 +2285,9 @@
             </div>
             <div class="agg-bar" id="agg-bar" style="display: none;"></div>
             <div class="results-body lance-data" id="results-body" data-render="table"
-                 @lq-start="$store.app.isLoading = true"
-                 @lq-complete="$store.app.resultsCount = `${$event.detail.total.toLocaleString()} rows`"
-                 @lq-error="$store.app.showStatus($event.detail.message, 'error')">
+                @lq-start="$store.app.isLoading = true"
+                @lq-complete="$store.app.resultsCount = `${$event.detail.total.toLocaleString()} rows`"
+                @lq-error="$store.app.showStatus($event.detail.message, 'error')">
             </div>
         </section>
     </div>
@@ -2278,7 +2703,7 @@
                 // Clear in-memory tables
                 for (const [name, info] of tablesRegistry) {
                     if (info?.dataset?.close) {
-                        try { info.dataset.close(); } catch (e) {}
+                        try { info.dataset.close(); } catch (e) { }
                     }
                 }
                 tablesRegistry.clear();
@@ -2364,7 +2789,11 @@
 
         // Default demo dataset URL - LAION 1M images dataset
         const DEFAULT_DATASET_URL = 'https://data.metal0.dev/laion-1m/images.lance';
-        const DEFAULT_QUERY = "SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50";
+        const DEFAULT_QUERY = `-- 🚀 Push-Down Filtering: Query 1M images, download only ~200KB (not 1.5GB!)
+SELECT url, text, aesthetic FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') 
+WHERE aesthetic > 0.7
+NEAR 'sunset on the beach' 
+LIMIT 20`;
 
         // Initialize
         async function init() {
@@ -2422,7 +2851,7 @@
         }
 
         // Toggle file loader visibility (make global for onclick)
-        window.toggleFileLoader = function() {
+        window.toggleFileLoader = function () {
             Alpine.store('app').fileLoaderCollapsed = !Alpine.store('app').fileLoaderCollapsed;
         };
 
@@ -2801,7 +3230,7 @@
                         const info = currentFile.getVectorInfo(i);
                         const name = (currentFile.columnNames && currentFile.columnNames[i]) || `column_${i}`;
                         vectorCol.innerHTML += `<option value="${i}">${name} (${info.dimension}D vectors, ${info.rows} rows)</option>`;
-                    } catch (e) {}
+                    } catch (e) { }
                 }
             }
             // If no vector columns found, show placeholder
@@ -2976,7 +3405,7 @@
                     stats.rows = info.rows;
                 } else if (colType === 'string') {
                     // Sample first 100 strings for stats
-                    const sample = await currentFile.readStringsAtIndices(colIdx, Array.from({length: Math.min(100, currentFile.rowCount || 100)}, (_, i) => i));
+                    const sample = await currentFile.readStringsAtIndices(colIdx, Array.from({ length: Math.min(100, currentFile.rowCount || 100) }, (_, i) => i));
                     const lengths = sample.filter(s => s).map(s => s.length);
                     stats.sampleSize = sample.length;
                     stats.nullCount = sample.filter(s => !s).length;
@@ -2986,10 +3415,10 @@
                     // Sample first 100 values for numeric stats
                     let values;
                     if (colType.includes('int')) {
-                        values = await currentFile.readInt64AtIndices(colIdx, Array.from({length: Math.min(100, currentFile.rowCount || 100)}, (_, i) => i));
+                        values = await currentFile.readInt64AtIndices(colIdx, Array.from({ length: Math.min(100, currentFile.rowCount || 100) }, (_, i) => i));
                         values = Array.from(values).map(v => Number(v));
                     } else {
-                        values = await currentFile.readFloat64AtIndices(colIdx, Array.from({length: Math.min(100, currentFile.rowCount || 100)}, (_, i) => i));
+                        values = await currentFile.readFloat64AtIndices(colIdx, Array.from({ length: Math.min(100, currentFile.rowCount || 100) }, (_, i) => i));
                         values = Array.from(values);
                     }
                     const validValues = values.filter(v => v !== null && !isNaN(v));
@@ -3873,7 +4302,7 @@
             }
 
             const rows = [];
-            const indices = filterIndices || Array.from({length: Math.min(rowCount, limit)}, (_, i) => i);
+            const indices = filterIndices || Array.from({ length: Math.min(rowCount, limit) }, (_, i) => i);
             const actualLimit = Math.min(indices.length, limit);
 
             for (let i = 0; i < actualLimit; i++) {
@@ -3910,7 +4339,7 @@
                 columns.push(colNames[i] || `column_${i}`);
             }
 
-            const indices = randomIndices || Array.from({length: limit}, (_, i) => i);
+            const indices = randomIndices || Array.from({ length: limit }, (_, i) => i);
             const actualLimit = indices.length;
             const numCols = currentFile.numColumns;
 
@@ -3990,7 +4419,7 @@
                             columnData.push({ type: 'string', data });
                             continue;
                         }
-                    } catch (e) {}
+                    } catch (e) { }
 
                     columnData.push({ type: 'unknown', data: null });
                 } catch (e) {
@@ -4079,7 +4508,7 @@
             if (!str || typeof str !== 'string') return false;
             const lower = str.toLowerCase();
             return (lower.startsWith('http://') || lower.startsWith('https://')) &&
-                   (lower.includes('.jpg') || lower.includes('.jpeg') || lower.includes('.png') ||
+                (lower.includes('.jpg') || lower.includes('.jpeg') || lower.includes('.png') ||
                     lower.includes('.gif') || lower.includes('.webp') || lower.includes('.svg'));
         }
 
@@ -4304,7 +4733,7 @@
 
             try {
                 const startIdx = infiniteScrollState.nextOffset;
-                const indices = Array.from({length: PAGE_SIZE}, (_, i) => startIdx + i)
+                const indices = Array.from({ length: PAGE_SIZE }, (_, i) => startIdx + i)
                     .filter(i => i < infiniteScrollState.total);
 
                 if (indices.length === 0) {
@@ -4326,7 +4755,7 @@
                             data = await currentFile.readStringsAtIndices(c, indices);
                             columnData.push({ type: 'string', data });
                             continue;
-                        } catch (e) {}
+                        } catch (e) { }
                     }
 
                     if (type === 'int64') {
@@ -4334,7 +4763,7 @@
                             data = await currentFile.readInt64AtIndices(c, indices);
                             columnData.push({ type: 'int64', data });
                             continue;
-                        } catch (e) {}
+                        } catch (e) { }
                     }
 
                     if (type === 'float64') {
@@ -4342,7 +4771,7 @@
                             data = await currentFile.readFloat64AtIndices(c, indices);
                             columnData.push({ type: 'float64', data });
                             continue;
-                        } catch (e) {}
+                        } catch (e) { }
                     }
 
                     if (type === 'int32' || type === 'float32') {
@@ -4354,7 +4783,7 @@
                             }
                             columnData.push({ type, data });
                             continue;
-                        } catch (e) {}
+                        } catch (e) { }
                     }
 
                     if (type === 'int16') {
@@ -4362,7 +4791,7 @@
                             data = await currentFile.readInt16AtIndices(c, indices);
                             columnData.push({ type: 'int16', data });
                             continue;
-                        } catch (e) {}
+                        } catch (e) { }
                     }
 
                     if (type === 'int8') {
@@ -4370,7 +4799,7 @@
                             data = await currentFile.readUint8AtIndices(c, indices);
                             columnData.push({ type: 'int8', data });
                             continue;
-                        } catch (e) {}
+                        } catch (e) { }
                     }
 
                     if (type === 'vector') {
@@ -4378,7 +4807,7 @@
                             const info = await currentFile.getVectorInfo(c);
                             columnData.push({ type: 'vector', data: null, info });
                             continue;
-                        } catch (e) {}
+                        } catch (e) { }
                     }
 
                     // Fallback
@@ -4388,7 +4817,7 @@
                             columnData.push({ type: 'string', data });
                             continue;
                         }
-                    } catch (e) {}
+                    } catch (e) { }
 
                     columnData.push({ type: 'unknown', data: null });
                 }
@@ -4662,7 +5091,7 @@
         function unregisterTable(name) {
             const info = tablesRegistry.get(name);
             if (info?.dataset?.close) {
-                try { info.dataset.close(); } catch (e) {}
+                try { info.dataset.close(); } catch (e) { }
             }
             tablesRegistry.delete(name);
             renderTablesUI();
@@ -4788,7 +5217,7 @@
                     const types = await dataset.detectColumnTypes();
                     cols = types.length;
                     dataset._columnTypes = types;
-                } catch (e) {}
+                } catch (e) { }
 
                 // Register table
                 registerTable(name, {
@@ -4847,7 +5276,7 @@
                             const types = await dataset.detectColumnTypes();
                             cols = types.length;
                             dataset._columnTypes = types;
-                        } catch (e) {}
+                        } catch (e) { }
 
                         tablesRegistry.set(tableName, {
                             type: 'local',
@@ -5342,7 +5771,7 @@
                     showStatus(`CLIP model (${modelName}) ready!`, 'success');
                     return true;
                 } else {
-                    const errors = {'-2': 'GGUF parse', '-3': 'Vocab', '-4': 'Vocab load', '-6': 'Weights'};
+                    const errors = { '-2': 'GGUF parse', '-3': 'Vocab', '-4': 'Vocab load', '-6': 'Weights' };
                     throw new Error(errors[loadResult] || `Error ${loadResult}`);
                 }
             } catch (e) {
@@ -5852,7 +6281,7 @@
                 runSqlQuery();
             });
         });
-        
+
         // Create demo JOIN table for testing
         let demoTableDb = null;
 
@@ -5912,4 +6341,5 @@
         setupDfEditorSync();
     </script>
 </body>
+
 </html>
