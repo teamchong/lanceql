@@ -1,0 +1,36 @@
+
+Running 1 test using 1 worker
+
+[1A[2K[1/1] [chromium] › tests/e2e/run-comparison-benchmark.spec.js:186:1 › LanceQL vs DuckDB benchmark 10K
+[1A[2K[chromium] › tests/e2e/run-comparison-benchmark.spec.js:186:1 › LanceQL vs DuckDB benchmark 10K
+[Browser] log: [LanceQL] Using Transferable ArrayBuffers
+
+[1A[2K[Browser] log: [LanceQL] Using regular Worker for better logging
+
+[1A[2K[Browser] error: [LanceQL] Worker error: Event
+
+[1A[2K  1) [chromium] › tests/e2e/run-comparison-benchmark.spec.js:186:1 › LanceQL vs DuckDB benchmark 10K 
+
+    Error: page.evaluate: Event
+
+      41 |     });
+      42 |
+    > 43 |     const results = await page.evaluate(async (rows) => {
+         |                                ^
+      44 |         const { vault } = await import('./lanceql.js');
+      45 |         const lanceVault = await vault();
+      46 |
+        at runBenchmark (/Users/steven_chong/Downloads/repos/lanceql/packages/browser/tests/e2e/run-comparison-benchmark.spec.js:43:32)
+        at /Users/steven_chong/Downloads/repos/lanceql/packages/browser/tests/e2e/run-comparison-benchmark.spec.js:188:21
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/run-comparison-benchmark-LanceQL-vs-DuckDB-benchmark-10K-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/run-comparison-benchmark-LanceQL-vs-DuckDB-benchmark-10K-chromium/error-context.md
+
+
+[1A[2K  1 failed
+    [chromium] › tests/e2e/run-comparison-benchmark.spec.js:186:1 › LanceQL vs DuckDB benchmark 10K 
+
+[36m  Serving HTML report at http://localhost:50773. Press Ctrl+C to quit.[39m

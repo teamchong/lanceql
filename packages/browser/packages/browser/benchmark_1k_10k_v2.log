@@ -1,0 +1,4 @@
+Error: Project(s) "chromium" not found. Available projects: ""
+    at filterProjects (/Users/steven_chong/Downloads/repos/lanceql/packages/browser/node_modules/playwright/lib/runner/projectUtils.js:80:11)
+    at runTests (/Users/steven_chong/Downloads/repos/lanceql/packages/browser/node_modules/playwright/lib/program.js:208:42)
+    at async r.<anonymous> (/Users/steven_chong/Downloads/repos/lanceql/packages/browser/node_modules/playwright/lib/program.js:70:7)

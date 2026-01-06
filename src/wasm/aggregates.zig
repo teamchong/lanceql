@@ -153,6 +153,188 @@ pub const AggState = struct {
     }
 };
 
+pub const MetricSet = struct {
+    sum: bool = false,
+    min: bool = false,
+    max: bool = false,
+    count: bool = false,
+
+    pub fn fromFunc(func: AggFunc) MetricSet {
+        var set = MetricSet{};
+        switch (func) {
+            .sum => set.sum = true,
+            .count => set.count = true,
+            .avg => { set.sum = true; set.count = true; },
+            .min => set.min = true,
+            .max => set.max = true,
+        }
+        return set;
+    }
+};
+
+pub const MultiAggState = struct {
+    sum_vec: Vec4f64 = @splat(0),
+    min_vec: Vec4f64 = @splat(std.math.floatMax(f64)),
+    max_vec: Vec4f64 = @splat(-std.math.floatMax(f64)),
+    sum_scalar: f64 = 0,
+    min_scalar: f64 = std.math.floatMax(f64),
+    max_scalar: f64 = -std.math.floatMax(f64),
+    count: usize = 0,
+    metrics: MetricSet = .{},
+
+    pub fn update(self: *MultiAggState, v: f64) void {
+        if (self.metrics.sum) self.sum_scalar += v;
+        if (self.metrics.min) { if (v < self.min_scalar) self.min_scalar = v; }
+        if (self.metrics.max) { if (v > self.max_scalar) self.max_scalar = v; }
+        if (self.metrics.count) self.count += 1;
+    }
+
+    pub fn updateVec4(self: *MultiAggState, v: Vec4f64) void {
+        if (self.metrics.sum) self.sum_vec += v;
+        if (self.metrics.min) self.min_vec = @min(self.min_vec, v);
+        if (self.metrics.max) self.max_vec = @max(self.max_vec, v);
+        if (self.metrics.count) self.count += 4;
+    }
+    
+    pub fn getResult(self: *const MultiAggState, func: AggFunc) f64 {
+        const final_sum = self.sum_scalar + @reduce(.Add, self.sum_vec);
+        const final_min = @min(self.min_scalar, @reduce(.Min, self.min_vec));
+        const final_max = @max(self.max_scalar, @reduce(.Max, self.max_vec));
+        
+        return switch (func) {
+            .sum => final_sum,
+            .count => @floatFromInt(self.count),
+            .avg => if (self.count > 0) final_sum / @as(f64, @floatFromInt(self.count)) else 0,
+            .min => final_min,
+            .max => final_max,
+        };
+    }
+
+    pub fn processBuffer(self: *MultiAggState, ptr: [*]const f64, len: usize) void {
+        var i: usize = 0;
+        var s1: Vec4f64 = @splat(0);
+        var s2: Vec4f64 = @splat(0);
+        var s3: Vec4f64 = @splat(0);
+        var s4: Vec4f64 = @splat(0);
+        
+        var m1: Vec4f64 = @splat(std.math.floatMax(f64));
+        var m2: Vec4f64 = @splat(std.math.floatMax(f64));
+        var m3: Vec4f64 = @splat(std.math.floatMax(f64));
+        var m4: Vec4f64 = @splat(std.math.floatMax(f64));
+        
+        var x1: Vec4f64 = @splat(-std.math.floatMax(f64));
+        var x2: Vec4f64 = @splat(-std.math.floatMax(f64));
+        var x3: Vec4f64 = @splat(-std.math.floatMax(f64));
+        var x4: Vec4f64 = @splat(-std.math.floatMax(f64));
+
+        const has_sum = self.metrics.sum;
+        const has_min = self.metrics.min;
+        const has_max = self.metrics.max;
+
+        while (i + 16 <= len) : (i += 16) {
+            const v1: Vec4f64 = ptr[i..i+4][0..4].*;
+            const v2: Vec4f64 = ptr[i+4..i+8][0..4].*;
+            const v3: Vec4f64 = ptr[i+8..i+12][0..4].*;
+            const v4: Vec4f64 = ptr[i+12..i+16][0..4].*;
+            
+            if (has_sum) { s1 += v1; s2 += v2; s3 += v3; s4 += v4; }
+            if (has_min) { m1 = @min(m1, v1); m2 = @min(m2, v2); m3 = @min(m3, v3); m4 = @min(m4, v4); }
+            if (has_max) { x1 = @max(x1, v1); x2 = @max(x2, v2); x3 = @max(x3, v3); x4 = @max(x4, v4); }
+        }
+        
+        if (has_sum) self.sum_vec += (s1 + s2 + s3 + s4);
+        if (has_min) self.min_vec = @min(self.min_vec, @min(@min(m1, m2), @min(m3, m4)));
+        if (has_max) self.max_vec = @max(self.max_vec, @max(@max(x1, x2), @max(x3, x4)));
+        if (self.metrics.count) self.count += i;
+        
+        while (i + 4 <= len) : (i += 4) {
+            const v: Vec4f64 = ptr[i..i+4][0..4].*;
+            self.updateVec4(v);
+        }
+        while (i < len) : (i += 1) {
+            self.update(ptr[i]);
+        }
+    }
+
+    pub fn processBufferI32(self: *MultiAggState, ptr: [*]const i32, len: usize) void {
+        var i: usize = 0;
+        var s1: Vec4f64 = @splat(0);
+        var s2: Vec4f64 = @splat(0);
+        var s3: Vec4f64 = @splat(0);
+        var s4: Vec4f64 = @splat(0);
+        
+        const has_sum = self.metrics.sum;
+        const has_min = self.metrics.min;
+        const has_max = self.metrics.max;
+
+        while (i + 16 <= len) : (i += 16) {
+            const v1: @Vector(4, i32) = ptr[i..i+4][0..4].*;
+            const v2: @Vector(4, i32) = ptr[i+4..i+8][0..4].*;
+            const v3: @Vector(4, i32) = ptr[i+8..i+12][0..4].*;
+            const v4: @Vector(4, i32) = ptr[i+12..i+16][0..4].*;
+            
+            if (has_sum) { s1 += @floatFromInt(v1); s2 += @floatFromInt(v2); s3 += @floatFromInt(v3); s4 += @floatFromInt(v4); }
+            if (has_min or has_max) {
+                const f1: Vec4f64 = @floatFromInt(v1);
+                const f2: Vec4f64 = @floatFromInt(v2);
+                const f3: Vec4f64 = @floatFromInt(v3);
+                const f4: Vec4f64 = @floatFromInt(v4);
+                if (has_min) self.min_vec = @min(self.min_vec, @min(@min(f1, f2), @min(f3, f4)));
+                if (has_max) self.max_vec = @max(self.max_vec, @max(@max(f1, f2), @max(f3, f4)));
+            }
+        }
+        if (has_sum) self.sum_vec += (s1 + s2 + s3 + s4);
+        if (self.metrics.count) self.count += i;
+
+        while (i + 4 <= len) : (i += 4) {
+            const v: @Vector(4, i32) = ptr[i..i+4][0..4].*;
+            self.updateVec4(@floatFromInt(v));
+        }
+        while (i < len) : (i += 1) {
+            self.update(@floatFromInt(ptr[i]));
+        }
+    }
+
+    pub fn processBufferI64(self: *MultiAggState, ptr: [*]const i64, len: usize) void {
+        var i: usize = 0;
+        var s1: Vec4f64 = @splat(0);
+        var s2: Vec4f64 = @splat(0);
+        var s3: Vec4f64 = @splat(0);
+        var s4: Vec4f64 = @splat(0);
+        
+        const has_sum = self.metrics.sum;
+        const has_min = self.metrics.min;
+        const has_max = self.metrics.max;
+
+        while (i + 16 <= len) : (i += 16) {
+            const v1: @Vector(4, i64) = ptr[i..i+4][0..4].*;
+            const v2: @Vector(4, i64) = ptr[i+4..i+8][0..4].*;
+            const v3: @Vector(4, i64) = ptr[i+8..i+12][0..4].*;
+            const v4: @Vector(4, i64) = ptr[i+12..i+16][0..4].*;
+            
+            if (has_sum) { s1 += @floatFromInt(v1); s2 += @floatFromInt(v2); s3 += @floatFromInt(v3); s4 += @floatFromInt(v4); }
+            if (has_min or has_max) {
+                const f1: Vec4f64 = @floatFromInt(v1);
+                const f2: Vec4f64 = @floatFromInt(v2);
+                const f3: Vec4f64 = @floatFromInt(v3);
+                const f4: Vec4f64 = @floatFromInt(v4);
+                if (has_min) self.min_vec = @min(self.min_vec, @min(@min(f1, f2), @min(f3, f4)));
+                if (has_max) self.max_vec = @max(self.max_vec, @max(@max(f1, f2), @max(f3, f4)));
+            }
+        }
+        if (has_sum) self.sum_vec += (s1 + s2 + s3 + s4);
+        if (self.metrics.count) self.count += i;
+        
+        while (i + 4 <= len) : (i += 4) {
+            const v: @Vector(4, i64) = ptr[i..i+4][0..4].*;
+            self.updateVec4(@floatFromInt(v));
+        }
+        while (i < len) : (i += 1) {
+            self.update(@floatFromInt(ptr[i]));
+        }
+    }
+};
+
 /// Sum float64 buffer with SIMD acceleration
 pub export fn sumFloat64Buffer(ptr: [*]const f64, len: usize) f64 {
     if (len == 0) return 0;

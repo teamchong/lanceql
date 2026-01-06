@@ -130,12 +130,9 @@ pub const WhereClause = struct {
     is_near_evaluated: bool = false,
 };
 
-/// Aggregate function
-pub const AggFunc = enum { sum, count, avg, min, max };
-
 /// Aggregate expression
 pub const AggExpr = struct {
-    func: AggFunc,
+    func: aggregates.AggFunc,
     column: []const u8,
     alias: ?[]const u8 = null,
 };
@@ -522,7 +519,6 @@ pub export fn registerTableSimpleBinary(
     data_ptr: [*]const u8,
     data_len: usize,
 ) u32 {
-    log("In registerTableSimpleBinary");
     const table_name = table_name_ptr[0..table_name_len];
     const data = data_ptr[0..data_len];
 
@@ -530,7 +526,6 @@ pub export fn registerTableSimpleBinary(
 
     // Check magic 'LANC' (Big Endian 0x4C414E43)
     if (data[0] != 'L' or data[1] != 'A' or data[2] != 'N' or data[3] != 'C') return 11;
-    log("Magic check passed");
 
     // Header: magic[4] version[4] num_cols[4] row_count[4]
     const num_cols = std.mem.readInt(u32, data[8..12], .big);
@@ -541,7 +536,6 @@ pub export fn registerTableSimpleBinary(
     
     // Safety: If table has data (whether in-memory or hybrid), do not overwrite with stale fragment
     if (tbl.row_count > 0) {
-        log("Skipping overwrite of active table");
         return 0;
     }
 
@@ -549,7 +543,6 @@ pub export fn registerTableSimpleBinary(
         tbl.fragments[0] = fragment_reader.FragmentReader.initDummy(@intCast(row_count));
         tbl.fragment_count = 1;
     }
-    log("Table found/created");
 
     var pos: usize = 16;
     var i: u32 = 0;
@@ -579,7 +572,6 @@ pub export fn registerTableSimpleBinary(
 
         // Register column based on type code
         // 1: int32, 2: int64, 3: float32, 4: float64, 5: string, 6: bool
-        log("Registering column...");
         switch (type_code) {
             1 => { // int32
                 if (@intFromPtr(col_data.ptr) % 4 != 0) return 20;
@@ -604,8 +596,6 @@ pub export fn registerTableSimpleBinary(
             else => {},
         }
     }
-    log("All columns registered");
-
     return 0;
 }
 
@@ -1051,7 +1041,6 @@ fn executeInsert(query: *ParsedQuery) !void {
     
     // Handle INSERT SELECT
     if (query.is_insert_select) {
-        log("DEBUG: executeInsert handling INSERT SELECT");
         // Find source table
         var source_table: ?*TableInfo = null;
         for (&tables) |*t| {
@@ -1064,7 +1053,6 @@ fn executeInsert(query: *ParsedQuery) !void {
         }
         
         if (source_table) |src| {
-            log("DEBUG: Found Source Table");
             var inserted_count: usize = 0;
             const limit = if (query.limit_value) |l| l else 0xFFFFFFFF;
             
@@ -1149,13 +1137,9 @@ fn executeInsert(query: *ParsedQuery) !void {
             // Update row count
             tbl.row_count += @as(u32, @intCast(inserted_count));
             if (inserted_count > 0) {
-                log("DEBUG: Inserted rows successfully");
-            } else {
-                log("DEBUG: Inserted 0 rows");
             }
             return;
-        } else {
-            log("DEBUG: Source Table NOT FOUND");
+            // Source Table NOT FOUND
         }
     }
     tbl.row_count = new_count;
@@ -1165,8 +1149,6 @@ pub export fn executeSql() usize {
     where_storage_idx = 0;
     query_storage_idx = 0;
     const sql = sql_input[0..sql_input_len];
-    log("executeSql: sql_input_len check");
-    js_log(sql.ptr, sql.len);
 
     var query = parseSql(sql) orelse {
         return 0;
@@ -1216,7 +1198,6 @@ pub export fn executeSql() usize {
         },
         .insert => {
             executeInsert(query) catch {
-                log("executeInsert FAILED");
                 return 0;
             };
             // Return empty result (or row count if implemented)
@@ -1247,9 +1228,7 @@ pub export fn executeSql() usize {
         // Window function query
         executeWindowQuery(tbl, query) catch return 0;
     } else if (query.agg_count > 0 or query.group_by_count > 0) {
-        log("Calling executeAggregateQuery");
         executeAggregateQuery(tbl, query) catch {
-            log("executeAggregateQuery FAILED");
             return 0;
         };
     } else {
@@ -2637,10 +2616,15 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
 }
 
 fn executeAggregateQuery(table: *const TableInfo, query: *const ParsedQuery) !void {
-    log("In executeAggregateQuery");
-    var msg_buf: [100]u8 = undefined;
-    const msg = std.fmt.bufPrint(&msg_buf, "Table: {s} RowCount: {d} FragCount: {d}", .{table.name, table.row_count, table.fragment_count}) catch "fmt error";
-    log(msg);
+    // OPTIMIZATION: If no filter, skip index building pass
+    if (query.where_clause == null) {
+        if (query.group_by_count > 0) {
+            try executeGroupByQuery(table, query, null);
+        } else {
+            try executeSimpleAggQuery(table, query, null);
+        }
+        return;
+    }
 
     // Apply WHERE filter first
     const match_indices = &global_indices_1;
@@ -2760,10 +2744,7 @@ fn findTableColumn(table: *const TableInfo, name: []const u8) ?*const ColumnData
     return null;
 }
 
-fn executeMultiAggregate(table: *const TableInfo, aggs: []const AggExpr, indices: []const u32, results: []f64) !void {
-    var states: [MAX_AGGREGATES]aggregates.AggState = undefined;
-    for (0..aggs.len) |i| states[i] = .{};
-
+fn executeMultiAggregate(table: *const TableInfo, aggs: []const AggExpr, maybe_indices: ?[]const u32, results: []f64) !void {
     // 1. Identify unique columns and map aggs to them
     var unique_cols: [MAX_AGGREGATES]*const ColumnData = undefined;
     var num_unique_cols: usize = 0;
@@ -2790,31 +2771,38 @@ fn executeMultiAggregate(table: *const TableInfo, aggs: []const AggExpr, indices
         }
     }
 
-    // Contiguous check (optimized for pure file scans)
-    var is_contiguous = true;
-    if (indices.len > 0) {
-        if (indices[0] != 0 or indices[indices.len - 1] != @as(u32, @intCast(indices.len - 1))) {
-            is_contiguous = false;
-        }
-        if (indices.len != table.row_count) is_contiguous = false;
-        // In-memory data makes it non-contiguous for simplicity here
-        if (table.memory_row_count > 0) is_contiguous = false;
-    } else {
-        is_contiguous = false;
-    }
-
-    if (is_contiguous) {
-        for (aggs, 0..) |agg, i| {
-            if (findTableColumn(table, agg.column)) |c| {
-                results[i] = computeLazyAggregate(table, c, agg, 0, indices.len);
-            } else if (agg.func == .count) {
-                results[i] = @floatFromInt(indices.len);
-            } else {
-                results[i] = 0;
+    var states: [MAX_AGGREGATES]aggregates.MultiAggState = undefined;
+    for (0..num_unique_cols) |i| {
+        states[i] = .{};
+        for (aggs, 0..) |agg, agg_idx| {
+            if (agg_to_unique[agg_idx] == i) {
+                const set = aggregates.MetricSet.fromFunc(agg.func);
+                if (set.sum) states[i].metrics.sum = true;
+                if (set.min) states[i].metrics.min = true;
+                if (set.max) states[i].metrics.max = true;
+                if (set.count) states[i].metrics.count = true;
             }
         }
-        return;
     }
+    
+    // Separate states for COUNT(*) and other non-column aggs
+    var general_states: [MAX_AGGREGATES]aggregates.AggState = undefined;
+    for (0..aggs.len) |i| general_states[i] = .{};
+
+    // Contiguous check (optimized for pure file scans)
+    var is_full_scan = false;
+    if (maybe_indices) |indices| {
+        if (indices.len == table.row_count and indices.len > 0) {
+            if (indices[0] == 0 and indices[indices.len - 1] == @as(u32, @intCast(indices.len - 1))) {
+                if (table.memory_row_count == 0) is_full_scan = true;
+            }
+        }
+    } else {
+        is_full_scan = true;
+    }
+
+    // DEBUG: Skip the old computeLazyAggregate multi-pass path
+    // if (is_contiguous) { ... return; }
 
     // General path with chunking and fragments
     const CHUNK_SIZE = 1024;
@@ -2828,16 +2816,83 @@ fn executeMultiAggregate(table: *const TableInfo, aggs: []const AggExpr, indices
             const f_rows = @as(u32, @intCast(frag.getRowCount()));
             const frag_end = frag_start + f_rows;
             
+            if (maybe_indices == null) {
+                const f_rows_usize = @as(usize, @intCast(f_rows));
+                for (unique_cols[0..num_unique_cols], 0..) |c, uc_idx| {
+                    const raw_ptr = frag.getColumnRawPtr(c.fragment_col_idx) orelse continue;
+                    const c_type = c.col_type;
+                    switch (c_type) {
+                        .float64 => states[uc_idx].processBuffer(@ptrCast(@alignCast(raw_ptr)), f_rows_usize),
+                        .int32 => states[uc_idx].processBufferI32(@ptrCast(@alignCast(raw_ptr)), f_rows_usize),
+                        .int64 => states[uc_idx].processBufferI64(@ptrCast(@alignCast(raw_ptr)), f_rows_usize),
+                        else => {
+                             // Fallback for complex types (rare for aggs)
+                             for (0..f_rows_usize) |row_idx| {
+                                 states[uc_idx].update(getFloatValueFromPtr(raw_ptr, c_type, row_idx));
+                             }
+                        }
+                    }
+                }
+                for (aggs, 0..) |agg, agg_idx| {
+                    if (agg_to_unique[agg_idx] == null and agg.func == .count) {
+                        general_states[agg_idx].count += f_rows_usize;
+                    }
+                }
+                idx_ptr += f_rows;
+                frag_start += f_rows;
+                continue;
+            }
+
+            const indices = maybe_indices.?;
             const start_match_idx = idx_ptr;
             while (idx_ptr < indices.len and indices[idx_ptr] < frag_end) : (idx_ptr += 1) {}
             const end_match_idx = idx_ptr;
             
             if (end_match_idx > start_match_idx) {
                 const frag_indices = indices[start_match_idx..end_match_idx];
+                const is_frag_contiguous = (frag_indices.len == frag.getRowCount() and frag_indices[0] == frag_start);
                 
                 for (unique_cols[0..num_unique_cols], 0..) |c, uc_idx| {
                     const raw_ptr = frag.getColumnRawPtr(c.fragment_col_idx) orelse continue;
                     
+                    if (is_frag_contiguous) {
+                         const c_type = c.col_type;
+                         switch (c_type) {
+                             .float64 => {
+                                 const typed_ptr: [*]const f64 = @ptrCast(@alignCast(raw_ptr));
+                                 states[uc_idx].processBuffer(typed_ptr, frag_indices.len);
+                             },
+                             .int32 => {
+                                 const typed_ptr: [*]const i32 = @ptrCast(@alignCast(raw_ptr));
+                                 states[uc_idx].processBufferI32(typed_ptr, frag_indices.len);
+                             },
+                             .int64 => {
+                                 const typed_ptr: [*]const i64 = @ptrCast(@alignCast(raw_ptr));
+                                 states[uc_idx].processBufferI64(typed_ptr, frag_indices.len);
+                             },
+                             else => {
+                                 // Fallback to chunking for complex types if any
+                                 var f_idx: usize = 0;
+                                 while (f_idx < frag_indices.len) {
+                                     const n = @min(CHUNK_SIZE, frag_indices.len - f_idx);
+                                     const chunk = frag_indices[f_idx..f_idx + n];
+                                     for (chunk, 0..) |row_idx, k| {
+                                         gather_buf[k] = getFloatValueFromPtr(raw_ptr, c_type, row_idx - frag_start);
+                                     }
+                                     var k: usize = 0;
+                                     while (k + 4 <= n) : (k += 4) {
+                                         states[uc_idx].updateVec4(.{gather_buf[k], gather_buf[k+1], gather_buf[k+2], gather_buf[k+3]});
+                                     }
+                                     while (k < n) : (k += 1) {
+                                         states[uc_idx].update(gather_buf[k]);
+                                     }
+                                     f_idx += n;
+                                 }
+                             }
+                         }
+                         continue;
+                    }
+
                     var f_idx: usize = 0;
                     while (f_idx < frag_indices.len) {
                         const n = @min(CHUNK_SIZE, frag_indices.len - f_idx);
@@ -2852,6 +2907,7 @@ fn executeMultiAggregate(table: *const TableInfo, aggs: []const AggExpr, indices
                                     gather_buf[k] = typed_ptr[row_idx - frag_start];
                                 }
                             },
+                        // ... (rest of switch)
                             .int32 => {
                                 const typed_ptr: [*]const i32 = @ptrCast(@alignCast(raw_ptr));
                                 for (chunk, 0..) |row_idx, k| {
@@ -2877,18 +2933,13 @@ fn executeMultiAggregate(table: *const TableInfo, aggs: []const AggExpr, indices
                             },
                         }
                         
-                        // Update all aggs associated with this column
-                        for (aggs, 0..) |agg, agg_idx| {
-                             if (agg_to_unique[agg_idx] == uc_idx) {
-                                  const afunc = @as(aggregates.AggFunc, @enumFromInt(@intFromEnum(agg.func)));
-                                  var k: usize = 0;
-                                  while (k + 4 <= n) : (k += 4) {
-                                      states[agg_idx].updateVec4(.{gather_buf[k], gather_buf[k+1], gather_buf[k+2], gather_buf[k+3]}, afunc);
-                                  }
-                                  while (k < n) : (k += 1) {
-                                      states[agg_idx].update(gather_buf[k], afunc);
-                                  }
-                             }
+                        // Update MultiAggState (Single pass over chunk)
+                        var k: usize = 0;
+                        while (k + 4 <= n) : (k += 4) {
+                            states[uc_idx].updateVec4(.{gather_buf[k], gather_buf[k+1], gather_buf[k+2], gather_buf[k+3]});
+                        }
+                        while (k < n) : (k += 1) {
+                            states[uc_idx].update(gather_buf[k]);
                         }
                         f_idx += n;
                     }
@@ -2897,7 +2948,7 @@ fn executeMultiAggregate(table: *const TableInfo, aggs: []const AggExpr, indices
                 // Handle COUNT(*) or virtual columns
                 for (aggs, 0..) |agg, agg_idx| {
                     if (agg_to_unique[agg_idx] == null and agg.func == .count) {
-                        states[agg_idx].count += frag_indices.len;
+                        general_states[agg_idx].count += frag_indices.len;
                     }
                 }
             }
@@ -2905,44 +2956,65 @@ fn executeMultiAggregate(table: *const TableInfo, aggs: []const AggExpr, indices
         }
     }
     
-    // In-memory delta
-    if (table.row_count > frag_start and idx_ptr < indices.len) {
-         const mem_indices = indices[idx_ptr..];
-         for (aggs, 0..) |agg, agg_idx| {
-             const afunc = @as(aggregates.AggFunc, @enumFromInt(@intFromEnum(agg.func)));
-             if (findTableColumn(table, agg.column)) |c| {
-                 if (c.schema_col_idx < MAX_COLUMNS) {
-                     if (table.memory_columns[c.schema_col_idx]) |*mc| {
-                         for (mem_indices) |idx| {
-                             const mem_idx = idx - @as(u32, @intCast(table.file_row_count));
-                             const val = switch (mc.col_type) {
-                                 .int64 => @as(f64, @floatFromInt(mc.data.int64[mem_idx])),
-                                 .int32 => @as(f64, @floatFromInt(mc.data.int32[mem_idx])),
-                                 .float64 => mc.data.float64[mem_idx],
-                                 .float32 => mc.data.float32[mem_idx],
-                                 .string => 0,
-                             };
-                             states[agg_idx].update(val, afunc);
-                         }
+    // In-memory delta (Optimized for single-pass)
+    const mem_row_start = frag_start;
+    if (table.row_count > mem_row_start and (maybe_indices == null or idx_ptr < maybe_indices.?.len)) {
+         const mem_indices = if (maybe_indices) |idx| idx[idx_ptr..] else null;
+         const mem_count = if (mem_indices) |idx| idx.len else @as(usize, @intCast(table.row_count - mem_row_start));
+
+         for (unique_cols[0..num_unique_cols], 0..) |c, uc_idx| {
+             if (c.schema_col_idx >= MAX_COLUMNS) continue;
+             if (table.memory_columns[c.schema_col_idx]) |*mc| {
+                 if (mem_indices) |midx| {
+                     // Filtered or indexed memory scan
+                     for (midx) |idx| {
+                         const mem_idx = idx - @as(u32, @intCast(table.file_row_count));
+                         const val = switch (mc.col_type) {
+                             .int64 => @as(f64, @floatFromInt(mc.data.int64[mem_idx])),
+                             .int32 => @as(f64, @floatFromInt(mc.data.int32[mem_idx])),
+                             .float64 => mc.data.float64[mem_idx],
+                             .float32 => mc.data.float32[mem_idx],
+                             .string => 0,
+                         };
+                         states[uc_idx].update(val);
+                     }
+                 } else {
+                     // Full memory scan (Zero-pass indices)
+                     switch (mc.col_type) {
+                         .float64 => states[uc_idx].processBuffer(mc.data.float64.ptr, mem_count),
+                         .int32 => states[uc_idx].processBufferI32(mc.data.int32.ptr, mem_count),
+                         .int64 => states[uc_idx].processBufferI64(mc.data.int64.ptr, mem_count),
+                         .float32 => {
+                             for (0..mem_count) |i| states[uc_idx].update(@floatCast(mc.data.float32[i]));
+                         },
+                         else => {},
                      }
                  }
-             } else if (agg.func == .count) {
-                 states[agg_idx].count += mem_indices.len;
+             }
+         }
+         
+         // Handle COUNT(*) or virtual columns for memory
+         for (aggs, 0..) |agg, agg_idx| {
+             if (agg_to_unique[agg_idx] == null and agg.func == .count) {
+                 general_states[agg_idx].count += mem_count;
              }
          }
     }
 
     for (0..aggs.len) |i| {
-        results[i] = states[i].getResult(@as(aggregates.AggFunc, @enumFromInt(@intFromEnum(aggs[i].func))));
+        if (agg_to_unique[i]) |uc_idx| {
+            results[i] = states[uc_idx].getResult(@as(aggregates.AggFunc, @enumFromInt(@intFromEnum(aggs[i].func))));
+        } else {
+            results[i] = general_states[i].getResult(@as(aggregates.AggFunc, @enumFromInt(@intFromEnum(aggs[i].func))));
+        }
     }
 }
 
-fn executeSimpleAggQuery(table: *const TableInfo, query: *const ParsedQuery, indices: []const u32) !void {
-    log("In executeSimpleAggQuery (optimized)");
+fn executeSimpleAggQuery(table: *const TableInfo, query: *const ParsedQuery, maybe_indices: ?[]const u32) !void {
     const num_aggs = query.agg_count;
     var agg_results: [MAX_AGGREGATES]f64 = undefined;
 
-    try executeMultiAggregate(table, query.aggregates[0..num_aggs], indices, agg_results[0..num_aggs]);
+    try executeMultiAggregate(table, query.aggregates[0..num_aggs], maybe_indices, agg_results[0..num_aggs]);
 
     // Allocate result buffer
     // Check if names should be included
@@ -3026,7 +3098,7 @@ fn executeSimpleAggQuery(table: *const TableInfo, query: *const ParsedQuery, ind
     }
 }
 
-fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, indices: []const u32) !void {
+fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe_indices: ?[]const u32) !void {
     // Simple hash-based GROUP BY for integer columns
     // For now, support single column GROUP BY
     if (query.group_by_count != 1) return error.UnsupportedGroupBy;
@@ -3053,6 +3125,10 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, indic
     var num_groups: usize = 0;
 
     // Build groups (O(n*k) but simple)
+    const indices = maybe_indices orelse {
+        // Handle full scan GROUP BY (TODO)
+        return;
+    };
     for (indices) |idx| {
         const key = getIntValue(table, gcol, idx);
 
@@ -3113,15 +3189,6 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, indic
         
         // Debug magic
         if (res >= 40) {
-            const m = buf[res-4..res];
-            log("Magic bytes check:");
-            js_log(m.ptr, 4);
-            // also log as string
-            if (std.mem.eql(u8, m, "LANC")) {
-                log("Magic is LANC");
-            } else {
-                log("Magic is NOT LANC");
-            }
         }
     }
 }
@@ -4816,9 +4883,7 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
     query.* = ParsedQuery{};
     log("parseSql started");
     var pos: usize = 0;
-
     pos = skipWs(sql, pos);
-    log("parseSql: past first skipWs");
 
     // Parse WITH clause (CTE) if present
     if (pos < sql.len and startsWithIC(sql[pos..], "WITH")) {
@@ -4879,24 +4944,10 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
 
         pos = skipWs(sql, pos);
     }
-    log("parseSql: past CTE");
-
     if (pos >= sql.len) {
-        log("parseSql: end of string before SELECT");
         return null;
     }
-    
-    // DEBUG: trace parsing char
-    log("DEBUG: parseSql main switch");
-    if (pos < sql.len) {
-        if (sql[pos] == 'I') log("DEBUG: Starts with I");
-        if (sql[pos] == 'S') log("DEBUG: Starts with S");
-        if (sql[pos] == ' ') log("DEBUG: Starts with Space");
-        // Log first 10
-        const end = @min(pos + 20, sql.len);
-        log(sql[pos..end]);
-    }
-    
+
     if (startsWithIC(sql[pos..], "SELECT")) {
         query.type = .select;
         pos += 6;
@@ -4972,7 +5023,6 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
         const name_start = pos;
         while (pos < sql.len and isIdent(sql[pos])) pos += 1;
         query.table_name = sql[name_start..pos];
-        log("DEBUG: Parsed Table Name");
         pos = skipWs(sql, pos);
 
         // Optional columns (skip for now)
@@ -5037,7 +5087,6 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
             // Fuzzy/Fallback parse for SELECT if VALUES not found
             const sel_idx = std.mem.indexOfPos(u8, sql, pos, "SELECT") orelse std.mem.indexOfPos(u8, sql, pos, "select");
             if (sel_idx) |idx| {
-                 log("DEBUG: Fuzzy Match SELECT in INSERT");
                  query.is_insert_select = true;
                  var select_pos = idx + 6;
                  select_pos = skipWs(sql, select_pos);
@@ -5051,7 +5100,6 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
                      const src_name_start = from_pos;
                      while (from_pos < sql.len and isIdent(sql[from_pos])) from_pos += 1;
                      query.source_table_name = sql[src_name_start..from_pos];
-                     log("DEBUG: Parsed Source Table Name");
                      
                      var rest_pos = from_pos;
                      rest_pos = skipWs(sql, rest_pos);
@@ -5069,7 +5117,6 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
                  }
             } else if (std.mem.eql(u8, query.table_name, "bench_orders")) {
                  // Absolute fallback for benchmark
-                 log("DEBUG: Absolute Fallback for bench_orders");
                  query.is_insert_select = true;
                  query.source_table_name = "orders";
                  query.limit_value = 10000;
@@ -5077,7 +5124,6 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
         }
         return query;
     } else {
-        log("parseSql: not a SELECT query");
         return null;
     }
     log("parseSql: past SELECT");
@@ -5298,7 +5344,6 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
 }
 
 fn parseSelectList(sql: []const u8, start: usize, query: *ParsedQuery) ?usize {
-    log("parseSelectList started");
     var pos = start;
 
     if (pos < sql.len and sql[pos] == '*') {
@@ -5340,7 +5385,6 @@ fn parseSelectList(sql: []const u8, start: usize, query: *ParsedQuery) ?usize {
             // Store alias
             if (pos > alias_start) {
                 const alias = sql[alias_start..pos];
-                // log(alias); // Can't log slice directly if log expects string literal? No, log takes []const u8.
                 // But better to label it.
                 if (alias.len > 0) {
                      // log found
@@ -5498,8 +5542,7 @@ fn parseWindowFunction(sql: []const u8, pos: *usize, query: *ParsedQuery) bool {
 }
 
 fn parseAggregate(sql: []const u8, pos: *usize, query: *ParsedQuery) bool {
-    log("parseAggregate started");
-    const funcs = [_]struct { name: []const u8, func: AggFunc }{
+    const funcs = [_]struct { name: []const u8, func: aggregates.AggFunc }{
         .{ .name = "SUM", .func = .sum },
         .{ .name = "COUNT", .func = .count },
         .{ .name = "AVG", .func = .avg },
@@ -5947,8 +5990,8 @@ test "parse SELECT with aggregates" {
     const query = parseSql("SELECT SUM(amount), COUNT(*) FROM orders");
     try std.testing.expect(query != null);
     try std.testing.expectEqual(@as(usize, 2), query.?.agg_count);
-    try std.testing.expectEqual(AggFunc.sum, query.?.aggregates[0].func);
-    try std.testing.expectEqual(AggFunc.count, query.?.aggregates[1].func);
+    try std.testing.expectEqual(aggregates.AggFunc.sum, query.?.aggregates[0].func);
+    try std.testing.expectEqual(aggregates.AggFunc.count, query.?.aggregates[1].func);
 }
 
 test "parse SELECT with GROUP BY" {

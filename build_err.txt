@@ -1,0 +1,38 @@
+wasm
++- install lanceql
+   +- compile exe lanceql ReleaseSmall wasm32-freestanding 5 errors
+src/wasm/sql_executor.zig:883:11: error: redeclaration of local constant 'name_copy'
+    const name_copy = try memory.allocator.dupe(u8, query.table_name);
+          ^~~~~~~~~
+src/wasm/sql_executor.zig:875:11: note: previous declaration here
+    const name_copy = try memory.allocator.dupe(u8, query.table_name);
+          ^~~~~~~~~
+src/wasm/sql_executor.zig:2411:9: error: unused local variable
+    var current_data_offset: u32 = 0;
+        ^~~~~~~~~~~~~~~~~~~
+src/wasm/sql_executor.zig:2410:9: error: unused local variable
+    var current_name_offset: u32 = 0;
+        ^~~~~~~~~~~~~~~~~~~
+src/wasm/sql_executor.zig:2493:11: error: unused local constant
+    const num_rows = num_groups;
+          ^~~~~~~~
+src/wasm/sql_executor.zig:2499:39: error: root source file struct 'wasm.memory' has no member named 'allocator'
+    const group_keys_out = try memory.allocator.alloc(f64, num_groups);
+                                      ^~~~~~~~~
+src/wasm/memory.zig:1:1: note: struct declared here
+//! WASM Memory Management
+^~~~~~~~~~~~~~~~~~~~~~~~~~
+referenced by:
+    executeAggregateQuery: src/wasm/sql_executor.zig:2353:32
+    executeCTEQuery: src/wasm/sql_executor.zig:3391:34
+    9 reference(s) hidden; use '-freference-trace=11' to see all references
+error: the following command failed with 5 compilation errors:
+/Users/steven_chong/.local/share/mise/installs/zig/0.15.2/zig build-exe -fno-entry -OReleaseSmall -target wasm32-freestanding -mcpu baseline+simd128 -Mroot=/Users/steven_chong/Downloads/repos/lanceql/src/wasm.zig --cache-dir .zig-cache --global-cache-dir /Users/steven_chong/.cache/zig --name lanceql -rdynamic --zig-lib-dir /Users/steven_chong/.local/share/mise/installs/zig/0.15.2/lib/ --listen=-
+
+Build Summary: 0/3 steps succeeded; 1 failed
+wasm transitive failure
++- install lanceql transitive failure
+   +- compile exe lanceql ReleaseSmall wasm32-freestanding 5 errors
+
+error: the following build command failed with exit code 1:
+.zig-cache/o/8d23d7a8d02c362ac874bdaca058522a/build /Users/steven_chong/.local/share/mise/installs/zig/0.15.2/zig /Users/steven_chong/.local/share/mise/installs/zig/0.15.2/lib /Users/steven_chong/Downloads/repos/lanceql .zig-cache /Users/steven_chong/.cache/zig --seed 0xecf112a6 -Z45882c2de16cb454 wasm
