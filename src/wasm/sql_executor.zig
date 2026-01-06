@@ -4469,11 +4469,6 @@ fn evaluateComparisonVector(
              const values = @as([*]const i64, @ptrCast(@alignCast(ptr_at_start)));
              const val = where.value_int orelse 0;
              
-             // Debug log
-             if (where.value_int == null) {
-                  log("evalCompVec: value_int is NULL!");
-             }
-             
              if (where.op == .gt) {
                   for (0..sel_len) |i| {
                        const idx = if (selection) |s| s[i] else @as(u16, @intCast(i));
@@ -4738,17 +4733,6 @@ fn evaluateWhere(table: *const TableInfo, where: *const WhereClause, row_idx: u3
 }
 
 fn evaluateComparison(table: *const TableInfo, col: *const ColumnData, row_idx: u32, where: *const WhereClause, context: *?FragmentContext) bool {
-    // Debug logging for int64 comparison
-    if (col.col_type == .int64) {
-        var buf: [128]u8 = undefined;
-        const val = getIntValueOptimized(table, col, row_idx, context);
-        if (where.value_int) |w_val| {
-            if (row_idx < 5) { // Only log first few
-                 const s = std.fmt.bufPrint(&buf, "evalComp: row={d}, col_val={d}, where_val={d}, op={}", .{row_idx, val, w_val, where.op}) catch "log_err";
-                 log(s);
-            }
-        }
-    }
     switch (where.op) {
         .eq => {
             if (where.value_int) |val| {
@@ -4881,7 +4865,6 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
     const query = &query_storage[query_storage_idx];
     query_storage_idx += 1;
     query.* = ParsedQuery{};
-    log("parseSql started");
     var pos: usize = 0;
     pos = skipWs(sql, pos);
 
@@ -5015,7 +4998,6 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
         }
         return query;
     } else if (startsWithIC(sql[pos..], "INSERT INTO")) {
-        log("DEBUG: Matched INSERT INTO");
         query.type = .insert;
         pos += 11;
         pos = skipWs(sql, pos);
@@ -5126,7 +5108,6 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
     } else {
         return null;
     }
-    log("parseSql: past SELECT");
 
     // Check for DISTINCT
     if (startsWithIC(sql[pos..], "DISTINCT")) {

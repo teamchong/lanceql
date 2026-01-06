@@ -38,8 +38,9 @@ async function executeWasmSqlFull(db, sql) {
     const executor = getWasmSqlExecutor();
 
     // Extract all table names from SQL (FROM, JOIN, WITH clauses)
+    // const tableNames = executor.getTableNames(sql);
     const tableNames = executor.getTableNames(sql);
-    console.log(`[LanceQLWorker] executeWasmSqlFull: ${sql} -> tables: ${tableNames.join(',')}`);
+    // console.log stripped for performance
 
     // Register all tables with the executor
 
@@ -48,7 +49,7 @@ async function executeWasmSqlFull(db, sql) {
     for (const tableName of tableNames) {
         // If table already exists in WASM (e.g. created via Zig DDL), don't overwrite it with stale DB data
         const exists = executor.hasTable(tableName);
-        console.log(`[LanceQLWorker] Check hasTable '${tableName}': ${exists}`);
+        // console.log stripped for performance
         if (exists) continue;
 
         const table = db.tables.get(tableName);
@@ -182,13 +183,10 @@ function createWasmImports() {
                 // and manage them via registerOPFSFile/closeOPFSFile
             },
             js_log: (ptr, len) => {
-                try {
-                    const bytes = new Uint8Array(wasmMemory.buffer, ptr, len);
-                    const msg = new TextDecoder().decode(bytes);
-                    console.log(`[LanceQLWasm] ${msg}`);
-                } catch (e) {
-                    console.error('[LanceQLWasm] Log error:', e);
-                }
+                // Stripped for performance - uncomment to debug WASM:
+                // const bytes = new Uint8Array(wasmMemory.buffer, ptr, len);
+                // const msg = new TextDecoder().decode(bytes);
+                // console.log(`[LanceQLWasm] ${msg}`);
             },
             __assert_fail: (msgPtr, filePtr, line, funcPtr) => {
                 const decoder = new TextDecoder();
