@@ -1,11 +1,15 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Vault SQL Test Suite</title>
     <style>
-        * { box-sizing: border-box; }
+        * {
+            box-sizing: border-box;
+        }
+
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             max-width: 1200px;
@@ -13,20 +17,31 @@
             padding: 20px;
             background: #f5f5f5;
         }
-        h1 { color: #333; margin-bottom: 10px; }
-        .subtitle { color: #666; margin-bottom: 30px; }
+
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+        }
+
         .test-section {
             background: white;
             border-radius: 8px;
             padding: 20px;
             margin-bottom: 15px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
         }
+
         .test-section h2 {
             margin: 0 0 15px 0;
             font-size: 1.1rem;
             color: #333;
         }
+
         button {
             background: #3b82f6;
             color: white;
@@ -36,55 +51,78 @@
             cursor: pointer;
             font-size: 14px;
         }
+
         button:disabled {
             background: #ccc;
             cursor: not-allowed;
         }
+
         button:hover:not(:disabled) {
             background: #2563eb;
         }
+
         .status {
             margin-top: 10px;
             padding: 8px 12px;
             border-radius: 4px;
             font-size: 14px;
         }
+
         .status.loading {
             background: #eff6ff;
             color: #3b82f6;
             border-left: 4px solid #3b82f6;
         }
+
         .status.success {
             background: #f0fdf4;
             color: #16a34a;
             border-left: 4px solid #22c55e;
         }
+
         .status.error {
             background: #fef2f2;
             color: #dc2626;
             border-left: 4px solid #ef4444;
         }
+
         .result {
             margin-top: 15px;
         }
+
         table {
             width: 100%;
             border-collapse: collapse;
             font-size: 13px;
             margin-top: 10px;
         }
-        th, td {
+
+        th,
+        td {
             border: 1px solid #e5e7eb;
             padding: 8px 12px;
             text-align: left;
         }
+
         th {
             background: #f9fafb;
             font-weight: 600;
         }
-        tr:nth-child(even) { background: #fafafa; }
-        .pass { color: #16a34a; font-weight: 600; }
-        .fail { color: #dc2626; font-weight: 600; }
+
+        tr:nth-child(even) {
+            background: #fafafa;
+        }
+
+        .pass {
+            color: #16a34a;
+            font-weight: 600;
+        }
+
+        .fail {
+            color: #dc2626;
+            font-weight: 600;
+        }
+
         .sql-code {
             font-family: 'Monaco', 'Menlo', monospace;
             font-size: 12px;
@@ -92,6 +130,7 @@
             padding: 2px 6px;
             border-radius: 3px;
         }
+
         .summary {
             background: #1e293b;
             color: white;
@@ -99,25 +138,44 @@
             border-radius: 8px;
             margin-top: 20px;
         }
-        .summary h2 { color: white; margin: 0 0 15px 0; }
+
+        .summary h2 {
+            color: white;
+            margin: 0 0 15px 0;
+        }
+
         .summary-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
             gap: 10px;
         }
+
         .summary-item {
-            background: rgba(255,255,255,0.1);
+            background: rgba(255, 255, 255, 0.1);
             padding: 10px;
             border-radius: 4px;
         }
-        .summary-item .label { font-size: 12px; opacity: 0.8; }
-        .summary-item .value { font-size: 24px; font-weight: 600; }
+
+        .summary-item .label {
+            font-size: 12px;
+            opacity: 0.8;
+        }
+
+        .summary-item .value {
+            font-size: 24px;
+            font-weight: 600;
+        }
+
         #run-all {
             background: #059669;
             font-size: 16px;
             padding: 12px 24px;
         }
-        #run-all:hover:not(:disabled) { background: #047857; }
+
+        #run-all:hover:not(:disabled) {
+            background: #047857;
+        }
+
         pre.error-detail {
             background: #fef2f2;
             padding: 10px;
@@ -129,6 +187,7 @@
         }
     </style>
 </head>
+
 <body>
     <h1>🔐 Vault SQL Test Suite</h1>
     <p class="subtitle">Comprehensive browser tests for vault.exec() SQL operations</p>
@@ -328,10 +387,11 @@
         // Test Functions
         // =========================================================================
 
-        window.testInit = async function() {
+        window.testInit = async function () {
             setStatus('init', 'loading', '⏳ Initializing vault...');
             try {
                 v = await vault();
+                window.vaultInstance = v;
                 setStatus('init', 'success', '✓ Vault initialized successfully');
                 enableButton('create');
             } catch (e) {
@@ -339,7 +399,7 @@
             }
         };
 
-        window.testCreate = async function() {
+        window.testCreate = async function () {
             setStatus('create', 'loading', '⏳ Running CREATE TABLE tests...');
             const tests = [];
 
@@ -367,7 +427,7 @@
             updateSummary();
         };
 
-        window.testInsert = async function() {
+        window.testInsert = async function () {
             setStatus('insert', 'loading', '⏳ Running INSERT tests...');
             const tests = [];
 
@@ -399,7 +459,7 @@
             updateSummary();
         };
 
-        window.testSelectBasic = async function() {
+        window.testSelectBasic = async function () {
             setStatus('select-basic', 'loading', '⏳ Running basic SELECT tests...');
             const tests = [];
 
@@ -439,7 +499,7 @@
             updateSummary();
         };
 
-        window.testSelectWhere = async function() {
+        window.testSelectWhere = async function () {
             setStatus('select-where', 'loading', '⏳ Running WHERE operator tests...');
             const tests = [];
 
@@ -479,7 +539,7 @@
             updateSummary();
         };
 
-        window.testSelectLogic = async function() {
+        window.testSelectLogic = async function () {
             setStatus('select-logic', 'loading', '⏳ Running AND/OR logic tests...');
             const tests = [];
 
@@ -507,7 +567,7 @@
             updateSummary();
         };
 
-        window.testUpdate = async function() {
+        window.testUpdate = async function () {
             setStatus('update', 'loading', '⏳ Running UPDATE tests...');
             const tests = [];
 
@@ -534,7 +594,7 @@
             updateSummary();
         };
 
-        window.testDelete = async function() {
+        window.testDelete = async function () {
             setStatus('delete', 'loading', '⏳ Running DELETE tests...');
             const tests = [];
 
@@ -562,7 +622,7 @@
             updateSummary();
         };
 
-        window.testAggregations = async function() {
+        window.testAggregations = async function () {
             setStatus('aggregations', 'loading', '⏳ Running aggregation tests...');
             const tests = [];
 
@@ -598,7 +658,7 @@
             updateSummary();
         };
 
-        window.testGroupBy = async function() {
+        window.testGroupBy = async function () {
             setStatus('groupby', 'loading', '⏳ Running GROUP BY tests...');
             const tests = [];
 
@@ -618,7 +678,7 @@
             updateSummary();
         };
 
-        window.testOrderBy = async function() {
+        window.testOrderBy = async function () {
             setStatus('orderby', 'loading', '⏳ Running ORDER BY tests...');
             const tests = [];
 
@@ -653,7 +713,7 @@
             updateSummary();
         };
 
-        window.testJoins = async function() {
+        window.testJoins = async function () {
             setStatus('joins', 'loading', '⏳ Running JOIN tests...');
             const tests = [];
 
@@ -673,7 +733,7 @@
             updateSummary();
         };
 
-        window.testDrop = async function() {
+        window.testDrop = async function () {
             setStatus('drop', 'loading', '⏳ Running DROP TABLE tests...');
             const tests = [];
 
@@ -700,7 +760,7 @@
         };
 
         // Run all tests sequentially
-        window.runAllTests = async function() {
+        window.runAllTests = async function () {
             testResults = { total: 0, passed: 0, failed: 0, time: 0 };
             const btn = document.getElementById('run-all');
             btn.disabled = true;
@@ -728,4 +788,5 @@
         };
     </script>
 </body>
+
 </html>

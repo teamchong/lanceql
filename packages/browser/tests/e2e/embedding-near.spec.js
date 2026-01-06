@@ -1,28 +1,40 @@
 /**
  * LanceQL Feature Tests - E2E
- * Tests: GROUP BY, JOIN, aggregations, WHERE filters
+ * Tests: GROUP BY, JOIN, aggregations, WHERE filters, NEAR
  * 
- * Note: These tests require WASM to be loaded. Some tests may be skipped in CI
- * if WASM loading times out.
+ * Uses window.vaultInstance exposed by test-vault-sql.html
  */
 
 import { test, expect } from '@playwright/test';
 
-// Increase timeout for all tests in this file
 test.setTimeout(60000);
 
 test.describe('SQL Features', () => {
     test.beforeEach(async ({ page }) => {
         await page.goto('/examples/wasm/test-vault-sql.html');
+        // Wait for module script to execute (timeout means script failed)
+        await page.waitForFunction(() => typeof window.testInit === 'function');
         await page.waitForLoadState('domcontentloaded');
+
+        // Initialize vault via the page's function
+        await page.evaluate(async () => {
+            if (!window.vaultInstance) {
+                await window.testInit();
+            }
+        });
+
+        // Wait for initialization to complete
+        await page.waitForFunction(() => !!window.vaultInstance, { timeout: 30000 }).catch(() => {
+            console.log('Vault initialization timed out');
+        });
     });
 
     test('GROUP BY with aggregates', async ({ page }) => {
         const result = await page.evaluate(async () => {
-            try {
-                const { vault } = await import('./lanceql.js');
-                const v = await vault();
+            const v = window.vaultInstance;
+            if (!v) return { success: false, error: 'Vault not initialized' };
 
+            try {
                 await v.exec('CREATE TABLE sales (category TEXT, amount REAL)');
                 await v.exec(`INSERT INTO sales VALUES 
                     ('electronics', 500), ('electronics', 300),
@@ -39,20 +51,20 @@ test.describe('SQL Features', () => {
             }
         });
 
-        if (!result.success) {
-            console.log('Skipped - WASM not loaded:', result.error);
+        if (!result.success && result.error === 'Vault not initialized') {
             test.skip();
             return;
         }
+        expect(result.success).toBe(true);
         expect(result.rowCount).toBe(3);
     });
 
     test('JOIN with WHERE filter', async ({ page }) => {
         const result = await page.evaluate(async () => {
-            try {
-                const { vault } = await import('./lanceql.js');
-                const v = await vault();
+            const v = window.vaultInstance;
+            if (!v) return { success: false, error: 'Vault not initialized' };
 
+            try {
                 await v.exec('CREATE TABLE orders (id INTEGER, customer_id INTEGER, amount REAL)');
                 await v.exec('CREATE TABLE customers (id INTEGER, name TEXT)');
                 await v.exec(`INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob')`);
@@ -69,20 +81,20 @@ test.describe('SQL Features', () => {
             }
         });
 
-        if (!result.success) {
-            console.log('Skipped - WASM not loaded:', result.error);
+        if (!result.success && result.error === 'Vault not initialized') {
             test.skip();
             return;
         }
+        expect(result.success).toBe(true);
         expect(result.rowCount).toBeGreaterThan(0);
     });
 
     test('aggregation SUM/AVG/MIN/MAX/COUNT', async ({ page }) => {
         const result = await page.evaluate(async () => {
-            try {
-                const { vault } = await import('./lanceql.js');
-                const v = await vault();
+            const v = window.vaultInstance;
+            if (!v) return { success: false, error: 'Vault not initialized' };
 
+            try {
                 await v.exec('CREATE TABLE scores (value REAL)');
                 await v.exec(`INSERT INTO scores VALUES (10), (20), (30), (40), (50)`);
 
@@ -93,21 +105,21 @@ test.describe('SQL Features', () => {
             }
         });
 
-        if (!result.success) {
-            console.log('Skipped - WASM not loaded:', result.error);
+        if (!result.success && result.error === 'Vault not initialized') {
             test.skip();
             return;
         }
+        expect(result.success).toBe(true);
         expect(result.row['sum(value)']).toBe(150);
         expect(result.row['count(*)']).toBe(5);
     });
 
     test('WHERE with multiple conditions', async ({ page }) => {
         const result = await page.evaluate(async () => {
-            try {
-                const { vault } = await import('./lanceql.js');
-                const v = await vault();
+            const v = window.vaultInstance;
+            if (!v) return { success: false, error: 'Vault not initialized' };
 
+            try {
                 await v.exec('CREATE TABLE products (id INTEGER, price REAL, status TEXT)');
                 await v.exec(`INSERT INTO products VALUES 
                     (1, 100, 'active'), (2, 200, 'active'), 
@@ -122,11 +134,11 @@ test.describe('SQL Features', () => {
             }
         });
 
-        if (!result.success) {
-            console.log('Skipped - WASM not loaded:', result.error);
+        if (!result.success && result.error === 'Vault not initialized') {
             test.skip();
             return;
         }
+        expect(result.success).toBe(true);
         expect(result.rowCount).toBe(2);
     });
 });

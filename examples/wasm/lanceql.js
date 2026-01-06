@@ -4513,7 +4513,7 @@ var init_remote_dataset = __esm({
                         filePath = new TextDecoder().decode(iContent);
                       }
                     } else if (iWire === 0) {
-                      while (innerPos < content.length && (content[innerPos++] & 128) !== 0) ;
+                      while (innerPos < content.length && (content[innerPos++] & 128) !== 0);
                     } else if (iWire === 5) {
                       innerPos += 4;
                     } else if (iWire === 1) {
@@ -5088,7 +5088,7 @@ async function workerRPC(method, args) {
 var import_meta, _lanceWorker, _lanceWorkerReady, _requestId, _pendingRequests, _transferMode, _sharedBuffer, SHARED_BUFFER_SIZE;
 var init_worker_rpc = __esm({
   "src/client/rpc/worker-rpc.js"() {
-    import_meta = {};
+    import_meta = { url: (typeof document !== 'undefined' && document.baseURI) ? new URL('lanceql.js', document.baseURI).href : '' };
     _lanceWorker = null;
     _lanceWorkerReady = null;
     _requestId = 0;
@@ -6251,7 +6251,9 @@ __export(index_exports, {
   vault: () => vault,
   wasmUtils: () => wasmUtils
 });
-module.exports = __toCommonJS(index_exports);
+if (typeof module !== 'undefined' && typeof module.exports !== 'undefined') {
+  module.exports = __toCommonJS(index_exports);
+}
 init_metadata_cache();
 init_lru_cache();
 init_hot_tier_cache();
@@ -7139,12 +7141,14 @@ var GPUVectorSearch = class {
     const vectorsBuffer = this._createStorage(flatVectors);
     const distanceBuffer = this.device.createBuffer({ size: numQueries * numVectors * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
     const readBuffer = this.device.createBuffer({ size: numQueries * numVectors * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-    const bindGroup = this.device.createBindGroup({ layout: this.pipelines.get("distance").getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: paramsBuffer } },
-      { binding: 1, resource: { buffer: queryBuffer } },
-      { binding: 2, resource: { buffer: vectorsBuffer } },
-      { binding: 3, resource: { buffer: distanceBuffer } }
-    ] });
+    const bindGroup = this.device.createBindGroup({
+      layout: this.pipelines.get("distance").getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: paramsBuffer } },
+        { binding: 1, resource: { buffer: queryBuffer } },
+        { binding: 2, resource: { buffer: vectorsBuffer } },
+        { binding: 3, resource: { buffer: distanceBuffer } }
+      ]
+    });
     const encoder = this.device.createCommandEncoder();
     const pass = encoder.beginComputePass();
     pass.setPipeline(this.pipelines.get("distance"));
@@ -7174,13 +7178,15 @@ var GPUVectorSearch = class {
     const inputIndicesBuffer = this._createStorage(indices);
     const intermediateScoresBuffer = this.device.createBuffer({ size: numCandidates * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
     const intermediateIndicesBuffer = this.device.createBuffer({ size: numCandidates * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
-    const localBG = this.device.createBindGroup({ layout: this.pipelines.get("local_topk").getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: paramsBuffer } },
-      { binding: 1, resource: { buffer: inputScoresBuffer } },
-      { binding: 2, resource: { buffer: inputIndicesBuffer } },
-      { binding: 3, resource: { buffer: intermediateScoresBuffer } },
-      { binding: 4, resource: { buffer: intermediateIndicesBuffer } }
-    ] });
+    const localBG = this.device.createBindGroup({
+      layout: this.pipelines.get("local_topk").getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: paramsBuffer } },
+        { binding: 1, resource: { buffer: inputScoresBuffer } },
+        { binding: 2, resource: { buffer: inputIndicesBuffer } },
+        { binding: 3, resource: { buffer: intermediateScoresBuffer } },
+        { binding: 4, resource: { buffer: intermediateIndicesBuffer } }
+      ]
+    });
     let encoder = this.device.createCommandEncoder();
     let pass = encoder.beginComputePass();
     pass.setPipeline(this.pipelines.get("local_topk"));
@@ -7193,13 +7199,15 @@ var GPUVectorSearch = class {
     const finalIndicesBuffer = this.device.createBuffer({ size: k * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
     const readScoresBuffer = this.device.createBuffer({ size: k * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     const readIndicesBuffer = this.device.createBuffer({ size: k * 4, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-    const mergeBG = this.device.createBindGroup({ layout: this.pipelines.get("merge_topk").getBindGroupLayout(0), entries: [
-      { binding: 0, resource: { buffer: mergeParamsBuffer } },
-      { binding: 1, resource: { buffer: intermediateScoresBuffer } },
-      { binding: 2, resource: { buffer: intermediateIndicesBuffer } },
-      { binding: 3, resource: { buffer: finalScoresBuffer } },
-      { binding: 4, resource: { buffer: finalIndicesBuffer } }
-    ] });
+    const mergeBG = this.device.createBindGroup({
+      layout: this.pipelines.get("merge_topk").getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: mergeParamsBuffer } },
+        { binding: 1, resource: { buffer: intermediateScoresBuffer } },
+        { binding: 2, resource: { buffer: intermediateIndicesBuffer } },
+        { binding: 3, resource: { buffer: finalScoresBuffer } },
+        { binding: 4, resource: { buffer: finalIndicesBuffer } }
+      ]
+    });
     encoder = this.device.createCommandEncoder();
     pass = encoder.beginComputePass();
     pass.setPipeline(this.pipelines.get("merge_topk"));
@@ -16455,3 +16463,4 @@ async function vault(getEncryptionKey = null) {
 init_lanceql();
 init_lanceql();
 //# sourceMappingURL=lanceql.js.map
+export { vault };
