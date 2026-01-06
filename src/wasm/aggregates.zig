@@ -2,6 +2,7 @@
 //!
 //! Column aggregation functions (sum, min, max, avg) for WASM.
 
+const std = @import("std");
 const format = @import("format.zig");
 const column_meta = @import("column_meta.zig");
 
@@ -106,6 +107,51 @@ export fn avgFloat64Column(col_idx: u32) f64 {
 
 /// SIMD vector type for 4x f64
 const Vec4f64 = @Vector(4, f64);
+
+pub const AggFunc = enum { sum, count, avg, min, max };
+
+pub const AggState = struct {
+    val: f64 = 0,
+    min: f64 = std.math.floatMax(f64),
+    max: f64 = -std.math.floatMax(f64),
+    count: usize = 0,
+
+    pub fn update(self: *AggState, v: f64, func: AggFunc) void {
+        switch (func) {
+            .sum, .avg => self.val += v,
+            .min => if (v < self.min) { self.min = v; },
+            .max => if (v > self.max) { self.max = v; },
+            .count => {},
+        }
+        self.count += 1;
+    }
+
+    pub fn updateVec4(self: *AggState, v: Vec4f64, func: AggFunc) void {
+        switch (func) {
+            .sum, .avg => self.val += @reduce(.Add, v),
+            .min => {
+                const m = @reduce(.Min, v);
+                if (m < self.min) self.min = m;
+            },
+            .max => {
+                const m = @reduce(.Max, v);
+                if (m > self.max) self.max = m;
+            },
+            .count => {},
+        }
+        self.count += 4;
+    }
+
+    pub fn getResult(self: *AggState, func: AggFunc) f64 {
+        return switch (func) {
+            .sum => self.val,
+            .avg => if (self.count > 0) self.val / @as(f64, @floatFromInt(self.count)) else 0,
+            .min => self.min,
+            .max => self.max,
+            .count => @floatFromInt(self.count),
+        };
+    }
+};
 
 /// Sum float64 buffer with SIMD acceleration
 pub export fn sumFloat64Buffer(ptr: [*]const f64, len: usize) f64 {

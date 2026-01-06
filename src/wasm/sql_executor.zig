@@ -2258,35 +2258,93 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
     var hash_map = std.AutoHashMap(i64, u32).init(memory.wasm_allocator);
     defer hash_map.deinit();
 
-    var r_ctx: ?FragmentContext = null;
-    for (0..rtbl.row_count) |ri| {
-        const key = getIntValueOptimized(rtbl, rc, @intCast(ri), &r_ctx);
-        
-        // Chaining logic:
-        // New node points to current head
-        if (hash_map.get(key)) |head| {
-            next_match[ri] = head;
+    var r_frag_start: u32 = 0;
+    for (rtbl.fragments[0..rtbl.fragment_count]) |maybe_f| {
+        if (maybe_f) |frag| {
+            const f_rows = @as(u32, @intCast(frag.getRowCount()));
+            const raw_ptr = frag.getColumnRawPtr(rc.fragment_col_idx) orelse {
+                 r_frag_start += f_rows;
+                 continue;
+            };
+            for (0..f_rows) |f_ri| {
+                const key = getIntValueFromPtr(raw_ptr, rc.col_type, @intCast(f_ri));
+                const ri = r_frag_start + @as(u32, @intCast(f_ri));
+                if (hash_map.get(key)) |head| {
+                    next_match[ri] = head;
+                }
+                try hash_map.put(key, ri);
+            }
+            r_frag_start += f_rows;
         }
-        // Update head to new node
-        try hash_map.put(key, @intCast(ri));
+    }
+    // Handle in-memory right table
+    if (rtbl.memory_row_count > 0) {
+        if (rc.schema_col_idx < MAX_COLUMNS) {
+            if (rtbl.memory_columns[rc.schema_col_idx]) |*mc| {
+                for (0..rtbl.memory_row_count) |mi| {
+                    const key = switch (mc.col_type) {
+                        .int64 => mc.data.int64[mi],
+                        .int32 => mc.data.int32[mi],
+                        else => 0,
+                    };
+                    const ri = @as(u32, @intCast(rtbl.file_row_count + mi));
+                    if (hash_map.get(key)) |head| {
+                        next_match[ri] = head;
+                    }
+                    try hash_map.put(key, ri);
+                }
+            }
+        }
     }
 
     // Probe hash table from left side
-    var l_ctx: ?FragmentContext = null;
-    // Limit to MAX_ROWS if needed, or handle generically? 
-    // Left table implies row iteration.
-    for (0..left_table.row_count) |li| {
-        const key = getIntValueOptimized(left_table, lc, @intCast(li), &l_ctx);
-        if (hash_map.get(key)) |head| {
-            var curr: u32 = head;
-            while (curr != std.math.maxInt(u32)) {
-                if (pair_count < MAX_JOIN_ROWS) {
-                    join_pairs[pair_count] = .{ .left = @intCast(li), .right = curr };
-                    pair_count += 1;
-                } else {
-                    break;
+    var l_frag_start: u32 = 0;
+    for (left_table.fragments[0..left_table.fragment_count]) |maybe_f| {
+        if (maybe_f) |frag| {
+            const f_rows = @as(u32, @intCast(frag.getRowCount()));
+            const raw_ptr = frag.getColumnRawPtr(lc.fragment_col_idx) orelse {
+                l_frag_start += f_rows;
+                continue;
+            };
+            for (0..f_rows) |f_li| {
+                const key = getIntValueFromPtr(raw_ptr, lc.col_type, @intCast(f_li));
+                const li = l_frag_start + @as(u32, @intCast(f_li));
+                if (hash_map.get(key)) |head| {
+                    var curr: u32 = head;
+                    while (curr != std.math.maxInt(u32)) {
+                        if (pair_count < MAX_JOIN_ROWS) {
+                            join_pairs[pair_count] = .{ .left = li, .right = curr };
+                            pair_count += 1;
+                        } else break;
+                        curr = next_match[curr];
+                    }
                 }
-                curr = next_match[curr];
+            }
+            l_frag_start += f_rows;
+        }
+    }
+    // Handle in-memory left table
+    if (left_table.memory_row_count > 0) {
+        if (lc.schema_col_idx < MAX_COLUMNS) {
+            if (left_table.memory_columns[lc.schema_col_idx]) |*mc| {
+                for (0..left_table.memory_row_count) |mi| {
+                     const key = switch (mc.col_type) {
+                        .int64 => mc.data.int64[mi],
+                        .int32 => mc.data.int32[mi],
+                        else => 0,
+                    };
+                    const li = @as(u32, @intCast(left_table.file_row_count + mi));
+                    if (hash_map.get(key)) |head| {
+                        var curr: u32 = head;
+                        while (curr != std.math.maxInt(u32)) {
+                            if (pair_count < MAX_JOIN_ROWS) {
+                                join_pairs[pair_count] = .{ .left = li, .right = curr };
+                                pair_count += 1;
+                            } else break;
+                            curr = next_match[curr];
+                        }
+                    }
+                }
             }
         }
     }
@@ -2307,15 +2365,30 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
 
     // Write Left Table Columns
     var l_ctx2: ?FragmentContext = null;
-    for (left_table.columns[0..left_col_count], 0..) |maybe_col, col_idx| {
+    for (left_table.columns[0..left_col_count]) |maybe_col| {
         if (maybe_col) |*col| {
-            _ = col_idx;
-            switch (col.col_type) {
+            const col_type = col.col_type;
+            const is_lazy = col.is_lazy;
+            const f_col_idx = col.fragment_col_idx;
+
+            switch (col_type) {
                 .int64 => {
                     const data = try memory.wasm_allocator.alloc(i64, pair_count);
                     defer memory.wasm_allocator.free(data);
                     for (join_pairs[0..pair_count], 0..) |pair, i| {
-                        data[i] = getIntValueOptimized(left_table, col, pair.left, &l_ctx2);
+                        if (is_lazy) {
+                             if (l_ctx2 == null or pair.left < l_ctx2.?.start_idx or pair.left >= l_ctx2.?.end_idx) {
+                                 l_ctx2 = null;
+                                 _ = getIntValueOptimized(left_table, col, pair.left, &l_ctx2);
+                             }
+                             if (l_ctx2.?.frag) |frag| {
+                                 const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
+                                 const typed_ptr: [*]const i64 = @ptrCast(@alignCast(raw_ptr));
+                                 data[i] = typed_ptr[pair.left - l_ctx2.?.start_idx];
+                             }
+                        } else {
+                            data[i] = col.data.int64[pair.left];
+                        }
                     }
                     _ = lw.fragmentAddInt64Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
                 },
@@ -2323,7 +2396,19 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                     const data = try memory.wasm_allocator.alloc(f64, pair_count);
                     defer memory.wasm_allocator.free(data);
                     for (join_pairs[0..pair_count], 0..) |pair, i| {
-                        data[i] = getFloatValueOptimized(left_table, col, pair.left, &l_ctx2);
+                        if (is_lazy) {
+                             if (l_ctx2 == null or pair.left < l_ctx2.?.start_idx or pair.left >= l_ctx2.?.end_idx) {
+                                 l_ctx2 = null;
+                                 _ = getFloatValueOptimized(left_table, col, pair.left, &l_ctx2);
+                             }
+                             if (l_ctx2.?.frag) |frag| {
+                                 const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
+                                 const typed_ptr: [*]const f64 = @ptrCast(@alignCast(raw_ptr));
+                                 data[i] = typed_ptr[pair.left - l_ctx2.?.start_idx];
+                             }
+                        } else {
+                            data[i] = col.data.float64[pair.left];
+                        }
                     }
                     _ = lw.fragmentAddFloat64Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
                 },
@@ -2331,7 +2416,19 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                     const data = try memory.wasm_allocator.alloc(i32, pair_count);
                     defer memory.wasm_allocator.free(data);
                     for (join_pairs[0..pair_count], 0..) |pair, i| {
-                        data[i] = @intCast(getIntValueOptimized(left_table, col, pair.left, &l_ctx2));
+                        if (is_lazy) {
+                             if (l_ctx2 == null or pair.left < l_ctx2.?.start_idx or pair.left >= l_ctx2.?.end_idx) {
+                                 l_ctx2 = null;
+                                 _ = getIntValueOptimized(left_table, col, pair.left, &l_ctx2);
+                             }
+                             if (l_ctx2.?.frag) |frag| {
+                                 const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
+                                 const typed_ptr: [*]const i32 = @ptrCast(@alignCast(raw_ptr));
+                                 data[i] = typed_ptr[pair.left - l_ctx2.?.start_idx];
+                             }
+                        } else {
+                            data[i] = col.data.int32[pair.left];
+                        }
                     }
                     _ = lw.fragmentAddInt32Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
                 },
@@ -2339,7 +2436,19 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                     const data = try memory.wasm_allocator.alloc(f32, pair_count);
                     defer memory.wasm_allocator.free(data);
                     for (join_pairs[0..pair_count], 0..) |pair, i| {
-                        data[i] = @floatCast(getFloatValueOptimized(left_table, col, pair.left, &l_ctx2));
+                        if (is_lazy) {
+                             if (l_ctx2 == null or pair.left < l_ctx2.?.start_idx or pair.left >= l_ctx2.?.end_idx) {
+                                 l_ctx2 = null;
+                                 _ = getFloatValueOptimized(left_table, col, pair.left, &l_ctx2);
+                             }
+                             if (l_ctx2.?.frag) |frag| {
+                                 const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
+                                 const typed_ptr: [*]const f32 = @ptrCast(@alignCast(raw_ptr));
+                                 data[i] = typed_ptr[pair.left - l_ctx2.?.start_idx];
+                             }
+                        } else {
+                            data[i] = col.data.float32[pair.left];
+                        }
                     }
                     _ = lw.fragmentAddFloat32Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
                 },
@@ -2352,28 +2461,31 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                     offsets[0] = 0;
                     
                     // Calc lengths
-                    for (join_pairs[0..pair_count], 0..) |pair, i| {
-                         if (!col.is_lazy) {
-                             const len = col.data.strings.lengths[pair.left];
-                             total_len += len;
-                             current_offset += len;
-                             offsets[i+1] = current_offset;
-                         } else {
-                             // Fallback
-                             offsets[i+1] = current_offset;
-                         }
+                    if (!is_lazy) {
+                        const lens = col.data.strings.lengths;
+                        for (join_pairs[0..pair_count], 0..) |pair, i| {
+                            const len = lens[pair.left];
+                            total_len += len;
+                            current_offset += len;
+                            offsets[i+1] = current_offset;
+                        }
+                    } else {
+                        // For lazy strings, we need a different approach (not implemented yet for joins)
+                        for (0..pair_count) |i| offsets[i+1] = 0;
                     }
                     
                     const str_data = try memory.wasm_allocator.alloc(u8, total_len);
                     defer memory.wasm_allocator.free(str_data);
                     
                     current_offset = 0;
-                    for (join_pairs[0..pair_count]) |pair| {
-                        if (!col.is_lazy) {
-                             const off = col.data.strings.offsets[pair.left];
-                             const len = col.data.strings.lengths[pair.left];
-                             const src = col.data.strings.data[off..][0..len];
-                             @memcpy(str_data[current_offset..][0..len], src);
+                    if (!is_lazy) {
+                        const s_data = col.data.strings.data;
+                        const s_offs = col.data.strings.offsets;
+                        const s_lens = col.data.strings.lengths;
+                        for (join_pairs[0..pair_count]) |pair| {
+                             const off = s_offs[pair.left];
+                             const len = s_lens[pair.left];
+                             @memcpy(str_data[current_offset..][0..len], s_data[off..][0..len]);
                              current_offset += len;
                         }
                     }
@@ -2385,15 +2497,30 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
     
     // Write Right Table Columns
     var r_ctx2: ?FragmentContext = null;
-    for (rtbl.columns[0..right_col_count], 0..) |maybe_col, col_idx| {
+    for (rtbl.columns[0..right_col_count]) |maybe_col| {
         if (maybe_col) |*col| {
-            _ = col_idx;
-            switch (col.col_type) {
+            const col_type = col.col_type;
+            const is_lazy = col.is_lazy;
+            const f_col_idx = col.fragment_col_idx;
+
+            switch (col_type) {
                 .int64 => {
                     const data = try memory.wasm_allocator.alloc(i64, pair_count);
                     defer memory.wasm_allocator.free(data);
                     for (join_pairs[0..pair_count], 0..) |pair, i| {
-                        data[i] = getIntValueOptimized(rtbl, col, pair.right, &r_ctx2);
+                        if (is_lazy) {
+                             if (r_ctx2 == null or pair.right < r_ctx2.?.start_idx or pair.right >= r_ctx2.?.end_idx) {
+                                 r_ctx2 = null;
+                                 _ = getIntValueOptimized(rtbl, col, pair.right, &r_ctx2);
+                             }
+                             if (r_ctx2.?.frag) |frag| {
+                                 const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
+                                 const typed_ptr: [*]const i64 = @ptrCast(@alignCast(raw_ptr));
+                                 data[i] = typed_ptr[pair.right - r_ctx2.?.start_idx];
+                             }
+                        } else {
+                            data[i] = col.data.int64[pair.right];
+                        }
                     }
                     _ = lw.fragmentAddInt64Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
                 },
@@ -2401,7 +2528,19 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                     const data = try memory.wasm_allocator.alloc(f64, pair_count);
                     defer memory.wasm_allocator.free(data);
                     for (join_pairs[0..pair_count], 0..) |pair, i| {
-                        data[i] = getFloatValueOptimized(rtbl, col, pair.right, &r_ctx2);
+                        if (is_lazy) {
+                             if (r_ctx2 == null or pair.right < r_ctx2.?.start_idx or pair.right >= r_ctx2.?.end_idx) {
+                                 r_ctx2 = null;
+                                 _ = getFloatValueOptimized(rtbl, col, pair.right, &r_ctx2);
+                             }
+                             if (r_ctx2.?.frag) |frag| {
+                                 const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
+                                 const typed_ptr: [*]const f64 = @ptrCast(@alignCast(raw_ptr));
+                                 data[i] = typed_ptr[pair.right - r_ctx2.?.start_idx];
+                             }
+                        } else {
+                            data[i] = col.data.float64[pair.right];
+                        }
                     }
                     _ = lw.fragmentAddFloat64Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
                 },
@@ -2409,7 +2548,19 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                     const data = try memory.wasm_allocator.alloc(i32, pair_count);
                     defer memory.wasm_allocator.free(data);
                     for (join_pairs[0..pair_count], 0..) |pair, i| {
-                        data[i] = @intCast(getIntValueOptimized(rtbl, col, pair.right, &r_ctx2));
+                        if (is_lazy) {
+                             if (r_ctx2 == null or pair.right < r_ctx2.?.start_idx or pair.right >= r_ctx2.?.end_idx) {
+                                 r_ctx2 = null;
+                                 _ = getIntValueOptimized(rtbl, col, pair.right, &r_ctx2);
+                             }
+                             if (r_ctx2.?.frag) |frag| {
+                                 const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
+                                 const typed_ptr: [*]const i32 = @ptrCast(@alignCast(raw_ptr));
+                                 data[i] = typed_ptr[pair.right - r_ctx2.?.start_idx];
+                             }
+                        } else {
+                            data[i] = col.data.int32[pair.right];
+                        }
                     }
                     _ = lw.fragmentAddInt32Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
                 },
@@ -2417,7 +2568,19 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                     const data = try memory.wasm_allocator.alloc(f32, pair_count);
                     defer memory.wasm_allocator.free(data);
                     for (join_pairs[0..pair_count], 0..) |pair, i| {
-                        data[i] = @floatCast(getFloatValueOptimized(rtbl, col, pair.right, &r_ctx2));
+                        if (is_lazy) {
+                             if (r_ctx2 == null or pair.right < r_ctx2.?.start_idx or pair.right >= r_ctx2.?.end_idx) {
+                                 r_ctx2 = null;
+                                 _ = getFloatValueOptimized(rtbl, col, pair.right, &r_ctx2);
+                             }
+                             if (r_ctx2.?.frag) |frag| {
+                                 const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
+                                 const typed_ptr: [*]const f32 = @ptrCast(@alignCast(raw_ptr));
+                                 data[i] = typed_ptr[pair.right - r_ctx2.?.start_idx];
+                             }
+                        } else {
+                            data[i] = col.data.float32[pair.right];
+                        }
                     }
                     _ = lw.fragmentAddFloat32Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
                 },
@@ -2430,27 +2593,30 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                     offsets[0] = 0;
                     
                     // Calc lengths
-                    for (join_pairs[0..pair_count], 0..) |pair, i| {
-                         if (!col.is_lazy) {
-                             const len = col.data.strings.lengths[pair.right];
-                             total_len += len;
-                             current_offset += len;
-                             offsets[i+1] = current_offset;
-                         } else {
-                             offsets[i+1] = current_offset;
-                         }
+                    if (!is_lazy) {
+                        const lens = col.data.strings.lengths;
+                        for (join_pairs[0..pair_count], 0..) |pair, i| {
+                            const len = lens[pair.right];
+                            total_len += len;
+                            current_offset += len;
+                            offsets[i+1] = current_offset;
+                        }
+                    } else {
+                        for (0..pair_count) |i| offsets[i+1] = 0;
                     }
                     
                     const str_data = try memory.wasm_allocator.alloc(u8, total_len);
                     defer memory.wasm_allocator.free(str_data);
                     
                     current_offset = 0;
-                    for (join_pairs[0..pair_count]) |pair| {
-                        if (!col.is_lazy) {
-                             const off = col.data.strings.offsets[pair.right];
-                             const len = col.data.strings.lengths[pair.right];
-                             const src = col.data.strings.data[off..][0..len];
-                             @memcpy(str_data[current_offset..][0..len], src);
+                    if (!is_lazy) {
+                        const s_data = col.data.strings.data;
+                        const s_offs = col.data.strings.offsets;
+                        const s_lens = col.data.strings.lengths;
+                        for (join_pairs[0..pair_count]) |pair| {
+                             const off = s_offs[pair.right];
+                             const len = s_lens[pair.right];
+                             @memcpy(str_data[current_offset..][0..len], s_data[off..][0..len]);
                              current_offset += len;
                         }
                     }
@@ -2585,15 +2751,198 @@ fn executeAggregateQuery(table: *const TableInfo, query: *const ParsedQuery) !vo
     }
 }
 
+fn findTableColumn(table: *const TableInfo, name: []const u8) ?*const ColumnData {
+    for (table.columns[0..table.column_count]) |maybe_c| {
+        if (maybe_c) |*c| {
+            if (std.mem.eql(u8, c.name, name)) return c;
+        }
+    }
+    return null;
+}
+
+fn executeMultiAggregate(table: *const TableInfo, aggs: []const AggExpr, indices: []const u32, results: []f64) !void {
+    var states: [MAX_AGGREGATES]aggregates.AggState = undefined;
+    for (0..aggs.len) |i| states[i] = .{};
+
+    // 1. Identify unique columns and map aggs to them
+    var unique_cols: [MAX_AGGREGATES]*const ColumnData = undefined;
+    var num_unique_cols: usize = 0;
+    var agg_to_unique: [MAX_AGGREGATES]?usize = undefined;
+    
+    for (aggs, 0..) |agg, i| {
+        agg_to_unique[i] = null;
+        if (std.mem.eql(u8, agg.column, "*") or agg.column.len == 0) continue;
+        
+        if (findTableColumn(table, agg.column)) |c| {
+            var found = false;
+            for (unique_cols[0..num_unique_cols], 0..) |uc, ui| {
+                if (std.mem.eql(u8, uc.name, c.name)) {
+                    agg_to_unique[i] = ui;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                unique_cols[num_unique_cols] = c;
+                agg_to_unique[i] = num_unique_cols;
+                num_unique_cols += 1;
+            }
+        }
+    }
+
+    // Contiguous check (optimized for pure file scans)
+    var is_contiguous = true;
+    if (indices.len > 0) {
+        if (indices[0] != 0 or indices[indices.len - 1] != @as(u32, @intCast(indices.len - 1))) {
+            is_contiguous = false;
+        }
+        if (indices.len != table.row_count) is_contiguous = false;
+        // In-memory data makes it non-contiguous for simplicity here
+        if (table.memory_row_count > 0) is_contiguous = false;
+    } else {
+        is_contiguous = false;
+    }
+
+    if (is_contiguous) {
+        for (aggs, 0..) |agg, i| {
+            if (findTableColumn(table, agg.column)) |c| {
+                results[i] = computeLazyAggregate(table, c, agg, 0, indices.len);
+            } else if (agg.func == .count) {
+                results[i] = @floatFromInt(indices.len);
+            } else {
+                results[i] = 0;
+            }
+        }
+        return;
+    }
+
+    // General path with chunking and fragments
+    const CHUNK_SIZE = 1024;
+    var gather_buf: [CHUNK_SIZE]f64 = undefined;
+    
+    var idx_ptr: usize = 0;
+    var frag_start: u32 = 0;
+    
+    for (table.fragments[0..table.fragment_count]) |maybe_f| {
+        if (maybe_f) |frag| {
+            const f_rows = @as(u32, @intCast(frag.getRowCount()));
+            const frag_end = frag_start + f_rows;
+            
+            const start_match_idx = idx_ptr;
+            while (idx_ptr < indices.len and indices[idx_ptr] < frag_end) : (idx_ptr += 1) {}
+            const end_match_idx = idx_ptr;
+            
+            if (end_match_idx > start_match_idx) {
+                const frag_indices = indices[start_match_idx..end_match_idx];
+                
+                for (unique_cols[0..num_unique_cols], 0..) |c, uc_idx| {
+                    const raw_ptr = frag.getColumnRawPtr(c.fragment_col_idx) orelse continue;
+                    
+                    var f_idx: usize = 0;
+                    while (f_idx < frag_indices.len) {
+                        const n = @min(CHUNK_SIZE, frag_indices.len - f_idx);
+                        const chunk = frag_indices[f_idx..f_idx + n];
+                        
+                        // Gather values for this unique column once
+                        const c_type = c.col_type;
+                        switch (c_type) {
+                            .float64 => {
+                                const typed_ptr: [*]const f64 = @ptrCast(@alignCast(raw_ptr));
+                                for (chunk, 0..) |row_idx, k| {
+                                    gather_buf[k] = typed_ptr[row_idx - frag_start];
+                                }
+                            },
+                            .int32 => {
+                                const typed_ptr: [*]const i32 = @ptrCast(@alignCast(raw_ptr));
+                                for (chunk, 0..) |row_idx, k| {
+                                    gather_buf[k] = @floatFromInt(typed_ptr[row_idx - frag_start]);
+                                }
+                            },
+                            .int64 => {
+                                const typed_ptr: [*]const i64 = @ptrCast(@alignCast(raw_ptr));
+                                for (chunk, 0..) |row_idx, k| {
+                                    gather_buf[k] = @floatFromInt(typed_ptr[row_idx - frag_start]);
+                                }
+                            },
+                            .float32 => {
+                                const typed_ptr: [*]const f32 = @ptrCast(@alignCast(raw_ptr));
+                                for (chunk, 0..) |row_idx, k| {
+                                    gather_buf[k] = @floatCast(typed_ptr[row_idx - frag_start]);
+                                }
+                            },
+                            else => {
+                                for (chunk, 0..) |row_idx, k| {
+                                    gather_buf[k] = getFloatValueFromPtr(raw_ptr, c_type, row_idx - frag_start);
+                                }
+                            },
+                        }
+                        
+                        // Update all aggs associated with this column
+                        for (aggs, 0..) |agg, agg_idx| {
+                             if (agg_to_unique[agg_idx] == uc_idx) {
+                                  const afunc = @as(aggregates.AggFunc, @enumFromInt(@intFromEnum(agg.func)));
+                                  var k: usize = 0;
+                                  while (k + 4 <= n) : (k += 4) {
+                                      states[agg_idx].updateVec4(.{gather_buf[k], gather_buf[k+1], gather_buf[k+2], gather_buf[k+3]}, afunc);
+                                  }
+                                  while (k < n) : (k += 1) {
+                                      states[agg_idx].update(gather_buf[k], afunc);
+                                  }
+                             }
+                        }
+                        f_idx += n;
+                    }
+                }
+                
+                // Handle COUNT(*) or virtual columns
+                for (aggs, 0..) |agg, agg_idx| {
+                    if (agg_to_unique[agg_idx] == null and agg.func == .count) {
+                        states[agg_idx].count += frag_indices.len;
+                    }
+                }
+            }
+            frag_start += f_rows;
+        }
+    }
+    
+    // In-memory delta
+    if (table.row_count > frag_start and idx_ptr < indices.len) {
+         const mem_indices = indices[idx_ptr..];
+         for (aggs, 0..) |agg, agg_idx| {
+             const afunc = @as(aggregates.AggFunc, @enumFromInt(@intFromEnum(agg.func)));
+             if (findTableColumn(table, agg.column)) |c| {
+                 if (c.schema_col_idx < MAX_COLUMNS) {
+                     if (table.memory_columns[c.schema_col_idx]) |*mc| {
+                         for (mem_indices) |idx| {
+                             const mem_idx = idx - @as(u32, @intCast(table.file_row_count));
+                             const val = switch (mc.col_type) {
+                                 .int64 => @as(f64, @floatFromInt(mc.data.int64[mem_idx])),
+                                 .int32 => @as(f64, @floatFromInt(mc.data.int32[mem_idx])),
+                                 .float64 => mc.data.float64[mem_idx],
+                                 .float32 => mc.data.float32[mem_idx],
+                                 .string => 0,
+                             };
+                             states[agg_idx].update(val, afunc);
+                         }
+                     }
+                 }
+             } else if (agg.func == .count) {
+                 states[agg_idx].count += mem_indices.len;
+             }
+         }
+    }
+
+    for (0..aggs.len) |i| {
+        results[i] = states[i].getResult(@as(aggregates.AggFunc, @enumFromInt(@intFromEnum(aggs[i].func))));
+    }
+}
+
 fn executeSimpleAggQuery(table: *const TableInfo, query: *const ParsedQuery, indices: []const u32) !void {
-    log("In executeSimpleAggQuery");
-    // Single row result with aggregate values
+    log("In executeSimpleAggQuery (optimized)");
     const num_aggs = query.agg_count;
     var agg_results: [MAX_AGGREGATES]f64 = undefined;
 
-    for (query.aggregates[0..num_aggs], 0..) |agg, i| {
-        agg_results[i] = computeAggregate(table, agg, indices);
-    }
+    try executeMultiAggregate(table, query.aggregates[0..num_aggs], indices, agg_results[0..num_aggs]);
 
     // Allocate result buffer
     // Check if names should be included
