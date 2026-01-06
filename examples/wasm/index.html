@@ -2034,16 +2034,17 @@
                 <div class="sql-editor">
                     <div class="sql-editor-container">
                         <textarea class="sql-textarea" id="sql-input"
-                            placeholder="SELECT * FROM read_lance('https://...') LIMIT 50">-- 🚀 Push-Down Filtering: Query 1M images, download only ~200KB (not 1.5GB!)
-SELECT url, text, aesthetic FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') 
-WHERE aesthetic > 0.7
-NEAR 'sunset on the beach' 
+                            placeholder="SELECT * FROM read_lance('https://...') LIMIT 50">-- 🚀 Push-Down Filtering + JOIN (downloads ~200KB, not 1.5GB!)
+SELECT i.url, i.text, t.text_zh, t.text_es
+FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') i
+JOIN read_lance('https://data.metal0.dev/laion-1m/translations.lance') t ON i.rowid = t.row_id
+WHERE i.embedding NEAR 'sunset'
 LIMIT 20</textarea>
                         <div class="sql-highlight" id="sql-highlight" aria-hidden="true"></div>
                     </div>
                     <div class="sql-examples">
                         <button class="sql-example"
-                            data-sql="SELECT url, text, aesthetic FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') NEAR 'cat playing' LIMIT 20"
+                            data-sql="SELECT url, text, aesthetic FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') WHERE embedding NEAR 'cat playing' LIMIT 20"
                             style="background: #7c3aed;">🔮 NEAR 'cat'</button>
                         <button class="sql-example"
                             data-sql="SELECT i.text, i.aesthetic, t.text_zh, t.text_es FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') i JOIN translations t ON i.rowid = t.row_id LIMIT 20"
@@ -2789,10 +2790,11 @@ LIMIT 20</textarea>
 
         // Default demo dataset URL - LAION 1M images dataset
         const DEFAULT_DATASET_URL = 'https://data.metal0.dev/laion-1m/images.lance';
-        const DEFAULT_QUERY = `-- 🚀 Push-Down Filtering: Query 1M images, download only ~200KB (not 1.5GB!)
-SELECT url, text, aesthetic FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') 
-WHERE aesthetic > 0.7
-NEAR 'sunset on the beach' 
+        const DEFAULT_QUERY = `-- 🚀 Push-Down Filtering + JOIN (downloads ~200KB, not 1.5GB!)
+SELECT i.url, i.text, t.text_zh, t.text_es
+FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') i
+JOIN read_lance('https://data.metal0.dev/laion-1m/translations.lance') t ON i.rowid = t.row_id
+WHERE i.embedding NEAR 'sunset'
 LIMIT 20`;
 
         // Initialize
