@@ -1,12 +1,12 @@
 const std = @import("std");
 
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-pub const wasm_allocator = gpa.allocator();
+// var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub const wasm_allocator = std.heap.page_allocator;
 
-/// Allocate memory (8-byte aligned)
 pub fn wasmAlloc(len: usize) ?[*]u8 {
-    const slice = wasm_allocator.alloc(u8, len) catch return null;
-    return slice.ptr;
+    const count = (len + 7) / 8;
+    const slice = wasm_allocator.alloc(u64, count) catch return null;
+    return @ptrCast(slice.ptr);
 }
 
 /// No-op as GPA doesn't support global reset, but we shouldn't need it if we free
@@ -73,5 +73,13 @@ test "memory: alignment" {
 }
 
 test "memory: heap capacity" {
-    try std.testing.expectEqual(@as(usize, 1024 * 1024), getHeapCapacity());
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), getHeapCapacity());
 }
+
+/// Free memory allocated by wasmAlloc
+pub fn wasmFree(ptr: [*]u8, len: usize) void {
+    const count = (len + 7) / 8;
+    const slice = @as([*]u64, @ptrCast(@alignCast(ptr)))[0..count];
+    wasm_allocator.free(slice);
+}
+

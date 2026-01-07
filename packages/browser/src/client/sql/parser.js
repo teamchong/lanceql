@@ -102,8 +102,8 @@ class SQLParser {
         // JOIN clauses (one or more)
         const joins = [];
         while (this.check(TokenType.JOIN) || this.check(TokenType.INNER) ||
-               this.check(TokenType.LEFT) || this.check(TokenType.RIGHT) ||
-               this.check(TokenType.FULL) || this.check(TokenType.CROSS)) {
+            this.check(TokenType.LEFT) || this.check(TokenType.RIGHT) ||
+            this.check(TokenType.FULL) || this.check(TokenType.CROSS)) {
             joins.push(this.parseJoinClause());
         }
 
@@ -127,9 +127,12 @@ class SQLParser {
 
         // GROUP BY (supports ROLLUP, CUBE, GROUPING SETS)
         let groupBy = [];
+        let groupByTopK = null;
         if (this.match(TokenType.GROUP)) {
             this.expect(TokenType.BY);
-            groupBy = Advanced.parseGroupByList(this);
+            const result = Advanced.parseGroupByList(this);
+            groupBy = result.items;
+            groupByTopK = result.topK;
         }
 
         // HAVING
@@ -161,6 +164,7 @@ class SQLParser {
             unpivot,
             where,
             groupBy,
+            groupByTopK,
             having,
             qualify,
             search,
@@ -184,7 +188,7 @@ class SQLParser {
                 this.expect(TokenType.BY);
                 orderBy = this.parseOrderByList();
             }
-            if (this.match(TokenType.LIMIT)) {
+            if (this.match(TokenType.LIMIT) || this.match(TokenType.TOPK)) {
                 limit = parseInt(this.expect(TokenType.NUMBER).value, 10);
             }
             if (orderBy.length === 0 && this.match(TokenType.ORDER)) {
@@ -209,6 +213,7 @@ class SQLParser {
                 orderBy,
                 limit,
                 offset,
+                groupByTopK: baseAst.groupByTopK
             };
         }
 
@@ -222,7 +227,7 @@ class SQLParser {
                 this.expect(TokenType.BY);
                 orderBy = this.parseOrderByList();
             }
-            if (this.match(TokenType.LIMIT)) {
+            if (this.match(TokenType.LIMIT) || this.match(TokenType.TOPK)) {
                 limit = parseInt(this.expect(TokenType.NUMBER).value, 10);
             }
             if (orderBy.length === 0 && this.match(TokenType.ORDER)) {
@@ -426,7 +431,7 @@ class SQLParser {
         let alias = null;
         if (this.match(TokenType.AS)) {
             alias = this.expect(TokenType.IDENTIFIER).value;
-        } else if (this.check(TokenType.IDENTIFIER) && !this.check(TokenType.FROM, TokenType.WHERE, TokenType.ORDER, TokenType.LIMIT, TokenType.GROUP, TokenType.JOIN, TokenType.INNER, TokenType.LEFT, TokenType.RIGHT, TokenType.COMMA)) {
+        } else if (this.check(TokenType.IDENTIFIER) && !this.check(TokenType.FROM, TokenType.WHERE, TokenType.ORDER, TokenType.LIMIT, TokenType.TOPK, TokenType.GROUP, TokenType.JOIN, TokenType.INNER, TokenType.LEFT, TokenType.RIGHT, TokenType.COMMA)) {
             alias = this.advance().value;
         }
 
@@ -477,7 +482,7 @@ class SQLParser {
         if (from) {
             if (this.match(TokenType.AS)) {
                 from.alias = this.expect(TokenType.IDENTIFIER).value;
-            } else if (this.check(TokenType.IDENTIFIER) && !this.check(TokenType.WHERE, TokenType.ORDER, TokenType.LIMIT, TokenType.GROUP, TokenType.NEAR, TokenType.JOIN, TokenType.INNER, TokenType.LEFT, TokenType.RIGHT, TokenType.COMMA)) {
+            } else if (this.check(TokenType.IDENTIFIER) && !this.check(TokenType.WHERE, TokenType.ORDER, TokenType.LIMIT, TokenType.TOPK, TokenType.GROUP, TokenType.NEAR, TokenType.JOIN, TokenType.INNER, TokenType.LEFT, TokenType.RIGHT, TokenType.COMMA)) {
                 from.alias = this.advance().value;
             }
         }

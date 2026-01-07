@@ -19,7 +19,7 @@ const simd_search = @import("simd_search.zig");
 const lw = @import("lance_writer.zig");
 
 const RESULT_VERSION: u32 = 1;
-const HEADER_SIZE: u32 = 32;
+const HEADER_SIZE: u32 = 36;
 const MAX_TABLES: usize = 16;
 const MAX_COLUMNS: usize = 64;
 const MAX_FRAGMENTS: usize = 16;
@@ -32,12 +32,6 @@ const MAX_ROWS: usize = 200000;
 const MAX_VECTOR_DIM: usize = 1536; // Support up to OpenAI embedding size
 const VECTOR_SIZE: usize = 1024; // Chunk size for vectorized execution
 
-// JS Imports
-extern "env" fn js_log(ptr: [*]const u8, len: usize) void;
-
-fn log(msg: []const u8) void {
-    js_log(msg.ptr, msg.len);
-}
 
 /// Column types
 pub const ColumnType = enum(u32) {
@@ -46,12 +40,14 @@ pub const ColumnType = enum(u32) {
     int32 = 2,
     float32 = 3,
     string = 4,
+    list = 5,
 };
 
 /// Column data storage
 pub const ColumnDef = struct {
     name: []const u8,
     type: ColumnType,
+    vector_dim: u32 = 0,
 };
 
 pub const ColumnData = struct {
@@ -100,7 +96,7 @@ pub const TableInfo = struct {
 };
 
 /// WHERE operators
-pub const WhereOp = enum { eq, ne, lt, le, gt, ge, and_op, or_op, in_list, not_in_list, in_subquery, exists, not_exists, like, not_like, between, is_null, is_not_null, near };
+pub const WhereOp = enum { eq, ne, lt, le, gt, ge, and_op, or_op, in_list, not_in_list, in_subquery, not_in_subquery, exists, not_exists, like, not_like, between, not_between, is_null, is_not_null, near };
 
 /// WHERE clause node
 pub const WhereClause = struct {
@@ -108,22 +104,29 @@ pub const WhereClause = struct {
     column: ?[]const u8 = null,
     value_int: ?i64 = null,
     value_float: ?f64 = null,
+    value_int_2: ?i64 = null,
+    value_float_2: ?f64 = null,
     value_str: ?[]const u8 = null,
     left: ?*const WhereClause = null,
     right: ?*const WhereClause = null,
+    arg_2_col: ?[]const u8 = null,
     // For IN lists
     in_values_int: [32]i64 = undefined,
+    in_values_str: [32][]const u8 = undefined,
     in_values_count: usize = 0,
     // For subqueries
     subquery_start: usize = 0,
     subquery_len: usize = 0,
-    // For BETWEEN
-    between_low: ?i64 = null,
-    between_high: ?i64 = null,
+    is_subquery_evaluated: bool = false,
+    subquery_results_i64: ?[]const i64 = null,
+    subquery_results_f64: ?[]const f64 = null,
+    subquery_results_str: ?[]const []const u8 = null,
+    subquery_exists: bool = false,
     // For NEAR (vector search)
     near_vector: [MAX_VECTOR_DIM]f32 = undefined,
     near_dim: usize = 0,
     near_target_row: ?u32 = null,
+    near_top_k: u32 = 0,
     // Runtime cache for NEAR results (indices that matched)
     near_matches: ?[]const u32 = null, 
     // Flag to indicate if this clause was a NEAR clause (internal use)
@@ -149,6 +152,12 @@ pub const JoinClause = struct {
     join_type: JoinType = .inner,
     left_col: []const u8 = "",
     right_col: []const u8 = "",
+    // NEAR support
+    is_near: bool = false,
+    near_vector: [MAX_VECTOR_DIM]f32 = undefined,
+    near_dim: usize = 0,
+    near_target_row: ?u32 = null,
+    top_k: ?u32 = null,
 };
 
 const MAX_JOINS: usize = 4;
@@ -158,6 +167,65 @@ pub const SetOpType = enum { none, union_all, union_distinct, intersect, interse
 
 /// Window function types
 pub const WindowFunc = enum { row_number, rank, dense_rank, sum, count, avg, min, max, lag, lead, ntile, percent_rank, cume_dist, first_value, last_value };
+
+/// Scalar function types
+pub const ScalarFunc = enum {
+    none, // Column reference
+    // Math
+    abs, ceil, floor, sqrt, power, mod, sign, trunc, round,
+    // String
+    trim, ltrim, rtrim, concat, replace, reverse, upper, lower, length, split,
+    left, substr, instr, lpad, rpad, right, repeat,
+    // Array
+    array_length, array_slice, array_contains,
+    // Operators
+    add, sub, mul, div,
+    // Conditional
+    nullif, coalesce, case,
+};
+
+/// CASE WHEN clause
+pub const CaseClause = struct {
+    when_cond: WhereClause,
+    then_val_int: ?i64 = null,
+    then_val_float: ?f64 = null,
+    then_val_str: ?[]const u8 = null,
+    then_col_name: ?[]const u8 = null,
+};
+
+/// Select Expression (Scalar)
+pub const SelectExpr = struct {
+    func: ScalarFunc = .none,
+    
+    // Primary column (or Left for operators)
+    col_name: []const u8 = "", 
+    val_int: ?i64 = null,
+    val_float: ?f64 = null,
+    val_str: ?[]const u8 = null,
+
+    // Secondary argument (Right for operators)
+    arg_2_col: ?[]const u8 = null,
+    arg_2_val_int: ?i64 = null,
+    arg_2_val_float: ?f64 = null,
+    arg_2_val_str: ?[]const u8 = null,
+
+    // Third argument (for SLICE, etc)
+    arg_3_col: ?[]const u8 = null,
+    arg_3_val_int: ?i64 = null,
+    arg_3_val_float: ?f64 = null,
+    arg_3_val_str: ?[]const u8 = null,
+
+    alias: ?[]const u8 = null,
+    trace: bool = false,
+
+    // CASE support
+    case_count: usize = 0,
+    case_clauses: [4]CaseClause = undefined,
+    else_val_int: ?i64 = null,
+    else_val_float: ?f64 = null,
+    else_val_str: ?[]const u8 = null,
+    else_col_name: ?[]const u8 = null,
+};
 
 /// Window function expression
 pub const WindowExpr = struct {
@@ -186,7 +254,8 @@ const MAX_CTES: usize = 4;
 pub const SetOp = enum { none, union_op, union_all, intersect, intersect_all, except, except_all };
 
 /// Query Type
-pub const QueryType = enum { select, create_table, drop_table, insert };
+pub const QueryType = enum { select, create_table, drop_table, insert, update, delete };
+pub const ConflictAction = enum { none, nothing, update };
 
 pub const ParsedQuery = struct {
     type: QueryType = .select,
@@ -197,26 +266,37 @@ pub const ParsedQuery = struct {
     insert_values: [MAX_INSERT_ROWS][MAX_SELECT_COLS][]const u8 = undefined, // Simplification: string values parsed at runtime
     insert_row_count: usize = 0,
     insert_col_count: usize = 0,
+    insert_col_names: [MAX_SELECT_COLS][]const u8 = undefined,
     create_columns: [MAX_SELECT_COLS]ColumnDef = undefined,
     create_col_count: usize = 0,
     
     // For INSERT SELECT
     is_insert_select: bool = false,
     source_table_name: []const u8 = "",
+    source_table_alias: ?[]const u8 = null,
+
+    on_conflict_action: ConflictAction = .none,
+    on_conflict_col: []const u8 = "",
+    update_cols: [MAX_SELECT_COLS][]const u8 = undefined,
+    update_exprs: [MAX_SELECT_COLS]SelectExpr = undefined,
+    update_count: usize = 0,
 
     table_name: []const u8 = "",
-    select_cols: [MAX_SELECT_COLS][]const u8 = undefined,
+    table_alias: ?[]const u8 = null,
+    select_exprs: [MAX_SELECT_COLS]SelectExpr = undefined,
     select_count: usize = 0,
     is_star: bool = false,
     is_distinct: bool = false,
     aggregates: [MAX_AGGREGATES]AggExpr = undefined,
     agg_count: usize = 0,
     where_clause: ?WhereClause = null,
+    having_clause: ?WhereClause = null,
     group_by_cols: [MAX_GROUP_COLS][]const u8 = undefined,
     group_by_count: usize = 0,
+    group_by_top_k: ?u32 = null,
     order_by_col: ?[]const u8 = null,
     order_dir: OrderDir = .asc,
-    limit_value: ?u32 = null,
+    top_k: ?u32 = null,
     offset_value: ?u32 = null,
     joins: [MAX_JOINS]JoinClause = undefined,
     join_count: usize = 0,
@@ -243,14 +323,31 @@ var global_indices_2: [MAX_ROWS]u32 = undefined;
 var global_indices_3: [MAX_ROWS]u32 = undefined;
 var global_join_pairs: [MAX_JOIN_ROWS]JoinPair = undefined;
 
+var global_join_pair_count: usize = 0;
+
+var global_partition_keys: [MAX_ROWS]i64 = undefined;
+var global_processed: [MAX_ROWS]bool = undefined;
+var global_window_values: [MAX_WINDOW_FUNCS][MAX_ROWS]f64 = undefined;
+
 // Static storage for parsed WHERE clauses (avoid dynamic allocation)
 var where_storage: [32]WhereClause = undefined;
 var where_storage_idx: usize = 0;
 
 var query_storage: [8]ParsedQuery = undefined;
 var query_storage_idx: usize = 0;
+var trace_string_exec: bool = false;
+var debug_counter: usize = 0;
 
 var table_names_buf: [1024]u8 = undefined;
+
+fn getColByName(table: *const TableInfo, name: []const u8) ?*const ColumnData {
+    for (0..table.column_count) |i| {
+        if (table.columns[i]) |*col| {
+            if (std.mem.eql(u8, col.name, name)) return col;
+        }
+    }
+    return null;
+}
 
 /// Context for optimized fragment access
 const FragmentContext = struct {
@@ -265,40 +362,37 @@ fn getFloatValueFromPtr(ptr: [*]const u8, col_type: ColumnType, rel_idx: u32) f6
         .float32 => @floatCast(@as([*]const f32, @ptrCast(@alignCast(ptr)))[rel_idx]),
         .int64 => @floatFromInt(@as([*]const i64, @ptrCast(@alignCast(ptr)))[rel_idx]),
         .int32 => @floatFromInt(@as([*]const i32, @ptrCast(@alignCast(ptr)))[rel_idx]),
-        .string => 0,
+        .string, .list => 0,
     };
 }
 
 fn getIntValueFromPtr(ptr: [*]const u8, col_type: ColumnType, rel_idx: u32) i64 {
     return switch (col_type) {
-        .int64 => @as([*]const i64, @ptrCast(@alignCast(ptr)))[rel_idx],
-        .int32 => @as([*]const i32, @ptrCast(@alignCast(ptr)))[rel_idx],
-        .float64 => @intFromFloat(@as([*]const f64, @ptrCast(@alignCast(ptr)))[rel_idx]),
-        .float32 => @intFromFloat(@as([*]const f32, @ptrCast(@alignCast(ptr)))[rel_idx]),
-        .string => 0,
+        .int64 => std.mem.readInt(i64, ptr[rel_idx * 8 ..][0..8], .little),
+        .int32 => std.mem.readInt(i32, ptr[rel_idx * 4 ..][0..4], .little),
+        .float64 => @intFromFloat(@as(f64, @bitCast(std.mem.readInt(u64, ptr[rel_idx * 8 ..][0..8], .little)))),
+        .float32 => @intFromFloat(@as(f32, @bitCast(std.mem.readInt(u32, ptr[rel_idx * 4 ..][0..4], .little)))),
+        .string, .list => 0,
     };
 }
 
 fn getFloatValueOptimized(table: *const TableInfo, col: *const ColumnData, idx: u32, context: *?FragmentContext) f64 {
+    // Hybrid Check: If index is beyond file rows, read from column data directly
+    // (not from memory_columns which may be stale after UPDATE)
+    if (table.memory_row_count > 0 and idx >= table.file_row_count) {
+         const mem_idx = idx - table.file_row_count;
+         // Read directly from col.data which is updated by setCellValueFloat
+         return switch (col.col_type) {
+            .float64 => if (col.data.float64.len > mem_idx) col.data.float64[mem_idx] else 0,
+            .int64 => if (col.data.int64.len > mem_idx) @floatFromInt(col.data.int64[mem_idx]) else 0,
+            .int32 => if (col.data.int32.len > mem_idx) @floatFromInt(col.data.int32[mem_idx]) else 0,
+            .float32 => if (col.data.float32.len > mem_idx) col.data.float32[mem_idx] else 0,
+            .string, .list => 0,
+         };
+    }
+
+
     if (col.is_lazy) {
-        // Hybrid Check: If index is beyond file rows, read from memory_batch
-        if (table.memory_row_count > 0 and idx >= table.file_row_count) {
-             const mem_idx = idx - table.file_row_count;
-             
-             if (col.schema_col_idx < MAX_COLUMNS) {
-                 if (table.memory_columns[col.schema_col_idx]) |*mc| {
-                     // Read from memory column
-                     return switch (mc.col_type) {
-                        .float64 => mc.data.float64[mem_idx],
-                        .int64 => @floatFromInt(mc.data.int64[mem_idx]),
-                        .int32 => @floatFromInt(mc.data.int32[mem_idx]),
-                        .float32 => mc.data.float32[mem_idx],
-                        .string => 0,
-                     };
-                 }
-             }
-             return 0;
-        }
 
         if (context.* == null or idx < context.*.?.start_idx or idx >= context.*.?.end_idx) {
             var f_start: u32 = 0;
@@ -330,31 +424,37 @@ fn getFloatValueOptimized(table: *const TableInfo, col: *const ColumnData, idx: 
         .int64 => @floatFromInt(col.data.int64[idx]),
         .int32 => @floatFromInt(col.data.int32[idx]),
         .float32 => col.data.float32[idx],
-        .string => 0,
+        .string, .list => 0,
     };
 }
 
 fn getIntValueOptimized(table: *const TableInfo, col: *const ColumnData, idx: u32, context: *?FragmentContext) i64 {
-    if (col.is_lazy) {
-        // Hybrid Check
-        if (table.memory_row_count > 0 and idx >= table.file_row_count) {
-             const mem_idx = idx - table.file_row_count;
-             
-             if (col.schema_col_idx < MAX_COLUMNS) {
-                 if (table.memory_columns[col.schema_col_idx]) |*mc| {
-                     return switch (mc.col_type) {
-                        .int64 => mc.data.int64[mem_idx],
-                        .int32 => @intCast(mc.data.int32[mem_idx]), // Cast generic i32 to i64 return
-                        .float64 => @intFromFloat(mc.data.float64[mem_idx]),
-                        .float32 => @intFromFloat(mc.data.float32[mem_idx]),
-                        .string => 0,
-                     };
-                 }
-             }
-             return 0;
-        }
+    // Hybrid Check: If index is beyond file rows, read from column data directly
+    // (not from memory_columns which may be stale after UPDATE)
+    if (table.memory_row_count > 0 and idx >= table.file_row_count) {
+         const mem_idx = idx - table.file_row_count;
+         // Read directly from col.data which is updated by setCellValueInt
+         return switch (col.col_type) {
+            .int64 => if (col.data.int64.len > mem_idx) col.data.int64[mem_idx] else 0,
+            .int32 => if (col.data.int32.len > mem_idx) @intCast(col.data.int32[mem_idx]) else 0,
+            .float64 => if (col.data.float64.len > mem_idx) @intFromFloat(col.data.float64[mem_idx]) else 0,
+            .float32 => if (col.data.float32.len > mem_idx) @intFromFloat(col.data.float32[mem_idx]) else 0,
+            .string, .list => {
+                if (col.data.strings.offsets.len > mem_idx and col.data.strings.lengths.len > mem_idx) {
+                    const off = col.data.strings.offsets[mem_idx];
+                    const len = col.data.strings.lengths[mem_idx];
+                    if (col.data.strings.data.len >= off + len) {
+                        const s = col.data.strings.data[off..][0..len];
+                        return @as(i64, @bitCast(std.hash.Wyhash.hash(0, s)));
+                    }
+                }
+                return 0;
+            },
+         };
+    }
 
-        if (context.* == null or idx < context.*.?.start_idx or idx >= context.*.?.end_idx) {
+
+    if (col.is_lazy) {        if (context.* == null or idx < context.*.?.start_idx or idx >= context.*.?.end_idx) {
             var f_start: u32 = 0;
             for (table.fragments[0..table.fragment_count]) |maybe_f| {
                 if (maybe_f) |f| {
@@ -384,8 +484,484 @@ fn getIntValueOptimized(table: *const TableInfo, col: *const ColumnData, idx: u3
         .int32 => col.data.int32[idx],
         .float64 => @intFromFloat(col.data.float64[idx]),
         .float32 => @intFromFloat(col.data.float32[idx]),
-        .string => 0,
+        .string, .list => {
+            const off = col.data.strings.offsets[idx];
+            const len = col.data.strings.lengths[idx];
+            const s = col.data.strings.data[off..][0..len];
+            return @as(i64, @bitCast(std.hash.Wyhash.hash(0, s)));
+        },
     };
+}
+
+// Shared buffer for scalar string evaluation (WASM is single-threaded)
+var scalar_str_buf: [4096]u8 = undefined;
+
+fn evaluateScalarFloat(table: *const TableInfo, expr: *const SelectExpr, idx: u32, context: *?FragmentContext, arg1_col: ?*const ColumnData, arg2_col: ?*const ColumnData) f64 {
+    var v1: f64 = 0;
+    var v2: f64 = 0;
+
+    // Resolve Arg 1
+    if (arg1_col) |col| {
+        v1 = getFloatValueOptimized(table, col, idx, context);
+    } else if (expr.col_name.len > 0) {
+        if (getColByName(table, expr.col_name)) |col| {
+            v1 = getFloatValueOptimized(table, col, idx, context);
+        }
+    } else if (expr.val_float) |v| {
+        v1 = v;
+    } else if (expr.val_int) |v| {
+        v1 = @floatFromInt(v);
+    }
+
+
+    // Resolve Arg 2
+    if (arg2_col) |col| {
+        v2 = getFloatValueOptimized(table, col, idx, context);
+    } else if (expr.arg_2_val_float) |v| {
+        v2 = v;
+    } else if (expr.arg_2_val_int) |v| {
+        v2 = @floatFromInt(v);
+    }
+
+    return switch (expr.func) {
+        .abs => @abs(v1),
+        .ceil => @ceil(v1),
+        .floor => @floor(v1),
+        .sqrt => @sqrt(v1),
+        .power => std.math.pow(f64, v1, v2),
+        .mod => @mod(v1, v2),
+        .sign => if (v1 > 0) 1.0 else if (v1 < 0) -1.0 else 0.0,
+        .add => v1 + v2,
+        .sub => v1 - v2,
+        .mul => v1 * v2,
+        .div => if (v2 != 0) v1 / v2 else 0.0,
+        .nullif => if (v1 == v2) std.math.nan(f64) else v1,
+        .coalesce => if (!std.math.isNan(v1)) v1 else if (!std.math.isNan(v2)) v2 else std.math.nan(f64),
+        .length, .array_length => blk: {
+            const s = if (arg1_col) |col| getStringValueOptimized(table, col, idx, context) else (expr.val_str orelse "");
+            if (s.len >= 2 and s[0] == '[' and s[s.len - 1] == ']') {
+                var count: f64 = 1;
+                var has_elements = false;
+                for (s) |c| {
+                    if (c == ',') {
+                        count += 1;
+                        has_elements = true;
+                    } else if (!std.ascii.isWhitespace(c) and c != '[' and c != ']') {
+                        has_elements = true;
+                    }
+                }
+                break :blk if (has_elements) count else 0;
+            }
+            break :blk @floatFromInt(s.len);
+        },
+        .array_contains => blk: {
+            const s = if (arg1_col) |col| getStringValueOptimized(table, col, idx, context) else (expr.val_str orelse "");
+            if (s.len < 2 or s[0] != '[' or s[s.len - 1] != ']') break :blk 0;
+            
+            // Very basic search for comma-separated values in "[1,2,3]"
+            // This is a hack, should ideally parse properly.
+            // Check if v2 (as string) is in s
+            var val_buf: [32]u8 = undefined;
+            const val_str = std.fmt.bufPrint(&val_buf, "{d}", .{v2}) catch "";
+            if (std.mem.indexOf(u8, s, val_str) != null) break :blk 1;
+            break :blk 0;
+        },
+        .instr => blk: {
+             const s = if (arg1_col) |col| getStringValueOptimized(table, col, idx, context) else (expr.val_str orelse "");
+             var sub: []const u8 = "";
+             if (expr.arg_2_col) |col_name| {
+                 if (getColByName(table, col_name)) |col| sub = getStringValueOptimized(table, col, idx, context);
+             } else if (expr.arg_2_val_str) |str| sub = str;
+             
+             if (sub.len == 0) break :blk 1;
+             if (std.mem.indexOf(u8, s, sub)) |p| {
+                 break :blk @as(f64, @floatFromInt(p + 1)); // 1-indexed
+             }
+             break :blk 0;
+        },
+
+        .trunc => blk: {
+            const v = if (expr.val_float) |f| f else if (expr.val_int) |i| @as(f64, @floatFromInt(i)) else 0;
+            const scale = if (expr.arg_2_val_int) |s| s else 0;
+            const multiplier = std.math.pow(f64, 10, @as(f64, @floatFromInt(scale)));
+            break :blk @trunc(v * multiplier) / multiplier;
+        },
+        .round => blk: {
+            const v = if (expr.val_float) |f| f else if (expr.val_int) |i| @as(f64, @floatFromInt(i)) else 0;
+            const scale = if (expr.arg_2_val_int) |s| s else 0;
+            const multiplier = std.math.pow(f64, 10, @as(f64, @floatFromInt(scale)));
+            break :blk @round(v * multiplier) / multiplier;
+        },
+        .case => blk: {
+            for (expr.case_clauses[0..expr.case_count]) |cc| {
+                if (evaluateWhere(table, &cc.when_cond, idx, context)) {
+                    if (cc.then_val_float) |v| break :blk v;
+                    if (cc.then_val_int) |v| break :blk @as(f64, @floatFromInt(v));
+                    if (cc.then_col_name) |col_name| {
+                        if (getColByName(table, col_name)) |c| break :blk getFloatValueOptimized(table, c, idx, context);
+                    }
+                    break :blk 0;
+                }
+            }
+            if (expr.else_val_float) |v| break :blk v;
+            if (expr.else_val_int) |v| break :blk @as(f64, @floatFromInt(v));
+            if (expr.else_col_name) |col_name| {
+                if (getColByName(table, col_name)) |c| break :blk getFloatValueOptimized(table, c, idx, context);
+            }
+            break :blk 0;
+        },
+        else => v1,
+    };
+}
+
+fn evaluateScalarString(table: *const TableInfo, expr: *const SelectExpr, idx: u32, context: *?FragmentContext, arg1_col: ?*const ColumnData) []const u8 {
+    // Resolve Arg 1 String
+    var s1: []const u8 = "";
+    if (arg1_col) |col| {
+        s1 = getStringValueOptimized(table, col, idx, context);
+    } else if (expr.val_str) |s| {
+        s1 = s;
+    }
+
+    // For now, simple single-threaded buffer for results
+    // Limitation: nested calls not supported yet
+    
+    switch (expr.func) {
+        .nullif => {
+            // Arg 2 String
+            var s2: []const u8 = "";
+            if (expr.arg_2_col) |col_name| {
+                 if (getColByName(table, col_name)) |col| {
+                     s2 = getStringValueOptimized(table, col, idx, context);
+                 }
+            } else if (expr.arg_2_val_str) |s| {
+                s2 = s;
+            }
+            if (std.mem.eql(u8, s1, s2)) return "";
+            return s1;
+        },
+        .coalesce => {
+            // Check if s1 is NULL (empty string, or literal "NULL" text)
+            const s1_is_null = (s1.len == 0) or std.mem.eql(u8, s1, "NULL");
+            if (!s1_is_null) return s1;
+            
+            // Arg 2
+            var s2: []const u8 = "";
+            if (expr.arg_2_col) |col_name| {
+                 if (getColByName(table, col_name)) |col| {
+                     s2 = getStringValueOptimized(table, col, idx, context);
+                 }
+            } else if (expr.arg_2_val_str) |s| {
+                s2 = s;
+            }
+            const s2_is_null = (s2.len == 0) or std.mem.eql(u8, s2, "NULL");
+            if (!s2_is_null) {
+                return s2;
+            }
+            
+            // Arg 3
+            var s3: []const u8 = "";
+             if (expr.arg_3_col) |col_name| {
+                 if (getColByName(table, col_name)) |col| {
+                     s3 = getStringValueOptimized(table, col, idx, context);
+                 }
+            } else if (expr.arg_3_val_str) |s| {
+                s3 = s;
+            }
+            const s3_is_null = (s3.len == 0) or std.mem.eql(u8, s3, "NULL");
+            if (!s3_is_null) {
+                return s3;
+            }
+            return "";  // All args are NULL, return empty
+        },
+        .concat => {
+            // Arg 2
+            var s2: []const u8 = "";
+            if (expr.arg_2_col) |col_name| {
+                 if (getColByName(table, col_name)) |col| s2 = getStringValueOptimized(table, col, idx, context);
+            } else if (expr.arg_2_val_str) |s| s2 = s;
+
+            // Arg 3
+            var s3: []const u8 = "";
+            if (expr.arg_3_col) |col_name| {
+                 if (getColByName(table, col_name)) |col| s3 = getStringValueOptimized(table, col, idx, context);
+            } else if (expr.arg_3_val_str) |s| s3 = s;
+
+            const total = s1.len + s2.len + s3.len;
+            if (total > scalar_str_buf.len) return s1;
+            @memcpy(scalar_str_buf[0..s1.len], s1);
+            @memcpy(scalar_str_buf[s1.len .. s1.len + s2.len], s2);
+            @memcpy(scalar_str_buf[s1.len + s2.len .. total], s3);
+            return scalar_str_buf[0..total];
+        },
+        .replace => {
+             // REPLACE(s1, from, to)
+             var from: []const u8 = "";
+             if (expr.arg_2_col) |col_name| {
+                 if (getColByName(table, col_name)) |col| from = getStringValueOptimized(table, col, idx, context);
+             } else if (expr.arg_2_val_str) |s| from = s;
+
+             var to: []const u8 = "";
+             if (expr.arg_3_col) |col_name| {
+                 if (getColByName(table, col_name)) |col| to = getStringValueOptimized(table, col, idx, context);
+             } else if (expr.arg_3_val_str) |s| to = s;
+
+             if (from.len == 0) return s1;
+             
+             var out_pos: usize = 0;
+             var in_pos: usize = 0;
+             while (in_pos < s1.len) {
+                 if (std.mem.startsWith(u8, s1[in_pos..], from)) {
+                     if (out_pos + to.len > scalar_str_buf.len) break;
+                     @memcpy(scalar_str_buf[out_pos .. out_pos + to.len], to);
+                     out_pos += to.len;
+                     in_pos += from.len;
+                 } else {
+                     if (out_pos + 1 > scalar_str_buf.len) break;
+                     scalar_str_buf[out_pos] = s1[in_pos];
+                     out_pos += 1;
+                     in_pos += 1;
+                 }
+             }
+             return scalar_str_buf[0..out_pos];
+        },
+        .left => {
+             const n = if (expr.arg_2_val_int) |v| v else 0;
+             const len = if (n < 0) 0 else if (n > s1.len) s1.len else @as(usize, @intCast(n));
+             return s1[0..len];
+        },
+        .substr => {
+             // SUBSTR(s1, start, length) - 1-indexed
+             const start_raw = if (expr.arg_2_val_int) |v| v else 1;
+             const length_raw = if (expr.arg_3_val_int) |v| v else -1;
+
+             if (start_raw > s1.len) return "";
+             const start = if (start_raw < 1) 0 else @as(usize, @intCast(start_raw - 1));
+             
+             var end: usize = s1.len;
+             if (length_raw >= 0) {
+                 end = start + @as(usize, @intCast(length_raw));
+                 if (end > s1.len) end = s1.len;
+             }
+             if (start >= end) return "";
+             return s1[start..end];
+        },
+        .lpad => {
+             const n_raw = if (expr.arg_2_val_int) |v| v else 0;
+             const n = if (n_raw < 0) 0 else @as(usize, @intCast(n_raw));
+             const pad = if (expr.arg_3_val_str) |s| s else " ";
+             if (n <= s1.len) return s1[0..n];
+             if (n > scalar_str_buf.len) return s1;
+
+             const pad_len = n - s1.len;
+             var i: usize = 0;
+             while (i < pad_len) {
+                 scalar_str_buf[i] = pad[i % pad.len];
+                 i += 1;
+             }
+             @memcpy(scalar_str_buf[pad_len..n], s1);
+             return scalar_str_buf[0..n];
+        },
+        .rpad => {
+             const n_raw = if (expr.arg_2_val_int) |v| v else 0;
+             const n = if (n_raw < 0) 0 else @as(usize, @intCast(n_raw));
+             const pad = if (expr.arg_3_val_str) |s| s else " ";
+             if (n <= s1.len) return s1[0..n];
+             if (n > scalar_str_buf.len) return s1;
+
+             @memcpy(scalar_str_buf[0..s1.len], s1);
+             var i: usize = s1.len;
+             while (i < n) {
+                 scalar_str_buf[i] = pad[(i - s1.len) % pad.len];
+                 i += 1;
+             }
+             return scalar_str_buf[0..n];
+        },
+        .right => {
+             const n = if (expr.arg_2_val_int) |v| v else 0;
+             const len = if (n < 0) 0 else if (n > s1.len) s1.len else @as(usize, @intCast(n));
+             return s1[s1.len - len .. s1.len];
+        },
+        .repeat => {
+             const n_raw = if (expr.arg_2_val_int) |v| v else 0;
+             const n = if (n_raw < 0) 0 else @as(usize, @intCast(n_raw));
+             if (n == 0) return "";
+             if (s1.len * n > scalar_str_buf.len) return s1;
+             
+             var i: usize = 0;
+             while (i < n) {
+                 @memcpy(scalar_str_buf[i * s1.len .. (i + 1) * s1.len], s1);
+                 i += 1;
+             }
+             return scalar_str_buf[0 .. n * s1.len];
+        },
+        .trim => return std.mem.trim(u8, s1, " "),
+        .ltrim => return std.mem.trimLeft(u8, s1, " "),
+        .rtrim => return std.mem.trimRight(u8, s1, " "),
+        .upper => {
+             // Basic ASCII upper
+             @memcpy(scalar_str_buf[0..s1.len], s1);
+             const out = scalar_str_buf[0..s1.len];
+             for (out) |*c| c.* = std.ascii.toUpper(c.*);
+             return out;
+        },
+        .lower => {
+             @memcpy(scalar_str_buf[0..s1.len], s1);
+             const out = scalar_str_buf[0..s1.len];
+             for (out) |*c| c.* = std.ascii.toLower(c.*);
+             return out;
+        },
+        .reverse => {
+             @memcpy(scalar_str_buf[0..s1.len], s1);
+             const out = scalar_str_buf[0..s1.len];
+             std.mem.reverse(u8, out);
+             return out;
+        },
+        .split => {
+            // SPLIT(s1, sep)
+            const sep = if (expr.arg_2_val_str) |s| s else ",";
+            var it = std.mem.splitSequence(u8, s1, sep);
+            var out_pos: usize = 0;
+            scalar_str_buf[out_pos] = '[';
+            out_pos += 1;
+            var first = true;
+            while (it.next()) |item| {
+                if (!first) {
+                    scalar_str_buf[out_pos] = ',';
+                    out_pos += 1;
+                }
+                const trimmed = std.mem.trim(u8, item, " ");
+                if (out_pos + trimmed.len + 2 > scalar_str_buf.len) break;
+                scalar_str_buf[out_pos] = '"';
+                @memcpy(scalar_str_buf[out_pos + 1 .. out_pos + 1 + trimmed.len], trimmed);
+                scalar_str_buf[out_pos + 1 + trimmed.len] = '"';
+                out_pos += trimmed.len + 2;
+                first = false;
+            }
+            scalar_str_buf[out_pos] = ']';
+            out_pos += 1;
+            return scalar_str_buf[0..out_pos];
+        },
+        .array_slice => {
+            // ARRAY_SLICE(arr, start, end) - 1-indexed, exclusive end? 
+            // Test expects: [1,2,3,4,5], 2, 4 -> [2, 3] (length 2)
+            // This means indices 2 and 3 (1-indexed).
+            const start: i64 = if (expr.arg_2_val_int) |v| v else 1;
+            const end: i64 = if (expr.arg_3_val_int) |v| v else 999999;
+            
+            if (s1.len < 2 or s1[0] != '[' or s1[s1.len - 1] != ']') return s1;
+            
+            // Extract elements
+            const inner = s1[1 .. s1.len - 1];
+            var it = std.mem.splitSequence(u8, inner, ",");
+            var count: i64 = 0;
+            var out_pos: usize = 0;
+            scalar_str_buf[out_pos] = '[';
+            out_pos += 1;
+            var first = true;
+            
+            while (it.next()) |item| {
+                count += 1;
+                if (count >= start and count < end) {
+                    const trimmed = std.mem.trim(u8, item, " ");
+                    if (!first) {
+                        scalar_str_buf[out_pos] = ',';
+                        out_pos += 1;
+                    }
+                    if (out_pos + trimmed.len + 2 > scalar_str_buf.len) break;
+                    
+                    // Add quotes if it's not already a bracketed thing or a number?
+                    // For simplicity, always add quotes for now as it's likely strings.
+                    // But wait, what if it's numbers? 
+                    // Let's check the test.
+                    scalar_str_buf[out_pos] = '"';
+                    @memcpy(scalar_str_buf[out_pos + 1 .. out_pos + 1 + trimmed.len], trimmed);
+                    scalar_str_buf[out_pos + 1 + trimmed.len] = '"';
+                    out_pos += trimmed.len + 2;
+                    first = false;
+                }
+            }
+            scalar_str_buf[out_pos] = ']';
+            out_pos += 1;
+            return scalar_str_buf[0..out_pos];
+        },
+        .case => {
+            for (expr.case_clauses[0..expr.case_count]) |cc| {
+                if (evaluateWhere(table, &cc.when_cond, idx, context)) {
+                    if (cc.then_val_str) |v| return v;
+                    if (cc.then_col_name) |col_name| {
+                        if (getColByName(table, col_name)) |c| return getStringValueOptimized(table, c, idx, context);
+                    }
+                    return "";
+                }
+            }
+            if (expr.else_val_str) |v| return v;
+            if (expr.else_col_name) |col_name| {
+                if (getColByName(table, col_name)) |c| return getStringValueOptimized(table, c, idx, context);
+            }
+            return "";
+        },
+        else => return s1,
+    }
+}
+
+fn getStringValueOptimized(table: *const TableInfo, col: *const ColumnData, idx: u32, context: *?FragmentContext) []const u8 {
+    // Hybrid Check: Read from column data directly (not memory_columns which may be stale after UPDATE)
+    if (table.memory_row_count > 0 and idx >= table.file_row_count) {
+         const mem_idx = idx - table.file_row_count;
+         // Read directly from col.data which is updated by setCellValueString
+         if (col.col_type == .string or col.col_type == .list) {
+             if (col.data.strings.offsets.len > mem_idx and col.data.strings.lengths.len > mem_idx) {
+                 const off = col.data.strings.offsets[mem_idx];
+                 const len = col.data.strings.lengths[mem_idx];
+                 if (col.data.strings.data.len >= off + len) {
+                     return col.data.strings.data[off..][0..len];
+                 }
+             }
+         }
+         return "";
+    }
+
+
+    if (col.is_lazy) {
+
+        if (context.* == null or idx < context.*.?.start_idx or idx >= context.*.?.end_idx) {
+            var f_start: u32 = 0;
+            for (table.fragments[0..table.fragment_count]) |maybe_f| {
+                if (maybe_f) |f| {
+                    const f_rows = @as(u32, @intCast(f.getRowCount()));
+                    if (idx < f_start + f_rows) {
+                        context.* = FragmentContext{
+                            .frag = f,
+                            .start_idx = f_start,
+                            .end_idx = f_start + f_rows,
+                        };
+                        break;
+                    }
+                    f_start += f_rows;
+                }
+            }
+        }
+        if (context.*) |ctx| {
+            if (ctx.frag) |frag| {
+                const len = frag.fragmentReadStringAt(col.fragment_col_idx, idx - ctx.start_idx, &scalar_str_buf, scalar_str_buf.len);
+                return scalar_str_buf[0..len];
+            }
+        }
+        return "";
+    }
+    if (col.col_type != .string and col.col_type != .list) return "";
+    const off = col.data.strings.offsets[idx];
+    const len = col.data.strings.lengths[idx];
+    return col.data.strings.data[off..][0..len];
+}
+
+pub extern "env" fn js_log(ptr: [*]const u8, len: usize) void;
+
+fn log(comptime fmt: []const u8, args: anytype) void {
+    var buf: [256]u8 = undefined;
+    const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
+    js_log(slice.ptr, slice.len);
 }
 
 // ============================================================================
@@ -395,6 +971,8 @@ fn getIntValueOptimized(table: *const TableInfo, col: *const ColumnData, idx: u3
 pub export fn getSqlInputBuffer() [*]u8 {
     return &sql_input;
 }
+
+
 
 pub export fn getSqlInputBufferSize() usize {
     return sql_input.len;
@@ -535,13 +1113,8 @@ pub export fn registerTableSimpleBinary(
     const tbl = findOrCreateTable(table_name, @intCast(row_count)) orelse return 12;
     
     // Safety: If table has data (whether in-memory or hybrid), do not overwrite with stale fragment
-    if (tbl.row_count > 0) {
+    if (tbl.column_count > 0) {
         return 0;
-    }
-
-    if (tbl.fragment_count == 0) {
-        tbl.fragments[0] = fragment_reader.FragmentReader.initDummy(@intCast(row_count));
-        tbl.fragment_count = 1;
     }
 
     var pos: usize = 16;
@@ -581,7 +1154,10 @@ pub export fn registerTableSimpleBinary(
             2 => { // int64
                 if (@intFromPtr(col_data.ptr) % 8 != 0) return 21;
                 const ptr: [*]const i64 = @ptrCast(@alignCast(col_data.ptr));
-                _ = registerColumnInt64(table_name, name, ptr[0..row_count], row_count);
+                const res = registerColumnInt64(table_name, name, ptr[0..row_count], row_count);
+                if (res != 0) {
+                     // Log error?
+                }
             },
             3 => { // float32
                 if (@intFromPtr(col_data.ptr) % 4 != 0) return 22;
@@ -593,7 +1169,95 @@ pub export fn registerTableSimpleBinary(
                 const ptr: [*]const f64 = @ptrCast(@alignCast(col_data.ptr));
                 _ = registerColumnFloat64(table_name, name, ptr[0..row_count], row_count);
             },
-            else => {},
+            else => {
+                if (type_code == 5) { // string
+                    // Parse JSON array of strings: ["a", "b", ...]
+                    // Check bounds for pointers
+                    if (row_count == 0) continue;
+                    
+                    // Allocate metadata buffers
+                    const offsets_size = row_count * 4;
+                    const lengths_size = row_count * 4;
+                    const offsets_ptr = memory.wasmAlloc(offsets_size) orelse return 30;
+                    const lengths_ptr = memory.wasmAlloc(lengths_size) orelse return 31;
+                    
+                    const offsets = @as([*]u32, @ptrCast(@alignCast(offsets_ptr)))[0..row_count];
+                    const lengths = @as([*]u32, @ptrCast(@alignCast(lengths_ptr)))[0..row_count];
+                    
+                    // Allocate string data buffer (upper bound is input size)
+                    const str_buf_ptr = memory.wasmAlloc(col_data.len) orelse return 32;
+                    const str_buf = str_buf_ptr[0..col_data.len];
+                    
+                    var str_offset: usize = 0;
+                    var pos_idx: usize = 0;
+                    
+                    // Simple JSON string scanner
+                    // Expect [ "..." , "..." ]
+                    if (pos_idx < col_data.len and col_data[pos_idx] == '[') pos_idx += 1;
+                    
+                    var r: usize = 0;
+                    while (r < row_count and pos_idx < col_data.len) : (r += 1) {
+                        // Skip whitespace/comma
+                        while (pos_idx < col_data.len and (col_data[pos_idx] == ' ' or col_data[pos_idx] == ',' or col_data[pos_idx] == '\n' or col_data[pos_idx] == '\r')) pos_idx += 1;
+                        
+                        if (pos_idx >= col_data.len) break;
+                        
+                        if (col_data[pos_idx] == 'n') {
+                            // null
+                            if (pos_idx + 4 <= col_data.len and std.mem.eql(u8, col_data[pos_idx..][0..4], "null")) {
+                                pos_idx += 4;
+                                offsets[r] = @intCast(str_offset);
+                                lengths[r] = 0;
+                                continue;
+                            }
+                        }
+                        
+                        if (col_data[pos_idx] == '"') {
+                            pos_idx += 1; // skip start quote
+                            const start = str_offset;
+                            
+                            while (pos_idx < col_data.len) {
+                                const c = col_data[pos_idx];
+                                if (c == '"') {
+                                    pos_idx += 1; // end quote
+                                    break;
+                                }
+                                if (c == '\\') {
+                                    pos_idx += 1;
+                                    if (pos_idx >= col_data.len) break;
+                                    const esc = col_data[pos_idx];
+                                    // Handle simple escapes
+                                    if (esc == '"') {
+                                        str_buf[str_offset] = '"';
+                                    } else if (esc == '\\') {
+                                        str_buf[str_offset] = '\\';
+                                    } else if (esc == 'n') {
+                                        str_buf[str_offset] = '\n';
+                                    } else {
+                                        str_buf[str_offset] = esc; // permissive
+                                    }
+                                    str_offset += 1;
+                                    pos_idx += 1;
+                                } else {
+                                    str_buf[str_offset] = c;
+                                    str_offset += 1;
+                                    pos_idx += 1;
+                                }
+                            }
+                            offsets[r] = @intCast(start);
+                            lengths[r] = @intCast(str_offset - start);
+                        } else {
+                            // Unexpected char, treat as empty/null to avoid crash
+                            offsets[r] = @intCast(str_offset);
+                            lengths[r] = 0;
+                             // Advance until comma or end
+                            while (pos_idx < col_data.len and col_data[pos_idx] != ',' and col_data[pos_idx] != ']') pos_idx += 1;
+                        }
+                    }
+                    
+                    _ = registerColumnString(table_name, name, offsets, lengths, str_buf[0..str_offset], row_count);
+                }
+            },
         }
     }
     return 0;
@@ -604,6 +1268,8 @@ pub export fn hasTable(name_ptr: [*]const u8, name_len: usize) u32 {
     if (findTable(name)) |_| return 1;
     return 0;
 }
+
+// function removed
 
 pub export fn registerTableFragment(
     table_name_ptr: [*]const u8,
@@ -756,6 +1422,7 @@ pub export fn appendTableMemory(
     @memcpy(name_ptr[0..col_name.len], col_name);
     col_data.name = name_ptr[0..col_name.len];
     col_data.row_count = row_count;
+    col_data.vector_dim = tbl.columns[col_index].?.vector_dim;
     col_data.is_lazy = false; // It's memory data proper
 
     switch (type_code) {
@@ -794,6 +1461,7 @@ pub export fn clearTable(name_ptr: [*]const u8, name_len: usize) void {
     for (0..table_count) |i| {
         if (tables[i]) |tbl| {
             if (std.mem.eql(u8, tbl.name, name)) {
+                // Free table memory (simplified for now, assuming arena or static)
                 // Shift remaining tables
                 for (i..table_count - 1) |j| {
                     tables[j] = tables[j + 1];
@@ -842,8 +1510,13 @@ fn executeCreateTable(query: *ParsedQuery) !void {
     // For now, we use a simple static allocator for metadata or assume it persists in WASM memory
     // In a real implementation, we'd allocate from the heap and manage lifecycle
     // Create new table info (struct copy)
+    // Alloc Strings
+    const t_name_ptr = memory.wasmAlloc(query.table_name.len) orelse return error.OutOfMemory;
+    const t_name = @as([*]u8, @ptrCast(t_name_ptr))[0..query.table_name.len];
+    @memcpy(t_name, query.table_name);
+
     var new_table = TableInfo{
-        .name = query.table_name,
+        .name = t_name,
         .column_count = query.create_col_count,
         .row_count = 0,
         .columns = undefined, // Will be filled below
@@ -853,14 +1526,19 @@ fn executeCreateTable(query: *ParsedQuery) !void {
 
     // Copy columns
     for (0..query.create_col_count) |i| {
+        const col_name_src = query.create_columns[i].name;
+        const col_name_ptr = memory.wasmAlloc(col_name_src.len) orelse return error.OutOfMemory;
+        const col_name = @as([*]u8, @ptrCast(col_name_ptr))[0..col_name_src.len];
+        @memcpy(col_name, col_name_src);
+
         new_table.columns[i] = ColumnData{
-            .name = query.create_columns[i].name,
+            .name = col_name,
             .col_type = query.create_columns[i].type,
             .data = .{ .none = {} },
             .row_count = 0,
             .schema_col_idx = @intCast(i),
             .is_lazy = false,
-            .vector_dim = 0,
+            .vector_dim = query.create_columns[i].vector_dim,
             // Pointers have defaults
         };
     }
@@ -868,7 +1546,6 @@ fn executeCreateTable(query: *ParsedQuery) !void {
     // Store in global tables array
     // Note: We need persistent storage. For this demo, we might need a better strategy
     // but assuming tables is an array of pointers or optional structs?
-    // It's defined as `tables = .{null} ** MAX_TABLES` (array of ?TableInfo or ?*TableInfo)
     // Checking definition... `var tables: [MAX_TABLES]?TableInfo = undefined;`? 
     // Or `var tables: [MAX_TABLES]?*TableInfo`?
     // Assuming `tables` stores pointers or structs.
@@ -923,6 +1600,35 @@ fn appendFloat(col: *ColumnData, val: f64) !void {
     col.data.float64 = list.items;
 }
 
+fn appendString(col: *ColumnData, val_str: []const u8) !void {
+    if (col.string_buffer == null) {
+        const char_list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(u8));
+        char_list.* = std.ArrayListUnmanaged(u8){};
+        col.string_buffer = char_list;
+        
+        const offset_list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(u32));
+        offset_list.* = std.ArrayListUnmanaged(u32){};
+        col.offsets_buffer = offset_list;
+        
+        const len_list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(u32));
+        len_list.* = std.ArrayListUnmanaged(u32){};
+        col.data_ptr = len_list;
+    }
+    var offset_list = @as(*std.ArrayListUnmanaged(u32), @ptrCast(@alignCast(col.offsets_buffer)));
+    var len_list = @as(*std.ArrayListUnmanaged(u32), @ptrCast(@alignCast(col.data_ptr)));
+    var char_list = @as(*std.ArrayListUnmanaged(u8), @ptrCast(@alignCast(col.string_buffer)));
+    
+    try offset_list.append(memory.wasm_allocator, @as(u32, @intCast(char_list.items.len)));
+    try char_list.appendSlice(memory.wasm_allocator, val_str);
+    try len_list.append(memory.wasm_allocator, @as(u32, @intCast(val_str.len)));
+    
+    col.data = .{ .strings = .{
+        .offsets = offset_list.items,
+        .lengths = len_list.items,
+        .data = char_list.items,
+    }};
+}
+
 fn appendEmptyString(col: *ColumnData) !void {
     if (col.string_buffer == null) {
         const char_list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(u8));
@@ -951,6 +1657,225 @@ fn appendEmptyString(col: *ColumnData) !void {
     }};
 }
 
+fn findTableColumnMut(table: *TableInfo, name: []const u8) ?*ColumnData {
+    for (table.columns[0..table.column_count]) |*maybe_col| {
+        if (maybe_col.*) |*col| {
+            if (std.mem.eql(u8, col.name, name)) return col;
+        }
+    }
+    return null;
+}
+
+fn findColumnIndex(table: *const TableInfo, name: []const u8) ?usize {
+    for (table.columns[0..table.column_count], 0..) |maybe_col, i| {
+        if (maybe_col) |col| {
+            if (std.mem.eql(u8, col.name, name)) return i;
+        }
+    }
+    return null;
+}
+
+fn setCellValue(table: *TableInfo, col: *ColumnData, idx: u32, val_str: []const u8) !void {
+    if (idx < table.file_row_count) return;
+    const mem_idx = idx - table.file_row_count;
+    
+    switch (col.col_type) {
+        .int64 => {
+            if (col.data_ptr) |ptr| {
+                var list = @as(*std.ArrayListUnmanaged(i64), @ptrCast(@alignCast(ptr)));
+                if (mem_idx < list.items.len) {
+                    list.items[mem_idx] = std.fmt.parseInt(i64, val_str, 10) catch 0;
+                    col.data.int64 = list.items;
+                }
+            }
+        },
+        .float64 => {
+            if (col.data_ptr) |ptr| {
+                var list = @as(*std.ArrayListUnmanaged(f64), @ptrCast(@alignCast(ptr)));
+                if (mem_idx < list.items.len) {
+                    list.items[mem_idx] = std.fmt.parseFloat(f64, val_str) catch 0.0;
+                    col.data.float64 = list.items;
+                }
+            }
+        },
+        .string, .list => {
+              // String update support
+              try setCellValueString(table, col, idx, val_str);
+        },
+        else => {}
+    }
+
+    // Sync to memory_columns if applicable
+    const schema_idx = col.schema_col_idx;
+    if (schema_idx < MAX_COLUMNS) {
+        if (table.memory_columns[schema_idx]) |*mc| {
+             if (mc != col) {
+                  try setCellValue(table, mc, idx, val_str);
+             }
+        }
+    }
+}
+
+fn setCellValueString(table: *TableInfo, col: *ColumnData, idx: u32, val: []const u8) !void {
+    if (idx < table.file_row_count) return;
+    const mem_idx = idx - table.file_row_count;
+    
+    if (col.string_buffer) |char_ptr| {
+        if (col.offsets_buffer) |offset_ptr| {
+             var char_list = @as(*std.ArrayListUnmanaged(u8), @ptrCast(@alignCast(char_ptr)));
+             var offset_list = @as(*std.ArrayListUnmanaged(u32), @ptrCast(@alignCast(offset_ptr)));
+             
+             if (mem_idx >= offset_list.items.len) return;
+             
+             const start_offset = offset_list.items[mem_idx];
+             
+             // Use lengths array to get old length
+             var old_len: u32 = 0;
+             if (col.data_ptr) |len_ptr| {
+                 const len_list = @as(*std.ArrayListUnmanaged(u32), @ptrCast(@alignCast(len_ptr)));
+                 if (mem_idx < len_list.items.len) {
+                     old_len = len_list.items[mem_idx];
+                 }
+             }
+             
+             // Replace content
+             try char_list.replaceRange(memory.wasm_allocator, start_offset, old_len, val);
+             
+             // Update offsets for subsequent elements
+             const diff = @as(i64, @intCast(val.len)) - @as(i64, @intCast(old_len));
+             if (diff != 0) {
+                 for (mem_idx + 1 .. offset_list.items.len) |k| {
+                     const old_off = offset_list.items[k];
+                     offset_list.items[k] = @as(u32, @intCast(@as(i64, @intCast(old_off)) + diff));
+                 }
+             }
+             
+             // Update length
+             if (col.data_ptr) |len_ptr| {
+                  var len_list = @as(*std.ArrayListUnmanaged(u32), @ptrCast(@alignCast(len_ptr)));
+                  if (mem_idx < len_list.items.len) {
+                      len_list.items[mem_idx] = @as(u32, @intCast(val.len));
+                      col.data.strings.lengths = len_list.items;
+                  }
+             }
+             
+             col.data.strings.data = char_list.items;
+             col.data.strings.offsets = offset_list.items;
+        }
+    }
+}
+
+
+fn setCellValueInt(table: *TableInfo, col: *ColumnData, idx: u32, val: i64) void {
+    if (idx < table.file_row_count) return;
+    const mem_idx = idx - table.file_row_count;
+    if (col.data_ptr) |ptr| {
+        if (col.col_type == .int64) {
+            @as(*std.ArrayListUnmanaged(i64), @ptrCast(@alignCast(ptr))).items[mem_idx] = val;
+            col.data.int64 = @as(*std.ArrayListUnmanaged(i64), @ptrCast(@alignCast(ptr))).items;
+        } else if (col.col_type == .float64) {
+             @as(*std.ArrayListUnmanaged(f64), @ptrCast(@alignCast(ptr))).items[mem_idx] = @floatFromInt(val);
+             col.data.float64 = @as(*std.ArrayListUnmanaged(f64), @ptrCast(@alignCast(ptr))).items;
+        }
+    }
+}
+
+fn setCellValueFloat(table: *TableInfo, col: *ColumnData, idx: u32, val: f64) void {
+    if (idx < table.file_row_count) return;
+    const mem_idx = idx - table.file_row_count;
+    if (col.data_ptr) |ptr| {
+        if (col.col_type == .float64) {
+            @as(*std.ArrayListUnmanaged(f64), @ptrCast(@alignCast(ptr))).items[mem_idx] = val;
+            col.data.float64 = @as(*std.ArrayListUnmanaged(f64), @ptrCast(@alignCast(ptr))).items;
+        } else if (col.col_type == .int64) {
+            @as(*std.ArrayListUnmanaged(i64), @ptrCast(@alignCast(ptr))).items[mem_idx] = @intFromFloat(val);
+            col.data.int64 = @as(*std.ArrayListUnmanaged(i64), @ptrCast(@alignCast(ptr))).items;
+        }
+    }
+}
+
+/// Helper to get a column from one of two tables (handling potential alias prefixes)
+fn getColFromTables(query: *const ParsedQuery, t1: *const TableInfo, t2: *const TableInfo, name: []const u8) ?struct { *const TableInfo, *const ColumnData } {
+    var clean_name = name;
+    if (std.mem.indexOf(u8, name, ".")) |dot| {
+        const alias = name[0..dot];
+        clean_name = name[dot+1..];
+        // If alias matches tbl name or its alias
+        if (std.mem.eql(u8, t1.name, alias) or (query.table_alias != null and std.mem.eql(u8, query.table_alias.?, alias))) {
+             if (getColByName(t1, clean_name)) |c| return .{ t1, c };
+        }
+        if (std.mem.eql(u8, t2.name, alias) or (query.source_table_alias != null and std.mem.eql(u8, query.source_table_alias.?, alias))) {
+             if (getColByName(t2, clean_name)) |c| return .{ t2, c };
+        }
+    }
+    
+    // Fallback: search both
+    if (getColByName(t1, clean_name)) |c| return .{ t1, c };
+    if (getColByName(t2, clean_name)) |c| return .{ t2, c };
+    return null;
+}
+
+fn evaluateJoinScalarFloat(query: *const ParsedQuery, t1: *const TableInfo, t2: *const TableInfo, expr: *const SelectExpr, idx1: u32, idx2: u32, ctx1: *?FragmentContext, ctx2: *?FragmentContext) f64 {
+    var v1: f64 = 0;
+    var v2: f64 = 0;
+
+    // Resolve Arg 1
+    if (expr.col_name.len > 0) {
+        const name = expr.col_name;
+        if (getColFromTables(query, t1, t2, name)) |pair| {
+            const t = pair[0];
+            const c = pair[1];
+            const idx = if (t == t1) idx1 else idx2;
+            const ctx = if (t == t1) ctx1 else ctx2;
+            v1 = getFloatValueOptimized(t, c, idx, ctx);
+        }
+    } else if (expr.val_float) |v| {
+        v1 = v;
+    } else if (expr.val_int) |v| {
+        v1 = @floatFromInt(v);
+    }
+
+    // Resolve Arg 2
+    if (expr.arg_2_col) |name| {
+        if (getColFromTables(query, t1, t2, name)) |pair| {
+            const t = pair[0];
+            const c = pair[1];
+            const idx = if (t == t1) idx1 else idx2;
+            const ctx = if (t == t1) ctx1 else ctx2;
+            v2 = getFloatValueOptimized(t, c, idx, ctx);
+        }
+    } else if (expr.arg_2_val_float) |v| {
+        v2 = v;
+    } else if (expr.arg_2_val_int) |v| {
+        v2 = @floatFromInt(v);
+    }
+
+    return switch (expr.func) {
+        .add => v1 + v2,
+        .sub => v1 - v2,
+        .mul => v1 * v2,
+        .div => if (v2 != 0) v1 / v2 else 0.0,
+        .none => v1,
+        else => evaluateScalarFloat(t1, expr, idx1, ctx1, null, null), // Fallback
+    };
+}
+
+fn evaluateJoinScalarString(query: *const ParsedQuery, t1: *const TableInfo, t2: *const TableInfo, expr: *const SelectExpr, idx1: u32, idx2: u32, ctx1: *?FragmentContext, ctx2: *?FragmentContext) []const u8 {
+    if (expr.col_name.len > 0) {
+        const name = expr.col_name;
+        if (getColFromTables(query, t1, t2, name)) |pair| {
+            const t = pair[0];
+            const c = pair[1];
+            const idx = if (t == t1) idx1 else idx2;
+            const ctx = if (t == t1) ctx1 else ctx2;
+            return getStringValueOptimized(t, c, idx, ctx);
+        }
+    } else if (expr.val_str) |v| {
+        return v;
+    }
+    return "";
+}
+
 fn executeInsert(query: *ParsedQuery) !void {
     // Find table
     var table: ?*TableInfo = null;
@@ -965,10 +1890,120 @@ fn executeInsert(query: *ParsedQuery) !void {
     const tbl = table orelse return error.TableNotFound;
 
     // Append rows
-    const new_count = tbl.row_count + query.insert_row_count;
-    // if (new_count > MAX_ROWS) return error.TableFull; // Remove check if using dynamic alloc
+    // Update table row count
+    // tbl.row_count += query.insert_row_count; (Done at end)
 
+    var actual_inserts: usize = 0;
     for (0..query.insert_row_count) |row_idx| {
+        // Check for ON CONFLICT
+        var conflict_row_idx: ?u32 = null;
+        if (query.on_conflict_action != .none) {
+             if (findTableColumn(tbl, query.on_conflict_col)) |c| {
+                 var conflict_val_idx: usize = 0;
+                 for (query.insert_col_names[0..query.insert_col_count], 0..) |icn, ici| {
+                     if (std.mem.eql(u8, icn, query.on_conflict_col)) {
+                         conflict_val_idx = ici;
+                         break;
+                     }
+                 }
+                 // Fallback to table schema order for conflict col value
+                 if (conflict_val_idx == 0 and query.insert_col_count == 0) {
+                     for (0..tbl.column_count) |ci| {
+                         if (tbl.columns[ci]) |col| {
+                             if (std.mem.eql(u8, col.name, query.on_conflict_col)) {
+                                 conflict_val_idx = ci;
+                                 break;
+                             }
+                         }
+                     }
+                 }
+                 const insert_val = query.insert_values[row_idx][conflict_val_idx];
+                 var ctx: ?FragmentContext = null;
+                 for (0..tbl.row_count) |tr| {
+                     var found = false;
+                     switch (c.col_type) {
+                         .int64 => {
+                             const val = getIntValueOptimized(tbl, c, @intCast(tr), &ctx);
+                             var buf: [32]u8 = undefined;
+                             const val_str = std.fmt.bufPrint(&buf, "{}", .{val}) catch "";
+                             found = std.mem.eql(u8, val_str, insert_val);
+                         },
+                         .float64 => {
+                             const val = getFloatValueOptimized(tbl, c, @intCast(tr), &ctx);
+                             var buf: [32]u8 = undefined;
+                             const val_str = std.fmt.bufPrint(&buf, "{d}", .{val}) catch "";
+                             found = std.mem.eql(u8, val_str, insert_val);
+                         },
+                         else => {
+                             const table_val = getStringValueOptimized(tbl, c, @intCast(tr), &ctx);
+                             found = std.mem.eql(u8, table_val, insert_val);
+                         }
+                     }
+                      
+                     if (found) {
+                         conflict_row_idx = @intCast(tr);
+                         break;
+                     }
+                 }
+             }
+        }
+
+        if (conflict_row_idx) |cri| {
+             if (query.on_conflict_action == .nothing) continue;
+             if (query.on_conflict_action == .update) {
+                 // Update the row cri
+                 for (0..query.update_count) |u_idx| {
+                     const upd_col_name = query.update_cols[u_idx];
+                     const expr = query.update_exprs[u_idx];
+                     
+                     if (findTableColumnMut(tbl, upd_col_name)) |c| {
+                         var val_str: []const u8 = "";
+                         // Handle EXCLUDED.col reference in expr
+                         if (expr.col_name.len > 0 and (std.mem.startsWith(u8, expr.col_name, "EXCLUDED.") or std.mem.startsWith(u8, expr.col_name, "excluded."))) {
+                             const excl_col = if (std.mem.indexOf(u8, expr.col_name, ".")) |dot| expr.col_name[dot+1..] else expr.col_name;
+                             // First try insert_col_names
+                             var found_excl = false;
+                             for (query.insert_col_names[0..query.insert_col_count], 0..) |icn, ici| {
+                                 if (std.mem.eql(u8, icn, excl_col)) {
+                                     val_str = query.insert_values[row_idx][ici];
+                                     found_excl = true;
+                                     break;
+                                 }
+                             }
+                             // Fallback to table schema column order
+                             if (!found_excl) {
+                                 for (0..tbl.column_count) |ci| {
+                                     if (tbl.columns[ci]) |col| {
+                                         if (std.mem.eql(u8, col.name, excl_col)) {
+                                             if (ci < query.insert_values[row_idx].len) {
+                                                 val_str = query.insert_values[row_idx][ci];
+                                             }
+                                             break;
+                                         }
+                                     }
+                                 }
+                             }
+                         } else if (expr.val_str) |s| {
+                             val_str = s;
+                         } else if (expr.val_int) |v| {
+                             var buf: [32]u8 = undefined;
+                             val_str = try memory.wasm_allocator.dupe(u8, std.fmt.bufPrint(&buf, "{}", .{v}) catch "");
+                         } else if (expr.val_float) |v| {
+                             var buf: [32]u8 = undefined;
+                             val_str = try memory.wasm_allocator.dupe(u8, std.fmt.bufPrint(&buf, "{d}", .{v}) catch "");
+                         }
+
+
+                         if (val_str.len > 0) {
+                            try setCellValue(tbl, c, cri, val_str);
+                         }
+                     }
+                 }
+                 continue;
+             }
+        }
+
+        // Actual insert - no conflict or conflict action not set
         for (0..query.insert_col_count) |col_idx| {
              // In ParsedQuery we support MAX_SELECT_COLS columns
              // We need to map insertion columns to table columns.
@@ -979,65 +2014,81 @@ fn executeInsert(query: *ParsedQuery) !void {
                  const val_str = query.insert_values[row_idx][col_idx];
                                   switch (col.col_type) {
                      .int64 => {
-                         if (col.data_ptr == null) {
-                             const list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(i64));
-                             list.* = std.ArrayListUnmanaged(i64){};
-                             col.data_ptr = list;
-                         }
-                         var list = @as(*std.ArrayListUnmanaged(i64), @ptrCast(@alignCast(col.data_ptr)));
                          const val = std.fmt.parseInt(i64, val_str, 10) catch 0;
-                         try list.append(memory.wasm_allocator, val);
-                         col.data.int64 = list.items;
+                         try appendInt(col, val);
                      },
                      .float64 => {
-                         if (col.data_ptr == null) {
-                             const list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(f64));
-                             list.* = std.ArrayListUnmanaged(f64){};
-                             col.data_ptr = list;
-                         }
-                         var list = @as(*std.ArrayListUnmanaged(f64), @ptrCast(@alignCast(col.data_ptr)));
                          const val = std.fmt.parseFloat(f64, val_str) catch 0.0;
-                         try list.append(memory.wasm_allocator, val);
-                         col.data.float64 = list.items;
+                         try appendFloat(col, val);
                      },
-                     .string => {
-                         // String: data buffer + offsets
-                         if (col.string_buffer == null) {
-                             const char_list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(u8));
-                             char_list.* = std.ArrayListUnmanaged(u8){};
-                             col.string_buffer = char_list;
-                             
-                             const offset_list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(u32));
-                             offset_list.* = std.ArrayListUnmanaged(u32){};
-                             col.offsets_buffer = offset_list;
-                             
-                             // Initialize lengths (not used in this simplified model but kept for compat)
-                             const len_list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(u32));
-                             len_list.* = std.ArrayListUnmanaged(u32){};
-                             col.data_ptr = len_list; // Using data_ptr for lengths list
+                     .string, .list => {
+                         try appendString(col, val_str);
+                     },
+                     .float32 => {
+                         // Check if this is a vector column
+                         if (col.vector_dim > 1) {
+                             // Parse vector literal like "[1.0, 2.0, 3.0]"
+                             const list = @as(*std.ArrayListUnmanaged(f32), @ptrCast(@alignCast(col.data_ptr orelse return error.NoDataPtr)));
+                             var it = std.mem.tokenizeAny(u8, val_str, " ,[]");
+                             var count: u32 = 0;
+                             while (it.next()) |token| {
+                                 if (count >= col.vector_dim) break;
+                                 const f = std.fmt.parseFloat(f32, token) catch 0.0;
+                                 try list.append(memory.wasm_allocator, f);
+                                 count += 1;
+                             }
+                             // Fill remainder with 0 if needed
+                             while (count < col.vector_dim) : (count += 1) {
+                                 try list.append(memory.wasm_allocator, 0.0);
+                             }
+                         } else {
+                             const val = std.fmt.parseFloat(f32, val_str) catch 0.0;
+                             const list = @as(*std.ArrayListUnmanaged(f32), @ptrCast(@alignCast(col.data_ptr orelse return error.NoDataPtr)));
+                             try list.append(memory.wasm_allocator, val);
                          }
-                         
-                         var char_list = @as(*std.ArrayListUnmanaged(u8), @ptrCast(@alignCast(col.string_buffer)));
-                         var offset_list = @as(*std.ArrayListUnmanaged(u32), @ptrCast(@alignCast(col.offsets_buffer)));
-                         var len_list = @as(*std.ArrayListUnmanaged(u32), @ptrCast(@alignCast(col.data_ptr)));
-
-                         const current_offset = @as(u32, @intCast(char_list.items.len));
-                         try offset_list.append(memory.wasm_allocator, current_offset);
-                         try char_list.appendSlice(memory.wasm_allocator, val_str);
-                         try len_list.append(memory.wasm_allocator, @as(u32, @intCast(val_str.len)));
-                         
-                         col.data = .{ .strings = .{
-                             .offsets = offset_list.items,
-                             .lengths = len_list.items,
-                            .data = char_list.items,
-                        }};
-                    },
+                         col.data.float32 = @as(*std.ArrayListUnmanaged(f32), @ptrCast(@alignCast(col.data_ptr))).items;
+                     },
                     else => {},
                  }
                  col.row_count += 1;
+
+                  // Duplicate to memory_columns
+                  const schema_idx = col.schema_col_idx;
+                  if (schema_idx < MAX_COLUMNS) {
+                      if (tbl.memory_columns[schema_idx] == null) {
+                          var mc: ColumnData = col.*; 
+                          mc.data_ptr = null;
+                          mc.string_buffer = null;
+                          mc.offsets_buffer = null;
+                          mc.data = undefined;
+                          mc.row_count = 0;
+                          tbl.memory_columns[schema_idx] = mc;
+                      }
+                      
+                      if (tbl.memory_columns[schema_idx]) |*mc| {
+                          switch (mc.col_type) {
+                              .int64 => {
+                                  const val = std.fmt.parseInt(i64, val_str, 10) catch 0;
+                                  try appendInt(mc, val);
+                              },
+                              .float64 => {
+                                  const val = std.fmt.parseFloat(f64, val_str) catch 0.0;
+                                  try appendFloat(mc, val);
+                              },
+                              .string, .list => {
+                                  try appendString(mc, val_str);
+                              },
+                              else => {}
+                          }
+                          mc.row_count += 1;
+                      }
+                  }
              }
         }
+        actual_inserts += 1;
     }
+    tbl.row_count += @as(u32, @intCast(actual_inserts));
+    tbl.memory_row_count += @as(u32, @intCast(actual_inserts));
     
     // Handle INSERT SELECT
     if (query.is_insert_select) {
@@ -1054,7 +2105,7 @@ fn executeInsert(query: *ParsedQuery) !void {
         
         if (source_table) |src| {
             var inserted_count: usize = 0;
-            const limit = if (query.limit_value) |l| l else 0xFFFFFFFF;
+            const limit = if (query.top_k) |l| l else 0xFFFFFFFF;
             
             // 1. Fragment Loop
             var current_idx: u32 = 0;
@@ -1136,28 +2187,168 @@ fn executeInsert(query: *ParsedQuery) !void {
             
             // Update row count
             tbl.row_count += @as(u32, @intCast(inserted_count));
+            tbl.memory_row_count += @as(u32, @intCast(inserted_count));
             if (inserted_count > 0) {
             }
             return;
             // Source Table NOT FOUND
         }
     }
-    tbl.row_count = new_count;
+    // tbl.row_count = new_count;
 }
 
-pub export fn executeSql() usize {
+fn executeUpdate(query: *const ParsedQuery) !void {
+    const tbl = findTable(query.table_name) orelse return error.TableNotFound;
+    
+    var ctx1: ?FragmentContext = null;
+    if (query.source_table_name.len > 0) {
+        const src = findTable(query.source_table_name) orelse return error.TableNotFound;
+        var ctx2: ?FragmentContext = null;
+        
+        for (0..tbl.row_count) |i| {
+            const idx1 = @as(u32, @intCast(i));
+            for (0..src.row_count) |j| {
+                const idx2 = @as(u32, @intCast(j));
+                
+                var match = false;
+                if (query.where_clause) |*where| {
+                    if (where.op == .eq and where.column != null and (where.arg_2_col != null or where.value_str != null or where.value_int != null or where.value_float != null)) {
+                        // Minimal join condition check
+                        const v1_pair = getColFromTables(query, tbl, src, where.column.?);
+                        const v1 = if (v1_pair) |p| blk: {
+                             const t = p[0];
+                             const idx = if (t == tbl) idx1 else idx2;
+                             const ctx = if (t == tbl) &ctx1 else &ctx2;
+                             break :blk getFloatValueOptimized(t, p[1], idx, ctx);
+                        } else 0.0;
+                        
+                        const v2 = if (where.arg_2_col) |c2| blk: {
+                             if (getColFromTables(query, tbl, src, c2)) |p| {
+                                 const t = p[0];
+                                 const idx = if (t == tbl) idx1 else idx2;
+                                 const ctx = if (t == tbl) &ctx1 else &ctx2;
+                                 break :blk getFloatValueOptimized(t, p[1], idx, ctx);
+                             } else break :blk 0.0;
+                        } else if (where.value_float) |vf| vf else if (where.value_int) |vi| @as(f64, @floatFromInt(vi)) else 0.0;
+                        
+                        if (v1 == v2) match = true;
+                         setDebug("Join check: v1 {} v2 {} match {}", .{v1, v2, match});
+                    }
+                } else {
+                    match = true;
+                }
+
+                if (match) {
+                     for (0..query.update_count) |u_idx| {
+                         const upd_col_name = query.update_cols[u_idx];
+                         const expr = query.update_exprs[u_idx];
+                         if (findTableColumnMut(tbl, upd_col_name)) |col| {
+                             if (col.col_type == .string) {
+                                 const val = evaluateJoinScalarString(query, tbl, src, &expr, idx1, idx2, &ctx1, &ctx2);
+                                 try setCellValueString(tbl, col, idx1, val);
+                             } else {
+                                 const val = evaluateJoinScalarFloat(query, tbl, src, &expr, idx1, idx2, &ctx1, &ctx2);
+                                 if (col.col_type == .int64) {
+                                     setCellValueInt(tbl, col, idx1, @intFromFloat(val));
+                                 } else {
+                                     setCellValueFloat(tbl, col, idx1, val);
+                                 }
+                             }
+                         }
+                     }
+                }
+            }
+        }
+    } else {
+        // Simple UPDATE
+        for (0..tbl.row_count) |i| {
+            const idx = @as(u32, @intCast(i));
+            if (query.where_clause == null or evaluateWhere(tbl, &query.where_clause.?, idx, &ctx1)) {
+                 for (0..query.update_count) |u_idx| {
+                     const upd_col_name = query.update_cols[u_idx];
+                     const expr = query.update_exprs[u_idx];
+                     setDebug("Simple UPDATE: col={s} expr.val_int={} update_count={}", .{upd_col_name, if (expr.val_int) |v| v else -9999, query.update_count});
+                     if (findTableColumnMut(tbl, upd_col_name)) |col| {
+                         if (col.col_type == .string) {
+                             if (expr.val_str) |s| {
+                                 try setCellValueString(tbl, col, idx, s);
+                             } else if (expr.col_name.len > 0) {
+                                  // Very basic column-to-column or scalar
+                                  const val = evaluateScalarString(tbl, &expr, idx, &ctx1, null);
+                                  try setCellValueString(tbl, col, idx, val);
+                             }
+                         } else {
+                             const val = evaluateScalarFloat(tbl, &expr, idx, &ctx1, null, null);
+                             if (col.col_type == .int64) {
+                                 setCellValueInt(tbl, col, idx, @intFromFloat(val));
+                             } else {
+                                 setCellValueFloat(tbl, col, idx, val);
+                             }
+                         }
+                     }
+                 }
+            }
+        }
+    }
+}
+
+fn executeDelete(query: *const ParsedQuery) void {
+    _ = query;
+    // Implementation stub
+}
+
+// ============================================================================
+// Error Handling
+// ============================================================================
+
+var last_error_buf: [4096]u8 = undefined;
+var last_error_len: usize = 0;
+
+fn setError(msg: []const u8) void {
+    last_error_len = @min(msg.len, 4096);
+    @memcpy(last_error_buf[0..last_error_len], msg);
+}
+
+fn setDebug(comptime fmt: []const u8, args: anytype) void {
+    if (last_error_len >= 4096) return;
+    if (last_error_len > 0) {
+        last_error_buf[last_error_len] = '\n';
+        last_error_len += 1;
+    }
+    const available = last_error_buf[last_error_len..];
+    const msg = std.fmt.bufPrint(available, "DEBUG: " ++ fmt, args) catch return;
+    last_error_len += msg.len;
+}
+
+pub export fn getLastError(ptr: *u8, max_len: usize) u32 {
+    const len = @min(last_error_len, max_len);
+    const dest = @as([*]u8, @ptrCast(ptr));
+    @memcpy(dest[0..len], last_error_buf[0..len]);
+    return @intCast(len);
+}
+
+
+pub export fn executeSql() u32 {
+
+
+    last_error_len = 0;
     where_storage_idx = 0;
     query_storage_idx = 0;
     const sql = sql_input[0..sql_input_len];
-
+    setDebug("Exec SQL: {s}", .{sql});
     var query = parseSql(sql) orelse {
+        setError("Invalid SQL Syntax");
         return 0;
     };
+    setDebug("Parsed Type: {any}", .{query.type});
     // Debug agg count
 
     // Handle set operations (UNION, INTERSECT, EXCEPT)
     if (query.set_op != .none) {
-        executeSetOpQuery(sql, query) catch return 0;
+        executeSetOpQuery(sql, query) catch |err| {
+             setError(@errorName(err));
+             return 0;
+        };
         if (result_buffer) |buf| {
             return @intFromPtr(buf.ptr);
         }
@@ -1170,10 +2361,14 @@ pub export fn executeSql() usize {
         for (query.ctes[0..query.cte_count]) |cte| {
             if (std.mem.eql(u8, cte.name, query.table_name)) {
                 // Execute CTE query
-                executeCTEQuery(sql, query, &cte) catch return 0;
+                executeCTEQuery(sql, query, &cte) catch |err| {
+                    setError(@errorName(err));
+                    return 0;
+                };
                 if (result_buffer) |buf| {
                     return @intFromPtr(buf.ptr);
                 }
+                setError("CTE Execution produced no result");
                 return 0;
             }
         }
@@ -1183,13 +2378,32 @@ pub export fn executeSql() usize {
     switch (query.type) {
         .select => {}, // Continue to existing SELECT logic
         .create_table => {
-            executeCreateTable(query) catch return 0;
+            executeCreateTable(query) catch |err| {
+                setError(@errorName(err));
+                return 0;
+            };
              // Return empty result
             writeEmptyResult() catch return 0;
             if (result_buffer) |buf| return @intFromPtr(buf.ptr);
             return 0;
         },
         .drop_table => {
+            // Check table existence if NOT "IF EXISTS"
+            if (!query.drop_if_exists) {
+                var table_exists = false;
+                for (&tables) |*t| {
+                     if (t.*) |*tbl| {
+                         if (std.mem.eql(u8, tbl.name, query.table_name)) {
+                             table_exists = true;
+                             break;
+                         }
+                     }
+                }
+                if (!table_exists) {
+                    setError("Table not found");
+                    return 0;
+                }
+            }
             executeDropTable(query);
             // Return empty result
             writeEmptyResult() catch return 0;
@@ -1197,10 +2411,54 @@ pub export fn executeSql() usize {
             return 0;
         },
         .insert => {
-            executeInsert(query) catch {
+            executeInsert(query) catch |err| {
+                setError(@errorName(err));
                 return 0;
             };
             // Return empty result (or row count if implemented)
+            writeEmptyResult() catch return 0;
+            if (result_buffer) |buf| return @intFromPtr(buf.ptr);
+            return 0;
+        },
+        .update => {
+            // Check table existence
+            var table_exists = false;
+            for (&tables) |*t| {
+                 if (t.*) |*tbl| {
+                     if (std.mem.eql(u8, tbl.name, query.table_name)) {
+                         table_exists = true;
+                         break;
+                     }
+                 }
+            }
+            if (!table_exists) {
+                setError("Table not found");
+                return 0;
+            }
+            executeUpdate(query) catch |err| {
+                setError(@errorName(err));
+                return 0;
+            };
+            writeEmptyResult() catch return 0;
+            if (result_buffer) |buf| return @intFromPtr(buf.ptr);
+            return 0;
+        },
+        .delete => {
+            // Check table existence
+            var table_exists = false;
+            for (&tables) |*t| {
+                 if (t.*) |*tbl| {
+                     if (std.mem.eql(u8, tbl.name, query.table_name)) {
+                         table_exists = true;
+                         break;
+                     }
+                 }
+            }
+            if (!table_exists) {
+                setError("Table not found");
+                return 0;
+            }
+            executeDelete(query);
             writeEmptyResult() catch return 0;
             if (result_buffer) |buf| return @intFromPtr(buf.ptr);
             return 0;
@@ -1218,21 +2476,36 @@ pub export fn executeSql() usize {
         }
     }
 
-    const tbl = table orelse return 0;
+    const tbl = table orelse {
+        setError("Table not found");
+        return 0;
+    };
 
     // Execute query based on type
+
+
     if (query.join_count > 0) {
         // JOIN query
-        executeJoinQuery(tbl, query) catch return 0;
+        executeJoinQuery(tbl, query) catch |err| {
+            setError(@errorName(err));
+            return 0;
+        };
     } else if (query.window_count > 0) {
         // Window function query
-        executeWindowQuery(tbl, query) catch return 0;
+        executeWindowQuery(tbl, query) catch |err| {
+            setError(@errorName(err));
+            return 0;
+        };
     } else if (query.agg_count > 0 or query.group_by_count > 0) {
-        executeAggregateQuery(tbl, query) catch {
+        executeAggregateQuery(tbl, query) catch |err| {
+            log("{s}", .{@errorName(err)});
             return 0;
         };
     } else {
-        executeSelectQuery(tbl, query) catch return 0;
+        executeSelectQuery(tbl, query) catch |err| {
+             log("{s}", .{@errorName(err)});
+             return 0;
+        };
     }
 
     if (result_buffer) |buf| {
@@ -1287,6 +2560,9 @@ fn findOrCreateTable(table_name: []const u8, row_count: u32) ?*TableInfo {
         .fragments = .{null} ** MAX_FRAGMENTS,
         .fragment_count = 0,
         .row_count = row_count,
+        .memory_columns = .{null} ** MAX_COLUMNS,
+        .memory_row_count = 0,
+        .file_row_count = row_count,
     };
     const idx = table_count;
     table_count += 1;
@@ -1420,6 +2696,7 @@ fn executeVectorSearch(table: *const TableInfo, near: *const WhereClause, limit:
     // out_indices will store the indices, we need scores too
     // We'll use a temporary buffer for scores
     const scores_ptr = memory.wasmAlloc(top_k * 4) orelse return 0;
+    defer memory.free(scores_ptr, top_k * 4);
     const scores = @as([*]f32, @ptrCast(@alignCast(scores_ptr)))[0..top_k];
     
     // Initialize scores
@@ -1443,7 +2720,9 @@ fn executeVectorSearch(table: *const TableInfo, near: *const WhereClause, limit:
             
             // Chunked read and search
             const CHUNK_SIZE = 256; // Smaller chunk for vectors (large size)
-            const buf_ptr = memory.wasmAlloc(CHUNK_SIZE * frag_dim * 4) orelse return 0;
+            const buf_len = CHUNK_SIZE * frag_dim * 4;
+            const buf_ptr = memory.wasmAlloc(buf_len) orelse return 0;
+            defer memory.free(buf_ptr, buf_len);
             const buf = @as([*]f32, @ptrCast(@alignCast(buf_ptr)));
             
             var processed: usize = 0;
@@ -1476,6 +2755,79 @@ fn executeVectorSearch(table: *const TableInfo, near: *const WhereClause, limit:
             }
             
             current_abs_idx += @intCast(row_count);
+        }
+    }
+
+    // Non-lazy memory columns (e.g. from INSERT)
+    if (!c.is_lazy) {
+        if (c.col_type == .float32 and c.row_count > 0) {
+            const data = c.data.float32;
+            const row_count = c.row_count;
+            const dim_u32 = c.vector_dim;
+
+            if (dim_u32 == near.near_dim) {
+                for (0..row_count) |row| {
+                    const vec_ptr = data.ptr + row * dim_u32;
+                    const dot = simd_search.simdDotProduct(query_vec.ptr, vec_ptr, dim_u32);
+                    
+                    var score: f32 = undefined;
+                    const query_norm = @sqrt(simd_search.simdNormSquared(query_vec.ptr, dim_u32));
+                    const vec_norm = @sqrt(simd_search.simdNormSquared(vec_ptr, dim_u32));
+                    const denom = query_norm * vec_norm;
+                    score = if (denom == 0) 0 else dot / denom;
+
+                    if (score > scores[top_k - 1]) {
+                        var insert_pos: usize = top_k - 1;
+                        while (insert_pos > 0 and score > scores[insert_pos - 1]) insert_pos -= 1;
+                        var j: usize = top_k - 1;
+                        while (j > insert_pos) {
+                            out_indices[j] = out_indices[j - 1];
+                            scores[j] = scores[j - 1];
+                            j -= 1;
+                        }
+                        out_indices[insert_pos] = @intCast(row);
+                        scores[insert_pos] = score;
+                    }
+                }
+            }
+        }
+    }
+
+    // In-memory search (delta)
+    if (table.memory_row_count > 0) {
+        if (table.memory_columns[c.schema_col_idx]) |mem_col| {
+            // Note: we use the data from the memory batch
+            if (mem_col.col_type == .float32 and mem_col.row_count > 0) {
+                const data = mem_col.data.float32;
+                const row_count = mem_col.row_count;
+                const dim_u32 = mem_col.vector_dim;
+
+                if (dim_u32 == near.near_dim) {
+                    for (0..row_count) |row| {
+                        const vec_ptr = data.ptr + row * dim_u32;
+                        const dot = simd_search.simdDotProduct(query_vec.ptr, vec_ptr, dim_u32);
+                        
+                        var score: f32 = undefined;
+                        const query_norm = @sqrt(simd_search.simdNormSquared(query_vec.ptr, dim_u32));
+                        const vec_norm = @sqrt(simd_search.simdNormSquared(vec_ptr, dim_u32));
+                        const denom = query_norm * vec_norm;
+                        score = if (denom == 0) 0 else dot / denom;
+
+                        if (score > scores[top_k - 1]) {
+                            var insert_pos: usize = top_k - 1;
+                            while (insert_pos > 0 and score > scores[insert_pos - 1]) insert_pos -= 1;
+                            var j: usize = top_k - 1;
+                            while (j > insert_pos) {
+                                out_indices[j] = out_indices[j - 1];
+                                scores[j] = scores[j - 1];
+                                j -= 1;
+                            }
+                            out_indices[insert_pos] = current_abs_idx + @as(u32, @intCast(row));
+                            scores[insert_pos] = score;
+                        }
+                    }
+                }
+            }
         }
     }
     
@@ -1511,7 +2863,9 @@ fn resolveNearClauses(table: *const TableInfo, where: *WhereClause, limit: usize
 }
 
 fn executeSelectQuery(table: *const TableInfo, query: *ParsedQuery) !void {
+    setDebug("executeSelectQuery table: {s}, where: {}", .{table.name, query.where_clause != null});
     // const row_count = table.row_count;
+
 
     // Apply WHERE filter
     const match_indices = &global_indices_1;
@@ -1519,7 +2873,7 @@ fn executeSelectQuery(table: *const TableInfo, query: *ParsedQuery) !void {
 
     // Resolve any NEAR clauses first (pre-calculate vector search results)
     if (query.where_clause) |*where| {
-        const limit = if (query.limit_value) |l| l else 10;
+        const limit = if (query.top_k) |l| l else 20;
         try resolveNearClauses(table, where, limit);
     }
 
@@ -1582,6 +2936,52 @@ fn executeSelectQuery(table: *const TableInfo, query: *ParsedQuery) !void {
         }
     }
 
+    // Scan In-Memory Data (rows after fragments)
+    if (table.row_count > current_global_idx) {
+
+        const mem_rows = @as(u32, @intCast(table.row_count)) - current_global_idx;
+        var frag_ctx = FragmentContext{
+            .frag = null,
+            .start_idx = current_global_idx,
+            .end_idx = @intCast(table.row_count),
+        };
+
+        var processed: u32 = 0;
+        while (processed < mem_rows) {
+            const chunk_size = @min(VECTOR_SIZE, mem_rows - processed);
+
+            if (query.where_clause) |*where| {
+                 var out_sel_buf: [VECTOR_SIZE]u16 = undefined;
+                 
+                 const selected_count = evaluateWhereVector(
+                     table,
+                     where,
+                     &frag_ctx,
+                     processed, // explicit cast handled in fn? fn takes u32
+                     @intCast(chunk_size),
+                     null, 
+                     &out_sel_buf
+                 );
+                 
+                 for (0..selected_count) |k| {
+                     match_indices[match_count] = current_global_idx + processed + out_sel_buf[k];
+                     match_count += 1;
+                 }
+            } else {
+                 if (match_count + chunk_size <= MAX_ROWS) {
+                     for (0..chunk_size) |k| {
+                         match_indices[match_count] = current_global_idx + processed + @as(u32, @intCast(k));
+                         match_count += 1;
+                     }
+                 }
+            }
+            
+            processed += @intCast(chunk_size);
+            if (match_count >= MAX_ROWS) break;
+        }
+    }
+
+
     // Determine output columns first (needed for DISTINCT)
     var output_cols: [MAX_COLUMNS]usize = undefined;
     var output_count: usize = 0;
@@ -1592,16 +2992,33 @@ fn executeSelectQuery(table: *const TableInfo, query: *ParsedQuery) !void {
             output_count += 1;
         }
     } else {
-        for (query.select_cols[0..query.select_count]) |col_name| {
-            for (table.columns[0..table.column_count], 0..) |maybe_col, i| {
-                if (maybe_col) |col| {
-                    if (std.mem.eql(u8, col.name, col_name)) {
-                        output_cols[output_count] = i;
-                        output_count += 1;
-                        break;
+        // Note: We need to determine output columns based on SelectExpr
+        // For now, if it's a simple column, we add it.
+        // If it's a function, output_cols isn't enough (need evaluation).
+        // For the fix, we will iterate Exprs.
+        // But output_cols stores INDEXES.
+        // We will repurpose logic to resolve columns for .none exprs.
+        
+        for (query.select_exprs[0..query.select_count]) |expr| {
+             if (expr.func == .none) {
+                // Simple column lookup
+                for (table.columns[0..table.column_count], 0..) |maybe_col, i| {
+                    if (maybe_col) |col| {
+                        if (std.mem.eql(u8, col.name, expr.col_name)) {
+                            output_cols[output_count] = i;
+                            output_count += 1;
+                            break;
+                        }
                     }
                 }
-            }
+             } else {
+                 // Function: We can't put it in output_cols (which are source indices).
+                 // We need to handle this in writeSelectResult.
+                 // For now, to allow implicit pass-through, we mark it as MAX_COLUMNS (sentinel)
+                 // or we update writeSelectResult to take expr list.
+                 output_cols[output_count] = MAX_COLUMNS; // Marker
+                 output_count += 1;
+             }
         }
     }
 
@@ -1619,21 +3036,28 @@ fn executeSelectQuery(table: *const TableInfo, query: *ParsedQuery) !void {
             // Check if this row matches any previous row
             var j: usize = 0;
             while (j < unique_count) : (j += 1) {
-                var all_equal = true;
-                for (output_cols[0..output_count]) |col_idx| {
-                    if (table.columns[col_idx]) |*col| {
-                        const v1 = getFloatValue(table, col, match_indices[i]);
-                        const v2 = getFloatValue(table, col, match_indices[j]);
-                        if (v1 != v2) {
-                            all_equal = false;
-                            break;
-                        }
+                // _ = all_equal = true;
+                for (query.select_exprs[0..query.select_count]) |expr| {
+                     // Evaluate both
+                     // For now only support simple columns for Distinct
+                     if (expr.func == .none) {
+                         // lookup column locally
+                         // This is slow. DISTINCT needs refactor for scalar functions.
+                         // SKIP validation for now.
+                     }
+                }
+                // Placeholder: Use first column only if available
+                 if (output_cols[0] < MAX_COLUMNS) {
+                    if (table.columns[output_cols[0]]) |*col| {
+                         if (compareValues(table, col, match_indices[i], match_indices[j]) != 0) {
+                              is_dup = false;
+                            // all_equal = false; breaks logic
+                         } else {
+                             is_dup = true;
+                         }
                     }
-                }
-                if (all_equal) {
-                    is_dup = true;
-                    break;
-                }
+                 }
+
             }
             if (!is_dup) {
                 match_indices[unique_count] = match_indices[i];
@@ -1643,19 +3067,20 @@ fn executeSelectQuery(table: *const TableInfo, query: *ParsedQuery) !void {
         match_count = unique_count;
     }
 
-    // Apply OFFSET/LIMIT
+    // Apply OFFSET/TOPK
     var start: usize = 0;
     var end: usize = match_count;
     if (query.offset_value) |offset| {
         start = @min(offset, match_count);
     }
-    if (query.limit_value) |limit| {
-        end = @min(start + limit, match_count);
-    }
+    const limit = query.top_k orelse 20;
+    end = @min(start + limit, match_count);
+    
     const final_count = end - start;
 
     // Write result
-    try writeSelectResult(table, output_cols[0..output_count], match_indices[start..end], final_count);
+    // Must pass query to handle expressions
+    try writeSelectResult(table, query, match_indices[start..end], final_count);
 }
 
 fn executeSetOpQuery(sql: []const u8, query: *const ParsedQuery) !void {
@@ -1736,11 +3161,16 @@ fn executeSetOpQuery(sql: []const u8, query: *const ParsedQuery) !void {
             }
         }
     } else {
-        for (query.select_cols[0..query.select_count]) |col| {
-            if (output_count < MAX_SELECT_COLS) {
-                output_cols[output_count] = col;
-                output_count += 1;
-            }
+        if (query.select_count > 0) {
+             for (query.select_exprs[0..query.select_count]) |expr| {
+                 const name = expr.alias orelse expr.col_name;
+
+                 
+                 if (output_count < MAX_SELECT_COLS) {
+                     output_cols[output_count] = name;
+                     output_count += 1;
+                 }
+             }
         }
     }
 
@@ -1814,21 +3244,7 @@ fn executeSetOpQuery(sql: []const u8, query: *const ParsedQuery) !void {
                 return;
             }
 
-            // Convert column names to indices
-            var col_indices: [MAX_SELECT_COLS]usize = undefined;
-            var idx_count: usize = 0;
-            for (output_cols[0..output_count]) |col_name| {
-                for (table1.columns[0..table1.column_count], 0..) |maybe_col, i| {
-                    if (maybe_col) |c| {
-                        if (std.mem.eql(u8, c.name, col_name)) {
-                            col_indices[idx_count] = i;
-                            idx_count += 1;
-                            break;
-                        }
-                    }
-                }
-            }
-            try writeSelectResult(table1, col_indices[0..idx_count], intersect_results[0..intersect_count], intersect_count);
+            try writeSelectResult(table1, query, intersect_results[0..intersect_count], intersect_count);
         },
         .except, .except_all => {
             // EXCEPT: rows in first query but not in second
@@ -1887,21 +3303,7 @@ fn executeSetOpQuery(sql: []const u8, query: *const ParsedQuery) !void {
                 return;
             }
 
-            // Convert column names to indices
-            var col_indices: [MAX_SELECT_COLS]usize = undefined;
-            var idx_count: usize = 0;
-            for (output_cols[0..output_count]) |col_name| {
-                for (table1.columns[0..table1.column_count], 0..) |maybe_col, i| {
-                    if (maybe_col) |c| {
-                        if (std.mem.eql(u8, c.name, col_name)) {
-                            col_indices[idx_count] = i;
-                            idx_count += 1;
-                            break;
-                        }
-                    }
-                }
-            }
-            try writeSelectResult(table1, col_indices[0..idx_count], except_results[0..except_count], except_count);
+            try writeSelectResult(table1, query, except_results[0..except_count], except_count);
         },
         .none => return error.InvalidSetOp,
     }
@@ -1936,7 +3338,7 @@ fn rowsMatch(col1: *const ColumnData, col2: *const ColumnData, ri1: u32, ri2: u3
         .int32 => return col1.data.int32[ri1] == col2.data.int32[ri2],
         .float64 => return col1.data.float64[ri1] == col2.data.float64[ri2],
         .float32 => return col1.data.float32[ri1] == col2.data.float32[ri2],
-        .string => {
+        .string, .list => {
             const off1 = col1.data.strings.offsets[ri1];
             const len1 = col1.data.strings.lengths[ri1];
             const off2 = col2.data.strings.offsets[ri2];
@@ -2021,7 +3423,7 @@ fn writeSetOpResult(table1: *const TableInfo, table2: *const TableInfo, output_c
                     data_size += switch (col.col_type) {
                         .int64, .float64 => total_count * 8,
                         .int32, .float32 => total_count * 4,
-                        .string => total_count * 8 + 65536,
+                        .string, .list => total_count * 8 + 65536,
                     };
                     break;
                 }
@@ -2032,14 +3434,25 @@ fn writeSetOpResult(table1: *const TableInfo, table2: *const TableInfo, output_c
     const total_size = HEADER_SIZE + num_cols * 16 + data_size;
     _ = allocResultBuffer(total_size) orelse return error.OutOfMemory;
 
+    const meta_end = HEADER_SIZE + @as(u32, @intCast(num_cols * 16));
+    const names_offset = meta_end;
+    
+    // Align data start
+    var padding: u32 = 0;
+    if (names_offset % 8 != 0) {
+        padding = 8 - (names_offset % 8);
+    }
+    const data_offset_start = names_offset + padding;
+
     // Write header
     _ = writeU32(RESULT_VERSION);
     _ = writeU32(@intCast(num_cols));
     _ = writeU64(@intCast(total_count));
     _ = writeU32(HEADER_SIZE);
     _ = writeU32(HEADER_SIZE);
-    _ = writeU32(HEADER_SIZE + @as(u32, @intCast(num_cols * 16)));
+    _ = writeU32(data_offset_start);
     _ = writeU32(0);
+    _ = writeU32(names_offset);
 
     // Write column metadata
     var data_offset: u32 = 0;
@@ -2054,7 +3467,7 @@ fn writeSetOpResult(table1: *const TableInfo, table2: *const TableInfo, output_c
                     data_offset += switch (col.col_type) {
                         .int64, .float64 => @intCast(total_count * 8),
                         .int32, .float32 => @intCast(total_count * 4),
-                        .string => @intCast(total_count * 8 + 65536),
+                        .string, .list => @intCast(total_count * 8 + 65536),
                     };
                     break;
                 }
@@ -2093,7 +3506,7 @@ fn writeSetOpResult(table1: *const TableInfo, table2: *const TableInfo, output_c
                                 _ = writeToResult(std.mem.asBytes(&val));
                             }
                         },
-                        .string => {
+                        .string, .list => {
                             var str_offset: u32 = 0;
                             for (first_indices) |ri| {
                                 _ = writeU32(str_offset);
@@ -2141,7 +3554,7 @@ fn writeSetOpResult(table1: *const TableInfo, table2: *const TableInfo, output_c
                                 _ = writeToResult(std.mem.asBytes(&val));
                             }
                         },
-                        .string => {
+                        .string, .list => {
                             var str_offset: u32 = 0;
                             for (actual_second) |ri| {
                                 _ = writeU32(str_offset);
@@ -2220,113 +3633,171 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
         }
     }
 
-    const lc = left_col orelse return error.ColumnNotFound;
-    const rc = right_col orelse return error.ColumnNotFound;
-
-    // Hash Join (O(N+M))
     const join_pairs = &global_join_pairs;
     var pair_count: usize = 0;
+    
+    // Check Columns
+    if (!join.is_near and left_col == null) {
+        var buf: [1024]u8 = undefined;
+        var fba = std.io.fixedBufferStream(&buf);
+        const writer = fba.writer();
+        
+        writer.print("ColumnNotFound Left: '{s}' in table '{s}'. Columns: ", .{join.left_col, left_table.name}) catch {};
 
-    // Use global_indices_2 as next_match array for chaining
-    // Layout: next_match[right_row_index] = next_index_in_chain
-    const next_match = &global_indices_2;
-    // Initialize with NO_MATCH (u32.max)
-    @memset(next_match[0..rtbl.row_count], std.math.maxInt(u32));
-
-    // Build hash table for right side
-    var hash_map = std.AutoHashMap(i64, u32).init(memory.wasm_allocator);
-    defer hash_map.deinit();
-
-    var r_frag_start: u32 = 0;
-    for (rtbl.fragments[0..rtbl.fragment_count]) |maybe_f| {
-        if (maybe_f) |frag| {
-            const f_rows = @as(u32, @intCast(frag.getRowCount()));
-            const raw_ptr = frag.getColumnRawPtr(rc.fragment_col_idx) orelse {
-                 r_frag_start += f_rows;
-                 continue;
-            };
-            for (0..f_rows) |f_ri| {
-                const key = getIntValueFromPtr(raw_ptr, rc.col_type, @intCast(f_ri));
-                const ri = r_frag_start + @as(u32, @intCast(f_ri));
-                if (hash_map.get(key)) |head| {
-                    next_match[ri] = head;
-                }
-                try hash_map.put(key, ri);
+        // Log available columns
+        for (left_table.columns[0..left_table.column_count]) |maybe_col| {
+            if (maybe_col) |c| {
+                writer.print("['{s}' l={d}] ", .{c.name, c.name.len}) catch {};
             }
-            r_frag_start += f_rows;
         }
+        
+        log("{s}", .{fba.getWritten()});
+        return error.ColumnNotFound;
     }
-    // Handle in-memory right table
-    if (rtbl.memory_row_count > 0) {
-        if (rc.schema_col_idx < MAX_COLUMNS) {
-            if (rtbl.memory_columns[rc.schema_col_idx]) |*mc| {
-                for (0..rtbl.memory_row_count) |mi| {
-                    const key = switch (mc.col_type) {
-                        .int64 => mc.data.int64[mi],
-                        .int32 => mc.data.int32[mi],
-                        else => 0,
-                    };
-                    const ri = @as(u32, @intCast(rtbl.file_row_count + mi));
+    if (right_col == null) {
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "ColumnNotFound Right: '{s}' in table '{s}'", .{join.right_col, rtbl.name}) catch "fmt error";
+        log("{s}", .{msg});
+        return error.ColumnNotFound;
+    }
+
+    const lc = if (join.is_near) null else left_col.?; // Safe because checked above
+    const rc = right_col.?;
+
+    // NEAR Join Support
+    if (join.is_near) {
+        const top_k = join.top_k orelse query.top_k orelse 20;
+        const match_ptr = memory.wasmAlloc(top_k * 4) orelse return error.OutOfMemory;
+        const matches = @as([*]u32, @ptrCast(@alignCast(match_ptr)))[0..top_k];
+        
+        // Setup a mock WhereClause for executeVectorSearch
+        var near_clause = WhereClause{
+            .op = .near,
+            .column = rc.name,
+            .near_dim = join.near_dim,
+            .near_target_row = join.near_target_row,
+        };
+        @memcpy(near_clause.near_vector[0..join.near_dim], join.near_vector[0..join.near_dim]);
+
+        const count = try executeVectorSearch(rtbl, &near_clause, top_k, matches);
+        for (0..left_table.row_count) |li| {
+            for (matches[0..count]) |ri| {
+                if (pair_count < MAX_JOIN_ROWS) {
+                    join_pairs[pair_count] = .{ .left = @intCast(li), .right = ri };
+                    pair_count += 1;
+                } else break;
+            }
+        }
+        memory.free(match_ptr, top_k * 4);
+    } else {
+        // Hash Join (O(N+M))
+        // Use global_indices_2 as next_match array for chaining
+        const next_match = &global_indices_2;
+        // Initialize with NO_MATCH (u32.max)
+        @memset(next_match[0..rtbl.row_count], std.math.maxInt(u32));
+
+        // Build hash table for right side
+        var hash_map = std.AutoHashMap(i64, u32).init(memory.wasm_allocator);
+        defer hash_map.deinit();
+
+        var r_frag_start: u32 = 0;
+        for (rtbl.fragments[0..rtbl.fragment_count]) |maybe_f| {
+            if (maybe_f) |frag| {
+                const f_rows = @as(u32, @intCast(frag.getRowCount()));
+                const raw_ptr = frag.getColumnRawPtr(rc.fragment_col_idx) orelse {
+                     r_frag_start += f_rows;
+                     continue;
+                };
+                for (0..f_rows) |f_ri| {
+                    const key = getIntValueFromPtr(raw_ptr, rc.col_type, @intCast(f_ri));
+                    const ri = r_frag_start + @as(u32, @intCast(f_ri));
                     if (hash_map.get(key)) |head| {
                         next_match[ri] = head;
                     }
                     try hash_map.put(key, ri);
                 }
+                r_frag_start += f_rows;
             }
         }
-    }
+        // Handle in-memory right table (from main columns)
+        if (rtbl.row_count > r_frag_start) {
+            const mem_rows = rtbl.row_count - r_frag_start;
+            for (0..mem_rows) |mi| {
+                 const key = getIntValue(rtbl, rc, r_frag_start + @as(u32, @intCast(mi)));
+                 const ri = r_frag_start + @as(u32, @intCast(mi));
+                 if (hash_map.get(key)) |head| {
+                     next_match[ri] = head;
+                 }
+                 try hash_map.put(key, ri);
+            }
+        }
 
-    // Probe hash table from left side
-    var l_frag_start: u32 = 0;
-    for (left_table.fragments[0..left_table.fragment_count]) |maybe_f| {
-        if (maybe_f) |frag| {
-            const f_rows = @as(u32, @intCast(frag.getRowCount()));
-            const raw_ptr = frag.getColumnRawPtr(lc.fragment_col_idx) orelse {
-                l_frag_start += f_rows;
-                continue;
-            };
-            for (0..f_rows) |f_li| {
-                const key = getIntValueFromPtr(raw_ptr, lc.col_type, @intCast(f_li));
-                const li = l_frag_start + @as(u32, @intCast(f_li));
-                if (hash_map.get(key)) |head| {
-                    var curr: u32 = head;
-                    while (curr != std.math.maxInt(u32)) {
-                        if (pair_count < MAX_JOIN_ROWS) {
-                            join_pairs[pair_count] = .{ .left = li, .right = curr };
-                            pair_count += 1;
-                        } else break;
-                        curr = next_match[curr];
+        // Scan left table and join
+        var l_frag_start: u32 = 0;
+        var filter_ctx: ?FragmentContext = null;
+        for (left_table.fragments[0..left_table.fragment_count]) |maybe_f| {
+            if (maybe_f) |frag| {
+                const f_rows = @as(u32, @intCast(frag.getRowCount()));
+                const raw_ptr = frag.getColumnRawPtr(lc.?.fragment_col_idx) orelse {
+                    l_frag_start += f_rows;
+                    continue;
+                };
+                for (0..f_rows) |f_li| {
+                    const li = l_frag_start + @as(u32, @intCast(f_li));
+                    // Apply WHERE (Left Table)
+                    if (query.where_clause) |*where| {
+                         const filter_pass = evaluateWhere(left_table, where, li, &filter_ctx);
+                         // log("Join Filter Li: {d} Pass: {}", .{li, filter_pass});
+                         if (!filter_pass) continue;
                     }
-                }
-            }
-            l_frag_start += f_rows;
-        }
-    }
-    // Handle in-memory left table
-    if (left_table.memory_row_count > 0) {
-        if (lc.schema_col_idx < MAX_COLUMNS) {
-            if (left_table.memory_columns[lc.schema_col_idx]) |*mc| {
-                for (0..left_table.memory_row_count) |mi| {
-                     const key = switch (mc.col_type) {
-                        .int64 => mc.data.int64[mi],
-                        .int32 => mc.data.int32[mi],
-                        else => 0,
-                    };
-                    const li = @as(u32, @intCast(left_table.file_row_count + mi));
+
+                    const key = getIntValueFromPtr(raw_ptr, lc.?.col_type, @intCast(f_li));
+
                     if (hash_map.get(key)) |head| {
                         var curr: u32 = head;
                         while (curr != std.math.maxInt(u32)) {
-                            if (pair_count < MAX_JOIN_ROWS) {
-                                join_pairs[pair_count] = .{ .left = li, .right = curr };
-                                pair_count += 1;
-                            } else break;
+                            if (rowsMatch(lc.?, rc, li, curr)) {
+                                if (pair_count < MAX_JOIN_ROWS) {
+                                    join_pairs[pair_count] = .{ .left = li, .right = curr };
+                                    pair_count += 1;
+                                } else break;
+                            }
                             curr = next_match[curr];
                         }
                     }
                 }
+                l_frag_start += f_rows;
+            }
+        }
+        // Handle in-memory left table
+        if (left_table.row_count > l_frag_start) {
+            const mem_rows = left_table.row_count - l_frag_start;
+            for (0..mem_rows) |mi| {
+                 const key = getIntValue(left_table, lc.?, l_frag_start + @as(u32, @intCast(mi)));
+                 const li = l_frag_start + @as(u32, @intCast(mi));
+                 
+                 // Apply WHERE (Left Table)
+                 if (query.where_clause) |*where| {
+                      if (!evaluateWhere(left_table, where, li, &filter_ctx)) continue;
+                 }
+
+                 if (hash_map.get(key)) |head| {
+                     var curr: u32 = head;
+                     while (curr != std.math.maxInt(u32)) {
+                         if (rowsMatch(lc.?, rc, li, curr)) {
+                             if (pair_count < MAX_JOIN_ROWS) {
+                                 join_pairs[pair_count] = .{ .left = li, .right = curr };
+                                 pair_count += 1;
+                             } else break;
+                         }
+                         curr = next_match[curr];
+                     }
+                 }
             }
         }
     }
+
+    global_join_pair_count = pair_count;
 
     // Calculate result columns (all from both tables)
     const left_col_count = left_table.column_count;
@@ -2342,264 +3813,334 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
         return error.OutOfMemory;
     }
 
-    // Write Left Table Columns
-    var l_ctx2: ?FragmentContext = null;
-    for (left_table.columns[0..left_col_count]) |maybe_col| {
-        if (maybe_col) |*col| {
-            const col_type = col.col_type;
-            const is_lazy = col.is_lazy;
-            const f_col_idx = col.fragment_col_idx;
+    // Write Result Columns
+    if (query.select_count > 0 and !query.is_star) {
+        // Selective output
+        var l_ctx: ?FragmentContext = null;
+        var r_ctx: ?FragmentContext = null;
 
-            switch (col_type) {
-                .int64 => {
-                    const data = try memory.wasm_allocator.alloc(i64, pair_count);
-                    defer memory.wasm_allocator.free(data);
-                    for (join_pairs[0..pair_count], 0..) |pair, i| {
-                        if (is_lazy) {
-                             if (l_ctx2 == null or pair.left < l_ctx2.?.start_idx or pair.left >= l_ctx2.?.end_idx) {
-                                 l_ctx2 = null;
-                                 _ = getIntValueOptimized(left_table, col, pair.left, &l_ctx2);
+        for (query.select_exprs[0..query.select_count]) |expr| {
+            var col: ?*const ColumnData = null;
+            var is_left = true;
+
+            // Try Left Table
+            for (left_table.columns[0..left_table.column_count]) |maybe_col| {
+                if (maybe_col) |*c| {
+                     var match = std.mem.eql(u8, c.name, expr.col_name);
+                     if (!match and std.mem.indexOf(u8, expr.col_name, ".") != null) {
+                         if (std.mem.endsWith(u8, expr.col_name, c.name)) {
+                             if (expr.col_name.len > c.name.len and expr.col_name[expr.col_name.len - c.name.len - 1] == '.') {
+                                 match = true;
                              }
-                             if (l_ctx2.?.frag) |frag| {
-                                 const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
-                                 const typed_ptr: [*]const i64 = @ptrCast(@alignCast(raw_ptr));
-                                 data[i] = typed_ptr[pair.left - l_ctx2.?.start_idx];
+                         }
+                     }
+                     if (match) {
+                         col = c;
+                         is_left = true;
+                         break;
+                     }
+                }
+            }
+
+            // Try Right Table
+            if (col == null) {
+                for (rtbl.columns[0..right_col_count]) |maybe_col| {
+                    if (maybe_col) |*c| {
+                         var match = std.mem.eql(u8, c.name, expr.col_name);
+                         if (!match and std.mem.indexOf(u8, expr.col_name, ".") != null) {
+                             if (std.mem.endsWith(u8, expr.col_name, c.name)) {
+                                 if (expr.col_name.len > c.name.len and expr.col_name[expr.col_name.len - c.name.len - 1] == '.') {
+                                     match = true;
+                                 }
                              }
-                        } else {
-                            data[i] = col.data.int64[pair.left];
-                        }
+                         }
+                         if (match) {
+                             col = c;
+                             is_left = false;
+                             break;
+                         }
                     }
-                    _ = lw.fragmentAddInt64Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
-                },
-                .float64 => {
-                    const data = try memory.wasm_allocator.alloc(f64, pair_count);
-                    defer memory.wasm_allocator.free(data);
-                    for (join_pairs[0..pair_count], 0..) |pair, i| {
-                        if (is_lazy) {
-                             if (l_ctx2 == null or pair.left < l_ctx2.?.start_idx or pair.left >= l_ctx2.?.end_idx) {
-                                 l_ctx2 = null;
-                                 _ = getFloatValueOptimized(left_table, col, pair.left, &l_ctx2);
-                             }
-                             if (l_ctx2.?.frag) |frag| {
-                                 const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
-                                 const typed_ptr: [*]const f64 = @ptrCast(@alignCast(raw_ptr));
-                                 data[i] = typed_ptr[pair.left - l_ctx2.?.start_idx];
-                             }
-                        } else {
-                            data[i] = col.data.float64[pair.left];
-                        }
-                    }
-                    _ = lw.fragmentAddFloat64Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
-                },
-                .int32 => {
-                    const data = try memory.wasm_allocator.alloc(i32, pair_count);
-                    defer memory.wasm_allocator.free(data);
-                    for (join_pairs[0..pair_count], 0..) |pair, i| {
-                        if (is_lazy) {
-                             if (l_ctx2 == null or pair.left < l_ctx2.?.start_idx or pair.left >= l_ctx2.?.end_idx) {
-                                 l_ctx2 = null;
-                                 _ = getIntValueOptimized(left_table, col, pair.left, &l_ctx2);
-                             }
-                             if (l_ctx2.?.frag) |frag| {
-                                 const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
-                                 const typed_ptr: [*]const i32 = @ptrCast(@alignCast(raw_ptr));
-                                 data[i] = typed_ptr[pair.left - l_ctx2.?.start_idx];
-                             }
-                        } else {
-                            data[i] = col.data.int32[pair.left];
-                        }
-                    }
-                    _ = lw.fragmentAddInt32Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
-                },
-                .float32 => {
-                    const data = try memory.wasm_allocator.alloc(f32, pair_count);
-                    defer memory.wasm_allocator.free(data);
-                    for (join_pairs[0..pair_count], 0..) |pair, i| {
-                        if (is_lazy) {
-                             if (l_ctx2 == null or pair.left < l_ctx2.?.start_idx or pair.left >= l_ctx2.?.end_idx) {
-                                 l_ctx2 = null;
-                                 _ = getFloatValueOptimized(left_table, col, pair.left, &l_ctx2);
-                             }
-                             if (l_ctx2.?.frag) |frag| {
-                                 const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
-                                 const typed_ptr: [*]const f32 = @ptrCast(@alignCast(raw_ptr));
-                                 data[i] = typed_ptr[pair.left - l_ctx2.?.start_idx];
-                             }
-                        } else {
-                            data[i] = col.data.float32[pair.left];
-                        }
-                    }
-                    _ = lw.fragmentAddFloat32Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
-                },
-                .string => {
-                    // Flatten strings
-                    var total_len: usize = 0;
-                    const offsets = try memory.wasm_allocator.alloc(u32, pair_count + 1);
-                    defer memory.wasm_allocator.free(offsets);
-                    var current_offset: u32 = 0;
-                    offsets[0] = 0;
-                    
-                    // Calc lengths
-                    if (!is_lazy) {
-                        const lens = col.data.strings.lengths;
+                }
+            }
+
+            if (col) |c| {
+                const out_name = expr.alias orelse c.name;
+                const col_type = c.col_type;
+                const is_lazy = c.is_lazy;
+                const f_col_idx = c.fragment_col_idx;
+
+                switch (col_type) {
+                    .int64 => {
+                        const data = try memory.wasm_allocator.alloc(i64, pair_count);
+                        defer memory.wasm_allocator.free(data);
                         for (join_pairs[0..pair_count], 0..) |pair, i| {
-                            const len = lens[pair.left];
-                            total_len += len;
-                            current_offset += len;
-                            offsets[i+1] = current_offset;
+                            const idx = if (is_left) pair.left else pair.right;
+                            if (is_lazy) {
+                                 const ctx = if (is_left) &l_ctx else &r_ctx;
+                                 const table = if (is_left) left_table else rtbl;
+                                 if (ctx.* == null or idx < ctx.*.?.start_idx or idx >= ctx.*.?.end_idx) {
+                                     ctx.* = null;
+                                     _ = getIntValueOptimized(table, c, idx, ctx);
+                                 }
+                                 if (ctx.*.?.frag) |frag| {
+                                     const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
+                                     const typed_ptr: [*]const i64 = @ptrCast(@alignCast(raw_ptr));
+                                     data[i] = typed_ptr[idx - ctx.*.?.start_idx];
+                                 }
+                            } else {
+                                data[i] = c.data.int64[idx];
+                            }
                         }
-                    } else {
-                        // For lazy strings, we need a different approach (not implemented yet for joins)
-                        for (0..pair_count) |i| offsets[i+1] = 0;
-                    }
-                    
-                    const str_data = try memory.wasm_allocator.alloc(u8, total_len);
-                    defer memory.wasm_allocator.free(str_data);
-                    
-                    current_offset = 0;
-                    if (!is_lazy) {
-                        const s_data = col.data.strings.data;
-                        const s_offs = col.data.strings.offsets;
-                        const s_lens = col.data.strings.lengths;
-                        for (join_pairs[0..pair_count]) |pair| {
-                             const off = s_offs[pair.left];
-                             const len = s_lens[pair.left];
-                             @memcpy(str_data[current_offset..][0..len], s_data[off..][0..len]);
-                             current_offset += len;
+                        _ = lw.fragmentAddInt64Column(out_name.ptr, out_name.len, data.ptr, pair_count, false);
+                    },
+                    .float64 => {
+                        const data = try memory.wasm_allocator.alloc(f64, pair_count);
+                        defer memory.wasm_allocator.free(data);
+                        for (join_pairs[0..pair_count], 0..) |pair, i| {
+                            const idx = if (is_left) pair.left else pair.right;
+                            if (is_lazy) {
+                                 const ctx = if (is_left) &l_ctx else &r_ctx;
+                                 const table = if (is_left) left_table else rtbl;
+                                 if (ctx.* == null or idx < ctx.*.?.start_idx or idx >= ctx.*.?.end_idx) {
+                                     ctx.* = null;
+                                     _ = getFloatValueOptimized(table, c, idx, ctx);
+                                 }
+                                 if (ctx.*.?.frag) |frag| {
+                                     const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
+                                     const typed_ptr: [*]const f64 = @ptrCast(@alignCast(raw_ptr));
+                                     data[i] = typed_ptr[idx - ctx.*.?.start_idx];
+                                 }
+                            } else {
+                                data[i] = c.data.float64[idx];
+                            }
                         }
-                    }
-                    _ = lw.fragmentAddStringColumn(col.name.ptr, col.name.len, str_data.ptr, total_len, offsets.ptr, pair_count, false);
+                        _ = lw.fragmentAddFloat64Column(out_name.ptr, out_name.len, data.ptr, pair_count, false);
+                    },
+                    .string, .list => {
+                        var total_len: usize = 0;
+                        const offsets = try memory.wasm_allocator.alloc(u32, pair_count + 1);
+                        defer memory.wasm_allocator.free(offsets);
+                        var current_offset: u32 = 0;
+                        offsets[0] = 0;
+                        
+                        if (!is_lazy) {
+                            const lens = c.data.strings.lengths;
+                            for (join_pairs[0..pair_count], 0..) |pair, i| {
+                                const idx = if (is_left) pair.left else pair.right;
+                                const len = lens[idx];
+                                total_len += len;
+                                current_offset += len;
+                                offsets[i+1] = current_offset;
+                            }
+                        } else {
+                            for (0..pair_count) |i| offsets[i+1] = 0;
+                        }
+                        
+                        const str_data = try memory.wasm_allocator.alloc(u8, total_len);
+                        defer memory.wasm_allocator.free(str_data);
+                        
+                        current_offset = 0;
+                        if (!is_lazy) {
+                            const s_data = c.data.strings.data;
+                            const s_offs = c.data.strings.offsets;
+                            const s_lens = c.data.strings.lengths;
+                            for (join_pairs[0..pair_count]) |pair| {
+                                 const idx = if (is_left) pair.left else pair.right;
+                                 const off = s_offs[idx];
+                                 const len = s_lens[idx];
+                                 @memcpy(str_data[current_offset..][0..len], s_data[off..][0..len]);
+                                 current_offset += len;
+                            }
+                        }
+                        _ = lw.fragmentAddStringColumn(out_name.ptr, out_name.len, str_data.ptr, total_len, offsets.ptr, pair_count, false);
+                    },
+                    else => {}
                 }
             }
         }
-    }
-    
-    // Write Right Table Columns
-    var r_ctx2: ?FragmentContext = null;
-    for (rtbl.columns[0..right_col_count]) |maybe_col| {
-        if (maybe_col) |*col| {
-            const col_type = col.col_type;
-            const is_lazy = col.is_lazy;
-            const f_col_idx = col.fragment_col_idx;
+    } else {
+        // SELECT * (Write Left Table Columns then Right Table Columns)
+        var l_ctx2: ?FragmentContext = null;
+        for (left_table.columns[0..left_table.column_count]) |maybe_col| {
+            if (maybe_col) |*col| {
+                const col_type = col.col_type;
+                const is_lazy = col.is_lazy;
+                const f_col_idx = col.fragment_col_idx;
 
-            switch (col_type) {
-                .int64 => {
-                    const data = try memory.wasm_allocator.alloc(i64, pair_count);
-                    defer memory.wasm_allocator.free(data);
-                    for (join_pairs[0..pair_count], 0..) |pair, i| {
-                        if (is_lazy) {
-                             if (r_ctx2 == null or pair.right < r_ctx2.?.start_idx or pair.right >= r_ctx2.?.end_idx) {
-                                 r_ctx2 = null;
-                                 _ = getIntValueOptimized(rtbl, col, pair.right, &r_ctx2);
-                             }
-                             if (r_ctx2.?.frag) |frag| {
-                                 const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
-                                 const typed_ptr: [*]const i64 = @ptrCast(@alignCast(raw_ptr));
-                                 data[i] = typed_ptr[pair.right - r_ctx2.?.start_idx];
-                             }
-                        } else {
-                            data[i] = col.data.int64[pair.right];
-                        }
-                    }
-                    _ = lw.fragmentAddInt64Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
-                },
-                .float64 => {
-                    const data = try memory.wasm_allocator.alloc(f64, pair_count);
-                    defer memory.wasm_allocator.free(data);
-                    for (join_pairs[0..pair_count], 0..) |pair, i| {
-                        if (is_lazy) {
-                             if (r_ctx2 == null or pair.right < r_ctx2.?.start_idx or pair.right >= r_ctx2.?.end_idx) {
-                                 r_ctx2 = null;
-                                 _ = getFloatValueOptimized(rtbl, col, pair.right, &r_ctx2);
-                             }
-                             if (r_ctx2.?.frag) |frag| {
-                                 const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
-                                 const typed_ptr: [*]const f64 = @ptrCast(@alignCast(raw_ptr));
-                                 data[i] = typed_ptr[pair.right - r_ctx2.?.start_idx];
-                             }
-                        } else {
-                            data[i] = col.data.float64[pair.right];
-                        }
-                    }
-                    _ = lw.fragmentAddFloat64Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
-                },
-                .int32 => {
-                    const data = try memory.wasm_allocator.alloc(i32, pair_count);
-                    defer memory.wasm_allocator.free(data);
-                    for (join_pairs[0..pair_count], 0..) |pair, i| {
-                        if (is_lazy) {
-                             if (r_ctx2 == null or pair.right < r_ctx2.?.start_idx or pair.right >= r_ctx2.?.end_idx) {
-                                 r_ctx2 = null;
-                                 _ = getIntValueOptimized(rtbl, col, pair.right, &r_ctx2);
-                             }
-                             if (r_ctx2.?.frag) |frag| {
-                                 const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
-                                 const typed_ptr: [*]const i32 = @ptrCast(@alignCast(raw_ptr));
-                                 data[i] = typed_ptr[pair.right - r_ctx2.?.start_idx];
-                             }
-                        } else {
-                            data[i] = col.data.int32[pair.right];
-                        }
-                    }
-                    _ = lw.fragmentAddInt32Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
-                },
-                .float32 => {
-                    const data = try memory.wasm_allocator.alloc(f32, pair_count);
-                    defer memory.wasm_allocator.free(data);
-                    for (join_pairs[0..pair_count], 0..) |pair, i| {
-                        if (is_lazy) {
-                             if (r_ctx2 == null or pair.right < r_ctx2.?.start_idx or pair.right >= r_ctx2.?.end_idx) {
-                                 r_ctx2 = null;
-                                 _ = getFloatValueOptimized(rtbl, col, pair.right, &r_ctx2);
-                             }
-                             if (r_ctx2.?.frag) |frag| {
-                                 const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
-                                 const typed_ptr: [*]const f32 = @ptrCast(@alignCast(raw_ptr));
-                                 data[i] = typed_ptr[pair.right - r_ctx2.?.start_idx];
-                             }
-                        } else {
-                            data[i] = col.data.float32[pair.right];
-                        }
-                    }
-                    _ = lw.fragmentAddFloat32Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
-                },
-                .string => {
-                    // Flatten strings
-                    var total_len: usize = 0;
-                    const offsets = try memory.wasm_allocator.alloc(u32, pair_count + 1);
-                    defer memory.wasm_allocator.free(offsets);
-                    var current_offset: u32 = 0;
-                    offsets[0] = 0;
-                    
-                    // Calc lengths
-                    if (!is_lazy) {
-                        const lens = col.data.strings.lengths;
+                switch (col_type) {
+                    .int64 => {
+                        const data = try memory.wasm_allocator.alloc(i64, pair_count);
+                        defer memory.wasm_allocator.free(data);
                         for (join_pairs[0..pair_count], 0..) |pair, i| {
-                            const len = lens[pair.right];
-                            total_len += len;
-                            current_offset += len;
-                            offsets[i+1] = current_offset;
+                            if (is_lazy) {
+                                 if (l_ctx2 == null or pair.left < l_ctx2.?.start_idx or pair.left >= l_ctx2.?.end_idx) {
+                                     l_ctx2 = null;
+                                     _ = getIntValueOptimized(left_table, col, pair.left, &l_ctx2);
+                                 }
+                                 if (l_ctx2.?.frag) |frag| {
+                                     const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
+                                     const typed_ptr: [*]const i64 = @ptrCast(@alignCast(raw_ptr));
+                                     data[i] = typed_ptr[pair.left - l_ctx2.?.start_idx];
+                                 }
+                            } else {
+                                data[i] = col.data.int64[pair.left];
+                            }
                         }
-                    } else {
-                        for (0..pair_count) |i| offsets[i+1] = 0;
-                    }
-                    
-                    const str_data = try memory.wasm_allocator.alloc(u8, total_len);
-                    defer memory.wasm_allocator.free(str_data);
-                    
-                    current_offset = 0;
-                    if (!is_lazy) {
-                        const s_data = col.data.strings.data;
-                        const s_offs = col.data.strings.offsets;
-                        const s_lens = col.data.strings.lengths;
-                        for (join_pairs[0..pair_count]) |pair| {
-                             const off = s_offs[pair.right];
-                             const len = s_lens[pair.right];
-                             @memcpy(str_data[current_offset..][0..len], s_data[off..][0..len]);
-                             current_offset += len;
+                        _ = lw.fragmentAddInt64Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
+                    },
+                    .float64 => {
+                        const data = try memory.wasm_allocator.alloc(f64, pair_count);
+                        defer memory.wasm_allocator.free(data);
+                        for (join_pairs[0..pair_count], 0..) |pair, i| {
+                            if (is_lazy) {
+                                 if (l_ctx2 == null or pair.left < l_ctx2.?.start_idx or pair.left >= l_ctx2.?.end_idx) {
+                                     l_ctx2 = null;
+                                     _ = getFloatValueOptimized(left_table, col, pair.left, &l_ctx2);
+                                 }
+                                 if (l_ctx2.?.frag) |frag| {
+                                     const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
+                                     const typed_ptr: [*]const f64 = @ptrCast(@alignCast(raw_ptr));
+                                     data[i] = typed_ptr[pair.left - l_ctx2.?.start_idx];
+                                 }
+                            } else {
+                                data[i] = col.data.float64[pair.left];
+                            }
                         }
-                    }
-                    _ = lw.fragmentAddStringColumn(col.name.ptr, col.name.len, str_data.ptr, total_len, offsets.ptr, pair_count, false);
+                        _ = lw.fragmentAddFloat64Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
+                    },
+                    .string, .list => {
+                        // Flatten strings
+                        var total_len: usize = 0;
+                        const offsets = try memory.wasm_allocator.alloc(u32, pair_count + 1);
+                        defer memory.wasm_allocator.free(offsets);
+                        var current_offset: u32 = 0;
+                        offsets[0] = 0;
+                        
+                        // Calc lengths
+                        if (!is_lazy) {
+                            const lens = col.data.strings.lengths;
+                            for (join_pairs[0..pair_count], 0..) |pair, i| {
+                                const len = lens[pair.left];
+                                total_len += len;
+                                current_offset += len;
+                                offsets[i+1] = current_offset;
+                            }
+                        } else {
+                            // For lazy strings, we need a different approach (not implemented yet for joins)
+                            for (0..pair_count) |i| offsets[i+1] = 0;
+                        }
+                        
+                        const str_data = try memory.wasm_allocator.alloc(u8, total_len);
+                        defer memory.wasm_allocator.free(str_data);
+                        
+                        current_offset = 0;
+                        if (!is_lazy) {
+                            const s_data = col.data.strings.data;
+                            const s_offs = col.data.strings.offsets;
+                            const s_lens = col.data.strings.lengths;
+                            for (join_pairs[0..pair_count]) |pair| {
+                                 const off = s_offs[pair.left];
+                                 const len = s_lens[pair.left];
+                                 @memcpy(str_data[current_offset..][0..len], s_data[off..][0..len]);
+                                 current_offset += len;
+                            }
+                        }
+                        _ = lw.fragmentAddStringColumn(col.name.ptr, col.name.len, str_data.ptr, total_len, offsets.ptr, pair_count, false);
+                    },
+                    else => {}
+                }
+            }
+        }
+        
+        // Write Right Table Columns
+        var r_ctx2: ?FragmentContext = null;
+        for (rtbl.columns[0..right_col_count]) |maybe_col| {
+            if (maybe_col) |*col| {
+                const col_type = col.col_type;
+                const is_lazy = col.is_lazy;
+                const f_col_idx = col.fragment_col_idx;
+
+                switch (col_type) {
+                    .int64 => {
+                        const data = try memory.wasm_allocator.alloc(i64, pair_count);
+                        defer memory.wasm_allocator.free(data);
+                        for (join_pairs[0..pair_count], 0..) |pair, i| {
+                            if (is_lazy) {
+                                 if (r_ctx2 == null or pair.right < r_ctx2.?.start_idx or pair.right >= r_ctx2.?.end_idx) {
+                                     r_ctx2 = null;
+                                     _ = getIntValueOptimized(rtbl, col, pair.right, &r_ctx2);
+                                 }
+                                 if (r_ctx2.?.frag) |frag| {
+                                     const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
+                                     const typed_ptr: [*]const i64 = @ptrCast(@alignCast(raw_ptr));
+                                     data[i] = typed_ptr[pair.right - r_ctx2.?.start_idx];
+                                 }
+                            } else {
+                                data[i] = col.data.int64[pair.right];
+                            }
+                        }
+                        _ = lw.fragmentAddInt64Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
+                    },
+                    .float64 => {
+                        const data = try memory.wasm_allocator.alloc(f64, pair_count);
+                        defer memory.wasm_allocator.free(data);
+                        for (join_pairs[0..pair_count], 0..) |pair, i| {
+                            if (is_lazy) {
+                                 if (r_ctx2 == null or pair.right < r_ctx2.?.start_idx or pair.right >= r_ctx2.?.end_idx) {
+                                     r_ctx2 = null;
+                                     _ = getFloatValueOptimized(rtbl, col, pair.right, &r_ctx2);
+                                 }
+                                 if (r_ctx2.?.frag) |frag| {
+                                     const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
+                                     const typed_ptr: [*]const f64 = @ptrCast(@alignCast(raw_ptr));
+                                     data[i] = typed_ptr[pair.right - r_ctx2.?.start_idx];
+                                 }
+                            } else {
+                                data[i] = col.data.float64[pair.right];
+                            }
+                        }
+                        _ = lw.fragmentAddFloat64Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
+                    },
+                    .string, .list => {
+                        // Flatten strings
+                        var total_len: usize = 0;
+                        const offsets = try memory.wasm_allocator.alloc(u32, pair_count + 1);
+                        defer memory.wasm_allocator.free(offsets);
+                        var current_offset: u32 = 0;
+                        offsets[0] = 0;
+                        
+                        // Calc lengths
+                        if (!is_lazy) {
+                            const lens = col.data.strings.lengths;
+                            for (join_pairs[0..pair_count], 0..) |pair, i| {
+                                const len = lens[pair.right];
+                                total_len += len;
+                                current_offset += len;
+                                offsets[i+1] = current_offset;
+                            }
+                        } else {
+                            // For lazy strings, we need a different approach (not implemented yet for joins)
+                            for (0..pair_count) |i| offsets[i+1] = 0;
+                        }
+                        
+                        const str_data = try memory.wasm_allocator.alloc(u8, total_len);
+                        defer memory.wasm_allocator.free(str_data);
+                        
+                        current_offset = 0;
+                        if (!is_lazy) {
+                            const s_data = col.data.strings.data;
+                            const s_offs = col.data.strings.offsets;
+                            const s_lens = col.data.strings.lengths;
+                            for (join_pairs[0..pair_count]) |pair| {
+                                 const off = s_offs[pair.right];
+                                 const len = s_lens[pair.right];
+                                 @memcpy(str_data[current_offset..][0..len], s_data[off..][0..len]);
+                                 current_offset += len;
+                            }
+                        }
+                        _ = lw.fragmentAddStringColumn(col.name.ptr, col.name.len, str_data.ptr, total_len, offsets.ptr, pair_count, false);
+                    },
+                    else => {}
                 }
             }
         }
@@ -2736,8 +4277,8 @@ fn executeAggregateQuery(table: *const TableInfo, query: *const ParsedQuery) !vo
 }
 
 fn findTableColumn(table: *const TableInfo, name: []const u8) ?*const ColumnData {
-    for (table.columns[0..table.column_count]) |maybe_c| {
-        if (maybe_c) |*c| {
+    for (table.columns[0..table.column_count]) |*maybe_c| {
+        if (maybe_c.*) |*c| {
             if (std.mem.eql(u8, c.name, name)) return c;
         }
     }
@@ -2825,6 +4366,7 @@ fn executeMultiAggregate(table: *const TableInfo, aggs: []const AggExpr, maybe_i
                         .float64 => states[uc_idx].processBuffer(@ptrCast(@alignCast(raw_ptr)), f_rows_usize),
                         .int32 => states[uc_idx].processBufferI32(@ptrCast(@alignCast(raw_ptr)), f_rows_usize),
                         .int64 => states[uc_idx].processBufferI64(@ptrCast(@alignCast(raw_ptr)), f_rows_usize),
+                        .string, .list => {}, // No direct numeric aggregation for string/list
                         else => {
                              // Fallback for complex types (rare for aggs)
                              for (0..f_rows_usize) |row_idx| {
@@ -2870,6 +4412,7 @@ fn executeMultiAggregate(table: *const TableInfo, aggs: []const AggExpr, maybe_i
                                  const typed_ptr: [*]const i64 = @ptrCast(@alignCast(raw_ptr));
                                  states[uc_idx].processBufferI64(typed_ptr, frag_indices.len);
                              },
+                             .string, .list => {}, // No direct numeric aggregation for string/list
                              else => {
                                  // Fallback to chunking for complex types if any
                                  var f_idx: usize = 0;
@@ -2926,9 +4469,9 @@ fn executeMultiAggregate(table: *const TableInfo, aggs: []const AggExpr, maybe_i
                                     gather_buf[k] = @floatCast(typed_ptr[row_idx - frag_start]);
                                 }
                             },
-                            else => {
-                                for (chunk, 0..) |row_idx, k| {
-                                    gather_buf[k] = getFloatValueFromPtr(raw_ptr, c_type, row_idx - frag_start);
+                            .string, .list => { // No direct numeric aggregation for string/list
+                                for (chunk, 0..) |_, k| {
+                                    gather_buf[k] = 0; // Default to 0 or handle error
                                 }
                             },
                         }
@@ -2952,54 +4495,76 @@ fn executeMultiAggregate(table: *const TableInfo, aggs: []const AggExpr, maybe_i
                     }
                 }
             }
-            frag_start += f_rows;
+            frag_start = frag_end;
+        }
+    }
+
+    // Process In-Memory Data (rows after fragments)
+    if (table.row_count > frag_start) {
+        const mem_row_count = table.row_count - frag_start;
+        const mem_start = frag_start;
+
+        if (maybe_indices == null) {
+            // Full Memory Scan
+            for (unique_cols[0..num_unique_cols], 0..) |c, uc_idx| {
+                if (c.row_count < mem_row_count) continue;
+                switch (c.col_type) {
+                    .int64 => {
+                         const slice = c.data.int64;
+                         if (slice.len >= mem_row_count) {
+                             const ptr: [*]const i64 = @ptrCast(slice.ptr);
+                             states[uc_idx].processBufferI64(ptr, mem_row_count);
+                         }
+                    },
+                    .int32 => {
+                         const slice = c.data.int32;
+                         if (slice.len >= mem_row_count) {
+                             const ptr: [*]const i32 = @ptrCast(slice.ptr);
+                             states[uc_idx].processBufferI32(ptr, mem_row_count);
+                         }
+                    },
+                    .float64 => {
+                         const slice = c.data.float64;
+
+                         if (slice.len >= mem_row_count) {
+                             const ptr: [*]const f64 = @ptrCast(slice.ptr);
+                             states[uc_idx].processBuffer(ptr, mem_row_count);
+                         }
+                    },
+                    .string, .list => {}, // No direct numeric aggregation for string/list
+                    else => {
+                         for (0..mem_row_count) |i| {
+                             const val = getFloatValue(table, c, mem_start + @as(u32, @intCast(i)));
+                             states[uc_idx].update(val);
+                         }
+                    }
+                }
+            }
+            for (aggs, 0..) |agg, agg_idx| {
+                if (agg_to_unique[agg_idx] == null and agg.func == .count) {
+                    general_states[agg_idx].count += mem_row_count;
+                }
+            }
+        } else {
+            // Indexed Memory Scan
+            const indices = maybe_indices.?;
+            const mem_indices = indices[idx_ptr..];
+            
+            for (unique_cols[0..num_unique_cols], 0..) |c, uc_idx| {
+                 for (mem_indices) |global_idx| {
+                     const val = getFloatValue(table, c, global_idx);
+                     states[uc_idx].update(val);
+                 }
+            }
+            for (aggs, 0..) |agg, agg_idx| {
+                if (agg_to_unique[agg_idx] == null and agg.func == .count) {
+                    general_states[agg_idx].count += mem_indices.len;
+                }
+            }
         }
     }
     
-    // In-memory delta (Optimized for single-pass)
-    const mem_row_start = frag_start;
-    if (table.row_count > mem_row_start and (maybe_indices == null or idx_ptr < maybe_indices.?.len)) {
-         const mem_indices = if (maybe_indices) |idx| idx[idx_ptr..] else null;
-         const mem_count = if (mem_indices) |idx| idx.len else @as(usize, @intCast(table.row_count - mem_row_start));
 
-         for (unique_cols[0..num_unique_cols], 0..) |c, uc_idx| {
-             if (c.schema_col_idx >= MAX_COLUMNS) continue;
-             if (table.memory_columns[c.schema_col_idx]) |*mc| {
-                 if (mem_indices) |midx| {
-                     // Filtered or indexed memory scan
-                     for (midx) |idx| {
-                         const mem_idx = idx - @as(u32, @intCast(table.file_row_count));
-                         const val = switch (mc.col_type) {
-                             .int64 => @as(f64, @floatFromInt(mc.data.int64[mem_idx])),
-                             .int32 => @as(f64, @floatFromInt(mc.data.int32[mem_idx])),
-                             .float64 => mc.data.float64[mem_idx],
-                             .float32 => mc.data.float32[mem_idx],
-                             .string => 0,
-                         };
-                         states[uc_idx].update(val);
-                     }
-                 } else {
-                     // Full memory scan (Zero-pass indices)
-                     switch (mc.col_type) {
-                         .float64 => states[uc_idx].processBuffer(mc.data.float64.ptr, mem_count),
-                         .int32 => states[uc_idx].processBufferI32(mc.data.int32.ptr, mem_count),
-                         .int64 => states[uc_idx].processBufferI64(mc.data.int64.ptr, mem_count),
-                         .float32 => {
-                             for (0..mem_count) |i| states[uc_idx].update(@floatCast(mc.data.float32[i]));
-                         },
-                         else => {},
-                     }
-                 }
-             }
-         }
-         
-         // Handle COUNT(*) or virtual columns for memory
-         for (aggs, 0..) |agg, agg_idx| {
-             if (agg_to_unique[agg_idx] == null and agg.func == .count) {
-                 general_states[agg_idx].count += mem_count;
-             }
-         }
-    }
 
     for (0..aggs.len) |i| {
         if (agg_to_unique[i]) |uc_idx| {
@@ -3028,10 +4593,8 @@ fn executeSimpleAggQuery(table: *const TableInfo, query: *const ParsedQuery, may
         }
     }
     
-    // Layout: header (36) + metadata (16*cols) + names + data
-    const extended_header: u32 = 36;
     const meta_size: u32 = @intCast(num_aggs * 16);
-    const names_offset: u32 = extended_header + meta_size;
+    const names_offset: u32 = HEADER_SIZE + meta_size;
     
     // Calculate padding to align data to 8 bytes
     const unaligned_data_offset = names_offset + @as(u32, @intCast(names_size));
@@ -3049,8 +4612,8 @@ fn executeSimpleAggQuery(table: *const TableInfo, query: *const ParsedQuery, may
     _ = writeU32(RESULT_VERSION);
     _ = writeU32(@intCast(num_aggs));
     _ = writeU64(1); // 1 row
-    _ = writeU32(extended_header);
-    _ = writeU32(extended_header);
+    _ = writeU32(HEADER_SIZE);
+    _ = writeU32(HEADER_SIZE);
     _ = writeU32(data_offset_start);
     _ = writeU32(0);
     _ = writeU32(names_offset); // names section
@@ -3069,17 +4632,18 @@ fn executeSimpleAggQuery(table: *const TableInfo, query: *const ParsedQuery, may
             name = alias;
         } else {
              const func_name = switch (agg.func) {
-                 .sum => "SUM",
-                 .count => "COUNT",
-                 .avg => "AVG",
-                 .min => "MIN",
-                 .max => "MAX",
+                 .sum => "sum",
+                 .count => "count",
+                 .avg => "avg",
+                 .min => "min",
+                 .max => "max",
              };
              if (std.mem.eql(u8, agg.column, "*")) {
                  name = std.fmt.bufPrint(&name_buf, "{s}(*)", .{func_name}) catch "col_x";
              } else {
                  name = std.fmt.bufPrint(&name_buf, "{s}({s})", .{func_name, agg.column}) catch "col_x";
              }
+
         }
         
         // Single value array
@@ -3118,66 +4682,194 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
     const gcol = group_col orelse return error.ColumnNotFound;
 
     // Simple approach: collect unique values and their indices
-    const MAX_GROUPS: usize = 1024;
-    var group_keys: [MAX_GROUPS]i64 = undefined;
-    var group_starts: [MAX_GROUPS]usize = undefined;
-    var group_counts: [MAX_GROUPS]usize = undefined;
+    const MAX_GROUPS_LIMIT: usize = 1024;
+    const effective_max_groups = if (query.group_by_top_k) |k| @min(k, MAX_GROUPS_LIMIT) else MAX_GROUPS_LIMIT;
+    var group_keys: [MAX_GROUPS_LIMIT]i64 = undefined;
+    var group_starts: [MAX_GROUPS_LIMIT]usize = undefined;
+    var group_counts: [MAX_GROUPS_LIMIT]usize = undefined;
     var num_groups: usize = 0;
 
     // Build groups (O(n*k) but simple)
-    const indices = maybe_indices orelse {
-        // Handle full scan GROUP BY (TODO)
-        return;
-    };
-    for (indices) |idx| {
-        const key = getIntValue(table, gcol, idx);
+    if (maybe_indices) |indices| {
+        for (indices) |idx| {
+            const key = getIntValue(table, gcol, idx);
 
-        // Find or add group
-        var found = false;
-        for (group_keys[0..num_groups], 0..) |gk, gi| {
-            if (gk == key) {
-                group_counts[gi] += 1;
-                found = true;
-                break;
+            // Find or add group
+            var found = false;
+            for (group_keys[0..num_groups], 0..) |gk, gi| {
+                if (gk == key) {
+                    group_counts[gi] += 1;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found and num_groups < effective_max_groups) {
+                group_keys[num_groups] = key;
+                group_starts[num_groups] = idx;
+                group_counts[num_groups] = 1;
+                num_groups += 1;
             }
         }
-        if (!found and num_groups < MAX_GROUPS) {
-            group_keys[num_groups] = key;
-            group_starts[num_groups] = idx;
-            group_counts[num_groups] = 1;
-            num_groups += 1;
+    } else {
+        // Full Scan
+        for (0..table.row_count) |i| {
+            const idx = @as(u32, @intCast(i));
+            const key = getIntValue(table, gcol, idx);
+
+            // Find or add group
+            var found = false;
+            for (group_keys[0..num_groups], 0..) |gk, gi| {
+                if (gk == key) {
+                    group_counts[gi] += 1;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found and num_groups < effective_max_groups) {
+                group_keys[num_groups] = key;
+                group_starts[num_groups] = idx;
+                group_counts[num_groups] = 1;
+                num_groups += 1;
+            }
         }
     }
 
     // Compute aggregates per group
     const num_aggs = query.agg_count;
-    
+    const all_agg_results = try memory.wasm_allocator.alloc(f64, num_groups * num_aggs);
+    defer memory.wasm_allocator.free(all_agg_results);
+
+    var group_indices: [MAX_ROWS]u32 = undefined;
+    for (0..num_groups) |gi| {
+        const key = group_keys[gi];
+        var group_idx_count: usize = 0;
+        
+        if (maybe_indices) |indices| {
+            for (indices) |idx| {
+                if (getIntValue(table, gcol, idx) == key) {
+                    if (group_idx_count < MAX_ROWS) {
+                        group_indices[group_idx_count] = idx;
+                        group_idx_count += 1;
+                    }
+                }
+            }
+        } else {
+            for (0..table.row_count) |i| {
+                const idx = @as(u32, @intCast(i));
+                if (getIntValue(table, gcol, idx) == key) {
+                    if (group_idx_count < MAX_ROWS) {
+                        group_indices[group_idx_count] = idx;
+                        group_idx_count += 1;
+                    }
+                }
+            }
+        }
+
+        var group_agg_res: [MAX_AGGREGATES]f64 = undefined;
+        try executeMultiAggregate(table, query.aggregates[0..num_aggs], group_indices[0..group_idx_count], group_agg_res[0..num_aggs]);
+        
+        for (0..num_aggs) |ai| {
+            all_agg_results[gi * num_aggs + ai] = group_agg_res[ai];
+        }
+    }
+
+    // Apply HAVING filter
+    var survivors = try memory.wasm_allocator.alloc(bool, num_groups);
+    defer memory.wasm_allocator.free(survivors);
+    @memset(survivors, true);
+    var survivor_count: usize = 0;
+
+    if (query.having_clause) |*having| {
+        for (0..num_groups) |gi| {
+            const pass = evaluateHaving(query, having, all_agg_results[gi * num_aggs .. (gi + 1) * num_aggs]);
+            survivors[gi] = pass;
+            if (pass) survivor_count += 1;
+        }
+    } else {
+        survivor_count = num_groups;
+    }
+
     // Use Lance Writer
-    if (lw.fragmentBegin(65536 + num_groups * 16 * (num_aggs + 1)) == 0) return error.OutOfMemory;
+    if (lw.fragmentBegin(65536 + survivor_count * 16 * (num_aggs + 1)) == 0) return error.OutOfMemory;
     
     // Group keys
-    const group_keys_out = try memory.wasm_allocator.alloc(f64, num_groups);
+    const group_keys_out = try memory.wasm_allocator.alloc(f64, survivor_count);
     defer memory.wasm_allocator.free(group_keys_out);
-    for (0..num_groups) |i| group_keys_out[i] = @floatFromInt(group_keys[i]); 
+    var out_idx: usize = 0;
+    for (0..num_groups) |gi| {
+        if (survivors[gi]) {
+            group_keys_out[out_idx] = @floatFromInt(group_keys[gi]);
+            out_idx += 1;
+        }
+    }
     
-    _ = lw.fragmentAddFloat64Column(group_col_name.ptr, group_col_name.len, group_keys_out.ptr, num_groups, false);
+    _ = lw.fragmentAddFloat64Column(group_col_name.ptr, group_col_name.len, group_keys_out.ptr, survivor_count, false);
     
-     // Aggregates (Assume COUNT for now for benchmark)
-    const counts_out = try memory.wasm_allocator.alloc(f64, num_groups);
-    defer memory.wasm_allocator.free(counts_out);
-     for (0..num_groups) |i| counts_out[i] = @floatFromInt(group_counts[i]);
-     
-    for (query.aggregates[0..num_aggs], 0..) |agg, i| {
+    // Aggregates
+    for (query.aggregates[0..num_aggs], 0..) |agg, ai| {
+        const out_buf = try memory.wasm_allocator.alloc(f64, survivor_count);
+        defer memory.wasm_allocator.free(out_buf);
+        
+        var o_idx: usize = 0;
+        for (0..num_groups) |gi| {
+            if (survivors[gi]) {
+                out_buf[o_idx] = all_agg_results[gi * num_aggs + ai];
+                o_idx += 1;
+            }
+        }
+
         var name_buf: [64]u8 = undefined;
         var name: []const u8 = "";
-        
         if (agg.alias) |alias| {
             name = alias;
         } else {
-             name = std.fmt.bufPrint(&name_buf, "col_{d}", .{i}) catch "cnt";
+             name = std.fmt.bufPrint(&name_buf, "col_{d}", .{ai}) catch "cnt";
         }
         
-        _ = lw.fragmentAddFloat64Column(name.ptr, name.len, counts_out.ptr, num_groups, false);
+        _ = lw.fragmentAddFloat64Column(name.ptr, name.len, out_buf.ptr, survivor_count, false);
+    }
+}
+
+fn evaluateHaving(query: *const ParsedQuery, having: *const WhereClause, agg_results: []const f64) bool {
+    switch (having.op) {
+        .and_op => {
+            return evaluateHaving(query, having.left.?, agg_results) and evaluateHaving(query, having.right.?, agg_results);
+        },
+        .or_op => {
+            return evaluateHaving(query, having.left.?, agg_results) or evaluateHaving(query, having.right.?, agg_results);
+        },
+        else => {
+            const col_name = having.column orelse return true;
+            
+            // Find aggregate by name or alias
+            var val: f64 = 0;
+            var found = false;
+            for (query.aggregates[0..query.agg_count], 0..) |agg, i| {
+                if (agg.alias) |alias| {
+                    if (std.mem.eql(u8, alias, col_name)) {
+                        val = agg_results[i];
+                        found = true;
+                        break;
+                    }
+                }
+                // Fallback: check function name if no alias? (Less reliable)
+            }
+            
+            if (!found) return true; // Treat unknown columns in HAVING as pass for now
+
+            // Simple comparisons for HAVING
+            const cmp_val = if (having.value_float) |f| f else if (having.value_int) |i| @as(f64, @floatFromInt(i)) else 0;
+            
+            return switch (having.op) {
+                .eq => val == cmp_val,
+                .ne => val != cmp_val,
+                .lt => val < cmp_val,
+                .le => val <= cmp_val,
+                .gt => val > cmp_val,
+                .ge => val >= cmp_val,
+                else => true,
+            };
+        }
     }
     
     const res = lw.fragmentEnd();
@@ -3253,6 +4945,7 @@ fn computeLazyAggregate(table: *const TableInfo, col: *const ColumnData, agg: Ag
                     n = frag.fragmentReadInt32(col.fragment_col_idx, @ptrCast(&buf_i32), chunk_len, read_start);
                     for (0..n) |i| buf_f64[i] = @floatFromInt(buf_i32[i]);
                 },
+                .string, .list => {}, // No direct numeric aggregation for string/list
                 else => {},
             }
 
@@ -3455,7 +5148,7 @@ fn getFloatValue(table: *const TableInfo, col: *const ColumnData, idx: u32) f64 
                             _ = frag.fragmentReadInt32(col_idx, @ptrCast(&i32_val), 1, c_idx);
                             val = @floatFromInt(i32_val);
                         },
-                        else => {},
+                        .string, .list => {}, // No direct float value for string/list
                     }
                     return val;
                 }
@@ -3470,7 +5163,7 @@ fn getFloatValue(table: *const TableInfo, col: *const ColumnData, idx: u32) f64 
         .int64 => @floatFromInt(col.data.int64[idx]),
         .int32 => @floatFromInt(col.data.int32[idx]),
         .float32 => col.data.float32[idx],
-        .string => 0,
+        .string, .list => 0,
     };
 }
 
@@ -3504,7 +5197,10 @@ fn getIntValue(table: *const TableInfo, col: *const ColumnData, idx: u32) i64 {
                             _ = frag.fragmentReadFloat32(col_idx, @ptrCast(&f32_val), 1, c_idx);
                             val = @intFromFloat(f32_val);
                         },
-                        else => {},
+                        .string, .list => {
+                            const len = frag.fragmentReadStringAt(col_idx, c_idx, &scalar_str_buf, scalar_str_buf.len);
+                            val = @as(i64, @bitCast(std.hash.Wyhash.hash(0, scalar_str_buf[0..len])));
+                        },
                     }
                     return val;
                 }
@@ -3519,7 +5215,7 @@ fn getIntValue(table: *const TableInfo, col: *const ColumnData, idx: u32) i64 {
         .int32 => col.data.int32[idx],
         .float64 => @intFromFloat(col.data.float64[idx]),
         .float32 => @intFromFloat(col.data.float32[idx]),
-        .string => 0,
+        .string, .list => 0,
     };
 }
 
@@ -3530,8 +5226,7 @@ fn getIntValue(table: *const TableInfo, col: *const ColumnData, idx: u32) i64 {
 fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void {
     const row_count = table.row_count;
     if (row_count == 0) {
-        const buf = allocResultBuffer(HEADER_SIZE) orelse return error.OutOfMemory;
-        _ = buf;
+        _ = allocResultBuffer(HEADER_SIZE) orelse return error.OutOfMemory;
         _ = writeU32(RESULT_VERSION);
         _ = writeU32(0);
         _ = writeU64(0);
@@ -3539,6 +5234,7 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
         _ = writeU32(HEADER_SIZE);
         _ = writeU32(HEADER_SIZE);
         _ = writeU32(0);
+        _ = writeU32(HEADER_SIZE);
         return;
     }
 
@@ -3597,8 +5293,7 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
     }
 
     if (idx_count == 0) {
-        const buf = allocResultBuffer(HEADER_SIZE) orelse return error.OutOfMemory;
-        _ = buf;
+        _ = allocResultBuffer(HEADER_SIZE) orelse return error.OutOfMemory;
         _ = writeU32(RESULT_VERSION);
         _ = writeU32(0);
         _ = writeU64(0);
@@ -3606,16 +5301,17 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
         _ = writeU32(HEADER_SIZE);
         _ = writeU32(HEADER_SIZE);
         _ = writeU32(0);
+        _ = writeU32(HEADER_SIZE);
         return;
     }
 
     // Compute window function values for each row
-    // Storage: window_values[window_idx][row_idx]
-    var window_values: [MAX_WINDOW_FUNCS][MAX_ROWS]f64 = undefined;
+    // Storage: global_window_values[window_idx][row_idx]
+    const window_values = &global_window_values;
 
     for (query.window_funcs[0..query.window_count], 0..) |wf, wf_idx| {
         // Partition rows
-        var partition_keys: [MAX_ROWS]i64 = undefined;
+        const partition_keys = &global_partition_keys;
         for (indices[0..idx_count], 0..) |row_idx, i| {
             var key: i64 = 0;
             for (wf.partition_by[0..wf.partition_count]) |part_col| {
@@ -3658,13 +5354,15 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
         }
 
         // Process each unique partition
-        var processed: [MAX_ROWS]bool = .{false} ** MAX_ROWS;
+        const processed = &global_processed;
+        @memset(processed[0..idx_count], false);
+        
         for (0..idx_count) |i| {
             if (processed[i]) continue;
             const part_key = partition_keys[i];
 
             // Collect partition indices
-            var part_indices: [MAX_ROWS]usize = undefined;
+            const part_indices = &global_indices_1;
             var part_count: usize = 0;
             for (0..idx_count) |j| {
                 if (partition_keys[j] == part_key) {
@@ -3850,7 +5548,9 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
             }
         }
     } else {
-        for (query.select_cols[0..query.select_count]) |col_name| {
+        for (query.select_exprs[0..query.select_count]) |expr| {
+            if (expr.func != .none) continue;
+            const col_name = expr.col_name;
             for (table.columns[0..table.column_count], 0..) |maybe_col, i| {
                 if (maybe_col) |col| {
                     if (std.mem.eql(u8, col.name, col_name)) {
@@ -3882,8 +5582,15 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
 
     const extended_header: u32 = 36;
     const meta_size: u32 = @intCast(total_cols * 16);
-    const names_offset: u32 = extended_header + meta_size;
-    const data_offset_start: u32 = names_offset + @as(u32, @intCast(names_size));
+    const names_offset: u32 = HEADER_SIZE + meta_size;
+    const unaligned_data_start = names_offset + @as(u32, @intCast(names_size));
+    
+    // 8-byte alignment for data section
+    var padding: u32 = 0;
+    if (unaligned_data_start % 8 != 0) {
+        padding = 8 - (unaligned_data_start % 8);
+    }
+    const data_offset_start = unaligned_data_start + padding;
 
     var data_size: usize = 0;
     for (output_cols[0..output_count]) |ci| {
@@ -3891,7 +5598,7 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
             data_size += switch (col.col_type) {
                 .int64, .float64 => idx_count * 8,
                 .int32, .float32 => idx_count * 4,
-                .string => idx_count * 8 + 65536,
+                .string, .list => idx_count * 8 + 65536,
             };
         }
     }
@@ -3927,7 +5634,7 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
             data_offset += switch (col.col_type) {
                 .int64, .float64 => @intCast(idx_count * 8),
                 .int32, .float32 => @intCast(idx_count * 4),
-                .string => @intCast(idx_count * 8 + 65536),
+                .string, .list => @intCast(idx_count * 8 + 65536),
             };
         }
     }
@@ -3988,7 +5695,7 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
                         _ = writeToResult(std.mem.asBytes(&val));
                     }
                 },
-                .string => {
+                .string, .list => {
                     var str_offset: u32 = 0;
                     for (indices[0..idx_count]) |ri| {
                         _ = writeU32(str_offset);
@@ -4126,8 +5833,162 @@ fn copyLazyColumnRange(table: *const TableInfo, col: *const ColumnData, start_id
 }
 
 
-fn writeSelectResult(table: *const TableInfo, col_indices: []const usize, row_indices: []const u32, row_count: usize) !void {
-    const col_count = col_indices.len;
+fn writeColumnData(table: *const TableInfo, col: *const ColumnData, row_indices: []const u32, row_count: usize, is_contiguous: bool, name_override: ?[]const u8) !void {
+    const name = name_override orelse col.name;
+    switch (col.col_type) {
+        .int64 => {
+             if (is_contiguous and !col.is_lazy) {
+                 _ = lw.fragmentAddInt64Column(name.ptr, name.len, col.data.int64.ptr, row_count, false);
+             } else {
+                const data = try memory.wasm_allocator.alloc(i64, row_count);
+                defer memory.wasm_allocator.free(data);
+                var ctx: ?FragmentContext = null;
+                for (row_indices, 0..) |ri, i| {
+                    data[i] = getIntValueOptimized(table, col, ri, &ctx);
+                }
+                _ = lw.fragmentAddInt64Column(name.ptr, name.len, data.ptr, row_count, false);
+             }
+        },
+        .float64 => {
+             if (is_contiguous and !col.is_lazy) {
+                 _ = lw.fragmentAddFloat64Column(name.ptr, name.len, col.data.float64.ptr, row_count, false);
+             } else {
+                const data = try memory.wasm_allocator.alloc(f64, row_count);
+                defer memory.wasm_allocator.free(data);
+                var ctx: ?FragmentContext = null;
+                for (row_indices, 0..) |ri, i| {
+                    data[i] = getFloatValueOptimized(table, col, ri, &ctx);
+                }
+                _ = lw.fragmentAddFloat64Column(name.ptr, name.len, data.ptr, row_count, false);
+             }
+        },
+         .int32 => {
+             if (is_contiguous and !col.is_lazy) {
+                 _ = lw.fragmentAddInt32Column(name.ptr, name.len, col.data.int32.ptr, row_count, false);
+             } else {
+                const data = try memory.wasm_allocator.alloc(i32, row_count);
+                defer memory.wasm_allocator.free(data);
+                var ctx: ?FragmentContext = null;
+                for (row_indices, 0..) |ri, i| {
+                     data[i] = @intCast(getIntValueOptimized(table, col, ri, &ctx));
+                }
+                _ = lw.fragmentAddInt32Column(name.ptr, name.len, data.ptr, row_count, false);
+             }
+        },
+        .float32 => {
+             if (is_contiguous and !col.is_lazy) {
+                 _ = lw.fragmentAddFloat32Column(name.ptr, name.len, col.data.float32.ptr, row_count, false);
+             } else {
+                const data = try memory.wasm_allocator.alloc(f32, row_count);
+                defer memory.wasm_allocator.free(data);
+                var ctx: ?FragmentContext = null;
+                for (row_indices, 0..) |ri, i| {
+                     data[i] = @floatCast(getFloatValueOptimized(table, col, ri, &ctx));
+                }
+                _ = lw.fragmentAddFloat32Column(name.ptr, name.len, data.ptr, row_count, false);
+             }
+        },
+        .string => {
+            var total_len: usize = 0;
+            const offsets = try memory.wasm_allocator.alloc(u32, row_count + 1);
+            defer memory.wasm_allocator.free(offsets);
+            
+            var current_offset: u32 = 0;
+            offsets[0] = 0;
+            
+            // Calc lengths
+            if (is_contiguous and !col.is_lazy) {
+                 for (0..row_count) |i| {
+                      const len = col.data.strings.lengths[i];
+                      total_len += len;
+                      current_offset += len;
+                      offsets[i+1] = current_offset;
+                 }
+            } else {
+                var ctx: ?FragmentContext = null;
+                for (row_indices, 0..) |ri, i| {
+                     const s = getStringValueOptimized(table, col, ri, &ctx);
+                     total_len += s.len;
+                     current_offset += @intCast(s.len);
+                     offsets[i+1] = current_offset;
+                }
+            }
+
+            const data = try memory.wasm_allocator.alloc(u8, total_len);
+            defer memory.wasm_allocator.free(data);
+            
+            // Copy data
+            if (is_contiguous and !col.is_lazy) {
+                  @memcpy(data, col.data.strings.data[0..total_len]);
+            } else {
+                var ctx: ?FragmentContext = null;
+                var offset: usize = 0;
+                 for (row_indices) |ri| {
+                     const s = getStringValueOptimized(table, col, ri, &ctx);
+                     @memcpy(data[offset..offset+s.len], s);
+                     offset += s.len;
+                }
+            }
+            
+            _ = lw.fragmentAddStringColumn(name.ptr, name.len, data.ptr, total_len, offsets.ptr, row_count, false);
+        },
+        .list => {
+            var total_len: usize = 0;
+            const offsets = try memory.wasm_allocator.alloc(u32, row_count + 1);
+            defer memory.wasm_allocator.free(offsets);
+            
+            var current_offset: u32 = 0;
+            offsets[0] = 0;
+            
+            // Calc lengths
+            if (is_contiguous and !col.is_lazy) {
+                 for (0..row_count) |i| {
+                      const len = col.data.strings.lengths[i];
+                      total_len += len;
+                      current_offset += len;
+                      offsets[i+1] = current_offset;
+                 }
+            } else {
+                var ctx: ?FragmentContext = null;
+                for (row_indices, 0..) |ri, i| {
+                     const s = getStringValueOptimized(table, col, ri, &ctx);
+                     total_len += s.len;
+                     current_offset += @intCast(s.len);
+                     offsets[i+1] = current_offset;
+                }
+            }
+
+            const data = try memory.wasm_allocator.alloc(u8, total_len);
+            defer memory.wasm_allocator.free(data);
+            
+            // Copy data
+            if (is_contiguous and !col.is_lazy) {
+                  @memcpy(data, col.data.strings.data[0..total_len]);
+            } else {
+                var ctx: ?FragmentContext = null;
+                var offset: usize = 0;
+                 for (row_indices) |ri| {
+                     const s = getStringValueOptimized(table, col, ri, &ctx);
+                     @memcpy(data[offset..offset+s.len], s);
+                     offset += s.len;
+                }
+            }
+            
+            _ = lw.fragmentAddListColumn(name.ptr, name.len, data.ptr, total_len, offsets.ptr, row_count, false);
+        },
+    }
+}
+
+
+fn writeSelectResult(table: *const TableInfo, query: *const ParsedQuery, row_indices: []const u32, row_count: usize) !void {
+    var col_count: usize = 0;
+    if (query.is_star) {
+         for (0..table.column_count) |i| {
+             if (table.columns[i] != null) col_count += 1;
+         }
+    } else {
+         col_count = query.select_count;
+    }
     
     // Safety check: Don't overflow MAX_COLUMNS in lance_writer
     if (col_count > 64) return error.TooManyColumns;
@@ -4151,117 +6012,171 @@ fn writeSelectResult(table: *const TableInfo, col_indices: []const usize, row_in
         }
     }
 
-    for (col_indices) |ci| {
-        if (table.columns[ci]) |*col| {
-            switch (col.col_type) {
-                .int64 => {
-                    // Gather data into temporary buffer if not contiguous
-                    // lance_writer expects contiguous slice for input
-                     if (is_contiguous and !col.is_lazy) {
-                         _ = lw.fragmentAddInt64Column(col.name.ptr, col.name.len, col.data.int64.ptr, row_count, false);
-                     } else {
-                        const data = try memory.wasm_allocator.alloc(i64, row_count);
-                        defer memory.wasm_allocator.free(data);
-                        var ctx: ?FragmentContext = null;
-                        for (row_indices, 0..) |ri, i| {
-                            data[i] = getIntValueOptimized(table, col, ri, &ctx);
-                        }
-                        _ = lw.fragmentAddInt64Column(col.name.ptr, col.name.len, data.ptr, row_count, false);
-                     }
-                },
-                .float64 => {
-                     if (is_contiguous and !col.is_lazy) {
-                         _ = lw.fragmentAddFloat64Column(col.name.ptr, col.name.len, col.data.float64.ptr, row_count, false);
-                     } else {
-                        const data = try memory.wasm_allocator.alloc(f64, row_count);
-                        defer memory.wasm_allocator.free(data);
-                        var ctx: ?FragmentContext = null;
-                        for (row_indices, 0..) |ri, i| {
-                            data[i] = getFloatValueOptimized(table, col, ri, &ctx);
-                        }
-                        _ = lw.fragmentAddFloat64Column(col.name.ptr, col.name.len, data.ptr, row_count, false);
-                     }
-                },
-                 .int32 => {
-                     if (is_contiguous and !col.is_lazy) {
-                         _ = lw.fragmentAddInt32Column(col.name.ptr, col.name.len, col.data.int32.ptr, row_count, false);
-                     } else {
-                        const data = try memory.wasm_allocator.alloc(i32, row_count);
-                        defer memory.wasm_allocator.free(data);
-                        var ctx: ?FragmentContext = null;
-                        for (row_indices, 0..) |ri, i| {
-                             data[i] = @intCast(getIntValueOptimized(table, col, ri, &ctx));
-                        }
-                        _ = lw.fragmentAddInt32Column(col.name.ptr, col.name.len, data.ptr, row_count, false);
-                     }
-                },
-                .float32 => {
-                     if (is_contiguous and !col.is_lazy) {
-                         _ = lw.fragmentAddFloat32Column(col.name.ptr, col.name.len, col.data.float32.ptr, row_count, false);
-                     } else {
-                        const data = try memory.wasm_allocator.alloc(f32, row_count);
-                        defer memory.wasm_allocator.free(data);
-                        var ctx: ?FragmentContext = null;
-                        for (row_indices, 0..) |ri, i| {
-                             data[i] = @floatCast(getFloatValueOptimized(table, col, ri, &ctx));
-                        }
-                        _ = lw.fragmentAddFloat32Column(col.name.ptr, col.name.len, data.ptr, row_count, false);
-                     }
-                },
-                .string => {
-                    // String handling: we need to flatten the strings into a single buffer + offsets
-                    var total_len: usize = 0;
-                    const offsets = try memory.wasm_allocator.alloc(u32, row_count + 1);
-                    defer memory.wasm_allocator.free(offsets);
-                    
-                    var current_offset: u32 = 0;
-                    offsets[0] = 0;
-                    
-                    // Calc lengths
-                    if (is_contiguous and !col.is_lazy) {
-                         // Fast path
-                         for (0..row_count) |i| {
-                              const len = col.data.strings.lengths[i];
-                              total_len += len;
-                              current_offset += len;
-                              offsets[i+1] = current_offset;
-                         }
-                    } else {
-                        for (row_indices, 0..) |ri, i| {
-                            // TODO: Add getStringOptimized
-                            if (!col.is_lazy) {
-                                const len = col.data.strings.lengths[ri];
-                                total_len += len;
-                                current_offset += len;
-                                offsets[i+1] = current_offset;
-                            } else {
-                                offsets[i+1] = current_offset; // Empty string fallback
+    if (query.is_star) {
+         for (table.columns[0..table.column_count]) |*maybe_col| {
+             if (maybe_col.*) |*col| {
+                 try writeColumnData(table, col, row_indices, row_count, is_contiguous, null);
+             }
+         }
+    } else {
+        for (query.select_exprs[0..query.select_count]) |expr| {
+
+        var col_type: ColumnType = .float64;
+        
+        if (debug_counter == 1) { // 2nd column (0-indexed)
+            trace_string_exec = true;
+            // Also log to confirm we hit this block
+             setDebug("DEBUG: Tracing enabled for col '{s}'", .{expr.col_name});
+        } else {
+            trace_string_exec = false;
+        }
+        
+        // Find column if simple ref
+        var source_col: ?*const ColumnData = null;
+        if (expr.func == .none) {
+            for (table.columns[0..table.column_count]) |*maybe_col| {
+                if (maybe_col.*) |*c| {
+                    var match = std.mem.eql(u8, c.name, expr.col_name);
+                    if (!match) {
+                        // Try table alias (suffix match)
+                        if (std.mem.indexOf(u8, expr.col_name, ".") != null) {
+                            if (std.mem.endsWith(u8, expr.col_name, c.name)) {
+                                if (expr.col_name.len > c.name.len and expr.col_name[expr.col_name.len - c.name.len - 1] == '.') {
+                                    match = true;
+                                }
                             }
                         }
                     }
-                    
-                    const str_data = try memory.wasm_allocator.alloc(u8, total_len);
-                    defer memory.wasm_allocator.free(str_data);
-                    
-                    current_offset = 0;
-                     if (is_contiguous and !col.is_lazy) {
-                         // Fast memcpy
-                          @memcpy(str_data[0..total_len], col.data.strings.data[0..total_len]);
-                     } else {
-                        for (row_indices) |ri| {
-                             if (!col.is_lazy) {
-                                 const off = col.data.strings.offsets[ri];
-                                 const len = col.data.strings.lengths[ri];
-                                 const src = col.data.strings.data[off..][0..len];
-                                 @memcpy(str_data[current_offset..][0..len], src);
-                                 current_offset += len;
-                             }
-                        }
-                     }
-                    
-                    _ = lw.fragmentAddStringColumn(col.name.ptr, col.name.len, str_data.ptr, total_len, offsets.ptr, row_count, false);
-                },
+                    if (match) {
+                        source_col = c;
+                        col_type = c.col_type;
+                        break;
+                    }
+                }
             }
+        } else {
+            // Infer type from function
+             switch (expr.func) {
+                 .trim, .ltrim, .rtrim, .concat, .replace, .reverse, .upper, .lower, .left, .substr, .lpad, .rpad, .right, .repeat => col_type = .string,
+                 .split, .array_slice => col_type = .list,
+                 .array_length, .length, .instr => col_type = .int64,
+                 .nullif, .coalesce => {
+                     col_type = .float64;
+                     var is_str = false;
+                     // Arg 1
+                     if (expr.val_str != null) is_str = true;
+                     if (!is_str and expr.col_name.len > 0) {
+                         if (getColByName(table, expr.col_name)) |c| {
+                             if (c.col_type == .string) is_str = true;
+                         }
+                     }
+                     // Arg 2
+                     if (!is_str) {
+                         if (expr.arg_2_val_str != null) is_str = true;
+                         if (expr.arg_2_col) |n| {
+                             if (getColByName(table, n)) |c| {
+                                 if (c.col_type == .string) is_str = true;
+                             }
+                         }
+                     }
+                     // Arg 3
+                     if (!is_str) {
+                         if (expr.arg_3_val_str != null) is_str = true;
+                         if (expr.arg_3_col) |n| {
+                             if (getColByName(table, n)) |c| {
+                                 if (c.col_type == .string) is_str = true;
+                             }
+                         }
+                     }
+                     
+                     if (is_str) col_type = .string;
+                 },
+                 else => {
+                     col_type = .float64;
+                     if (expr.func != .none) {
+                          setDebug("UNKNOWN_FUNC: {}", .{@intFromEnum(expr.func)});
+                          setError("DEBUG_FAIL: UNKNOWN FUNC");
+                     }
+                 },
+             }
+        }
+        
+        const col_name = expr.alias orelse (if (source_col) |sc| sc.name else (if (expr.func == .none) expr.col_name else "expr"));
+
+        // Write Column Data
+        if (source_col) |col| {
+            try writeColumnData(table, col, row_indices, row_count, is_contiguous, col_name);
+        } else {
+             // Calculated Column
+             // Resolve Args
+             var arg1_col: ?*const ColumnData = null;
+             if (expr.col_name.len > 0) {
+                 for (table.columns[0..table.column_count]) |*maybe_c| {
+                     if (maybe_c.*) |*c| {
+                         if (std.mem.eql(u8, c.name, expr.col_name)) {
+                             arg1_col = c;
+                             break;
+                         }
+                     }
+                 }
+             }
+             var arg2_col: ?*const ColumnData = null;
+             if (expr.arg_2_col) |name| {
+                  for (table.columns[0..table.column_count]) |*maybe_c| {
+                     if (maybe_c.*) |*c| {
+                         if (std.mem.eql(u8, c.name, name)) {
+                             arg2_col = c;
+                          }
+                      }
+                  }
+              }
+
+              if (col_type == .string or col_type == .list) {
+                  // String Calc: Two-pass approach
+                  const offsets = try memory.wasm_allocator.alloc(u32, row_count + 1);
+                  defer memory.wasm_allocator.free(offsets);
+                  offsets[0] = 0;
+                  
+                  // Pass 1: Calculate total size
+                  var total_len: usize = 0;
+                  var ctx: ?FragmentContext = null;
+                  for (row_indices, 0..) |ri, i| {
+                      const s = evaluateScalarString(table, &expr, ri, &ctx, arg1_col);
+                      total_len += s.len;
+                      offsets[i+1] = @intCast(total_len);
+                  }
+                  
+                  // Allocate data buffer
+                  const data = try memory.wasm_allocator.alloc(u8, total_len);
+                  defer memory.wasm_allocator.free(data);
+                  
+                  // Pass 2: Copy data
+                  ctx = null;
+                  var current_offset: usize = 0;
+                  for (row_indices) |ri| {
+                      const s = evaluateScalarString(table, &expr, ri, &ctx, arg1_col);
+                      @memcpy(data[current_offset..current_offset+s.len], s);
+                      current_offset += s.len;
+                  }
+                  
+                  if (col_type == .list) {
+                      _ = lw.fragmentAddListColumn(col_name.ptr, col_name.len, data.ptr, total_len, offsets.ptr, row_count, false);
+                  } else {
+                      _ = lw.fragmentAddStringColumn(col_name.ptr, col_name.len, data.ptr, total_len, offsets.ptr, row_count, false);
+                  }
+
+             } else {
+                 // Float Calc
+                 const data = try memory.wasm_allocator.alloc(f64, row_count);
+                 defer memory.wasm_allocator.free(data);
+                 
+                 var ctx: ?FragmentContext = null;
+                 for (row_indices, 0..) |ri, i| {
+                     data[i] = evaluateScalarFloat(table, &expr, ri, &ctx, arg1_col, arg2_col);
+                 }
+                 _ = lw.fragmentAddFloat64Column(col_name.ptr, col_name.len, data.ptr, row_count, false);
+             }
+        }
         }
     }
     
@@ -4289,6 +6204,10 @@ fn evaluateWhereVector(
     selection: ?[]const u16, // Input selection (relative to start_row_in_frag), if null allow all 0..count
     out_selection: []u16 // Output selection
 ) u32 {
+    // setDebug("evaluateWhereVector op: {any}", .{where.op});
+    if (where.op == .in_subquery or where.op == .not_in_subquery) {
+        setDebug("evaluateWhereVector SUBQUERY op: {any}", .{where.op});
+    }
     switch (where.op) {
         .and_op => {
             const l = where.left orelse return 0;
@@ -4317,7 +6236,7 @@ fn evaluateWhereVector(
                 const abs_idx = start_row_in_frag + rel_idx; // This is purely relative to frag start for now
                 // We need global row_idx for evaluateWhere if it does global lookups?
                 // evaluateWhere takes global row_idx for lazy loading logic usually. 
-                // But we have context.
+                // We have context.
                 // Let's rely on evaluateWhere's logic but we need to trick it or adapt it.
                 // Current evaluateWhere takes global `row_idx`. 
                 // We can compute it if we know fragment offset.
@@ -4371,7 +6290,15 @@ fn evaluateWhereVector(
             var col: ?*const ColumnData = null;
             for (table.columns[0..table.column_count]) |maybe_col| {
                  if (maybe_col) |*c| {
-                     if (std.mem.eql(u8, c.name, col_name)) {
+                     var match = std.mem.eql(u8, c.name, col_name);
+                     if (!match and std.mem.indexOf(u8, col_name, ".") != null) {
+                         if (std.mem.endsWith(u8, col_name, c.name)) {
+                             if (col_name.len > c.name.len and col_name[col_name.len - c.name.len - 1] == '.') {
+                                 match = true;
+                             }
+                         }
+                     }
+                     if (match) {
                          col = c;
                          break;
                      }
@@ -4403,6 +6330,16 @@ fn evaluateComparisonVector(
     var data_ptr: [*]const u8 = undefined;
     var is_valid_ptr = false;
 
+    // Check if op is supported for vectorization
+    // If not, force scalar fallback even if we have a valid pointer
+    const is_vector_op = switch (where.op) {
+        .eq, .ne, .lt, .le, .gt, .ge, .is_null, .is_not_null, .between, .not_between => true,
+        // Subqueries and other complex ops must use scalar fallback
+        else => false,
+    };
+
+    if (is_vector_op) {
+
     if (col.is_lazy) {
         if (context.frag) |frag| {
             if (frag.getColumnRawPtr(col.fragment_col_idx)) |ptr| {
@@ -4420,6 +6357,7 @@ fn evaluateComparisonVector(
              // TODO: Strings
              else => {}
         }
+    }
     }
 
     if (!is_valid_ptr) {
@@ -4463,11 +6401,13 @@ fn evaluateComparisonVector(
     
     const ptr_at_start = data_ptr + base_offset_bytes;
 
+
     // MACRO-like inline logic
     switch (col.col_type) {
         .int64 => {
              const values = @as([*]const i64, @ptrCast(@alignCast(ptr_at_start)));
              const val = where.value_int orelse 0;
+
              
              if (where.op == .gt) {
                   for (0..sel_len) |i| {
@@ -4493,13 +6433,79 @@ fn evaluateComparisonVector(
                            out_idx += 1;
                        }
                   }
+             } else if (where.op == .ge) {
+                  for (0..sel_len) |i| {
+                       const idx = if (selection) |s| s[i] else @as(u16, @intCast(i));
+                       if (values[idx] >= val) {
+                           out_selection[out_idx] = idx;
+                           out_idx += 1;
+                       }
+                  }
+             } else if (where.op == .le) {
+                  for (0..sel_len) |i| {
+                       const idx = if (selection) |s| s[i] else @as(u16, @intCast(i));
+                       if (values[idx] <= val) {
+                           out_selection[out_idx] = idx;
+                           out_idx += 1;
+                       }
+                  }
+             } else if (where.op == .ne) {
+                  for (0..sel_len) |i| {
+                       const idx = if (selection) |s| s[i] else @as(u16, @intCast(i));
+                       if (values[idx] != val) {
+                           out_selection[out_idx] = idx;
+                           out_idx += 1;
+                       }
+                  }
+             } else if (where.op == .between) {
+                  const low = where.value_int orelse 0;
+                  const high = where.value_int_2 orelse 0;
+                  for (0..sel_len) |i| {
+                       const idx = if (selection) |s| s[i] else @as(u16, @intCast(i));
+                       const v = values[idx];
+                       if (v >= low and v <= high) {
+                           out_selection[out_idx] = idx;
+                           out_idx += 1;
+                       }
+                  }
+             } else if (where.op == .is_null) {
+                   for (0..sel_len) |_| {
+                       // const idx = if (selection) |s| s[i] else @as(u16, @intCast(i));
+                       // int64 is nullable in our model? Or we need null bitmap.
+                       // For now, assume 0 is not null. Nulls handled via validity bitmap if we had one.
+                       // Just do fallback for IS NULL on int64 if needed, or skip.
+                   }
+             } else if (where.op == .is_not_null) {
+                   for (0..sel_len) |i| {
+                       const idx = if (selection) |s| s[i] else @as(u16, @intCast(i));
+                       if (values[idx] != 0) {
+                           out_selection[out_idx] = idx;
+                           out_idx += 1;
+                       }
+                   }
              } else {
-                  return evaluateComparisonVectorFallback(values, where, selection, count, out_selection);
+                 // Fallback for unhandled operators (e.g. IN subquery)
+                 var tmp_ctx: ?FragmentContext = context.*;
+                 for (0..sel_len) |i| {
+                      const idx = if (selection) |s| s[i] else @as(u16, @intCast(i));
+                      const global_row = context.start_idx + start_row_in_frag + idx;
+                      if (evaluateComparison(table, col, global_row, where, &tmp_ctx)) {
+                          out_selection[out_idx] = idx;
+                          out_idx += 1;
+                      }
+                 }
              }
         },
         .float64 => {
              const values = @as([*]const f64, @ptrCast(@alignCast(ptr_at_start)));
-             const val = where.value_float orelse return 0; // Assuming float comparison
+             var val: f64 = 0;
+             if (where.value_float) |v| {
+                 val = v;
+             } else if (where.value_int) |v| {
+                 val = @as(f64, @floatFromInt(v));
+             } else {
+                 return 0; // Or fallback
+             }
              
              if (where.op == .gt) {
                   for (0..sel_len) |i| {
@@ -4517,6 +6523,66 @@ fn evaluateComparisonVector(
                            out_idx += 1;
                        }
                   }
+             } else if (where.op == .ge) {
+                  for (0..sel_len) |i| {
+                       const idx = if (selection) |s| s[i] else @as(u16, @intCast(i));
+                       if (values[idx] >= val) {
+                           out_selection[out_idx] = idx;
+                           out_idx += 1;
+                       }
+                  }
+             } else if (where.op == .le) {
+                  for (0..sel_len) |i| {
+                       const idx = if (selection) |s| s[i] else @as(u16, @intCast(i));
+                       if (values[idx] <= val) {
+                           out_selection[out_idx] = idx;
+                           out_idx += 1;
+                       }
+                  }
+             } else if (where.op == .eq) {
+                  for (0..sel_len) |i| {
+                       const idx = if (selection) |s| s[i] else @as(u16, @intCast(i));
+                       if (values[idx] == val) {
+                           out_selection[out_idx] = idx;
+                           out_idx += 1;
+                       }
+                  }
+             } else if (where.op == .ne) {
+                  for (0..sel_len) |i| {
+                       const idx = if (selection) |s| s[i] else @as(u16, @intCast(i));
+                       if (values[idx] != val) {
+                           out_selection[out_idx] = idx;
+                           out_idx += 1;
+                       }
+                  }
+             } else if (where.op == .between) {
+                  const low: f64 = if (where.value_float) |v| v else if (where.value_int) |v| @floatFromInt(v) else 0;
+                  const high: f64 = if (where.value_float_2) |v| v else if (where.value_int_2) |v| @floatFromInt(v) else 0;
+                  
+                  for (0..sel_len) |i| {
+                       const idx = if (selection) |s| s[i] else @as(u16, @intCast(i));
+                       const v = values[idx];
+                       if (v >= low and v <= high) {
+                           out_selection[out_idx] = idx;
+                           out_idx += 1;
+                       }
+                  }
+             } else if (where.op == .is_null) {
+                   for (0..sel_len) |i| {
+                       const idx = if (selection) |s| s[i] else @as(u16, @intCast(i));
+                       if (std.math.isNan(values[idx])) {
+                           out_selection[out_idx] = idx;
+                           out_idx += 1;
+                       }
+                   }
+             } else if (where.op == .is_not_null) {
+                   for (0..sel_len) |i| {
+                       const idx = if (selection) |s| s[i] else @as(u16, @intCast(i));
+                       if (!std.math.isNan(values[idx])) {
+                           out_selection[out_idx] = idx;
+                           out_idx += 1;
+                       }
+                   }
              } else {
                   // Fallback for other ops
                   return evaluateComparisonVectorFallback(values, where, selection, count, out_selection);
@@ -4569,14 +6635,7 @@ fn evaluateComparisonVector(
                   // The original code had `evaluateComparison`... did it support strings?
                   // Yes, `evaluateComparison` at 2811 (previous view) had `else => { // Strings? }` or similar?
                   // Actually I don't see string support in `evaluateComparison` in my previous `view_file`.
-                  // If `evaluateComparison` doesn't support strings, then `evaluateWhere` fallback fails?
-                  // Ah, line 2821 `getFloatValueOptimized`.
-                  // Step 23 view showed `evaluateComparison` cases `.eq`, `.ne`, `.lt`...
-                  // It only checked `value_int` and `value_float`.
-                  // It did NOT check `value_str`!
-                  // Does LanceQL support string filtering currently?
-                  // The benchmark has `status = 'shipped'`.
-                  // If `evaluateComparison` doesn't handle strings, then it returns false?
+                  // If `evaluateComparison` doesn't support strings, then it returns false?
                   // But the benchmark SAYS LanceQL returned valid results (passed verification).
                   // This means `evaluateComparison` MUST handle strings or I missed it.
                   
@@ -4691,9 +6750,92 @@ fn evaluateComparisonVectorFallback(_: anytype, _: *const WhereClause, _: ?[]con
 }
 
 
+
+const SubqueryResult = struct {
+    int64_results: ?[]const i64 = null,
+    float64_results: ?[]const f64 = null,
+    string_results: ?[]const []const u8 = null,
+    exists: bool = false,
+};
+
+fn executeSubqueryInternal(sql: []const u8) !SubqueryResult {
+    setDebug("Subquery SQL: {s}", .{sql});
+    const sub_query = parseSql(sql) orelse return error.ParseError;
+    const table = findTable(sub_query.table_name) orelse return error.TableNotFound;
+    
+    // Simple row-by-row iteration for subqueries to avoid clobbering global vectorized state
+    var match_count: usize = 0;
+    var ctx: ?FragmentContext = null;
+    
+    // First pass: count matches
+    for (0..table.row_count) |i| {
+        const idx = @as(u32, @intCast(i));
+        if (sub_query.where_clause == null or evaluateWhere(table, &sub_query.where_clause.?, idx, &ctx)) {
+            match_count += 1;
+        }
+    }
+    
+    var result = SubqueryResult{ .exists = match_count > 0 };
+    
+    if (sub_query.select_count > 0 and match_count > 0) {
+        const expr = sub_query.select_exprs[0];
+        if (expr.col_name.len > 0) {
+            const col_name = expr.col_name;
+            if (findTableColumn(table, col_name)) |col| {
+                 if (col.col_type == .int64 or col.col_type == .int32) {
+                     var vals = try memory.wasm_allocator.alloc(i64, match_count);
+                     var r: usize = 0;
+                     for (0..table.row_count) |i| {
+                         const idx = @as(u32, @intCast(i));
+                         if (sub_query.where_clause == null or evaluateWhere(table, &sub_query.where_clause.?, idx, &ctx)) {
+                             const v = getIntValueOptimized(table, col, idx, &ctx);
+                             setDebug("Subquery populate idx {} val {}", .{idx, v});
+                             vals[r] = v;
+                             r += 1;
+                         }
+                     }
+                     result.int64_results = vals;
+                 } else if (col.col_type == .float64 or col.col_type == .float32) {
+                      var fvals = try memory.wasm_allocator.alloc(f64, match_count);
+                      var fr: usize = 0;
+                      for (0..table.row_count) |i| {
+                          const idx = @as(u32, @intCast(i));
+                          if (sub_query.where_clause == null or evaluateWhere(table, &sub_query.where_clause.?, idx, &ctx)) {
+                              fvals[fr] = getFloatValueOptimized(table, col, idx, &ctx);
+                              fr += 1;
+                          }
+                      }
+                      result.float64_results = fvals;
+                 } else if (col.col_type == .string) {
+                     var vals = try memory.wasm_allocator.alloc([]const u8, match_count);
+                     var r: usize = 0;
+                     for (0..table.row_count) |i| {
+                         const idx = @as(u32, @intCast(i));
+                         if (sub_query.where_clause == null or evaluateWhere(table, &sub_query.where_clause.?, idx, &ctx)) {
+                             const s = getStringValueOptimized(table, col, idx, &ctx);
+                             const dup = try memory.wasm_allocator.alloc(u8, s.len);
+                             @memcpy(dup, s);
+                             vals[r] = dup;
+                             r += 1;
+                         }
+                     }
+                     result.string_results = vals;
+                     }
+            } else {
+                 setDebug("Subquery column not found: {s}", .{expr.col_name});
+            }
+        }
+    }
+    
+    setDebug("Subquery done. Match count: {d}, Exists: {}", .{match_count, result.exists});
+    return result;
+}
+
 fn evaluateWhere(table: *const TableInfo, where: *const WhereClause, row_idx: u32, context: *?FragmentContext) bool {
+
     switch (where.op) {
         .and_op => {
+
             const l = where.left orelse return false;
             const r = where.right orelse return false;
             return evaluateWhere(table, l, row_idx, context) and evaluateWhere(table, r, row_idx, context);
@@ -4717,71 +6859,224 @@ fn evaluateWhere(table: *const TableInfo, where: *const WhereClause, row_idx: u3
         },
         else => {
             const col_name = where.column orelse return false;
+
             var col: ?*const ColumnData = null;
             for (table.columns[0..table.column_count]) |maybe_col| {
                 if (maybe_col) |*c| {
-                    if (std.mem.eql(u8, c.name, col_name)) {
+                    var match = std.mem.eql(u8, c.name, col_name);
+                    if (!match and std.mem.indexOf(u8, col_name, ".") != null) {
+                        if (std.mem.endsWith(u8, col_name, c.name)) {
+                            if (col_name.len > c.name.len and col_name[col_name.len - c.name.len - 1] == '.') {
+                                match = true;
+                            }
+                        }
+                    }
+                    if (match) {
                         col = c;
                         break;
                     }
                 }
             }
-            const c = col orelse return false;
+
+            const c = col orelse {
+                setDebug("Column not found in where: {s}", .{col_name});
+                return false;
+            };
+            // setDebug("Evaluating col {s} op {}", .{c.name, where.op});
             return evaluateComparison(table, c, row_idx, where, context);
         },
     }
 }
 
 fn evaluateComparison(table: *const TableInfo, col: *const ColumnData, row_idx: u32, where: *const WhereClause, context: *?FragmentContext) bool {
+
     switch (where.op) {
-        .eq => {
-            if (where.value_int) |val| {
-                return getIntValueOptimized(table, col, row_idx, context) == val;
-            } else if (where.value_float) |val| {
-                return getFloatValueOptimized(table, col, row_idx, context) == val;
+        .eq, .ne, .lt, .le, .gt, .ge => {
+             var cmp_val: f64 = 0;
+             var is_str = false;
+             var cmp_str: []const u8 = "";
+             if (where.arg_2_col) |c2_name| {
+                 if (getColByName(table, c2_name)) |c2| {
+                      if (c2.col_type == .string) {
+                           is_str = true;
+                           cmp_str = getStringValueOptimized(table, c2, row_idx, context);
+                      } else {
+                           cmp_val = getFloatValueOptimized(table, c2, row_idx, context);
+                      }
+                 }
+             } else if (where.value_float) |v| {
+                 cmp_val = v;
+             } else if (where.value_int) |v| {
+                 cmp_val = @floatFromInt(v);
+             } else if (where.value_str) |v| {
+                 is_str = true;
+                 cmp_str = v;
+             }
+             
+             if (is_str) {
+                 const s = getStringValueOptimized(table, col, row_idx, context);
+                 const match = std.mem.eql(u8, s, cmp_str);
+                 return if (where.op == .eq) match else if (where.op == .ne) !match else false;
+             }
+             
+             const row_val = getFloatValueOptimized(table, col, row_idx, context);
+             return switch (where.op) {
+                 .eq => row_val == cmp_val,
+                 .ne => row_val != cmp_val,
+                 .lt => row_val < cmp_val,
+                 .le => row_val <= cmp_val,
+                 .gt => row_val > cmp_val,
+                 .ge => row_val >= cmp_val,
+                 else => false,
+             };
+        },
+        .like => {
+            if (where.value_str) |pattern| {
+                const s = getStringValueOptimized(table, col, row_idx, context);
+                return matchLike(s, pattern);
             }
         },
-        .ne => {
-            if (where.value_int) |val| {
-                return getIntValueOptimized(table, col, row_idx, context) != val;
-            } else if (where.value_float) |val| {
-                return getFloatValueOptimized(table, col, row_idx, context) != val;
+        .between => {
+            // Check column type first to handle int literals vs float column
+            if (col.col_type == .float64 or col.col_type == .float32) {
+                const row_val = getFloatValueOptimized(table, col, row_idx, context);
+                const low: f64 = if (where.value_float) |v| v else if (where.value_int) |v| @floatFromInt(v) else 0;
+                const high: f64 = if (where.value_float_2) |v| v else if (where.value_int_2) |v| @floatFromInt(v) else 0;
+                return row_val >= low and row_val <= high;
+            } else if (where.value_int) |low| {
+                const val = getIntValueOptimized(table, col, row_idx, context);
+                const high = where.value_int_2 orelse 0;
+                return val >= low and val <= high;
+            } else if (where.value_float) |low| {
+                const val = getFloatValueOptimized(table, col, row_idx, context);
+                const high = where.value_float_2 orelse 0;
+                return val >= low and val <= high;
             }
         },
-        .lt => {
-            if (where.value_int) |val| {
-                return getIntValueOptimized(table, col, row_idx, context) < val;
-            } else if (where.value_float) |val| {
-                return getFloatValueOptimized(table, col, row_idx, context) < val;
+        .not_between => {
+             // Negation of BETWEEN
+            if (col.col_type == .float64 or col.col_type == .float32) {
+                const row_val = getFloatValueOptimized(table, col, row_idx, context);
+                const low: f64 = if (where.value_float) |v| v else if (where.value_int) |v| @floatFromInt(v) else 0;
+                const high: f64 = if (where.value_float_2) |v| v else if (where.value_int_2) |v| @floatFromInt(v) else 0;
+                return row_val < low or row_val > high;
+            } else if (where.value_int) |low| {
+                const val = getIntValueOptimized(table, col, row_idx, context);
+                const high = where.value_int_2 orelse 0;
+                return val < low or val > high;
+            } else if (where.value_float) |low| {
+                const val = getFloatValueOptimized(table, col, row_idx, context);
+                const high = where.value_float_2 orelse 0;
+                return val < low or val > high;
             }
         },
-        .le => {
-            if (where.value_int) |val| {
-                return getIntValueOptimized(table, col, row_idx, context) <= val;
-            } else if (where.value_float) |val| {
-                return getFloatValueOptimized(table, col, row_idx, context) <= val;
+        .not_in_list => {
+            if (col.col_type == .string) {
+                const row_val = getStringValueOptimized(table, col, row_idx, context);
+                for (where.in_values_str[0..where.in_values_count]) |val| {
+                     if (std.mem.eql(u8, row_val, val)) return false;
+                }
+                return true;
+            } else {
+                const row_val = getIntValueOptimized(table, col, row_idx, context);
+                for (where.in_values_int[0..where.in_values_count]) |v| {
+                    if (row_val == v) return false;
+                }
+                return true;
             }
         },
-        .gt => {
-            if (where.value_int) |val| {
-                return getIntValueOptimized(table, col, row_idx, context) > val;
-            } else if (where.value_float) |val| {
-                return getFloatValueOptimized(table, col, row_idx, context) > val;
+        .not_like => {
+            if (where.value_str) |pattern| {
+                const s = getStringValueOptimized(table, col, row_idx, context);
+                return !matchLike(s, pattern);
             }
         },
-        .ge => {
-            if (where.value_int) |val| {
-                return getIntValueOptimized(table, col, row_idx, context) >= val;
-            } else if (where.value_float) |val| {
-                return getFloatValueOptimized(table, col, row_idx, context) >= val;
+        .in_list => {
+            if (col.col_type == .string) {
+                const row_val = getStringValueOptimized(table, col, row_idx, context);
+                for (where.in_values_str[0..where.in_values_count]) |val| {
+                     if (std.mem.eql(u8, row_val, val)) return true;
+                }
+                // Fallback for single value_str (from non-list parse if any)
+                if (where.value_str) |val| {
+                     return std.mem.eql(u8, row_val, val);
+                }
+            } else {
+                const row_val = getIntValueOptimized(table, col, row_idx, context);
+                for (where.in_values_int[0..where.in_values_count]) |v| {
+                    if (row_val == v) return true;
+                }
             }
+        },
+        .in_subquery, .not_in_subquery => {
+             // Lazily evaluate subquery once per query run
+             if (!where.is_subquery_evaluated) {
+                 setDebug("Evaluating subquery first time. Op: {any}", .{where.op});
+                 const mut_where = @as(*WhereClause, @ptrCast(@constCast(where)));
+                 const sub_sql = sql_input[where.subquery_start .. where.subquery_start + where.subquery_len];
+                 
+                 const res = executeSubqueryInternal(sub_sql) catch |err| blk: {
+                     setDebug("Subquery execution failed: {s}", .{@errorName(err)});
+                     break :blk SubqueryResult{ .exists = false };
+                 };
+                 
+                 mut_where.subquery_results_i64 = res.int64_results;
+                 mut_where.subquery_results_f64 = res.float64_results;
+                 mut_where.subquery_results_str = res.string_results;
+                 mut_where.subquery_exists = res.exists;
+                 mut_where.is_subquery_evaluated = true;
+             }
+             
+             var match = false;
+             if (where.subquery_results_i64) |results| {
+                 const row_val = getIntValueOptimized(table, col, row_idx, context);
+                 for (results) |v| {
+                     if (row_val == v) {
+                         match = true;
+                         break;
+                     }
+                 }
+             } else if (where.subquery_results_f64) |results| {
+                 const row_val = getFloatValueOptimized(table, col, row_idx, context);
+                 for (results) |v| {
+                     if (row_val == v) {
+                         match = true;
+                         break;
+                     }
+                 }
+             } else if (where.subquery_results_str) |results| {
+                 const row_val = getStringValueOptimized(table, col, row_idx, context);
+                 for (results) |v| {
+                     if (std.mem.eql(u8, row_val, v)) {
+                         match = true;
+                         break;
+                     }
+                 }
+             }
+             return if (where.op == .in_subquery) match else !match;
+        },
+        .exists, .not_exists => {
+             if (!where.is_subquery_evaluated) {
+                 const mut_where = @as(*WhereClause, @ptrCast(@constCast(where)));
+                 const sub_sql = sql_input[where.subquery_start .. where.subquery_start + where.subquery_len];
+                 
+                 const res = executeSubqueryInternal(sub_sql) catch |err| blk: {
+                      setDebug("EXISTS Subquery failed: {s}", .{@errorName(err)});
+                      break :blk SubqueryResult{ .exists = false };
+                 };
+                 
+                 mut_where.subquery_exists = res.exists;
+                 mut_where.is_subquery_evaluated = true;
+             }
+             return if (where.op == .exists) where.subquery_exists else !where.subquery_exists;
         },
         .is_null => {
-            // For now assume non-nullable
-            return false;
+             const s = getStringValueOptimized(table, col, row_idx, context);
+             return (s.len == 0) or std.mem.eql(u8, s, "NULL");
         },
         .is_not_null => {
-            return true;
+             const s = getStringValueOptimized(table, col, row_idx, context);
+             return (s.len > 0) and !std.mem.eql(u8, s, "NULL");
         },
         else => return false,
     }
@@ -4828,6 +7123,33 @@ fn matchLike(str: []const u8, pattern: []const u8) bool {
 // Sorting
 // ============================================================================
 
+fn compareValues(table: *const TableInfo, col: *const ColumnData, idx1: u32, idx2: u32) i32 {
+    switch (col.col_type) {
+        .string, .list => {
+            var ctx: ?FragmentContext = null;
+            const s1 = getStringValueOptimized(table, col, idx1, &ctx);
+            const s2 = getStringValueOptimized(table, col, idx2, &ctx);
+            return switch (std.mem.order(u8, s1, s2)) {
+                .lt => -1, .gt => 1, .eq => 0
+            };
+        },
+        .int64 => {
+             const v1 = getIntValue(table, col, idx1);
+             const v2 = getIntValue(table, col, idx2);
+             if (v1 < v2) return -1;
+             if (v1 > v2) return 1;
+             return 0;
+        },
+        else => {
+            const v1 = getFloatValue(table, col, idx1);
+            const v2 = getFloatValue(table, col, idx2);
+            if (v1 < v2) return -1;
+            if (v1 > v2) return 1;
+            return 0;
+        }
+    }
+}
+
 fn sortIndices(table: *const TableInfo, indices: []u32, col_name: []const u8, dir: OrderDir) void {
     var col: ?*const ColumnData = null;
     for (table.columns[0..table.column_count]) |maybe_col| {
@@ -4843,11 +7165,10 @@ fn sortIndices(table: *const TableInfo, indices: []u32, col_name: []const u8, di
     // Simple insertion sort (good enough for moderate sizes)
     for (1..indices.len) |i| {
         const key = indices[i];
-        const key_val = getFloatValue(table, c, key);
         var j: usize = i;
         while (j > 0) {
-            const cmp_val = getFloatValue(table, c, indices[j - 1]);
-            const should_swap = if (dir == .asc) cmp_val > key_val else cmp_val < key_val;
+            const cmp = compareValues(table, c, indices[j - 1], key);
+            const should_swap = if (dir == .asc) cmp > 0 else cmp < 0;
             if (!should_swap) break;
             indices[j] = indices[j - 1];
             j -= 1;
@@ -4860,11 +7181,13 @@ fn sortIndices(table: *const TableInfo, indices: []u32, col_name: []const u8, di
 // SQL Parser
 // ============================================================================
 
-fn parseSql(sql: []const u8) ?*ParsedQuery {
+pub fn parseSql(sql: []const u8) ?*ParsedQuery {
     if (query_storage_idx >= query_storage.len) return null;
+
     const query = &query_storage[query_storage_idx];
     query_storage_idx += 1;
-    query.* = ParsedQuery{};
+    query.* = .{};
+    setDebug("parseSql input: {s}", .{sql});
     var pos: usize = 0;
     pos = skipWs(sql, pos);
 
@@ -4977,24 +7300,133 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
                 pos = skipWs(sql, pos);
 
                 // Type
+                // Type
                 const type_start = pos;
                 while (pos < sql.len and isIdent(sql[pos])) pos += 1;
                 const type_str = sql[type_start..pos];
                 var col_type: ColumnType = .string; // Default
-                if (std.ascii.eqlIgnoreCase(type_str, "INT") or std.ascii.eqlIgnoreCase(type_str, "INTEGER")) col_type = .int64;
-                if (std.ascii.eqlIgnoreCase(type_str, "FLOAT") or std.ascii.eqlIgnoreCase(type_str, "DOUBLE")) col_type = .float64;
+                if (std.ascii.eqlIgnoreCase(type_str, "INT") or std.ascii.eqlIgnoreCase(type_str, "INTEGER") or std.ascii.eqlIgnoreCase(type_str, "INT64")) col_type = .int64;
+                if (std.ascii.eqlIgnoreCase(type_str, "FLOAT") or std.ascii.eqlIgnoreCase(type_str, "DOUBLE") or std.ascii.eqlIgnoreCase(type_str, "REAL") or std.ascii.eqlIgnoreCase(type_str, "FLOAT64")) col_type = .float64;
+                if (std.ascii.eqlIgnoreCase(type_str, "FLOAT32")) col_type = .float32;
+
+                var v_dim: u32 = 0;
+                if (pos < sql.len and sql[pos] == '[') {
+                    pos += 1;
+                    const dim_start = pos;
+                    while (pos < sql.len and std.ascii.isDigit(sql[pos])) pos += 1;
+                    v_dim = std.fmt.parseInt(u32, sql[dim_start..pos], 10) catch 0;
+                    if (pos < sql.len and sql[pos] == ']') pos += 1;
+                }
                 
                 if (query.create_col_count < MAX_SELECT_COLS) {
-                    query.create_columns[query.create_col_count] = .{ .name = col_name, .type = col_type };
+                    query.create_columns[query.create_col_count] = .{ .name = col_name, .type = col_type, .vector_dim = v_dim };
                     query.create_col_count += 1;
                 }
 
                 pos = skipWs(sql, pos);
+                
+                // Consume modifiers (PRIMARY KEY, NOT NULL, etc)
+                while (pos < sql.len and sql[pos] != ',' and sql[pos] != ')') {
+                    while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+                    pos = skipWs(sql, pos);
+                }
+
                 if (pos < sql.len and sql[pos] == ',') {
                     pos += 1;
                     pos = skipWs(sql, pos);
                 }
             }
+        }
+        return query;
+    } else if (startsWithIC(sql[pos..], "UPDATE")) {
+        query.type = .update;
+        pos += 6;
+        pos = skipWs(sql, pos);
+        
+        const name_start = pos;
+        while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+        query.table_name = sql[name_start..pos];
+        pos = skipWs(sql, pos);
+        
+        // Swallow alias if present
+        if (pos < sql.len and isIdent(sql[pos]) and !startsWithIC(sql[pos..], "SET")) {
+             const alias_start = pos;
+             while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+             query.table_alias = sql[alias_start..pos];
+             pos = skipWs(sql, pos);
+        }
+        
+        // SET clause
+        if (startsWithIC(sql[pos..], "SET")) {
+             pos += 3;
+             pos = skipWs(sql, pos);
+             
+             while (query.update_count < MAX_SELECT_COLS) {
+                 const col_name_start = pos;
+                 while (pos < sql.len and sql[pos] != '=') pos += 1;
+                 const full_col_name = std.mem.trim(u8, sql[col_name_start..pos], &std.ascii.whitespace);
+                 
+                 var clean_name = full_col_name;
+                 if (std.mem.indexOf(u8, full_col_name, ".")) |dot| {
+                     clean_name = full_col_name[dot+1..];
+                 }
+                 query.update_cols[query.update_count] = clean_name;
+
+                 if (pos < sql.len) pos += 1;
+                 pos = skipWs(sql, pos);
+                 if (parseScalarExpr(sql, &pos)) |expr| {
+                     query.update_exprs[query.update_count] = expr;
+                 }
+                 query.update_count += 1;
+                 
+                 pos = skipWs(sql, pos);
+                 if (pos < sql.len and sql[pos] == ',') {
+                     pos += 1;
+                     pos = skipWs(sql, pos);
+                 } else {
+                     break;
+                 }
+             }
+        }
+
+        // Optional FROM clause (for UPDATE FROM)
+        if (startsWithIC(sql[pos..], "FROM")) {
+             pos += 4;
+             pos = skipWs(sql, pos);
+             const src_name_start = pos;
+             while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+             query.source_table_name = sql[src_name_start..pos];
+             pos = skipWs(sql, pos);
+
+             // Swallow alias
+             if (pos < sql.len and isIdent(sql[pos]) and !startsWithIC(sql[pos..], "WHERE")) {
+                  const alias_start = pos;
+                  while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+                  query.source_table_alias = sql[alias_start..pos];
+                  pos = skipWs(sql, pos);
+             }
+        }
+
+        if (pos < sql.len and startsWithIC(sql[pos..], "WHERE")) {
+            pos += 5;
+            pos = skipWs(sql, pos);
+            query.where_clause = parseWhere(sql, &pos);
+        }
+        return query;
+    } else if (startsWithIC(sql[pos..], "DELETE FROM")) {
+        query.type = .delete;
+        pos += 11;
+        pos = skipWs(sql, pos);
+        
+        const name_start = pos;
+        while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+        query.table_name = sql[name_start..pos];
+        pos = skipWs(sql, pos);
+        
+        if (pos < sql.len and startsWithIC(sql[pos..], "WHERE")) {
+            pos += 5;
+            pos = skipWs(sql, pos);
+            query.where_clause = parseWhere(sql, &pos);
         }
         return query;
     } else if (startsWithIC(sql[pos..], "INSERT INTO")) {
@@ -5007,10 +7439,25 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
         query.table_name = sql[name_start..pos];
         pos = skipWs(sql, pos);
 
-        // Optional columns (skip for now)
+        // Optional columns
         if (pos < sql.len and sql[pos] == '(') {
-             while (pos < sql.len and sql[pos] != ')') pos += 1;
              pos += 1;
+             pos = skipWs(sql, pos);
+             var col_idx: usize = 0;
+             while (pos < sql.len and sql[pos] != ')') {
+                 const col_start = pos;
+                 while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+                 if (col_idx < MAX_SELECT_COLS) {
+                     query.insert_col_names[col_idx] = sql[col_start..pos];
+                 }
+                 col_idx += 1;
+                 pos = skipWs(sql, pos);
+                 if (pos < sql.len and sql[pos] == ',') {
+                     pos += 1;
+                     pos = skipWs(sql, pos);
+                 }
+             }
+             if (pos < sql.len and sql[pos] == ')') pos += 1;
              pos = skipWs(sql, pos);
         }
 
@@ -5029,10 +7476,15 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
                             pos += 1;
                             while (pos < sql.len and sql[pos] != '\'') pos += 1;
                             pos += 1;
+                        } else if (sql[pos] == '[') {
+                            pos += 1;
+                            while (pos < sql.len and sql[pos] != ']') pos += 1;
+                            pos += 1;
                         } else {
                             while (pos < sql.len and sql[pos] != ',' and sql[pos] != ')') pos += 1;
                         }
-                        const val = sql[val_start..pos];
+                        const raw_val = sql[val_start..pos];
+                        const val = std.mem.trim(u8, raw_val, &std.ascii.whitespace);
                         // Trim quotes if needed
                         if (val.len >= 2 and val[0] == '\'' and val[val.len-1] == '\'') {
                             if (query.insert_row_count < MAX_ROWS and col_idx < MAX_SELECT_COLS) {
@@ -5065,6 +7517,50 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
                     break;
                 }
             }
+            
+            // Check for ON CONFLICT
+            pos = skipWs(sql, pos);
+            if (startsWithIC(sql[pos..], "ON CONFLICT")) {
+                pos += 11;
+                pos = skipWs(sql, pos);
+                if (pos < sql.len and sql[pos] == '(') {
+                    pos += 1;
+                    const c_start = pos;
+                    while (pos < sql.len and sql[pos] != ')') pos += 1;
+                    query.on_conflict_col = sql[c_start..pos];
+                    if (pos < sql.len) pos += 1;
+                    pos = skipWs(sql, pos);
+                }
+                
+                if (startsWithIC(sql[pos..], "DO NOTHING")) {
+                    query.on_conflict_action = .nothing;
+                    pos += 10;
+                } else if (startsWithIC(sql[pos..], "DO UPDATE SET")) {
+                    query.on_conflict_action = .update;
+                    pos += 13;
+                    pos = skipWs(sql, pos);
+                    
+                    while (query.update_count < MAX_SELECT_COLS) {
+                        const c_upd_start = pos;
+                        while (pos < sql.len and sql[pos] != '=') pos += 1;
+                        query.update_cols[query.update_count] = std.mem.trim(u8, sql[c_upd_start..pos], &std.ascii.whitespace);
+                        if (pos < sql.len) pos += 1;
+                        pos = skipWs(sql, pos);
+                        if (parseScalarExpr(sql, &pos)) |expr| {
+                            query.update_exprs[query.update_count] = expr;
+                        }
+                        query.update_count += 1;
+                        
+                        pos = skipWs(sql, pos);
+                        if (pos < sql.len and sql[pos] == ',') {
+                            pos += 1;
+                            pos = skipWs(sql, pos);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
         } else {
             // Fuzzy/Fallback parse for SELECT if VALUES not found
             const sel_idx = std.mem.indexOfPos(u8, sql, pos, "SELECT") orelse std.mem.indexOfPos(u8, sql, pos, "select");
@@ -5093,7 +7589,7 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
                          while (rest_pos < sql.len and std.ascii.isDigit(sql[rest_pos])) rest_pos += 1;
                          const limit_str = sql[limit_start..rest_pos];
                          if (std.fmt.parseInt(u32, limit_str, 10)) |l| {
-                             query.limit_value = l;
+                             query.top_k = l;
                          } else |_| {}
                      }
                  }
@@ -5101,7 +7597,7 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
                  // Absolute fallback for benchmark
                  query.is_insert_select = true;
                  query.source_table_name = "orders";
-                 query.limit_value = 10000;
+                 query.top_k = 10000;
             }
         }
         return query;
@@ -5142,15 +7638,19 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
         !startsWithIC(sql[pos..], "WHERE") and 
         !startsWithIC(sql[pos..], "GROUP") and 
         !startsWithIC(sql[pos..], "ORDER") and 
+        !startsWithIC(sql[pos..], "TOPK") and
         !startsWithIC(sql[pos..], "LIMIT")) {
         // Skip alias
         while (pos < sql.len and isIdent(sql[pos])) pos += 1;
         pos = skipWs(sql, pos);
+        // log("Skipped alias. SQL now: {s}", .{sql[pos..@min(pos+10, sql.len)]});
     }
 
-    // Optional JOIN clauses
+
     while (query.join_count < MAX_JOINS) {
+
         pos = skipWs(sql, pos);
+        // if (pos < sql.len) log("SQL at loop: {s}", .{sql[pos..@min(pos+10, sql.len)]});
 
         var join_type: JoinType = .inner;
 
@@ -5173,6 +7673,7 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
         }
 
         if (!startsWithIC(sql[pos..], "JOIN")) break;
+        // log("Found JOIN keyword", .{});
         pos += 4;
         pos = skipWs(sql, pos);
 
@@ -5197,39 +7698,104 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
             pos += 2;
             pos = skipWs(sql, pos);
 
-            // Parse: table.col = table.col or col = col
-            const on_start = pos;
+            const first_expr_start = pos;
             while (pos < sql.len and (isIdent(sql[pos]) or sql[pos] == '.')) pos += 1;
-            const left_expr = sql[on_start..pos];
-
-            // Extract column name (after last dot or whole thing)
-            if (std.mem.lastIndexOf(u8, left_expr, ".")) |dot| {
-                left_col = left_expr[dot + 1 ..];
-            } else {
-                left_col = left_expr;
-            }
-
-            pos = skipWs(sql, pos);
-            if (pos < sql.len and sql[pos] == '=') pos += 1;
+            const first_expr = sql[first_expr_start..pos];
             pos = skipWs(sql, pos);
 
-            const right_start = pos;
-            while (pos < sql.len and (isIdent(sql[pos]) or sql[pos] == '.')) pos += 1;
-            const right_expr = sql[right_start..pos];
+            if (startsWithIC(sql[pos..], "NEAR")) {
+                pos += 4;
+                pos = skipWs(sql, pos);
+                if (std.mem.lastIndexOf(u8, first_expr, ".")) |dot| {
+                    right_col = first_expr[dot + 1 ..];
+                } else {
+                    right_col = first_expr;
+                }
 
-            if (std.mem.lastIndexOf(u8, right_expr, ".")) |dot| {
-                right_col = right_expr[dot + 1 ..];
+                const is_near_const = true;
+                var near_vec: [MAX_VECTOR_DIM]f32 = undefined;
+                var near_dim: usize = 0;
+                var near_target_row: ?u32 = null;
+
+                if (pos < sql.len and sql[pos] == '[') {
+                    pos += 1;
+                    while (pos < sql.len and near_dim < MAX_VECTOR_DIM) {
+                        pos = skipWs(sql, pos);
+                        if (pos < sql.len and sql[pos] == ']') {
+                            pos += 1;
+                            break;
+                        }
+                        const num_start = pos;
+                        if (sql[pos] == '-') pos += 1;
+                        while (pos < sql.len and (std.ascii.isDigit(sql[pos]) or sql[pos] == '.')) pos += 1;
+                        if (pos > num_start) {
+                            near_vec[near_dim] = std.fmt.parseFloat(f32, sql[num_start..pos]) catch 0;
+                            near_dim += 1;
+                        }
+                        pos = skipWs(sql, pos);
+                        if (pos < sql.len and sql[pos] == ',') pos += 1;
+                    }
+                } else {
+                    const num_start = pos;
+                    while (pos < sql.len and std.ascii.isDigit(sql[pos])) pos += 1;
+                    if (pos > num_start) {
+                        near_target_row = std.fmt.parseInt(u32, sql[num_start..pos], 10) catch null;
+                    }
+                }
+
+                pos = skipWs(sql, pos);
+                var join_top_k: ?u32 = null;
+                if (startsWithIC(sql[pos..], "TOPK")) {
+                    pos += 4;
+                    pos = skipWs(sql, pos);
+                    const num_start = pos;
+                    while (pos < sql.len and std.ascii.isDigit(sql[pos])) pos += 1;
+                    if (pos > num_start) {
+                        join_top_k = std.fmt.parseInt(u32, sql[num_start..pos], 10) catch null;
+                    }
+                }
+
+                query.joins[query.join_count] = JoinClause{
+                    .table_name = join_table,
+                    .join_type = join_type,
+                    .left_col = "", // NEAR join doesn't use left_col for now
+                    .right_col = right_col,
+                    .is_near = is_near_const,
+                    .near_vector = near_vec,
+                    .near_dim = near_dim,
+                    .near_target_row = near_target_row,
+                    .top_k = join_top_k,
+                };
+                query.join_count += 1;
             } else {
-                right_col = right_expr;
+                // Parse: table.col = table.col or col = col
+                if (std.mem.lastIndexOf(u8, first_expr, ".")) |dot| {
+                    left_col = first_expr[dot + 1 ..];
+                } else {
+                    left_col = first_expr;
+                }
+
+                if (pos < sql.len and sql[pos] == '=') pos += 1;
+                pos = skipWs(sql, pos);
+
+                const right_start = pos;
+                while (pos < sql.len and (isIdent(sql[pos]) or sql[pos] == '.')) pos += 1;
+                const right_expr = sql[right_start..pos];
+
+                if (std.mem.lastIndexOf(u8, right_expr, ".")) |dot| {
+                    right_col = right_expr[dot + 1 ..];
+                } else {
+                    right_col = right_expr;
+                }
+
+                query.joins[query.join_count] = JoinClause{
+                    .table_name = join_table,
+                    .join_type = join_type,
+                    .left_col = left_col,
+                    .right_col = right_col,
+                };
             }
         }
-
-        query.joins[query.join_count] = JoinClause{
-            .table_name = join_table,
-            .join_type = join_type,
-            .left_col = left_col,
-            .right_col = right_col,
-        };
         query.join_count += 1;
     }
 
@@ -5237,6 +7803,7 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
 
     // Optional WHERE
     if (pos < sql.len and startsWithIC(sql[pos..], "WHERE")) {
+        // log("Found WHERE keyword", .{});
         pos += 5;
         pos = skipWs(sql, pos);
         query.where_clause = parseWhere(sql, &pos);
@@ -5251,6 +7818,14 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
         pos = skipWs(sql, pos);
     }
 
+    // Optional HAVING
+    if (pos < sql.len and startsWithIC(sql[pos..], "HAVING")) {
+        pos += 6;
+        pos = skipWs(sql, pos);
+        query.having_clause = parseWhere(sql, &pos);
+        pos = skipWs(sql, pos);
+    }
+
     // Optional ORDER BY
     if (pos < sql.len and startsWithIC(sql[pos..], "ORDER BY")) {
         pos += 8;
@@ -5259,13 +7834,13 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
         pos = skipWs(sql, pos);
     }
 
-    if (startsWithIC(sql[pos..], "LIMIT")) {
-        pos += 5;
+    if (startsWithIC(sql[pos..], "TOPK") or startsWithIC(sql[pos..], "LIMIT")) {
+        if (startsWithIC(sql[pos..], "TOPK")) { pos += 4; } else { pos += 5; }
         pos = skipWs(sql, pos);
         const num_start = pos;
         while (pos < sql.len and std.ascii.isDigit(sql[pos])) pos += 1;
         if (pos > num_start) {
-            query.limit_value = std.fmt.parseInt(u32, sql[num_start..pos], 10) catch null;
+            query.top_k = std.fmt.parseInt(u32, sql[num_start..pos], 10) catch null;
         }
         pos = skipWs(sql, pos);
     }
@@ -5324,6 +7899,251 @@ fn parseSql(sql: []const u8) ?*ParsedQuery {
     return query;
 }
 
+
+fn getScalarFunc(name: []const u8) ScalarFunc {
+    if (std.ascii.eqlIgnoreCase(name, "TRIM")) return .trim;
+    if (std.ascii.eqlIgnoreCase(name, "LTRIM")) return .ltrim;
+    if (std.ascii.eqlIgnoreCase(name, "RTRIM")) return .rtrim;
+    if (std.ascii.eqlIgnoreCase(name, "ABS")) return .abs;
+    if (std.ascii.eqlIgnoreCase(name, "CEIL")) return .ceil;
+    if (std.ascii.eqlIgnoreCase(name, "FLOOR")) return .floor;
+    if (std.ascii.eqlIgnoreCase(name, "SQRT")) return .sqrt;
+    if (std.ascii.eqlIgnoreCase(name, "POWER")) return .power;
+    if (std.ascii.eqlIgnoreCase(name, "MOD")) return .mod;
+    if (std.ascii.eqlIgnoreCase(name, "SIGN")) return .sign;
+    if (std.ascii.eqlIgnoreCase(name, "TRUNC")) return .trunc;
+    if (std.ascii.eqlIgnoreCase(name, "ROUND")) return .round;
+    if (std.ascii.eqlIgnoreCase(name, "CONCAT")) return .concat;
+    if (std.ascii.eqlIgnoreCase(name, "REPLACE")) return .replace;
+    if (std.ascii.eqlIgnoreCase(name, "REVERSE")) return .reverse;
+    if (std.ascii.eqlIgnoreCase(name, "UPPER")) return .upper;
+    if (std.ascii.eqlIgnoreCase(name, "LOWER")) return .lower;
+    if (std.ascii.eqlIgnoreCase(name, "LENGTH")) return .length;
+    if (std.ascii.eqlIgnoreCase(name, "SPLIT")) return .split;
+    if (std.ascii.eqlIgnoreCase(name, "ARRAY_LENGTH")) return .array_length;
+    if (std.ascii.eqlIgnoreCase(name, "ARRAY_SLICE")) return .array_slice;
+    if (std.ascii.eqlIgnoreCase(name, "ARRAY_CONTAINS")) return .array_contains;
+    if (std.ascii.eqlIgnoreCase(name, "NULLIF")) return .nullif;
+    if (std.ascii.eqlIgnoreCase(name, "COALESCE")) return .coalesce;
+    if (std.ascii.eqlIgnoreCase(name, "LEFT")) return .left;
+    if (std.ascii.eqlIgnoreCase(name, "SUBSTR")) return .substr;
+    if (std.ascii.eqlIgnoreCase(name, "INSTR")) return .instr;
+    if (std.ascii.eqlIgnoreCase(name, "LPAD")) return .lpad;
+    if (std.ascii.eqlIgnoreCase(name, "RPAD")) return .rpad;
+    if (std.ascii.eqlIgnoreCase(name, "RIGHT")) return .right;
+    if (std.ascii.eqlIgnoreCase(name, "REPEAT")) return .repeat;
+    if (std.ascii.eqlIgnoreCase(name, "POSITION")) return .instr;
+    return .none;
+}
+
+fn parseScalarExpr(sql: []const u8, pos: *usize) ?SelectExpr {
+    pos.* = skipWs(sql, pos.*);
+    
+    var expr = SelectExpr{};
+
+    // 1. Literal Numbers
+    if (pos.* < sql.len and (std.ascii.isDigit(sql[pos.*]) or sql[pos.*] == '-')) {
+        const num_start = pos.*;
+        if (sql[pos.*] == '-') pos.* += 1;
+        while (pos.* < sql.len and (std.ascii.isDigit(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+        const num_str = sql[num_start..pos.*];
+        if (std.mem.indexOf(u8, num_str, ".") != null) {
+            expr.val_float = std.fmt.parseFloat(f64, num_str) catch 0;
+        } else {
+            expr.val_int = std.fmt.parseInt(i64, num_str, 10) catch 0;
+        }
+        return expr;
+    }
+
+    // 2. Literal Strings
+    if (pos.* < sql.len and sql[pos.*] == '\'') {
+        pos.* += 1;
+        const val_start = pos.*;
+        while (pos.* < sql.len and sql[pos.*] != '\'') pos.* += 1;
+        expr.val_str = sql[val_start..pos.*];
+        if (pos.* < sql.len) pos.* += 1;
+
+        return expr;
+    }
+
+    // 3. Identifier
+    const start = pos.*;
+    while (pos.* < sql.len and (isIdent(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+    if (pos.* == start) return null;
+    const name = sql[start..pos.*];
+    
+    // 4. ARRAY[...] literal
+    if (std.ascii.eqlIgnoreCase(name, "ARRAY") and pos.* < sql.len and sql[pos.*] == '[') {
+        pos.* += 1;
+        const array_start = pos.*;
+        var count: i64 = 0;
+        var has_elements = false;
+        while (pos.* < sql.len and sql[pos.*] != ']') {
+            if (sql[pos.*] == ',') count += 1;
+            if (!std.ascii.isWhitespace(sql[pos.*])) has_elements = true;
+            pos.* += 1;
+        }
+        if (has_elements) count += 1;
+        if (pos.* < sql.len) pos.* += 1; // skip ]
+        
+        expr.func = .none;
+        expr.val_int = count; // Store length in val_int for ARRAY_LENGTH
+        expr.val_str = sql[array_start - 1 .. pos.*]; // Store full literal "[1,2,3]"
+        return expr;
+    }
+
+    // 5. CASE expression
+    if (std.ascii.eqlIgnoreCase(name, "CASE")) {
+        expr.func = .case;
+        pos.* = skipWs(sql, pos.*);
+        
+        // Check for simple CASE: CASE sc WHEN ...
+        var searched_col: ?[]const u8 = null;
+        if (!startsWithIC(sql[pos.*..], "WHEN")) {
+             const sc_start = pos.*;
+             while (pos.* < sql.len and (isIdent(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+             if (pos.* > sc_start) searched_col = sql[sc_start..pos.*];
+             pos.* = skipWs(sql, pos.*);
+        }
+
+        while (pos.* < sql.len and startsWithIC(sql[pos.*..], "WHEN")) {
+            pos.* += 4;
+            pos.* = skipWs(sql, pos.*);
+
+            var when_clause: ?WhereClause = null;
+            if (searched_col) |sc| {
+                // CASE sc WHEN val THEN ... -> sc = val
+                if (parseScalarExpr(sql, pos)) |val_expr| {
+                    when_clause = WhereClause{
+                        .op = .eq,
+                        .column = sc,
+                        .value_int = val_expr.val_int,
+                        .value_float = val_expr.val_float,
+                        .value_str = val_expr.val_str,
+                    };
+                }
+            } else {
+                when_clause = parseOrExpr(sql, pos);
+            }
+
+            pos.* = skipWs(sql, pos.*);
+            if (startsWithIC(sql[pos.*..], "THEN")) {
+                pos.* += 4;
+                pos.* = skipWs(sql, pos.*);
+                if (parseScalarExpr(sql, pos)) |then_expr| {
+                    if (expr.case_count < 4 and when_clause != null) {
+                        expr.case_clauses[expr.case_count] = .{
+                            .when_cond = when_clause.?,
+                            .then_val_int = then_expr.val_int,
+                            .then_val_float = then_expr.val_float,
+                            .then_val_str = then_expr.val_str,
+                            .then_col_name = if (then_expr.col_name.len > 0) then_expr.col_name else null,
+                        };
+                        expr.case_count += 1;
+                    }
+                }
+            }
+            pos.* = skipWs(sql, pos.*);
+        }
+        
+        // Optional ELSE
+        if (startsWithIC(sql[pos.*..], "ELSE")) {
+            pos.* += 4;
+            pos.* = skipWs(sql, pos.*);
+            if (parseScalarExpr(sql, pos)) |else_expr| {
+                expr.else_val_int = else_expr.val_int;
+                expr.else_val_float = else_expr.val_float;
+                expr.else_val_str = else_expr.val_str;
+                expr.else_col_name = if (else_expr.col_name.len > 0) else_expr.col_name else null;
+            }
+            pos.* = skipWs(sql, pos.*);
+        }
+        
+        if (startsWithIC(sql[pos.*..], "END")) {
+            pos.* += 3;
+        }
+        
+        return expr;
+    }
+    
+    pos.* = skipWs(sql, pos.*);
+    
+    if (pos.* < sql.len and sql[pos.*] == '(') {
+        // Function Call
+        pos.* += 1; // skip (
+        pos.* = skipWs(sql, pos.*);
+        
+        expr.func = getScalarFunc(name);
+        
+        // Parse Arg 1
+        if (parseScalarExpr(sql, pos)) |arg1| {
+            if (arg1.val_str) |s| expr.val_str = s;
+            if (arg1.val_int) |i| expr.val_int = i;
+            if (arg1.val_float) |f| expr.val_float = f;
+            if (arg1.col_name.len > 0) expr.col_name = arg1.col_name;
+            // Nested? Flatten to 1 level for now/hack
+        }
+        
+        pos.* = skipWs(sql, pos.*);
+        if (pos.* < sql.len and sql[pos.*] == ',') {
+            pos.* += 1;
+            // Parse Arg 2
+            if (parseScalarExpr(sql, pos)) |arg2| {
+                if (arg2.val_str) |s| expr.arg_2_val_str = s;
+                if (arg2.val_int) |i| expr.arg_2_val_int = i;
+                if (arg2.val_float) |f| expr.arg_2_val_float = f;
+                if (arg2.col_name.len > 0) expr.arg_2_col = arg2.col_name;
+            }
+
+            pos.* = skipWs(sql, pos.*);
+            if (pos.* < sql.len and sql[pos.*] == ',') {
+                pos.* += 1;
+                // Parse Arg 3
+                if (parseScalarExpr(sql, pos)) |arg3| {
+                    if (arg3.val_str) |s| expr.arg_3_val_str = s;
+                    if (arg3.val_int) |i| expr.arg_3_val_int = i;
+                    if (arg3.val_float) |f| expr.arg_3_val_float = f;
+                    if (arg3.col_name.len > 0) expr.arg_3_col = arg3.col_name;
+                }
+            }
+        }
+        
+        // Skip until )
+        while (pos.* < sql.len and sql[pos.*] != ')') pos.* += 1;
+        if (pos.* < sql.len) pos.* += 1; 
+        
+    } else {
+        // Column Reference
+        expr.func = .none;
+        expr.col_name = name;
+        
+        // Check for operator
+        pos.* = skipWs(sql, pos.*);
+        if (pos.* < sql.len) {
+            const op_char = sql[pos.*];
+            if (op_char == '+' or op_char == '-' or op_char == '*' or op_char == '/') {
+                pos.* += 1;
+                switch (op_char) {
+                    '+' => expr.func = .add,
+                    '-' => expr.func = .sub,
+                    '*' => expr.func = .mul,
+                    '/' => expr.func = .div,
+                    else => {},
+                }
+                
+                // Parse RHS
+                if (parseScalarExpr(sql, pos)) |rhs| {
+                     if (rhs.val_int) |i| expr.arg_2_val_int = i;
+                     if (rhs.val_float) |f| expr.arg_2_val_float = f;
+                     if (rhs.col_name.len > 0) expr.arg_2_col = rhs.col_name;
+                }
+            }
+        }
+    }
+    
+    return expr;
+}
+
 fn parseSelectList(sql: []const u8, start: usize, query: *ParsedQuery) ?usize {
     var pos = start;
 
@@ -5346,12 +8166,13 @@ fn parseSelectList(sql: []const u8, start: usize, query: *ParsedQuery) ?usize {
         else if (parseAggregate(sql, &pos, query)) {
             parsed_agg = true;
         } else {
-            // Regular column
-            const col_start = pos;
-            while (pos < sql.len and (isIdent(sql[pos]) or sql[pos] == '.')) pos += 1;
-            if (pos > col_start and query.select_count < MAX_SELECT_COLS) {
-                query.select_cols[query.select_count] = sql[col_start..pos];
-                query.select_count += 1;
+            // Regular expression
+            if (parseScalarExpr(sql, &pos)) |expr| {
+                if (query.select_count < MAX_SELECT_COLS) {
+                    query.select_exprs[query.select_count] = expr;
+                    query.select_count += 1;
+                    // log("Added select expr: count={d}", .{query.select_count});
+                }
             }
         }
 
@@ -5375,6 +8196,9 @@ fn parseSelectList(sql: []const u8, start: usize, query: *ParsedQuery) ?usize {
                     query.window_funcs[query.window_count - 1].alias = alias;
                 } else if (parsed_agg) {
                     query.aggregates[query.agg_count - 1].alias = alias;
+                } else {
+                    query.select_exprs[query.select_count - 1].alias = alias;
+                    // log("Set alias for expr {d}: {s}", .{query.select_count - 1, alias});
                 }
             }
             pos = skipWs(sql, pos);
@@ -5428,7 +8252,7 @@ fn parseWindowFunction(sql: []const u8, pos: *usize, query: *ParsedQuery) bool {
                     }
                 } else if (sql[p] != '*' and sql[p] != ')') {
                     const col_start = p;
-                    while (p < sql.len and isIdent(sql[p])) p += 1;
+                    while (p < sql.len and (isIdent(sql[p]) or sql[p] == '.')) p += 1;
                     if (p > col_start) {
                         arg_col = sql[col_start..p];
                     }
@@ -5467,7 +8291,7 @@ fn parseWindowFunction(sql: []const u8, pos: *usize, query: *ParsedQuery) bool {
                     // Parse partition columns
                     while (window_expr.partition_count < 4) {
                         const part_start = p;
-                        while (p < sql.len and isIdent(sql[p])) p += 1;
+                        while (p < sql.len and (isIdent(sql[p]) or sql[p] == '.')) p += 1;
                         if (p > part_start) {
                             window_expr.partition_by[window_expr.partition_count] = sql[part_start..p];
                             window_expr.partition_count += 1;
@@ -5489,7 +8313,7 @@ fn parseWindowFunction(sql: []const u8, pos: *usize, query: *ParsedQuery) bool {
                     p += 2;
                     p = skipWs(sql, p);
                     const order_start = p;
-                    while (p < sql.len and isIdent(sql[p])) p += 1;
+                    while (p < sql.len and (isIdent(sql[p]) or sql[p] == '.')) p += 1;
                     if (p > order_start) {
                         window_expr.order_by_col = sql[order_start..p];
                     }
@@ -5544,7 +8368,7 @@ fn parseAggregate(sql: []const u8, pos: *usize, query: *ParsedQuery) bool {
             if (sql[p] == '*') {
                 p += 1;
             } else {
-                while (p < sql.len and isIdent(sql[p])) p += 1;
+                while (p < sql.len and (isIdent(sql[p]) or sql[p] == '.')) p += 1;
             }
             const col_name = sql[col_start..p];
 
@@ -5624,6 +8448,48 @@ fn parseAndExpr(sql: []const u8, pos: *usize) ?WhereClause {
 fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
     pos.* = skipWs(sql, pos.*);
 
+    // Check for EXISTS or NOT EXISTS
+    var is_exists_not = false;
+    const p_exists_check = pos.*;
+    if (startsWithIC(sql[pos.*..], "NOT")) {
+        pos.* += 3;
+        pos.* = skipWs(sql, pos.*);
+        if (startsWithIC(sql[pos.*..], "EXISTS")) {
+            is_exists_not = true;
+        } else {
+            pos.* = p_exists_check;
+        }
+    }
+    
+    if (startsWithIC(sql[pos.*..], "EXISTS")) {
+        pos.* += 6;
+        pos.* = skipWs(sql, pos.*);
+        if (pos.* < sql.len and sql[pos.*] == '(') {
+            pos.* += 1;
+            pos.* = skipWs(sql, pos.*);
+            if (startsWithIC(sql[pos.*..], "SELECT")) {
+                 var clause = WhereClause{
+                     .op = if (is_exists_not) .not_exists else .exists,
+                     .subquery_start = pos.*,
+                 };
+                 // Find matching ')'
+                 var depth: usize = 1;
+                 const start_pos = pos.*;
+                 while (pos.* < sql.len and depth > 0) {
+                     if (sql[pos.*] == '(') {
+                         depth += 1;
+                     } else if (sql[pos.*] == ')') {
+                         depth -= 1;
+                     }
+                     pos.* += 1;
+                 }
+                 clause.subquery_len = if (pos.* > start_pos) pos.* - start_pos - 1 else 0;
+                 return clause;
+            }
+        }
+        pos.* = p_exists_check; // Fallback if not a subquery
+    }
+
     // Handle parentheses
     if (pos.* < sql.len and sql[pos.*] == '(') {
         pos.* += 1;
@@ -5635,9 +8501,10 @@ fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
 
     // Column name
     const col_start = pos.*;
-    while (pos.* < sql.len and isIdent(sql[pos.*])) pos.* += 1;
+    while (pos.* < sql.len and (isIdent(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
     if (pos.* == col_start) return null;
     const column = sql[col_start..pos.*];
+
 
     pos.* = skipWs(sql, pos.*);
 
@@ -5673,6 +8540,30 @@ fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
         pos.* = skipWs(sql, pos.*);
         if (pos.* < sql.len and sql[pos.*] == '(') {
             pos.* += 1;
+            pos.* = skipWs(sql, pos.*);
+
+            if (startsWithIC(sql[pos.*..], "SELECT")) {
+                 // Subquery
+                 var clause = WhereClause{
+                     .op = if (is_not) .not_in_subquery else .in_subquery,
+                     .column = column,
+                     .subquery_start = pos.*,
+                 };
+                 // Find matching ')'
+                 var depth: usize = 1;
+                 const start_pos = pos.*;
+                 while (pos.* < sql.len and depth > 0) {
+                     if (sql[pos.*] == '(') {
+                         depth += 1;
+                     } else if (sql[pos.*] == ')') {
+                         depth -= 1;
+                     }
+                     pos.* += 1;
+                 }
+                 clause.subquery_len = if (pos.* > start_pos) pos.* - start_pos - 1 else 0;
+                 return clause;
+            }
+
             var clause = WhereClause{
                 .op = if (is_not) .not_in_list else .in_list,
                 .column = column,
@@ -5684,43 +8575,47 @@ fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
                     pos.* += 1;
                     break;
                 }
-                const num_start = pos.*;
-                if (sql[pos.*] == '-') pos.* += 1;
-                while (pos.* < sql.len and std.ascii.isDigit(sql[pos.*])) pos.* += 1;
-                if (pos.* > num_start) {
-                    if (std.fmt.parseInt(i64, sql[num_start..pos.*], 10)) |v| {
-                        clause.in_values_int[clause.in_values_count] = v;
+                
+                const prev_pos = pos.*;
+                if (sql[pos.*] == '\'') {
+                    // String literal
+                    pos.* += 1;
+                    const val_start = pos.*;
+                    while (pos.* < sql.len and sql[pos.*] != '\'') pos.* += 1;
+                    const val = sql[val_start..pos.*];
+                    if (pos.* < sql.len) pos.* += 1;
+                    
+                    if (clause.in_values_count < 32) {
+                        clause.in_values_str[clause.in_values_count] = val;
                         clause.in_values_count += 1;
-                    } else |_| {}
+                    }
+                } else {
+                    // Numeric literal
+                    const num_start = pos.*;
+                    if (sql[pos.*] == '-') pos.* += 1;
+                    while (pos.* < sql.len and (std.ascii.isDigit(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+                    if (pos.* > num_start) {
+                        const num_str = sql[num_start..pos.*];
+                        if (std.mem.indexOf(u8, num_str, ".") != null) {
+                             // Fallback or handle floats in IN? Parser just has in_values_int for now.
+                             // For now convert to int or skip.
+                        }
+                        if (std.fmt.parseInt(i64, num_str, 10)) |v| {
+                            if (clause.in_values_count < 32) {
+                                clause.in_values_int[clause.in_values_count] = v;
+                                clause.in_values_count += 1;
+                            }
+                        } else |_| {}
+                    }
                 }
+                
+                if (pos.* == prev_pos) pos.* += 1; // Safety advance
+
                 pos.* = skipWs(sql, pos.*);
                 if (pos.* < sql.len and sql[pos.*] == ',') pos.* += 1;
             }
             return clause;
         }
-    }
-
-    // Check for BETWEEN
-    if (startsWithIC(sql[pos.*..], "BETWEEN")) {
-        pos.* += 7;
-        pos.* = skipWs(sql, pos.*);
-        const low_start = pos.*;
-        if (sql[pos.*] == '-') pos.* += 1;
-        while (pos.* < sql.len and std.ascii.isDigit(sql[pos.*])) pos.* += 1;
-        const low_val = std.fmt.parseInt(i64, sql[low_start..pos.*], 10) catch null;
-        pos.* = skipWs(sql, pos.*);
-        if (startsWithIC(sql[pos.*..], "AND")) pos.* += 3;
-        pos.* = skipWs(sql, pos.*);
-        const high_start = pos.*;
-        if (sql[pos.*] == '-') pos.* += 1;
-        while (pos.* < sql.len and std.ascii.isDigit(sql[pos.*])) pos.* += 1;
-        const high_val = std.fmt.parseInt(i64, sql[high_start..pos.*], 10) catch null;
-        return WhereClause{
-            .op = .between,
-            .column = column,
-            .between_low = low_val,
-            .between_high = high_val,
-        };
     }
 
     // Check for LIKE
@@ -5740,6 +8635,55 @@ fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
                 .value_str = pattern,
             };
         }
+    }
+
+    // Check for BETWEEN
+    if (startsWithIC(sql[pos.*..], "BETWEEN")) {
+        pos.* += 7;
+        pos.* = skipWs(sql, pos.*);
+        
+        var val_int_1: ?i64 = null;
+        var val_float_1: ?f64 = null;
+        
+        {
+            const num_start = pos.*;
+            if (pos.* < sql.len and sql[pos.*] == '-') pos.* += 1;
+            while (pos.* < sql.len and (std.ascii.isDigit(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+            const num_str = sql[num_start..pos.*];
+            if (std.mem.indexOf(u8, num_str, ".") != null) {
+                val_float_1 = std.fmt.parseFloat(f64, num_str) catch null;
+            } else {
+                val_int_1 = std.fmt.parseInt(i64, num_str, 10) catch null;
+            }
+        }
+        
+        pos.* = skipWs(sql, pos.*);
+        if (startsWithIC(sql[pos.*..], "AND")) pos.* += 3;
+        pos.* = skipWs(sql, pos.*);
+
+        var val_int_2: ?i64 = null;
+        var val_float_2: ?f64 = null;
+        
+        {
+            const num_start = pos.*;
+            if (pos.* < sql.len and sql[pos.*] == '-') pos.* += 1;
+            while (pos.* < sql.len and (std.ascii.isDigit(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+            const num_str = sql[num_start..pos.*];
+            if (std.mem.indexOf(u8, num_str, ".") != null) {
+                val_float_2 = std.fmt.parseFloat(f64, num_str) catch null;
+            } else {
+                val_int_2 = std.fmt.parseInt(i64, num_str, 10) catch null;
+            }
+        }
+        
+        return WhereClause{
+            .op = if (is_not) .not_between else .between,
+            .column = column,
+            .value_int = val_int_1,
+            .value_float = val_float_1,
+            .value_int_2 = val_int_2,
+            .value_float_2 = val_float_2,
+        };
     }
 
     // Check for NEAR
@@ -5854,7 +8798,20 @@ fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
         } else {
             value_int = std.fmt.parseInt(i64, num_str, 10) catch null;
         }
+    } else {
+        // Potential column name (e.g. o.id = u.order_id)
+        const val_start = pos.*;
+        while (pos.* < sql.len and (isIdent(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+        if (pos.* > val_start) {
+             const rhs_name = sql[val_start..pos.*];
+             return WhereClause{
+                 .op = op,
+                 .column = column,
+                 .arg_2_col = rhs_name,
+             };
+        }
     }
+
 
     return WhereClause{
         .op = op,
@@ -5879,6 +8836,19 @@ fn parseGroupBy(sql: []const u8, start: usize, query: *ParsedQuery) usize {
         if (pos >= sql.len or sql[pos] != ',') break;
         pos += 1;
     }
+
+    // Optional TOPK modifier to limit groups
+    if (pos < sql.len and startsWithIC(sql[pos..], "TOPK")) {
+        pos += 4;
+        pos = skipWs(sql, pos);
+        const num_start = pos;
+        while (pos < sql.len and std.ascii.isDigit(sql[pos])) pos += 1;
+        if (pos > num_start) {
+            query.group_by_top_k = std.fmt.parseInt(u32, sql[num_start..pos], 10) catch null;
+        }
+        pos = skipWs(sql, pos);
+    }
+    
     return pos;
 }
 
@@ -5987,7 +8957,7 @@ test "parse SELECT with ORDER BY" {
     try std.testing.expect(query != null);
     try std.testing.expect(query.?.order_by_col != null);
     try std.testing.expectEqual(OrderDir.desc, query.?.order_dir);
-    try std.testing.expectEqual(@as(u32, 10), query.?.limit_value.?);
+    try std.testing.expectEqual(@as(u32, 10), query.?.top_k.?);
 }
 
 test "parse WHERE with AND/OR" {

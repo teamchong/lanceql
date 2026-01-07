@@ -269,6 +269,10 @@ class SQLExecutor {
         return SubqueryModule.executeSubquery(this, subqueryAst, outerColumnData, outerRowIdx);
     }
 
+    _executeCTEBody(bodyAst, db) {
+        return SubqueryModule.executeCTEBody(this, bodyAst, db);
+    }
+
     async materializeCTEs(ctes, db) {
         return SubqueryModule.materializeCTEs(this, ctes, db);
     }
@@ -293,6 +297,14 @@ class SQLExecutor {
 
     _executeWindowFunctions(ast, data, columnData, filteredIndices) {
         return WindowModule.executeWindowFunctions(this, ast, data, columnData, filteredIndices);
+    }
+
+    _partitionRows(rows, partitionBy, columnData, evaluateExpr) {
+        return WindowModule.partitionRows(rows, partitionBy, columnData, evaluateExpr);
+    }
+
+    _compareRowsByOrder(a, b, orderBy, columnData, evaluateExpr) {
+        return WindowModule.compareRowsByOrder(a, b, orderBy, columnData, evaluateExpr);
     }
 
     // === Aggregation ===

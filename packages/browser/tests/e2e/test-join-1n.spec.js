@@ -76,6 +76,15 @@ test('verify WASM 1:N Join execution', async ({ page }) => {
     expect(aliceOrders.length).toBe(2);
     expect(bobOrders.length).toBe(1);
 
+    expect(rows.length).toBe(3);
+
+    // Check amounts
     const amounts = aliceOrders.map(r => r.amount).sort();
     expect(amounts).toEqual([10, 20]);
+
+    // Check Names (String column verification)
+    const aliceNames = aliceOrders.map(r => r.name);
+    expect(aliceNames).toEqual(['Alice', 'Alice']);
+    const bobNames = bobOrders.map(r => r.name);
+    expect(bobNames).toEqual(['Bob']);
 });

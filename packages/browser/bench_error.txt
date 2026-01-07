@@ -1,0 +1,288 @@
+[1A[2K[2m[WebServer] [22m::ffff:127.0.0.1 - - [06/Jan/2026 12:00:26] "GET / HTTP/1.1" 200 -
+
+
+Running 13 tests using 1 worker
+
+[1A[2K[1/13] [chromium] › tests/e2e/benchmark-sql.spec.js:24:5 › LanceQL SQL Performance Benchmarks › Cold start time
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:27] "GET /examples/wasm/test-vault-sql.html HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:27] "GET /examples/wasm/lanceql.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:27] "GET /examples/wasm/lanceql-worker.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:27] "GET /examples/wasm/lanceql.wasm?v=1767718827781 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:27] "GET /examples/wasm/lanceql.wasm?v=1767718827785 HTTP/1.1" 200 -
+
+[1A[2K[chromium] › tests/e2e/benchmark-sql.spec.js:24:5 › LanceQL SQL Performance Benchmarks › Cold start time
+
+=== Cold Start ===
+
+[1A[2KLanceQL: 37.80ms
+
+[1A[2K[2/13] [chromium] › tests/e2e/benchmark-sql.spec.js:41:9 › LanceQL SQL Performance Benchmarks › Simple SELECT performance (100 rows)
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:27] "GET /examples/wasm/test-vault-sql.html HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:27] "GET /examples/wasm/lanceql.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:27] "GET /examples/wasm/lanceql-worker.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:27] "GET /examples/wasm/lanceql.wasm?v=1767718827930 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:27] "GET /examples/wasm/lanceql.wasm?v=1767718827931 HTTP/1.1" 200 -
+
+[1A[2K[chromium] › tests/e2e/benchmark-sql.spec.js:41:9 › LanceQL SQL Performance Benchmarks › Simple SELECT performance (100 rows)
+
+=== Simple SELECT (100 rows) ===
+
+[1A[2KMedian: 0.10ms
+
+[1A[2KP95:    0.20ms
+
+[1A[2KRange:  0.00-0.20ms
+
+[1A[2K[3/13] [chromium] › tests/e2e/benchmark-sql.spec.js:84:9 › LanceQL SQL Performance Benchmarks › Aggregation performance (100 rows)
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/test-vault-sql.html HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql-worker.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql.wasm?v=1767718828080 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql.wasm?v=1767718828081 HTTP/1.1" 200 -
+
+[1A[2K[chromium] › tests/e2e/benchmark-sql.spec.js:84:9 › LanceQL SQL Performance Benchmarks › Aggregation performance (100 rows)
+
+=== Aggregation (100 rows) ===
+
+[1A[2KMedian: 0.10ms
+
+[1A[2KP95:    0.20ms
+
+[1A[2KRange:  0.10-0.20ms
+
+[1A[2K[4/13] [chromium] › tests/e2e/benchmark-sql.spec.js:132:9 › LanceQL SQL Performance Benchmarks › JOIN performance (100 rows)
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/test-vault-sql.html HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql-worker.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql.wasm?v=1767718828215 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql.wasm?v=1767718828214 HTTP/1.1" 200 -
+
+[1A[2K[chromium] › tests/e2e/benchmark-sql.spec.js:132:9 › LanceQL SQL Performance Benchmarks › JOIN performance (100 rows)
+
+=== JOIN (100 rows) ===
+
+[1A[2KMedian: 0.20ms
+
+[1A[2KP95:    0.30ms
+
+[1A[2KRange:  0.00-0.30ms
+
+[1A[2K[5/13] [chromium] › tests/e2e/benchmark-sql.spec.js:41:9 › LanceQL SQL Performance Benchmarks › Simple SELECT performance (1000 rows)
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/test-vault-sql.html HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql-worker.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql.wasm?v=1767718828347 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql.wasm?v=1767718828348 HTTP/1.1" 200 -
+
+[1A[2K[chromium] › tests/e2e/benchmark-sql.spec.js:41:9 › LanceQL SQL Performance Benchmarks › Simple SELECT performance (1000 rows)
+
+=== Simple SELECT (1000 rows) ===
+
+[1A[2KMedian: 0.10ms
+
+[1A[2KP95:    0.20ms
+
+[1A[2KRange:  0.00-0.20ms
+
+[1A[2K[6/13] [chromium] › tests/e2e/benchmark-sql.spec.js:84:9 › LanceQL SQL Performance Benchmarks › Aggregation performance (1000 rows)
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/test-vault-sql.html HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql-worker.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql.wasm?v=1767718828555 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql.wasm?v=1767718828557 HTTP/1.1" 200 -
+
+[1A[2K[chromium] › tests/e2e/benchmark-sql.spec.js:84:9 › LanceQL SQL Performance Benchmarks › Aggregation performance (1000 rows)
+
+=== Aggregation (1000 rows) ===
+
+[1A[2KMedian: 0.10ms
+
+[1A[2KP95:    0.10ms
+
+[1A[2KRange:  0.00-0.10ms
+
+[1A[2K[7/13] [chromium] › tests/e2e/benchmark-sql.spec.js:132:9 › LanceQL SQL Performance Benchmarks › JOIN performance (1000 rows)
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/test-vault-sql.html HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql-worker.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql.wasm?v=1767718828763 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql.wasm?v=1767718828764 HTTP/1.1" 200 -
+
+[1A[2K[chromium] › tests/e2e/benchmark-sql.spec.js:132:9 › LanceQL SQL Performance Benchmarks › JOIN performance (1000 rows)
+
+=== JOIN (1000 rows) ===
+
+[1A[2KMedian: 0.30ms
+
+[1A[2KP95:    0.60ms
+
+[1A[2KRange:  0.20-0.60ms
+
+[1A[2K[8/13] [chromium] › tests/e2e/benchmark-sql.spec.js:41:9 › LanceQL SQL Performance Benchmarks › Simple SELECT performance (5000 rows)
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/test-vault-sql.html HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql-worker.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql.wasm?v=1767718828980 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:28] "GET /examples/wasm/lanceql.wasm?v=1767718828981 HTTP/1.1" 200 -
+
+[1A[2K[chromium] › tests/e2e/benchmark-sql.spec.js:41:9 › LanceQL SQL Performance Benchmarks › Simple SELECT performance (5000 rows)
+
+=== Simple SELECT (5000 rows) ===
+
+[1A[2KMedian: 0.10ms
+
+[1A[2KP95:    1.90ms
+
+[1A[2KRange:  0.00-1.90ms
+
+[1A[2K[9/13] [chromium] › tests/e2e/benchmark-sql.spec.js:84:9 › LanceQL SQL Performance Benchmarks › Aggregation performance (5000 rows)
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:29] "GET /examples/wasm/test-vault-sql.html HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:29] "GET /examples/wasm/lanceql.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:29] "GET /examples/wasm/lanceql-worker.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:29] "GET /examples/wasm/lanceql.wasm?v=1767718829729 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:29] "GET /examples/wasm/lanceql.wasm?v=1767718829728 HTTP/1.1" 200 -
+
+[1A[2K[chromium] › tests/e2e/benchmark-sql.spec.js:84:9 › LanceQL SQL Performance Benchmarks › Aggregation performance (5000 rows)
+
+=== Aggregation (5000 rows) ===
+
+[1A[2KMedian: 0.10ms
+
+[1A[2KP95:    0.20ms
+
+[1A[2KRange:  0.10-0.20ms
+
+[1A[2K[10/13] [chromium] › tests/e2e/benchmark-sql.spec.js:132:9 › LanceQL SQL Performance Benchmarks › JOIN performance (5000 rows)
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:30] "GET /examples/wasm/test-vault-sql.html HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:30] "GET /examples/wasm/lanceql.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:30] "GET /examples/wasm/lanceql-worker.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:30] "GET /examples/wasm/lanceql.wasm?v=1767718830327 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:30] "GET /examples/wasm/lanceql.wasm?v=1767718830326 HTTP/1.1" 200 -
+
+[1A[2K[chromium] › tests/e2e/benchmark-sql.spec.js:132:9 › LanceQL SQL Performance Benchmarks › JOIN performance (5000 rows)
+
+=== JOIN (5000 rows) ===
+
+[1A[2KMedian: 0.80ms
+
+[1A[2KP95:    1.90ms
+
+[1A[2KRange:  0.80-1.90ms
+
+[1A[2K[11/13] [chromium] › tests/e2e/benchmark-sql.spec.js:188:5 › LanceQL SQL Performance Benchmarks › Complex WHERE performance
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:30] "GET /examples/wasm/test-vault-sql.html HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:30] "GET /examples/wasm/lanceql.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:30] "GET /examples/wasm/lanceql-worker.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:30] "GET /examples/wasm/lanceql.wasm?v=1767718830939 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:30] "GET /examples/wasm/lanceql.wasm?v=1767718830940 HTTP/1.1" 200 -
+
+[1A[2K[chromium] › tests/e2e/benchmark-sql.spec.js:188:5 › LanceQL SQL Performance Benchmarks › Complex WHERE performance
+
+=== Complex WHERE (1000 rows) ===
+
+[1A[2KMedian: 0.40ms
+
+[1A[2KP95:    0.50ms
+
+[1A[2KRange:  0.30-0.50ms
+
+[1A[2K[12/13] [chromium] › tests/e2e/benchmark-sql.spec.js:240:5 › LanceQL SQL Performance Benchmarks › Window function performance
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:31] "GET /examples/wasm/test-vault-sql.html HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:31] "GET /examples/wasm/lanceql.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:31] "GET /examples/wasm/lanceql-worker.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:31] "GET /examples/wasm/lanceql.wasm?v=1767718831156 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 12:00:31] "GET /examples/wasm/lanceql.wasm?v=1767718831157 HTTP/1.1" 200 -
+
+[1A[2K  1) [chromium] › tests/e2e/benchmark-sql.spec.js:240:5 › LanceQL SQL Performance Benchmarks › Window function performance 
+
+    Error: page.evaluate: Error: RuntimeError: memory access out of bounds
+        at wasm://wasm/0033c622:wasm-function[21]:0x1f33
+        at wasm://wasm/0033c622:wasm-function[20]:0x1eef
+        at wasm://wasm/0033c622:wasm-function[172]:0x10dbb
+        at wasm://wasm/0033c622:wasm-function[238]:0x1c236
+        at wasm://wasm/0033c622:wasm-function[262]:0x20fca
+        at WasmSqlExecutor.execute (http://localhost:3000/examples/wasm/lanceql-worker.js:2042:29)
+        at executeWasmSqlFull (http://localhost:3000/examples/wasm/lanceql-worker.js:2214:19)
+        at handleMessage (http://localhost:3000/examples/wasm/lanceql-worker.js:2710:22)
+        at wasm://wasm/0033c622:wasm-function[21]:0x1f33
+        at wasm://wasm/0033c622:wasm-function[20]:0x1eef
+        at wasm://wasm/0033c622:wasm-function[172]:0x10dbb
+        at wasm://wasm/0033c622:wasm-function[238]:0x1c236
+        at wasm://wasm/0033c622:wasm-function[262]:0x20fca
+        at WasmSqlExecutor.execute (http://localhost:3000/examples/wasm/lanceql-worker.js:2042:29)
+        at executeWasmSqlFull (http://localhost:3000/examples/wasm/lanceql-worker.js:2214:19)
+        at handleMessage (http://localhost:3000/examples/wasm/lanceql-worker.js:2710:22)
+        at handleWorkerMessage (http://localhost:3000/examples/wasm/lanceql.js:4881:24)
+        at _lanceWorker.onmessage (http://localhost:3000/examples/wasm/lanceql.js:4846:9)
+        at WasmSqlExecutor.execute (http://localhost:3000/examples/wasm/lanceql-worker.js:2042:29)
+        at executeWasmSqlFull (http://localhost:3000/examples/wasm/lanceql-worker.js:2214:19)
+        at handleMessage (http://localhost:3000/examples/wasm/lanceql-worker.js:2710:22)
+        at WasmSqlExecutor.execute (http://localhost:3000/examples/wasm/lanceql-worker.js:2042:29)
+        at executeWasmSqlFull (http://localhost:3000/examples/wasm/lanceql-worker.js:2214:19)
+        at handleMessage (http://localhost:3000/examples/wasm/lanceql-worker.js:2710:22)
+        at handleWorkerMessage (http://localhost:3000/examples/wasm/lanceql.js:4881:24)
+        at _lanceWorker.onmessage (http://localhost:3000/examples/wasm/lanceql.js:4846:9)
+        at /Users/steven_chong/Downloads/repos/lanceql/packages/browser/tests/e2e/benchmark-sql.spec.js:241:35
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/benchmark-sql-LanceQL-SQL--1bc84-Window-function-performance-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/benchmark-sql-LanceQL-SQL--1bc84-Window-function-performance-chromium/error-context.md
+
+
+[1A[2K[13/13] [chromium] › tests/e2e/benchmark-sql.spec.js:289:5 › LanceQL SQL Performance Benchmarks › CTE performance
+[1A[2K  1 failed
+    [chromium] › tests/e2e/benchmark-sql.spec.js:240:5 › LanceQL SQL Performance Benchmarks › Window function performance 
+  1 did not run
+  11 passed (5.1s)
+
+[36m  Serving HTML report at http://localhost:50092. Press Ctrl+C to quit.[39m

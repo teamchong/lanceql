@@ -2,6 +2,8 @@
  * Lance Writer - Protobuf encoding and Lance file format writer
  */
 
+import { LANCE_FOOTER_SIZE, LANCE_MAGIC } from '../lance/constants.js';
+
 class ProtobufEncoder {
     constructor() {
         this.chunks = [];

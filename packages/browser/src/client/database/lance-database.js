@@ -410,6 +410,10 @@ class LanceDatabase {
         return JoinsModule.buildInClause(column, keys);
     }
 
+    _hashJoinWithInMemoryLeft(leftResult, rightDataset, ast, context) {
+        return JoinsModule.hashJoinWithInMemoryLeft(this, leftResult, rightDataset, ast, context);
+    }
+
     _appendWhereClause(sql, clause) {
         return JoinsModule.appendWhereClause(sql, clause);
     }

@@ -22,7 +22,7 @@ const Vec4 = @Vector(4, f32);
 // ============================================================================
 
 /// SIMD dot product for f32 vectors (4-wide)
-fn simdDotProduct(a_ptr: [*]const f32, b_ptr: [*]const f32, dim: usize) f32 {
+pub fn simdDotProduct(a_ptr: [*]const f32, b_ptr: [*]const f32, dim: usize) f32 {
     var sum: Vec4 = @splat(0);
     var i: usize = 0;
 
@@ -45,7 +45,7 @@ fn simdDotProduct(a_ptr: [*]const f32, b_ptr: [*]const f32, dim: usize) f32 {
 }
 
 /// SIMD L2 norm squared
-fn simdNormSquared(ptr: [*]const f32, dim: usize) f32 {
+pub fn simdNormSquared(ptr: [*]const f32, dim: usize) f32 {
     var sum: Vec4 = @splat(0);
     var i: usize = 0;
 
@@ -236,12 +236,15 @@ pub export fn vectorSearchBuffer(
     normalized: u32,
     start_index: u32,
 ) usize {
+    if (num_vectors == 0 or top_k == 0) return 0;
     const actual_k = @min(top_k, num_vectors);
 
-    // Initialize with worst scores
-    for (0..actual_k) |i| {
-        out_indices[i] = 0;
-        out_scores[i] = -2.0;
+    // Initialize with worst scores ONLY if this is the start of a search (start_index == 0)
+    if (start_index == 0) {
+        for (0..top_k) |i| {
+            out_indices[i] = 0;
+            out_scores[i] = -2.0;
+        }
     }
 
     // Pre-compute query norm if not normalized
@@ -263,14 +266,14 @@ pub export fn vectorSearchBuffer(
             score = if (denom == 0) 0 else dot / denom;
         }
 
-        // Insert into top-k if better than worst
-        if (score > out_scores[actual_k - 1]) {
-            var insert_pos: usize = actual_k - 1;
+        // Insert into top-k if better than worst (and we have a valid k)
+        if (actual_k > 0 and score > out_scores[top_k - 1]) {
+            var insert_pos: usize = top_k - 1;
             while (insert_pos > 0 and score > out_scores[insert_pos - 1]) {
                 insert_pos -= 1;
             }
 
-            var j: usize = actual_k - 1;
+            var j: usize = top_k - 1;
             while (j > insert_pos) {
                 out_indices[j] = out_indices[j - 1];
                 out_scores[j] = out_scores[j - 1];

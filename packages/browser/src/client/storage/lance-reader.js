@@ -2,6 +2,9 @@
  * ChunkedLanceReader - Lance file format parser with memory management
  */
 
+import { LRUCache } from '../cache/lru-cache.js';
+import { LANCE_FOOTER_SIZE, LANCE_MAGIC } from '../lance/constants.js';
+
 class ChunkedLanceReader {
     /**
      * @param {OPFSFileReader} fileReader - OPFS file reader

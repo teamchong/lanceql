@@ -35,9 +35,10 @@
     "dist"
   ],
   "scripts": {
-    "build": "npm run build:wasm && npm run build:js",
+    "build": "npm run build:wasm && npm run build:js && npm run sync:examples",
     "build:wasm": "cd ../.. && zig build wasm && cp zig-out/bin/lanceql.wasm packages/browser/dist/",
     "build:js": "node esbuild.config.js",
+    "sync:examples": "cp dist/lanceql.wasm ../../examples/wasm/ && cp dist/lanceql-worker.js ../../examples/wasm/ && cp dist/lanceql.esm.js ../../examples/wasm/lanceql.js",
     "build:legacy": "node scripts/build.js",
     "dev": "node esbuild.config.js --watch",
     "test": "npx playwright test",

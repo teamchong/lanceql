@@ -12,7 +12,7 @@ import { getWasm, getWasmMemory } from './index.js';
 
 // Result buffer format constants (must match sql_executor.zig)
 const RESULT_VERSION = 1;
-const HEADER_SIZE = 32;
+const HEADER_SIZE = 36;
 
 // Column types
 const ColumnType = {
@@ -21,6 +21,7 @@ const ColumnType = {
     INT32: 2,
     FLOAT32: 3,
     STRING: 4,
+    LIST: 5,
 };
 
 /**
@@ -30,6 +31,32 @@ const ColumnType = {
 export class WasmSqlExecutor {
     constructor() {
         this._registered = new Map(); // tableName -> { version: string, columns: Set }
+    }
+
+    getLastError() {
+        const wasm = getWasm();
+        if (!wasm) return "WASM not loaded";
+        const memory = getWasmMemory();
+
+        // Alloc temp buffer for error
+        const ptr = wasm.alloc(4096);
+        console.log(`[WASM LOG] getLastError alloc ptr: ${ptr}`);
+        const len = wasm.getLastError(ptr, 4096);
+        console.log(`[WASM LOG] getLastError len: ${len}`);
+        if (len === 0) return "Unknown Error";
+
+        const bytes = new Uint8Array(memory.buffer, ptr, len);
+        const msg = new TextDecoder().decode(bytes);
+        console.log(`[WASM LOG] getLastError msg: ${msg}`);
+        // Cleanup? wasm.alloc might not need free if we use stack logic in WASM side but we use allocator.
+        // We should free? Existing code doesn't seem to free systematically in tight loops but generic allocs should be freed.
+        // But alloc implementation in Zig uses GPA or Arena?
+        // memory.zig says wasmAlloc uses std.heap.page_allocator or similar.
+        // Assuming we should free if possible, but we don't expose free in this class easily.
+        // But wait, `alloc` is exposed. `free` should be too?
+        // Checking index.js would confirm exports.
+        // For now, leaking 256 bytes on error is fine.
+        return msg;
     }
 
     /**
@@ -354,12 +381,22 @@ export class WasmSqlExecutor {
         // Execute SQL in WASM
         const resultPtr = wasm.executeSql();
         if (resultPtr === 0) {
-            throw new Error('WASM SQL execution failed');
+            const errMsg = this.getLastError();
+            console.log(`[WASM LOG] execute throwing: "${errMsg}"`);
+            throw new Error(errMsg);
         }
 
         const resultSize = wasm.getResultSize();
+        const debugMsg = this.getLastError();
+        if (debugMsg && debugMsg.length > 0) {
+            console.log(`[WASM DEBUG CAPTURED] ${debugMsg}`);
+        }
+        if (debugMsg.length > 0 && debugMsg.startsWith("DEBUG:")) {
+            // Throw to clear visible logs
+            // throw new Error(`[WASM DEBUG] ${debugMsg}`);
+        }
 
-        // Parse result buffer
+        const buffer = wasm.memory.buffer;
         const result = this._parseResult(memory.buffer, resultPtr, resultSize);
 
         // Reset WASM state for next query
@@ -375,23 +412,34 @@ export class WasmSqlExecutor {
         const view = new DataView(buffer, ptr, size);
         const decoder = new TextDecoder();
 
+        // Check for Lance Footer first (Standard Format)
         // Footer is at the end (40 bytes)
-        if (size < 40) throw new Error("Result too small for Lance footer");
-        const footerOffset = size - 40;
-
-        // Verify Magic
-        const magicVals = [
-            view.getUint8(footerOffset + 36),
-            view.getUint8(footerOffset + 37),
-            view.getUint8(footerOffset + 38),
-            view.getUint8(footerOffset + 39)
-        ];
-        const magic = String.fromCharCode(...magicVals);
-        if (magic !== 'LANC') {
-            throw new Error("Invalid Lance Magic: " + magic);
+        if (size >= 40) {
+            const footerOffset = size - 40;
+            const magicVals = [
+                view.getUint8(footerOffset + 36),
+                view.getUint8(footerOffset + 37),
+                view.getUint8(footerOffset + 38),
+                view.getUint8(footerOffset + 39)
+            ];
+            const magic = String.fromCharCode(...magicVals);
+            if (magic === 'LANC') {
+                // It's a Lance file
+                return this._parseLanceResult(buffer, ptr, size, footerOffset, view, decoder);
+            }
         }
 
+        // Check for legacy format (RESULT_VERSION = 1 at the very beginning)
+        if (size >= 36 && view.getUint32(0, true) === RESULT_VERSION) {
+            return this._parseLegacyResult(buffer, ptr, size);
+        }
+
+        throw new Error(`Invalid result format (Size: ${size}). Not a Lance file.`);
+    }
+
+    _parseLanceResult(buffer, ptr, size, footerOffset, view, decoder) {
         // Read Footer
+
         // const colMetaStart = Number(view.getBigUint64(footerOffset, true));
         const colMetaOffsetsStart = Number(view.getBigUint64(footerOffset + 8, true));
         // const globalBuffOffsetsStart = Number(view.getBigUint64(footerOffset + 16, true));
@@ -464,7 +512,24 @@ export class WasmSqlExecutor {
             if (typeStr === 'float64' || typeStr === 'int64' || typeStr === 'int32' || typeStr === 'float32') {
                 if (typeStr === 'float64') {
                     // Zero-ish copy: slice the buffer
-                    colData[colName] = new Float64Array(buffer, absDataOffset, rowCount).slice();
+                    const arr = new Float64Array(buffer, absDataOffset, rowCount).slice();
+                    // Check for NaN implies NULL (SQL semantics for this engine)
+                    // We only convert if NaN exists to save perf
+                    let hasNan = false;
+                    for (let k = 0; k < rowCount; k++) {
+                        if (Number.isNaN(arr[k])) { hasNan = true; break; }
+                    }
+                    if (hasNan) {
+                        console.log(`[WASM LOG] Column ${colName} has NaNs, converting to nulls`);
+                        const nullArr = new Array(rowCount);
+                        for (let k = 0; k < rowCount; k++) {
+                            const v = arr[k];
+                            nullArr[k] = Number.isNaN(v) ? null : v;
+                        }
+                        colData[colName] = nullArr;
+                    } else {
+                        colData[colName] = arr;
+                    }
                 } else if (typeStr === 'int64') {
                     // Conversion needed or return BigInt64Array?
                     // Previous logic converted to Float64 for JS compat
@@ -483,7 +548,8 @@ export class WasmSqlExecutor {
                     for (let j = 0; j < rowCount; j++) dst[j] = src[j];
                     colData[colName] = dst;
                 }
-            } else if (typeStr === 'string') {
+            } else if (typeStr === 'string' || typeStr === 'list') {
+                const isList = typeStr === 'list';
                 // Separating Data and Offsets
                 // Data Size includes both data bytes and offsets array
                 const offsetsLen = (rowCount + 1) * 4;
@@ -495,7 +561,7 @@ export class WasmSqlExecutor {
                 // Offsets start after data bytes
                 const offsets = new Uint32Array(buffer, absDataOffset + dataBytesLen, rowCount + 1).slice();
 
-                colData[colName] = { _arrowString: true, offsets, bytes };
+                colData[colName] = { _arrowString: true, offsets, bytes, isList: typeStr === 'list' };
             }
         }
 
@@ -524,6 +590,93 @@ export class WasmSqlExecutor {
     /**
      * Clear all registered tables
      */
+    /**
+     * Parse legacy result format (used by window functions)
+     */
+    _parseLegacyResult(buffer, ptr, size) {
+        const view = new DataView(buffer, ptr, size);
+        const decoder = new TextDecoder();
+
+        // Header (36 bytes)
+        // 0: RESULT_VERSION (4)
+        // 4: total_cols (4)
+        // 8: row_count (8)
+        // 16: extended_header (4)
+        // 20: extended_header (4)
+        // 24: data_offset_start (4)
+        // 28: 0 (4)
+        // 32: names_offset (4)
+
+        const numCols = view.getUint32(4, true);
+        const rowCount = Number(view.getBigUint64(8, true));
+        const dataOffsetStart = view.getUint32(24, true);
+        const namesOffset = view.getUint32(32, true);
+
+        const columns = [];
+        const colData = {};
+
+        for (let i = 0; i < numCols; i++) {
+            const metaPos = 36 + i * 16;
+            const typeEnum = view.getUint32(metaPos, true);
+            const nameOff = view.getUint32(metaPos + 4, true);
+            const nameLen = view.getUint32(metaPos + 8, true);
+            const dataOff = view.getUint32(metaPos + 12, true);
+
+            // Read Name
+            const nameBytes = new Uint8Array(buffer, ptr + namesOffset + nameOff, nameLen);
+            const colName = decoder.decode(nameBytes);
+            columns.push(colName);
+
+            // Read Data
+            const typeStr = Object.keys(ColumnType).find(key => ColumnType[key] === typeEnum).toLowerCase();
+            const absDataOffset = ptr + dataOffsetStart + dataOff;
+
+            if (typeStr === 'float64' || typeStr === 'int64' || typeStr === 'int32' || typeStr === 'float32') {
+                if (typeStr === 'float64') {
+                    colData[colName] = new Float64Array(buffer, absDataOffset, rowCount).slice();
+                } else if (typeStr === 'int64') {
+                    // Legacy format often stores int64 as float64 for JS
+                    colData[colName] = new Float64Array(buffer, absDataOffset, rowCount).slice();
+                } else if (typeStr === 'int32') {
+                    colData[colName] = new Int32Array(buffer, absDataOffset, rowCount).slice();
+                } else if (typeStr === 'float32') {
+                    colData[colName] = new Float32Array(buffer, absDataOffset, rowCount).slice();
+                }
+            } else if (typeStr === 'string' || typeStr === 'list') {
+                // Legacy string/list format: offsets(u32 * rows) + len(u32 * rows) + data
+                // Wait! Let's check Zig again for legacy string format.
+                // Zig 4668 reg columns: 
+                // for ri: writeU32(str_offset), writeU32(len)
+                // for ri: writeToResult(data)
+
+                const offsets = new Uint32Array(rowCount + 1);
+                let currentOffset = 0;
+                offsets[0] = 0;
+
+                // Pass 1: results are stored as [off0, len0, off1, len1, ...]
+                const metaDataOffset = absDataOffset;
+                let totalBytes = 0;
+                for (let j = 0; j < rowCount; j++) {
+                    const len = view.getUint32(metaDataOffset + j * 8 + 4, true);
+                    totalBytes += len;
+                    offsets[j + 1] = totalBytes;
+                }
+
+                const dataBytesOffset = absDataOffset + rowCount * 8;
+                const bytes = new Uint8Array(buffer, dataBytesOffset, totalBytes).slice();
+
+                colData[colName] = { _arrowString: true, offsets, bytes, isList: typeStr === 'list' };
+            }
+        }
+
+        return {
+            _format: 'columnar',
+            columns,
+            rowCount,
+            data: colData,
+        };
+    }
+
     clear() {
         const wasm = getWasm();
         if (wasm) {

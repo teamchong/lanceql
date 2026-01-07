@@ -14,6 +14,7 @@ import { WorkerStore } from './worker-store.js';
 import { WorkerDatabase } from './worker-database.js';
 import { WorkerVault } from './worker-vault.js';
 
+
 import { BufferPool } from './buffer-pool.js';
 import { getWasmSqlExecutor } from './wasm-sql-bridge.js';
 import { E } from './data-types.js';
@@ -38,9 +39,7 @@ async function executeWasmSqlFull(db, sql) {
     const executor = getWasmSqlExecutor();
 
     // Extract all table names from SQL (FROM, JOIN, WITH clauses)
-    // const tableNames = executor.getTableNames(sql);
     const tableNames = executor.getTableNames(sql);
-    // console.log stripped for performance
 
     // Register all tables with the executor
 
@@ -182,16 +181,16 @@ function createWasmImports() {
                 // We keep handles open for the duration of the query/registration
                 // and manage them via registerOPFSFile/closeOPFSFile
             },
-            js_log: (ptr, len) => {
-                // Stripped for performance - uncomment to debug WASM:
-                // const bytes = new Uint8Array(wasmMemory.buffer, ptr, len);
-                // const msg = new TextDecoder().decode(bytes);
-                // console.log(`[LanceQLWasm] ${msg}`);
-            },
+
             __assert_fail: (msgPtr, filePtr, line, funcPtr) => {
                 const decoder = new TextDecoder();
                 const msg = decoder.decode(new Uint8Array(wasmMemory.buffer, msgPtr).subarray(0, 100));
                 console.error(`[WASM ASSERT] ${msg} at line ${line}`);
+            },
+            js_log: (ptr, len) => {
+                const decoder = new TextDecoder();
+                const msg = decoder.decode(new Uint8Array(wasmMemory.buffer, ptr, len));
+                console.log(`[WASM LOG] ${msg}`);
             }
         }
     };
@@ -233,7 +232,9 @@ export function closeOPFSFile(handleId) {
 async function loadWasm() {
     if (wasm) return wasm;
     try {
-        const response = await fetch(new URL('./lanceql.wasm', import.meta.url));
+        const url = new URL('./lanceql.wasm', import.meta.url);
+        url.searchParams.set('v', Date.now().toString());
+        const response = await fetch(url);
         const bytes = await response.arrayBuffer();
 
         // Instantiate with OPFS imports

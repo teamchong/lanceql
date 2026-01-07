@@ -2,6 +2,7 @@
  * Vault - Encrypted key-value store and Table reference
  */
 import { workerRPC } from '../rpc/worker-rpc.js';
+import { PureLanceWriter } from '../storage/lance-writer.js';
 
 class Vault {
     /**

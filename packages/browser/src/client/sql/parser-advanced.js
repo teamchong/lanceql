@@ -100,7 +100,13 @@ export function parseGroupByList(parser) {
         }
     } while (parser.match(TokenType.COMMA));
 
-    return items;
+    // Optional TOPK modifier for GROUP BY
+    let topK = null;
+    if (parser.match(TokenType.TOPK)) {
+        topK = parseInt(parser.expect(TokenType.NUMBER).value, 10);
+    }
+
+    return { items, topK };
 }
 
 /**

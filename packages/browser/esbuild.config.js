@@ -24,7 +24,7 @@ const isWatch = process.argv.includes('--watch');
 const commonOptions = {
     bundle: true,
     sourcemap: true,
-    minify: isProduction,
+    minify: true,
     target: ['es2020'],
     logLevel: 'info',
     loader: {

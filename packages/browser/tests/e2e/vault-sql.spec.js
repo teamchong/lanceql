@@ -13,7 +13,7 @@ test.describe('Vault SQL Operations', () => {
     test('vault initializes successfully', async ({ page }) => {
         // Initialize vault via page context
         const result = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             try {
                 const v = await vault();
                 return { success: true };
@@ -27,7 +27,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('CREATE TABLE operations', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -71,7 +71,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('INSERT operations', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -116,7 +116,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('SELECT basic operations', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -161,7 +161,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('WHERE operators', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -202,7 +202,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('AND/OR logic operators', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -239,7 +239,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('UPDATE operations', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -270,7 +270,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('DELETE operations', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -301,7 +301,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Aggregation functions', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -370,7 +370,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('GROUP BY and HAVING', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -407,7 +407,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('ORDER BY, LIMIT, OFFSET', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -462,7 +462,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('JOIN operations', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -503,7 +503,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('DROP TABLE operations', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -536,7 +536,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('NEAR clause parsing', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -576,7 +576,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('DISTINCT operations', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const tests = [];
             const v = await vault();
 
@@ -629,8 +629,9 @@ test.describe('Vault SQL Operations', () => {
     });
 
     test('Column and table aliases', async ({ page }) => {
+        page.on('console', msg => console.log(`[BROWSER] ${msg.text()}`));
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const tests = [];
             const v = await vault();
 
@@ -691,7 +692,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Advanced JOINs - RIGHT JOIN and multiple JOINs', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const tests = [];
             const v = await vault();
 
@@ -754,7 +755,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Multi-column ORDER BY', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const tests = [];
             const v = await vault();
 
@@ -779,7 +780,7 @@ test.describe('Vault SQL Operations', () => {
             tests.push({
                 sql: 'Multi-column ORDER BY (dept ASC, salary DESC)',
                 pass: mixed.rows.slice(0, 3).every(r => r.department === 'Engineering') &&
-                      mixed.rows.slice(3, 5).every(r => r.department === 'Sales'),
+                    mixed.rows.slice(3, 5).every(r => r.department === 'Sales'),
                 error: `Expected Engineering first, then Sales. Got ${JSON.stringify(names)}`
             });
 
@@ -811,7 +812,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Data type edge cases', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const tests = [];
             const v = await vault();
 
@@ -886,7 +887,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('LIKE pattern variations', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const tests = [];
             const v = await vault();
 
@@ -952,24 +953,43 @@ test.describe('Vault SQL Operations', () => {
     });
 
     test('Complex WHERE expressions', async ({ page }) => {
+        page.on('console', msg => {
+            if (msg.type() === 'error') {
+                console.error(`[BROWSER ERROR] ${msg.text()}`);
+            } else {
+                console.log(`[BROWSER LOG] ${msg.text()}`);
+            }
+        });
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const tests = [];
+            console.log('[TEST] Creating vault...');
             const v = await vault();
 
             // Setup
+            console.log('[TEST] DROP TABLE IF EXISTS products');
             await v.exec('DROP TABLE IF EXISTS products');
+            console.log('[TEST] CREATE TABLE products');
             await v.exec('CREATE TABLE products (id INTEGER, name TEXT, price REAL, category TEXT, stock INTEGER)');
+            console.log('[TEST] INSERT 1');
             await v.exec("INSERT INTO products VALUES (1, 'Apple', 1.50, 'fruit', 100)");
+            console.log('[TEST] INSERT 2');
             await v.exec("INSERT INTO products VALUES (2, 'Banana', 0.75, 'fruit', 150)");
+            console.log('[TEST] INSERT 3');
             await v.exec("INSERT INTO products VALUES (3, 'Carrot', 0.50, 'vegetable', 80)");
+            console.log('[TEST] INSERT 4');
             await v.exec("INSERT INTO products VALUES (4, 'Milk', 3.00, 'dairy', 50)");
+            console.log('[TEST] INSERT 5');
             await v.exec("INSERT INTO products VALUES (5, 'Cheese', 5.00, 'dairy', 30)");
+            console.log('[TEST] INSERT 6');
             await v.exec("INSERT INTO products VALUES (6, 'Bread', 2.50, 'bakery', 40)");
+            console.log('[TEST] INSERT 7');
             await v.exec("INSERT INTO products VALUES (7, 'Avocado', 2.00, 'fruit', 25)");
 
             // Test nested AND/OR with parentheses
+            console.log('[TEST] Running nested AND/OR query...');
             const nested = await v.exec("SELECT name FROM products WHERE (category = 'fruit' AND price > 1) OR (category = 'dairy' AND stock < 40)");
+            console.log('[TEST] Nested AND/OR query completed');
             tests.push({
                 sql: 'Nested AND/OR',
                 pass: nested.rows.length === 3, // Apple, Avocado, Cheese
@@ -977,7 +997,9 @@ test.describe('Vault SQL Operations', () => {
             });
 
             // Test complex combination with IN and comparison
+            console.log('[TEST] Running IN with multiple conditions...');
             const complex = await v.exec("SELECT name FROM products WHERE category IN ('fruit', 'vegetable') AND price >= 0.75 AND stock > 50");
+            console.log('[TEST] IN with multiple conditions completed');
             tests.push({
                 sql: 'IN with multiple conditions',
                 pass: complex.rows.length === 2, // Apple (100 stock), Banana (150 stock)
@@ -985,7 +1007,9 @@ test.describe('Vault SQL Operations', () => {
             });
 
             // Test BETWEEN with AND
+            console.log('[TEST] Running BETWEEN with AND...');
             const betweenAnd = await v.exec("SELECT name FROM products WHERE price BETWEEN 1 AND 3 AND stock > 30");
+            console.log('[TEST] BETWEEN with AND completed');
             tests.push({
                 sql: 'BETWEEN with AND',
                 pass: betweenAnd.rows.length === 3, // Apple, Milk, Bread
@@ -993,7 +1017,9 @@ test.describe('Vault SQL Operations', () => {
             });
 
             // Test LIKE with OR
+            console.log('[TEST] Running LIKE with OR...');
             const likeOr = await v.exec("SELECT name FROM products WHERE name LIKE 'A%' OR name LIKE 'B%'");
+            console.log('[TEST] LIKE with OR completed');
             tests.push({
                 sql: 'LIKE with OR',
                 pass: likeOr.rows.length === 4, // Apple, Avocado, Banana, Bread
@@ -1001,7 +1027,9 @@ test.describe('Vault SQL Operations', () => {
             });
 
             // Test empty result with impossible condition
+            console.log('[TEST] Running empty result query...');
             const empty = await v.exec("SELECT name FROM products WHERE price < 0");
+            console.log('[TEST] Empty result query completed');
             tests.push({
                 sql: 'Empty result set',
                 pass: empty.rows.length === 0,
@@ -1021,7 +1049,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Advanced aggregations', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const tests = [];
             const v = await vault();
 
@@ -1101,7 +1129,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('KV basic operations', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const tests = [];
             const v = await vault();
 
@@ -1187,7 +1215,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('KV data types', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const tests = [];
             const v = await vault();
 
@@ -1281,7 +1309,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('KV persistence across vault instances', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const tests = [];
 
             // Create first vault and store data
@@ -1321,7 +1349,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Encryption with password', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const tests = [];
 
             // Create encrypted vault with password
@@ -1369,7 +1397,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Error handling - invalid SQL', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const tests = [];
             const v = await vault();
 
@@ -1419,7 +1447,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Error handling - missing table', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const tests = [];
             const v = await vault();
 
@@ -1481,7 +1509,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('KV and SQL coexistence', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const tests = [];
             const v = await vault();
 
@@ -1540,7 +1568,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('COALESCE function', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -1598,7 +1626,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('NULLIF function', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -1642,7 +1670,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('CASE WHEN expression', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -1688,7 +1716,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('String functions', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -1793,7 +1821,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Math functions', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -1897,7 +1925,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('IS NULL and IS NOT NULL', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -1955,7 +1983,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('NOT IN, NOT LIKE, NOT BETWEEN', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -2013,8 +2041,9 @@ test.describe('Vault SQL Operations', () => {
     });
 
     test('Subquery in WHERE with IN', async ({ page }) => {
+        page.on('console', msg => console.log(`[BROWSER] ${msg.text()}`));
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -2067,7 +2096,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('UNION and UNION ALL', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -2119,7 +2148,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('INTERSECT and EXCEPT', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -2172,7 +2201,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('WITH clause (CTEs)', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -2252,7 +2281,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Window functions', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -2343,7 +2372,7 @@ test.describe('Vault SQL Operations', () => {
     // Date/Time functions
     test('Date/Time functions', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -2441,7 +2470,7 @@ test.describe('Vault SQL Operations', () => {
     // Additional string functions
     test('Additional string functions', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -2547,7 +2576,7 @@ test.describe('Vault SQL Operations', () => {
     // Arithmetic operators in SELECT
     test('Arithmetic operators in SELECT', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -2683,7 +2712,7 @@ test.describe('Vault SQL Operations', () => {
     // NULLS FIRST/LAST in ORDER BY
     test('NULLS FIRST/LAST in ORDER BY', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -2762,7 +2791,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Quick wins - GREATEST, LEAST, IIF functions', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -2821,7 +2850,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Quick wins - Math functions', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -2925,7 +2954,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Quick wins - CAST function', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -2966,7 +2995,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Advanced aggregates - STDDEV, VARIANCE, MEDIAN', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -3027,7 +3056,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Advanced aggregates - STRING_AGG', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -3067,7 +3096,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Window functions - NTILE', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -3100,7 +3129,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Window functions - PERCENT_RANK, CUME_DIST', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -3146,7 +3175,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Window functions - FIRST_VALUE, LAST_VALUE', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -3188,7 +3217,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Window frames - ROWS BETWEEN', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -3238,7 +3267,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('FROM subqueries (derived tables)', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -3279,7 +3308,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('EXISTS and NOT EXISTS', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -3342,7 +3371,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('FULL OUTER JOIN operations', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -3384,7 +3413,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('CROSS JOIN operations', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -3417,7 +3446,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Compound JOIN conditions (AND/OR)', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -3460,7 +3489,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('REGEXP functions', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -3535,7 +3564,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('JSON functions', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -3649,7 +3678,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Scalar subqueries in SELECT', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -3708,7 +3737,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('LEFT OUTER JOIN (with OUTER keyword)', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -3752,7 +3781,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('ARRAY operations', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -3871,7 +3900,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('UUID functions', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
             const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -3933,7 +3962,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('DECIMAL precision - TRUNC and ROUND with scale', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -4001,7 +4030,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('Binary/Bitwise operations', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -4134,7 +4163,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('INSERT...SELECT copies data between tables', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -4185,7 +4214,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('UPSERT with ON CONFLICT DO NOTHING and DO UPDATE', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -4243,7 +4272,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('UPDATE with FROM clause (JOIN-based update)', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -4258,8 +4287,8 @@ test.describe('Vault SQL Operations', () => {
                 await v.exec('UPDATE orders o SET status = u.new_status FROM status_updates u WHERE o.id = u.order_id');
                 const res = await v.exec('SELECT id, status FROM orders ORDER BY id');
                 const pass = res.rows[0]?.status === 'shipped' &&
-                             res.rows[1]?.status === 'pending' &&
-                             res.rows[2]?.status === 'delivered';
+                    res.rows[1]?.status === 'pending' &&
+                    res.rows[2]?.status === 'delivered';
                 tests.push({ name: 'UPDATE FROM basic', pass, actual: JSON.stringify(res.rows) });
             } catch (e) {
                 tests.push({ name: 'UPDATE FROM basic', pass: false, error: e.message });
@@ -4287,7 +4316,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('DELETE with USING clause (JOIN-based delete)', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -4331,7 +4360,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('exportToLance creates valid Lance bytes', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -4377,7 +4406,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('exportToLance handles various column types', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -4933,7 +4962,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('SELECT DISTINCT deduplicates rows', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const tests = [];
 
             const v = await vault();
@@ -4988,7 +5017,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('SELECT DISTINCT handles edge cases', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const tests = [];
 
             const v = await vault();
@@ -5206,7 +5235,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('String aggregates (STRING_AGG, GROUP_CONCAT, MEDIAN)', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const tests = [];
 
             const v = await vault();
@@ -5267,7 +5296,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('STDDEV and VARIANCE aggregates', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const tests = [];
 
             const v = await vault();
@@ -5342,7 +5371,7 @@ test.describe('Vault SQL Operations', () => {
     test('SEARCH + Aggregations (COUNT, SUM, AVG with NEAR)', async ({ page }) => {
         // This test verifies that vector search can be combined with aggregate functions
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -5422,7 +5451,7 @@ test.describe('Vault SQL Operations', () => {
     test('SEARCH + GROUP BY Aggregations', async ({ page }) => {
         // This test verifies that vector search can be combined with GROUP BY
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -5489,7 +5518,7 @@ test.describe('Vault SQL Operations', () => {
     test('BM25 Full-Text Search (NEAR without vector column)', async ({ page }) => {
         // This test verifies BM25 text search works when no vector/embedding column exists
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -5604,7 +5633,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('PIVOT transformation - rows to columns with aggregation', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -5700,7 +5729,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('UNPIVOT transformation - columns to rows', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -5799,7 +5828,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('QUALIFY clause - filter on window function results', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 
@@ -5913,7 +5942,7 @@ test.describe('Vault SQL Operations', () => {
 
     test('ROLLUP, CUBE, GROUPING SETS - multi-dimensional aggregation', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { vault } = await import('./lanceql.js');
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
 

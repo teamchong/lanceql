@@ -1,20 +1,20 @@
-[1A[2K[2m[WebServer] [22m::ffff:127.0.0.1 - - [06/Jan/2026 20:54:00] "GET / HTTP/1.1" 200 -
+[1A[2K[2m[WebServer] [22m::ffff:127.0.0.1 - - [06/Jan/2026 20:56:36] "GET / HTTP/1.1" 200 -
 
 
 Running 1 test using 1 worker
 
 [1A[2K[1/1] [chromium] › tests/e2e/vault-sql.spec.js:240:5 › Vault SQL Operations › UPDATE operations
-[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 20:54:02] "GET /examples/wasm/test-vault-sql.html HTTP/1.1" 200 -
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 20:56:38] "GET /examples/wasm/test-vault-sql.html HTTP/1.1" 200 -
 
-[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 20:54:02] "GET /examples/wasm/lanceql.js HTTP/1.1" 200 -
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 20:56:38] "GET /examples/wasm/lanceql.js HTTP/1.1" 200 -
 
-[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 20:54:02] "GET /examples/wasm/lanceql.js?v=1767750842297 HTTP/1.1" 200 -
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 20:56:38] "GET /examples/wasm/lanceql.js?v=1767750998354 HTTP/1.1" 200 -
 
-[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 20:54:02] "GET /examples/wasm/lanceql-worker.js?v=1767750842310 HTTP/1.1" 200 -
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 20:56:38] "GET /examples/wasm/lanceql-worker.js?v=1767750998369 HTTP/1.1" 200 -
 
-[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 20:54:02] "GET /examples/wasm/lanceql.wasm?v=1767750842327 HTTP/1.1" 200 -
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 20:56:38] "GET /examples/wasm/lanceql.wasm?v=1767750998387 HTTP/1.1" 200 -
 
-[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 20:54:02] "GET /examples/wasm/lanceql.wasm?v=1767750842332 HTTP/1.1" 200 -
+[1A[2K[2m[WebServer] [22m::1 - - [06/Jan/2026 20:56:38] "GET /examples/wasm/lanceql.wasm?v=1767750998384 HTTP/1.1" 200 -
 
 [1A[2K  1) [chromium] › tests/e2e/vault-sql.spec.js:240:5 › Vault SQL Operations › UPDATE operations ─────
 
@@ -44,4 +44,4 @@ Running 1 test using 1 worker
 [1A[2K  1 failed
     [chromium] › tests/e2e/vault-sql.spec.js:240:5 › Vault SQL Operations › UPDATE operations ──────
 
-[36m  Serving HTML report at http://localhost:50569. Press Ctrl+C to quit.[39m
+[36m  Serving HTML report at http://localhost:50753. Press Ctrl+C to quit.[39m

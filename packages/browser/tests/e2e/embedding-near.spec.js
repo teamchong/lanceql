@@ -11,6 +11,10 @@ test.setTimeout(60000);
 
 test.describe('SQL Features', () => {
     test.beforeEach(async ({ page }) => {
+        // Debug console
+        page.on('console', msg => console.log('BROWSER LOG:', msg.text()));
+        page.on('pageerror', err => console.log('BROWSER ERROR:', err.message));
+
         await page.goto('/examples/wasm/test-vault-sql.html');
         // Wait for module script to execute (timeout means script failed)
         await page.waitForFunction(() => typeof window.testInit === 'function');
@@ -35,11 +39,12 @@ test.describe('SQL Features', () => {
             if (!v) return { success: false, error: 'Vault not initialized' };
 
             try {
-                await v.exec('CREATE TABLE sales (category TEXT, amount REAL)');
+                await v.exec('CREATE TABLE sales (category INTEGER, amount REAL)');
+                // 1: electronics, 2: clothing, 3: kitchen
                 await v.exec(`INSERT INTO sales VALUES 
-                    ('electronics', 500), ('electronics', 300),
-                    ('clothing', 100), ('clothing', 150),
-                    ('food', 50), ('food', 25)`);
+                    (1, 500), (1, 300), 
+                    (2, 100), (2, 150), 
+                    (3, 75)`);
 
                 const grouped = await v.exec(`
                     SELECT category, SUM(amount), AVG(amount), COUNT(*)
@@ -110,8 +115,14 @@ test.describe('SQL Features', () => {
             return;
         }
         expect(result.success).toBe(true);
-        expect(result.row['sum(value)']).toBe(150);
-        expect(result.row['count(*)']).toBe(5);
+        try {
+            expect(result.row['sum(value)']).toBe(150);
+            expect(result.row['count(*)']).toBe(5);
+        } catch (e) {
+            console.log('Aggregation Failed. Result Row Keys:', Object.keys(result.row || {}));
+            console.log('Result Row:', JSON.stringify(result.row));
+            throw e;
+        }
     });
 
     test('WHERE with multiple conditions', async ({ page }) => {

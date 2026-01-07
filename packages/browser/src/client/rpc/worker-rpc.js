@@ -59,7 +59,7 @@ export function getLanceWorker() {
         console.log('[LanceQL] Using regular Worker for better logging');
         try {
             _lanceWorker = new Worker(
-                new URL('./lanceql-worker.js', import.meta.url),
+                new URL('./lanceql-worker.js?v=' + Date.now(), import.meta.url),
                 { type: 'module', name: 'lanceql' }
             );
 
@@ -289,6 +289,58 @@ function handleWorkerMessage(data, port, resolveReady) {
                 // Handle columnar result - add lazy rows getter for API compatibility
                 else if (result && result._format === 'columnar') {
                     const { columns, rowCount, data: colData } = result;
+
+                    // Check for Arrow String columns and create lazy proxies
+                    for (const col of columns) {
+                        const colVal = colData[col];
+                        if (colVal && colVal._arrowString) {
+                            const { offsets, bytes, isList } = colVal;
+                            if (isList) console.log(`[WorkerRPC] Column ${col} is list mode`);
+                            const decoder = new TextDecoder();
+                            const items = new Array(rowCount);
+                            let decoded = false;
+
+                            colData[col] = new Proxy(items, {
+                                get(target, prop) {
+                                    if (prop === 'length') return rowCount;
+                                    if (typeof prop === 'string' && !isNaN(prop)) {
+                                        if (!decoded && bytes && offsets) {
+                                            for (let j = 0; j < rowCount; j++) {
+                                                const start = offsets[j];
+                                                const end = offsets[j + 1];
+                                                const s = decoder.decode(bytes.subarray(start, end));
+                                                try {
+                                                    target[j] = isList ? JSON.parse(s) : s;
+                                                } catch (e) {
+                                                    target[j] = s;
+                                                }
+                                            }
+                                            decoded = true;
+                                        }
+                                        return target[+prop];
+                                    }
+                                    if (prop === Symbol.iterator) {
+                                        if (!decoded && bytes && offsets) {
+                                            for (let j = 0; j < rowCount; j++) {
+                                                const start = offsets[j];
+                                                const end = offsets[j + 1];
+                                                const s = decoder.decode(bytes.subarray(start, end));
+                                                try {
+                                                    target[j] = isList ? JSON.parse(s) : s;
+                                                } catch (e) {
+                                                    target[j] = s;
+                                                }
+                                            }
+                                            decoded = true;
+                                        }
+                                        return () => target[Symbol.iterator]();
+                                    }
+                                    return target[prop];
+                                }
+                            });
+                        }
+                    }
+
                     Object.defineProperty(result, 'rows', {
                         configurable: true,
                         enumerable: true,

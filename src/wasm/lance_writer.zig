@@ -28,10 +28,11 @@ pub const ColumnType = enum(u8) {
     bool = 5,
     vector = 6,
     uint8 = 7,
+    list = 8,
 };
 
 const ColumnInfo = struct {
-    name_ptr: [*]const u8,
+    name_buf: [64]u8,
     name_len: usize,
     col_type: ColumnType,
     data_offset: usize,
@@ -67,12 +68,13 @@ pub export fn writerInit(capacity: usize) u32 {
 
     // Free previous buffer
     if (writer_buffer) |buf| {
-        memory.wasm_allocator.free(buf[0..writer_buffer_len]);
+        memory.wasmFree(buf, writer_buffer_len);
         writer_buffer = null;
     }
 
-    const slice = memory.wasm_allocator.alloc(u8, capacity) catch return 0;
-    writer_buffer = slice.ptr;
+    // Allocate 8-byte aligned memory (via memory wrapper)
+    const slice_ptr = memory.wasmAlloc(capacity) orelse return 0;
+    writer_buffer = slice_ptr;
     writer_buffer_len = capacity;
     writer_offset = 0;
     return 1;
@@ -270,8 +272,8 @@ pub export fn fragmentAddInt64Column(
     if (writerWriteInt64(values, count) == 0) return 0;
     const data_size = writer_offset - data_offset;
 
-    fragment_columns[fragment_column_count] = .{
-        .name_ptr = name_ptr,
+    var col = ColumnInfo{
+        .name_buf = undefined,
         .name_len = name_len,
         .col_type = .int64,
         .data_offset = data_offset,
@@ -280,6 +282,10 @@ pub export fn fragmentAddInt64Column(
         .vector_dim = 0,
         .nullable = nullable,
     };
+    const len = if (name_len > 64) 64 else name_len;
+    @memcpy(col.name_buf[0..len], name_ptr[0..len]);
+    
+    fragment_columns[fragment_column_count] = col;
     fragment_column_count += 1;
     if (count > fragment_row_count) fragment_row_count = count;
 
@@ -300,8 +306,8 @@ pub export fn fragmentAddInt32Column(
     if (writerWriteInt32(values, count) == 0) return 0;
     const data_size = writer_offset - data_offset;
 
-    fragment_columns[fragment_column_count] = .{
-        .name_ptr = name_ptr,
+    var col = ColumnInfo{
+        .name_buf = undefined,
         .name_len = name_len,
         .col_type = .int32,
         .data_offset = data_offset,
@@ -310,6 +316,9 @@ pub export fn fragmentAddInt32Column(
         .vector_dim = 0,
         .nullable = nullable,
     };
+    const len = if (name_len > 64) 64 else name_len;
+    @memcpy(col.name_buf[0..len], name_ptr[0..len]);
+    fragment_columns[fragment_column_count] = col;
     fragment_column_count += 1;
     if (count > fragment_row_count) fragment_row_count = count;
 
@@ -334,8 +343,8 @@ pub export fn fragmentAddFloat64Column(
     if (writerWriteFloat64(values, count) == 0) return 0;
     const data_size = writer_offset - data_offset;
 
-    fragment_columns[fragment_column_count] = .{
-        .name_ptr = name_ptr,
+    var col = ColumnInfo{
+        .name_buf = undefined,
         .name_len = name_len,
         .col_type = .float64,
         .data_offset = data_offset,
@@ -344,6 +353,9 @@ pub export fn fragmentAddFloat64Column(
         .vector_dim = 0,
         .nullable = nullable,
     };
+    const len = if (name_len > 64) 64 else name_len;
+    @memcpy(col.name_buf[0..len], name_ptr[0..len]);
+    fragment_columns[fragment_column_count] = col;
     fragment_column_count += 1;
     if (count > fragment_row_count) fragment_row_count = count;
 
@@ -364,8 +376,8 @@ pub export fn fragmentAddFloat32Column(
     if (writerWriteFloat32(values, count) == 0) return 0;
     const data_size = writer_offset - data_offset;
 
-    fragment_columns[fragment_column_count] = .{
-        .name_ptr = name_ptr,
+    var col = ColumnInfo{
+        .name_buf = undefined,
         .name_len = name_len,
         .col_type = .float32,
         .data_offset = data_offset,
@@ -374,6 +386,9 @@ pub export fn fragmentAddFloat32Column(
         .vector_dim = 0,
         .nullable = nullable,
     };
+    const len = if (name_len > 64) 64 else name_len;
+    @memcpy(col.name_buf[0..len], name_ptr[0..len]);
+    fragment_columns[fragment_column_count] = col;
     fragment_column_count += 1;
     if (count > fragment_row_count) fragment_row_count = count;
 
@@ -424,8 +439,8 @@ pub export fn fragmentAddStringColumn(
 
     const data_size = writer_offset - data_offset;
 
-    fragment_columns[fragment_column_count] = .{
-        .name_ptr = name_ptr,
+    var col = ColumnInfo{
+        .name_buf = undefined,
         .name_len = name_len,
         .col_type = .string,
         .data_offset = data_offset,
@@ -434,6 +449,67 @@ pub export fn fragmentAddStringColumn(
         .vector_dim = 0,
         .nullable = nullable,
     };
+    const len = if (name_len > 64) 64 else name_len;
+    @memcpy(col.name_buf[0..len], name_ptr[0..len]);
+    fragment_columns[fragment_column_count] = col;
+    fragment_column_count += 1;
+    if (count > fragment_row_count) fragment_row_count = count;
+
+    return 1;
+}
+
+/// Add a column with list data (JSON-encoded array in string format + offsets)
+pub export fn fragmentAddListColumn(
+    name_ptr: [*]const u8,
+    name_len: usize,
+    string_data: [*]const u8,
+    string_data_len: usize,
+    offsets: [*]const u32,
+    count: usize,
+    nullable: bool,
+) u32 {
+    if (fragment_column_count >= MAX_COLUMNS) return 0;
+
+    const data_offset = writer_offset;
+
+    // Write string data
+    if (writerWriteBytes(string_data, string_data_len) == 0) return 0;
+
+    // Pad to 4-byte alignment for offsets
+    const buf = writer_buffer orelse return 0;
+    const padding = (4 - (writer_offset % 4)) % 4;
+    var p: usize = 0;
+    while (p < padding) : (p += 1) {
+        if (writer_offset >= writer_buffer_len) return 0;
+        buf[writer_offset] = 0;
+        writer_offset += 1;
+    }
+
+    // Write offsets (count + 1 values)
+    const offsets_bytes = (count + 1) * 4;
+    if (writer_offset + offsets_bytes > writer_buffer_len) return 0;
+
+    var i: usize = 0;
+    while (i <= count) : (i += 1) {
+        std.mem.writeInt(u32, buf[writer_offset..][0..4], offsets[i], .little);
+        writer_offset += 4;
+    }
+
+    const data_size = writer_offset - data_offset;
+
+    var col = ColumnInfo{
+        .name_buf = undefined,
+        .name_len = name_len,
+        .col_type = .list,
+        .data_offset = data_offset,
+        .data_size = data_size,
+        .row_count = count,
+        .vector_dim = 0,
+        .nullable = nullable,
+    };
+    const len = if (name_len > 64) 64 else name_len;
+    @memcpy(col.name_buf[0..len], name_ptr[0..len]);
+    fragment_columns[fragment_column_count] = col;
     fragment_column_count += 1;
     if (count > fragment_row_count) fragment_row_count = count;
 
@@ -455,8 +531,8 @@ pub export fn fragmentAddBoolColumn(
     if (writerWriteBytes(packed_bits, byte_count) == 0) return 0;
     const data_size = writer_offset - data_offset;
 
-    fragment_columns[fragment_column_count] = .{
-        .name_ptr = name_ptr,
+    var col = ColumnInfo{
+        .name_buf = undefined,
         .name_len = name_len,
         .col_type = .bool,
         .data_offset = data_offset,
@@ -465,6 +541,9 @@ pub export fn fragmentAddBoolColumn(
         .vector_dim = 0,
         .nullable = nullable,
     };
+    const len = if (name_len > 64) 64 else name_len;
+    @memcpy(col.name_buf[0..len], name_ptr[0..len]);
+    fragment_columns[fragment_column_count] = col;
     fragment_column_count += 1;
     if (row_count > fragment_row_count) fragment_row_count = row_count;
 
@@ -493,8 +572,8 @@ pub export fn fragmentAddVectorColumn(
 
     const row_count = total_floats / vector_dim;
 
-    fragment_columns[fragment_column_count] = .{
-        .name_ptr = name_ptr,
+    var col = ColumnInfo{
+        .name_buf = undefined,
         .name_len = name_len,
         .col_type = .vector,
         .data_offset = data_offset,
@@ -503,6 +582,9 @@ pub export fn fragmentAddVectorColumn(
         .vector_dim = vector_dim,
         .nullable = nullable,
     };
+    const len = if (name_len > 64) 64 else name_len;
+    @memcpy(col.name_buf[0..len], name_ptr[0..len]);
+    fragment_columns[fragment_column_count] = col;
     fragment_column_count += 1;
     if (row_count > fragment_row_count) fragment_row_count = row_count;
 
@@ -517,7 +599,7 @@ fn writeColumnMetadata(col: *const ColumnInfo) void {
     buf[writer_offset] = 10;
     writer_offset += 1;
     writeVarintInternal(col.name_len);
-    @memcpy(buf[writer_offset..][0..col.name_len], col.name_ptr[0..col.name_len]);
+    @memcpy(buf[writer_offset..][0..col.name_len], col.name_buf[0..col.name_len]);
     writer_offset += col.name_len;
 
     // Field 2: type (string) - tag = (2 << 3) | 2 = 18
@@ -530,6 +612,7 @@ fn writeColumnMetadata(col: *const ColumnInfo) void {
         .bool => "bool",
         .vector => "vector",
         .uint8 => "uint8",
+        .list => "list",
     };
     buf[writer_offset] = 18;
     writer_offset += 1;

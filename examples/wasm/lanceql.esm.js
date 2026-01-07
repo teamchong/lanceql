@@ -8512,7 +8512,11 @@ function parseGroupByList(parser) {
       items.push({ type: "COLUMN", column: parser.expect(TokenType2.IDENTIFIER).value });
     }
   } while (parser.match(TokenType2.COMMA));
-  return items;
+  let topK = null;
+  if (parser.match(TokenType2.TOPK)) {
+    topK = parseInt(parser.expect(TokenType2.NUMBER).value, 10);
+  }
+  return { items, topK };
 }
 function parseGroupingSets(parser) {
   const sets = [];
@@ -8754,9 +8758,12 @@ var SQLParser = class {
       where = this.parseExpr();
     }
     let groupBy = [];
+    let groupByTopK = null;
     if (this.match(TokenType2.GROUP)) {
       this.expect(TokenType2.BY);
-      groupBy = parseGroupByList(this);
+      const result = parseGroupByList(this);
+      groupBy = result.items;
+      groupByTopK = result.topK;
     }
     let having = null;
     if (this.match(TokenType2.HAVING)) {
@@ -8780,6 +8787,7 @@ var SQLParser = class {
       unpivot,
       where,
       groupBy,
+      groupByTopK,
       having,
       qualify,
       search,
@@ -8798,7 +8806,7 @@ var SQLParser = class {
         this.expect(TokenType2.BY);
         orderBy = this.parseOrderByList();
       }
-      if (this.match(TokenType2.LIMIT)) {
+      if (this.match(TokenType2.LIMIT) || this.match(TokenType2.TOPK)) {
         limit = parseInt(this.expect(TokenType2.NUMBER).value, 10);
       }
       if (orderBy.length === 0 && this.match(TokenType2.ORDER)) {
@@ -8819,7 +8827,8 @@ var SQLParser = class {
         right,
         orderBy,
         limit,
-        offset
+        offset,
+        groupByTopK: baseAst.groupByTopK
       };
     }
     if (!noSetOps) {
@@ -8830,7 +8839,7 @@ var SQLParser = class {
         this.expect(TokenType2.BY);
         orderBy = this.parseOrderByList();
       }
-      if (this.match(TokenType2.LIMIT)) {
+      if (this.match(TokenType2.LIMIT) || this.match(TokenType2.TOPK)) {
         limit = parseInt(this.expect(TokenType2.NUMBER).value, 10);
       }
       if (orderBy.length === 0 && this.match(TokenType2.ORDER)) {
@@ -8990,7 +8999,7 @@ var SQLParser = class {
     let alias = null;
     if (this.match(TokenType2.AS)) {
       alias = this.expect(TokenType2.IDENTIFIER).value;
-    } else if (this.check(TokenType2.IDENTIFIER) && !this.check(TokenType2.FROM, TokenType2.WHERE, TokenType2.ORDER, TokenType2.LIMIT, TokenType2.GROUP, TokenType2.JOIN, TokenType2.INNER, TokenType2.LEFT, TokenType2.RIGHT, TokenType2.COMMA)) {
+    } else if (this.check(TokenType2.IDENTIFIER) && !this.check(TokenType2.FROM, TokenType2.WHERE, TokenType2.ORDER, TokenType2.LIMIT, TokenType2.TOPK, TokenType2.GROUP, TokenType2.JOIN, TokenType2.INNER, TokenType2.LEFT, TokenType2.RIGHT, TokenType2.COMMA)) {
       alias = this.advance().value;
     }
     return { type: "expr", expr, alias };
@@ -9035,7 +9044,7 @@ var SQLParser = class {
     if (from) {
       if (this.match(TokenType2.AS)) {
         from.alias = this.expect(TokenType2.IDENTIFIER).value;
-      } else if (this.check(TokenType2.IDENTIFIER) && !this.check(TokenType2.WHERE, TokenType2.ORDER, TokenType2.LIMIT, TokenType2.GROUP, TokenType2.NEAR, TokenType2.JOIN, TokenType2.INNER, TokenType2.LEFT, TokenType2.RIGHT, TokenType2.COMMA)) {
+      } else if (this.check(TokenType2.IDENTIFIER) && !this.check(TokenType2.WHERE, TokenType2.ORDER, TokenType2.LIMIT, TokenType2.TOPK, TokenType2.GROUP, TokenType2.NEAR, TokenType2.JOIN, TokenType2.INNER, TokenType2.LEFT, TokenType2.RIGHT, TokenType2.COMMA)) {
         from.alias = this.advance().value;
       }
     }

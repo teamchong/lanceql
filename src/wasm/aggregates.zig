@@ -60,7 +60,10 @@ export fn sumFloat64Column(col_idx: u32) f64 {
     const buf = getColumnBuffer(col_idx) orelse return 0;
     const row_count = buf.size / 8;
     var sum: f64 = 0;
-    for (0..row_count) |i| sum += readF64LE(buf.data, buf.start + i * 8);
+    for (0..row_count) |i| {
+        const v = readF64LE(buf.data, buf.start + i * 8);
+        if (!std.math.isNan(v)) sum += v;
+    }
     return sum;
 }
 
@@ -96,8 +99,16 @@ export fn avgFloat64Column(col_idx: u32) f64 {
     const row_count = buf.size / 8;
     if (row_count == 0) return 0;
     var sum: f64 = 0;
-    for (0..row_count) |i| sum += readF64LE(buf.data, buf.start + i * 8);
-    return sum / @as(f64, @floatFromInt(row_count));
+    var count: usize = 0;
+    for (0..row_count) |i| {
+        const v = readF64LE(buf.data, buf.start + i * 8);
+        if (!std.math.isNan(v)) {
+            sum += v;
+            count += 1;
+        }
+    }
+    if (count == 0) return 0;
+    return sum / @as(f64, @floatFromInt(count));
 }
 
 // ============================================================================
@@ -127,19 +138,12 @@ pub const AggState = struct {
     }
 
     pub fn updateVec4(self: *AggState, v: Vec4f64, func: AggFunc) void {
-        switch (func) {
-            .sum, .avg => self.val += @reduce(.Add, v),
-            .min => {
-                const m = @reduce(.Min, v);
-                if (m < self.min) self.min = m;
-            },
-            .max => {
-                const m = @reduce(.Max, v);
-                if (m > self.max) self.max = m;
-            },
-            .count => {},
+        const arr: [4]f64 = v;
+        for (arr) |val| {
+            if (!std.math.isNan(val)) {
+                self.update(val, func);
+            }
         }
-        self.count += 4;
     }
 
     pub fn getResult(self: *AggState, func: AggFunc) f64 {
@@ -190,10 +194,12 @@ pub const MultiAggState = struct {
     }
 
     pub fn updateVec4(self: *MultiAggState, v: Vec4f64) void {
-        if (self.metrics.sum) self.sum_vec += v;
-        if (self.metrics.min) self.min_vec = @min(self.min_vec, v);
-        if (self.metrics.max) self.max_vec = @max(self.max_vec, v);
-        if (self.metrics.count) self.count += 4;
+        const arr: [4]f64 = v;
+        for (arr) |val| {
+            if (!std.math.isNan(val)) {
+                self.update(val);
+            }
+        }
     }
     
     pub fn getResult(self: *const MultiAggState, func: AggFunc) f64 {
@@ -336,75 +342,40 @@ pub const MultiAggState = struct {
 };
 
 /// Sum float64 buffer with SIMD acceleration
+/// Sum float64 buffer with NaN check
 pub export fn sumFloat64Buffer(ptr: [*]const f64, len: usize) f64 {
-    if (len == 0) return 0;
-
-    var sum: Vec4f64 = @splat(0);
-    var i: usize = 0;
-
-    // Process 4 elements at a time with SIMD
-    while (i + 4 <= len) : (i += 4) {
-        const v: Vec4f64 = .{ ptr[i], ptr[i + 1], ptr[i + 2], ptr[i + 3] };
-        sum += v;
+    var sum: f64 = 0;
+    for (0..len) |i| {
+        const v = ptr[i];
+        if (!std.math.isNan(v)) sum += v;
     }
-
-    // Horizontal sum
-    var result = @reduce(.Add, sum);
-
-    // Handle remainder
-    while (i < len) : (i += 1) {
-        result += ptr[i];
-    }
-
-    return result;
+    return sum;
 }
 
 /// Min float64 buffer with SIMD acceleration
+/// Min float64 buffer with NaN check
 pub export fn minFloat64Buffer(ptr: [*]const f64, len: usize) f64 {
     if (len == 0) return 0;
-
-    var min_vec: Vec4f64 = @splat(ptr[0]);
-    var i: usize = 0;
-
-    // Process 4 elements at a time with SIMD
-    while (i + 4 <= len) : (i += 4) {
-        const v: Vec4f64 = .{ ptr[i], ptr[i + 1], ptr[i + 2], ptr[i + 3] };
-        min_vec = @min(min_vec, v);
+    var min_val = std.math.floatMax(f64);
+    for (0..len) |i| {
+         const v = ptr[i];
+         if (!std.math.isNan(v) and v < min_val) min_val = v;
     }
-
-    // Horizontal min
-    var result = @reduce(.Min, min_vec);
-
-    // Handle remainder
-    while (i < len) : (i += 1) {
-        if (ptr[i] < result) result = ptr[i];
-    }
-
-    return result;
+    if (min_val == std.math.floatMax(f64)) return 0;
+    return min_val;
 }
 
 /// Max float64 buffer with SIMD acceleration
+/// Max float64 buffer with NaN check
 pub export fn maxFloat64Buffer(ptr: [*]const f64, len: usize) f64 {
     if (len == 0) return 0;
-
-    var max_vec: Vec4f64 = @splat(ptr[0]);
-    var i: usize = 0;
-
-    // Process 4 elements at a time with SIMD
-    while (i + 4 <= len) : (i += 4) {
-        const v: Vec4f64 = .{ ptr[i], ptr[i + 1], ptr[i + 2], ptr[i + 3] };
-        max_vec = @max(max_vec, v);
+    var max_val = -std.math.floatMax(f64);
+    for (0..len) |i| {
+        const v = ptr[i];
+        if (!std.math.isNan(v) and v > max_val) max_val = v;
     }
-
-    // Horizontal max
-    var result = @reduce(.Max, max_vec);
-
-    // Handle remainder
-    while (i < len) : (i += 1) {
-        if (ptr[i] > result) result = ptr[i];
-    }
-
-    return result;
+    if (max_val == -std.math.floatMax(f64)) return 0; // Or NaN?
+    return max_val;
 }
 
 /// Average float64 buffer
