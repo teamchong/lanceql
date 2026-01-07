@@ -328,6 +328,7 @@ var global_join_pair_count: usize = 0;
 var global_partition_keys: [MAX_ROWS]i64 = undefined;
 var global_processed: [MAX_ROWS]bool = undefined;
 var global_window_values: [MAX_WINDOW_FUNCS][MAX_ROWS]f64 = undefined;
+var global_group_indices: [MAX_ROWS]u32 = undefined;
 
 // Static storage for parsed WHERE clauses (avoid dynamic allocation)
 var where_storage: [32]WhereClause = undefined;
@@ -2293,9 +2294,143 @@ fn executeUpdate(query: *const ParsedQuery) !void {
 }
 
 fn executeDelete(query: *const ParsedQuery) void {
-    _ = query;
-    // Implementation stub
+    // Find table
+    var tbl: ?*TableInfo = null;
+    for (&tables) |*t| {
+        if (t.*) |*table| {
+            if (std.mem.eql(u8, table.name, query.table_name)) {
+                tbl = table;
+                break;
+            }
+        }
+    }
+    
+    if (tbl == null) return;
+    const table = tbl.?;
+    
+    // Count rows to keep (rows that DO NOT match WHERE)
+    // For in-memory tables, row_count == memory_row_count
+    const original_row_count = table.row_count;
+    if (original_row_count == 0) return;
+    
+    // Build list of surviving row indices (use global buffer to avoid stack overflow)
+    var surviving_count: usize = 0;
+    var ctx: ?FragmentContext = null;
+    
+    for (0..original_row_count) |i| {
+        const idx = @as(u32, @intCast(i));
+        const matches_where = if (query.where_clause) |*where|
+            evaluateWhere(table, where, idx, &ctx)
+        else
+            true; // No WHERE = delete all
+        
+        if (!matches_where) {
+            // This row survives (does not match WHERE)
+            global_indices_1[surviving_count] = idx;
+            surviving_count += 1;
+        }
+    }
+    
+    // If all rows deleted or none deleted, handle specially
+    if (surviving_count == original_row_count) return; // Nothing to delete
+    
+    // Compact each column - copy surviving rows
+    for (0..table.column_count) |col_idx| {
+        if (table.memory_columns[col_idx]) |*col| {
+            switch (col.col_type) {
+                .int64 => {
+                    if (col.data_ptr) |ptr| {
+                        var list = @as(*std.ArrayListUnmanaged(i64), @ptrCast(@alignCast(ptr)));
+                        // Compact in-place
+                        for (0..surviving_count) |j| {
+                            const src_idx = global_indices_1[j];
+                            if (src_idx < list.items.len) {
+                                list.items[j] = list.items[src_idx];
+                            }
+                        }
+                        // Shrink the list
+                        list.shrinkRetainingCapacity(surviving_count);
+                        col.data.int64 = list.items;
+                        col.row_count = surviving_count;
+                    }
+                },
+                .float64 => {
+                    if (col.data_ptr) |ptr| {
+                        var list = @as(*std.ArrayListUnmanaged(f64), @ptrCast(@alignCast(ptr)));
+                        for (0..surviving_count) |j| {
+                            const src_idx = global_indices_1[j];
+                            if (src_idx < list.items.len) {
+                                list.items[j] = list.items[src_idx];
+                            }
+                        }
+                        list.shrinkRetainingCapacity(surviving_count);
+                        col.data.float64 = list.items;
+                        col.row_count = surviving_count;
+                    }
+                },
+                .int32 => {
+                    if (col.data_ptr) |ptr| {
+                        var list = @as(*std.ArrayListUnmanaged(i32), @ptrCast(@alignCast(ptr)));
+                        for (0..surviving_count) |j| {
+                            const src_idx = global_indices_1[j];
+                            if (src_idx < list.items.len) {
+                                list.items[j] = list.items[src_idx];
+                            }
+                        }
+                        list.shrinkRetainingCapacity(surviving_count);
+                        col.data.int32 = list.items;
+                        col.row_count = surviving_count;
+                    }
+                },
+                .float32 => {
+                    if (col.data_ptr) |ptr| {
+                        var list = @as(*std.ArrayListUnmanaged(f32), @ptrCast(@alignCast(ptr)));
+                        for (0..surviving_count) |j| {
+                            const src_idx = global_indices_1[j];
+                            if (src_idx < list.items.len) {
+                                list.items[j] = list.items[src_idx];
+                            }
+                        }
+                        list.shrinkRetainingCapacity(surviving_count);
+                        col.data.float32 = list.items;
+                        col.row_count = surviving_count;
+                    }
+                },
+                .string => {
+                    // Strings are more complex - need to rebuild offsets/lengths
+                    // For now, just update lengths list and leave char data (wasteful but works)
+                    if (col.data_ptr) |ptr| {
+                        var len_list = @as(*std.ArrayListUnmanaged(u32), @ptrCast(@alignCast(ptr)));
+                        if (col.offsets_buffer) |off_ptr| {
+                            var offset_list = @as(*std.ArrayListUnmanaged(u32), @ptrCast(@alignCast(off_ptr)));
+                            for (0..surviving_count) |j| {
+                                const src_idx = global_indices_1[j];
+                                if (src_idx < len_list.items.len) {
+                                    len_list.items[j] = len_list.items[src_idx];
+                                    offset_list.items[j] = offset_list.items[src_idx];
+                                }
+                            }
+                            len_list.shrinkRetainingCapacity(surviving_count);
+                            offset_list.shrinkRetainingCapacity(surviving_count);
+                            col.data = .{ .strings = .{
+                                .offsets = offset_list.items,
+                                .lengths = len_list.items,
+                                .data = col.data.strings.data,
+                            }};
+                        }
+                        col.row_count = surviving_count;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    
+    // Update table row counts
+    table.row_count = surviving_count;
+    table.memory_row_count = surviving_count;
 }
+
 
 // ============================================================================
 // Error Handling
@@ -4739,7 +4874,7 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
     const all_agg_results = try memory.wasm_allocator.alloc(f64, num_groups * num_aggs);
     defer memory.wasm_allocator.free(all_agg_results);
 
-    var group_indices: [MAX_ROWS]u32 = undefined;
+    const group_indices = &global_group_indices;
     for (0..num_groups) |gi| {
         const key = group_keys[gi];
         var group_idx_count: usize = 0;
@@ -4791,7 +4926,7 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
 
     // Use Lance Writer
     if (lw.fragmentBegin(65536 + survivor_count * 16 * (num_aggs + 1)) == 0) return error.OutOfMemory;
-    
+
     // Group keys
     const group_keys_out = try memory.wasm_allocator.alloc(f64, survivor_count);
     defer memory.wasm_allocator.free(group_keys_out);
@@ -4827,6 +4962,15 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
         }
         
         _ = lw.fragmentAddFloat64Column(name.ptr, name.len, out_buf.ptr, survivor_count, false);
+    }
+
+    // Finalize fragment and return it directly
+    const final_size = lw.fragmentEnd();
+    if (final_size == 0) return error.EncodingError;
+
+    if (lw.writerGetBuffer()) |buf| {
+        result_buffer = buf[0..final_size];
+        result_size = final_size;
     }
 }
 

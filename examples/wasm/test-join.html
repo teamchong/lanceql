@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -13,19 +14,30 @@
             background: #0f172a;
             color: #e2e8f0;
         }
-        h1 { color: #3b82f6; margin-bottom: 10px; }
-        .subtitle { color: #94a3b8; margin-bottom: 30px; }
+
+        h1 {
+            color: #3b82f6;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            color: #94a3b8;
+            margin-bottom: 30px;
+        }
+
         .test-section {
             background: #1e293b;
             border-radius: 8px;
             padding: 20px;
             margin: 20px 0;
         }
+
         .test-section h2 {
             margin-top: 0;
             color: #60a5fa;
             font-size: 1.2rem;
         }
+
         button {
             background: #3b82f6;
             color: white;
@@ -37,13 +49,16 @@
             font-size: 14px;
             font-weight: 500;
         }
+
         button:hover {
             background: #2563eb;
         }
+
         button:disabled {
             background: #475569;
             cursor: not-allowed;
         }
+
         .status {
             padding: 10px;
             border-radius: 6px;
@@ -51,18 +66,22 @@
             font-family: 'Courier New', monospace;
             font-size: 13px;
         }
+
         .status.loading {
             background: #1e3a5f;
             border-left: 4px solid #3b82f6;
         }
+
         .status.success {
             background: #14532d;
             border-left: 4px solid #22c55e;
         }
+
         .status.error {
             background: #7f1d1d;
             border-left: 4px solid #ef4444;
         }
+
         pre {
             background: #0f172a;
             padding: 15px;
@@ -72,24 +91,30 @@
             max-height: 400px;
             overflow-y: auto;
         }
+
         table {
             width: 100%;
             border-collapse: collapse;
             margin-top: 10px;
         }
-        th, td {
+
+        th,
+        td {
             text-align: left;
             padding: 8px;
             border-bottom: 1px solid #334155;
         }
+
         th {
             background: #0f172a;
             color: #60a5fa;
             font-weight: 600;
         }
+
         tr:hover {
             background: #1e293b;
         }
+
         .code {
             background: #0f172a;
             padding: 4px 8px;
@@ -101,6 +126,7 @@
             margin: 10px 0;
             white-space: pre-wrap;
         }
+
         .schema {
             background: #1e293b;
             padding: 10px;
@@ -109,16 +135,19 @@
             font-family: 'Courier New', monospace;
             font-size: 13px;
         }
+
         .run-all {
             background: #059669;
             font-size: 16px;
             padding: 12px 24px;
         }
+
         .run-all:hover {
             background: #047857;
         }
     </style>
 </head>
+
 <body>
     <h1>🔗 LanceQL JOIN Demo</h1>
     <p class="subtitle">Row-based JOIN operations using vault with in-memory tables</p>
@@ -193,7 +222,13 @@ ORDER BY total_spent DESC</code>
     </div>
 
     <script type="module">
-        import { vault } from './lanceql.js';
+        import { vault, LanceDatabase, SQLLexer, SQLParser, SQLExecutor } from './lanceql.js';
+
+        // Expose on window for test access
+        window.LanceDatabase = LanceDatabase;
+        window.SQLLexer = SQLLexer;
+        window.SQLParser = SQLParser;
+        window.SQLExecutor = SQLExecutor;
 
         let v = null;
 
@@ -230,7 +265,7 @@ ORDER BY total_spent DESC</code>
             return html;
         }
 
-        window.testInit = async function() {
+        window.testInit = async function () {
             const btn = document.getElementById('btn-init');
             const status = document.getElementById('status-init');
 
@@ -247,7 +282,7 @@ ORDER BY total_spent DESC</code>
             }
         };
 
-        window.testCreate = async function() {
+        window.testCreate = async function () {
             const btn = document.getElementById('btn-create');
             const status = document.getElementById('status-create');
 
@@ -266,7 +301,7 @@ ORDER BY total_spent DESC</code>
             }
         };
 
-        window.testInsert = async function() {
+        window.testInsert = async function () {
             const btn = document.getElementById('btn-insert');
             const status = document.getElementById('status-insert');
             const result = document.getElementById('result-insert');
@@ -300,7 +335,7 @@ ORDER BY total_spent DESC</code>
             }
         };
 
-        window.testInnerJoin = async function() {
+        window.testInnerJoin = async function () {
             const btn = document.getElementById('btn-inner-join');
             const status = document.getElementById('status-inner-join');
             const result = document.getElementById('result-inner-join');
@@ -325,7 +360,7 @@ ORDER BY total_spent DESC</code>
             }
         };
 
-        window.testLeftJoin = async function() {
+        window.testLeftJoin = async function () {
             const btn = document.getElementById('btn-left-join');
             const status = document.getElementById('status-left-join');
             const result = document.getElementById('result-left-join');
@@ -350,7 +385,7 @@ ORDER BY total_spent DESC</code>
             }
         };
 
-        window.testComplexJoin = async function() {
+        window.testComplexJoin = async function () {
             const btn = document.getElementById('btn-complex-join');
             const status = document.getElementById('status-complex-join');
             const result = document.getElementById('result-complex-join');
@@ -375,7 +410,7 @@ ORDER BY total_spent DESC</code>
             }
         };
 
-        window.testAggregationJoin = async function() {
+        window.testAggregationJoin = async function () {
             const btn = document.getElementById('btn-agg-join');
             const status = document.getElementById('status-agg-join');
             const result = document.getElementById('result-agg-join');
@@ -400,7 +435,7 @@ ORDER BY total_spent DESC</code>
             }
         };
 
-        window.runAllTests = async function() {
+        window.runAllTests = async function () {
             await testInit();
             if (v) {
                 await testCreate();
@@ -417,4 +452,5 @@ ORDER BY total_spent DESC</code>
         });
     </script>
 </body>
+
 </html>

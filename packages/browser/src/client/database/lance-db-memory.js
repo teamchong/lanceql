@@ -24,11 +24,8 @@ export class MemoryTable {
      * Convert to in-memory data format for executor
      */
     toInMemoryData() {
-        const columnData = {};
-        this.columns.forEach((col, idx) => {
-            columnData[col.toLowerCase()] = this.rows.map(row => row[idx]);
-        });
-        return { columnData, columnNames: this.columns };
+        // Return format expected by SQLExecutor._executeOnInMemoryData
+        return { columns: this.columns, rows: this.rows };
     }
 }
 
