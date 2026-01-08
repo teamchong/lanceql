@@ -6076,28 +6076,36 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
                     .sum => {
                         if (arg_col) |acol| {
                             var s: f64 = 0;
-                            for (0..rank + 1) |j| {
+                            // Without ORDER BY, aggregate entire partition; with ORDER BY, running sum
+                            const agg_end = if (order_col == null) part_count else rank + 1;
+                            for (0..agg_end) |j| {
                                 s += getFloatValue(table, acol, indices[part_indices[j]]);
                             }
                             value = s;
                         }
                     },
                     .count => {
-                        value = @floatFromInt(rank + 1);
+                        // Without ORDER BY, count entire partition; with ORDER BY, running count
+                        const agg_end = if (order_col == null) part_count else rank + 1;
+                        value = @floatFromInt(agg_end);
                     },
                     .avg => {
                         if (arg_col) |acol| {
                             var s: f64 = 0;
-                            for (0..rank + 1) |j| {
+                            // Without ORDER BY, avg entire partition; with ORDER BY, running avg
+                            const agg_end = if (order_col == null) part_count else rank + 1;
+                            for (0..agg_end) |j| {
                                 s += getFloatValue(table, acol, indices[part_indices[j]]);
                             }
-                            value = s / @as(f64, @floatFromInt(rank + 1));
+                            value = s / @as(f64, @floatFromInt(agg_end));
                         }
                     },
                     .min => {
                         if (arg_col) |acol| {
                             var m: f64 = std.math.floatMax(f64);
-                            for (0..rank + 1) |j| {
+                            // Without ORDER BY, min of entire partition; with ORDER BY, running min
+                            const agg_end = if (order_col == null) part_count else rank + 1;
+                            for (0..agg_end) |j| {
                                 const v = getFloatValue(table, acol, indices[part_indices[j]]);
                                 if (v < m) m = v;
                             }
@@ -6107,7 +6115,9 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
                     .max => {
                         if (arg_col) |acol| {
                             var m: f64 = -std.math.floatMax(f64);
-                            for (0..rank + 1) |j| {
+                            // Without ORDER BY, max of entire partition; with ORDER BY, running max
+                            const agg_end = if (order_col == null) part_count else rank + 1;
+                            for (0..agg_end) |j| {
                                 const v = getFloatValue(table, acol, indices[part_indices[j]]);
                                 if (v > m) m = v;
                             }
@@ -6121,7 +6131,7 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
         }
     }
 
-    // Build output: regular columns + window function columns
+    // Build output using lance_writer for consistent format
     // Determine output columns
     var output_cols: [MAX_SELECT_COLS]usize = undefined;
     var output_count: usize = 0;
@@ -6151,157 +6161,67 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
 
     const total_cols = output_count + query.window_count;
 
-    // Calculate sizes
-    var names_size: usize = 0;
-    for (output_cols[0..output_count]) |ci| {
-        if (table.columns[ci]) |col| {
-            names_size += col.name.len;
-        }
-    }
-    for (query.window_funcs[0..query.window_count]) |wf| {
-        if (wf.alias) |alias| {
-            names_size += alias.len;
-        } else {
-            names_size += 10; // Default name like "window_0"
-        }
-    }
+    // Estimate capacity for lance_writer
+    const capacity = idx_count * total_cols * 16 + 1024 * total_cols + 65536;
+    if (lw.fragmentBegin(capacity) == 0) return error.OutOfMemory;
 
-    const extended_header: u32 = 36;
-    const meta_size: u32 = @intCast(total_cols * 16);
-    const names_offset: u32 = HEADER_SIZE + meta_size;
-    const unaligned_data_start = names_offset + @as(u32, @intCast(names_size));
-    
-    // 8-byte alignment for data section
-    var padding: u32 = 0;
-    if (unaligned_data_start % 8 != 0) {
-        padding = 8 - (unaligned_data_start % 8);
-    }
-    const data_offset_start = unaligned_data_start + padding;
-
-    // Pre-calculate actual string sizes for accurate buffer allocation
-    var string_sizes: [MAX_SELECT_COLS]usize = undefined;
-    for (output_cols[0..output_count], 0..) |ci, out_idx| {
-        string_sizes[out_idx] = 0;
-        if (table.columns[ci]) |*col| {
-            if (col.col_type == .string or col.col_type == .list) {
-                for (indices[0..idx_count]) |ri| {
-                    var ctx: ?FragmentContext = null;
-                    string_sizes[out_idx] += getStringValueOptimized(table, col, ri, &ctx).len;
-                }
-            }
-        }
-    }
-
-    var data_size: usize = 0;
-    for (output_cols[0..output_count], 0..) |ci, out_idx| {
-        if (table.columns[ci]) |col| {
-            data_size += switch (col.col_type) {
-                .int64, .float64, .int32, .float32 => idx_count * 8, // All numeric written as f64
-                .string, .list => idx_count * 8 + string_sizes[out_idx],
-            };
-        }
-    }
-    // Window function columns are all float64
-    data_size += query.window_count * idx_count * 8;
-
-    const total_size = data_offset_start + data_size;
-    _ = allocResultBuffer(total_size) orelse return error.OutOfMemory;
-
-    // Write header
-    _ = writeU32(RESULT_VERSION);
-    _ = writeU32(@intCast(total_cols));
-    _ = writeU64(@intCast(idx_count));
-    _ = writeU32(extended_header);
-    _ = writeU32(extended_header);
-    _ = writeU32(data_offset_start);
-    _ = writeU32(0);
-    _ = writeU32(names_offset);
-
-    // Write column metadata
-    var name_offset: u32 = 0;
-    var data_offset: u32 = 0;
-
-    // Regular columns
-    for (output_cols[0..output_count], 0..) |ci, out_idx| {
-        if (table.columns[ci]) |col| {
-            _ = writeU32(@intFromEnum(col.col_type));
-            _ = writeU32(name_offset);
-            _ = writeU32(@intCast(col.name.len));
-            _ = writeU32(data_offset);
-
-            name_offset += @intCast(col.name.len);
-            data_offset += switch (col.col_type) {
-                .int64, .float64, .int32, .float32 => @intCast(idx_count * 8), // All numeric as f64
-                .string, .list => @intCast(idx_count * 8 + string_sizes[out_idx]),
-            };
-        }
-    }
-
-    // Window function columns (all float64)
-    for (query.window_funcs[0..query.window_count]) |wf| {
-        _ = writeU32(1); // float64
-        _ = writeU32(name_offset);
-        const name_len: u32 = if (wf.alias) |alias| @intCast(alias.len) else 10;
-        _ = writeU32(name_len);
-        _ = writeU32(data_offset);
-
-        name_offset += name_len;
-        data_offset += @intCast(idx_count * 8);
-    }
-
-    // Write column names
-    for (output_cols[0..output_count]) |ci| {
-        if (table.columns[ci]) |col| {
-            _ = writeToResult(col.name);
-        }
-    }
-    for (query.window_funcs[0..query.window_count], 0..) |wf, i| {
-        if (wf.alias) |alias| {
-            _ = writeToResult(alias);
-        } else {
-            var buf: [10]u8 = undefined;
-            const name = std.fmt.bufPrint(&buf, "window_{d}", .{i}) catch "window";
-            _ = writeToResult(name);
-        }
-    }
-
-    // Write data - regular columns (use safe accessors for in-memory tables)
+    // Write regular columns using lance_writer
     for (output_cols[0..output_count]) |ci| {
         if (table.columns[ci]) |*col| {
             switch (col.col_type) {
                 .float64, .int64, .int32, .float32 => {
-                    for (indices[0..idx_count]) |ri| {
+                    const data = try memory.wasm_allocator.alloc(f64, idx_count);
+                    defer memory.wasm_allocator.free(data);
+                    for (indices[0..idx_count], 0..) |ri, i| {
                         var ctx: ?FragmentContext = null;
-                        const val = getFloatValueOptimized(table, col, ri, &ctx);
-                        _ = writeToResult(std.mem.asBytes(&val));
+                        data[i] = getFloatValueOptimized(table, col, ri, &ctx);
                     }
+                    _ = lw.fragmentAddFloat64Column(col.name.ptr, col.name.len, data.ptr, idx_count, false);
                 },
                 .string, .list => {
-                    // Collect string data first to calculate offsets
-                    var str_offset: u32 = 0;
+                    // Two-pass for strings: first calculate offsets, then collect data
+                    const offsets = try memory.wasm_allocator.alloc(u32, idx_count + 1);
+                    defer memory.wasm_allocator.free(offsets);
+                    offsets[0] = 0;
+                    var total_len: usize = 0;
+                    for (indices[0..idx_count], 0..) |ri, i| {
+                        var ctx: ?FragmentContext = null;
+                        const s = getStringValueOptimized(table, col, ri, &ctx);
+                        total_len += s.len;
+                        offsets[i + 1] = @intCast(total_len);
+                    }
+                    const str_data = try memory.wasm_allocator.alloc(u8, total_len);
+                    defer memory.wasm_allocator.free(str_data);
+                    var offset: usize = 0;
                     for (indices[0..idx_count]) |ri| {
                         var ctx: ?FragmentContext = null;
-                        const str_val = getStringValueOptimized(table, col, ri, &ctx);
-                        _ = writeU32(str_offset);
-                        _ = writeU32(@intCast(str_val.len));
-                        str_offset += @intCast(str_val.len);
+                        const s = getStringValueOptimized(table, col, ri, &ctx);
+                        @memcpy(str_data[offset..][0..s.len], s);
+                        offset += s.len;
                     }
-                    for (indices[0..idx_count]) |ri| {
-                        var ctx: ?FragmentContext = null;
-                        const str_val = getStringValueOptimized(table, col, ri, &ctx);
-                        _ = writeToResult(str_val);
-                    }
+                    _ = lw.fragmentAddStringColumn(col.name.ptr, col.name.len, str_data.ptr, total_len, offsets.ptr, idx_count, col.col_type == .list);
                 },
             }
         }
     }
 
-    // Write window function data
-    for (0..query.window_count) |wf_idx| {
+    // Write window function columns
+    for (query.window_funcs[0..query.window_count], 0..) |wf, wf_idx| {
+        const data = try memory.wasm_allocator.alloc(f64, idx_count);
+        defer memory.wasm_allocator.free(data);
         for (0..idx_count) |i| {
-            const val = window_values[wf_idx][i];
-            _ = writeToResult(std.mem.asBytes(&val));
+            data[i] = window_values[wf_idx][i];
         }
+        const name = wf.alias orelse "window";
+        _ = lw.fragmentAddFloat64Column(name.ptr, name.len, data.ptr, idx_count, false);
+    }
+
+    // Finalize and get result
+    const res = lw.fragmentEnd();
+    if (res == 0) return error.EncodingError;
+    if (lw.writerGetBuffer()) |buf| {
+        result_buffer = buf[0..res];
+        result_size = res;
     }
 }
 

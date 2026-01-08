@@ -1,0 +1,53 @@
+[1A[2K[2m[WebServer] [22m::ffff:127.0.0.1 - - [07/Jan/2026 22:01:37] "GET / HTTP/1.1" 200 -
+
+
+Running 1 test using 1 worker
+
+[1A[2K[1/1] [chromium] › tests/e2e/vault-sql.spec.js:2811:5 › Vault SQL Operations › Quick wins - GREATEST, LEAST, IIF functions
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 22:01:38] "GET /examples/wasm/test-vault-sql.html HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 22:01:38] "GET /examples/wasm/lanceql.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 22:01:39] "GET /examples/wasm/lanceql.js?v=1767841299026 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 22:01:39] "GET /examples/wasm/lanceql-worker.js?v=1767841299035 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 22:01:39] "GET /examples/wasm/lanceql.wasm?v=1767841299045 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 22:01:39] "GET /examples/wasm/lanceql.wasm?v=1767841299049 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 22:01:39] "GET /examples/wasm/lanceql.js?v=1767841299132 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 22:01:39] "GET /examples/wasm/lanceql-worker.js?v=1767841299141 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 22:01:39] "GET /examples/wasm/lanceql.wasm?v=1767841299146 HTTP/1.1" 200 -
+
+[1A[2K  1) [chromium] › tests/e2e/vault-sql.spec.js:2811:5 › Vault SQL Operations › Quick wins - GREATEST, LEAST, IIF functions 
+
+    Error: IIF(1 > 0): got no
+
+    [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32mtrue[39m
+    Received: [31mfalse[39m
+
+      2864 |
+      2865 |         for (const t of results) {
+    > 2866 |             expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+           |                                                                          ^
+      2867 |         }
+      2868 |     });
+      2869 |
+        at /Users/steven_chong/Downloads/repos/lanceql/packages/browser/tests/e2e/vault-sql.spec.js:2866:74
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/vault-sql-Vault-SQL-Operat-9dc50-REATEST-LEAST-IIF-functions-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/vault-sql-Vault-SQL-Operat-9dc50-REATEST-LEAST-IIF-functions-chromium/error-context.md
+
+
+[1A[2K  1 failed
+    [chromium] › tests/e2e/vault-sql.spec.js:2811:5 › Vault SQL Operations › Quick wins - GREATEST, LEAST, IIF functions 
+
+[36m  Serving HTML report at http://localhost:63134. Press Ctrl+C to quit.[39m

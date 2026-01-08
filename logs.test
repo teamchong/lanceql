@@ -1,0 +1,1653 @@
+[1A[2K[2m[WebServer] [22m::ffff:127.0.0.1 - - [07/Jan/2026 23:30:20] "GET / HTTP/1.1" 200 -
+
+
+Running 1 test using 1 worker
+
+[1A[2K[1/1] [chromium] › tests/e2e/vault-sql.spec.js:2814:5 › Vault SQL Operations › Quick wins - GREATEST, LEAST, IIF functions
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:30:22] "GET /examples/wasm/test-vault-sql.html HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:30:22] "GET /examples/wasm/lanceql.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:30:22] "GET /examples/wasm/lanceql.js?v=1767846622295 HTTP/1.1" 200 -
+
+[1A[2K[chromium] › tests/e2e/vault-sql.spec.js:2814:5 › Vault SQL Operations › Quick wins - GREATEST, LEAST, IIF functions
+[LanceQL] Using Transferable ArrayBuffers
+
+[1A[2K[LanceQL] Using regular Worker for better logging
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:30:22] "GET /examples/wasm/lanceql-worker.js?v=1767846622309 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:30:22] "GET /examples/wasm/lanceql.wasm?v=1767846622323 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:30:22] "GET /examples/wasm/lanceql.wasm?v=1767846622327 HTTP/1.1" 200 -
+
+[1A[2K[LanceQLWorker] Initialized
+
+[1A[2K[LanceQLWorker] WASM loaded with OPFS support
+
+[1A[2K[LanceQL] Incoming worker message: ready
+
+[1A[2K[LanceQL] Worker ready, mode: transfer
+
+[1A[2K[LanceQLWorker] WASM loaded with OPFS support
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_users
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_users
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_users
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_users
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57016320
+
+[1A[2K[WASM LOG] getLastError len: 135
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_users
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_users
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_users
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_users
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_products
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_products
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_products
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_products
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57024512
+
+[1A[2K[WASM LOG] getLastError len: 141
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_products
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_products
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_products
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_products
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_orders
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_orders
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_orders
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_orders
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57032704
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError len: 137
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_orders
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_orders
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_orders
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_orders
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_drop
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_drop
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_drop
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_drop
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57040896
+
+[1A[2K[WASM LOG] getLastError len: 133
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_drop
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_drop
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_drop
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_drop
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_table
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_table
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_table
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_table
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57049088
+
+[1A[2K[WASM LOG] getLastError len: 135
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_table
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_table
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_table
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_table
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_items
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_items
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_items
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_items
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57057280
+
+[1A[2K[WASM LOG] getLastError len: 135
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_items
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_items
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_items
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_items
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_transactions
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_transactions
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_transactions
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_transactions
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57065472
+
+[1A[2K[WASM LOG] getLastError len: 149
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_transactions
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_transactions
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_transactions
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_transactions
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_categories
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_categories
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_categories
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_categories
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57073664
+
+[1A[2K[WASM LOG] getLastError len: 145
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_categories
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_categories
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_categories
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_categories
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS products
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS products
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS products
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS products
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57147392
+
+[1A[2K[WASM LOG] getLastError len: 131
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS products
+DEBUG: parseSql input: DROP TABLE IF EXISTS products
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS products
+DEBUG: parseSql input: DROP TABLE IF EXISTS products
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS orders
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS orders
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS orders
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS orders
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57155584
+
+[1A[2K[WASM LOG] getLastError len: 127
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS orders
+DEBUG: parseSql input: DROP TABLE IF EXISTS orders
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS orders
+DEBUG: parseSql input: DROP TABLE IF EXISTS orders
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS users
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS users
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS users
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS users
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57163776
+
+[1A[2K[WASM LOG] getLastError len: 125
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS users
+DEBUG: parseSql input: DROP TABLE IF EXISTS users
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS users
+DEBUG: parseSql input: DROP TABLE IF EXISTS users
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS employees
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS employees
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS employees
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS employees
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57171968
+
+[1A[2K[WASM LOG] getLastError len: 133
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS employees
+DEBUG: parseSql input: DROP TABLE IF EXISTS employees
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS employees
+DEBUG: parseSql input: DROP TABLE IF EXISTS employees
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS departments
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS departments
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS departments
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS departments
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57180160
+
+[1A[2K[WASM LOG] getLastError len: 137
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS departments
+DEBUG: parseSql input: DROP TABLE IF EXISTS departments
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS departments
+DEBUG: parseSql input: DROP TABLE IF EXISTS departments
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS sales
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS sales
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS sales
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS sales
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57188352
+
+[1A[2K[WASM LOG] getLastError len: 125
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS sales
+DEBUG: parseSql input: DROP TABLE IF EXISTS sales
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS sales
+DEBUG: parseSql input: DROP TABLE IF EXISTS sales
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS customers
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS customers
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS customers
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS customers
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57196544
+
+[1A[2K[WASM LOG] getLastError len: 133
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS customers
+DEBUG: parseSql input: DROP TABLE IF EXISTS customers
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS customers
+DEBUG: parseSql input: DROP TABLE IF EXISTS customers
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_data
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_data
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_data
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_data
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57204736
+
+[1A[2K[WASM LOG] getLastError len: 133
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_data
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_data
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_data
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_data
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_strings
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_strings
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_strings
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_strings
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57212928
+
+[1A[2K[WASM LOG] getLastError len: 139
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_strings
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_strings
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_strings
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_strings
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_nums
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_nums
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_nums
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_nums
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57221120
+
+[1A[2K[WASM LOG] getLastError len: 133
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_nums
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_nums
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_nums
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_nums
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_dates
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_dates
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_dates
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_dates
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57229312
+
+[1A[2K[WASM LOG] getLastError len: 135
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_dates
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_dates
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_dates
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_dates
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_json
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_json
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_json
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_json
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57237504
+
+[1A[2K[WASM LOG] getLastError len: 133
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_json
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_json
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_json
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_json
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_arrays
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_arrays
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_arrays
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_arrays
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57245696
+
+[1A[2K[WASM LOG] getLastError len: 137
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_arrays
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_arrays
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_arrays
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_arrays
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_nulls
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_nulls
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_nulls
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_nulls
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57253888
+
+[1A[2K[WASM LOG] getLastError len: 135
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_nulls
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_nulls
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_nulls
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_nulls
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_agg
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_agg
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_agg
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_agg
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57262080
+
+[1A[2K[WASM LOG] getLastError len: 131
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_agg
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_agg
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_agg
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_agg
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_window
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_window
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_window
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_window
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57270272
+
+[1A[2K[WASM LOG] getLastError len: 137
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_window
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_window
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_window
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_window
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_cte
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_cte
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_cte
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_cte
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57278464
+
+[1A[2K[WASM LOG] getLastError len: 131
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_cte
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_cte
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_cte
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_cte
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_distinct
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_distinct
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_distinct
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_distinct
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57286656
+
+[1A[2K[WASM LOG] getLastError len: 141
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_distinct
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_distinct
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_distinct
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_distinct
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_join_left
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_join_left
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_join_left
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_join_left
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57294848
+
+[1A[2K[WASM LOG] getLastError len: 143
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_join_left
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_join_left
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_join_left
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_join_left
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_join_right
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_join_right
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_join_right
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_join_right
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57303040
+
+[1A[2K[WASM LOG] getLastError len: 145
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_join_right
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_join_right
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_join_right
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_join_right
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_subq
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_subq
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_subq
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_subq
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57311232
+
+[1A[2K[WASM LOG] getLastError len: 133
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_subq
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_subq
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_subq
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_subq
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_having
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_having
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS test_having
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS test_having
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57319424
+
+[1A[2K[WASM LOG] getLastError len: 137
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_having
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_having
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_having
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_having
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS source_table
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS source_table
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS source_table
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS source_table
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57327616
+
+[1A[2K[WASM LOG] getLastError len: 139
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS source_table
+DEBUG: parseSql input: DROP TABLE IF EXISTS source_table
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS source_table
+DEBUG: parseSql input: DROP TABLE IF EXISTS source_table
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS target_table
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS target_table
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS target_table
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS target_table
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57335808
+
+[1A[2K[WASM LOG] getLastError len: 139
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS target_table
+DEBUG: parseSql input: DROP TABLE IF EXISTS target_table
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS target_table
+DEBUG: parseSql input: DROP TABLE IF EXISTS target_table
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS base_table
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS base_table
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS base_table
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS base_table
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57344000
+
+[1A[2K[WASM LOG] getLastError len: 135
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS base_table
+DEBUG: parseSql input: DROP TABLE IF EXISTS base_table
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS base_table
+DEBUG: parseSql input: DROP TABLE IF EXISTS base_table
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS delete_target
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS delete_target
+
+[1A[2K[WASM LOG] Exec SQL: DROP TABLE IF EXISTS delete_target
+
+[1A[2K[WASM LOG] parseSql input: DROP TABLE IF EXISTS delete_target
+
+[1A[2K[WASM LOG] Parsed Type: .drop_table
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57352192
+
+[1A[2K[WASM LOG] getLastError len: 141
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS delete_target
+DEBUG: parseSql input: DROP TABLE IF EXISTS delete_target
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS delete_target
+DEBUG: parseSql input: DROP TABLE IF EXISTS delete_target
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:30:22] "GET /examples/wasm/lanceql.js?v=1767846622450 HTTP/1.1" 200 -
+
+[1A[2K[LanceQL] Using Transferable ArrayBuffers
+
+[1A[2K[LanceQL] Using regular Worker for better logging
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:30:22] "GET /examples/wasm/lanceql-worker.js?v=1767846622461 HTTP/1.1" 200 -
+
+[1A[2K[LanceQLWorker] Initialized
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:30:22] "GET /examples/wasm/lanceql.wasm?v=1767846622468 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:30:22] "GET /examples/wasm/lanceql.wasm?v=1767846622469 HTTP/1.1" 200 -
+
+[1A[2K[LanceQLWorker] WASM loaded with OPFS support
+
+[1A[2K[LanceQLWorker] WASM loaded with OPFS support
+
+[1A[2K[LanceQL] Incoming worker message: ready
+
+[1A[2K[LanceQL] Worker ready, mode: transfer
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: SELECT GREATEST(1, 5, 3) AS max_val
+
+[1A[2K[WASM LOG] Detected SELECT at pos 0
+
+[1A[2K[WASM LOG] Parsing select list at pos 7
+
+[1A[2K[WASM LOG] parseSelectList success, new pos 35
+
+[1A[2K[WASM LOG] Tableless query detected (pos=35, len=35)
+
+[1A[2K[WASM LOG] Tableless query detected, returning early
+
+[1A[2K[WASM LOG] parseSql input: SELECT GREATEST(1, 5, 3) AS max_val
+
+[1A[2K[WASM LOG] Detected SELECT at pos 0
+
+[1A[2K[WASM LOG] Parsing select list at pos 7
+
+[1A[2K[WASM LOG] parseSelectList success, new pos 35
+
+[1A[2K[WASM LOG] Tableless query detected (pos=35, len=35)
+
+[1A[2K[WASM LOG] Tableless query detected, returning early
+
+[1A[2K[WASM LOG] Exec SQL: SELECT GREATEST(1, 5, 3) AS max_val
+
+[1A[2K[WASM LOG] parseSql input: SELECT GREATEST(1, 5, 3) AS max_val
+
+[1A[2K[WASM LOG] Detected SELECT at pos 0
+
+[1A[2K[WASM LOG] Parsing select list at pos 7
+
+[1A[2K[WASM LOG] parseSelectList success, new pos 35
+
+[1A[2K[WASM LOG] Tableless query detected (pos=35, len=35)
+
+[1A[2K[WASM LOG] Tableless query detected, returning early
+
+[1A[2K[WASM LOG] Parsed Type: .select
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57147392
+
+[1A[2K[WASM LOG] getLastError len: 188
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: SELECT GREATEST(1, 5, 3) AS max_val
+DEBUG: parseSql input: SELECT GREATEST(1, 5, 3) AS max_val
+DEBUG: Tableless query detected, returning early
+DEBUG: Parsed Type: .select
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: SELECT GREATEST(1, 5, 3) AS max_val
+DEBUG: parseSql input: SELECT GREATEST(1, 5, 3) AS max_val
+DEBUG: Tableless query detected, returning early
+DEBUG: Parsed Type: .select
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: SELECT LEAST(1, 5, 3) AS min_val
+
+[1A[2K[WASM LOG] Detected SELECT at pos 0
+
+[1A[2K[WASM LOG] Parsing select list at pos 7
+
+[1A[2K[WASM LOG] parseSelectList success, new pos 32
+
+[1A[2K[WASM LOG] Tableless query detected (pos=32, len=32)
+
+[1A[2K[WASM LOG] Tableless query detected, returning early
+
+[1A[2K[WASM LOG] parseSql input: SELECT LEAST(1, 5, 3) AS min_val
+
+[1A[2K[WASM LOG] Detected SELECT at pos 0
+
+[1A[2K[WASM LOG] Parsing select list at pos 7
+
+[1A[2K[WASM LOG] parseSelectList success, new pos 32
+
+[1A[2K[WASM LOG] Tableless query detected (pos=32, len=32)
+
+[1A[2K[WASM LOG] Tableless query detected, returning early
+
+[1A[2K[WASM LOG] Exec SQL: SELECT LEAST(1, 5, 3) AS min_val
+
+[1A[2K[WASM LOG] parseSql input: SELECT LEAST(1, 5, 3) AS min_val
+
+[1A[2K[WASM LOG] Detected SELECT at pos 0
+
+[1A[2K[WASM LOG] Parsing select list at pos 7
+
+[1A[2K[WASM LOG] parseSelectList success, new pos 32
+
+[1A[2K[WASM LOG] Tableless query detected (pos=32, len=32)
+
+[1A[2K[WASM LOG] Tableless query detected, returning early
+
+[1A[2K[WASM LOG] Parsed Type: .select
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57155584
+
+[1A[2K[WASM LOG] getLastError len: 182
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: SELECT LEAST(1, 5, 3) AS min_val
+DEBUG: parseSql input: SELECT LEAST(1, 5, 3) AS min_val
+DEBUG: Tableless query detected, returning early
+DEBUG: Parsed Type: .select
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: SELECT LEAST(1, 5, 3) AS min_val
+DEBUG: parseSql input: SELECT LEAST(1, 5, 3) AS min_val
+DEBUG: Tableless query detected, returning early
+DEBUG: Parsed Type: .select
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: SELECT GREATEST(1, NULL, 3) AS max_val
+
+[1A[2K[WASM LOG] Detected SELECT at pos 0
+
+[1A[2K[WASM LOG] Parsing select list at pos 7
+
+[1A[2K[WASM LOG] parseSelectList success, new pos 38
+
+[1A[2K[WASM LOG] Tableless query detected (pos=38, len=38)
+
+[1A[2K[WASM LOG] Tableless query detected, returning early
+
+[1A[2K[WASM LOG] parseSql input: SELECT GREATEST(1, NULL, 3) AS max_val
+
+[1A[2K[WASM LOG] Detected SELECT at pos 0
+
+[1A[2K[WASM LOG] Parsing select list at pos 7
+
+[1A[2K[WASM LOG] parseSelectList success, new pos 38
+
+[1A[2K[WASM LOG] Tableless query detected (pos=38, len=38)
+
+[1A[2K[WASM LOG] Tableless query detected, returning early
+
+[1A[2K[WASM LOG] Exec SQL: SELECT GREATEST(1, NULL, 3) AS max_val
+
+[1A[2K[WASM LOG] parseSql input: SELECT GREATEST(1, NULL, 3) AS max_val
+
+[1A[2K[WASM LOG] Detected SELECT at pos 0
+
+[1A[2K[WASM LOG] Parsing select list at pos 7
+
+[1A[2K[WASM LOG] parseSelectList success, new pos 38
+
+[1A[2K[WASM LOG] Tableless query detected (pos=38, len=38)
+
+[1A[2K[WASM LOG] Tableless query detected, returning early
+
+[1A[2K[WASM LOG] Parsed Type: .select
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57163776
+
+[1A[2K[WASM LOG] getLastError len: 194
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: SELECT GREATEST(1, NULL, 3) AS max_val
+DEBUG: parseSql input: SELECT GREATEST(1, NULL, 3) AS max_val
+DEBUG: Tableless query detected, returning early
+DEBUG: Parsed Type: .select
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: SELECT GREATEST(1, NULL, 3) AS max_val
+DEBUG: parseSql input: SELECT GREATEST(1, NULL, 3) AS max_val
+DEBUG: Tableless query detected, returning early
+DEBUG: Parsed Type: .select
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: SELECT IIF(1 > 0, 'yes', 'no') AS result
+
+[1A[2K[WASM LOG] Detected SELECT at pos 0
+
+[1A[2K[WASM LOG] Parsing select list at pos 7
+
+[1A[2K[WASM LOG] Parsing Ident '1' -> Int: 1, Float: 1
+
+[1A[2K[WASM LOG] Literal comparison: lhs_int=1, lhs_str=null, op=.gt, rhs_int=0, rhs_str=null -> result=true
+
+[1A[2K[WASM LOG] parseSelectList success, new pos 40
+
+[1A[2K[WASM LOG] Tableless query detected (pos=40, len=40)
+
+[1A[2K[WASM LOG] Tableless query detected, returning early
+
+[1A[2K[WASM LOG] parseSql input: SELECT IIF(1 > 0, 'yes', 'no') AS result
+
+[1A[2K[WASM LOG] Detected SELECT at pos 0
+
+[1A[2K[WASM LOG] Parsing select list at pos 7
+
+[1A[2K[WASM LOG] Parsing Ident '1' -> Int: 1, Float: 1
+
+[1A[2K[WASM LOG] Literal comparison: lhs_int=1, lhs_str=null, op=.gt, rhs_int=0, rhs_str=null -> result=true
+
+[1A[2K[WASM LOG] parseSelectList success, new pos 40
+
+[1A[2K[WASM LOG] Tableless query detected (pos=40, len=40)
+
+[1A[2K[WASM LOG] Tableless query detected, returning early
+
+[1A[2K[WASM LOG] Exec SQL: SELECT IIF(1 > 0, 'yes', 'no') AS result
+
+[1A[2K[WASM LOG] parseSql input: SELECT IIF(1 > 0, 'yes', 'no') AS result
+
+[1A[2K[WASM LOG] Detected SELECT at pos 0
+
+[1A[2K[WASM LOG] Parsing select list at pos 7
+
+[1A[2K[WASM LOG] Parsing Ident '1' -> Int: 1, Float: 1
+
+[1A[2K[WASM LOG] Literal comparison: lhs_int=1, lhs_str=null, op=.gt, rhs_int=0, rhs_str=null -> result=true
+
+[1A[2K[WASM LOG] parseSelectList success, new pos 40
+
+[1A[2K[WASM LOG] Tableless query detected (pos=40, len=40)
+
+[1A[2K[WASM LOG] Tableless query detected, returning early
+
+[1A[2K[WASM LOG] Parsed Type: .select
+
+[1A[2K[WASM LOG] Evaluating CASE string. Clauses: 1
+
+[1A[2K[WASM LOG] CASE clause condition res: true
+
+[1A[2K[WASM LOG] Evaluating CASE string. Clauses: 1
+
+[1A[2K[WASM LOG] CASE clause condition res: true
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57171968
+
+[1A[2K[WASM LOG] getLastError len: 504
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: SELECT IIF(1 > 0, 'yes', 'no') AS result
+DEBUG: parseSql input: SELECT IIF(1 > 0, 'yes', 'no') AS result
+DEBUG: Parsing Ident '1' -> Int: 1, Float: 1
+DEBUG: Literal comparison: lhs_int=1, lhs_str=null, op=.gt, rhs_int=0, rhs_str=null -> result=true
+DEBUG: Tableless query detected, returning early
+DEBUG: Parsed Type: .select
+DEBUG: Evaluating CASE string. Clauses: 1
+DEBUG: CASE clause condition res: true
+DEBUG: Evaluating CASE string. Clauses: 1
+DEBUG: CASE clause condition res: true
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: SELECT IIF(1 > 0, 'yes', 'no') AS result
+DEBUG: parseSql input: SELECT IIF(1 > 0, 'yes', 'no') AS result
+DEBUG: Parsing Ident '1' -> Int: 1, Float: 1
+DEBUG: Literal comparison: lhs_int=1, lhs_str=null, op=.gt, rhs_int=0, rhs_str=null -> result=true
+DEBUG: Tableless query detected, returning early
+DEBUG: Parsed Type: .select
+DEBUG: Evaluating CASE string. Clauses: 1
+DEBUG: CASE clause condition res: true
+DEBUG: Evaluating CASE string. Clauses: 1
+DEBUG: CASE clause condition res: true
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] parseSql input: SELECT IIF(1 < 0, 'yes', 'no') AS result
+
+[1A[2K[WASM LOG] Detected SELECT at pos 0
+
+[1A[2K[WASM LOG] Parsing select list at pos 7
+
+[1A[2K[WASM LOG] Parsing Ident '1' -> Int: 1, Float: 1
+
+[1A[2K[WASM LOG] Literal comparison: lhs_int=1, lhs_str=null, op=.lt, rhs_int=0, rhs_str=null -> result=true
+
+[1A[2K[WASM LOG] parseSelectList success, new pos 40
+
+[1A[2K[WASM LOG] Tableless query detected (pos=40, len=40)
+
+[1A[2K[WASM LOG] Tableless query detected, returning early
+
+[1A[2K[WASM LOG] parseSql input: SELECT IIF(1 < 0, 'yes', 'no') AS result
+
+[1A[2K[WASM LOG] Detected SELECT at pos 0
+
+[1A[2K[WASM LOG] Parsing select list at pos 7
+
+[1A[2K[WASM LOG] Parsing Ident '1' -> Int: 1, Float: 1
+
+[1A[2K[WASM LOG] Literal comparison: lhs_int=1, lhs_str=null, op=.lt, rhs_int=0, rhs_str=null -> result=true
+
+[1A[2K[WASM LOG] parseSelectList success, new pos 40
+
+[1A[2K[WASM LOG] Tableless query detected (pos=40, len=40)
+
+[1A[2K[WASM LOG] Tableless query detected, returning early
+
+[1A[2K[WASM LOG] Exec SQL: SELECT IIF(1 < 0, 'yes', 'no') AS result
+
+[1A[2K[WASM LOG] parseSql input: SELECT IIF(1 < 0, 'yes', 'no') AS result
+
+[1A[2K[WASM LOG] Detected SELECT at pos 0
+
+[1A[2K[WASM LOG] Parsing select list at pos 7
+
+[1A[2K[WASM LOG] Parsing Ident '1' -> Int: 1, Float: 1
+
+[1A[2K[WASM LOG] Literal comparison: lhs_int=1, lhs_str=null, op=.lt, rhs_int=0, rhs_str=null -> result=true
+
+[1A[2K[WASM LOG] parseSelectList success, new pos 40
+
+[1A[2K[WASM LOG] Tableless query detected (pos=40, len=40)
+
+[1A[2K[WASM LOG] Tableless query detected, returning early
+
+[1A[2K[WASM LOG] Parsed Type: .select
+
+[1A[2K[WASM LOG] Evaluating CASE string. Clauses: 1
+
+[1A[2K[WASM LOG] CASE clause condition res: true
+
+[1A[2K[WASM LOG] Evaluating CASE string. Clauses: 1
+
+[1A[2K[WASM LOG] CASE clause condition res: true
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 57180160
+
+[1A[2K[WASM LOG] getLastError len: 504
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: SELECT IIF(1 < 0, 'yes', 'no') AS result
+DEBUG: parseSql input: SELECT IIF(1 < 0, 'yes', 'no') AS result
+DEBUG: Parsing Ident '1' -> Int: 1, Float: 1
+DEBUG: Literal comparison: lhs_int=1, lhs_str=null, op=.lt, rhs_int=0, rhs_str=null -> result=true
+DEBUG: Tableless query detected, returning early
+DEBUG: Parsed Type: .select
+DEBUG: Evaluating CASE string. Clauses: 1
+DEBUG: CASE clause condition res: true
+DEBUG: Evaluating CASE string. Clauses: 1
+DEBUG: CASE clause condition res: true
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: SELECT IIF(1 < 0, 'yes', 'no') AS result
+DEBUG: parseSql input: SELECT IIF(1 < 0, 'yes', 'no') AS result
+DEBUG: Parsing Ident '1' -> Int: 1, Float: 1
+DEBUG: Literal comparison: lhs_int=1, lhs_str=null, op=.lt, rhs_int=0, rhs_str=null -> result=true
+DEBUG: Tableless query detected, returning early
+DEBUG: Parsed Type: .select
+DEBUG: Evaluating CASE string. Clauses: 1
+DEBUG: CASE clause condition res: true
+DEBUG: Evaluating CASE string. Clauses: 1
+DEBUG: CASE clause condition res: true
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K  1) [chromium] › tests/e2e/vault-sql.spec.js:2814:5 › Vault SQL Operations › Quick wins - GREATEST, LEAST, IIF functions 
+
+    Error: IIF(1 < 0): 
+    LOGS:
+    [BROWSER] [LanceQL] Using Transferable ArrayBuffers
+    [BROWSER] [LanceQL] Using regular Worker for better logging
+    [WORKER] [LanceQLWorker] Initialized
+    [BROWSER] [LanceQLWorker] Initialized
+    [WORKER] [LanceQLWorker] WASM loaded with OPFS support
+    [BROWSER] [LanceQLWorker] WASM loaded with OPFS support
+    [WORKER] [LanceQLWorker] WASM loaded with OPFS support
+    [BROWSER] [LanceQLWorker] WASM loaded with OPFS support
+    [BROWSER] [LanceQL] Incoming worker message: ready
+    [BROWSER] [LanceQL] Worker ready, mode: transfer
+    [BROWSER] [LanceQL] Incoming worker message: RPC reply
+    [WORKER] [WASM LOG] parseSql input: SELECT GREATEST(1, 5, 3) AS max_val
+    [BROWSER] [WASM LOG] parseSql input: SELECT GREATEST(1, 5, 3) AS max_val
+    [WORKER] [WASM LOG] Detected SELECT at pos 0
+    [BROWSER] [WASM LOG] Detected SELECT at pos 0
+    [WORKER] [WASM LOG] Parsing select list at pos 7
+    [BROWSER] [WASM LOG] Parsing select list at pos 7
+    [WORKER] [WASM LOG] parseSelectList success, new pos 35
+    [BROWSER] [WASM LOG] parseSelectList success, new pos 35
+    [WORKER] [WASM LOG] Tableless query detected (pos=35, len=35)
+    [BROWSER] [WASM LOG] Tableless query detected (pos=35, len=35)
+    [WORKER] [WASM LOG] Tableless query detected, returning early
+    [BROWSER] [WASM LOG] Tableless query detected, returning early
+    [WORKER] [WASM LOG] parseSql input: SELECT GREATEST(1, 5, 3) AS max_val
+    [BROWSER] [WASM LOG] parseSql input: SELECT GREATEST(1, 5, 3) AS max_val
+    [WORKER] [WASM LOG] Detected SELECT at pos 0
+    [BROWSER] [WASM LOG] Detected SELECT at pos 0
+    [WORKER] [WASM LOG] Parsing select list at pos 7
+    [BROWSER] [WASM LOG] Parsing select list at pos 7
+    [WORKER] [WASM LOG] parseSelectList success, new pos 35
+    [BROWSER] [WASM LOG] parseSelectList success, new pos 35
+    [WORKER] [WASM LOG] Tableless query detected (pos=35, len=35)
+    [BROWSER] [WASM LOG] Tableless query detected (pos=35, len=35)
+    [WORKER] [WASM LOG] Tableless query detected, returning early
+    [BROWSER] [WASM LOG] Tableless query detected, returning early
+    [WORKER] [WASM LOG] Exec SQL: SELECT GREATEST(1, 5, 3) AS max_val
+    [BROWSER] [WASM LOG] Exec SQL: SELECT GREATEST(1, 5, 3) AS max_val
+    [WORKER] [WASM LOG] parseSql input: SELECT GREATEST(1, 5, 3) AS max_val
+    [BROWSER] [WASM LOG] parseSql input: SELECT GREATEST(1, 5, 3) AS max_val
+    [WORKER] [WASM LOG] Detected SELECT at pos 0
+    [BROWSER] [WASM LOG] Detected SELECT at pos 0
+    [WORKER] [WASM LOG] Parsing select list at pos 7
+    [BROWSER] [WASM LOG] Parsing select list at pos 7
+    [WORKER] [WASM LOG] parseSelectList success, new pos 35
+    [BROWSER] [WASM LOG] parseSelectList success, new pos 35
+    [WORKER] [WASM LOG] Tableless query detected (pos=35, len=35)
+    [BROWSER] [WASM LOG] Tableless query detected (pos=35, len=35)
+    [WORKER] [WASM LOG] Tableless query detected, returning early
+    [BROWSER] [WASM LOG] Tableless query detected, returning early
+    [WORKER] [WASM LOG] Parsed Type: .select
+    [BROWSER] [WASM LOG] Parsed Type: .select
+    [WORKER] [WASM LOG] getLastError alloc ptr: 57147392
+    [BROWSER] [WASM LOG] getLastError alloc ptr: 57147392
+    [WORKER] [WASM LOG] getLastError len: 188
+    [BROWSER] [WASM LOG] getLastError len: 188
+    [WORKER] [WASM LOG] getLastError msg: DEBUG: Exec SQL: SELECT GREATEST(1, 5, 3) AS max_val
+    DEBUG: parseSql input: SELECT GREATEST(1, 5, 3) AS max_val
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    [BROWSER] [WASM LOG] getLastError msg: DEBUG: Exec SQL: SELECT GREATEST(1, 5, 3) AS max_val
+    DEBUG: parseSql input: SELECT GREATEST(1, 5, 3) AS max_val
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    [WORKER] [WASM DEBUG CAPTURED] DEBUG: Exec SQL: SELECT GREATEST(1, 5, 3) AS max_val
+    DEBUG: parseSql input: SELECT GREATEST(1, 5, 3) AS max_val
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    [BROWSER] [WASM DEBUG CAPTURED] DEBUG: Exec SQL: SELECT GREATEST(1, 5, 3) AS max_val
+    DEBUG: parseSql input: SELECT GREATEST(1, 5, 3) AS max_val
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    [BROWSER] [LanceQL] Incoming worker message: RPC reply
+    [WORKER] [WASM LOG] parseSql input: SELECT LEAST(1, 5, 3) AS min_val
+    [BROWSER] [WASM LOG] parseSql input: SELECT LEAST(1, 5, 3) AS min_val
+    [WORKER] [WASM LOG] Detected SELECT at pos 0
+    [BROWSER] [WASM LOG] Detected SELECT at pos 0
+    [WORKER] [WASM LOG] Parsing select list at pos 7
+    [BROWSER] [WASM LOG] Parsing select list at pos 7
+    [WORKER] [WASM LOG] parseSelectList success, new pos 32
+    [BROWSER] [WASM LOG] parseSelectList success, new pos 32
+    [WORKER] [WASM LOG] Tableless query detected (pos=32, len=32)
+    [BROWSER] [WASM LOG] Tableless query detected (pos=32, len=32)
+    [WORKER] [WASM LOG] Tableless query detected, returning early
+    [BROWSER] [WASM LOG] Tableless query detected, returning early
+    [WORKER] [WASM LOG] parseSql input: SELECT LEAST(1, 5, 3) AS min_val
+    [BROWSER] [WASM LOG] parseSql input: SELECT LEAST(1, 5, 3) AS min_val
+    [WORKER] [WASM LOG] Detected SELECT at pos 0
+    [BROWSER] [WASM LOG] Detected SELECT at pos 0
+    [WORKER] [WASM LOG] Parsing select list at pos 7
+    [BROWSER] [WASM LOG] Parsing select list at pos 7
+    [WORKER] [WASM LOG] parseSelectList success, new pos 32
+    [BROWSER] [WASM LOG] parseSelectList success, new pos 32
+    [WORKER] [WASM LOG] Tableless query detected (pos=32, len=32)
+    [BROWSER] [WASM LOG] Tableless query detected (pos=32, len=32)
+    [WORKER] [WASM LOG] Tableless query detected, returning early
+    [BROWSER] [WASM LOG] Tableless query detected, returning early
+    [WORKER] [WASM LOG] Exec SQL: SELECT LEAST(1, 5, 3) AS min_val
+    [BROWSER] [WASM LOG] Exec SQL: SELECT LEAST(1, 5, 3) AS min_val
+    [WORKER] [WASM LOG] parseSql input: SELECT LEAST(1, 5, 3) AS min_val
+    [BROWSER] [WASM LOG] parseSql input: SELECT LEAST(1, 5, 3) AS min_val
+    [WORKER] [WASM LOG] Detected SELECT at pos 0
+    [BROWSER] [WASM LOG] Detected SELECT at pos 0
+    [WORKER] [WASM LOG] Parsing select list at pos 7
+    [BROWSER] [WASM LOG] Parsing select list at pos 7
+    [WORKER] [WASM LOG] parseSelectList success, new pos 32
+    [BROWSER] [WASM LOG] parseSelectList success, new pos 32
+    [WORKER] [WASM LOG] Tableless query detected (pos=32, len=32)
+    [BROWSER] [WASM LOG] Tableless query detected (pos=32, len=32)
+    [WORKER] [WASM LOG] Tableless query detected, returning early
+    [BROWSER] [WASM LOG] Tableless query detected, returning early
+    [WORKER] [WASM LOG] Parsed Type: .select
+    [BROWSER] [WASM LOG] Parsed Type: .select
+    [WORKER] [WASM LOG] getLastError alloc ptr: 57155584
+    [BROWSER] [WASM LOG] getLastError alloc ptr: 57155584
+    [WORKER] [WASM LOG] getLastError len: 182
+    [BROWSER] [WASM LOG] getLastError len: 182
+    [WORKER] [WASM LOG] getLastError msg: DEBUG: Exec SQL: SELECT LEAST(1, 5, 3) AS min_val
+    DEBUG: parseSql input: SELECT LEAST(1, 5, 3) AS min_val
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    [BROWSER] [WASM LOG] getLastError msg: DEBUG: Exec SQL: SELECT LEAST(1, 5, 3) AS min_val
+    DEBUG: parseSql input: SELECT LEAST(1, 5, 3) AS min_val
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    [WORKER] [WASM DEBUG CAPTURED] DEBUG: Exec SQL: SELECT LEAST(1, 5, 3) AS min_val
+    DEBUG: parseSql input: SELECT LEAST(1, 5, 3) AS min_val
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    [BROWSER] [WASM DEBUG CAPTURED] DEBUG: Exec SQL: SELECT LEAST(1, 5, 3) AS min_val
+    DEBUG: parseSql input: SELECT LEAST(1, 5, 3) AS min_val
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    [BROWSER] [LanceQL] Incoming worker message: RPC reply
+    [WORKER] [WASM LOG] parseSql input: SELECT GREATEST(1, NULL, 3) AS max_val
+    [BROWSER] [WASM LOG] parseSql input: SELECT GREATEST(1, NULL, 3) AS max_val
+    [WORKER] [WASM LOG] Detected SELECT at pos 0
+    [BROWSER] [WASM LOG] Detected SELECT at pos 0
+    [WORKER] [WASM LOG] Parsing select list at pos 7
+    [BROWSER] [WASM LOG] Parsing select list at pos 7
+    [WORKER] [WASM LOG] parseSelectList success, new pos 38
+    [BROWSER] [WASM LOG] parseSelectList success, new pos 38
+    [WORKER] [WASM LOG] Tableless query detected (pos=38, len=38)
+    [BROWSER] [WASM LOG] Tableless query detected (pos=38, len=38)
+    [WORKER] [WASM LOG] Tableless query detected, returning early
+    [BROWSER] [WASM LOG] Tableless query detected, returning early
+    [WORKER] [WASM LOG] parseSql input: SELECT GREATEST(1, NULL, 3) AS max_val
+    [BROWSER] [WASM LOG] parseSql input: SELECT GREATEST(1, NULL, 3) AS max_val
+    [WORKER] [WASM LOG] Detected SELECT at pos 0
+    [BROWSER] [WASM LOG] Detected SELECT at pos 0
+    [WORKER] [WASM LOG] Parsing select list at pos 7
+    [BROWSER] [WASM LOG] Parsing select list at pos 7
+    [WORKER] [WASM LOG] parseSelectList success, new pos 38
+    [BROWSER] [WASM LOG] parseSelectList success, new pos 38
+    [WORKER] [WASM LOG] Tableless query detected (pos=38, len=38)
+    [BROWSER] [WASM LOG] Tableless query detected (pos=38, len=38)
+    [WORKER] [WASM LOG] Tableless query detected, returning early
+    [BROWSER] [WASM LOG] Tableless query detected, returning early
+    [WORKER] [WASM LOG] Exec SQL: SELECT GREATEST(1, NULL, 3) AS max_val
+    [BROWSER] [WASM LOG] Exec SQL: SELECT GREATEST(1, NULL, 3) AS max_val
+    [WORKER] [WASM LOG] parseSql input: SELECT GREATEST(1, NULL, 3) AS max_val
+    [BROWSER] [WASM LOG] parseSql input: SELECT GREATEST(1, NULL, 3) AS max_val
+    [WORKER] [WASM LOG] Detected SELECT at pos 0
+    [BROWSER] [WASM LOG] Detected SELECT at pos 0
+    [WORKER] [WASM LOG] Parsing select list at pos 7
+    [BROWSER] [WASM LOG] Parsing select list at pos 7
+    [WORKER] [WASM LOG] parseSelectList success, new pos 38
+    [BROWSER] [WASM LOG] parseSelectList success, new pos 38
+    [WORKER] [WASM LOG] Tableless query detected (pos=38, len=38)
+    [BROWSER] [WASM LOG] Tableless query detected (pos=38, len=38)
+    [WORKER] [WASM LOG] Tableless query detected, returning early
+    [BROWSER] [WASM LOG] Tableless query detected, returning early
+    [WORKER] [WASM LOG] Parsed Type: .select
+    [BROWSER] [WASM LOG] Parsed Type: .select
+    [WORKER] [WASM LOG] getLastError alloc ptr: 57163776
+    [BROWSER] [WASM LOG] getLastError alloc ptr: 57163776
+    [WORKER] [WASM LOG] getLastError len: 194
+    [BROWSER] [WASM LOG] getLastError len: 194
+    [WORKER] [WASM LOG] getLastError msg: DEBUG: Exec SQL: SELECT GREATEST(1, NULL, 3) AS max_val
+    DEBUG: parseSql input: SELECT GREATEST(1, NULL, 3) AS max_val
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    [BROWSER] [WASM LOG] getLastError msg: DEBUG: Exec SQL: SELECT GREATEST(1, NULL, 3) AS max_val
+    DEBUG: parseSql input: SELECT GREATEST(1, NULL, 3) AS max_val
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    [WORKER] [WASM DEBUG CAPTURED] DEBUG: Exec SQL: SELECT GREATEST(1, NULL, 3) AS max_val
+    DEBUG: parseSql input: SELECT GREATEST(1, NULL, 3) AS max_val
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    [BROWSER] [WASM DEBUG CAPTURED] DEBUG: Exec SQL: SELECT GREATEST(1, NULL, 3) AS max_val
+    DEBUG: parseSql input: SELECT GREATEST(1, NULL, 3) AS max_val
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    [BROWSER] [LanceQL] Incoming worker message: RPC reply
+    [WORKER] [WASM LOG] parseSql input: SELECT IIF(1 > 0, 'yes', 'no') AS result
+    [BROWSER] [WASM LOG] parseSql input: SELECT IIF(1 > 0, 'yes', 'no') AS result
+    [WORKER] [WASM LOG] Detected SELECT at pos 0
+    [BROWSER] [WASM LOG] Detected SELECT at pos 0
+    [WORKER] [WASM LOG] Parsing select list at pos 7
+    [BROWSER] [WASM LOG] Parsing select list at pos 7
+    [WORKER] [WASM LOG] Parsing Ident '1' -> Int: 1, Float: 1
+    [BROWSER] [WASM LOG] Parsing Ident '1' -> Int: 1, Float: 1
+    [WORKER] [WASM LOG] Literal comparison: lhs_int=1, lhs_str=null, op=.gt, rhs_int=0, rhs_str=null -> result=true
+    [BROWSER] [WASM LOG] Literal comparison: lhs_int=1, lhs_str=null, op=.gt, rhs_int=0, rhs_str=null -> result=true
+    [WORKER] [WASM LOG] parseSelectList success, new pos 40
+    [BROWSER] [WASM LOG] parseSelectList success, new pos 40
+    [WORKER] [WASM LOG] Tableless query detected (pos=40, len=40)
+    [BROWSER] [WASM LOG] Tableless query detected (pos=40, len=40)
+    [WORKER] [WASM LOG] Tableless query detected, returning early
+    [BROWSER] [WASM LOG] Tableless query detected, returning early
+    [WORKER] [WASM LOG] parseSql input: SELECT IIF(1 > 0, 'yes', 'no') AS result
+    [BROWSER] [WASM LOG] parseSql input: SELECT IIF(1 > 0, 'yes', 'no') AS result
+    [WORKER] [WASM LOG] Detected SELECT at pos 0
+    [BROWSER] [WASM LOG] Detected SELECT at pos 0
+    [WORKER] [WASM LOG] Parsing select list at pos 7
+    [BROWSER] [WASM LOG] Parsing select list at pos 7
+    [WORKER] [WASM LOG] Parsing Ident '1' -> Int: 1, Float: 1
+    [BROWSER] [WASM LOG] Parsing Ident '1' -> Int: 1, Float: 1
+    [WORKER] [WASM LOG] Literal comparison: lhs_int=1, lhs_str=null, op=.gt, rhs_int=0, rhs_str=null -> result=true
+    [BROWSER] [WASM LOG] Literal comparison: lhs_int=1, lhs_str=null, op=.gt, rhs_int=0, rhs_str=null -> result=true
+    [WORKER] [WASM LOG] parseSelectList success, new pos 40
+    [BROWSER] [WASM LOG] parseSelectList success, new pos 40
+    [WORKER] [WASM LOG] Tableless query detected (pos=40, len=40)
+    [BROWSER] [WASM LOG] Tableless query detected (pos=40, len=40)
+    [WORKER] [WASM LOG] Tableless query detected, returning early
+    [BROWSER] [WASM LOG] Tableless query detected, returning early
+    [WORKER] [WASM LOG] Exec SQL: SELECT IIF(1 > 0, 'yes', 'no') AS result
+    [BROWSER] [WASM LOG] Exec SQL: SELECT IIF(1 > 0, 'yes', 'no') AS result
+    [WORKER] [WASM LOG] parseSql input: SELECT IIF(1 > 0, 'yes', 'no') AS result
+    [BROWSER] [WASM LOG] parseSql input: SELECT IIF(1 > 0, 'yes', 'no') AS result
+    [WORKER] [WASM LOG] Detected SELECT at pos 0
+    [BROWSER] [WASM LOG] Detected SELECT at pos 0
+    [WORKER] [WASM LOG] Parsing select list at pos 7
+    [BROWSER] [WASM LOG] Parsing select list at pos 7
+    [WORKER] [WASM LOG] Parsing Ident '1' -> Int: 1, Float: 1
+    [BROWSER] [WASM LOG] Parsing Ident '1' -> Int: 1, Float: 1
+    [WORKER] [WASM LOG] Literal comparison: lhs_int=1, lhs_str=null, op=.gt, rhs_int=0, rhs_str=null -> result=true
+    [BROWSER] [WASM LOG] Literal comparison: lhs_int=1, lhs_str=null, op=.gt, rhs_int=0, rhs_str=null -> result=true
+    [WORKER] [WASM LOG] parseSelectList success, new pos 40
+    [BROWSER] [WASM LOG] parseSelectList success, new pos 40
+    [WORKER] [WASM LOG] Tableless query detected (pos=40, len=40)
+    [BROWSER] [WASM LOG] Tableless query detected (pos=40, len=40)
+    [WORKER] [WASM LOG] Tableless query detected, returning early
+    [BROWSER] [WASM LOG] Tableless query detected, returning early
+    [WORKER] [WASM LOG] Parsed Type: .select
+    [BROWSER] [WASM LOG] Parsed Type: .select
+    [WORKER] [WASM LOG] Evaluating CASE string. Clauses: 1
+    [BROWSER] [WASM LOG] Evaluating CASE string. Clauses: 1
+    [WORKER] [WASM LOG] CASE clause condition res: true
+    [BROWSER] [WASM LOG] CASE clause condition res: true
+    [WORKER] [WASM LOG] Evaluating CASE string. Clauses: 1
+    [BROWSER] [WASM LOG] Evaluating CASE string. Clauses: 1
+    [WORKER] [WASM LOG] CASE clause condition res: true
+    [BROWSER] [WASM LOG] CASE clause condition res: true
+    [WORKER] [WASM LOG] getLastError alloc ptr: 57171968
+    [BROWSER] [WASM LOG] getLastError alloc ptr: 57171968
+    [WORKER] [WASM LOG] getLastError len: 504
+    [BROWSER] [WASM LOG] getLastError len: 504
+    [WORKER] [WASM LOG] getLastError msg: DEBUG: Exec SQL: SELECT IIF(1 > 0, 'yes', 'no') AS result
+    DEBUG: parseSql input: SELECT IIF(1 > 0, 'yes', 'no') AS result
+    DEBUG: Parsing Ident '1' -> Int: 1, Float: 1
+    DEBUG: Literal comparison: lhs_int=1, lhs_str=null, op=.gt, rhs_int=0, rhs_str=null -> result=true
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    DEBUG: Evaluating CASE string. Clauses: 1
+    DEBUG: CASE clause condition res: true
+    DEBUG: Evaluating CASE string. Clauses: 1
+    DEBUG: CASE clause condition res: true
+    [BROWSER] [WASM LOG] getLastError msg: DEBUG: Exec SQL: SELECT IIF(1 > 0, 'yes', 'no') AS result
+    DEBUG: parseSql input: SELECT IIF(1 > 0, 'yes', 'no') AS result
+    DEBUG: Parsing Ident '1' -> Int: 1, Float: 1
+    DEBUG: Literal comparison: lhs_int=1, lhs_str=null, op=.gt, rhs_int=0, rhs_str=null -> result=true
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    DEBUG: Evaluating CASE string. Clauses: 1
+    DEBUG: CASE clause condition res: true
+    DEBUG: Evaluating CASE string. Clauses: 1
+    DEBUG: CASE clause condition res: true
+    [WORKER] [WASM DEBUG CAPTURED] DEBUG: Exec SQL: SELECT IIF(1 > 0, 'yes', 'no') AS result
+    DEBUG: parseSql input: SELECT IIF(1 > 0, 'yes', 'no') AS result
+    DEBUG: Parsing Ident '1' -> Int: 1, Float: 1
+    DEBUG: Literal comparison: lhs_int=1, lhs_str=null, op=.gt, rhs_int=0, rhs_str=null -> result=true
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    DEBUG: Evaluating CASE string. Clauses: 1
+    DEBUG: CASE clause condition res: true
+    DEBUG: Evaluating CASE string. Clauses: 1
+    DEBUG: CASE clause condition res: true
+    [BROWSER] [WASM DEBUG CAPTURED] DEBUG: Exec SQL: SELECT IIF(1 > 0, 'yes', 'no') AS result
+    DEBUG: parseSql input: SELECT IIF(1 > 0, 'yes', 'no') AS result
+    DEBUG: Parsing Ident '1' -> Int: 1, Float: 1
+    DEBUG: Literal comparison: lhs_int=1, lhs_str=null, op=.gt, rhs_int=0, rhs_str=null -> result=true
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    DEBUG: Evaluating CASE string. Clauses: 1
+    DEBUG: CASE clause condition res: true
+    DEBUG: Evaluating CASE string. Clauses: 1
+    DEBUG: CASE clause condition res: true
+    [BROWSER] [LanceQL] Incoming worker message: RPC reply
+    [WORKER] [WASM LOG] parseSql input: SELECT IIF(1 < 0, 'yes', 'no') AS result
+    [BROWSER] [WASM LOG] parseSql input: SELECT IIF(1 < 0, 'yes', 'no') AS result
+    [WORKER] [WASM LOG] Detected SELECT at pos 0
+    [BROWSER] [WASM LOG] Detected SELECT at pos 0
+    [WORKER] [WASM LOG] Parsing select list at pos 7
+    [BROWSER] [WASM LOG] Parsing select list at pos 7
+    [WORKER] [WASM LOG] Parsing Ident '1' -> Int: 1, Float: 1
+    [BROWSER] [WASM LOG] Parsing Ident '1' -> Int: 1, Float: 1
+    [WORKER] [WASM LOG] Literal comparison: lhs_int=1, lhs_str=null, op=.lt, rhs_int=0, rhs_str=null -> result=true
+    [BROWSER] [WASM LOG] Literal comparison: lhs_int=1, lhs_str=null, op=.lt, rhs_int=0, rhs_str=null -> result=true
+    [WORKER] [WASM LOG] parseSelectList success, new pos 40
+    [BROWSER] [WASM LOG] parseSelectList success, new pos 40
+    [WORKER] [WASM LOG] Tableless query detected (pos=40, len=40)
+    [BROWSER] [WASM LOG] Tableless query detected (pos=40, len=40)
+    [WORKER] [WASM LOG] Tableless query detected, returning early
+    [BROWSER] [WASM LOG] Tableless query detected, returning early
+    [WORKER] [WASM LOG] parseSql input: SELECT IIF(1 < 0, 'yes', 'no') AS result
+    [BROWSER] [WASM LOG] parseSql input: SELECT IIF(1 < 0, 'yes', 'no') AS result
+    [WORKER] [WASM LOG] Detected SELECT at pos 0
+    [BROWSER] [WASM LOG] Detected SELECT at pos 0
+    [WORKER] [WASM LOG] Parsing select list at pos 7
+    [BROWSER] [WASM LOG] Parsing select list at pos 7
+    [WORKER] [WASM LOG] Parsing Ident '1' -> Int: 1, Float: 1
+    [BROWSER] [WASM LOG] Parsing Ident '1' -> Int: 1, Float: 1
+    [WORKER] [WASM LOG] Literal comparison: lhs_int=1, lhs_str=null, op=.lt, rhs_int=0, rhs_str=null -> result=true
+    [BROWSER] [WASM LOG] Literal comparison: lhs_int=1, lhs_str=null, op=.lt, rhs_int=0, rhs_str=null -> result=true
+    [WORKER] [WASM LOG] parseSelectList success, new pos 40
+    [BROWSER] [WASM LOG] parseSelectList success, new pos 40
+    [WORKER] [WASM LOG] Tableless query detected (pos=40, len=40)
+    [BROWSER] [WASM LOG] Tableless query detected (pos=40, len=40)
+    [WORKER] [WASM LOG] Tableless query detected, returning early
+    [BROWSER] [WASM LOG] Tableless query detected, returning early
+    [WORKER] [WASM LOG] Exec SQL: SELECT IIF(1 < 0, 'yes', 'no') AS result
+    [BROWSER] [WASM LOG] Exec SQL: SELECT IIF(1 < 0, 'yes', 'no') AS result
+    [WORKER] [WASM LOG] parseSql input: SELECT IIF(1 < 0, 'yes', 'no') AS result
+    [BROWSER] [WASM LOG] parseSql input: SELECT IIF(1 < 0, 'yes', 'no') AS result
+    [WORKER] [WASM LOG] Detected SELECT at pos 0
+    [BROWSER] [WASM LOG] Detected SELECT at pos 0
+    [WORKER] [WASM LOG] Parsing select list at pos 7
+    [BROWSER] [WASM LOG] Parsing select list at pos 7
+    [WORKER] [WASM LOG] Parsing Ident '1' -> Int: 1, Float: 1
+    [BROWSER] [WASM LOG] Parsing Ident '1' -> Int: 1, Float: 1
+    [WORKER] [WASM LOG] Literal comparison: lhs_int=1, lhs_str=null, op=.lt, rhs_int=0, rhs_str=null -> result=true
+    [BROWSER] [WASM LOG] Literal comparison: lhs_int=1, lhs_str=null, op=.lt, rhs_int=0, rhs_str=null -> result=true
+    [WORKER] [WASM LOG] parseSelectList success, new pos 40
+    [BROWSER] [WASM LOG] parseSelectList success, new pos 40
+    [WORKER] [WASM LOG] Tableless query detected (pos=40, len=40)
+    [BROWSER] [WASM LOG] Tableless query detected (pos=40, len=40)
+    [WORKER] [WASM LOG] Tableless query detected, returning early
+    [BROWSER] [WASM LOG] Tableless query detected, returning early
+    [WORKER] [WASM LOG] Parsed Type: .select
+    [BROWSER] [WASM LOG] Parsed Type: .select
+    [WORKER] [WASM LOG] Evaluating CASE string. Clauses: 1
+    [BROWSER] [WASM LOG] Evaluating CASE string. Clauses: 1
+    [WORKER] [WASM LOG] CASE clause condition res: true
+    [BROWSER] [WASM LOG] CASE clause condition res: true
+    [WORKER] [WASM LOG] Evaluating CASE string. Clauses: 1
+    [BROWSER] [WASM LOG] Evaluating CASE string. Clauses: 1
+    [WORKER] [WASM LOG] CASE clause condition res: true
+    [BROWSER] [WASM LOG] CASE clause condition res: true
+    [WORKER] [WASM LOG] getLastError alloc ptr: 57180160
+    [BROWSER] [WASM LOG] getLastError alloc ptr: 57180160
+    [WORKER] [WASM LOG] getLastError len: 504
+    [BROWSER] [WASM LOG] getLastError len: 504
+    [WORKER] [WASM LOG] getLastError msg: DEBUG: Exec SQL: SELECT IIF(1 < 0, 'yes', 'no') AS result
+    DEBUG: parseSql input: SELECT IIF(1 < 0, 'yes', 'no') AS result
+    DEBUG: Parsing Ident '1' -> Int: 1, Float: 1
+    DEBUG: Literal comparison: lhs_int=1, lhs_str=null, op=.lt, rhs_int=0, rhs_str=null -> result=true
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    DEBUG: Evaluating CASE string. Clauses: 1
+    DEBUG: CASE clause condition res: true
+    DEBUG: Evaluating CASE string. Clauses: 1
+    DEBUG: CASE clause condition res: true
+    [BROWSER] [WASM LOG] getLastError msg: DEBUG: Exec SQL: SELECT IIF(1 < 0, 'yes', 'no') AS result
+    DEBUG: parseSql input: SELECT IIF(1 < 0, 'yes', 'no') AS result
+    DEBUG: Parsing Ident '1' -> Int: 1, Float: 1
+    DEBUG: Literal comparison: lhs_int=1, lhs_str=null, op=.lt, rhs_int=0, rhs_str=null -> result=true
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    DEBUG: Evaluating CASE string. Clauses: 1
+    DEBUG: CASE clause condition res: true
+    DEBUG: Evaluating CASE string. Clauses: 1
+    DEBUG: CASE clause condition res: true
+    [WORKER] [WASM DEBUG CAPTURED] DEBUG: Exec SQL: SELECT IIF(1 < 0, 'yes', 'no') AS result
+    DEBUG: parseSql input: SELECT IIF(1 < 0, 'yes', 'no') AS result
+    DEBUG: Parsing Ident '1' -> Int: 1, Float: 1
+    DEBUG: Literal comparison: lhs_int=1, lhs_str=null, op=.lt, rhs_int=0, rhs_str=null -> result=true
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    DEBUG: Evaluating CASE string. Clauses: 1
+    DEBUG: CASE clause condition res: true
+    DEBUG: Evaluating CASE string. Clauses: 1
+    DEBUG: CASE clause condition res: true
+    [BROWSER] [WASM DEBUG CAPTURED] DEBUG: Exec SQL: SELECT IIF(1 < 0, 'yes', 'no') AS result
+    DEBUG: parseSql input: SELECT IIF(1 < 0, 'yes', 'no') AS result
+    DEBUG: Parsing Ident '1' -> Int: 1, Float: 1
+    DEBUG: Literal comparison: lhs_int=1, lhs_str=null, op=.lt, rhs_int=0, rhs_str=null -> result=true
+    DEBUG: Tableless query detected, returning early
+    DEBUG: Parsed Type: .select
+    DEBUG: Evaluating CASE string. Clauses: 1
+    DEBUG: CASE clause condition res: true
+    DEBUG: Evaluating CASE string. Clauses: 1
+    DEBUG: CASE clause condition res: true
+    [BROWSER] [LanceQL] Incoming worker message: RPC reply
+
+    [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32mtrue[39m
+    Received: [31mfalse[39m
+
+      2875 |                 t.error = (t.error || '') + "\nLOGS:\n" + logs.join("\n");
+      2876 |             }
+    > 2877 |             expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+           |                                                                          ^
+      2878 |         }
+      2879 |     });
+      2880 |
+        at /Users/steven_chong/Downloads/repos/lanceql/packages/browser/tests/e2e/vault-sql.spec.js:2877:74
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/vault-sql-Vault-SQL-Operat-9dc50-REATEST-LEAST-IIF-functions-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/vault-sql-Vault-SQL-Operat-9dc50-REATEST-LEAST-IIF-functions-chromium/error-context.md
+
+
+[1A[2K  1 failed
+    [chromium] › tests/e2e/vault-sql.spec.js:2814:5 › Vault SQL Operations › Quick wins - GREATEST, LEAST, IIF functions 
+
+[36m  Serving HTML report at http://localhost:9323. Press Ctrl+C to quit.[39m

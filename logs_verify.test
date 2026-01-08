@@ -1,0 +1,669 @@
+[1A[2K[2m[WebServer] [22m::ffff:127.0.0.1 - - [07/Jan/2026 23:35:13] "GET / HTTP/1.1" 200 -
+
+
+Running 1 test using 1 worker
+
+[1A[2K[1/1] [chromium] › tests/e2e/vault-sql.spec.js:2814:5 › Vault SQL Operations › Quick wins - GREATEST, LEAST, IIF functions
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:35:14] "GET /examples/wasm/test-vault-sql.html HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:35:14] "GET /examples/wasm/lanceql.js HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:35:14] "GET /examples/wasm/lanceql.js?v=1767846914502 HTTP/1.1" 200 -
+
+[1A[2K[chromium] › tests/e2e/vault-sql.spec.js:2814:5 › Vault SQL Operations › Quick wins - GREATEST, LEAST, IIF functions
+[LanceQL] Using Transferable ArrayBuffers
+
+[1A[2K[LanceQL] Using regular Worker for better logging
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:35:14] "GET /examples/wasm/lanceql-worker.js?v=1767846914512 HTTP/1.1" 200 -
+
+[1A[2K[LanceQLWorker] Initialized
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:35:14] "GET /examples/wasm/lanceql.wasm?v=1767846914521 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:35:14] "GET /examples/wasm/lanceql.wasm?v=1767846914524 HTTP/1.1" 200 -
+
+[1A[2K[LanceQLWorker] WASM loaded with OPFS support
+
+[1A[2K[LanceQLWorker] WASM loaded with OPFS support
+
+[1A[2K[LanceQL] Incoming worker message: ready
+
+[1A[2K[LanceQL] Worker ready, mode: transfer
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50528256
+
+[1A[2K[WASM LOG] getLastError len: 135
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_users
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_users
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_users
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_users
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50536448
+
+[1A[2K[WASM LOG] getLastError len: 141
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_products
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_products
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_products
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_products
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50544640
+
+[1A[2K[WASM LOG] getLastError len: 137
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_orders
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_orders
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_orders
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_orders
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50552832
+
+[1A[2K[WASM LOG] getLastError len: 133
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_drop
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_drop
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_drop
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_drop
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50561024
+
+[1A[2K[WASM LOG] getLastError len: 135
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_table
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_table
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_table
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_table
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50569216
+
+[1A[2K[WASM LOG] getLastError len: 135
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_items
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_items
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_items
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_items
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50577408
+
+[1A[2K[WASM LOG] getLastError len: 149
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_transactions
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_transactions
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_transactions
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_transactions
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50585600
+
+[1A[2K[WASM LOG] getLastError len: 145
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_categories
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_categories
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_categories
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_categories
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50659328
+
+[1A[2K[WASM LOG] getLastError len: 131
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS products
+DEBUG: parseSql input: DROP TABLE IF EXISTS products
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS products
+DEBUG: parseSql input: DROP TABLE IF EXISTS products
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50667520
+
+[1A[2K[WASM LOG] getLastError len: 127
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS orders
+DEBUG: parseSql input: DROP TABLE IF EXISTS orders
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS orders
+DEBUG: parseSql input: DROP TABLE IF EXISTS orders
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50675712
+
+[1A[2K[WASM LOG] getLastError len: 125
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS users
+DEBUG: parseSql input: DROP TABLE IF EXISTS users
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS users
+DEBUG: parseSql input: DROP TABLE IF EXISTS users
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50683904
+
+[1A[2K[WASM LOG] getLastError len: 133
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS employees
+DEBUG: parseSql input: DROP TABLE IF EXISTS employees
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS employees
+DEBUG: parseSql input: DROP TABLE IF EXISTS employees
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50692096
+
+[1A[2K[WASM LOG] getLastError len: 137
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS departments
+DEBUG: parseSql input: DROP TABLE IF EXISTS departments
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS departments
+DEBUG: parseSql input: DROP TABLE IF EXISTS departments
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50700288
+
+[1A[2K[WASM LOG] getLastError len: 125
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS sales
+DEBUG: parseSql input: DROP TABLE IF EXISTS sales
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS sales
+DEBUG: parseSql input: DROP TABLE IF EXISTS sales
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50708480
+
+[1A[2K[WASM LOG] getLastError len: 133
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS customers
+DEBUG: parseSql input: DROP TABLE IF EXISTS customers
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS customers
+DEBUG: parseSql input: DROP TABLE IF EXISTS customers
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50716672
+
+[1A[2K[WASM LOG] getLastError len: 133
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_data
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_data
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_data
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_data
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50724864
+
+[1A[2K[WASM LOG] getLastError len: 139
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_strings
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_strings
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_strings
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_strings
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50733056
+
+[1A[2K[WASM LOG] getLastError len: 133
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_nums
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_nums
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_nums
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_nums
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50741248
+
+[1A[2K[WASM LOG] getLastError len: 135
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_dates
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_dates
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_dates
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_dates
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50749440
+
+[1A[2K[WASM LOG] getLastError len: 133
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_json
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_json
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_json
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_json
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50757632
+
+[1A[2K[WASM LOG] getLastError len: 137
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_arrays
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_arrays
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_arrays
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_arrays
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50765824
+
+[1A[2K[WASM LOG] getLastError len: 135
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_nulls
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_nulls
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_nulls
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_nulls
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50774016
+
+[1A[2K[WASM LOG] getLastError len: 131
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_agg
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_agg
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_agg
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_agg
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50782208
+
+[1A[2K[WASM LOG] getLastError len: 137
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_window
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_window
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_window
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_window
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50790400
+
+[1A[2K[WASM LOG] getLastError len: 131
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_cte
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_cte
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_cte
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_cte
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50798592
+
+[1A[2K[WASM LOG] getLastError len: 141
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_distinct
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_distinct
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_distinct
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_distinct
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50806784
+
+[1A[2K[WASM LOG] getLastError len: 143
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_join_left
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_join_left
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_join_left
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_join_left
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50814976
+
+[1A[2K[WASM LOG] getLastError len: 145
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_join_right
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_join_right
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_join_right
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_join_right
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50823168
+
+[1A[2K[WASM LOG] getLastError len: 133
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_subq
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_subq
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_subq
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_subq
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50831360
+
+[1A[2K[WASM LOG] getLastError len: 137
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS test_having
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_having
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS test_having
+DEBUG: parseSql input: DROP TABLE IF EXISTS test_having
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50839552
+
+[1A[2K[WASM LOG] getLastError len: 139
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS source_table
+DEBUG: parseSql input: DROP TABLE IF EXISTS source_table
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS source_table
+DEBUG: parseSql input: DROP TABLE IF EXISTS source_table
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50847744
+
+[1A[2K[WASM LOG] getLastError len: 139
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS target_table
+DEBUG: parseSql input: DROP TABLE IF EXISTS target_table
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS target_table
+DEBUG: parseSql input: DROP TABLE IF EXISTS target_table
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50855936
+
+[1A[2K[WASM LOG] getLastError len: 135
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS base_table
+DEBUG: parseSql input: DROP TABLE IF EXISTS base_table
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS base_table
+DEBUG: parseSql input: DROP TABLE IF EXISTS base_table
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50864128
+
+[1A[2K[WASM LOG] getLastError len: 141
+
+[1A[2K[WASM LOG] getLastError msg: DEBUG: Exec SQL: DROP TABLE IF EXISTS delete_target
+DEBUG: parseSql input: DROP TABLE IF EXISTS delete_target
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[WASM DEBUG CAPTURED] DEBUG: Exec SQL: DROP TABLE IF EXISTS delete_target
+DEBUG: parseSql input: DROP TABLE IF EXISTS delete_target
+DEBUG: Parsed Type: .drop_table
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:35:14] "GET /examples/wasm/lanceql.js?v=1767846914584 HTTP/1.1" 200 -
+
+[1A[2K[LanceQL] Using Transferable ArrayBuffers
+
+[1A[2K[LanceQL] Using regular Worker for better logging
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:35:14] "GET /examples/wasm/lanceql-worker.js?v=1767846914591 HTTP/1.1" 200 -
+
+[1A[2K[LanceQLWorker] Initialized
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:35:14] "GET /examples/wasm/lanceql.wasm?v=1767846914594 HTTP/1.1" 200 -
+
+[1A[2K[2m[WebServer] [22m::1 - - [07/Jan/2026 23:35:14] "GET /examples/wasm/lanceql.wasm?v=1767846914595 HTTP/1.1" 200 -
+
+[1A[2K[LanceQLWorker] WASM loaded with OPFS support
+
+[1A[2K[LanceQL] Incoming worker message: ready
+
+[1A[2K[LanceQL] Worker ready, mode: transfer
+
+[1A[2K[LanceQLWorker] WASM loaded with OPFS support
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50462720
+
+[1A[2K[WASM LOG] getLastError len: 18
+
+[1A[2K[WASM LOG] getLastError msg: Invalid SQL Syntax
+
+[1A[2K[WASM LOG] execute throwing: "Invalid SQL Syntax"
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50470912
+
+[1A[2K[WASM LOG] getLastError len: 18
+
+[1A[2K[WASM LOG] getLastError msg: Invalid SQL Syntax
+
+[1A[2K[WASM LOG] execute throwing: "Invalid SQL Syntax"
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50479104
+
+[1A[2K[WASM LOG] getLastError len: 18
+
+[1A[2K[WASM LOG] getLastError msg: Invalid SQL Syntax
+
+[1A[2K[WASM LOG] execute throwing: "Invalid SQL Syntax"
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50487296
+
+[1A[2K[WASM LOG] getLastError len: 18
+
+[1A[2K[WASM LOG] getLastError msg: Invalid SQL Syntax
+
+[1A[2K[WASM LOG] execute throwing: "Invalid SQL Syntax"
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K[WASM LOG] getLastError alloc ptr: 50495488
+
+[1A[2K[WASM LOG] getLastError len: 18
+
+[1A[2K[WASM LOG] getLastError msg: Invalid SQL Syntax
+
+[1A[2K[WASM LOG] execute throwing: "Invalid SQL Syntax"
+
+[1A[2K[LanceQL] Incoming worker message: RPC reply
+
+[1A[2K  1) [chromium] › tests/e2e/vault-sql.spec.js:2814:5 › Vault SQL Operations › Quick wins - GREATEST, LEAST, IIF functions 
+
+    Error: GREATEST(1, 5, 3): Error: Invalid SQL Syntax
+        at WasmSqlExecutor.execute (http://localhost:3000/examples/wasm/lanceql-worker.js?v=1767846914591:2069:13)
+        at executeWasmSqlFull (http://localhost:3000/examples/wasm/lanceql-worker.js?v=1767846914591:2339:19)
+        at handleMessage (http://localhost:3000/examples/wasm/lanceql-worker.js?v=1767846914591:2838:22)
+    LOGS:
+    [BROWSER] [LanceQL] Using Transferable ArrayBuffers
+    [BROWSER] [LanceQL] Using regular Worker for better logging
+    [WORKER] [LanceQLWorker] Initialized
+    [BROWSER] [LanceQLWorker] Initialized
+    [WORKER] [LanceQLWorker] WASM loaded with OPFS support
+    [BROWSER] [LanceQLWorker] WASM loaded with OPFS support
+    [BROWSER] [LanceQL] Incoming worker message: ready
+    [BROWSER] [LanceQL] Worker ready, mode: transfer
+    [WORKER] [LanceQLWorker] WASM loaded with OPFS support
+    [BROWSER] [LanceQLWorker] WASM loaded with OPFS support
+    [BROWSER] [LanceQL] Incoming worker message: RPC reply
+    [WORKER] [WASM LOG] getLastError alloc ptr: 50462720
+    [BROWSER] [WASM LOG] getLastError alloc ptr: 50462720
+    [WORKER] [WASM LOG] getLastError len: 18
+    [BROWSER] [WASM LOG] getLastError len: 18
+    [WORKER] [WASM LOG] getLastError msg: Invalid SQL Syntax
+    [BROWSER] [WASM LOG] getLastError msg: Invalid SQL Syntax
+    [WORKER] [WASM LOG] execute throwing: "Invalid SQL Syntax"
+    [BROWSER] [WASM LOG] execute throwing: "Invalid SQL Syntax"
+    [BROWSER] [LanceQL] Incoming worker message: RPC reply
+    [WORKER] [WASM LOG] getLastError alloc ptr: 50470912
+    [BROWSER] [WASM LOG] getLastError alloc ptr: 50470912
+    [WORKER] [WASM LOG] getLastError len: 18
+    [BROWSER] [WASM LOG] getLastError len: 18
+    [WORKER] [WASM LOG] getLastError msg: Invalid SQL Syntax
+    [BROWSER] [WASM LOG] getLastError msg: Invalid SQL Syntax
+    [WORKER] [WASM LOG] execute throwing: "Invalid SQL Syntax"
+    [BROWSER] [WASM LOG] execute throwing: "Invalid SQL Syntax"
+    [BROWSER] [LanceQL] Incoming worker message: RPC reply
+    [WORKER] [WASM LOG] getLastError alloc ptr: 50479104
+    [BROWSER] [WASM LOG] getLastError alloc ptr: 50479104
+    [WORKER] [WASM LOG] getLastError len: 18
+    [BROWSER] [WASM LOG] getLastError len: 18
+    [WORKER] [WASM LOG] getLastError msg: Invalid SQL Syntax
+    [BROWSER] [WASM LOG] getLastError msg: Invalid SQL Syntax
+    [WORKER] [WASM LOG] execute throwing: "Invalid SQL Syntax"
+    [BROWSER] [WASM LOG] execute throwing: "Invalid SQL Syntax"
+    [BROWSER] [LanceQL] Incoming worker message: RPC reply
+    [WORKER] [WASM LOG] getLastError alloc ptr: 50487296
+    [BROWSER] [WASM LOG] getLastError alloc ptr: 50487296
+    [WORKER] [WASM LOG] getLastError len: 18
+    [BROWSER] [WASM LOG] getLastError len: 18
+    [WORKER] [WASM LOG] getLastError msg: Invalid SQL Syntax
+    [BROWSER] [WASM LOG] getLastError msg: Invalid SQL Syntax
+    [WORKER] [WASM LOG] execute throwing: "Invalid SQL Syntax"
+    [BROWSER] [WASM LOG] execute throwing: "Invalid SQL Syntax"
+    [BROWSER] [LanceQL] Incoming worker message: RPC reply
+    [WORKER] [WASM LOG] getLastError alloc ptr: 50495488
+    [BROWSER] [WASM LOG] getLastError alloc ptr: 50495488
+    [WORKER] [WASM LOG] getLastError len: 18
+    [BROWSER] [WASM LOG] getLastError len: 18
+    [WORKER] [WASM LOG] getLastError msg: Invalid SQL Syntax
+    [BROWSER] [WASM LOG] getLastError msg: Invalid SQL Syntax
+    [WORKER] [WASM LOG] execute throwing: "Invalid SQL Syntax"
+    [BROWSER] [WASM LOG] execute throwing: "Invalid SQL Syntax"
+    [BROWSER] [LanceQL] Incoming worker message: RPC reply
+
+    [2mexpect([22m[31mreceived[39m[2m).[22mtoBe[2m([22m[32mexpected[39m[2m) // Object.is equality[22m
+
+    Expected: [32mtrue[39m
+    Received: [31mfalse[39m
+        at WasmSqlExecutor.execute (http://localhost:3000/examples/wasm/lanceql-worker.js?v=1767846914591:2069:13)
+        at executeWasmSqlFull (http://localhost:3000/examples/wasm/lanceql-worker.js?v=1767846914591:2339:19)
+        at handleMessage (http://localhost:3000/examples/wasm/lanceql-worker.js?v=1767846914591:2838:22)
+        at /Users/steven_chong/Downloads/repos/lanceql/packages/browser/tests/e2e/vault-sql.spec.js:2877:74
+
+    attachment #1: screenshot (image/png) ──────────────────────────────────────────────────────────
+    test-results/vault-sql-Vault-SQL-Operat-9dc50-REATEST-LEAST-IIF-functions-chromium/test-failed-1.png
+    ────────────────────────────────────────────────────────────────────────────────────────────────
+
+    Error Context: test-results/vault-sql-Vault-SQL-Operat-9dc50-REATEST-LEAST-IIF-functions-chromium/error-context.md
+
+
+[1A[2K  1 failed
+    [chromium] › tests/e2e/vault-sql.spec.js:2814:5 › Vault SQL Operations › Quick wins - GREATEST, LEAST, IIF functions 
+
+[36m  Serving HTML report at http://localhost:59376. Press Ctrl+C to quit.[39m

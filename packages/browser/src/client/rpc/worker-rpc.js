@@ -99,6 +99,12 @@ function handleWorkerMessage(data, port, resolveReady) {
         return;
     }
 
+    if (data.type === 'log') {
+        // __WASM_LOG_BRIDGE__
+        console.log(data.message);
+        return;
+    }
+
     // Handle RPC responses
     if (data.id !== undefined) {
         const pending = _pendingRequests.get(data.id);

@@ -191,6 +191,9 @@ function createWasmImports() {
                 const decoder = new TextDecoder();
                 const msg = decoder.decode(new Uint8Array(wasmMemory.buffer, ptr, len));
                 console.log(`[WASM LOG] ${msg}`);
+                for (const port of ports) {
+                    port.postMessage({ type: 'log', message: msg, marker: '__WASM_LOG_BRIDGE__' });
+                }
             }
         }
     };

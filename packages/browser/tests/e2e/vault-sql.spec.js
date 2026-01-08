@@ -3,6 +3,9 @@ import { test, expect } from '@playwright/test';
 
 test.describe('Vault SQL Operations', () => {
     test.beforeEach(async ({ page }) => {
+        // Monitor console logs
+        page.on('console', msg => console.log(msg.text()));
+
         // Navigate to test page
         await page.goto('/examples/wasm/test-vault-sql.html');
 
@@ -14,12 +17,12 @@ test.describe('Vault SQL Operations', () => {
             const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tables = ['test_users', 'test_products', 'test_orders', 'test_drop', 'test_table',
-                           'test_items', 'test_transactions', 'test_categories', 'products', 'orders',
-                           'users', 'employees', 'departments', 'sales', 'customers', 'test_data',
-                           'test_strings', 'test_nums', 'test_dates', 'test_json', 'test_arrays',
-                           'test_nulls', 'test_agg', 'test_window', 'test_cte', 'test_distinct',
-                           'test_join_left', 'test_join_right', 'test_subq', 'test_having',
-                           'source_table', 'target_table', 'base_table', 'delete_target'];
+                'test_items', 'test_transactions', 'test_categories', 'products', 'orders',
+                'users', 'employees', 'departments', 'sales', 'customers', 'test_data',
+                'test_strings', 'test_nums', 'test_dates', 'test_json', 'test_arrays',
+                'test_nulls', 'test_agg', 'test_window', 'test_cte', 'test_distinct',
+                'test_join_left', 'test_join_right', 'test_subq', 'test_having',
+                'source_table', 'target_table', 'base_table', 'delete_target'];
             for (const t of tables) {
                 try { await v.exec(`DROP TABLE IF EXISTS ${t}`); } catch (e) { /* ignore */ }
             }
@@ -2809,6 +2812,11 @@ test.describe('Vault SQL Operations', () => {
     });
 
     test('Quick wins - GREATEST, LEAST, IIF functions', async ({ page }) => {
+        const logs = [];
+        page.on('console', msg => logs.push(`[BROWSER] ${msg.text()}`));
+        page.on('worker', worker => {
+            worker.on('console', msg => logs.push(`[WORKER] ${msg.text()}`));
+        });
         const results = await page.evaluate(async () => {
             const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
@@ -2863,6 +2871,9 @@ test.describe('Vault SQL Operations', () => {
         });
 
         for (const t of results) {
+            if (!t.pass && logs.length > 0) {
+                t.error = (t.error || '') + "\nLOGS:\n" + logs.join("\n");
+            }
             expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
         }
     });

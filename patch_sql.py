@@ -1,0 +1,463 @@
+import sys
+
+with open('src/wasm/sql_executor.zig', 'r') as f:
+    content = f.readlines()
+
+new_func = r"""fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
+    pos.* = skipWs(sql, pos.*);
+
+    // Check for EXISTS or NOT EXISTS
+    var is_exists_not = false;
+    const p_exists_check = pos.*;
+    if (startsWithIC(sql[pos.*..], "NOT")) {
+        pos.* += 3;
+        pos.* = skipWs(sql, pos.*);
+        if (startsWithIC(sql[pos.*..], "EXISTS")) {
+            is_exists_not = true;
+        } else {
+            pos.* = p_exists_check;
+        }
+    }
+    
+    if (startsWithIC(sql[pos.*..], "EXISTS")) {
+        pos.* += 6;
+        pos.* = skipWs(sql, pos.*);
+        if (pos.* < sql.len and sql[pos.*] == '(') {
+            pos.* += 1;
+            pos.* = skipWs(sql, pos.*);
+            if (startsWithIC(sql[pos.*..], "SELECT")) {
+                 var clause = WhereClause{
+                     .op = if (is_exists_not) .not_exists else .exists,
+                     .subquery_start = pos.*,
+                 };
+                 // Find matching ')'
+                 var depth: usize = 1;
+                 const start_pos = pos.*;
+                 while (pos.* < sql.len and depth > 0) {
+                     if (sql[pos.*] == '(') {
+                         depth += 1;
+                     } else if (sql[pos.*] == ')') {
+                         depth -= 1;
+                     }
+                     pos.* += 1;
+                 }
+                 clause.subquery_len = if (pos.* > start_pos) pos.* - start_pos - 1 else 0;
+                 return clause;
+            }
+        }
+        pos.* = p_exists_check; // Fallback if not a subquery
+    }
+
+    // Handle parentheses
+    if (pos.* < sql.len and sql[pos.*] == '(') {
+        pos.* += 1;
+        const inner = parseOrExpr(sql, pos) orelse return null;
+        pos.* = skipWs(sql, pos.*);
+        if (pos.* < sql.len and sql[pos.*] == ')') pos.* += 1;
+        return inner;
+    }
+
+    // LHS: Column name or literal
+    var lhs_val_int: ?i64 = null;
+    var lhs_val_float: ?f64 = null;
+    var lhs_val_str: ?[]const u8 = null;
+    var lhs_col_name: ?[]const u8 = null;
+
+    if (pos.* < sql.len and sql[pos.*] == '\'') {
+        pos.* += 1;
+        const s = pos.*;
+        while (pos.* < sql.len and sql[pos.*] != '\'') pos.* += 1;
+        lhs_val_str = sql[s..pos.*];
+        if (pos.* < sql.len) pos.* += 1;
+    } else {
+        const start = pos.*;
+        while (pos.* < sql.len and (isIdent(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+        if (pos.* == start) return null;
+        const ident = sql[start..pos.*];
+        
+        if (ident.len > 0 and (std.ascii.isDigit(ident[0]) or (ident.len > 1 and ident[0] == '-'))) {
+             if (std.mem.indexOf(u8, ident, ".") != null) {
+                 lhs_val_float = std.fmt.parseFloat(f64, ident) catch null;
+             } else {
+                 lhs_val_int = std.fmt.parseInt(i64, ident, 10) catch null;
+             }
+             if (lhs_val_int == null and lhs_val_float == null) {
+                 lhs_col_name = ident;
+             }
+        } else {
+            lhs_col_name = ident;
+        }
+    }
+
+    pos.* = skipWs(sql, pos.*);
+
+    // Skip function call arguments
+    if (pos.* < sql.len and sql[pos.*] == '(') {
+        var depth: usize = 1;
+        pos.* += 1;
+        while (pos.* < sql.len and depth > 0) {
+            if (sql[pos.*] == '(') depth += 1;
+            if (sql[pos.*] == ')') depth -= 1;
+            pos.* += 1;
+        }
+        pos.* = skipWs(sql, pos.*);
+    }
+
+    // Check for IS NULL / IS NOT NULL
+    if (startsWithIC(sql[pos.*..], "IS")) {
+        pos.* += 2;
+        pos.* = skipWs(sql, pos.*);
+        const is_not_null = startsWithIC(sql[pos.*..], "NOT");
+        if (is_not_null) {
+            pos.* += 3;
+            pos.* = skipWs(sql, pos.*);
+        }
+        if (startsWithIC(sql[pos.*..], "NULL")) {
+            pos.* += 4;
+            if (lhs_col_name) |column| {
+                return WhereClause{
+                    .op = if (is_not_null) .is_not_null else .is_null,
+                    .column = column,
+                };
+            }
+            return null;
+        }
+    }
+
+    // Check for NOT IN, NOT LIKE, NOT BETWEEN
+    var is_not = false;
+    if (startsWithIC(sql[pos.*..], "NOT")) {
+        is_not = true;
+        pos.* += 3;
+        pos.* = skipWs(sql, pos.*);
+    }
+
+    // Check for IN
+    if (startsWithIC(sql[pos.*..], "IN")) {
+        pos.* += 2;
+        pos.* = skipWs(sql, pos.*);
+        if (pos.* < sql.len and sql[pos.*] == '(') {
+            pos.* += 1;
+            pos.* = skipWs(sql, pos.*);
+
+            if (startsWithIC(sql[pos.*..], "SELECT")) {
+                if (lhs_col_name) |column| {
+                     // Subquery
+                     var clause = WhereClause{
+                         .op = if (is_not) .not_in_subquery else .in_subquery,
+                         .column = column,
+                         .subquery_start = pos.*,
+                     };
+                     // Find matching ')'
+                     var depth: usize = 1;
+                     const start_pos = pos.*;
+                     while (pos.* < sql.len and depth > 0) {
+                         if (sql[pos.*] == '(') {
+                             depth += 1;
+                         } else if (sql[pos.*] == ')') {
+                             depth -= 1;
+                         }
+                         pos.* += 1;
+                     }
+                     clause.subquery_len = if (pos.* > start_pos) pos.* - start_pos - 1 else 0;
+                     return clause;
+                }
+                return null;
+            }
+
+            if (lhs_col_name) |column| {
+                var clause = WhereClause{
+                    .op = if (is_not) .not_in_list else .in_list,
+                    .column = column,
+                };
+                // Parse value list
+                while (pos.* < sql.len and clause.in_values_count < 32) {
+                    pos.* = skipWs(sql, pos.*);
+                    if (sql[pos.*] == ')') {
+                        pos.* += 1;
+                        break;
+                    }
+                    
+                    const prev_pos = pos.*;
+                    if (sql[pos.*] == '\'') {
+                        // String literal
+                        pos.* += 1;
+                        const val_start = pos.*;
+                        while (pos.* < sql.len and sql[pos.*] != '\'') pos.* += 1;
+                        const val = sql[val_start..pos.*];
+                        if (pos.* < sql.len) pos.* += 1;
+                        
+                        if (clause.in_values_count < 32) {
+                            clause.in_values_str[clause.in_values_count] = val;
+                            clause.in_values_count += 1;
+                        }
+                    } else {
+                        // Numeric literal
+                        const num_start = pos.*;
+                        if (sql[pos.*] == '-') pos.* += 1;
+                        while (pos.* < sql.len and (std.ascii.isDigit(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+                        if (pos.* > num_start) {
+                            const num_str = sql[num_start..pos.*];
+                            if (std.fmt.parseInt(i64, num_str, 10)) |v| {
+                                if (clause.in_values_count < 32) {
+                                    clause.in_values_int[clause.in_values_count] = v;
+                                    clause.in_values_count += 1;
+                                }
+                            } else |_| {}
+                        }
+                    }
+                    
+                    if (pos.* == prev_pos) pos.* += 1; // Safety advance
+
+                    pos.* = skipWs(sql, pos.*);
+                    if (pos.* < sql.len and sql[pos.*] == ',') pos.* += 1;
+                }
+                return clause;
+            }
+            return null;
+        }
+    }
+
+    // Check for LIKE
+    if (startsWithIC(sql[pos.*..], "LIKE")) {
+        pos.* += 4;
+        pos.* = skipWs(sql, pos.*);
+        // Parse string pattern
+        if (pos.* < sql.len and sql[pos.*] == '\'') {
+            pos.* += 1;
+            const pat_start = pos.*;
+            while (pos.* < sql.len and sql[pos.*] != '\'') pos.* += 1;
+            const pattern = sql[pat_start..pos.*];
+            if (pos.* < sql.len) pos.* += 1; // skip closing quote
+            if (lhs_col_name) |column| {
+                return WhereClause{
+                    .op = if (is_not) .not_like else .like,
+                    .column = column,
+                    .value_str = pattern,
+                };
+            }
+            return null;
+        }
+    }
+
+    // Check for BETWEEN
+    if (startsWithIC(sql[pos.*..], "BETWEEN")) {
+        pos.* += 7;
+        pos.* = skipWs(sql, pos.*);
+        
+        var val_int_1: ?i64 = null;
+        var val_float_1: ?f64 = null;
+        
+        {
+            const num_start = pos.*;
+            if (pos.* < sql.len and sql[pos.*] == '-') pos.* += 1;
+            while (pos.* < sql.len and (std.ascii.isDigit(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+            const num_str = sql[num_start..pos.*];
+            if (std.mem.indexOf(u8, num_str, ".") != null) {
+                val_float_1 = std.fmt.parseFloat(f64, num_str) catch null;
+            } else {
+                val_int_1 = std.fmt.parseInt(i64, num_str, 10) catch null;
+            }
+        }
+        
+        pos.* = skipWs(sql, pos.*);
+        if (startsWithIC(sql[pos.*..], "AND")) pos.* += 3;
+        pos.* = skipWs(sql, pos.*);
+
+        var val_int_2: ?i64 = null;
+        var val_float_2: ?f64 = null;
+        
+        {
+            const num_start = pos.*;
+            if (pos.* < sql.len and sql[pos.*] == '-') pos.* += 1;
+            while (pos.* < sql.len and (std.ascii.isDigit(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+            const num_str = sql[num_start..pos.*];
+            if (std.mem.indexOf(u8, num_str, ".") != null) {
+                val_float_2 = std.fmt.parseFloat(f64, num_str) catch null;
+            } else {
+                val_int_2 = std.fmt.parseInt(i64, num_str, 10) catch null;
+            }
+        }
+        
+        if (lhs_col_name) |column| {
+            return WhereClause{
+                .op = if (is_not) .not_between else .between,
+                .column = column,
+                .value_int = val_int_1,
+                .value_float = val_float_1,
+                .value_int_2 = val_int_2,
+                .value_float_2 = val_float_2,
+            };
+        }
+        return null;
+    }
+
+    // Check for NEAR
+    if (startsWithIC(sql[pos.*..], "NEAR")) {
+        pos.* += 4;
+        pos.* = skipWs(sql, pos.*);
+        
+        // Parse vector literal [1.0, 2.0, ...]
+        if (pos.* < sql.len and sql[pos.*] == '[') {
+            pos.* += 1;
+            var vec: [MAX_VECTOR_DIM]f32 = undefined;
+            var dim: usize = 0;
+            
+            while (pos.* < sql.len and dim < MAX_VECTOR_DIM) {
+                pos.* = skipWs(sql, pos.*);
+                if (pos.* < sql.len and sql[pos.*] == ']') {
+                    pos.* += 1;
+                    break;
+                }
+                
+                // Parse float
+                const num_start = pos.*;
+                if (sql[pos.*] == '-') pos.* += 1;
+                while (pos.* < sql.len and (std.ascii.isDigit(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+                if (pos.* > num_start) {
+                    if (std.fmt.parseFloat(f32, sql[num_start..pos.*])) |v| {
+                        vec[dim] = v;
+                        dim += 1;
+                    } else |_| {}
+                }
+                
+                pos.* = skipWs(sql, pos.*);
+                if (pos.* < sql.len and sql[pos.*] == ',') pos.* += 1;
+            }
+            
+            if (lhs_col_name) |column| {
+                return WhereClause{
+                    .op = .near,
+                    .column = column,
+                    .near_vector = vec,
+                    .near_dim = dim,
+                };
+            }
+            return null;
+        } else {
+            // Check for NEAR <number> (row ID)
+            const num_start = pos.*;
+            while (pos.* < sql.len and std.ascii.isDigit(sql[pos.*])) pos.* += 1;
+            if (pos.* > num_start) {
+                if (std.fmt.parseInt(u32, sql[num_start..pos.*], 10)) |row_id| {
+                    if (lhs_col_name) |column| {
+                        return WhereClause{
+                            .op = .near,
+                            .column = column,
+                            .near_target_row = row_id,
+                        };
+                    }
+                    return null;
+                } else |_| {}
+            }
+        }
+    }
+
+    // Standard comparison operators
+    var op: WhereOp = .eq;
+    if (pos.* < sql.len) {
+        if (sql[pos.*] == '=') {
+            op = .eq;
+            pos.* += 1;
+        } else if (sql[pos.*] == '<') {
+            pos.* += 1;
+            if (pos.* < sql.len and sql[pos.*] == '=') {
+                op = .le;
+                pos.* += 1;
+            } else if (pos.* < sql.len and sql[pos.*] == '>') {
+                op = .ne;
+                pos.* += 1;
+            } else {
+                op = .lt;
+            }
+        } else if (sql[pos.*] == '>') {
+            pos.* += 1;
+            if (pos.* < sql.len and sql[pos.*] == '=') {
+                op = .ge;
+                pos.* += 1;
+            } else {
+                op = .gt;
+            }
+        } else if (sql[pos.*] == '!' and pos.* + 1 < sql.len and sql[pos.* + 1] == '=') {
+            op = .ne;
+            pos.* += 2;
+        } else {
+            return null;
+        }
+    }
+
+    pos.* = skipWs(sql, pos.*);
+
+    // Value - number or string
+    var value_int: ?i64 = null;
+    var value_float: ?f64 = null;
+    var value_str: ?[]const u8 = null;
+
+    if (pos.* < sql.len and sql[pos.*] == '\'') {
+        // String value
+        pos.* += 1;
+        const str_start = pos.*;
+        while (pos.* < sql.len and sql[pos.*] != '\'') pos.* += 1;
+        value_str = sql[str_start..pos.*];
+        if (pos.* < sql.len) pos.* += 1;
+    } else if (pos.* < sql.len and (std.ascii.isDigit(sql[pos.*]) or sql[pos.*] == '-')) {
+        const num_start = pos.*;
+        if (sql[pos.*] == '-') pos.* += 1;
+        while (pos.* < sql.len and (std.ascii.isDigit(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+        const num_str = sql[num_start..pos.*];
+        if (std.mem.indexOf(u8, num_str, ".") != null) {
+            value_float = std.fmt.parseFloat(f64, num_str) catch null;
+        } else {
+            value_int = std.fmt.parseInt(i64, num_str, 10) catch null;
+        }
+    } else {
+        // Potential column name (e.g. o.id = u.order_id)
+        const val_start = pos.*;
+        while (pos.* < sql.len and (isIdent(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+        if (pos.* > val_start) {
+            const rhs_name = sql[val_start..pos.*];
+            if (lhs_col_name) |lc| {
+                 return WhereClause{
+                     .op = op,
+                     .column = lc,
+                     .arg_2_col = rhs_name,
+                 };
+            } else {
+                 // literal OP column -> column INV_OP literal
+                 return WhereClause{
+                     .op = invertOp(op),
+                     .column = rhs_name,
+                     .value_int = lhs_val_int,
+                     .value_float = lhs_val_float,
+                     .value_str = lhs_val_str,
+                 };
+            }
+        }
+    }
+    
+    if (lhs_col_name) |lc| {
+        return WhereClause{
+            .op = op,
+            .column = lc,
+            .value_int = value_int,
+            .value_float = value_float,
+            .value_str = value_str,
+        };
+    } else {
+        // Literal-literal
+        const res = evaluateLiteralComparison(lhs_val_int, lhs_val_float, lhs_val_str, op, value_int, value_float, value_str);
+        return WhereClause{ .op = if (res) .always_true else .always_false };
+    }
+}"""
+
+# Use raw string for new_func to preserve backslashes
+new_func_lines = new_func.split('\n')
+
+with open('src/wasm/sql_executor.zig', 'r') as f:
+    content = f.readlines()
+
+# Replace lines 9085 to 9529 (0-indexed 9084 to 9529)
+content[9084:9529] = [line + '\n' for line in new_func_lines]
+
+with open('src/wasm/sql_executor.zig', 'w') as f:
+    f.writelines(content)
