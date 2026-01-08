@@ -377,6 +377,13 @@ pub const ParsedQuery = struct {
     from_subquery_len: usize = 0,
     from_subquery_alias: []const u8 = "",
     has_from_subquery: bool = false,
+    // PIVOT support
+    has_pivot: bool = false,
+    pivot_agg_func: aggregates.AggFunc = .sum,
+    pivot_agg_col: []const u8 = "",
+    pivot_col: []const u8 = "",
+    pivot_values: [8][]const u8 = undefined,
+    pivot_value_count: usize = 0,
 };
 
 // Global state
@@ -5368,9 +5375,153 @@ fn executeSelectQuery(table: *const TableInfo, query: *ParsedQuery) !void {
     
     const final_count = end - start;
 
+    // Handle PIVOT if present
+    if (query.has_pivot) {
+        try executePivotQuery(table, query, match_indices[start..end], final_count);
+        return;
+    }
+
     // Write result
     // Must pass query to handle expressions
     try writeSelectResult(table, query, match_indices[start..end], final_count);
+}
+
+/// Execute a PIVOT transformation query
+fn executePivotQuery(table: *const TableInfo, query: *const ParsedQuery, row_indices: []const u32, row_count: usize) !void {
+    setDebug("PIVOT: agg_col={s}, pivot_col={s}, values={d}", .{query.pivot_agg_col, query.pivot_col, query.pivot_value_count});
+
+    // Find the pivot column and aggregation column
+    const pivot_col = findTableColumn(table, query.pivot_col) orelse return error.ColumnNotFound;
+    const agg_col = findTableColumn(table, query.pivot_agg_col) orelse return error.ColumnNotFound;
+
+    // Find the "group by" column (non-pivot, non-agg column from SELECT)
+    // In PIVOT, the first column in SELECT that isn't pivot_col or agg_col becomes the row key
+    var group_col: ?*const ColumnData = null;
+    for (query.select_exprs[0..query.select_count]) |expr| {
+        if (expr.col_name.len > 0 and
+            !std.mem.eql(u8, expr.col_name, query.pivot_col) and
+            !std.mem.eql(u8, expr.col_name, query.pivot_agg_col)) {
+            group_col = findTableColumn(table, expr.col_name);
+            break;
+        }
+    }
+    const row_key_col = group_col orelse return error.ColumnNotFound;
+
+    // Collect unique group values
+    const MAX_GROUPS = 64;
+    var group_keys: [MAX_GROUPS][]const u8 = undefined;
+    var group_count: usize = 0;
+    var ctx: ?FragmentContext = null;
+
+    for (row_indices[0..row_count]) |idx| {
+        const key = getStringValueOptimized(table, row_key_col, idx, &ctx);
+        var found = false;
+        for (group_keys[0..group_count]) |gk| {
+            if (std.mem.eql(u8, gk, key)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found and group_count < MAX_GROUPS) {
+            group_keys[group_count] = key;
+            group_count += 1;
+        }
+    }
+
+    // For each group, compute aggregate for each pivot value
+    // Result: group_count rows, 1 + pivot_value_count columns
+    const total_cols = 1 + query.pivot_value_count;
+
+    // Initialize fragment writer
+    const capacity = group_count * total_cols * 32 + 4096;
+    if (lw.fragmentBegin(capacity) == 0) return error.OutOfMemory;
+
+    // Write group key column
+    {
+        const offsets = try memory.wasm_allocator.alloc(u32, group_count + 1);
+        defer memory.wasm_allocator.free(offsets);
+        var total_len: usize = 0;
+        offsets[0] = 0;
+        for (group_keys[0..group_count], 0..) |key, i| {
+            total_len += key.len;
+            offsets[i + 1] = @intCast(total_len);
+        }
+        const data = try memory.wasm_allocator.alloc(u8, total_len);
+        defer memory.wasm_allocator.free(data);
+        var offset: usize = 0;
+        for (group_keys[0..group_count]) |key| {
+            @memcpy(data[offset .. offset + key.len], key);
+            offset += key.len;
+        }
+        _ = lw.fragmentAddStringColumn(row_key_col.name.ptr, row_key_col.name.len, data.ptr, total_len, offsets.ptr, group_count, false);
+    }
+
+    // For each pivot value, compute aggregates
+    for (query.pivot_values[0..query.pivot_value_count]) |pivot_val| {
+        const col_data = try memory.wasm_allocator.alloc(f64, group_count);
+        defer memory.wasm_allocator.free(col_data);
+
+        // Initialize based on aggregation type
+        for (0..group_count) |i| {
+            switch (query.pivot_agg_func) {
+                .count, .sum, .avg => col_data[i] = 0,
+                .min => col_data[i] = std.math.floatMax(f64),
+                .max => col_data[i] = -std.math.floatMax(f64),
+                else => col_data[i] = 0,
+            }
+        }
+
+        var counts: [MAX_GROUPS]usize = [_]usize{0} ** MAX_GROUPS;
+
+        // Scan matching rows
+        ctx = null;
+        for (row_indices[0..row_count]) |idx| {
+            const row_key = getStringValueOptimized(table, row_key_col, idx, &ctx);
+            const pv = getStringValueOptimized(table, pivot_col, idx, &ctx);
+
+            if (std.mem.eql(u8, pv, pivot_val)) {
+                // Find group index
+                for (group_keys[0..group_count], 0..) |gk, gi| {
+                    if (std.mem.eql(u8, gk, row_key)) {
+                        const val = getFloatValueOptimized(table, agg_col, idx, &ctx);
+                        switch (query.pivot_agg_func) {
+                            .count => col_data[gi] += 1,
+                            .sum, .avg => col_data[gi] += val,
+                            .min => if (val < col_data[gi]) { col_data[gi] = val; },
+                            .max => if (val > col_data[gi]) { col_data[gi] = val; },
+                            else => {},
+                        }
+                        counts[gi] += 1;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Post-process for AVG
+        if (query.pivot_agg_func == .avg) {
+            for (0..group_count) |i| {
+                if (counts[i] > 0) col_data[i] /= @floatFromInt(counts[i]);
+            }
+        }
+
+        // For MIN/MAX with no matches, set to 0
+        for (0..group_count) |i| {
+            if (counts[i] == 0) {
+                col_data[i] = 0;
+            }
+        }
+
+        _ = lw.fragmentAddFloat64Column(pivot_val.ptr, pivot_val.len, col_data.ptr, group_count, false);
+    }
+
+    // Finalize
+    const final_size = lw.fragmentEnd();
+    if (final_size == 0) return error.WriteFailed;
+    if (lw.writerGetBuffer()) |buf| {
+        result_buffer = buf[0..final_size];
+        result_size = final_size;
+    }
 }
 
 fn executeSetOpQuery(sql: []const u8, query: *const ParsedQuery) !void {
@@ -11831,13 +11982,98 @@ pub fn parseSql(sql: []const u8) ?*ParsedQuery {
         !startsWithIC(sql[pos..], "OFFSET") and
         !startsWithIC(sql[pos..], "UNION") and
         !startsWithIC(sql[pos..], "INTERSECT") and
-        !startsWithIC(sql[pos..], "EXCEPT")) {
+        !startsWithIC(sql[pos..], "EXCEPT") and
+        !startsWithIC(sql[pos..], "PIVOT") and
+        !startsWithIC(sql[pos..], "UNPIVOT")) {
         const alias_start = pos;
         while (pos < sql.len and isIdent(sql[pos])) pos += 1;
         query.table_alias = sql[alias_start..pos];
         pos = skipWs(sql, pos);
     }
 
+    // Check for PIVOT clause
+    if (startsWithIC(sql[pos..], "PIVOT")) {
+        pos += 5;
+        pos = skipWs(sql, pos);
+        if (pos < sql.len and sql[pos] == '(') {
+            pos += 1;
+            pos = skipWs(sql, pos);
+
+            // Parse aggregation function: SUM(amount), COUNT(*), AVG(amount), etc.
+            const agg_funcs = [_]struct { name: []const u8, func: aggregates.AggFunc }{
+                .{ .name = "SUM", .func = .sum },
+                .{ .name = "COUNT", .func = .count },
+                .{ .name = "AVG", .func = .avg },
+                .{ .name = "MIN", .func = .min },
+                .{ .name = "MAX", .func = .max },
+            };
+
+            for (agg_funcs) |af| {
+                if (startsWithIC(sql[pos..], af.name)) {
+                    query.pivot_agg_func = af.func;
+                    pos += af.name.len;
+                    pos = skipWs(sql, pos);
+                    if (pos < sql.len and sql[pos] == '(') {
+                        pos += 1;
+                        pos = skipWs(sql, pos);
+                        const col_start = pos;
+                        while (pos < sql.len and (isIdent(sql[pos]) or sql[pos] == '*')) pos += 1;
+                        query.pivot_agg_col = sql[col_start..pos];
+                        pos = skipWs(sql, pos);
+                        if (pos < sql.len and sql[pos] == ')') pos += 1;
+                    }
+                    break;
+                }
+            }
+
+            pos = skipWs(sql, pos);
+
+            // Parse FOR column IN (values)
+            if (startsWithIC(sql[pos..], "FOR")) {
+                pos += 3;
+                pos = skipWs(sql, pos);
+                const pivot_col_start = pos;
+                while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+                query.pivot_col = sql[pivot_col_start..pos];
+                pos = skipWs(sql, pos);
+
+                if (startsWithIC(sql[pos..], "IN")) {
+                    pos += 2;
+                    pos = skipWs(sql, pos);
+                    if (pos < sql.len and sql[pos] == '(') {
+                        pos += 1;
+                        pos = skipWs(sql, pos);
+
+                        // Parse values: 'Q1', 'Q2', etc.
+                        while (pos < sql.len and sql[pos] != ')' and query.pivot_value_count < 8) {
+                            pos = skipWs(sql, pos);
+                            if (sql[pos] == '\'') {
+                                pos += 1;
+                                const val_start = pos;
+                                while (pos < sql.len and sql[pos] != '\'') pos += 1;
+                                query.pivot_values[query.pivot_value_count] = sql[val_start..pos];
+                                query.pivot_value_count += 1;
+                                if (pos < sql.len) pos += 1; // skip closing quote
+                            }
+                            pos = skipWs(sql, pos);
+                            if (pos < sql.len and sql[pos] == ',') pos += 1;
+                        }
+                        if (pos < sql.len and sql[pos] == ')') pos += 1;
+                    }
+                }
+            }
+
+            // Skip closing paren of PIVOT()
+            pos = skipWs(sql, pos);
+            if (pos < sql.len and sql[pos] == ')') pos += 1;
+
+            query.has_pivot = true;
+            setDebug("PIVOT parsed: agg={s}, col={s}, pivot_col={s}, values={d}", .{
+                query.pivot_agg_col, query.pivot_col, query.pivot_col, query.pivot_value_count
+            });
+        }
+        pos = skipWs(sql, pos);
+    }
 
     while (query.join_count < MAX_JOINS) {
 
