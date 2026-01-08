@@ -130,9 +130,11 @@ pub const WhereClause = struct {
     near_target_row: ?u32 = null,
     near_top_k: u32 = 0,
     // Runtime cache for NEAR results (indices that matched)
-    near_matches: ?[]const u32 = null, 
+    near_matches: ?[]const u32 = null,
     // Flag to indicate if this clause was a NEAR clause (internal use)
     is_near_evaluated: bool = false,
+    // Flag for text-based NEAR requiring embedding model
+    is_text_near: bool = false,
 };
 
 /// Aggregate expression
@@ -2947,10 +2949,16 @@ fn executeInsert(query: *ParsedQuery) !void {
                          try appendString(col, val_str);
                      },
                      .float32 => {
+                         // Initialize data_ptr if null
+                         if (col.data_ptr == null) {
+                             const new_list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(f32));
+                             new_list.* = std.ArrayListUnmanaged(f32){};
+                             col.data_ptr = new_list;
+                         }
+                         const list = @as(*std.ArrayListUnmanaged(f32), @ptrCast(@alignCast(col.data_ptr)));
                          // Check if this is a vector column
                          if (col.vector_dim > 1) {
                              // Parse vector literal like "[1.0, 2.0, 3.0]"
-                             const list = @as(*std.ArrayListUnmanaged(f32), @ptrCast(@alignCast(col.data_ptr orelse return error.NoDataPtr)));
                              var it = std.mem.tokenizeAny(u8, val_str, " ,[]");
                              var count: u32 = 0;
                              while (it.next()) |token| {
@@ -2965,10 +2973,9 @@ fn executeInsert(query: *ParsedQuery) !void {
                              }
                          } else {
                              const val = std.fmt.parseFloat(f32, val_str) catch 0.0;
-                             const list = @as(*std.ArrayListUnmanaged(f32), @ptrCast(@alignCast(col.data_ptr orelse return error.NoDataPtr)));
                              try list.append(memory.wasm_allocator, val);
                          }
-                         col.data.float32 = @as(*std.ArrayListUnmanaged(f32), @ptrCast(@alignCast(col.data_ptr))).items;
+                         col.data.float32 = list.items;
                      },
                     else => {},
                  }
@@ -3863,8 +3870,8 @@ pub export fn executeSql() u32 {
 
     // Find primary table (ONLY for SELECT)
     var table: ?*const TableInfo = null;
-    for (&tables) |*t| {
-        if (t.*) |*tbl| {
+    for (0..table_count) |i| {
+        if (tables[i]) |*tbl| {
             if (std.mem.eql(u8, tbl.name, query.table_name)) {
                 table = tbl;
                 break;
@@ -4241,11 +4248,16 @@ fn executeVectorSearch(table: *const TableInfo, near: *const WhereClause, limit:
 
 fn resolveNearClauses(table: *const TableInfo, where: *WhereClause, limit: usize) !void {
     if (where.op == .near) {
+        // Check for text-based NEAR that requires embedding model
+        if (where.is_text_near) {
+            setError("NEAR with text requires embedding model - no model loaded");
+            return error.NoModelLoaded;
+        }
         if (!where.is_near_evaluated) {
             const top_k = if (limit > 0) limit else 10;
             const match_ptr = memory.wasmAlloc(top_k * 4) orelse return error.OutOfMemory;
             const matches = @as([*]u32, @ptrCast(@alignCast(match_ptr)))[0..top_k];
-            
+
             const count = try executeVectorSearch(table, where, limit, matches);
             where.near_matches = matches[0..count];
             where.is_near_evaluated = true;
@@ -10962,7 +10974,7 @@ pub fn parseSql(sql: []const u8) ?*ParsedQuery {
                     .near_target_row = near_target_row,
                     .top_k = join_top_k,
                 };
-                query.join_count += 1;
+                // Note: join_count incremented at end of loop
             } else {
                 // Check for compound condition (AND/OR after first comparison)
                 // Save position to reparse if compound
@@ -12640,6 +12652,17 @@ fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
                     .column = column,
                     .near_vector_ptr = vec_ptr,
                     .near_dim = dim,
+                };
+            }
+            return null;
+        } else if (pos.* < sql.len and (sql[pos.*] == '\'' or sql[pos.*] == '"')) {
+            // NEAR 'text' - requires text embedding model
+            // Mark this as a text search NEAR that will fail at runtime
+            if (lhs_col_name) |column| {
+                return WhereClause{
+                    .op = .near,
+                    .column = column,
+                    .is_text_near = true, // Flag for text search requiring model
                 };
             }
             return null;
