@@ -29,6 +29,8 @@ const MAX_AGGREGATES: usize = 16;
 const MAX_JOIN_ROWS: usize = 200000;
 const MAX_INSERT_ROWS: usize = 2000;
 const MAX_ROWS: usize = 200000;
+const NULL_SENTINEL_INT: i64 = std.math.minInt(i64);
+const NULL_SENTINEL_FLOAT: f64 = std.math.nan(f64);
 const MAX_VECTOR_DIM: usize = 1536; // Support up to OpenAI embedding size
 const VECTOR_SIZE: usize = 1024; // Chunk size for vectorized execution
 
@@ -149,6 +151,7 @@ pub const JoinType = enum { inner, left, right, cross };
 /// JOIN clause
 pub const JoinClause = struct {
     table_name: []const u8,
+    alias: ?[]const u8 = null,
     join_type: JoinType = .inner,
     left_col: []const u8 = "",
     right_col: []const u8 = "",
@@ -317,13 +320,12 @@ export var sql_input: [131072]u8 = undefined;
 export var sql_input_len: usize = 0;
 
 // Global scratch buffers to avoid stack overflow
-const JoinPair = struct { left: u32, right: u32 };
+const JoinRow = struct { indices: [MAX_JOINS + 1]u32 };
 var global_indices_1: [MAX_ROWS]u32 = undefined;
 var global_indices_2: [MAX_ROWS]u32 = undefined;
 var global_indices_3: [MAX_ROWS]u32 = undefined;
-var global_join_pairs: [MAX_JOIN_ROWS]JoinPair = undefined;
-
-var global_join_pair_count: usize = 0;
+var global_join_rows_src: [MAX_JOIN_ROWS]JoinRow = undefined;
+var global_join_rows_dst: [MAX_JOIN_ROWS]JoinRow = undefined;
 
 var global_partition_keys: [MAX_ROWS]i64 = undefined;
 var global_processed: [MAX_ROWS]bool = undefined;
@@ -2015,12 +2017,22 @@ fn executeInsert(query: *ParsedQuery) !void {
                  const val_str = query.insert_values[row_idx][col_idx];
                                   switch (col.col_type) {
                      .int64 => {
-                         const val = std.fmt.parseInt(i64, val_str, 10) catch 0;
-                         try appendInt(col, val);
+                         // Check for NULL value (case-insensitive)
+                         if (std.ascii.eqlIgnoreCase(val_str, "NULL") or val_str.len == 0) {
+                             try appendInt(col, NULL_SENTINEL_INT);
+                         } else {
+                             const val = std.fmt.parseInt(i64, val_str, 10) catch 0;
+                             try appendInt(col, val);
+                         }
                      },
                      .float64 => {
-                         const val = std.fmt.parseFloat(f64, val_str) catch 0.0;
-                         try appendFloat(col, val);
+                         // Check for NULL value (case-insensitive)
+                         if (std.ascii.eqlIgnoreCase(val_str, "NULL") or val_str.len == 0) {
+                             try appendFloat(col, NULL_SENTINEL_FLOAT);
+                         } else {
+                             const val = std.fmt.parseFloat(f64, val_str) catch 0.0;
+                             try appendFloat(col, val);
+                         }
                      },
                      .string, .list => {
                          try appendString(col, val_str);
@@ -2069,12 +2081,22 @@ fn executeInsert(query: *ParsedQuery) !void {
                       if (tbl.memory_columns[schema_idx]) |*mc| {
                           switch (mc.col_type) {
                               .int64 => {
-                                  const val = std.fmt.parseInt(i64, val_str, 10) catch 0;
-                                  try appendInt(mc, val);
+                                  // Check for NULL value (case-insensitive)
+                                  if (std.ascii.eqlIgnoreCase(val_str, "NULL") or val_str.len == 0) {
+                                      try appendInt(mc, NULL_SENTINEL_INT);
+                                  } else {
+                                      const val = std.fmt.parseInt(i64, val_str, 10) catch 0;
+                                      try appendInt(mc, val);
+                                  }
                               },
                               .float64 => {
-                                  const val = std.fmt.parseFloat(f64, val_str) catch 0.0;
-                                  try appendFloat(mc, val);
+                                  // Check for NULL value (case-insensitive)
+                                  if (std.ascii.eqlIgnoreCase(val_str, "NULL") or val_str.len == 0) {
+                                      try appendFloat(mc, NULL_SENTINEL_FLOAT);
+                                  } else {
+                                      const val = std.fmt.parseFloat(f64, val_str) catch 0.0;
+                                      try appendFloat(mc, val);
+                                  }
                               },
                               .string, .list => {
                                   try appendString(mc, val_str);
@@ -3168,31 +3190,25 @@ fn executeSelectQuery(table: *const TableInfo, query: *ParsedQuery) !void {
         var i: usize = 1;
         while (i < match_count) : (i += 1) {
             var is_dup = false;
-            // Check if this row matches any previous row
+            // Check if this row matches any previous unique row
             var j: usize = 0;
             while (j < unique_count) : (j += 1) {
-                // _ = all_equal = true;
-                for (query.select_exprs[0..query.select_count]) |expr| {
-                     // Evaluate both
-                     // For now only support simple columns for Distinct
-                     if (expr.func == .none) {
-                         // lookup column locally
-                         // This is slow. DISTINCT needs refactor for scalar functions.
-                         // SKIP validation for now.
-                     }
-                }
-                // Placeholder: Use first column only if available
-                 if (output_cols[0] < MAX_COLUMNS) {
-                    if (table.columns[output_cols[0]]) |*col| {
-                         if (compareValues(table, col, match_indices[i], match_indices[j]) != 0) {
-                              is_dup = false;
-                            // all_equal = false; breaks logic
-                         } else {
-                             is_dup = true;
-                         }
+                var all_cols_match = true;
+                // Check all output columns for this pair
+                for (output_cols[0..output_count]) |col_idx| {
+                    if (col_idx < MAX_COLUMNS) {
+                        if (table.columns[col_idx]) |*col| {
+                            if (compareValues(table, col, match_indices[i], match_indices[j]) != 0) {
+                                all_cols_match = false;
+                                break;
+                            }
+                        }
                     }
-                 }
-
+                }
+                if (all_cols_match) {
+                    is_dup = true;
+                    break;
+                }
             }
             if (!is_dup) {
                 match_indices[unique_count] = match_indices[i];
@@ -3713,571 +3729,487 @@ fn writeSetOpResult(table1: *const TableInfo, table2: *const TableInfo, output_c
 fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !void {
     if (query.join_count == 0) return error.NoJoin;
 
-    const join = query.joins[0];
-
-    // Find right table
-    var right_table: ?*const TableInfo = null;
-    for (&tables) |*t| {
-        if (t.*) |*tbl| {
-            if (std.mem.eql(u8, tbl.name, join.table_name)) {
-                right_table = tbl;
-                break;
-            }
-        }
-    }
-
-    const rtbl = right_table orelse return error.TableNotFound;
-
-    // Find join columns
-    var left_col: ?*const ColumnData = null;
-    var right_col: ?*const ColumnData = null;
-
-    for (left_table.columns[0..left_table.column_count]) |maybe_col| {
-        if (maybe_col) |*c| {
-            if (std.mem.eql(u8, c.name, join.left_col)) {
-                left_col = c;
-                break;
-            }
-            // Check alias e.g. "c.id" == "id"
-            if (join.left_col.len > c.name.len + 1) {
-                const suffix_start = join.left_col.len - c.name.len;
-                if (join.left_col[suffix_start - 1] == '.' and 
-                    std.mem.eql(u8, join.left_col[suffix_start..], c.name)) {
-                    left_col = c;
-                    break;
-                }
-            }
-        }
-    }
-
-    for (rtbl.columns[0..rtbl.column_count]) |maybe_col| {
-        if (maybe_col) |*c| {
-            if (std.mem.eql(u8, c.name, join.right_col)) {
-                right_col = c;
-                break;
-            }
-             // Check alias e.g. "o.customer_id" == "customer_id"
-            if (join.right_col.len > c.name.len + 1) {
-                const suffix_start = join.right_col.len - c.name.len;
-                if (join.right_col[suffix_start - 1] == '.' and 
-                    std.mem.eql(u8, join.right_col[suffix_start..], c.name)) {
-                    right_col = c;
-                    break;
-                }
-            }
-        }
-    }
-
-    const join_pairs = &global_join_pairs;
-    var pair_count: usize = 0;
+    // Track tables involved for index resolution
+    var tables_in_join: [MAX_JOINS + 1]*const TableInfo = undefined;
+    var tables_in_join_aliases: [MAX_JOINS + 1]?[]const u8 = undefined;
     
-    // Check Columns
-    if (!join.is_near and left_col == null) {
-        var buf: [1024]u8 = undefined;
-        var fba = std.io.fixedBufferStream(&buf);
-        const writer = fba.writer();
+    tables_in_join[0] = left_table;
+    tables_in_join_aliases[0] = query.table_alias;
+
+    // Use double buffering
+    var src_buffer: []JoinRow = global_join_rows_src[0..MAX_JOIN_ROWS];
+    var dst_buffer: []JoinRow = global_join_rows_dst[0..MAX_JOIN_ROWS];
+    var src_count: usize = 0;
+
+    for (0..query.join_count) |join_idx| {
+        const join = query.joins[join_idx];
+
+        // Find right table
+        const rtbl = findTable(join.table_name) orelse return error.TableNotFound;
+        tables_in_join[join_idx + 1] = rtbl;
+        tables_in_join_aliases[join_idx + 1] = join.alias;
+
+        // Resolve Columns
+        var left_col: ?*const ColumnData = null;
+        var left_tbl_idx: usize = 0;
         
-        writer.print("ColumnNotFound Left: '{s}' in table '{s}'. Columns: ", .{join.left_col, left_table.name}) catch {};
-
-        // Log available columns
-        for (left_table.columns[0..left_table.column_count]) |maybe_col| {
-            if (maybe_col) |c| {
-                writer.print("['{s}' l={d}] ", .{c.name, c.name.len}) catch {};
-            }
-        }
-        
-        log("{s}", .{fba.getWritten()});
-        return error.ColumnNotFound;
-    }
-    if (right_col == null) {
-        var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "ColumnNotFound Right: '{s}' in table '{s}'", .{join.right_col, rtbl.name}) catch "fmt error";
-        log("{s}", .{msg});
-        return error.ColumnNotFound;
-    }
-
-    const lc = if (join.is_near) null else left_col.?; // Safe because checked above
-    const rc = right_col.?;
-
-    // NEAR Join Support
-    if (join.is_near) {
-        const top_k = join.top_k orelse query.top_k orelse 20;
-        const match_ptr = memory.wasmAlloc(top_k * 4) orelse return error.OutOfMemory;
-        const matches = @as([*]u32, @ptrCast(@alignCast(match_ptr)))[0..top_k];
-        
-        // Setup a mock WhereClause for executeVectorSearch
-        var near_clause = WhereClause{
-            .op = .near,
-            .column = rc.name,
-            .near_dim = join.near_dim,
-            .near_target_row = join.near_target_row,
-        };
-        @memcpy(near_clause.near_vector[0..join.near_dim], join.near_vector[0..join.near_dim]);
-
-        const count = try executeVectorSearch(rtbl, &near_clause, top_k, matches);
-        for (0..left_table.row_count) |li| {
-            for (matches[0..count]) |ri| {
-                if (pair_count < MAX_JOIN_ROWS) {
-                    join_pairs[pair_count] = .{ .left = @intCast(li), .right = ri };
-                    pair_count += 1;
-                } else break;
-            }
-        }
-        memory.free(match_ptr, top_k * 4);
-    } else {
-        // Hash Join (O(N+M))
-        // Use global_indices_2 as next_match array for chaining
-        const next_match = &global_indices_2;
-        // Initialize with NO_MATCH (u32.max)
-        @memset(next_match[0..rtbl.row_count], std.math.maxInt(u32));
-
-        // Build hash table for right side
-        var hash_map = std.AutoHashMap(i64, u32).init(memory.wasm_allocator);
-        defer hash_map.deinit();
-
-        var r_frag_start: u32 = 0;
-        for (rtbl.fragments[0..rtbl.fragment_count]) |maybe_f| {
-            if (maybe_f) |frag| {
-                const f_rows = @as(u32, @intCast(frag.getRowCount()));
-                const raw_ptr = frag.getColumnRawPtr(rc.fragment_col_idx) orelse {
-                     r_frag_start += f_rows;
-                     continue;
-                };
-                for (0..f_rows) |f_ri| {
-                    const key = getIntValueFromPtr(raw_ptr, rc.col_type, @intCast(f_ri));
-                    const ri = r_frag_start + @as(u32, @intCast(f_ri));
-                    if (hash_map.get(key)) |head| {
-                        next_match[ri] = head;
-                    }
-                    try hash_map.put(key, ri);
+        // Search in all previous tables for left column
+        if (!join.is_near) {
+            var found_left = false;
+            for (tables_in_join[0..join_idx+1], 0..) |prev_t, t_idx| {
+                if (findTableColumn(prev_t, join.left_col)) |c| {
+                    left_col = c;
+                    left_tbl_idx = t_idx;
+                    found_left = true;
+                    break;
                 }
-                r_frag_start += f_rows;
-            }
-        }
-        // Handle in-memory right table (from main columns)
-        if (rtbl.row_count > r_frag_start) {
-            const mem_rows = rtbl.row_count - r_frag_start;
-            for (0..mem_rows) |mi| {
-                 const key = getIntValue(rtbl, rc, r_frag_start + @as(u32, @intCast(mi)));
-                 const ri = r_frag_start + @as(u32, @intCast(mi));
-                 if (hash_map.get(key)) |head| {
-                     next_match[ri] = head;
-                 }
-                 try hash_map.put(key, ri);
-            }
-        }
-
-        // Scan left table and join
-        var l_frag_start: u32 = 0;
-        var filter_ctx: ?FragmentContext = null;
-        for (left_table.fragments[0..left_table.fragment_count]) |maybe_f| {
-            if (maybe_f) |frag| {
-                const f_rows = @as(u32, @intCast(frag.getRowCount()));
-                const raw_ptr = frag.getColumnRawPtr(lc.?.fragment_col_idx) orelse {
-                    l_frag_start += f_rows;
-                    continue;
-                };
-                for (0..f_rows) |f_li| {
-                    const li = l_frag_start + @as(u32, @intCast(f_li));
-                    // Apply WHERE (Left Table)
-                    if (query.where_clause) |*where| {
-                         const filter_pass = evaluateWhere(left_table, where, li, &filter_ctx);
-                         // log("Join Filter Li: {d} Pass: {}", .{li, filter_pass});
-                         if (!filter_pass) continue;
-                    }
-
-                    const key = getIntValueFromPtr(raw_ptr, lc.?.col_type, @intCast(f_li));
-
-                    if (hash_map.get(key)) |head| {
-                        var curr: u32 = head;
-                        while (curr != std.math.maxInt(u32)) {
-                            if (rowsMatch(lc.?, rc, li, curr)) {
-                                if (pair_count < MAX_JOIN_ROWS) {
-                                    join_pairs[pair_count] = .{ .left = li, .right = curr };
-                                    pair_count += 1;
-                                } else break;
+                // Check prefix match using aliases/names
+                for (prev_t.columns[0..prev_t.column_count]) |maybe_c| {
+                    if (maybe_c) |*c| {
+                        // Check Alias Prefix
+                        if (tables_in_join_aliases[t_idx]) |alias| {
+                            if (join.left_col.len == alias.len + 1 + c.name.len) {
+                                if (std.mem.eql(u8, join.left_col[0..alias.len], alias) and
+                                    join.left_col[alias.len] == '.' and
+                                    std.mem.eql(u8, join.left_col[alias.len+1..], c.name)) {
+                                    left_col = c;
+                                    left_tbl_idx = t_idx;
+                                    found_left = true;
+                                    break;
+                                }
                             }
-                            curr = next_match[curr];
+                        }
+                        // Check Table Name Prefix
+                        if (join.left_col.len == prev_t.name.len + 1 + c.name.len) {
+                            if (std.mem.eql(u8, join.left_col[0..prev_t.name.len], prev_t.name) and
+                                join.left_col[prev_t.name.len] == '.' and
+                                std.mem.eql(u8, join.left_col[prev_t.name.len+1..], c.name)) {
+                                left_col = c;
+                                left_tbl_idx = t_idx;
+                                found_left = true;
+                                break;
+                            }
                         }
                     }
                 }
-                l_frag_start += f_rows;
+                if (found_left) break;
+            }
+            if (left_col == null) return error.ColumnNotFound;
+        }
+
+        var right_col: ?*const ColumnData = null;
+        if (findTableColumn(rtbl, join.right_col)) |c| {
+            right_col = c;
+        } else {
+             // Try prefix match for right col
+             for (rtbl.columns[0..rtbl.column_count]) |maybe_c| {
+                if (maybe_c) |*c| {
+                    // Check Alias
+                    if (join.alias) |alias| {
+                         if (join.right_col.len == alias.len + 1 + c.name.len) {
+                            if (std.mem.eql(u8, join.right_col[0..alias.len], alias) and
+                                join.right_col[alias.len] == '.' and
+                                std.mem.eql(u8, join.right_col[alias.len+1..], c.name)) {
+                                right_col = c;
+                                break;
+                            }
+                        }
+                    }
+                    // Check Table Name
+                     if (join.right_col.len == rtbl.name.len + 1 + c.name.len) {
+                        if (std.mem.eql(u8, join.right_col[0..rtbl.name.len], rtbl.name) and
+                            join.right_col[rtbl.name.len] == '.' and
+                            std.mem.eql(u8, join.right_col[rtbl.name.len+1..], c.name)) {
+                            right_col = c;
+                            break;
+                        }
+                    }
+                }
             }
         }
-        // Handle in-memory left table
-        if (left_table.row_count > l_frag_start) {
-            const mem_rows = left_table.row_count - l_frag_start;
-            for (0..mem_rows) |mi| {
-                 const key = getIntValue(left_table, lc.?, l_frag_start + @as(u32, @intCast(mi)));
-                 const li = l_frag_start + @as(u32, @intCast(mi));
-                 
-                 // Apply WHERE (Left Table)
-                 if (query.where_clause) |*where| {
-                      if (!evaluateWhere(left_table, where, li, &filter_ctx)) continue;
-                 }
+        if (right_col == null) return error.ColumnNotFound;
 
-                 if (hash_map.get(key)) |head| {
-                     var curr: u32 = head;
-                     while (curr != std.math.maxInt(u32)) {
-                         if (rowsMatch(lc.?, rc, li, curr)) {
-                             if (pair_count < MAX_JOIN_ROWS) {
-                                 join_pairs[pair_count] = .{ .left = li, .right = curr };
-                                 pair_count += 1;
-                             } else break;
+        const lc = if (join.is_near) null else left_col.?;
+        const rc = right_col.?;
+
+        // ------------------
+        // Execution
+        // ------------------
+        var pair_count: usize = 0;
+
+        if (join.is_near and join_idx == 0) {
+             const top_k = join.top_k orelse query.top_k orelse 20;
+             const match_ptr = memory.wasmAlloc(top_k * 4) orelse return error.OutOfMemory;
+             const matches = @as([*]u32, @ptrCast(@alignCast(match_ptr)))[0..top_k];
+             
+             var near_clause = WhereClause{
+                 .op = .near,
+                 .column = rc.name,
+                 .near_dim = join.near_dim,
+                 .near_target_row = join.near_target_row,
+             };
+             @memcpy(near_clause.near_vector[0..join.near_dim], join.near_vector[0..join.near_dim]);
+
+             const count = try executeVectorSearch(rtbl, &near_clause, top_k, matches);
+             
+             for (0..left_table.row_count) |li| {
+                 for (matches[0..count]) |ri| {
+                     if (pair_count < MAX_JOIN_ROWS) {
+                         @memset(&dst_buffer[pair_count].indices, std.math.maxInt(u32));
+                         dst_buffer[pair_count].indices[0] = @intCast(li);
+                         dst_buffer[pair_count].indices[1] = ri;
+                         pair_count += 1;
+                     } else break;
+                 }
+             }
+             memory.free(match_ptr, top_k * 4);
+        } else if (join.is_near) {
+            return error.NotImplemented; 
+        } else {
+             // Hash Join
+             const next_match = &global_indices_2;
+             @memset(next_match[0..rtbl.row_count], std.math.maxInt(u32));
+             var hash_map = std.AutoHashMap(i64, u32).init(memory.wasm_allocator);
+             defer hash_map.deinit();
+
+             var r_frag_start: u32 = 0;
+             for (rtbl.fragments[0..rtbl.fragment_count]) |maybe_f| {
+                 if (maybe_f) |frag| {
+                     const f_rows = @as(u32, @intCast(frag.getRowCount()));
+                     var idx: u32 = 0;
+                     while (idx < f_rows) {
+                         const chunk = @min(VECTOR_SIZE, f_rows - idx);
+                         for (0..chunk) |k| {
+                              const f_ri = idx + @as(u32, @intCast(k));
+                              const key = getIntValue(rtbl, rc, r_frag_start + f_ri);
+                              const ri = r_frag_start + f_ri;
+                              if (hash_map.get(key)) |head| {
+                                  next_match[ri] = head;
+                              }
+                              try hash_map.put(key, ri);
                          }
-                         curr = next_match[curr];
+                         idx += @intCast(chunk);
+                     }
+                     r_frag_start += f_rows;
+                 }
+             }
+             if (rtbl.row_count > r_frag_start) {
+                 for (r_frag_start..rtbl.row_count) |ri_usize| {
+                      const ri: u32 = @intCast(ri_usize);
+                      const key = getIntValue(rtbl, rc, ri);
+                      if (hash_map.get(key)) |head| {
+                          next_match[ri] = head;
+                      }
+                      try hash_map.put(key, ri);
+                 }
+             }
+             
+             if (join_idx == 0) {
+                 const lt = tables_in_join[0];
+                 for (0..lt.row_count) |li_usize| {
+                     const li: u32 = @intCast(li_usize);
+                     const left_val = getIntValue(lt, lc.?, li);
+                     if (hash_map.get(left_val)) |head| {
+                         var curr = head;
+                         while (curr != std.math.maxInt(u32)) {
+                             const right_val = getIntValue(rtbl, rc, curr);
+                             if (left_val == right_val) {
+                                 if (pair_count < MAX_JOIN_ROWS) {
+                                     @memset(&dst_buffer[pair_count].indices, std.math.maxInt(u32));
+                                     dst_buffer[pair_count].indices[0] = li;
+                                     dst_buffer[pair_count].indices[1] = curr;
+                                     pair_count += 1;
+                                 }
+                             }
+                             curr = next_match[curr];
+                         }
                      }
                  }
+             } else {
+                 const lt = tables_in_join[left_tbl_idx];
+                 for (0..src_count) |i| {
+                     const l_idx = src_buffer[i].indices[left_tbl_idx];
+                     if (l_idx == std.math.maxInt(u32)) continue;
+
+                     const left_val = getIntValue(lt, lc.?, l_idx);
+                     if (hash_map.get(left_val)) |head| {
+                         var curr = head;
+                         while (curr != std.math.maxInt(u32)) {
+                             const right_val = getIntValue(rtbl, rc, curr);
+                             if (left_val == right_val) {
+                                 if (pair_count < MAX_JOIN_ROWS) {
+                                     dst_buffer[pair_count].indices = src_buffer[i].indices;
+                                     dst_buffer[pair_count].indices[join_idx + 1] = curr;
+                                     pair_count += 1;
+                                 }
+                             }
+                             curr = next_match[curr];
+                         }
+                     }
+                 }
+             }
+        }
+        
+        const tmp = src_buffer;
+        src_buffer = dst_buffer;
+        dst_buffer = tmp;
+        src_count = pair_count;
+    }
+    
+    // Apply WHERE clause filtering to joined results
+    if (query.where_clause != null) {
+        const where = &query.where_clause.?;
+        const where_col_name = where.column orelse "";
+        
+        // Only filter if we have an actual column to check
+        if (where_col_name.len > 0) {
+            var filtered_count: usize = 0;
+            var context: ?FragmentContext = null;
+            
+            // Find the table and column referenced in WHERE clause
+            var where_table: ?*const TableInfo = null;
+            var where_col: ?*const ColumnData = null;
+            var where_t_idx: usize = 0;
+            
+            // Resolve column - try with alias prefix first
+            for (tables_in_join[0..query.join_count+1], 0..) |t, t_idx| {
+                if (findTableColumn(t, where_col_name)) |c| {
+                    where_table = t;
+                    where_col = c;
+                    where_t_idx = t_idx;
+                    break;
+                }
+            // Check prefix match
+            for (t.columns[0..t.column_count]) |*maybe_c| {
+                if (maybe_c.*) |*c| {
+                    // Check alias prefix
+                    if (tables_in_join_aliases[t_idx]) |alias| {
+                        if (where_col_name.len == alias.len + 1 + c.name.len) {
+                            if (std.mem.eql(u8, where_col_name[0..alias.len], alias) and
+                                where_col_name[alias.len] == '.' and
+                                std.mem.eql(u8, where_col_name[alias.len+1..], c.name)) {
+                                where_table = t;
+                                where_col = c;
+                                where_t_idx = t_idx;
+                                break;
+                            }
+                        }
+                    }
+                    // Check table name prefix
+                    if (where_col_name.len == t.name.len + 1 + c.name.len) {
+                        if (std.mem.eql(u8, where_col_name[0..t.name.len], t.name) and
+                            where_col_name[t.name.len] == '.' and
+                            std.mem.eql(u8, where_col_name[t.name.len+1..], c.name)) {
+                            where_table = t;
+                            where_col = c;
+                            where_t_idx = t_idx;
+                            break;
+                        }
+                    }
+                }
             }
+            if (where_col != null) break;
+        }
+        
+        if (where_table != null and where_col != null) {
+            const wt = where_table.?;
+            const wc = where_col.?;
+            
+            for (0..src_count) |i| {
+                const row_idx = src_buffer[i].indices[where_t_idx];
+                if (row_idx == std.math.maxInt(u32)) continue;
+                
+                // Evaluate the WHERE condition
+                if (evaluateComparison(wt, wc, row_idx, where, &context)) {
+                    // Row passes filter - keep it
+                    dst_buffer[filtered_count] = src_buffer[i];
+                    filtered_count += 1;
+                }
+            }
+            
+            // Swap buffers
+            const tmp2 = src_buffer;
+            src_buffer = dst_buffer;
+            dst_buffer = tmp2;
+            src_count = filtered_count;
+        }
         }
     }
-
-    global_join_pair_count = pair_count;
-
-    // Calculate result columns (all from both tables)
-    const left_col_count = left_table.column_count;
-    const right_col_count = rtbl.column_count;
-    const total_cols = left_col_count + right_col_count;
     
-    // Safety check
+    // Output Phase
+    const pair_count = src_count;
+    
+    var total_cols: usize = 0;
+    if (query.select_count > 0 and !query.is_star) {
+         total_cols = query.select_count;
+    } else {
+         for (0..query.join_count+1) |t_idx| {
+             total_cols += tables_in_join[t_idx].column_count;
+         }
+    }
     if (total_cols > 64) return error.TooManyColumns;
     
-    // Estimate capacity (heuristic)
     const capacity = pair_count * total_cols * 16 + 1024 * total_cols + 65536;
-    if (lw.fragmentBegin(capacity) == 0) {
-        return error.OutOfMemory;
-    }
+    if (lw.fragmentBegin(capacity) == 0) return error.OutOfMemory;
 
-    // Write Result Columns
+    const WriteContext = struct {
+        table: *const TableInfo,
+        col: *const ColumnData,
+        t_idx: usize,
+        out_name: []const u8,
+    };
+    
+    var output_cols_ctx: [MAX_COLUMNS]WriteContext = undefined;
+    var out_col_count: usize = 0;
+
     if (query.select_count > 0 and !query.is_star) {
-        // Selective output
-        var l_ctx: ?FragmentContext = null;
-        var r_ctx: ?FragmentContext = null;
-
         for (query.select_exprs[0..query.select_count]) |expr| {
-            var col: ?*const ColumnData = null;
-            var is_left = true;
-
-            // Try Left Table
-            for (left_table.columns[0..left_table.column_count]) |maybe_col| {
-                if (maybe_col) |*c| {
-                     var match = std.mem.eql(u8, c.name, expr.col_name);
-                     if (!match and std.mem.indexOf(u8, expr.col_name, ".") != null) {
-                         if (std.mem.endsWith(u8, expr.col_name, c.name)) {
-                             if (expr.col_name.len > c.name.len and expr.col_name[expr.col_name.len - c.name.len - 1] == '.') {
-                                 match = true;
+            var found = false;
+            for (tables_in_join[0..query.join_count+1], 0..) |t, t_idx| {
+                 if (findTableColumn(t, expr.col_name)) |c| {
+                     var prefix_match = true;
+                     if (std.mem.indexOf(u8, expr.col_name, ".")) |_| {
+                         prefix_match = false;
+                         if (tables_in_join_aliases[t_idx]) |alias| {
+                             if (expr.col_name.len == alias.len + 1 + c.name.len) {
+                                 if (std.mem.eql(u8, expr.col_name[0..alias.len], alias)) {
+                                     prefix_match = true;
+                                 }
+                             }
+                         }
+                         if (!prefix_match) {
+                             if (expr.col_name.len == t.name.len + 1 + c.name.len) {
+                                 if (std.mem.eql(u8, expr.col_name[0..t.name.len], t.name)) {
+                                     prefix_match = true;
+                                 }
                              }
                          }
                      }
-                     if (match) {
-                         col = c;
-                         is_left = true;
+                     if (prefix_match) {
+                         const alias = if (expr.alias) |a| a else c.name;
+                         output_cols_ctx[out_col_count] = .{ .table = t, .col = c, .t_idx = t_idx, .out_name = alias };
+                         out_col_count += 1;
+                         found = true;
                          break;
                      }
-                }
-            }
-
-            // Try Right Table
-            if (col == null) {
-                for (rtbl.columns[0..right_col_count]) |maybe_col| {
-                    if (maybe_col) |*c| {
-                         var match = std.mem.eql(u8, c.name, expr.col_name);
-                         if (!match and std.mem.indexOf(u8, expr.col_name, ".") != null) {
-                             if (std.mem.endsWith(u8, expr.col_name, c.name)) {
-                                 if (expr.col_name.len > c.name.len and expr.col_name[expr.col_name.len - c.name.len - 1] == '.') {
-                                     match = true;
-                                 }
-                             }
-                         }
-                         if (match) {
-                             col = c;
-                             is_left = false;
-                             break;
-                         }
+                 }
+                 for (t.columns[0..t.column_count]) |*maybe_c| {
+                    if (maybe_c.*) |*c| {
+                        if (tables_in_join_aliases[t_idx]) |alias| {
+                            if (expr.col_name.len == alias.len + 1 + c.name.len) {
+                                if (std.mem.eql(u8, expr.col_name[0..alias.len], alias) and
+                                    expr.col_name[alias.len] == '.' and
+                                    std.mem.eql(u8, expr.col_name[alias.len+1..], c.name)) {
+                                    
+                                    const alias_out = if (expr.alias) |a| a else c.name;
+                                    output_cols_ctx[out_col_count] = .{ .table = t, .col = c, .t_idx = t_idx, .out_name = alias_out };
+                                    out_col_count += 1;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                         if (expr.col_name.len == t.name.len + 1 + c.name.len) {
+                            if (std.mem.eql(u8, expr.col_name[0..t.name.len], t.name) and
+                                expr.col_name[t.name.len] == '.' and
+                                std.mem.eql(u8, expr.col_name[t.name.len+1..], c.name)) {
+                                
+                                const alias_out = if (expr.alias) |a| a else c.name;
+                                output_cols_ctx[out_col_count] = .{ .table = t, .col = c, .t_idx = t_idx, .out_name = alias_out };
+                                out_col_count += 1;
+                                found = true;
+                                break;
+                            }
+                        }
                     }
                 }
-            }
-
-            if (col) |c| {
-                const out_name = expr.alias orelse c.name;
-                const col_type = c.col_type;
-                const is_lazy = c.is_lazy;
-                const f_col_idx = c.fragment_col_idx;
-
-                switch (col_type) {
-                    .int64 => {
-                        const data = try memory.wasm_allocator.alloc(i64, pair_count);
-                        defer memory.wasm_allocator.free(data);
-                        for (join_pairs[0..pair_count], 0..) |pair, i| {
-                            const idx = if (is_left) pair.left else pair.right;
-                            if (is_lazy) {
-                                 const ctx = if (is_left) &l_ctx else &r_ctx;
-                                 const table = if (is_left) left_table else rtbl;
-                                 if (ctx.* == null or idx < ctx.*.?.start_idx or idx >= ctx.*.?.end_idx) {
-                                     ctx.* = null;
-                                     _ = getIntValueOptimized(table, c, idx, ctx);
-                                 }
-                                 if (ctx.*.?.frag) |frag| {
-                                     const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
-                                     const typed_ptr: [*]const i64 = @ptrCast(@alignCast(raw_ptr));
-                                     data[i] = typed_ptr[idx - ctx.*.?.start_idx];
-                                 }
-                            } else {
-                                data[i] = c.data.int64[idx];
-                            }
-                        }
-                        _ = lw.fragmentAddInt64Column(out_name.ptr, out_name.len, data.ptr, pair_count, false);
-                    },
-                    .float64 => {
-                        const data = try memory.wasm_allocator.alloc(f64, pair_count);
-                        defer memory.wasm_allocator.free(data);
-                        for (join_pairs[0..pair_count], 0..) |pair, i| {
-                            const idx = if (is_left) pair.left else pair.right;
-                            if (is_lazy) {
-                                 const ctx = if (is_left) &l_ctx else &r_ctx;
-                                 const table = if (is_left) left_table else rtbl;
-                                 if (ctx.* == null or idx < ctx.*.?.start_idx or idx >= ctx.*.?.end_idx) {
-                                     ctx.* = null;
-                                     _ = getFloatValueOptimized(table, c, idx, ctx);
-                                 }
-                                 if (ctx.*.?.frag) |frag| {
-                                     const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
-                                     const typed_ptr: [*]const f64 = @ptrCast(@alignCast(raw_ptr));
-                                     data[i] = typed_ptr[idx - ctx.*.?.start_idx];
-                                 }
-                            } else {
-                                data[i] = c.data.float64[idx];
-                            }
-                        }
-                        _ = lw.fragmentAddFloat64Column(out_name.ptr, out_name.len, data.ptr, pair_count, false);
-                    },
-                    .string, .list => {
-                        var total_len: usize = 0;
-                        const offsets = try memory.wasm_allocator.alloc(u32, pair_count + 1);
-                        defer memory.wasm_allocator.free(offsets);
-                        var current_offset: u32 = 0;
-                        offsets[0] = 0;
-                        
-                        if (!is_lazy) {
-                            const lens = c.data.strings.lengths;
-                            for (join_pairs[0..pair_count], 0..) |pair, i| {
-                                const idx = if (is_left) pair.left else pair.right;
-                                const len = lens[idx];
-                                total_len += len;
-                                current_offset += len;
-                                offsets[i+1] = current_offset;
-                            }
-                        } else {
-                            for (0..pair_count) |i| offsets[i+1] = 0;
-                        }
-                        
-                        const str_data = try memory.wasm_allocator.alloc(u8, total_len);
-                        defer memory.wasm_allocator.free(str_data);
-                        
-                        current_offset = 0;
-                        if (!is_lazy) {
-                            const s_data = c.data.strings.data;
-                            const s_offs = c.data.strings.offsets;
-                            const s_lens = c.data.strings.lengths;
-                            for (join_pairs[0..pair_count]) |pair| {
-                                 const idx = if (is_left) pair.left else pair.right;
-                                 const off = s_offs[idx];
-                                 const len = s_lens[idx];
-                                 @memcpy(str_data[current_offset..][0..len], s_data[off..][0..len]);
-                                 current_offset += len;
-                            }
-                        }
-                        _ = lw.fragmentAddStringColumn(out_name.ptr, out_name.len, str_data.ptr, total_len, offsets.ptr, pair_count, false);
-                    },
-                    else => {}
-                }
+                if (found) break;
             }
         }
     } else {
-        // SELECT * (Write Left Table Columns then Right Table Columns)
-        var l_ctx2: ?FragmentContext = null;
-        for (left_table.columns[0..left_table.column_count]) |maybe_col| {
-            if (maybe_col) |*col| {
-                const col_type = col.col_type;
-                const is_lazy = col.is_lazy;
-                const f_col_idx = col.fragment_col_idx;
-
-                switch (col_type) {
-                    .int64 => {
-                        const data = try memory.wasm_allocator.alloc(i64, pair_count);
-                        defer memory.wasm_allocator.free(data);
-                        for (join_pairs[0..pair_count], 0..) |pair, i| {
-                            if (is_lazy) {
-                                 if (l_ctx2 == null or pair.left < l_ctx2.?.start_idx or pair.left >= l_ctx2.?.end_idx) {
-                                     l_ctx2 = null;
-                                     _ = getIntValueOptimized(left_table, col, pair.left, &l_ctx2);
-                                 }
-                                 if (l_ctx2.?.frag) |frag| {
-                                     const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
-                                     const typed_ptr: [*]const i64 = @ptrCast(@alignCast(raw_ptr));
-                                     data[i] = typed_ptr[pair.left - l_ctx2.?.start_idx];
-                                 }
-                            } else {
-                                data[i] = col.data.int64[pair.left];
-                            }
-                        }
-                        _ = lw.fragmentAddInt64Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
-                    },
-                    .float64 => {
-                        const data = try memory.wasm_allocator.alloc(f64, pair_count);
-                        defer memory.wasm_allocator.free(data);
-                        for (join_pairs[0..pair_count], 0..) |pair, i| {
-                            if (is_lazy) {
-                                 if (l_ctx2 == null or pair.left < l_ctx2.?.start_idx or pair.left >= l_ctx2.?.end_idx) {
-                                     l_ctx2 = null;
-                                     _ = getFloatValueOptimized(left_table, col, pair.left, &l_ctx2);
-                                 }
-                                 if (l_ctx2.?.frag) |frag| {
-                                     const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
-                                     const typed_ptr: [*]const f64 = @ptrCast(@alignCast(raw_ptr));
-                                     data[i] = typed_ptr[pair.left - l_ctx2.?.start_idx];
-                                 }
-                            } else {
-                                data[i] = col.data.float64[pair.left];
-                            }
-                        }
-                        _ = lw.fragmentAddFloat64Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
-                    },
-                    .string, .list => {
-                        // Flatten strings
-                        var total_len: usize = 0;
-                        const offsets = try memory.wasm_allocator.alloc(u32, pair_count + 1);
-                        defer memory.wasm_allocator.free(offsets);
-                        var current_offset: u32 = 0;
-                        offsets[0] = 0;
-                        
-                        // Calc lengths
-                        if (!is_lazy) {
-                            const lens = col.data.strings.lengths;
-                            for (join_pairs[0..pair_count], 0..) |pair, i| {
-                                const len = lens[pair.left];
-                                total_len += len;
-                                current_offset += len;
-                                offsets[i+1] = current_offset;
-                            }
-                        } else {
-                            // For lazy strings, we need a different approach (not implemented yet for joins)
-                            for (0..pair_count) |i| offsets[i+1] = 0;
-                        }
-                        
-                        const str_data = try memory.wasm_allocator.alloc(u8, total_len);
-                        defer memory.wasm_allocator.free(str_data);
-                        
-                        current_offset = 0;
-                        if (!is_lazy) {
-                            const s_data = col.data.strings.data;
-                            const s_offs = col.data.strings.offsets;
-                            const s_lens = col.data.strings.lengths;
-                            for (join_pairs[0..pair_count]) |pair| {
-                                 const off = s_offs[pair.left];
-                                 const len = s_lens[pair.left];
-                                 @memcpy(str_data[current_offset..][0..len], s_data[off..][0..len]);
-                                 current_offset += len;
-                            }
-                        }
-                        _ = lw.fragmentAddStringColumn(col.name.ptr, col.name.len, str_data.ptr, total_len, offsets.ptr, pair_count, false);
-                    },
-                    else => {}
+        // SELECT *
+        for (tables_in_join[0..query.join_count+1], 0..) |t, t_idx| {
+            for (0..t.column_count) |c_idx| {
+                if (t.columns[c_idx]) |*c| {
+                     output_cols_ctx[out_col_count] = .{ .table = t, .col = c, .t_idx = t_idx, .out_name = c.name };
+                     out_col_count += 1;
                 }
             }
         }
-        
-        // Write Right Table Columns
-        var r_ctx2: ?FragmentContext = null;
-        for (rtbl.columns[0..right_col_count]) |maybe_col| {
-            if (maybe_col) |*col| {
-                const col_type = col.col_type;
-                const is_lazy = col.is_lazy;
-                const f_col_idx = col.fragment_col_idx;
+    }
 
-                switch (col_type) {
-                    .int64 => {
-                        const data = try memory.wasm_allocator.alloc(i64, pair_count);
-                        defer memory.wasm_allocator.free(data);
-                        for (join_pairs[0..pair_count], 0..) |pair, i| {
-                            if (is_lazy) {
-                                 if (r_ctx2 == null or pair.right < r_ctx2.?.start_idx or pair.right >= r_ctx2.?.end_idx) {
-                                     r_ctx2 = null;
-                                     _ = getIntValueOptimized(rtbl, col, pair.right, &r_ctx2);
-                                 }
-                                 if (r_ctx2.?.frag) |frag| {
-                                     const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
-                                     const typed_ptr: [*]const i64 = @ptrCast(@alignCast(raw_ptr));
-                                     data[i] = typed_ptr[pair.right - r_ctx2.?.start_idx];
-                                 }
-                            } else {
-                                data[i] = col.data.int64[pair.right];
-                            }
-                        }
-                        _ = lw.fragmentAddInt64Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
-                    },
-                    .float64 => {
-                        const data = try memory.wasm_allocator.alloc(f64, pair_count);
-                        defer memory.wasm_allocator.free(data);
-                        for (join_pairs[0..pair_count], 0..) |pair, i| {
-                            if (is_lazy) {
-                                 if (r_ctx2 == null or pair.right < r_ctx2.?.start_idx or pair.right >= r_ctx2.?.end_idx) {
-                                     r_ctx2 = null;
-                                     _ = getFloatValueOptimized(rtbl, col, pair.right, &r_ctx2);
-                                 }
-                                 if (r_ctx2.?.frag) |frag| {
-                                     const raw_ptr = frag.getColumnRawPtr(f_col_idx).?;
-                                     const typed_ptr: [*]const f64 = @ptrCast(@alignCast(raw_ptr));
-                                     data[i] = typed_ptr[pair.right - r_ctx2.?.start_idx];
-                                 }
-                            } else {
-                                data[i] = col.data.float64[pair.right];
-                            }
-                        }
-                        _ = lw.fragmentAddFloat64Column(col.name.ptr, col.name.len, data.ptr, pair_count, false);
-                    },
-                    .string, .list => {
-                        // Flatten strings
-                        var total_len: usize = 0;
-                        const offsets = try memory.wasm_allocator.alloc(u32, pair_count + 1);
-                        defer memory.wasm_allocator.free(offsets);
-                        var current_offset: u32 = 0;
-                        offsets[0] = 0;
-                        
-                        // Calc lengths
-                        if (!is_lazy) {
-                            const lens = col.data.strings.lengths;
-                            for (join_pairs[0..pair_count], 0..) |pair, i| {
-                                const len = lens[pair.right];
-                                total_len += len;
-                                current_offset += len;
-                                offsets[i+1] = current_offset;
-                            }
-                        } else {
-                            // For lazy strings, we need a different approach (not implemented yet for joins)
-                            for (0..pair_count) |i| offsets[i+1] = 0;
-                        }
-                        
-                        const str_data = try memory.wasm_allocator.alloc(u8, total_len);
-                        defer memory.wasm_allocator.free(str_data);
-                        
-                        current_offset = 0;
-                        if (!is_lazy) {
-                            const s_data = col.data.strings.data;
-                            const s_offs = col.data.strings.offsets;
-                            const s_lens = col.data.strings.lengths;
-                            for (join_pairs[0..pair_count]) |pair| {
-                                 const off = s_offs[pair.right];
-                                 const len = s_lens[pair.right];
-                                 @memcpy(str_data[current_offset..][0..len], s_data[off..][0..len]);
-                                 current_offset += len;
-                            }
-                        }
-                        _ = lw.fragmentAddStringColumn(col.name.ptr, col.name.len, str_data.ptr, total_len, offsets.ptr, pair_count, false);
-                    },
-                    else => {}
+    // Write Data
+    var ctx_buf: ?FragmentContext = null;
+    
+    for (0..out_col_count) |c_k| {
+        const ctx = output_cols_ctx[c_k];
+        const col = ctx.col;
+        const table = ctx.table;
+        const t_idx = ctx.t_idx;
+        const out_name = ctx.out_name;
+        
+
+
+        switch (col.col_type) {
+            .int64 => {
+                const data = try memory.wasm_allocator.alloc(i64, pair_count);
+                defer memory.wasm_allocator.free(data);
+                for (0..pair_count) |i| {
+                    const idx = src_buffer[i].indices[t_idx];
+                    if (idx == std.math.maxInt(u32)) {
+                        data[i] = NULL_SENTINEL_INT;
+                    } else {
+                        data[i] = getIntValue(table, col, idx);
+                    }
                 }
-            }
+                _ = lw.fragmentAddInt64Column(out_name.ptr, out_name.len, data.ptr, pair_count, false);
+            },
+            .float64 => {
+                const data = try memory.wasm_allocator.alloc(f64, pair_count);
+                defer memory.wasm_allocator.free(data);
+                for (0..pair_count) |i| {
+                    const idx = src_buffer[i].indices[t_idx];
+                     if (idx == std.math.maxInt(u32)) {
+                        data[i] = NULL_SENTINEL_FLOAT;
+                    } else {
+                        data[i] = getFloatValue(table, col, idx);
+                    }
+                }
+                _ = lw.fragmentAddFloat64Column(out_name.ptr, out_name.len, data.ptr, pair_count, false);
+            },
+            .string, .list => {
+                var total_len: usize = 0;
+                const offsets = try memory.wasm_allocator.alloc(u32, pair_count + 1);
+                defer memory.wasm_allocator.free(offsets);
+                offsets[0] = 0;
+                
+                for (0..pair_count) |i| {
+                    const idx = src_buffer[i].indices[t_idx];
+                    var len: u32 = 0;
+                    if (idx != std.math.maxInt(u32)) {
+                         const s = getStringValueOptimized(table, col, idx, &ctx_buf);
+                         len = @intCast(s.len);
+                    }
+                    total_len += len;
+                    offsets[i+1] = offsets[i] + len;
+                }
+                
+                const str_data = try memory.wasm_allocator.alloc(u8, total_len);
+                defer memory.wasm_allocator.free(str_data);
+                
+                var current_offset: usize = 0;
+                for (0..pair_count) |i| {
+                    const idx = src_buffer[i].indices[t_idx];
+                    if (idx != std.math.maxInt(u32)) {
+                        const s = getStringValueOptimized(table, col, idx, &ctx_buf);
+
+                        @memcpy(str_data[current_offset..][0..s.len], s);
+                        current_offset += s.len;
+                    }
+                }
+                _ = lw.fragmentAddStringColumn(out_name.ptr, out_name.len, str_data.ptr, total_len, offsets.ptr, pair_count, false);
+            },
+            else => {}
         }
     }
     
@@ -4984,10 +4916,12 @@ fn evaluateHaving(query: *const ParsedQuery, having: *const WhereClause, agg_res
         },
         else => {
             const col_name = having.column orelse return true;
-            
-            // Find aggregate by name or alias
+
+            // Find aggregate by alias or function name
             var val: f64 = 0;
             var found = false;
+
+            // First try to match by alias
             for (query.aggregates[0..query.agg_count], 0..) |agg, i| {
                 if (agg.alias) |alias| {
                     if (std.mem.eql(u8, alias, col_name)) {
@@ -4996,14 +4930,31 @@ fn evaluateHaving(query: *const ParsedQuery, having: *const WhereClause, agg_res
                         break;
                     }
                 }
-                // Fallback: check function name if no alias? (Less reliable)
             }
-            
+
+            // Fallback: match by aggregate function name (COUNT, SUM, AVG, etc.)
+            if (!found) {
+                for (query.aggregates[0..query.agg_count], 0..) |agg, i| {
+                    const func_name = switch (agg.func) {
+                        .count => "COUNT",
+                        .sum => "SUM",
+                        .avg => "AVG",
+                        .min => "MIN",
+                        .max => "MAX",
+                    };
+                    if (eqlIgnoreCase(col_name, func_name)) {
+                        val = agg_results[i];
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
             if (!found) return true; // Treat unknown columns in HAVING as pass for now
 
             // Simple comparisons for HAVING
             const cmp_val = if (having.value_float) |f| f else if (having.value_int) |i| @as(f64, @floatFromInt(i)) else 0;
-            
+
             return switch (having.op) {
                 .eq => val == cmp_val,
                 .ne => val != cmp_val,
@@ -6613,16 +6564,19 @@ fn evaluateComparisonVector(
                        }
                   }
              } else if (where.op == .is_null) {
-                   for (0..sel_len) |_| {
-                       // const idx = if (selection) |s| s[i] else @as(u16, @intCast(i));
-                       // int64 is nullable in our model? Or we need null bitmap.
-                       // For now, assume 0 is not null. Nulls handled via validity bitmap if we had one.
-                       // Just do fallback for IS NULL on int64 if needed, or skip.
+                   for (0..sel_len) |i| {
+                       const idx = if (selection) |s| s[i] else @as(u16, @intCast(i));
+                       // Check for NULL_SENTINEL_INT to detect NULL values
+                       if (values[idx] == NULL_SENTINEL_INT) {
+                           out_selection[out_idx] = idx;
+                           out_idx += 1;
+                       }
                    }
              } else if (where.op == .is_not_null) {
                    for (0..sel_len) |i| {
                        const idx = if (selection) |s| s[i] else @as(u16, @intCast(i));
-                       if (values[idx] != 0) {
+                       // Check that value is not NULL_SENTINEL_INT
+                       if (values[idx] != NULL_SENTINEL_INT) {
                            out_selection[out_idx] = idx;
                            out_idx += 1;
                        }
@@ -7215,12 +7169,32 @@ fn evaluateComparison(table: *const TableInfo, col: *const ColumnData, row_idx: 
              return if (where.op == .exists) where.subquery_exists else !where.subquery_exists;
         },
         .is_null => {
-             const s = getStringValueOptimized(table, col, row_idx, context);
-             return (s.len == 0) or std.mem.eql(u8, s, "NULL");
+             // Check based on column type
+             if (col.col_type == .int64 or col.col_type == .int32) {
+                 const val = getIntValueOptimized(table, col, row_idx, context);
+                 return val == NULL_SENTINEL_INT;
+             } else if (col.col_type == .float64 or col.col_type == .float32) {
+                 const val = getFloatValueOptimized(table, col, row_idx, context);
+                 return std.math.isNan(val);
+             } else {
+                 // String type
+                 const s = getStringValueOptimized(table, col, row_idx, context);
+                 return (s.len == 0) or std.mem.eql(u8, s, "NULL");
+             }
         },
         .is_not_null => {
-             const s = getStringValueOptimized(table, col, row_idx, context);
-             return (s.len > 0) and !std.mem.eql(u8, s, "NULL");
+             // Check based on column type
+             if (col.col_type == .int64 or col.col_type == .int32) {
+                 const val = getIntValueOptimized(table, col, row_idx, context);
+                 return val != NULL_SENTINEL_INT;
+             } else if (col.col_type == .float64 or col.col_type == .float32) {
+                 const val = getFloatValueOptimized(table, col, row_idx, context);
+                 return !std.math.isNan(val);
+             } else {
+                 // String type
+                 const s = getStringValueOptimized(table, col, row_idx, context);
+                 return (s.len > 0) and !std.mem.eql(u8, s, "NULL");
+             }
         },
         else => return false,
     }
@@ -7784,10 +7758,10 @@ pub fn parseSql(sql: []const u8) ?*ParsedQuery {
         !startsWithIC(sql[pos..], "ORDER") and 
         !startsWithIC(sql[pos..], "TOPK") and
         !startsWithIC(sql[pos..], "LIMIT")) {
-        // Skip alias
+        const alias_start = pos;
         while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+        query.table_alias = sql[alias_start..pos];
         pos = skipWs(sql, pos);
-        // log("Skipped alias. SQL now: {s}", .{sql[pos..@min(pos+10, sql.len)]});
     }
 
 
@@ -7828,9 +7802,11 @@ pub fn parseSql(sql: []const u8) ?*ParsedQuery {
         const join_table = sql[join_tbl_start..pos];
         pos = skipWs(sql, pos);
 
-        // Consume join table alias
+        var join_alias: ?[]const u8 = null;
         if (pos < sql.len and isIdent(sql[pos]) and !startsWithIC(sql[pos..], "ON")) {
+             const alias_start = pos;
              while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+             join_alias = sql[alias_start..pos];
              pos = skipWs(sql, pos);
         }
 
@@ -7901,6 +7877,7 @@ pub fn parseSql(sql: []const u8) ?*ParsedQuery {
 
                 query.joins[query.join_count] = JoinClause{
                     .table_name = join_table,
+                    .alias = join_alias,
                     .join_type = join_type,
                     .left_col = "", // NEAR join doesn't use left_col for now
                     .right_col = right_col,
@@ -7913,11 +7890,8 @@ pub fn parseSql(sql: []const u8) ?*ParsedQuery {
                 query.join_count += 1;
             } else {
                 // Parse: table.col = table.col or col = col
-                if (std.mem.lastIndexOf(u8, first_expr, ".")) |dot| {
-                    left_col = first_expr[dot + 1 ..];
-                } else {
-                    left_col = first_expr;
-                }
+                // Don't strip prefix
+                left_col = first_expr;
 
                 if (pos < sql.len and sql[pos] == '=') pos += 1;
                 pos = skipWs(sql, pos);
@@ -7926,14 +7900,12 @@ pub fn parseSql(sql: []const u8) ?*ParsedQuery {
                 while (pos < sql.len and (isIdent(sql[pos]) or sql[pos] == '.')) pos += 1;
                 const right_expr = sql[right_start..pos];
 
-                if (std.mem.lastIndexOf(u8, right_expr, ".")) |dot| {
-                    right_col = right_expr[dot + 1 ..];
-                } else {
-                    right_col = right_expr;
-                }
+                // Don't strip prefix
+                right_col = right_expr;
 
                 query.joins[query.join_count] = JoinClause{
                     .table_name = join_table,
+                    .alias = join_alias,
                     .join_type = join_type,
                     .left_col = left_col,
                     .right_col = right_col,
@@ -8649,8 +8621,19 @@ fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
     if (pos.* == col_start) return null;
     const column = sql[col_start..pos.*];
 
-
     pos.* = skipWs(sql, pos.*);
+
+    // Skip function call arguments for aggregate functions like COUNT(*), SUM(col), etc.
+    if (pos.* < sql.len and sql[pos.*] == '(') {
+        var depth: usize = 1;
+        pos.* += 1;
+        while (pos.* < sql.len and depth > 0) {
+            if (sql[pos.*] == '(') depth += 1;
+            if (sql[pos.*] == ')') depth -= 1;
+            pos.* += 1;
+        }
+        pos.* = skipWs(sql, pos.*);
+    }
 
     // Check for IS NULL / IS NOT NULL
     if (startsWithIC(sql[pos.*..], "IS")) {
@@ -9036,6 +9019,14 @@ fn startsWithIC(haystack: []const u8, needle: []const u8) bool {
     if (haystack.len < needle.len) return false;
     for (haystack[0..needle.len], needle) |h, n| {
         if (std.ascii.toLower(h) != std.ascii.toLower(n)) return false;
+    }
+    return true;
+}
+
+fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |c1, c2| {
+        if (std.ascii.toLower(c1) != std.ascii.toLower(c2)) return false;
     }
     return true;
 }

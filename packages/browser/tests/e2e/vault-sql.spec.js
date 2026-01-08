@@ -8,6 +8,22 @@ test.describe('Vault SQL Operations', () => {
 
         // Wait for page to load
         await page.waitForLoadState('domcontentloaded');
+
+        // Clean up any leftover tables from previous tests
+        await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js?v=' + Date.now());
+            const v = await vault();
+            const tables = ['test_users', 'test_products', 'test_orders', 'test_drop', 'test_table',
+                           'test_items', 'test_transactions', 'test_categories', 'products', 'orders',
+                           'users', 'employees', 'departments', 'sales', 'customers', 'test_data',
+                           'test_strings', 'test_nums', 'test_dates', 'test_json', 'test_arrays',
+                           'test_nulls', 'test_agg', 'test_window', 'test_cte', 'test_distinct',
+                           'test_join_left', 'test_join_right', 'test_subq', 'test_having',
+                           'source_table', 'target_table', 'base_table', 'delete_target'];
+            for (const t of tables) {
+                try { await v.exec(`DROP TABLE IF EXISTS ${t}`); } catch (e) { /* ignore */ }
+            }
+        });
     });
 
     test('vault initializes successfully', async ({ page }) => {
@@ -373,6 +389,9 @@ test.describe('Vault SQL Operations', () => {
             const { vault } = await import('./lanceql.js?v=' + Date.now());
             const v = await vault();
             const tests = [];
+
+            // Cleanup any leftover data from previous runs
+            await v.exec('DROP TABLE IF EXISTS test_users');
 
             // Setup
             await v.exec('CREATE TABLE test_users (id INT, name TEXT, age INT)');
@@ -4445,10 +4464,11 @@ test.describe('Vault SQL Operations', () => {
 
     test('GPU aggregations match CPU results', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { gpuAggregator } = await import('./lanceql.js');
+            const { getGPUAggregator } = await import('./lanceql.js');
             const tests = [];
 
             // Initialize GPU aggregator
+            const gpuAggregator = getGPUAggregator();
             await gpuAggregator.init();
             const isAvailable = gpuAggregator.isAvailable();
             tests.push({ name: 'GPUAggregator initializes', pass: true, actual: isAvailable ? 'GPU available' : 'CPU fallback' });
@@ -4526,9 +4546,10 @@ test.describe('Vault SQL Operations', () => {
 
     test('GPU aggregations handle edge cases', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { gpuAggregator } = await import('./lanceql.js');
+            const { getGPUAggregator } = await import('./lanceql.js');
             const tests = [];
 
+            const gpuAggregator = getGPUAggregator();
             await gpuAggregator.init();
 
             // Test empty array
@@ -4577,10 +4598,11 @@ test.describe('Vault SQL Operations', () => {
 
     test('GPU hash join matches CPU results', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { gpuJoiner } = await import('./lanceql.js');
+            const { getGPUJoiner } = await import('./lanceql.js');
             const tests = [];
 
             // Initialize GPU joiner
+            const gpuJoiner = getGPUJoiner();
             await gpuJoiner.init();
             const isAvailable = gpuJoiner.isAvailable();
             tests.push({ name: 'GPUJoiner initializes', pass: true, actual: isAvailable ? 'GPU available' : 'CPU fallback' });
@@ -4631,9 +4653,10 @@ test.describe('Vault SQL Operations', () => {
 
     test('GPU hash join handles edge cases', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { gpuJoiner } = await import('./lanceql.js');
+            const { getGPUJoiner } = await import('./lanceql.js');
             const tests = [];
 
+            const gpuJoiner = getGPUJoiner();
             await gpuJoiner.init();
 
             // Test empty tables
@@ -4685,10 +4708,11 @@ test.describe('Vault SQL Operations', () => {
 
     test('GPU bitonic sort matches CPU results', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { gpuSorter } = await import('./lanceql.js');
+            const { getGPUSorter } = await import('./lanceql.js');
             const tests = [];
 
             // Initialize GPU sorter
+            const gpuSorter = getGPUSorter();
             await gpuSorter.init();
             const isAvailable = gpuSorter.isAvailable();
             tests.push({ name: 'GPUSorter initializes', pass: true, actual: isAvailable ? 'GPU available' : 'CPU fallback' });
@@ -4750,9 +4774,10 @@ test.describe('Vault SQL Operations', () => {
 
     test('GPU sort handles edge cases', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { gpuSorter } = await import('./lanceql.js');
+            const { getGPUSorter } = await import('./lanceql.js');
             const tests = [];
 
+            const gpuSorter = getGPUSorter();
             await gpuSorter.init();
 
             // Test empty array
@@ -4829,10 +4854,11 @@ test.describe('Vault SQL Operations', () => {
 
     test('GPU GROUP BY matches CPU results', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { gpuGrouper } = await import('./lanceql.js');
+            const { getGPUGrouper } = await import('./lanceql.js');
             const tests = [];
 
             // Initialize GPU grouper
+            const gpuGrouper = getGPUGrouper();
             await gpuGrouper.init();
             const isAvailable = gpuGrouper.isAvailable();
             tests.push({ name: 'GPUGrouper initializes', pass: true, actual: isAvailable ? 'GPU available' : 'CPU fallback' });
@@ -4893,9 +4919,10 @@ test.describe('Vault SQL Operations', () => {
 
     test('GPU GROUP BY handles edge cases', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { gpuGrouper } = await import('./lanceql.js');
+            const { getGPUGrouper } = await import('./lanceql.js');
             const tests = [];
 
+            const gpuGrouper = getGPUGrouper();
             await gpuGrouper.init();
 
             // Test single group
@@ -4966,6 +4993,7 @@ test.describe('Vault SQL Operations', () => {
             const tests = [];
 
             const v = await vault();
+            await v.exec('DROP TABLE IF EXISTS test_distinct');
             await v.exec('CREATE TABLE test_distinct (id INT, category TEXT, value FLOAT)');
             await v.exec("INSERT INTO test_distinct VALUES (1, 'A', 10.5), (2, 'B', 20.5), (3, 'A', 10.5), (4, 'B', 30.5), (5, 'A', 10.5)");
 
@@ -5090,10 +5118,13 @@ test.describe('Vault SQL Operations', () => {
 
     test('GPU vector search top-K selection', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { gpuVectorSearch, DistanceMetric } = await import('./lanceql.js');
+            const { getGPUVectorSearch } = await import('./lanceql.js');
+            // Distance metrics: 0 = COSINE, 1 = L2, 2 = DOT_PRODUCT
+            const DistanceMetric = { COSINE: 0, L2: 1, DOT_PRODUCT: 2 };
             const tests = [];
 
             // Initialize GPU vector search
+            const gpuVectorSearch = getGPUVectorSearch();
             await gpuVectorSearch.init();
             const isAvailable = gpuVectorSearch.isAvailable();
             tests.push({ name: 'GPUVectorSearch initializes', pass: true, actual: isAvailable ? 'GPU available' : 'CPU fallback' });
@@ -5162,9 +5193,12 @@ test.describe('Vault SQL Operations', () => {
 
     test('GPU vector search handles edge cases', async ({ page }) => {
         const results = await page.evaluate(async () => {
-            const { gpuVectorSearch, DistanceMetric } = await import('./lanceql.js');
+            const { getGPUVectorSearch } = await import('./lanceql.js');
+            // Distance metrics: 0 = COSINE, 1 = L2, 2 = DOT_PRODUCT
+            const DistanceMetric = { COSINE: 0, L2: 1, DOT_PRODUCT: 2 };
             const tests = [];
 
+            const gpuVectorSearch = getGPUVectorSearch();
             await gpuVectorSearch.init();
 
             // Test empty input

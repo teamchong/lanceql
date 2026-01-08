@@ -215,4 +215,40 @@ These are acceptable for v1 and can be added incrementally.
 
 ---
 
-**Note:** Not pushed to git yet, waiting for user confirmation.
+
+## SQL Engine Performance Benchmarks (WASM) ✅
+
+**Date:** 2026-01-07
+**Environment:** Local Browser (Chromium) / OPFS Storage
+**Status:** ✅ **ALL BENCHMARKS PASSED**
+
+These benchmarks measure the execution time of the SQL engine running entirely within WASM, using columnar data stored in-memory or in OPFS.
+
+### 🚀 Initialization
+| Benchmark | Result | Status |
+|-----------|--------|--------|
+| Cold Start Time (WASM + Worker) | ~725ms | ✅ PASS |
+
+### 📊 Query Performance (Median Times)
+
+| Query Type | 100 Rows | 1,000 Rows | 5,000 Rows |
+|------------|----------|------------|------------|
+| **Simple SELECT** | 0.30ms | 0.40ms | 1.10ms |
+| **Aggregation** | 0.50ms | 0.60ms | 0.50ms |
+| **JOIN** | 0.80ms | 1.10ms | 1.40ms |
+
+### 🧩 Advanced Features (500-1000 Rows)
+| Feature | Median | P95 | Status |
+|---------|--------|-----|--------|
+| **Complex WHERE** (1000 rows) | 0.80ms | 1.10ms | ✅ PASS |
+| **Window Functions** (500 rows) | 0.80ms | 1.50ms | ✅ PASS |
+| **CTE (Common Table Expr)** (500 rows) | 0.70ms | 1.00ms | ✅ PASS |
+
+### 🛠 Fixes Verified
+1. **Stack Overflow Fix:** Handled large aggregations (5000+ rows) by moving heavy buffers to global storage.
+2. **Aggregation Finalization:** Corrected `executeGroupByQuery` to return valid Lance fragments to the driver.
+3. **Memory Access Stability:** Resolved "Memory access out of bounds" errors during high-frequency inserts and queries.
+
+---
+
+*Results compiled by Antigravity AI.*

@@ -43,11 +43,16 @@ test.describe('LanceQL SQL Performance Benchmarks', () => {
                 const { vault } = await import('./lanceql.js');
                 const v = await vault();
 
-                // Setup
+                // Setup - use batch INSERT (10 rows per statement) for better memory efficiency
                 await v.exec('DROP TABLE IF EXISTS perf_select');
                 await v.exec('CREATE TABLE perf_select (id INTEGER, name TEXT, value REAL)');
-                for (let i = 0; i < rows; i++) {
-                    await v.exec(`INSERT INTO perf_select VALUES (${i}, 'Name${i}', ${Math.random() * 1000})`);
+                const batchSize = 10;
+                for (let i = 0; i < rows; i += batchSize) {
+                    const values = [];
+                    for (let j = i; j < Math.min(i + batchSize, rows); j++) {
+                        values.push(`(${j}, 'Name${j}', ${Math.random() * 1000})`);
+                    }
+                    await v.exec(`INSERT INTO perf_select VALUES ${values.join(',')}`);
                 }
 
                 // Warmup
@@ -86,13 +91,18 @@ test.describe('LanceQL SQL Performance Benchmarks', () => {
                 const { vault } = await import('./lanceql.js');
                 const v = await vault();
 
-                // Setup
+                // Setup - use batch INSERT for better memory efficiency
                 await v.exec('DROP TABLE IF EXISTS perf_agg');
                 await v.exec('CREATE TABLE perf_agg (id INTEGER, category TEXT, amount REAL)');
                 const categories = ['A', 'B', 'C', 'D', 'E'];
-                for (let i = 0; i < rows; i++) {
-                    const cat = categories[i % categories.length];
-                    await v.exec(`INSERT INTO perf_agg VALUES (${i}, '${cat}', ${Math.random() * 1000})`);
+                const batchSize = 10;
+                for (let i = 0; i < rows; i += batchSize) {
+                    const values = [];
+                    for (let j = i; j < Math.min(i + batchSize, rows); j++) {
+                        const cat = categories[j % categories.length];
+                        values.push(`(${j}, '${cat}', ${Math.random() * 1000})`);
+                    }
+                    await v.exec(`INSERT INTO perf_agg VALUES ${values.join(',')}`);
                 }
 
                 const query = 'SELECT category, COUNT(*), SUM(amount), AVG(amount) FROM perf_agg GROUP BY category';
@@ -134,19 +144,30 @@ test.describe('LanceQL SQL Performance Benchmarks', () => {
                 const { vault } = await import('./lanceql.js');
                 const v = await vault();
 
-                // Setup
+                // Setup - use batch INSERT for better memory efficiency
                 const numCustomers = Math.min(Math.floor(rows / 10), 100);
                 await v.exec('DROP TABLE IF EXISTS perf_orders');
                 await v.exec('DROP TABLE IF EXISTS perf_customers');
                 await v.exec('CREATE TABLE perf_customers (id INTEGER, name TEXT)');
                 await v.exec('CREATE TABLE perf_orders (id INTEGER, customer_id INTEGER, amount REAL)');
 
-                for (let i = 0; i < numCustomers; i++) {
-                    await v.exec(`INSERT INTO perf_customers VALUES (${i}, 'Customer${i}')`);
+                // Batch insert customers
+                const batchSize = 10;
+                for (let i = 0; i < numCustomers; i += batchSize) {
+                    const values = [];
+                    for (let j = i; j < Math.min(i + batchSize, numCustomers); j++) {
+                        values.push(`(${j}, 'Customer${j}')`);
+                    }
+                    await v.exec(`INSERT INTO perf_customers VALUES ${values.join(',')}`);
                 }
-                for (let i = 0; i < rows; i++) {
-                    const customerId = Math.floor(Math.random() * numCustomers);
-                    await v.exec(`INSERT INTO perf_orders VALUES (${i}, ${customerId}, ${Math.random() * 1000})`);
+                // Batch insert orders
+                for (let i = 0; i < rows; i += batchSize) {
+                    const values = [];
+                    for (let j = i; j < Math.min(i + batchSize, rows); j++) {
+                        const customerId = Math.floor(Math.random() * numCustomers);
+                        values.push(`(${j}, ${customerId}, ${Math.random() * 1000})`);
+                    }
+                    await v.exec(`INSERT INTO perf_orders VALUES ${values.join(',')}`);
                 }
 
                 const query = 'SELECT c.name, SUM(o.amount) FROM perf_orders o JOIN perf_customers c ON o.customer_id = c.id GROUP BY c.name';
@@ -191,15 +212,20 @@ test.describe('LanceQL SQL Performance Benchmarks', () => {
             const v = await vault();
             const rows = 1000;
 
-            // Setup
+            // Setup - use batch INSERT for better memory efficiency
             const statuses = ['active', 'pending', 'inactive', 'archived'];
             await v.exec('DROP TABLE IF EXISTS perf_where');
             await v.exec('CREATE TABLE perf_where (id INTEGER, status TEXT, amount REAL, priority INTEGER)');
 
-            for (let i = 0; i < rows; i++) {
-                const status = statuses[i % statuses.length];
-                const priority = (i % 5) + 1;
-                await v.exec(`INSERT INTO perf_where VALUES (${i}, '${status}', ${Math.random() * 1000}, ${priority})`);
+            const batchSize = 10;
+            for (let i = 0; i < rows; i += batchSize) {
+                const values = [];
+                for (let j = i; j < Math.min(i + batchSize, rows); j++) {
+                    const status = statuses[j % statuses.length];
+                    const priority = (j % 5) + 1;
+                    values.push(`(${j}, '${status}', ${Math.random() * 1000}, ${priority})`);
+                }
+                await v.exec(`INSERT INTO perf_where VALUES ${values.join(',')}`);
             }
 
             const query = `SELECT * FROM perf_where
@@ -243,14 +269,19 @@ test.describe('LanceQL SQL Performance Benchmarks', () => {
             const v = await vault();
             const rows = 500;
 
-            // Setup
+            // Setup - use batch INSERT for better memory efficiency
             await v.exec('DROP TABLE IF EXISTS perf_window');
             await v.exec('CREATE TABLE perf_window (id INTEGER, region TEXT, amount REAL)');
             const regions = ['North', 'South', 'East', 'West'];
 
-            for (let i = 0; i < rows; i++) {
-                const region = regions[i % regions.length];
-                await v.exec(`INSERT INTO perf_window VALUES (${i}, '${region}', ${Math.random() * 1000})`);
+            const batchSize = 10;
+            for (let i = 0; i < rows; i += batchSize) {
+                const values = [];
+                for (let j = i; j < Math.min(i + batchSize, rows); j++) {
+                    const region = regions[j % regions.length];
+                    values.push(`(${j}, '${region}', ${Math.random() * 1000})`);
+                }
+                await v.exec(`INSERT INTO perf_window VALUES ${values.join(',')}`);
             }
 
             const query = 'SELECT id, region, ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount) AS rn, SUM(amount) OVER (PARTITION BY region) AS region_total FROM perf_window';
@@ -292,13 +323,18 @@ test.describe('LanceQL SQL Performance Benchmarks', () => {
             const v = await vault();
             const rows = 500;
 
-            // Setup
+            // Setup - use batch INSERT for better memory efficiency
             await v.exec('DROP TABLE IF EXISTS perf_cte');
             await v.exec('CREATE TABLE perf_cte (id INTEGER, dept_id INTEGER, salary REAL)');
 
-            for (let i = 0; i < rows; i++) {
-                const deptId = (i % 10) + 1;
-                await v.exec(`INSERT INTO perf_cte VALUES (${i}, ${deptId}, ${30000 + Math.random() * 70000})`);
+            const batchSize = 10;
+            for (let i = 0; i < rows; i += batchSize) {
+                const values = [];
+                for (let j = i; j < Math.min(i + batchSize, rows); j++) {
+                    const deptId = (j % 10) + 1;
+                    values.push(`(${j}, ${deptId}, ${30000 + Math.random() * 70000})`);
+                }
+                await v.exec(`INSERT INTO perf_cte VALUES ${values.join(',')}`);
             }
 
             const query = `

@@ -381,6 +381,26 @@ class LanceDatabase {
         return OptimizerModule.getPlanCacheStats(this);
     }
 
+    _normalizeSQL(sql) {
+        return OptimizerModule.normalizeSQL(sql);
+    }
+
+    _getCachedPlan(sql) {
+        return OptimizerModule.getCachedPlan(this, sql);
+    }
+
+    _setCachedPlan(sql, plan) {
+        return OptimizerModule.setCachedPlan(this, sql, plan);
+    }
+
+    _clearPlanCache() {
+        this._planCache.clear();
+    }
+
+    _explainQuery(ast) {
+        return OptimizerModule.explainQuery(this, ast);
+    }
+
     _optimizeExpr(expr) {
         return OptimizerModule.optimizeExpr(expr);
     }

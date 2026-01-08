@@ -152,6 +152,7 @@ function handleWorkerMessage(data, port, resolveReady) {
 
                 // Handle WASM binary format (single buffer, fastest)
                 else if (result && result._format === 'wasm_binary') {
+                    const NULL_SENTINEL_INT = -9223372036854775808n;
                     const { buffer, columns, rowCount, schema } = result;
                     const view = new DataView(buffer);
                     const u8 = new Uint8Array(buffer);
@@ -163,18 +164,24 @@ function handleWorkerMessage(data, port, resolveReady) {
                     // Parse column metadata and create views
                     for (let i = 0; i < columns.length; i++) {
                         const metaOffset = HEADER_SIZE + i * COL_META_SIZE;
-                        const colType = view.getUint32(metaOffset, true); // 0=numeric, 1=string
+                        const colType = view.getUint32(metaOffset, true);
                         const dataOffset = view.getUint32(metaOffset + 8, true);
                         const dataSize = Number(view.getBigUint64(metaOffset + 12, true));
                         const elemSize = view.getUint32(metaOffset + 20, true);
                         const colName = columns[i];
 
-                        if (colType === 0) {
+                        if (colType <= 3) {
                             // Numeric column - create typed array view
                             const length = dataSize / elemSize;
-                            colData[colName] = elemSize === 8
-                                ? new Float64Array(buffer, dataOffset, length)
-                                : new Float32Array(buffer, dataOffset, length);
+                            if (colType === 0) { // int64
+                                colData[colName] = new BigInt64Array(buffer, dataOffset, length);
+                            } else if (colType === 1) { // float64
+                                colData[colName] = new Float64Array(buffer, dataOffset, length);
+                            } else if (colType === 2) { // int32
+                                colData[colName] = new Int32Array(buffer, dataOffset, length);
+                            } else if (colType === 3) { // float32
+                                colData[colName] = new Float32Array(buffer, dataOffset, length);
+                            }
                         } else {
                             // String column - lazy decode
                             const offsetsStart = dataOffset;
@@ -236,7 +243,13 @@ function handleWorkerMessage(data, port, resolveReady) {
                             for (let i = 0; i < rowCount; i++) {
                                 const row = {};
                                 for (let j = 0; j < columns.length; j++) {
-                                    row[columns[j]] = colArrays[j][i];
+                                    let val = colArrays[j][i];
+                                    if (val === NULL_SENTINEL_INT) {
+                                        val = null;
+                                    } else if (typeof val === 'number' && isNaN(val)) {
+                                        val = null;
+                                    }
+                                    row[columns[j]] = val;
                                 }
                                 rows[i] = row;
                             }

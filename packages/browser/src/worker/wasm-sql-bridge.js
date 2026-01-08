@@ -532,20 +532,35 @@ export class WasmSqlExecutor {
                     }
                 } else if (typeStr === 'int64') {
                     // Conversion needed or return BigInt64Array?
-                    // Previous logic converted to Float64 for JS compat
                     const src = new BigInt64Array(buffer, absDataOffset, rowCount);
-                    const dst = new Float64Array(rowCount);
-                    for (let j = 0; j < rowCount; j++) dst[j] = Number(src[j]);
+                    const dst = new Array(rowCount);
+                    const NULL_SENTINEL_INT = -9223372036854775808n;
+                    for (let j = 0; j < rowCount; j++) {
+                        const v = src[j];
+                        dst[j] = (v === NULL_SENTINEL_INT) ? null : Number(v);
+                    }
                     colData[colName] = dst;
                 } else if (typeStr === 'int32') {
                     const src = new Int32Array(buffer, absDataOffset, rowCount);
-                    const dst = new Float64Array(rowCount);
-                    for (let j = 0; j < rowCount; j++) dst[j] = src[j];
+                    const dst = new Array(rowCount);
+                    // For int32, we currently use the same i64 sentinel if we were appending from JS,
+                    // but if it's from file it might be different. 
+                    // However, getIntValueOptimized returns i64, so it might be promoted.
+                    // Let's assume for now.
+                    for (let j = 0; j < rowCount; j++) {
+                        const v = src[j];
+                        // check for both int32 min and int64 min (cast to int32)
+                        if (v === -2147483648) dst[j] = null;
+                        else dst[j] = v;
+                    }
                     colData[colName] = dst;
                 } else { // float32
                     const src = new Float32Array(buffer, absDataOffset, rowCount);
-                    const dst = new Float64Array(rowCount);
-                    for (let j = 0; j < rowCount; j++) dst[j] = src[j];
+                    const dst = new Array(rowCount);
+                    for (let j = 0; j < rowCount; j++) {
+                        const v = src[j];
+                        dst[j] = isNaN(v) ? null : v;
+                    }
                     colData[colName] = dst;
                 }
             } else if (typeStr === 'string' || typeStr === 'list') {

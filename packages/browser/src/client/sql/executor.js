@@ -580,6 +580,36 @@ class SQLExecutor {
             }
         }
     }
+
+    // Aggregate delegations
+    _expandGroupBy(groupBy) {
+        return AggModule.expandGroupBy(groupBy);
+    }
+
+    _powerSet(arr) {
+        return AggModule.powerSet(arr);
+    }
+
+    // Window delegations
+    _rank(indices, sortIndices) {
+        return WindowModule.rank(indices, sortIndices);
+    }
+
+    _denseRank(indices, sortIndices) {
+        return WindowModule.denseRank(indices, sortIndices);
+    }
+
+    _percentRank(indices, sortIndices) {
+        return WindowModule.percentRank(indices, sortIndices);
+    }
+
+    _cumeDist(indices, sortIndices) {
+        return WindowModule.cumeDist(indices, sortIndices);
+    }
+
+    _getRowNumber(indices) {
+        return WindowModule.getRowNumber(indices);
+    }
 }
 
 export { SQLExecutor };
