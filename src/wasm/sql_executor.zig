@@ -193,7 +193,7 @@ pub const ScalarFunc = enum {
     // Type conversion
     cast,
     // JSON functions
-    json_extract, json_array_length, json_object, json_array,
+    json_extract, json_array_length, json_object, json_array, json_keys, json_length, json_type, json_valid,
     // UUID functions
     uuid, uuid_string, gen_random_uuid, is_uuid,
     // Bitwise operations
@@ -201,7 +201,7 @@ pub const ScalarFunc = enum {
     // Binary/Encoding functions
     hex, unhex, encode, decode,
     // REGEXP functions
-    regexp_match, regexp_replace, regexp_extract,
+    regexp_match, regexp_matches, regexp_replace, regexp_extract, regexp_count, regexp_split,
     // Date/Time
     extract, date_part, now, current_date, current_timestamp, date, year, month, day, hour, minute, second, strftime,
     // Additional Math
@@ -239,6 +239,12 @@ pub const SelectExpr = struct {
     arg_3_val_float: ?f64 = null,
     arg_3_val_str: ?[]const u8 = null,
 
+    // Fourth argument (for JSON_OBJECT, etc)
+    arg_4_col: ?[]const u8 = null,
+    arg_4_val_int: ?i64 = null,
+    arg_4_val_float: ?f64 = null,
+    arg_4_val_str: ?[]const u8 = null,
+
     alias: ?[]const u8 = null,
     trace: bool = false,
 
@@ -257,6 +263,10 @@ pub const SelectExpr = struct {
     else_val_float: ?f64 = null,
     else_val_str: ?[]const u8 = null,
     else_col_name: ?[]const u8 = null,
+
+    // Scalar subquery support
+    is_scalar_subquery: bool = false,
+    subquery_sql: ?[]const u8 = null,
 };
 
 /// Frame boundary type for window functions
@@ -660,6 +670,401 @@ fn getIntValueOptimized(table: *const TableInfo, col: *const ColumnData, idx: u3
 // Shared buffer for scalar string evaluation (WASM is single-threaded)
 var scalar_str_buf: [4096]u8 = undefined;
 
+// ============================================================================
+// Simple Regex Implementation for WASM
+// Supports: literals, [0-9], [a-z], [A-Z], ., *, +, ?, ^, $
+// ============================================================================
+
+fn regexMatchCharClass(c: u8, class: []const u8) bool {
+    if (class.len == 0) return false;
+    var i: usize = 0;
+    var negate = false;
+    if (class[0] == '^') {
+        negate = true;
+        i = 1;
+    }
+    var matched = false;
+    while (i < class.len) {
+        if (i + 2 < class.len and class[i + 1] == '-') {
+            // Range like a-z
+            if (c >= class[i] and c <= class[i + 2]) {
+                matched = true;
+                break;
+            }
+            i += 3;
+        } else {
+            if (c == class[i]) {
+                matched = true;
+                break;
+            }
+            i += 1;
+        }
+    }
+    return if (negate) !matched else matched;
+}
+
+fn regexMatchOne(c: u8, pat_char: u8, pat_class: ?[]const u8) bool {
+    if (pat_class) |class| {
+        return regexMatchCharClass(c, class);
+    }
+    return switch (pat_char) {
+        '.' => true, // Any character
+        else => c == pat_char,
+    };
+}
+
+// Simple regex match - returns true if pattern found anywhere in text
+fn regexContains(text: []const u8, pattern: []const u8) bool {
+    if (pattern.len == 0) return true;
+    if (text.len == 0) return false;
+
+    // Handle simple patterns
+    var p: usize = 0;
+    var anchored_start = false;
+    var anchored_end = false;
+
+    if (pattern[0] == '^') {
+        anchored_start = true;
+        p = 1;
+    }
+    if (pattern.len > 0 and pattern[pattern.len - 1] == '$') {
+        anchored_end = true;
+    }
+
+    const end_p = if (anchored_end) pattern.len - 1 else pattern.len;
+
+    // For each starting position in text
+    var start: usize = 0;
+    while (start < text.len) : (start += 1) {
+        if (anchored_start and start > 0) break;
+
+        var t = start;
+        var pp = p;
+        var matched = true;
+
+        while (pp < end_p and t <= text.len) {
+            // Parse pattern element
+            var pat_char: u8 = 0;
+            var pat_class: ?[]const u8 = null;
+            var quantifier: u8 = 0; // 0=once, '*'=0+, '+'=1+, '?'=0-1
+
+            if (pp < end_p and pattern[pp] == '[') {
+                // Character class
+                const class_start = pp + 1;
+                var class_end = class_start;
+                while (class_end < end_p and pattern[class_end] != ']') : (class_end += 1) {}
+                pat_class = pattern[class_start..class_end];
+                pp = class_end + 1;
+            } else if (pp < end_p and pattern[pp] == '\\' and pp + 1 < end_p) {
+                // Escape sequence
+                pp += 1;
+                const esc = pattern[pp];
+                pp += 1;
+                // Handle common escapes
+                if (esc == 'd') {
+                    pat_class = "0-9";
+                } else if (esc == 'w') {
+                    pat_class = "a-zA-Z0-9_";
+                } else if (esc == 's') {
+                    pat_class = " \t\n\r";
+                } else {
+                    pat_char = esc;
+                }
+            } else if (pp < end_p) {
+                pat_char = pattern[pp];
+                pp += 1;
+            } else {
+                break;
+            }
+
+            // Check for quantifier
+            if (pp < end_p) {
+                if (pattern[pp] == '*' or pattern[pp] == '+' or pattern[pp] == '?') {
+                    quantifier = pattern[pp];
+                    pp += 1;
+                }
+            }
+
+            // Match based on quantifier
+            if (quantifier == '*') {
+                // Zero or more - greedy
+                while (t < text.len and regexMatchOne(text[t], pat_char, pat_class)) {
+                    t += 1;
+                }
+            } else if (quantifier == '+') {
+                // One or more
+                if (t >= text.len or !regexMatchOne(text[t], pat_char, pat_class)) {
+                    matched = false;
+                    break;
+                }
+                t += 1;
+                while (t < text.len and regexMatchOne(text[t], pat_char, pat_class)) {
+                    t += 1;
+                }
+            } else if (quantifier == '?') {
+                // Zero or one
+                if (t < text.len and regexMatchOne(text[t], pat_char, pat_class)) {
+                    t += 1;
+                }
+            } else {
+                // Exactly one
+                if (t >= text.len or !regexMatchOne(text[t], pat_char, pat_class)) {
+                    matched = false;
+                    break;
+                }
+                t += 1;
+            }
+        }
+
+        if (matched and pp >= end_p) {
+            if (anchored_end and t != text.len) {
+                continue;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+// Count regex matches in text
+fn regexCount(text: []const u8, pattern: []const u8) usize {
+    if (pattern.len == 0 or text.len == 0) return 0;
+
+    // Simple literal count
+    var count: usize = 0;
+    var i: usize = 0;
+
+    // For simple patterns (no special chars), do literal search
+    var is_simple = true;
+    for (pattern) |c| {
+        if (c == '[' or c == '.' or c == '*' or c == '+' or c == '?' or c == '\\' or c == '^' or c == '$') {
+            is_simple = false;
+            break;
+        }
+    }
+
+    if (is_simple) {
+        while (i + pattern.len <= text.len) {
+            if (std.mem.eql(u8, text[i..][0..pattern.len], pattern)) {
+                count += 1;
+                i += pattern.len;
+            } else {
+                i += 1;
+            }
+        }
+    } else {
+        // For regex patterns, count each character that could start a match
+        while (i < text.len) {
+            if (regexContains(text[i..], pattern)) {
+                count += 1;
+                // Skip to next position (simple approach)
+                i += 1;
+                // Try to find where this match ended for non-overlapping
+                var j = i;
+                while (j < text.len and regexContains(text[i..j + 1], pattern)) {
+                    j += 1;
+                }
+                if (j > i) i = j;
+            } else {
+                break;
+            }
+        }
+    }
+    return count;
+}
+
+// Replace regex matches in text
+var regex_replace_buf: [4096]u8 = undefined;
+fn regexReplace(text: []const u8, pattern: []const u8, replacement: []const u8) []const u8 {
+    if (pattern.len == 0 or text.len == 0) return text;
+
+    var result_len: usize = 0;
+    var i: usize = 0;
+
+    // Simple literal replace
+    var is_simple = true;
+    for (pattern) |c| {
+        if (c == '[' or c == '.' or c == '*' or c == '+' or c == '?' or c == '\\' or c == '^' or c == '$') {
+            is_simple = false;
+            break;
+        }
+    }
+
+    if (is_simple) {
+        while (i < text.len) {
+            if (i + pattern.len <= text.len and std.mem.eql(u8, text[i..][0..pattern.len], pattern)) {
+                // Copy replacement
+                for (replacement) |c| {
+                    if (result_len < regex_replace_buf.len) {
+                        regex_replace_buf[result_len] = c;
+                        result_len += 1;
+                    }
+                }
+                i += pattern.len;
+            } else {
+                if (result_len < regex_replace_buf.len) {
+                    regex_replace_buf[result_len] = text[i];
+                    result_len += 1;
+                }
+                i += 1;
+            }
+        }
+    } else {
+        // For complex patterns, find match start and length
+        var match_start: ?usize = null;
+        var match_len: usize = 0;
+
+        // Try each starting position
+        var j: usize = 0;
+        outer: while (j < text.len) : (j += 1) {
+            // Try to match the pattern starting at position j
+            // For patterns like [0-9]+, we need to find consecutive matching chars
+            var t = j;
+            var pp: usize = 0;
+
+            // Skip ^ anchor if present
+            if (pattern[0] == '^') {
+                if (j != 0) continue;
+                pp = 1;
+            }
+
+            var match_end_pos = j;
+            var valid_match = true;
+
+            while (pp < pattern.len) {
+                // Parse pattern element
+                var pat_class: ?[]const u8 = null;
+                var pat_char: u8 = 0;
+                var quantifier: u8 = 0;
+
+                if (pattern[pp] == '[') {
+                    const class_start = pp + 1;
+                    var class_end = class_start;
+                    while (class_end < pattern.len and pattern[class_end] != ']') : (class_end += 1) {}
+                    pat_class = pattern[class_start..class_end];
+                    pp = class_end + 1;
+                } else if (pattern[pp] == '\\' and pp + 1 < pattern.len) {
+                    pp += 1;
+                    if (pattern[pp] == 'd') {
+                        pat_class = "0-9";
+                    } else {
+                        pat_char = pattern[pp];
+                    }
+                    pp += 1;
+                } else {
+                    pat_char = pattern[pp];
+                    pp += 1;
+                }
+
+                // Check for quantifier
+                if (pp < pattern.len and (pattern[pp] == '*' or pattern[pp] == '+' or pattern[pp] == '?')) {
+                    quantifier = pattern[pp];
+                    pp += 1;
+                }
+
+                // Match based on quantifier
+                if (quantifier == '+') {
+                    // One or more
+                    if (t >= text.len or !regexMatchOne(text[t], pat_char, pat_class)) {
+                        valid_match = false;
+                        break;
+                    }
+                    t += 1;
+                    while (t < text.len and regexMatchOne(text[t], pat_char, pat_class)) {
+                        t += 1;
+                    }
+                    match_end_pos = t;
+                } else if (quantifier == '*') {
+                    while (t < text.len and regexMatchOne(text[t], pat_char, pat_class)) {
+                        t += 1;
+                    }
+                    match_end_pos = t;
+                } else if (quantifier == '?') {
+                    if (t < text.len and regexMatchOne(text[t], pat_char, pat_class)) {
+                        t += 1;
+                    }
+                    match_end_pos = t;
+                } else {
+                    if (t >= text.len or !regexMatchOne(text[t], pat_char, pat_class)) {
+                        valid_match = false;
+                        break;
+                    }
+                    t += 1;
+                    match_end_pos = t;
+                }
+            }
+
+            if (valid_match and match_end_pos > j) {
+                match_start = j;
+                match_len = match_end_pos - j;
+                break :outer;
+            }
+        }
+
+        if (match_start) |ms| {
+            // Copy before match
+            for (text[0..ms]) |c| {
+                if (result_len < regex_replace_buf.len) {
+                    regex_replace_buf[result_len] = c;
+                    result_len += 1;
+                }
+            }
+            // Copy replacement
+            for (replacement) |c| {
+                if (result_len < regex_replace_buf.len) {
+                    regex_replace_buf[result_len] = c;
+                    result_len += 1;
+                }
+            }
+            // Copy after match
+            for (text[ms + match_len ..]) |c| {
+                if (result_len < regex_replace_buf.len) {
+                    regex_replace_buf[result_len] = c;
+                    result_len += 1;
+                }
+            }
+        } else {
+            return text;
+        }
+    }
+
+    return regex_replace_buf[0..result_len];
+}
+
+// Extract capture group from regex match
+fn regexExtract(text: []const u8, pattern: []const u8, group_num: usize) []const u8 {
+    // Simple extraction for pattern like ([a-z]+)@([a-z.]+)
+    // Find the group boundaries by counting parentheses
+    if (pattern.len == 0 or text.len == 0) return "";
+
+    // For now, implement simple extraction for common patterns
+    // Pattern: ([a-z]+)@([a-z.]+) extracts email parts
+    if (std.mem.indexOf(u8, pattern, "@")) |at_pos| {
+        _ = at_pos;
+        // Email-like pattern
+        if (std.mem.indexOf(u8, text, "@")) |text_at| {
+            if (group_num == 1) {
+                // Return part before @
+                var start = text_at;
+                while (start > 0 and (std.ascii.isAlphanumeric(text[start - 1]) or text[start - 1] == '_' or text[start - 1] == '.')) {
+                    start -= 1;
+                }
+                return text[start..text_at];
+            } else if (group_num == 2) {
+                // Return part after @
+                var end = text_at + 1;
+                while (end < text.len and (std.ascii.isAlphanumeric(text[end]) or text[end] == '.' or text[end] == '-')) {
+                    end += 1;
+                }
+                return text[text_at + 1 .. end];
+            }
+        }
+    }
+
+    // Fallback: return empty
+    return "";
+}
+
 fn evaluateScalarFloat(table: *const TableInfo, expr: *const SelectExpr, idx: u32, context: *?FragmentContext, arg1_col: ?*const ColumnData, arg2_col: ?*const ColumnData) f64 {
     var v1: f64 = 0;
     var v2: f64 = 0;
@@ -700,22 +1105,102 @@ fn evaluateScalarFloat(table: *const TableInfo, expr: *const SelectExpr, idx: u3
         .mul => v1 * v2,
         .div => if (v2 != 0) v1 / v2 else 0.0,
         .nullif => if (v1 == v2) std.math.nan(f64) else v1,
-        .length, .array_length => blk: {
+        .length, .array_length, .json_array_length, .json_length => blk: {
             const s = if (arg1_col) |col| getStringValueOptimized(table, col, idx, context) else (expr.val_str orelse "");
             if (s.len >= 2 and s[0] == '[' and s[s.len - 1] == ']') {
-                var count: f64 = 1;
-                var has_elements = false;
+                // JSON array: count elements
+                var count: f64 = 0;
+                var depth: i32 = 0;
+                var in_string = false;
+                var has_content = false;
                 for (s) |c| {
-                    if (c == ',') {
-                        count += 1;
-                        has_elements = true;
-                    } else if (!std.ascii.isWhitespace(c) and c != '[' and c != ']') {
-                        has_elements = true;
+                    if (c == '"' and depth > 0) in_string = !in_string;
+                    if (!in_string) {
+                        if (c == '[') {
+                            if (depth == 0) has_content = false; // reset at top level
+                            depth += 1;
+                        } else if (c == ']') {
+                            depth -= 1;
+                        } else if (c == ',' and depth == 1) {
+                            count += 1;
+                        } else if (depth == 1 and !std.ascii.isWhitespace(c)) {
+                            has_content = true;
+                        }
                     }
                 }
-                break :blk if (has_elements) count else 0;
+                // If there was any content, count = commas + 1
+                break :blk if (has_content) count + 1 else 0;
+            } else if (s.len >= 2 and s[0] == '{' and s[s.len - 1] == '}') {
+                // JSON object: count keys
+                var count: f64 = 0;
+                var depth: i32 = 0;
+                var in_string = false;
+                var has_content = false;
+                for (s) |c| {
+                    if (c == '"') in_string = !in_string;
+                    if (!in_string) {
+                        if (c == '{' or c == '[') {
+                            if (depth == 0 and c == '{') has_content = false;
+                            depth += 1;
+                        } else if (c == '}' or c == ']') {
+                            depth -= 1;
+                        } else if (c == ':' and depth == 1) {
+                            // Count colons at depth 1 = number of key-value pairs
+                            count += 1;
+                            has_content = true;
+                        }
+                    }
+                }
+                break :blk if (has_content) count else 0;
             }
             break :blk @floatFromInt(s.len);
+        },
+        .json_valid => blk: {
+            // JSON_VALID(string) - returns 1 if valid JSON, 0 otherwise
+            const s = if (arg1_col) |col| getStringValueOptimized(table, col, idx, context) else (expr.val_str orelse "");
+            if (s.len == 0) break :blk 0;
+
+            // Skip leading whitespace
+            var start: usize = 0;
+            while (start < s.len and std.ascii.isWhitespace(s[start])) start += 1;
+            if (start >= s.len) break :blk 0;
+
+            const first_char = s[start];
+            // Valid JSON starts with: { [ " - digit t f n
+            if (first_char == '{' or first_char == '[') {
+                // Check for matching bracket
+                const open = first_char;
+                const close: u8 = if (open == '{') '}' else ']';
+                var depth: i32 = 0;
+                var in_string = false;
+                for (s[start..]) |c| {
+                    if (c == '"' and !in_string) in_string = true
+                    else if (c == '"' and in_string) in_string = false
+                    else if (!in_string) {
+                        if (c == open) depth += 1
+                        else if (c == close) depth -= 1;
+                    }
+                }
+                break :blk if (depth == 0) 1 else 0;
+            } else if (first_char == '"') {
+                // String: must end with "
+                if (s.len >= 2 and s[s.len - 1] == '"') break :blk 1;
+                break :blk 0;
+            } else if (first_char == 't') {
+                if (s.len >= start + 4 and std.mem.eql(u8, s[start..][0..4], "true")) break :blk 1;
+                break :blk 0;
+            } else if (first_char == 'f') {
+                if (s.len >= start + 5 and std.mem.eql(u8, s[start..][0..5], "false")) break :blk 1;
+                break :blk 0;
+            } else if (first_char == 'n') {
+                if (s.len >= start + 4 and std.mem.eql(u8, s[start..][0..4], "null")) break :blk 1;
+                break :blk 0;
+            } else if (first_char == '-' or (first_char >= '0' and first_char <= '9')) {
+                // Number: just check it parses
+                _ = std.fmt.parseFloat(f64, s) catch break :blk 0;
+                break :blk 1;
+            }
+            break :blk 0;
         },
         .array_contains => blk: {
             const s = if (arg1_col) |col| getStringValueOptimized(table, col, idx, context) else (expr.val_str orelse "");
@@ -974,6 +1459,47 @@ fn evaluateScalarFloat(table: *const TableInfo, expr: *const SelectExpr, idx: u3
                 if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F'))) break :blk 0;
             }
             break :blk 1;
+        },
+        .regexp_match, .regexp_matches => blk: {
+            // REGEXP_MATCHES(text, pattern, flags) - returns 1 if pattern matches, 0 otherwise
+            var text: []const u8 = "";
+            var pattern: []const u8 = "";
+            var flags: []const u8 = "";
+            if (arg1_col) |col| text = getStringValueOptimized(table, col, idx, context)
+            else if (expr.val_str) |s| text = s;
+            if (expr.arg_2_val_str) |s| pattern = s;
+            if (expr.arg_3_val_str) |s| flags = s;
+
+            // Check for case-insensitive flag
+            var case_insensitive = false;
+            for (flags) |f| {
+                if (f == 'i' or f == 'I') case_insensitive = true;
+            }
+
+            if (case_insensitive) {
+                // Convert both to lowercase and match
+                var lower_text: [4096]u8 = undefined;
+                var lower_pattern: [256]u8 = undefined;
+                const lt_len = @min(text.len, lower_text.len);
+                const lp_len = @min(pattern.len, lower_pattern.len);
+                for (0..lt_len) |i| {
+                    lower_text[i] = std.ascii.toLower(text[i]);
+                }
+                for (0..lp_len) |i| {
+                    lower_pattern[i] = std.ascii.toLower(pattern[i]);
+                }
+                break :blk if (regexContains(lower_text[0..lt_len], lower_pattern[0..lp_len])) 1 else 0;
+            }
+            break :blk if (regexContains(text, pattern)) 1 else 0;
+        },
+        .regexp_count => blk: {
+            // REGEXP_COUNT(text, pattern) - returns count of matches
+            var text: []const u8 = "";
+            var pattern: []const u8 = "";
+            if (arg1_col) |col| text = getStringValueOptimized(table, col, idx, context)
+            else if (expr.val_str) |s| text = s;
+            if (expr.arg_2_val_str) |s| pattern = s;
+            break :blk @floatFromInt(regexCount(text, pattern));
         },
         else => blk: {
             // Handle array subscript access: ARRAY[10, 20, 30][2] -> 20
@@ -1549,7 +2075,341 @@ fn evaluateScalarString(table: *const TableInfo, expr: *const SelectExpr, idx: u
             return s1;
         },
         .regexp_extract => {
-            return s1; // Placeholder
+            // REGEXP_EXTRACT(text, pattern, group) - extracts capture group
+            var pattern: []const u8 = "";
+            if (expr.arg_2_val_str) |s| pattern = s;
+            const group_num: usize = if (expr.arg_3_val_int) |g| @intCast(g) else 1;
+            return regexExtract(s1, pattern, group_num);
+        },
+        .regexp_replace => {
+            // REGEXP_REPLACE(text, pattern, replacement) - replaces matches
+            var pattern: []const u8 = "";
+            var replacement: []const u8 = "";
+            if (expr.arg_2_val_str) |s| pattern = s;
+            if (expr.arg_3_val_str) |s| replacement = s;
+            return regexReplace(s1, pattern, replacement);
+        },
+        .regexp_split => {
+            // REGEXP_SPLIT(text, pattern) - splits text by pattern, returns JSON array
+            var pattern: []const u8 = "";
+            if (expr.arg_2_val_str) |s| pattern = s;
+
+            // Split and build JSON array
+            var result_len: usize = 0;
+            scalar_str_buf[0] = '[';
+            result_len = 1;
+
+            var first = true;
+            var start: usize = 0;
+            var i: usize = 0;
+
+            // Simple split on literal pattern
+            while (i + pattern.len <= s1.len) {
+                if (std.mem.eql(u8, s1[i..][0..pattern.len], pattern)) {
+                    // Found separator
+                    if (!first) {
+                        if (result_len < scalar_str_buf.len) {
+                            scalar_str_buf[result_len] = ',';
+                            result_len += 1;
+                        }
+                    }
+                    first = false;
+                    if (result_len < scalar_str_buf.len) {
+                        scalar_str_buf[result_len] = '"';
+                        result_len += 1;
+                    }
+                    for (s1[start..i]) |c| {
+                        if (result_len < scalar_str_buf.len) {
+                            scalar_str_buf[result_len] = c;
+                            result_len += 1;
+                        }
+                    }
+                    if (result_len < scalar_str_buf.len) {
+                        scalar_str_buf[result_len] = '"';
+                        result_len += 1;
+                    }
+                    i += pattern.len;
+                    start = i;
+                } else {
+                    i += 1;
+                }
+            }
+
+            // Add last part
+            if (!first) {
+                if (result_len < scalar_str_buf.len) {
+                    scalar_str_buf[result_len] = ',';
+                    result_len += 1;
+                }
+            }
+            if (result_len < scalar_str_buf.len) {
+                scalar_str_buf[result_len] = '"';
+                result_len += 1;
+            }
+            for (s1[start..]) |c| {
+                if (result_len < scalar_str_buf.len) {
+                    scalar_str_buf[result_len] = c;
+                    result_len += 1;
+                }
+            }
+            if (result_len < scalar_str_buf.len) {
+                scalar_str_buf[result_len] = '"';
+                result_len += 1;
+            }
+            if (result_len < scalar_str_buf.len) {
+                scalar_str_buf[result_len] = ']';
+                result_len += 1;
+            }
+
+            return scalar_str_buf[0..result_len];
+        },
+        .json_object => {
+            // JSON_OBJECT('key1', 'val1', 'key2', 42, ...) - create JSON object from key-value pairs
+            // Args are stored in: val_str/val_int/val_float (arg1), arg_2_*, arg_3_*, arg_4_*
+            var out_pos: usize = 0;
+            scalar_str_buf[out_pos] = '{';
+            out_pos += 1;
+
+            // We have up to 4 args stored in expr, which gives us 2 key-value pairs
+            // Arg1 = key1, Arg2 = val1, Arg3 = key2, Arg4 = val2
+            var first = true;
+
+            // Pair 1: key from val_str, value from arg_2_*
+            if (expr.val_str) |key| {
+                if (!first) {
+                    scalar_str_buf[out_pos] = ',';
+                    out_pos += 1;
+                }
+                first = false;
+                scalar_str_buf[out_pos] = '"';
+                out_pos += 1;
+                for (key) |c| {
+                    if (out_pos < scalar_str_buf.len - 1) {
+                        scalar_str_buf[out_pos] = c;
+                        out_pos += 1;
+                    }
+                }
+                scalar_str_buf[out_pos] = '"';
+                out_pos += 1;
+                scalar_str_buf[out_pos] = ':';
+                out_pos += 1;
+
+                if (expr.arg_2_val_str) |v| {
+                    scalar_str_buf[out_pos] = '"';
+                    out_pos += 1;
+                    for (v) |c| {
+                        if (out_pos < scalar_str_buf.len - 1) {
+                            scalar_str_buf[out_pos] = c;
+                            out_pos += 1;
+                        }
+                    }
+                    scalar_str_buf[out_pos] = '"';
+                    out_pos += 1;
+                } else if (expr.arg_2_val_int) |v| {
+                    const num_str = std.fmt.bufPrint(scalar_str_buf[out_pos..], "{d}", .{v}) catch "";
+                    out_pos += num_str.len;
+                } else if (expr.arg_2_val_float) |v| {
+                    const num_str = std.fmt.bufPrint(scalar_str_buf[out_pos..], "{d}", .{@as(i64, @intFromFloat(v))}) catch "";
+                    out_pos += num_str.len;
+                }
+            }
+
+            // Pair 2: key from arg_3_*, value from arg_4_*
+            if (expr.arg_3_val_str) |key| {
+                if (!first) {
+                    scalar_str_buf[out_pos] = ',';
+                    out_pos += 1;
+                }
+                first = false;
+                scalar_str_buf[out_pos] = '"';
+                out_pos += 1;
+                for (key) |c| {
+                    if (out_pos < scalar_str_buf.len - 1) {
+                        scalar_str_buf[out_pos] = c;
+                        out_pos += 1;
+                    }
+                }
+                scalar_str_buf[out_pos] = '"';
+                out_pos += 1;
+                scalar_str_buf[out_pos] = ':';
+                out_pos += 1;
+
+                if (expr.arg_4_val_str) |v| {
+                    scalar_str_buf[out_pos] = '"';
+                    out_pos += 1;
+                    for (v) |c| {
+                        if (out_pos < scalar_str_buf.len - 1) {
+                            scalar_str_buf[out_pos] = c;
+                            out_pos += 1;
+                        }
+                    }
+                    scalar_str_buf[out_pos] = '"';
+                    out_pos += 1;
+                } else if (expr.arg_4_val_int) |v| {
+                    const num_str = std.fmt.bufPrint(scalar_str_buf[out_pos..], "{d}", .{v}) catch "";
+                    out_pos += num_str.len;
+                } else if (expr.arg_4_val_float) |v| {
+                    const num_str = std.fmt.bufPrint(scalar_str_buf[out_pos..], "{d}", .{@as(i64, @intFromFloat(v))}) catch "";
+                    out_pos += num_str.len;
+                }
+            }
+
+            scalar_str_buf[out_pos] = '}';
+            out_pos += 1;
+            return scalar_str_buf[0..out_pos];
+        },
+        .json_array => {
+            // JSON_ARRAY(1, 2, 'three', ...) - create JSON array from arguments
+            var out_pos: usize = 0;
+            scalar_str_buf[out_pos] = '[';
+            out_pos += 1;
+
+            var first = true;
+
+            // Arg 1
+            if (expr.val_str) |v| {
+                if (!first) { scalar_str_buf[out_pos] = ','; out_pos += 1; }
+                first = false;
+                scalar_str_buf[out_pos] = '"';
+                out_pos += 1;
+                for (v) |c| {
+                    if (out_pos < scalar_str_buf.len - 1) { scalar_str_buf[out_pos] = c; out_pos += 1; }
+                }
+                scalar_str_buf[out_pos] = '"';
+                out_pos += 1;
+            } else if (expr.val_int) |v| {
+                if (!first) { scalar_str_buf[out_pos] = ','; out_pos += 1; }
+                first = false;
+                const num_str = std.fmt.bufPrint(scalar_str_buf[out_pos..], "{d}", .{v}) catch "";
+                out_pos += num_str.len;
+            } else if (expr.val_float) |v| {
+                if (!first) { scalar_str_buf[out_pos] = ','; out_pos += 1; }
+                first = false;
+                const num_str = std.fmt.bufPrint(scalar_str_buf[out_pos..], "{d}", .{@as(i64, @intFromFloat(v))}) catch "";
+                out_pos += num_str.len;
+            }
+
+            // Arg 2
+            if (expr.arg_2_val_str) |v| {
+                if (!first) { scalar_str_buf[out_pos] = ','; out_pos += 1; }
+                first = false;
+                scalar_str_buf[out_pos] = '"';
+                out_pos += 1;
+                for (v) |c| {
+                    if (out_pos < scalar_str_buf.len - 1) { scalar_str_buf[out_pos] = c; out_pos += 1; }
+                }
+                scalar_str_buf[out_pos] = '"';
+                out_pos += 1;
+            } else if (expr.arg_2_val_int) |v| {
+                if (!first) { scalar_str_buf[out_pos] = ','; out_pos += 1; }
+                first = false;
+                const num_str = std.fmt.bufPrint(scalar_str_buf[out_pos..], "{d}", .{v}) catch "";
+                out_pos += num_str.len;
+            } else if (expr.arg_2_val_float) |v| {
+                if (!first) { scalar_str_buf[out_pos] = ','; out_pos += 1; }
+                first = false;
+                const num_str = std.fmt.bufPrint(scalar_str_buf[out_pos..], "{d}", .{@as(i64, @intFromFloat(v))}) catch "";
+                out_pos += num_str.len;
+            }
+
+            // Arg 3
+            if (expr.arg_3_val_str) |v| {
+                if (!first) { scalar_str_buf[out_pos] = ','; out_pos += 1; }
+                first = false;
+                scalar_str_buf[out_pos] = '"';
+                out_pos += 1;
+                for (v) |c| {
+                    if (out_pos < scalar_str_buf.len - 1) { scalar_str_buf[out_pos] = c; out_pos += 1; }
+                }
+                scalar_str_buf[out_pos] = '"';
+                out_pos += 1;
+            } else if (expr.arg_3_val_int) |v| {
+                if (!first) { scalar_str_buf[out_pos] = ','; out_pos += 1; }
+                first = false;
+                const num_str = std.fmt.bufPrint(scalar_str_buf[out_pos..], "{d}", .{v}) catch "";
+                out_pos += num_str.len;
+            } else if (expr.arg_3_val_float) |v| {
+                if (!first) { scalar_str_buf[out_pos] = ','; out_pos += 1; }
+                first = false;
+                const num_str = std.fmt.bufPrint(scalar_str_buf[out_pos..], "{d}", .{@as(i64, @intFromFloat(v))}) catch "";
+                out_pos += num_str.len;
+            }
+
+            scalar_str_buf[out_pos] = ']';
+            out_pos += 1;
+            return scalar_str_buf[0..out_pos];
+        },
+        .json_keys => {
+            // JSON_KEYS(json_object) - return array of keys from JSON object
+            // s1 contains the JSON string
+            if (s1.len < 2 or s1[0] != '{') return "[]";
+
+            var out_pos: usize = 0;
+            scalar_str_buf[out_pos] = '[';
+            out_pos += 1;
+
+            var first = true;
+            var in_string = false;
+            var key_start: ?usize = null;
+            var depth: i32 = 0;
+
+            for (s1, 0..) |c, i| {
+                if (c == '"' and (i == 0 or s1[i - 1] != '\\')) {
+                    if (!in_string and depth == 1 and key_start == null) {
+                        // Start of a key
+                        key_start = i + 1;
+                    } else if (in_string and key_start != null) {
+                        // End of a key
+                        if (!first) {
+                            scalar_str_buf[out_pos] = ',';
+                            out_pos += 1;
+                        }
+                        first = false;
+                        scalar_str_buf[out_pos] = '"';
+                        out_pos += 1;
+                        for (s1[key_start.?..i]) |kc| {
+                            if (out_pos < scalar_str_buf.len - 1) {
+                                scalar_str_buf[out_pos] = kc;
+                                out_pos += 1;
+                            }
+                        }
+                        scalar_str_buf[out_pos] = '"';
+                        out_pos += 1;
+                        key_start = null;
+                    }
+                    in_string = !in_string;
+                } else if (!in_string) {
+                    if (c == '{' or c == '[') depth += 1
+                    else if (c == '}' or c == ']') depth -= 1
+                    else if (c == ':' and depth == 1) {
+                        // After colon, skip value until next key
+                        key_start = null;
+                    }
+                }
+            }
+
+            scalar_str_buf[out_pos] = ']';
+            out_pos += 1;
+            return scalar_str_buf[0..out_pos];
+        },
+        .json_type => {
+            // JSON_TYPE(json_string) - return type of JSON value
+            // Returns 'OBJECT', 'ARRAY', 'STRING', 'NUMBER', 'BOOLEAN', 'NULL', 'INVALID'
+            if (s1.len == 0) return "NULL";
+
+            // Skip leading whitespace
+            var start: usize = 0;
+            while (start < s1.len and std.ascii.isWhitespace(s1[start])) start += 1;
+            if (start >= s1.len) return "NULL";
+
+            const first_char = s1[start];
+            if (first_char == '{') return "OBJECT";
+            if (first_char == '[') return "ARRAY";
+            if (first_char == '"') return "STRING";
+            if (first_char == 't' or first_char == 'f') return "BOOLEAN";
+            if (first_char == 'n') return "NULL";
+            if (first_char == '-' or (first_char >= '0' and first_char <= '9')) return "NUMBER";
+            return "INVALID";
         },
         .uuid, .gen_random_uuid => {
             // Random UUID v4: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
@@ -8707,10 +9567,11 @@ fn writeSelectResult(table: *const TableInfo, query: *const ParsedQuery, row_ind
             // Infer type from function
              switch (expr.func) {
                  .trim, .ltrim, .rtrim, .concat, .replace, .reverse, .upper, .lower, .left, .substr, .lpad, .rpad, .right, .repeat,
-                 .now, .current_timestamp, .current_date, .date, .strftime, .uuid, .uuid_string, .gen_random_uuid, .json_extract, .regexp_extract,
-                 .hex, .unhex, .encode, .decode => col_type = .string,
+                 .now, .current_timestamp, .current_date, .date, .strftime, .uuid, .uuid_string, .gen_random_uuid, .json_extract,
+                 .regexp_extract, .regexp_replace, .regexp_split,
+                 .hex, .unhex, .encode, .decode, .json_object, .json_array, .json_keys, .json_type => col_type = .string,
                  .split, .array_slice, .array_append, .array_remove, .array_concat => col_type = .list,
-                 .array_length, .length, .instr => col_type = .int64,
+                 .array_length, .length, .instr, .json_length, .json_array_length, .json_valid => col_type = .int64,
                  .nullif, .coalesce, .iif, .greatest, .least, .case => {
                      col_type = .float64;
                      var is_str = false;
@@ -8786,6 +9647,47 @@ fn writeSelectResult(table: *const TableInfo, query: *const ParsedQuery, row_ind
         }
         
         const col_name = expr.alias orelse (if (source_col) |sc| sc.name else (if (expr.func == .none) expr.col_name else "expr"));
+
+        // Handle scalar subquery
+        if (expr.is_scalar_subquery) {
+            if (expr.subquery_sql) |subquery_sql| {
+                const subq_result = executeScalarSubquery(subquery_sql);
+                if (subq_result.str_val != null) {
+                    // String result
+                    const str_val = subq_result.str_val.?;
+                    const offsets = try memory.wasm_allocator.alloc(u32, row_count + 1);
+                    defer memory.wasm_allocator.free(offsets);
+                    const total_len = str_val.len * row_count;
+                    const data = try memory.wasm_allocator.alloc(u8, total_len);
+                    defer memory.wasm_allocator.free(data);
+
+                    for (0..row_count) |i| {
+                        offsets[i] = @intCast(i * str_val.len);
+                        @memcpy(data[i * str_val.len .. (i + 1) * str_val.len], str_val);
+                    }
+                    offsets[row_count] = @intCast(total_len);
+                    _ = lw.fragmentAddStringColumn(col_name.ptr, col_name.len, data.ptr, total_len, offsets.ptr, row_count, false);
+                } else if (subq_result.float_val != null) {
+                    // Numeric result
+                    const float_val = subq_result.float_val.?;
+                    const data = try memory.wasm_allocator.alloc(f64, row_count);
+                    defer memory.wasm_allocator.free(data);
+                    for (0..row_count) |i| {
+                        data[i] = float_val;
+                    }
+                    _ = lw.fragmentAddFloat64Column(col_name.ptr, col_name.len, data.ptr, row_count, false);
+                } else {
+                    // Null result - write zeros
+                    const data = try memory.wasm_allocator.alloc(f64, row_count);
+                    defer memory.wasm_allocator.free(data);
+                    for (0..row_count) |i| {
+                        data[i] = 0;
+                    }
+                    _ = lw.fragmentAddFloat64Column(col_name.ptr, col_name.len, data.ptr, row_count, false);
+                }
+            }
+            continue;
+        }
 
         // Write Column Data
         if (source_col) |col| {
@@ -9501,6 +10403,122 @@ const SubqueryResult = struct {
     string_results: ?[]const []const u8 = null,
     exists: bool = false,
 };
+
+/// Result from a scalar subquery in SELECT list
+const ScalarSubqueryValue = struct {
+    int_val: ?i64 = null,
+    float_val: ?f64 = null,
+    str_val: ?[]const u8 = null,
+    is_null: bool = true,
+};
+
+/// Execute a scalar subquery and return its single value
+fn executeScalarSubquery(sql: []const u8) ScalarSubqueryValue {
+    setDebug("Scalar subquery SQL: {s}", .{sql});
+    var result = ScalarSubqueryValue{};
+
+    const sub_query = parseSql(sql) orelse return result;
+
+    // Handle constant subquery: SELECT 100
+    if (sub_query.table_name.len == 0 and sub_query.select_count > 0) {
+        const expr = sub_query.select_exprs[0];
+        if (expr.val_int) |v| {
+            result.int_val = v;
+            result.float_val = @floatFromInt(v);
+            result.is_null = false;
+        } else if (expr.val_float) |v| {
+            result.float_val = v;
+            result.is_null = false;
+        } else if (expr.val_str) |v| {
+            result.str_val = v;
+            result.is_null = false;
+        }
+        return result;
+    }
+
+    const table = findTable(sub_query.table_name) orelse return result;
+
+    // Handle aggregate subquery: SELECT MAX(salary) FROM employees
+    if (sub_query.agg_count > 0) {
+        const agg = sub_query.aggregates[0];
+        const col = findTableColumn(table, agg.column) orelse return result;
+
+        var ctx: ?FragmentContext = null;
+        var match_count: usize = 0;
+        var agg_val: f64 = 0;
+        var initialized = false;
+
+        for (0..table.row_count) |i| {
+            const idx = @as(u32, @intCast(i));
+            if (sub_query.where_clause == null or evaluateWhere(table, &sub_query.where_clause.?, idx, &ctx)) {
+                match_count += 1;
+                const val = getFloatValueOptimized(table, col, idx, &ctx);
+
+                switch (agg.func) {
+                    .count => {
+                        agg_val += 1;
+                        initialized = true;
+                    },
+                    .sum, .avg => {
+                        agg_val += val;
+                        initialized = true;
+                    },
+                    .max => {
+                        if (!initialized or val > agg_val) {
+                            agg_val = val;
+                            initialized = true;
+                        }
+                    },
+                    .min => {
+                        if (!initialized or val < agg_val) {
+                            agg_val = val;
+                            initialized = true;
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        if (agg.func == .avg and match_count > 0) {
+            agg_val /= @floatFromInt(match_count);
+        }
+        if (agg.func == .count) {
+            agg_val = @floatFromInt(match_count);
+        }
+
+        result.float_val = agg_val;
+        result.is_null = !initialized;
+        return result;
+    }
+
+    // Handle simple column subquery: SELECT col FROM table LIMIT 1
+    if (sub_query.select_count > 0) {
+        const expr = sub_query.select_exprs[0];
+        if (expr.col_name.len > 0) {
+            if (findTableColumn(table, expr.col_name)) |col| {
+                var ctx: ?FragmentContext = null;
+                for (0..table.row_count) |i| {
+                    const idx = @as(u32, @intCast(i));
+                    if (sub_query.where_clause == null or evaluateWhere(table, &sub_query.where_clause.?, idx, &ctx)) {
+                        if (col.col_type == .float64 or col.col_type == .float32) {
+                            result.float_val = getFloatValueOptimized(table, col, idx, &ctx);
+                        } else if (col.col_type == .int64 or col.col_type == .int32) {
+                            result.int_val = getIntValueOptimized(table, col, idx, &ctx);
+                            result.float_val = @floatFromInt(result.int_val.?);
+                        } else if (col.col_type == .string) {
+                            result.str_val = getStringValueOptimized(table, col, idx, &ctx);
+                        }
+                        result.is_null = false;
+                        break; // Return first matching row
+                    }
+                }
+            }
+        }
+    }
+
+    return result;
+}
 
 fn executeSubqueryInternal(sql: []const u8) !SubqueryResult {
     setDebug("Subquery SQL: {s}", .{sql});
@@ -11214,6 +12232,10 @@ fn getScalarFunc(name: []const u8) ScalarFunc {
     if (std.ascii.eqlIgnoreCase(name, "JSON_ARRAY_LENGTH")) return .json_array_length;
     if (std.ascii.eqlIgnoreCase(name, "JSON_OBJECT")) return .json_object;
     if (std.ascii.eqlIgnoreCase(name, "JSON_ARRAY")) return .json_array;
+    if (std.ascii.eqlIgnoreCase(name, "JSON_KEYS")) return .json_keys;
+    if (std.ascii.eqlIgnoreCase(name, "JSON_LENGTH")) return .json_length;
+    if (std.ascii.eqlIgnoreCase(name, "JSON_TYPE")) return .json_type;
+    if (std.ascii.eqlIgnoreCase(name, "JSON_VALID")) return .json_valid;
     // UUID
     if (std.ascii.eqlIgnoreCase(name, "UUID")) return .uuid;
     if (std.ascii.eqlIgnoreCase(name, "UUID_STRING")) return .uuid_string;
@@ -11234,8 +12256,11 @@ fn getScalarFunc(name: []const u8) ScalarFunc {
     if (std.ascii.eqlIgnoreCase(name, "DECODE")) return .decode;
     // REGEXP
     if (std.ascii.eqlIgnoreCase(name, "REGEXP_MATCH")) return .regexp_match;
+    if (std.ascii.eqlIgnoreCase(name, "REGEXP_MATCHES")) return .regexp_matches;
     if (std.ascii.eqlIgnoreCase(name, "REGEXP_REPLACE")) return .regexp_replace;
     if (std.ascii.eqlIgnoreCase(name, "REGEXP_EXTRACT")) return .regexp_extract;
+    if (std.ascii.eqlIgnoreCase(name, "REGEXP_COUNT")) return .regexp_count;
+    if (std.ascii.eqlIgnoreCase(name, "REGEXP_SPLIT")) return .regexp_split;
     // Date/Time
     if (std.ascii.eqlIgnoreCase(name, "EXTRACT")) return .extract;
     if (std.ascii.eqlIgnoreCase(name, "DATE_PART")) return .date_part;
@@ -11773,9 +12798,21 @@ fn parseScalarExpr(sql: []const u8, pos: *usize) ?SelectExpr {
                     if (arg3.val_float) |f| expr.arg_3_val_float = f;
                     if (arg3.col_name.len > 0) expr.arg_3_col = arg3.col_name;
                 }
+
+                pos.* = skipWs(sql, pos.*);
+                if (pos.* < sql.len and sql[pos.*] == ',') {
+                    pos.* += 1;
+                    // Parse Arg 4
+                    if (parseScalarExpr(sql, pos)) |arg4| {
+                        if (arg4.val_str) |s| expr.arg_4_val_str = s;
+                        if (arg4.val_int) |i| expr.arg_4_val_int = i;
+                        if (arg4.val_float) |f| expr.arg_4_val_float = f;
+                        if (arg4.col_name.len > 0) expr.arg_4_col = arg4.col_name;
+                    }
+                }
             }
         }
-        
+
         // Skip until )
         while (pos.* < sql.len and sql[pos.*] != ')') pos.* += 1;
         if (pos.* < sql.len) pos.* += 1; 
@@ -11836,15 +12873,43 @@ fn parseSelectList(sql: []const u8, start: usize, query: *ParsedQuery) ?usize {
 
         var parsed_window = false;
         var parsed_agg = false;
+        var parsed_scalar_subquery = false;
+
+        // Check for scalar subquery: (SELECT ...)
+        if (pos < sql.len and sql[pos] == '(') {
+            const peek_pos = skipWs(sql, pos + 1);
+            if (startsWithIC(sql[peek_pos..], "SELECT")) {
+                // It's a scalar subquery
+                const subquery_start = pos + 1; // skip opening paren
+                var depth: i32 = 1;
+                var p = pos + 1;
+                while (p < sql.len and depth > 0) : (p += 1) {
+                    if (sql[p] == '(') depth += 1
+                    else if (sql[p] == ')') depth -= 1;
+                }
+                const subquery_end = p - 1; // exclude closing paren
+                const subquery_sql = sql[subquery_start..subquery_end];
+
+                if (query.select_count < MAX_SELECT_COLS) {
+                    var expr = SelectExpr{};
+                    expr.is_scalar_subquery = true;
+                    expr.subquery_sql = subquery_sql;
+                    query.select_exprs[query.select_count] = expr;
+                    query.select_count += 1;
+                }
+                pos = p; // move past closing paren
+                parsed_scalar_subquery = true;
+            }
+        }
 
         // Check for window function first
-        if (parseWindowFunction(sql, &pos, query)) {
+        if (!parsed_scalar_subquery and parseWindowFunction(sql, &pos, query)) {
             parsed_window = true;
         }
         // Check for aggregate function
-        else if (parseAggregate(sql, &pos, query)) {
+        else if (!parsed_scalar_subquery and parseAggregate(sql, &pos, query)) {
             parsed_agg = true;
-        } else {
+        } else if (!parsed_scalar_subquery) {
             // Regular expression
             if (parseScalarExpr(sql, &pos)) |expr| {
                 if (query.select_count < MAX_SELECT_COLS) {
@@ -11875,7 +12940,7 @@ fn parseSelectList(sql: []const u8, start: usize, query: *ParsedQuery) ?usize {
                     query.window_funcs[query.window_count - 1].alias = alias;
                 } else if (parsed_agg) {
                     query.aggregates[query.agg_count - 1].alias = alias;
-                } else {
+                } else if (parsed_scalar_subquery or query.select_count > 0) {
                     query.select_exprs[query.select_count - 1].alias = alias;
                     // log("Set alias for expr {d}: {s}", .{query.select_count - 1, alias});
                 }
