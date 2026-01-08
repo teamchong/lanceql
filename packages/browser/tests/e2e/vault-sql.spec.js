@@ -6232,7 +6232,7 @@ test.describe('Vault SQL Operations', () => {
             // Test 1: Basic EXPLAIN
             try {
                 const res = await v.exec(`EXPLAIN SELECT * FROM users`);
-                const plan = JSON.parse(res.rows[0][0]);
+                const plan = JSON.parse(res.rows[0].plan);
                 tests.push({
                     name: 'Basic EXPLAIN returns plan',
                     pass: plan.operation === 'SELECT' && plan.table === 'users' && plan.access === 'FULL_SCAN',
@@ -6245,7 +6245,7 @@ test.describe('Vault SQL Operations', () => {
             // Test 2: EXPLAIN with WHERE shows PREDICATE_PUSHDOWN
             try {
                 const res = await v.exec(`EXPLAIN SELECT * FROM users WHERE age > 30`);
-                const plan = JSON.parse(res.rows[0][0]);
+                const plan = JSON.parse(res.rows[0].plan);
                 tests.push({
                     name: 'EXPLAIN shows PREDICATE_PUSHDOWN',
                     pass: plan.optimizations?.includes('PREDICATE_PUSHDOWN') && plan.filter !== undefined,
@@ -6258,7 +6258,7 @@ test.describe('Vault SQL Operations', () => {
             // Test 3: EXPLAIN with GROUP BY shows AGGREGATE
             try {
                 const res = await v.exec(`EXPLAIN SELECT status, COUNT(*) FROM users GROUP BY status`);
-                const plan = JSON.parse(res.rows[0][0]);
+                const plan = JSON.parse(res.rows[0].plan);
                 tests.push({
                     name: 'EXPLAIN shows AGGREGATE optimization',
                     pass: plan.optimizations?.includes('AGGREGATE'),
@@ -6271,7 +6271,7 @@ test.describe('Vault SQL Operations', () => {
             // Test 4: EXPLAIN with JOIN shows HASH_JOIN and children
             try {
                 const res = await v.exec(`EXPLAIN SELECT * FROM users u JOIN orders o ON u.id = o.user_id`);
-                const plan = JSON.parse(res.rows[0][0]);
+                const plan = JSON.parse(res.rows[0].plan);
                 tests.push({
                     name: 'EXPLAIN JOIN shows HASH_JOIN with children',
                     pass: plan.operation === 'HASH_JOIN' && plan.children?.length > 0,
@@ -6284,7 +6284,7 @@ test.describe('Vault SQL Operations', () => {
             // Test 5: EXPLAIN with ORDER BY shows SORT
             try {
                 const res = await v.exec(`EXPLAIN SELECT * FROM users ORDER BY age DESC`);
-                const plan = JSON.parse(res.rows[0][0]);
+                const plan = JSON.parse(res.rows[0].plan);
                 tests.push({
                     name: 'EXPLAIN shows SORT optimization',
                     pass: plan.optimizations?.includes('SORT'),
@@ -6315,7 +6315,7 @@ test.describe('Vault SQL Operations', () => {
             // Test 1: EXPLAIN ANALYZE returns plan AND execution stats
             try {
                 const res = await v.exec(`EXPLAIN ANALYZE SELECT * FROM users WHERE age > 25`);
-                const result = JSON.parse(res.rows[0][0]);
+                const result = JSON.parse(res.rows[0].plan);
                 tests.push({
                     name: 'EXPLAIN ANALYZE returns plan and execution',
                     pass: result.plan !== undefined && result.execution !== undefined,
@@ -6328,7 +6328,7 @@ test.describe('Vault SQL Operations', () => {
             // Test 2: Execution stats include timing
             try {
                 const res = await v.exec(`EXPLAIN ANALYZE SELECT * FROM users`);
-                const result = JSON.parse(res.rows[0][0]);
+                const result = JSON.parse(res.rows[0].plan);
                 tests.push({
                     name: 'EXPLAIN ANALYZE includes timing',
                     pass: typeof result.execution.actualTimeMs === 'number' && result.execution.actualTimeMs >= 0,
@@ -6341,7 +6341,7 @@ test.describe('Vault SQL Operations', () => {
             // Test 3: Execution stats include row counts
             try {
                 const res = await v.exec(`EXPLAIN ANALYZE SELECT * FROM users WHERE age > 30`);
-                const result = JSON.parse(res.rows[0][0]);
+                const result = JSON.parse(res.rows[0].plan);
                 tests.push({
                     name: 'EXPLAIN ANALYZE includes row counts',
                     pass: typeof result.execution.rowsReturned === 'number' && typeof result.execution.rowsTotal === 'number',
@@ -6354,7 +6354,7 @@ test.describe('Vault SQL Operations', () => {
             // Test 4: EXPLAIN ANALYZE with aggregation
             try {
                 const res = await v.exec(`EXPLAIN ANALYZE SELECT status, COUNT(*) FROM users GROUP BY status`);
-                const result = JSON.parse(res.rows[0][0]);
+                const result = JSON.parse(res.rows[0].plan);
                 tests.push({
                     name: 'EXPLAIN ANALYZE with aggregation',
                     pass: result.plan.optimizations?.includes('AGGREGATE') && result.execution.actualTimeMs >= 0,
