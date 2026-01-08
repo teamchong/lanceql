@@ -119,17 +119,21 @@ export fn avgFloat64Column(col_idx: u32) f64 {
 /// SIMD vector type for 4x f64
 const Vec4f64 = @Vector(4, f64);
 
-pub const AggFunc = enum { sum, count, avg, min, max };
+pub const AggFunc = enum { sum, count, avg, min, max, stddev, variance, stddev_pop, var_pop, median };
 
 pub const AggState = struct {
     val: f64 = 0,
+    sum_sq: f64 = 0,
     min: f64 = std.math.floatMax(f64),
     max: f64 = -std.math.floatMax(f64),
     count: usize = 0,
 
     pub fn update(self: *AggState, v: f64, func: AggFunc) void {
         switch (func) {
-            .sum, .avg => self.val += v,
+            .sum, .avg, .stddev, .variance, .stddev_pop, .var_pop => {
+                self.val += v;
+                self.sum_sq += v * v;
+            },
             .min => if (v < self.min) { self.min = v; },
             .max => if (v > self.max) { self.max = v; },
             .count => {},
@@ -153,6 +157,35 @@ pub const AggState = struct {
             .min => self.min,
             .max => self.max,
             .count => @floatFromInt(self.count),
+            .variance => blk: {
+                if (self.count <= 1) break :blk 0;
+                const n = @as(f64, @floatFromInt(self.count));
+                const mean = self.val / n;
+                // Variance = (sum_sq - n*mean^2) / (n-1)  [sample variance]
+                break :blk (self.sum_sq - n * mean * mean) / (n - 1);
+            },
+            .stddev => blk: {
+                if (self.count <= 1) break :blk 0;
+                const n = @as(f64, @floatFromInt(self.count));
+                const mean = self.val / n;
+                const var_val = (self.sum_sq - n * mean * mean) / (n - 1);
+                break :blk @sqrt(@max(0, var_val));
+            },
+            .var_pop => blk: {
+                if (self.count == 0) break :blk 0;
+                const n = @as(f64, @floatFromInt(self.count));
+                const mean = self.val / n;
+                // Population variance = (sum_sq - n*mean^2) / n
+                break :blk (self.sum_sq - n * mean * mean) / n;
+            },
+            .stddev_pop => blk: {
+                if (self.count == 0) break :blk 0;
+                const n = @as(f64, @floatFromInt(self.count));
+                const mean = self.val / n;
+                const var_val = (self.sum_sq - n * mean * mean) / n;
+                break :blk @sqrt(@max(0, var_val));
+            },
+            .median => 0, // MEDIAN is handled separately - requires collecting all values
         };
     }
 };
@@ -162,6 +195,8 @@ pub const MetricSet = struct {
     min: bool = false,
     max: bool = false,
     count: bool = false,
+    sum_sq: bool = false,
+    needs_values: bool = false,
 
     pub fn fromFunc(func: AggFunc) MetricSet {
         var set = MetricSet{};
@@ -171,6 +206,8 @@ pub const MetricSet = struct {
             .avg => { set.sum = true; set.count = true; },
             .min => set.min = true,
             .max => set.max = true,
+            .stddev, .variance, .stddev_pop, .var_pop => { set.sum = true; set.sum_sq = true; set.count = true; },
+            .median => { set.needs_values = true; set.count = true; },
         }
         return set;
     }
@@ -181,6 +218,7 @@ pub const MultiAggState = struct {
     min_vec: Vec4f64 = @splat(std.math.floatMax(f64)),
     max_vec: Vec4f64 = @splat(-std.math.floatMax(f64)),
     sum_scalar: f64 = 0,
+    sum_sq_scalar: f64 = 0,
     min_scalar: f64 = std.math.floatMax(f64),
     max_scalar: f64 = -std.math.floatMax(f64),
     count: usize = 0,
@@ -188,6 +226,7 @@ pub const MultiAggState = struct {
 
     pub fn update(self: *MultiAggState, v: f64) void {
         if (self.metrics.sum) self.sum_scalar += v;
+        if (self.metrics.sum_sq) self.sum_sq_scalar += v * v;
         if (self.metrics.min) { if (v < self.min_scalar) self.min_scalar = v; }
         if (self.metrics.max) { if (v > self.max_scalar) self.max_scalar = v; }
         if (self.metrics.count) self.count += 1;
@@ -206,13 +245,40 @@ pub const MultiAggState = struct {
         const final_sum = self.sum_scalar + @reduce(.Add, self.sum_vec);
         const final_min = @min(self.min_scalar, @reduce(.Min, self.min_vec));
         const final_max = @max(self.max_scalar, @reduce(.Max, self.max_vec));
-        
+
         return switch (func) {
             .sum => final_sum,
             .count => @floatFromInt(self.count),
             .avg => if (self.count > 0) final_sum / @as(f64, @floatFromInt(self.count)) else 0,
             .min => final_min,
             .max => final_max,
+            .variance => blk: {
+                if (self.count <= 1) break :blk 0;
+                const n = @as(f64, @floatFromInt(self.count));
+                const mean = final_sum / n;
+                break :blk (self.sum_sq_scalar - n * mean * mean) / (n - 1);
+            },
+            .stddev => blk: {
+                if (self.count <= 1) break :blk 0;
+                const n = @as(f64, @floatFromInt(self.count));
+                const mean = final_sum / n;
+                const var_val = (self.sum_sq_scalar - n * mean * mean) / (n - 1);
+                break :blk @sqrt(@max(0, var_val));
+            },
+            .var_pop => blk: {
+                if (self.count == 0) break :blk 0;
+                const n = @as(f64, @floatFromInt(self.count));
+                const mean = final_sum / n;
+                break :blk (self.sum_sq_scalar - n * mean * mean) / n;
+            },
+            .stddev_pop => blk: {
+                if (self.count == 0) break :blk 0;
+                const n = @as(f64, @floatFromInt(self.count));
+                const mean = final_sum / n;
+                const var_val = (self.sum_sq_scalar - n * mean * mean) / n;
+                break :blk @sqrt(@max(0, var_val));
+            },
+            .median => 0, // MEDIAN is handled separately - requires collecting all values
         };
     }
 

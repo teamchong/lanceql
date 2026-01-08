@@ -98,7 +98,7 @@ pub const TableInfo = struct {
 };
 
 /// WHERE operators
-pub const WhereOp = enum { eq, ne, lt, le, gt, ge, and_op, or_op, in_list, not_in_list, in_subquery, not_in_subquery, exists, not_exists, like, not_like, between, not_between, is_null, is_not_null, near };
+pub const WhereOp = enum { eq, ne, lt, le, gt, ge, and_op, or_op, in_list, not_in_list, in_subquery, not_in_subquery, exists, not_exists, like, not_like, between, not_between, is_null, is_not_null, near, always_true, always_false };
 
 /// WHERE clause node
 pub const WhereClause = struct {
@@ -184,7 +184,21 @@ pub const ScalarFunc = enum {
     // Operators
     add, sub, mul, div,
     // Conditional
-    nullif, coalesce, case,
+    nullif, coalesce, case, iif, greatest, least,
+    // Type conversion
+    cast,
+    // JSON functions
+    json_extract, json_array_length, json_object, json_array,
+    // UUID functions
+    uuid, uuid_string,
+    // Bitwise operations
+    bit_and, bit_or, bit_xor, bit_not, lshift, rshift,
+    // REGEXP functions
+    regexp_match, regexp_replace, regexp_extract,
+    // Date/Time
+    extract, date_part,
+    // Additional Math
+    pi, log, ln, exp, sin, cos, tan, asin, acos, atan, degrees, radians, random, truncate,
 };
 
 /// CASE WHEN clause
@@ -297,8 +311,11 @@ pub const ParsedQuery = struct {
     group_by_cols: [MAX_GROUP_COLS][]const u8 = undefined,
     group_by_count: usize = 0,
     group_by_top_k: ?u32 = null,
-    order_by_col: ?[]const u8 = null,
-    order_dir: OrderDir = .asc,
+    order_by_cols: [4][]const u8 = undefined,
+    order_by_dirs: [4]OrderDir = undefined,
+    order_by_count: usize = 0,
+    order_nulls_first: bool = false,
+    order_nulls_last: bool = false,
     top_k: ?u32 = null,
     offset_value: ?u32 = null,
     joins: [MAX_JOINS]JoinClause = undefined,
@@ -539,7 +556,6 @@ fn evaluateScalarFloat(table: *const TableInfo, expr: *const SelectExpr, idx: u3
         .mul => v1 * v2,
         .div => if (v2 != 0) v1 / v2 else 0.0,
         .nullif => if (v1 == v2) std.math.nan(f64) else v1,
-        .coalesce => if (!std.math.isNan(v1)) v1 else if (!std.math.isNan(v2)) v2 else std.math.nan(f64),
         .length, .array_length => blk: {
             const s = if (arg1_col) |col| getStringValueOptimized(table, col, idx, context) else (expr.val_str orelse "");
             if (s.len >= 2 and s[0] == '[' and s[s.len - 1] == ']') {
@@ -583,21 +599,49 @@ fn evaluateScalarFloat(table: *const TableInfo, expr: *const SelectExpr, idx: u3
              break :blk 0;
         },
 
-        .trunc => blk: {
-            const v = if (expr.val_float) |f| f else if (expr.val_int) |i| @as(f64, @floatFromInt(i)) else 0;
-            const scale = if (expr.arg_2_val_int) |s| s else 0;
+        .trunc, .truncate => blk: {
+            // Use v1 (already resolved from column or literal) instead of expr.val_float
+            const scale = if (expr.arg_2_val_int) |s| s else @as(i32, @intFromFloat(v2));
             const multiplier = std.math.pow(f64, 10, @as(f64, @floatFromInt(scale)));
-            break :blk @trunc(v * multiplier) / multiplier;
+            break :blk @trunc(v1 * multiplier) / multiplier;
         },
         .round => blk: {
-            const v = if (expr.val_float) |f| f else if (expr.val_int) |i| @as(f64, @floatFromInt(i)) else 0;
-            const scale = if (expr.arg_2_val_int) |s| s else 0;
+            // Use v1 (already resolved from column or literal) instead of expr.val_float
+            const scale = if (expr.arg_2_val_int) |s| s else @as(i32, @intFromFloat(v2));
             const multiplier = std.math.pow(f64, 10, @as(f64, @floatFromInt(scale)));
-            break :blk @round(v * multiplier) / multiplier;
+            break :blk @round(v1 * multiplier) / multiplier;
+        },
+        .coalesce => blk: {
+            if (!std.math.isNan(v1)) break :blk v1;
+            var v2_val: f64 = std.math.nan(f64);
+            if (expr.arg_2_col) |col_name| {
+                if (getColByName(table, col_name)) |col| v2_val = getFloatValueOptimized(table, col, idx, context);
+            } else if (expr.arg_2_val_float) |v| { v2_val = v; } else if (expr.arg_2_val_int) |v| { v2_val = @floatFromInt(v); }
+            if (!std.math.isNan(v2_val)) break :blk v2_val;
+            var v3_val: f64 = std.math.nan(f64);
+            if (expr.arg_3_col) |col_name| {
+                if (getColByName(table, col_name)) |col| v3_val = getFloatValueOptimized(table, col, idx, context);
+            } else if (expr.arg_3_val_float) |v| { v3_val = v; } else if (expr.arg_3_val_int) |v| { v3_val = @floatFromInt(v); }
+            if (!std.math.isNan(v3_val)) break :blk v3_val;
+            break :blk 0;
+        },
+        .extract, .date_part => blk: {
+            // EXTRACT(part FROM date)
+            const part = @as(i64, if (std.math.isNan(v1)) 0 else @intFromFloat(v1));
+            const ts = v2;
+            if (std.math.isNan(ts)) break :blk std.math.nan(f64);
+            const seconds = @as(i64, @intFromFloat(@trunc(ts / 1000.0)));
+            if (part == 1) break :blk @floatFromInt(1970 + @divFloor(seconds, 31536000)); // YEAR
+            if (part == 2) break :blk @floatFromInt(1 + @mod(@divFloor(seconds, 2592000), 12)); // MONTH
+            if (part == 3) break :blk @floatFromInt(1 + @mod(@divFloor(seconds, 86400), 31)); // DAY
+            break :blk ts;
         },
         .case => blk: {
+            setDebug("Evaluating CASE numeric. Clauses: {d}", .{expr.case_count});
             for (expr.case_clauses[0..expr.case_count]) |cc| {
-                if (evaluateWhere(table, &cc.when_cond, idx, context)) {
+                const res = evaluateWhere(table, &cc.when_cond, idx, context);
+                setDebug("CASE clause condition res: {}", .{res});
+                if (res) {
                     if (cc.then_val_float) |v| break :blk v;
                     if (cc.then_val_int) |v| break :blk @as(f64, @floatFromInt(v));
                     if (cc.then_col_name) |col_name| {
@@ -612,6 +656,65 @@ fn evaluateScalarFloat(table: *const TableInfo, expr: *const SelectExpr, idx: u3
                 if (getColByName(table, col_name)) |c| break :blk getFloatValueOptimized(table, c, idx, context);
             }
             break :blk 0;
+        },
+        .greatest => blk: {
+            var max_val: f64 = v1;
+            if (std.math.isNan(max_val) or (!std.math.isNan(v2) and v2 > max_val)) max_val = v2;
+            var v3: f64 = std.math.nan(f64);
+            if (expr.arg_3_col) |col_name| {
+                if (getColByName(table, col_name)) |col| v3 = getFloatValueOptimized(table, col, idx, context);
+            } else if (expr.arg_3_val_float) |v| { v3 = v; } else if (expr.arg_3_val_int) |v| { v3 = @floatFromInt(v); }
+            if (std.math.isNan(max_val) or (!std.math.isNan(v3) and v3 > max_val)) max_val = v3;
+            break :blk max_val;
+        },
+        .least => blk: {
+            var min_val: f64 = v1;
+            if (std.math.isNan(min_val) or (!std.math.isNan(v2) and v2 < min_val)) min_val = v2;
+            var v3: f64 = std.math.nan(f64);
+            if (expr.arg_3_col) |col_name| {
+                if (getColByName(table, col_name)) |col| v3 = getFloatValueOptimized(table, col, idx, context);
+            } else if (expr.arg_3_val_float) |v| { v3 = v; } else if (expr.arg_3_val_int) |v| { v3 = @floatFromInt(v); }
+            if (std.math.isNan(min_val) or (!std.math.isNan(v3) and v3 < min_val)) min_val = v3;
+            break :blk min_val;
+        },
+        .iif => blk: {
+            var v3: f64 = 0;
+            if (expr.arg_3_col) |col_name| {
+                if (getColByName(table, col_name)) |col| v3 = getFloatValueOptimized(table, col, idx, context);
+            } else if (expr.arg_3_val_float) |v| { v3 = v; } else if (expr.arg_3_val_int) |v| { v3 = @floatFromInt(v); }
+            break :blk if (v1 != 0 and !std.math.isNan(v1)) v2 else v3;
+        },
+        .cast => blk: {
+            if (expr.val_str) |s| break :blk std.fmt.parseFloat(f64, s) catch 0;
+            break :blk v1;
+        },
+        .pi => std.math.pi,
+        .log => if (v1 > 0) std.math.log(f64, std.math.e, v1) else std.math.nan(f64),
+        .ln => if (v1 > 0) std.math.log(f64, std.math.e, v1) else std.math.nan(f64),
+        .exp => std.math.exp(v1),
+        .sin => std.math.sin(v1),
+        .cos => std.math.cos(v1),
+        .tan => std.math.tan(v1),
+        .asin => std.math.asin(v1),
+        .acos => std.math.acos(v1),
+        .atan => std.math.atan(v1),
+        .degrees => v1 * (180.0 / std.math.pi),
+        .radians => v1 * (std.math.pi / 180.0),
+        .bit_and => if (std.math.isNan(v1) or std.math.isNan(v2)) 0 else @floatFromInt(@as(i64, @intFromFloat(v1)) & @as(i64, @intFromFloat(v2))),
+        .bit_or => if (std.math.isNan(v1) or std.math.isNan(v2)) 0 else @floatFromInt(@as(i64, @intFromFloat(v1)) | @as(i64, @intFromFloat(v2))),
+        .bit_xor => if (std.math.isNan(v1) or std.math.isNan(v2)) 0 else @floatFromInt(@as(i64, @intFromFloat(v1)) ^ @as(i64, @intFromFloat(v2))),
+        .bit_not => if (std.math.isNan(v1)) 0 else @floatFromInt(~@as(i64, @intFromFloat(v1))),
+        .lshift => blk: {
+            if (std.math.isNan(v1) or std.math.isNan(v2)) break :blk 0;
+            const shift = @as(i64, @intFromFloat(v2));
+            if (shift < 0 or shift >= 64) break :blk 0;
+            break :blk @floatFromInt(@as(i64, @intFromFloat(v1)) << @as(u6, @intCast(shift)));
+        },
+        .rshift => blk: {
+            if (std.math.isNan(v1) or std.math.isNan(v2)) break :blk 0;
+            const shift = @as(i64, @intFromFloat(v2));
+            if (shift < 0 or shift >= 64) break :blk 0;
+            break :blk @floatFromInt(@as(i64, @intFromFloat(v1)) >> @as(u6, @intCast(shift)));
         },
         else => v1,
     };
@@ -629,7 +732,71 @@ fn evaluateScalarString(table: *const TableInfo, expr: *const SelectExpr, idx: u
     // For now, simple single-threaded buffer for results
     // Limitation: nested calls not supported yet
     
-    switch (expr.func) {
+    return switch (expr.func) {
+        .iif => blk: {
+             const v1 = if (arg1_col) |col| getFloatValueOptimized(table, col, idx, context) else (expr.val_float orelse @as(f64, @floatFromInt(expr.val_int orelse 0)));
+             if (v1 != 0) {
+                 // Return arg 2
+                 if (expr.arg_2_col) |n| {
+                      if (getColByName(table, n)) |c| break :blk getStringValueOptimized(table, c, idx, context);
+                 } else if (expr.arg_2_val_str) |s| {
+                      break :blk s;
+                 }
+             } else {
+                 // Return arg 3
+                 if (expr.arg_3_col) |n| {
+                      if (getColByName(table, n)) |c| break :blk getStringValueOptimized(table, c, idx, context);
+                 } else if (expr.arg_3_val_str) |s| {
+                      break :blk s;
+                 }
+             }
+             break :blk "";
+        },
+        .greatest => blk: {
+            var max_s = s1;
+            // Arg 2
+            var s2: []const u8 = "";
+            if (expr.arg_2_col) |n| {
+                if (getColByName(table, n)) |c| s2 = getStringValueOptimized(table, c, idx, context);
+            } else if (expr.arg_2_val_str) |s| s2 = s;
+            if (s2.len > 0 and std.mem.order(u8, s2, max_s) == .gt) max_s = s2;
+            
+            // Arg 3
+            var s3: []const u8 = "";
+            if (expr.arg_3_col) |n| {
+                if (getColByName(table, n)) |c| s3 = getStringValueOptimized(table, c, idx, context);
+            } else if (expr.arg_3_val_str) |s| s3 = s;
+            if (s3.len > 0 and std.mem.order(u8, s3, max_s) == .gt) max_s = s3;
+            
+            break :blk max_s;
+        },
+        .least => blk: {
+            var min_s = s1;
+            // Arg 2
+            var s2: []const u8 = "";
+            if (expr.arg_2_col) |n| {
+                if (getColByName(table, n)) |c| s2 = getStringValueOptimized(table, c, idx, context);
+            } else if (expr.arg_2_val_str) |s| s2 = s;
+            if (s2.len > 0 and std.mem.order(u8, s2, min_s) == .lt) min_s = s2;
+            
+            // Arg 3
+            var s3: []const u8 = "";
+            if (expr.arg_3_col) |n| {
+                if (getColByName(table, n)) |c| s3 = getStringValueOptimized(table, c, idx, context);
+            } else if (expr.arg_3_val_str) |s| s3 = s;
+            if (s3.len > 0 and std.mem.order(u8, s3, min_s) == .lt) min_s = s3;
+            
+            break :blk min_s;
+        },
+        .cast => blk: {
+             if (expr.val_str) |s| break :blk s;
+             if (arg1_col) |col| break :blk getStringValueOptimized(table, col, idx, context);
+             
+             // Fallback: format numeric value
+             const v = if (expr.val_float) |f| f else if (expr.val_int) |i| @as(f64, @floatFromInt(i)) else 0;
+             const s = std.fmt.bufPrint(&scalar_str_buf, "{d}", .{v}) catch "";
+             break :blk s;
+        },
         .nullif => {
             // Arg 2 String
             var s2: []const u8 = "";
@@ -888,9 +1055,127 @@ fn evaluateScalarString(table: *const TableInfo, expr: *const SelectExpr, idx: u
             out_pos += 1;
             return scalar_str_buf[0..out_pos];
         },
+        .json_extract => {
+            // JSON_EXTRACT(json_str, path)
+            var path: []const u8 = "";
+            if (expr.arg_2_col) |col_name| {
+                if (getColByName(table, col_name)) |col| path = getStringValueOptimized(table, col, idx, context);
+            } else if (expr.arg_2_val_str) |s| path = s;
+
+            if (s1.len == 0 or path.len == 0) return s1;
+            
+            // Basic JSONPath support: $.field, $.field.subfield, $.field[idx]
+            if (std.mem.startsWith(u8, path, "$.")) {
+                var current = s1;
+                var p_pos: usize = 2;
+                while (p_pos < path.len) {
+                    const start_p = p_pos;
+                    while (p_pos < path.len and path[p_pos] != '.' and path[p_pos] != '[') p_pos += 1;
+                    const field = path[start_p..p_pos];
+                    
+                    if (field.len > 0) {
+                        // Find "field":
+                        var key_buf: [128]u8 = undefined;
+                        const key = std.fmt.bufPrint(&key_buf, "\"{s}\":", .{field}) catch break;
+                        if (std.mem.indexOf(u8, current, key)) |key_pos| {
+                            var v_start = key_pos + key.len;
+                            while (v_start < current.len and std.ascii.isWhitespace(current[v_start])) v_start += 1;
+                            if (v_start < current.len) {
+                                if (current[v_start] == '"') {
+                                    v_start += 1;
+                                    const v_end = std.mem.indexOfScalar(u8, current[v_start..], '"') orelse current.len;
+                                    current = current[v_start .. v_start + v_end];
+                                } else if (current[v_start] == '{' or current[v_start] == '[') {
+                                    // Find matching bracket
+                                    var depth: i32 = 0;
+                                    const open = current[v_start];
+                                    const close: u8 = if (open == '{') '}' else ']';
+                                    var v_pos = v_start;
+                                    while (v_pos < current.len) : (v_pos += 1) {
+                                        if (current[v_pos] == open) depth += 1
+                                        else if (current[v_pos] == close) {
+                                            depth -= 1;
+                                            if (depth == 0) {
+                                                current = current[v_start .. v_pos + 1];
+                                                break;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    var v_pos = v_start;
+                                    while (v_pos < current.len and current[v_pos] != ',' and current[v_pos] != '}' and current[v_pos] != ']') v_pos += 1;
+                                    current = current[v_start..v_pos];
+                                }
+                            } else break;
+                        } else break;
+                    }
+
+                    if (p_pos < path.len and path[p_pos] == '[') {
+                        p_pos += 1;
+                        const idx_start = p_pos;
+                        while (p_pos < path.len and path[p_pos] != ']') p_pos += 1;
+                        const idx_val = std.fmt.parseInt(usize, path[idx_start..p_pos], 10) catch 0;
+                        if (p_pos < path.len) p_pos += 1; // skip ]
+                        
+                        // Extract from array
+                        if (current.len > 0 and current[0] == '[') {
+                            var it = std.mem.tokenizeAny(u8, current[1 .. current.len - 1], ", ");
+                            var i: usize = 0;
+                            while (it.next()) |item| {
+                                if (i == idx_val) {
+                                    current = std.mem.trim(u8, item, "\"");
+                                    break;
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                    if (p_pos < path.len and path[p_pos] == '.') p_pos += 1;
+                }
+                return current;
+            }
+            return s1;
+        },
+        .regexp_extract => {
+            return s1; // Placeholder
+        },
+        .uuid => {
+            // Random UUID: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+            const hex = "0123456789abcdef";
+            var i: usize = 0;
+            while (i < 36) : (i += 1) {
+                if (i == 8 or i == 13 or i == 18 or i == 23) {
+                    scalar_str_buf[i] = '-';
+                } else if (i == 14) {
+                    scalar_str_buf[i] = '4';
+                } else {
+                    const r = @as(usize, @intCast(@mod(idx + i + 1234, 16))); // Semi-random based on index
+                    scalar_str_buf[i] = hex[r];
+                }
+            }
+            return scalar_str_buf[0..36];
+        },
+        .uuid_string => {
+            const hex = "0123456789abcdef";
+            var i: usize = 0;
+            while (i < 36) : (i += 1) {
+                if (i == 8 or i == 13 or i == 18 or i == 23) {
+                    scalar_str_buf[i] = '-';
+                } else if (i == 14) {
+                    scalar_str_buf[i] = '4';
+                } else {
+                    const r = @as(usize, @intCast(@mod(idx + i + 5678, 16)));
+                    scalar_str_buf[i] = hex[r];
+                }
+            }
+            return scalar_str_buf[0..36];
+        },
         .case => {
+            // setDebug("Evaluating CASE string. Clauses: {d}", .{expr.case_count});
             for (expr.case_clauses[0..expr.case_count]) |cc| {
-                if (evaluateWhere(table, &cc.when_cond, idx, context)) {
+                const res = evaluateWhere(table, &cc.when_cond, idx, context);
+                // setDebug("CASE clause condition res: {}", .{res});
+                if (res) {
                     if (cc.then_val_str) |v| return v;
                     if (cc.then_col_name) |col_name| {
                         if (getColByName(table, col_name)) |c| return getStringValueOptimized(table, c, idx, context);
@@ -904,8 +1189,8 @@ fn evaluateScalarString(table: *const TableInfo, expr: *const SelectExpr, idx: u
             }
             return "";
         },
-        else => return s1,
-    }
+        else => s1,
+    };
 }
 
 fn getStringValueOptimized(table: *const TableInfo, col: *const ColumnData, idx: u32, context: *?FragmentContext) []const u8 {
@@ -962,9 +1247,21 @@ fn getStringValueOptimized(table: *const TableInfo, col: *const ColumnData, idx:
 pub extern "env" fn js_log(ptr: [*]const u8, len: usize) void;
 
 fn log(comptime fmt: []const u8, args: anytype) void {
-    var buf: [256]u8 = undefined;
+    var buf: [1024]u8 = undefined;
     const slice = std.fmt.bufPrint(&buf, fmt, args) catch return;
     js_log(slice.ptr, slice.len);
+}
+
+fn setDebug(comptime fmt: []const u8, args: anytype) void {
+    log(fmt, args);
+    if (last_error_len >= 4096) return;
+    if (last_error_len > 0) {
+        last_error_buf[last_error_len] = '\n';
+        last_error_len += 1;
+    }
+    const available = last_error_buf[last_error_len..];
+    const msg = std.fmt.bufPrint(available, "DEBUG: " ++ fmt, args) catch return;
+    last_error_len += msg.len;
 }
 
 // ============================================================================
@@ -1032,7 +1329,7 @@ pub export fn isComplexQuery(sql_ptr: [*]const u8, sql_len: usize) u32 {
     if (query.join_count > 0) return 1;
     if (query.agg_count > 0) return 1;
     if (query.group_by_count > 0) return 1;
-    if (query.order_by_col != null) return 1;
+    if (query.order_by_count > 0) return 1;
     if (query.where_clause != null) return 1;
     if (query.window_count > 0) return 1;
     if (query.set_op != .none) return 1;
@@ -2462,20 +2759,17 @@ var last_error_buf: [4096]u8 = undefined;
 var last_error_len: usize = 0;
 
 fn setError(msg: []const u8) void {
-    last_error_len = @min(msg.len, 4096);
-    @memcpy(last_error_buf[0..last_error_len], msg);
-}
-
-fn setDebug(comptime fmt: []const u8, args: anytype) void {
-    if (last_error_len >= 4096) return;
-    if (last_error_len > 0) {
+    if (last_error_len > 0 and last_error_len < 4095) {
         last_error_buf[last_error_len] = '\n';
         last_error_len += 1;
     }
-    const available = last_error_buf[last_error_len..];
-    const msg = std.fmt.bufPrint(available, "DEBUG: " ++ fmt, args) catch return;
-    last_error_len += msg.len;
+    const available = 4096 - last_error_len;
+    const len = @min(msg.len, available);
+    @memcpy(last_error_buf[last_error_len..][0..len], msg);
+    last_error_len += len;
 }
+
+
 
 pub export fn getLastError(ptr: *u8, max_len: usize) u32 {
     const len = @min(last_error_len, max_len);
@@ -2498,8 +2792,6 @@ pub export fn executeSql() u32 {
         return 0;
     };
     setDebug("Parsed Type: {any}", .{query.type});
-    // Debug agg count
-
     // Handle set operations (UNION, INTERSECT, EXCEPT)
     if (query.set_op != .none) {
         executeSetOpQuery(sql, query) catch |err| {
@@ -2620,6 +2912,18 @@ pub export fn executeSql() u32 {
             if (result_buffer) |buf| return @intFromPtr(buf.ptr);
             return 0;
         },
+    }
+
+    // Handle tableless queries (SELECT without FROM - e.g., SELECT GREATEST(1,2,3))
+    if (std.mem.eql(u8, query.table_name, "__DUAL__")) {
+        executeTablelessQuery(query) catch |err| {
+            setError(@errorName(err));
+            return 0;
+        };
+        if (result_buffer) |buf| {
+            return @intFromPtr(buf.ptr);
+        }
+        return 0;
     }
 
     // Find primary table (ONLY for SELECT)
@@ -3019,6 +3323,27 @@ fn resolveNearClauses(table: *const TableInfo, where: *WhereClause, limit: usize
     }
 }
 
+fn executeTablelessQuery(query: *const ParsedQuery) !void {
+    var dummy_table = TableInfo{
+        .name = "__DUAL__",
+        .column_count = 0,
+        .row_count = 1,
+        .fragments = undefined,
+        .fragment_count = 0,
+        .columns = undefined,
+        .memory_columns = undefined,
+        .memory_row_count = 0,
+        .file_row_count = 0,
+    };
+    // Initialize collections
+    for (&dummy_table.columns) |*c| c.* = null;
+    for (&dummy_table.fragments) |*f| f.* = null;
+    for (&dummy_table.memory_columns) |*c| c.* = null;
+    
+    const row_indices = [_]u32{0};
+    try writeSelectResult(&dummy_table, query, &row_indices, 1);
+}
+
 fn executeSelectQuery(table: *const TableInfo, query: *ParsedQuery) !void {
     setDebug("executeSelectQuery table: {s}, where: {}", .{table.name, query.where_clause != null});
     // const row_count = table.row_count;
@@ -3180,8 +3505,11 @@ fn executeSelectQuery(table: *const TableInfo, query: *ParsedQuery) !void {
     }
 
     // Apply ORDER BY
-    if (query.order_by_col) |order_col| {
-        sortIndices(table, match_indices[0..match_count], order_col, query.order_dir);
+    if (query.order_by_count > 0) {
+        sortIndicesMulti(table, match_indices[0..match_count], 
+                        query.order_by_cols[0..query.order_by_count], 
+                        query.order_by_dirs[0..query.order_by_count],
+                        query.order_nulls_first, query.order_nulls_last);
     }
 
     // Apply DISTINCT - remove duplicate rows
@@ -3198,7 +3526,7 @@ fn executeSelectQuery(table: *const TableInfo, query: *ParsedQuery) !void {
                 for (output_cols[0..output_count]) |col_idx| {
                     if (col_idx < MAX_COLUMNS) {
                         if (table.columns[col_idx]) |*col| {
-                            if (compareValues(table, col, match_indices[i], match_indices[j]) != 0) {
+                            if (compareValues(table, col, match_indices[i], match_indices[j], false, false) != 0) {
                                 all_cols_match = false;
                                 break;
                             }
@@ -3565,164 +3893,164 @@ fn writeSetOpResult(table1: *const TableInfo, table2: *const TableInfo, output_c
     const actual_second = filtered_second[0..filtered_count];
     const total_count = first_indices.len + filtered_count;
 
-    // Calculate size
-    var data_size: usize = 0;
+    if (total_count == 0) {
+        try writeEmptyResult();
+        return;
+    }
+
+    // Estimate capacity and use lance_writer for consistent format
+    const capacity = total_count * num_cols * 16 + 1024 * num_cols + 65536;
+    if (lw.fragmentBegin(capacity) == 0) return error.OutOfMemory;
+
+    // Write each column using lance_writer
     for (output_cols) |col_name| {
+        // Find columns in both tables
+        var col1: ?*const ColumnData = null;
+        var col2: ?*const ColumnData = null;
         for (table1.columns[0..table1.column_count]) |maybe_col| {
-            if (maybe_col) |col| {
-                if (std.mem.eql(u8, col.name, col_name)) {
-                    data_size += switch (col.col_type) {
-                        .int64, .float64 => total_count * 8,
-                        .int32, .float32 => total_count * 4,
-                        .string, .list => total_count * 8 + 65536,
-                    };
+            if (maybe_col) |*c| {
+                if (std.mem.eql(u8, c.name, col_name)) {
+                    col1 = c;
                     break;
                 }
             }
         }
-    }
-
-    const total_size = HEADER_SIZE + num_cols * 16 + data_size;
-    _ = allocResultBuffer(total_size) orelse return error.OutOfMemory;
-
-    const meta_end = HEADER_SIZE + @as(u32, @intCast(num_cols * 16));
-    const names_offset = meta_end;
-    
-    // Align data start
-    var padding: u32 = 0;
-    if (names_offset % 8 != 0) {
-        padding = 8 - (names_offset % 8);
-    }
-    const data_offset_start = names_offset + padding;
-
-    // Write header
-    _ = writeU32(RESULT_VERSION);
-    _ = writeU32(@intCast(num_cols));
-    _ = writeU64(@intCast(total_count));
-    _ = writeU32(HEADER_SIZE);
-    _ = writeU32(HEADER_SIZE);
-    _ = writeU32(data_offset_start);
-    _ = writeU32(0);
-    _ = writeU32(names_offset);
-
-    // Write column metadata
-    var data_offset: u32 = 0;
-    for (output_cols) |col_name| {
-        for (table1.columns[0..table1.column_count]) |maybe_col| {
-            if (maybe_col) |col| {
-                if (std.mem.eql(u8, col.name, col_name)) {
-                    _ = writeU32(@intFromEnum(col.col_type));
-                    _ = writeU32(0);
-                    _ = writeU32(@intCast(col.name.len));
-                    _ = writeU32(data_offset);
-                    data_offset += switch (col.col_type) {
-                        .int64, .float64 => @intCast(total_count * 8),
-                        .int32, .float32 => @intCast(total_count * 4),
-                        .string, .list => @intCast(total_count * 8 + 65536),
-                    };
-                    break;
-                }
-            }
-        }
-    }
-
-    // Write data from both tables
-    for (output_cols) |col_name| {
-        // Write from first table
-        for (table1.columns[0..table1.column_count]) |maybe_col| {
-            if (maybe_col) |*col| {
-                if (std.mem.eql(u8, col.name, col_name)) {
-                    switch (col.col_type) {
-                        .int64 => {
-                            for (first_indices) |ri| {
-                                const val = col.data.int64[ri];
-                                _ = writeToResult(std.mem.asBytes(&val));
-                            }
-                        },
-                        .float64 => {
-                            for (first_indices) |ri| {
-                                const val = col.data.float64[ri];
-                                _ = writeToResult(std.mem.asBytes(&val));
-                            }
-                        },
-                        .int32 => {
-                            for (first_indices) |ri| {
-                                const val = col.data.int32[ri];
-                                _ = writeToResult(std.mem.asBytes(&val));
-                            }
-                        },
-                        .float32 => {
-                            for (first_indices) |ri| {
-                                const val = col.data.float32[ri];
-                                _ = writeToResult(std.mem.asBytes(&val));
-                            }
-                        },
-                        .string, .list => {
-                            var str_offset: u32 = 0;
-                            for (first_indices) |ri| {
-                                _ = writeU32(str_offset);
-                                _ = writeU32(col.data.strings.lengths[ri]);
-                                str_offset += col.data.strings.lengths[ri];
-                            }
-                            for (first_indices) |ri| {
-                                const off = col.data.strings.offsets[ri];
-                                const len = col.data.strings.lengths[ri];
-                                _ = writeToResult(col.data.strings.data[off..][0..len]);
-                            }
-                        },
-                    }
-                    break;
-                }
-            }
-        }
-
-        // Write from second table (filtered if UNION DISTINCT)
         for (table2.columns[0..table2.column_count]) |maybe_col| {
-            if (maybe_col) |*col| {
-                if (std.mem.eql(u8, col.name, col_name)) {
-                    switch (col.col_type) {
-                        .int64 => {
-                            for (actual_second) |ri| {
-                                const val = col.data.int64[ri];
-                                _ = writeToResult(std.mem.asBytes(&val));
-                            }
-                        },
-                        .float64 => {
-                            for (actual_second) |ri| {
-                                const val = col.data.float64[ri];
-                                _ = writeToResult(std.mem.asBytes(&val));
-                            }
-                        },
-                        .int32 => {
-                            for (actual_second) |ri| {
-                                const val = col.data.int32[ri];
-                                _ = writeToResult(std.mem.asBytes(&val));
-                            }
-                        },
-                        .float32 => {
-                            for (actual_second) |ri| {
-                                const val = col.data.float32[ri];
-                                _ = writeToResult(std.mem.asBytes(&val));
-                            }
-                        },
-                        .string, .list => {
-                            var str_offset: u32 = 0;
-                            for (actual_second) |ri| {
-                                _ = writeU32(str_offset);
-                                _ = writeU32(col.data.strings.lengths[ri]);
-                                str_offset += col.data.strings.lengths[ri];
-                            }
-                            for (actual_second) |ri| {
-                                const off = col.data.strings.offsets[ri];
-                                const len = col.data.strings.lengths[ri];
-                                _ = writeToResult(col.data.strings.data[off..][0..len]);
-                            }
-                        },
-                    }
+            if (maybe_col) |*c| {
+                if (std.mem.eql(u8, c.name, col_name)) {
+                    col2 = c;
                     break;
                 }
             }
         }
+
+        if (col1) |c1| {
+            switch (c1.col_type) {
+                .int64 => {
+                    const data = try memory.wasm_allocator.alloc(i64, total_count);
+                    defer memory.wasm_allocator.free(data);
+                    var idx: usize = 0;
+                    for (first_indices) |ri| {
+                        data[idx] = c1.data.int64[ri];
+                        idx += 1;
+                    }
+                    if (col2) |c2| {
+                        for (actual_second) |ri| {
+                            data[idx] = c2.data.int64[ri];
+                            idx += 1;
+                        }
+                    }
+                    _ = lw.fragmentAddInt64Column(col_name.ptr, col_name.len, data.ptr, total_count, false);
+                },
+                .float64 => {
+                    const data = try memory.wasm_allocator.alloc(f64, total_count);
+                    defer memory.wasm_allocator.free(data);
+                    var idx: usize = 0;
+                    for (first_indices) |ri| {
+                        data[idx] = c1.data.float64[ri];
+                        idx += 1;
+                    }
+                    if (col2) |c2| {
+                        for (actual_second) |ri| {
+                            data[idx] = c2.data.float64[ri];
+                            idx += 1;
+                        }
+                    }
+                    _ = lw.fragmentAddFloat64Column(col_name.ptr, col_name.len, data.ptr, total_count, false);
+                },
+                .int32 => {
+                    const data = try memory.wasm_allocator.alloc(i32, total_count);
+                    defer memory.wasm_allocator.free(data);
+                    var idx: usize = 0;
+                    for (first_indices) |ri| {
+                        data[idx] = c1.data.int32[ri];
+                        idx += 1;
+                    }
+                    if (col2) |c2| {
+                        for (actual_second) |ri| {
+                            data[idx] = c2.data.int32[ri];
+                            idx += 1;
+                        }
+                    }
+                    _ = lw.fragmentAddInt32Column(col_name.ptr, col_name.len, data.ptr, total_count, false);
+                },
+                .float32 => {
+                    const data = try memory.wasm_allocator.alloc(f32, total_count);
+                    defer memory.wasm_allocator.free(data);
+                    var idx: usize = 0;
+                    for (first_indices) |ri| {
+                        data[idx] = c1.data.float32[ri];
+                        idx += 1;
+                    }
+                    if (col2) |c2| {
+                        for (actual_second) |ri| {
+                            data[idx] = c2.data.float32[ri];
+                            idx += 1;
+                        }
+                    }
+                    _ = lw.fragmentAddFloat32Column(col_name.ptr, col_name.len, data.ptr, total_count, false);
+                },
+                .string, .list => {
+                    // Calculate total string length
+                    var total_len: usize = 0;
+                    for (first_indices) |ri| {
+                        total_len += c1.data.strings.lengths[ri];
+                    }
+                    if (col2) |c2| {
+                        for (actual_second) |ri| {
+                            total_len += c2.data.strings.lengths[ri];
+                        }
+                    }
+
+                    // Allocate offsets array (n+1 for Arrow format)
+                    const offsets = try memory.wasm_allocator.alloc(u32, total_count + 1);
+                    defer memory.wasm_allocator.free(offsets);
+
+                    // Allocate string data
+                    const str_data = try memory.wasm_allocator.alloc(u8, total_len);
+                    defer memory.wasm_allocator.free(str_data);
+
+                    // Build offsets and copy string data
+                    var current_offset: u32 = 0;
+                    var str_pos: usize = 0;
+                    var row_idx: usize = 0;
+                    offsets[0] = 0;
+
+                    for (first_indices) |ri| {
+                        const off = c1.data.strings.offsets[ri];
+                        const len = c1.data.strings.lengths[ri];
+                        @memcpy(str_data[str_pos..][0..len], c1.data.strings.data[off..][0..len]);
+                        str_pos += len;
+                        current_offset += len;
+                        row_idx += 1;
+                        offsets[row_idx] = current_offset;
+                    }
+
+                    if (col2) |c2| {
+                        for (actual_second) |ri| {
+                            const off = c2.data.strings.offsets[ri];
+                            const len = c2.data.strings.lengths[ri];
+                            @memcpy(str_data[str_pos..][0..len], c2.data.strings.data[off..][0..len]);
+                            str_pos += len;
+                            current_offset += len;
+                            row_idx += 1;
+                            offsets[row_idx] = current_offset;
+                        }
+                    }
+
+                    _ = lw.fragmentAddStringColumn(col_name.ptr, col_name.len, str_data.ptr, total_len, offsets.ptr, total_count, false);
+                },
+            }
+        }
+    }
+
+    // Finalize the fragment and get result
+    const res = lw.fragmentEnd();
+    if (res == 0) return error.EncodingError;
+
+    if (lw.writerGetBuffer()) |buf| {
+        result_buffer = buf[0..res];
+        result_size = res;
     }
 }
 
@@ -4389,6 +4717,7 @@ fn executeMultiAggregate(table: *const TableInfo, aggs: []const AggExpr, maybe_i
                 if (set.min) states[i].metrics.min = true;
                 if (set.max) states[i].metrics.max = true;
                 if (set.count) states[i].metrics.count = true;
+                if (set.sum_sq) states[i].metrics.sum_sq = true;
             }
         }
     }
@@ -4598,7 +4927,18 @@ fn executeMultiAggregate(table: *const TableInfo, aggs: []const AggExpr, maybe_i
                              states[uc_idx].processBuffer(ptr, mem_row_count);
                          }
                     },
-                    .string, .list => {}, // No direct numeric aggregation for string/list
+                    .string, .list => {
+                        // For COUNT, count non-NULL strings
+                        if (states[uc_idx].metrics.count) {
+                            for (0..mem_row_count) |i| {
+                                const str_val = getStringValue(c, @intCast(i));
+                                // Count non-NULL: not empty and not literal "NULL"
+                                if (str_val.len > 0 and !std.mem.eql(u8, str_val, "NULL")) {
+                                    states[uc_idx].count += 1;
+                                }
+                            }
+                        }
+                    },
                     else => {
                          for (0..mem_row_count) |i| {
                              const val = getFloatValue(table, c, mem_start + @as(u32, @intCast(i)));
@@ -4616,12 +4956,25 @@ fn executeMultiAggregate(table: *const TableInfo, aggs: []const AggExpr, maybe_i
             // Indexed Memory Scan
             const indices = maybe_indices.?;
             const mem_indices = indices[idx_ptr..];
-            
+
             for (unique_cols[0..num_unique_cols], 0..) |c, uc_idx| {
-                 for (mem_indices) |global_idx| {
-                     const val = getFloatValue(table, c, global_idx);
-                     states[uc_idx].update(val);
-                 }
+                if (c.col_type == .string or c.col_type == .list) {
+                    // For COUNT, count non-NULL strings
+                    if (states[uc_idx].metrics.count) {
+                        for (mem_indices) |global_idx| {
+                            const local_idx = global_idx - mem_start;
+                            const str_val = getStringValue(c, local_idx);
+                            if (str_val.len > 0 and !std.mem.eql(u8, str_val, "NULL")) {
+                                states[uc_idx].count += 1;
+                            }
+                        }
+                    }
+                } else {
+                    for (mem_indices) |global_idx| {
+                        const val = getFloatValue(table, c, global_idx);
+                        states[uc_idx].update(val);
+                    }
+                }
             }
             for (aggs, 0..) |agg, agg_idx| {
                 if (agg_to_unique[agg_idx] == null and agg.func == .count) {
@@ -4630,11 +4983,62 @@ fn executeMultiAggregate(table: *const TableInfo, aggs: []const AggExpr, maybe_i
             }
         }
     }
-    
 
+    // Handle MEDIAN separately - it requires collecting and sorting all values
+    var median_results: [MAX_AGGREGATES]f64 = undefined;
+    for (0..aggs.len) |agg_idx| {
+        if (aggs[agg_idx].func == .median) {
+            median_results[agg_idx] = blk: {
+                // Find the column for this MEDIAN aggregate
+                const col_idx = agg_to_unique[agg_idx] orelse break :blk 0;
+                const col = unique_cols[col_idx];
+
+                // Determine how many values we need to collect
+                const count = states[col_idx].count;
+                if (count == 0) break :blk 0;
+
+                // Allocate buffer and collect all values
+                const values = memory.wasm_allocator.alloc(f64, count) catch break :blk 0;
+                defer memory.wasm_allocator.free(values);
+
+                var val_idx: usize = 0;
+                if (maybe_indices) |indices| {
+                    for (indices) |idx| {
+                        if (val_idx >= count) break;
+                        var ctx: ?FragmentContext = null;
+                        values[val_idx] = getFloatValueOptimized(table, col, idx, &ctx);
+                        val_idx += 1;
+                    }
+                } else {
+                    for (0..table.row_count) |i| {
+                        if (val_idx >= count) break;
+                        var ctx: ?FragmentContext = null;
+                        values[val_idx] = getFloatValueOptimized(table, col, @intCast(i), &ctx);
+                        val_idx += 1;
+                    }
+                }
+
+                // Sort values for median calculation
+                std.mem.sort(f64, values[0..val_idx], {}, std.sort.asc(f64));
+
+                // Compute median
+                if (val_idx == 0) break :blk 0;
+                if (val_idx % 2 == 1) {
+                    // Odd count: return middle value
+                    break :blk values[val_idx / 2];
+                } else {
+                    // Even count: return average of two middle values
+                    const mid = val_idx / 2;
+                    break :blk (values[mid - 1] + values[mid]) / 2.0;
+                }
+            };
+        }
+    }
 
     for (0..aggs.len) |i| {
-        if (agg_to_unique[i]) |uc_idx| {
+        if (aggs[i].func == .median) {
+            results[i] = median_results[i];
+        } else if (agg_to_unique[i]) |uc_idx| {
             results[i] = states[uc_idx].getResult(@as(aggregates.AggFunc, @enumFromInt(@intFromEnum(aggs[i].func))));
         } else {
             results[i] = general_states[i].getResult(@as(aggregates.AggFunc, @enumFromInt(@intFromEnum(aggs[i].func))));
@@ -4704,6 +5108,11 @@ fn executeSimpleAggQuery(table: *const TableInfo, query: *const ParsedQuery, may
                  .avg => "avg",
                  .min => "min",
                  .max => "max",
+                 .stddev => "stddev",
+                 .variance => "variance",
+                 .stddev_pop => "stddev_pop",
+                 .var_pop => "var_pop",
+                 .median => "median",
              };
              if (std.mem.eql(u8, agg.column, "*")) {
                  name = std.fmt.bufPrint(&name_buf, "{s}(*)", .{func_name}) catch "col_x";
@@ -4859,18 +5268,56 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
     // Use Lance Writer
     if (lw.fragmentBegin(65536 + survivor_count * 16 * (num_aggs + 1)) == 0) return error.OutOfMemory;
 
-    // Group keys
-    const group_keys_out = try memory.wasm_allocator.alloc(f64, survivor_count);
-    defer memory.wasm_allocator.free(group_keys_out);
-    var out_idx: usize = 0;
-    for (0..num_groups) |gi| {
-        if (survivors[gi]) {
-            group_keys_out[out_idx] = @floatFromInt(group_keys[gi]);
-            out_idx += 1;
+    // Group keys - handle TEXT columns properly by outputting actual string values
+    if (gcol.col_type == .string or gcol.col_type == .list) {
+        // For string group columns, write actual string values
+        var ctx: ?FragmentContext = null;
+
+        // First pass: calculate total length
+        var total_len: usize = 0;
+        for (0..num_groups) |gi| {
+            if (survivors[gi]) {
+                const representative_idx = @as(u32, @intCast(group_starts[gi]));
+                const str_val = getStringValueOptimized(table, gcol, representative_idx, &ctx);
+                total_len += str_val.len;
+            }
         }
+
+        // Allocate buffers
+        const str_data = try memory.wasm_allocator.alloc(u8, total_len);
+        defer memory.wasm_allocator.free(str_data);
+        const offsets = try memory.wasm_allocator.alloc(u32, survivor_count);
+        defer memory.wasm_allocator.free(offsets);
+
+        // Second pass: copy data and build offsets
+        var current_offset: usize = 0;
+        var out_idx: usize = 0;
+        for (0..num_groups) |gi| {
+            if (survivors[gi]) {
+                const representative_idx = @as(u32, @intCast(group_starts[gi]));
+                const str_val = getStringValueOptimized(table, gcol, representative_idx, &ctx);
+                offsets[out_idx] = @intCast(current_offset);
+                @memcpy(str_data[current_offset..][0..str_val.len], str_val);
+                current_offset += str_val.len;
+                out_idx += 1;
+            }
+        }
+
+        _ = lw.fragmentAddStringColumn(group_col_name.ptr, group_col_name.len, str_data.ptr, total_len, offsets.ptr, survivor_count, false);
+    } else {
+        // For numeric group columns, output as float64
+        const group_keys_out = try memory.wasm_allocator.alloc(f64, survivor_count);
+        defer memory.wasm_allocator.free(group_keys_out);
+        var out_idx: usize = 0;
+        for (0..num_groups) |gi| {
+            if (survivors[gi]) {
+                group_keys_out[out_idx] = @floatFromInt(group_keys[gi]);
+                out_idx += 1;
+            }
+        }
+
+        _ = lw.fragmentAddFloat64Column(group_col_name.ptr, group_col_name.len, group_keys_out.ptr, survivor_count, false);
     }
-    
-    _ = lw.fragmentAddFloat64Column(group_col_name.ptr, group_col_name.len, group_keys_out.ptr, survivor_count, false);
     
     // Aggregates
     for (query.aggregates[0..num_aggs], 0..) |agg, ai| {
@@ -4941,6 +5388,11 @@ fn evaluateHaving(query: *const ParsedQuery, having: *const WhereClause, agg_res
                         .avg => "AVG",
                         .min => "MIN",
                         .max => "MAX",
+                        .stddev => "STDDEV",
+                        .variance => "VARIANCE",
+                        .stddev_pop => "STDDEV_POP",
+                        .var_pop => "VAR_POP",
+                        .median => "MEDIAN",
                     };
                     if (eqlIgnoreCase(col_name, func_name)) {
                         val = agg_results[i];
@@ -5060,6 +5512,7 @@ fn computeLazyAggregate(table: *const TableInfo, col: *const ColumnData, agg: Ag
                     if (chunk_max > max_val) max_val = chunk_max;
                 },
                 .count => total_count += @floatFromInt(n),
+                else => {}, // STDDEV, VARIANCE, MEDIAN handled via executeMultiAggregate
             }
             
             chunk_offset += @intCast(chunk_len);
@@ -5077,6 +5530,7 @@ fn computeLazyAggregate(table: *const TableInfo, col: *const ColumnData, agg: Ag
         .min => min_val,
         .max => max_val,
         .count => total_count,
+        else => 0, // STDDEV, VARIANCE, MEDIAN handled via executeMultiAggregate
     };
 }
 
@@ -5122,6 +5576,7 @@ fn computeAggregate(table: *const TableInfo, agg: AggExpr, indices: []const u32)
                 .min => aggregates.minFloat64Buffer(ptr, len),
                 .max => aggregates.maxFloat64Buffer(ptr, len),
                 .count => @floatFromInt(len),
+                else => 0, // STDDEV, VARIANCE, MEDIAN handled via executeMultiAggregate
             };
         }
     }
@@ -5169,6 +5624,7 @@ fn computeAggregate(table: *const TableInfo, agg: AggExpr, indices: []const u32)
                             .min => min_val = @min(min_val, aggregates.minFloat64Buffer(ptr, CHUNK_SIZE)),
                             .max => max_val = @max(max_val, aggregates.maxFloat64Buffer(ptr, CHUNK_SIZE)),
                             .count => {},
+                            else => {}, // STDDEV, VARIANCE, MEDIAN handled via executeMultiAggregate
                         }
                         total_count += CHUNK_SIZE;
                         gather_idx = 0;
@@ -5187,6 +5643,7 @@ fn computeAggregate(table: *const TableInfo, agg: AggExpr, indices: []const u32)
             .min => min_val = @min(min_val, aggregates.minFloat64Buffer(ptr, gather_idx)),
             .max => max_val = @max(max_val, aggregates.maxFloat64Buffer(ptr, gather_idx)),
             .count => {},
+            else => {}, // STDDEV, VARIANCE, MEDIAN handled via executeMultiAggregate
         }
         total_count += gather_idx;
     }
@@ -5208,6 +5665,7 @@ fn computeAggregate(table: *const TableInfo, agg: AggExpr, indices: []const u32)
         .min => if (total_count > 0) min_val else 0,
         .max => if (total_count > 0) max_val else 0,
         .count => @floatFromInt(indices.len),
+        else => 0, // STDDEV, VARIANCE, MEDIAN handled via executeMultiAggregate
     };
 }
 
@@ -5310,7 +5768,12 @@ fn getIntValue(table: *const TableInfo, col: *const ColumnData, idx: u32) i64 {
         .int32 => col.data.int32[idx],
         .float64 => @intFromFloat(col.data.float64[idx]),
         .float32 => @intFromFloat(col.data.float32[idx]),
-        .string, .list => 0,
+        .string, .list => blk: {
+            // Hash string values for grouping
+            var ctx: ?FragmentContext = null;
+            const s = getStringValueOptimized(table, col, idx, &ctx);
+            break :blk @as(i64, @bitCast(std.hash.Wyhash.hash(0, s)));
+        },
     };
 }
 
@@ -5387,6 +5850,34 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
         }
     }
 
+    // Process In-Memory Data (rows after fragments, e.g. from CREATE TABLE + INSERT)
+    if (row_count > current_global_idx) {
+        const mem_row_count = row_count - current_global_idx;
+        const mem_start = current_global_idx;
+
+        if (query.where_clause) |*where| {
+            // Apply WHERE filter to in-memory rows
+            for (0..mem_row_count) |i| {
+                const global_idx = mem_start + @as(u32, @intCast(i));
+                var ctx: ?FragmentContext = null;
+                if (evaluateWhere(table, where, global_idx, &ctx)) {
+                    if (idx_count < MAX_ROWS) {
+                        indices[idx_count] = global_idx;
+                        idx_count += 1;
+                    }
+                }
+            }
+        } else {
+            // No WHERE clause - add all in-memory rows
+            for (0..mem_row_count) |i| {
+                if (idx_count < MAX_ROWS) {
+                    indices[idx_count] = mem_start + @as(u32, @intCast(i));
+                    idx_count += 1;
+                }
+            }
+        }
+    }
+
     if (idx_count == 0) {
         _ = allocResultBuffer(HEADER_SIZE) orelse return error.OutOfMemory;
         _ = writeU32(RESULT_VERSION);
@@ -5456,8 +5947,8 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
             if (processed[i]) continue;
             const part_key = partition_keys[i];
 
-            // Collect partition indices
-            const part_indices = &global_indices_1;
+            // Collect partition indices (use global_indices_2 to avoid overwriting main indices)
+            const part_indices = &global_indices_2;
             var part_count: usize = 0;
             for (0..idx_count) |j| {
                 if (partition_keys[j] == part_key) {
@@ -5687,13 +6178,26 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
     }
     const data_offset_start = unaligned_data_start + padding;
 
+    // Pre-calculate actual string sizes for accurate buffer allocation
+    var string_sizes: [MAX_SELECT_COLS]usize = undefined;
+    for (output_cols[0..output_count], 0..) |ci, out_idx| {
+        string_sizes[out_idx] = 0;
+        if (table.columns[ci]) |*col| {
+            if (col.col_type == .string or col.col_type == .list) {
+                for (indices[0..idx_count]) |ri| {
+                    var ctx: ?FragmentContext = null;
+                    string_sizes[out_idx] += getStringValueOptimized(table, col, ri, &ctx).len;
+                }
+            }
+        }
+    }
+
     var data_size: usize = 0;
-    for (output_cols[0..output_count]) |ci| {
+    for (output_cols[0..output_count], 0..) |ci, out_idx| {
         if (table.columns[ci]) |col| {
             data_size += switch (col.col_type) {
-                .int64, .float64 => idx_count * 8,
-                .int32, .float32 => idx_count * 4,
-                .string, .list => idx_count * 8 + 65536,
+                .int64, .float64, .int32, .float32 => idx_count * 8, // All numeric written as f64
+                .string, .list => idx_count * 8 + string_sizes[out_idx],
             };
         }
     }
@@ -5718,7 +6222,7 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
     var data_offset: u32 = 0;
 
     // Regular columns
-    for (output_cols[0..output_count]) |ci| {
+    for (output_cols[0..output_count], 0..) |ci, out_idx| {
         if (table.columns[ci]) |col| {
             _ = writeU32(@intFromEnum(col.col_type));
             _ = writeU32(name_offset);
@@ -5727,9 +6231,8 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
 
             name_offset += @intCast(col.name.len);
             data_offset += switch (col.col_type) {
-                .int64, .float64 => @intCast(idx_count * 8),
-                .int32, .float32 => @intCast(idx_count * 4),
-                .string, .list => @intCast(idx_count * 8 + 65536),
+                .int64, .float64, .int32, .float32 => @intCast(idx_count * 8), // All numeric as f64
+                .string, .list => @intCast(idx_count * 8 + string_sizes[out_idx]),
             };
         }
     }
@@ -5762,45 +6265,31 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
         }
     }
 
-    // Write data - regular columns
+    // Write data - regular columns (use safe accessors for in-memory tables)
     for (output_cols[0..output_count]) |ci| {
         if (table.columns[ci]) |*col| {
             switch (col.col_type) {
-                .float64 => {
+                .float64, .int64, .int32, .float32 => {
                     for (indices[0..idx_count]) |ri| {
-                        const val = col.data.float64[ri];
-                        _ = writeToResult(std.mem.asBytes(&val));
-                    }
-                },
-                .int64 => {
-                    for (indices[0..idx_count]) |ri| {
-                        const val: f64 = @floatFromInt(col.data.int64[ri]);
-                        _ = writeToResult(std.mem.asBytes(&val));
-                    }
-                },
-                .int32 => {
-                    for (indices[0..idx_count]) |ri| {
-                        const val = col.data.int32[ri];
-                        _ = writeToResult(std.mem.asBytes(&val));
-                    }
-                },
-                .float32 => {
-                    for (indices[0..idx_count]) |ri| {
-                        const val = col.data.float32[ri];
+                        var ctx: ?FragmentContext = null;
+                        const val = getFloatValueOptimized(table, col, ri, &ctx);
                         _ = writeToResult(std.mem.asBytes(&val));
                     }
                 },
                 .string, .list => {
+                    // Collect string data first to calculate offsets
                     var str_offset: u32 = 0;
                     for (indices[0..idx_count]) |ri| {
+                        var ctx: ?FragmentContext = null;
+                        const str_val = getStringValueOptimized(table, col, ri, &ctx);
                         _ = writeU32(str_offset);
-                        _ = writeU32(col.data.strings.lengths[ri]);
-                        str_offset += col.data.strings.lengths[ri];
+                        _ = writeU32(@intCast(str_val.len));
+                        str_offset += @intCast(str_val.len);
                     }
                     for (indices[0..idx_count]) |ri| {
-                        const off = col.data.strings.offsets[ri];
-                        const len = col.data.strings.lengths[ri];
-                        _ = writeToResult(col.data.strings.data[off..][0..len]);
+                        var ctx: ?FragmentContext = null;
+                        const str_val = getStringValueOptimized(table, col, ri, &ctx);
+                        _ = writeToResult(str_val);
                     }
                 },
             }
@@ -6155,7 +6644,7 @@ fn writeSelectResult(table: *const TableInfo, query: *const ParsedQuery, row_ind
                  .trim, .ltrim, .rtrim, .concat, .replace, .reverse, .upper, .lower, .left, .substr, .lpad, .rpad, .right, .repeat => col_type = .string,
                  .split, .array_slice => col_type = .list,
                  .array_length, .length, .instr => col_type = .int64,
-                 .nullif, .coalesce => {
+                 .nullif, .coalesce, .iif, .greatest, .least, .case => {
                      col_type = .float64;
                      var is_str = false;
                      // Arg 1
@@ -6174,7 +6663,7 @@ fn writeSelectResult(table: *const TableInfo, query: *const ParsedQuery, row_ind
                              }
                          }
                      }
-                     // Arg 3
+                     // Arg 3 (for IIF/CASE/COALESCE)
                      if (!is_str) {
                          if (expr.arg_3_val_str != null) is_str = true;
                          if (expr.arg_3_col) |n| {
@@ -6183,15 +6672,48 @@ fn writeSelectResult(table: *const TableInfo, query: *const ParsedQuery, row_ind
                              }
                          }
                      }
+                     // Case clauses
+                     if (!is_str and expr.func == .case) {
+                         for (expr.case_clauses[0..expr.case_count]) |cc| {
+                             if (cc.then_val_str != null) { is_str = true; break; }
+                             if (cc.then_col_name) |n| {
+                                 if (getColByName(table, n)) |cl| {
+                                     if (cl.col_type == .string) { is_str = true; break; }
+                                 }
+                             }
+                         }
+                         if (!is_str and expr.else_col_name != null) {
+                             if (getColByName(table, expr.else_col_name.?)) |cl| {
+                                 if (cl.col_type == .string) is_str = true;
+                             }
+                         }
+                     }
                      
                      if (is_str) col_type = .string;
                  },
+                 .cast => {
+                     // Check target type stored in arg_2_val_str
+                     col_type = .float64;
+                     if (expr.arg_2_val_str) |target_type| {
+                         if (std.ascii.eqlIgnoreCase(target_type, "TEXT") or
+                             std.ascii.eqlIgnoreCase(target_type, "VARCHAR") or
+                             std.ascii.eqlIgnoreCase(target_type, "CHAR") or
+                             std.ascii.eqlIgnoreCase(target_type, "STRING")) {
+                             col_type = .string;
+                         } else if (std.ascii.eqlIgnoreCase(target_type, "INTEGER") or
+                                    std.ascii.eqlIgnoreCase(target_type, "INT") or
+                                    std.ascii.eqlIgnoreCase(target_type, "BIGINT")) {
+                             col_type = .int64;
+                         }
+                         // Default: float64 (REAL, DOUBLE, FLOAT, NUMERIC)
+                     }
+                 },
+                 .abs, .ceil, .floor, .sqrt, .exp, .log, .sin, .cos, .tan, .asin, .acos, .atan, .degrees, .radians, .round, .trunc, .truncate, .pi, .random,
+                 .add, .sub, .mul, .div, .mod, .power, .bit_and, .bit_or, .bit_xor, .bit_not, .lshift, .rshift => {
+                     col_type = .float64;
+                 },
                  else => {
                      col_type = .float64;
-                     if (expr.func != .none) {
-                          setDebug("UNKNOWN_FUNC: {}", .{@intFromEnum(expr.func)});
-                          setError("DEBUG_FAIL: UNKNOWN FUNC");
-                     }
                  },
              }
         }
@@ -6260,11 +6782,22 @@ fn writeSelectResult(table: *const TableInfo, query: *const ParsedQuery, row_ind
                       _ = lw.fragmentAddStringColumn(col_name.ptr, col_name.len, data.ptr, total_len, offsets.ptr, row_count, false);
                   }
 
+             } else if (col_type == .int64) {
+                 // Int64 Calc
+                 const data = try memory.wasm_allocator.alloc(i64, row_count);
+                 defer memory.wasm_allocator.free(data);
+
+                 var ctx: ?FragmentContext = null;
+                 for (row_indices, 0..) |ri, i| {
+                     const f = evaluateScalarFloat(table, &expr, ri, &ctx, arg1_col, arg2_col);
+                     data[i] = @intFromFloat(f);
+                 }
+                 _ = lw.fragmentAddInt64Column(col_name.ptr, col_name.len, data.ptr, row_count, false);
              } else {
                  // Float Calc
                  const data = try memory.wasm_allocator.alloc(f64, row_count);
                  defer memory.wasm_allocator.free(data);
-                 
+
                  var ctx: ?FragmentContext = null;
                  for (row_indices, 0..) |ri, i| {
                      data[i] = evaluateScalarFloat(table, &expr, ri, &ctx, arg1_col, arg2_col);
@@ -6304,6 +6837,16 @@ fn evaluateWhereVector(
         setDebug("evaluateWhereVector SUBQUERY op: {any}", .{where.op});
     }
     switch (where.op) {
+        .always_true => {
+             const sel_len = if (selection) |s| s.len else count;
+             if (selection) |s| {
+                 @memcpy(out_selection[0..sel_len], s);
+             } else {
+                 for (0..count) |i| out_selection[i] = @as(u16, @intCast(i));
+             }
+             return @as(u32, @intCast(sel_len));
+        },
+        .always_false => return 0,
         .and_op => {
             const l = where.left orelse return 0;
             const r = where.right orelse return 0;
@@ -6932,6 +7475,14 @@ fn executeSubqueryInternal(sql: []const u8) !SubqueryResult {
 fn evaluateWhere(table: *const TableInfo, where: *const WhereClause, row_idx: u32, context: *?FragmentContext) bool {
 
     switch (where.op) {
+        .always_true => {
+            // setDebug("Evaluating always_true", .{});
+            return true;
+        },
+        .always_false => {
+            // setDebug("Evaluating always_false", .{});
+            return false;
+        },
         .and_op => {
 
             const l = where.left orelse return false;
@@ -7241,26 +7792,57 @@ fn matchLike(str: []const u8, pattern: []const u8) bool {
 // Sorting
 // ============================================================================
 
-fn compareValues(table: *const TableInfo, col: *const ColumnData, idx1: u32, idx2: u32) i32 {
+fn isNullValue(table: *const TableInfo, col: *const ColumnData, idx: u32) bool {
+    var ctx: ?FragmentContext = null;
+    if (col.col_type == .int64 or col.col_type == .int32) {
+        return getIntValueOptimized(table, col, idx, &ctx) == NULL_SENTINEL_INT;
+    } else if (col.col_type == .float64 or col.col_type == .float32) {
+        return std.math.isNan(getFloatValueOptimized(table, col, idx, &ctx));
+    } else {
+        const s = getStringValueOptimized(table, col, idx, &ctx);
+        return (s.len == 0) or std.mem.eql(u8, s, "NULL");
+    }
+}
+
+fn compareValues(table: *const TableInfo, col: *const ColumnData, idx1: u32, idx2: u32, nulls_first: bool, nulls_last: bool) i32 {
+    const is1 = isNullValue(table, col, idx1);
+    const is2 = isNullValue(table, col, idx2);
+
+    if (is1 and is2) return 0;
+    if (is1) {
+        if (nulls_first) return -1;
+        if (nulls_last) return 1;
+        // Default: NULLs are "largest"
+        return 1;
+    }
+    if (is2) {
+        if (nulls_first) return 1;
+        if (nulls_last) return -1;
+        // Default: NULLs are "largest"
+        return -1;
+    }
+
+    // Use optimized versions with context for proper memory row handling
+    var ctx: ?FragmentContext = null;
+
     switch (col.col_type) {
         .string, .list => {
-            var ctx: ?FragmentContext = null;
             const s1 = getStringValueOptimized(table, col, idx1, &ctx);
             const s2 = getStringValueOptimized(table, col, idx2, &ctx);
             return switch (std.mem.order(u8, s1, s2)) {
                 .lt => -1, .gt => 1, .eq => 0
             };
         },
-        .int64 => {
-             const v1 = getIntValue(table, col, idx1);
-             const v2 = getIntValue(table, col, idx2);
+        .int64, .int32 => {
+             const v1 = getIntValueOptimized(table, col, idx1, &ctx);
+             const v2 = getIntValueOptimized(table, col, idx2, &ctx);
              if (v1 < v2) return -1;
              if (v1 > v2) return 1;
              return 0;
         },
         else => {
-            const v1 = getFloatValue(table, col, idx1);
-            const v2 = getFloatValue(table, col, idx2);
+            const v1 = getFloatValueOptimized(table, col, idx1, &ctx);
+            const v2 = getFloatValueOptimized(table, col, idx2, &ctx);
             if (v1 < v2) return -1;
             if (v1 > v2) return 1;
             return 0;
@@ -7268,26 +7850,64 @@ fn compareValues(table: *const TableInfo, col: *const ColumnData, idx1: u32, idx
     }
 }
 
-fn sortIndices(table: *const TableInfo, indices: []u32, col_name: []const u8, dir: OrderDir) void {
-    var col: ?*const ColumnData = null;
+fn findColumn(table: *const TableInfo, col_name: []const u8) ?*const ColumnData {
     for (table.columns[0..table.column_count]) |maybe_col| {
         if (maybe_col) |*c| {
             if (std.mem.eql(u8, c.name, col_name)) {
-                col = c;
-                break;
+                return c;
             }
         }
     }
-    const c = col orelse return;
+    return null;
+}
 
-    // Simple insertion sort (good enough for moderate sizes)
+fn compareMultiKey(table: *const TableInfo, idx1: u32, idx2: u32,
+                   cols: []const []const u8, dirs: []const OrderDir,
+                   nulls_first: bool, nulls_last: bool) i32 {
+    for (cols, dirs) |col_name, dir| {
+        if (findColumn(table, col_name)) |col| {
+            // Handle NULL ordering separately - should not be affected by DESC
+            const is1 = isNullValue(table, col, idx1);
+            const is2 = isNullValue(table, col, idx2);
+
+            if (is1 and is2) continue;  // Both null, check next column
+            if (is1) {
+                // value1 is NULL
+                if (nulls_first) return -1;  // NULL comes first (absolute)
+                if (nulls_last) return 1;    // NULL comes last (absolute)
+                // Default: depends on direction (NULLs last for ASC, first for DESC)
+                return if (dir == .desc) -1 else 1;
+            }
+            if (is2) {
+                // value2 is NULL
+                if (nulls_first) return 1;   // value1 not null, so it comes after NULL
+                if (nulls_last) return -1;   // value1 not null, so it comes before NULL
+                // Default: depends on direction
+                return if (dir == .desc) 1 else -1;
+            }
+
+            // Neither is NULL, compare values (passing false for null flags since already handled)
+            const cmp = compareValues(table, col, idx1, idx2, false, false);
+            if (cmp != 0) {
+                return if (dir == .desc) -cmp else cmp;
+            }
+        }
+    }
+    return 0;
+}
+
+fn sortIndicesMulti(table: *const TableInfo, indices: []u32, 
+                    cols: []const []const u8, dirs: []const OrderDir,
+                    nulls_first: bool, nulls_last: bool) void {
+    if (cols.len == 0) return;
+    
+    // Simple insertion sort (stable, good for moderate sizes)
     for (1..indices.len) |i| {
         const key = indices[i];
         var j: usize = i;
         while (j > 0) {
-            const cmp = compareValues(table, c, indices[j - 1], key);
-            const should_swap = if (dir == .asc) cmp > 0 else cmp < 0;
-            if (!should_swap) break;
+            const cmp = compareMultiKey(table, indices[j - 1], key, cols, dirs, nulls_first, nulls_last);
+            if (cmp <= 0) break;
             indices[j] = indices[j - 1];
             j -= 1;
         }
@@ -7369,14 +7989,17 @@ pub fn parseSql(sql: []const u8) ?*ParsedQuery {
         pos = skipWs(sql, pos);
     }
     if (pos >= sql.len) {
+        setDebug("Empty SQL or whitespace only at pos {d}", .{pos});
         return null;
     }
 
     if (startsWithIC(sql[pos..], "SELECT")) {
+        log("Detected SELECT at pos {d}", .{pos});
         query.type = .select;
         pos += 6;
         pos = skipWs(sql, pos);
     } else if (startsWithIC(sql[pos..], "DROP TABLE")) {
+        // log("Found DROP TABLE", .{});
         query.type = .drop_table;
         pos += 10;
         pos = skipWs(sql, pos);
@@ -7720,6 +8343,7 @@ pub fn parseSql(sql: []const u8) ?*ParsedQuery {
         }
         return query;
     } else {
+        setDebug("Unsupported SQL statement at pos {d}: {s}", .{pos, if (pos < sql.len) sql[pos..@min(pos+10, sql.len)] else ""});
         return null;
     }
 
@@ -7731,33 +8355,51 @@ pub fn parseSql(sql: []const u8) ?*ParsedQuery {
     }
 
     // Parse select list
-    pos = parseSelectList(sql, pos, query) orelse return null;
+    log("Parsing select list at pos {d}", .{pos});
+    pos = parseSelectList(sql, pos, query) orelse {
+        log("parseSelectList failed at pos {d}", .{pos});
+        setDebug("parseSelectList failed at pos {d}", .{pos});
+        return null;
+    };
+    log("parseSelectList success, new pos {d}", .{pos});
     pos = skipWs(sql, pos);
 
-    // FROM clause
-    if (pos >= sql.len or !startsWithIC(sql[pos..], "FROM")) return null;
+    // FROM clause (optional for scalar expressions like SELECT GREATEST(1,2,3))
+    if (pos >= sql.len or !startsWithIC(sql[pos..], "FROM")) {
+        // No FROM clause - this is a tableless scalar query (e.g., SELECT 1+1, SELECT GREATEST(1,2))
+        query.table_name = "__DUAL__"; // Sentinel for tableless queries
+        log("Tableless query detected (pos={d}, len={d})", .{pos, sql.len});
+        setDebug("Tableless query detected, returning early", .{});
+        return query;
+    }
     pos += 4;
     pos = skipWs(sql, pos);
 
     // Table name
     const tbl_start = pos;
     while (pos < sql.len and isIdent(sql[pos])) pos += 1;
-    if (pos == tbl_start) return null;
+    if (pos == tbl_start) {
+        setDebug("Missing table name after FROM at pos {d}", .{pos});
+        return null;
+    }
     query.table_name = sql[tbl_start..pos];
     pos = skipWs(sql, pos);
 
     // Consume table alias if present (and not a keyword for next clause)
-    if (pos < sql.len and isIdent(sql[pos]) and 
-        !startsWithIC(sql[pos..], "JOIN") and 
-        !startsWithIC(sql[pos..], "INNER") and 
-        !startsWithIC(sql[pos..], "LEFT") and 
-        !startsWithIC(sql[pos..], "RIGHT") and 
-        !startsWithIC(sql[pos..], "CROSS") and 
-        !startsWithIC(sql[pos..], "WHERE") and 
-        !startsWithIC(sql[pos..], "GROUP") and 
-        !startsWithIC(sql[pos..], "ORDER") and 
+    if (pos < sql.len and isIdent(sql[pos]) and
+        !startsWithIC(sql[pos..], "JOIN") and
+        !startsWithIC(sql[pos..], "INNER") and
+        !startsWithIC(sql[pos..], "LEFT") and
+        !startsWithIC(sql[pos..], "RIGHT") and
+        !startsWithIC(sql[pos..], "CROSS") and
+        !startsWithIC(sql[pos..], "WHERE") and
+        !startsWithIC(sql[pos..], "GROUP") and
+        !startsWithIC(sql[pos..], "ORDER") and
         !startsWithIC(sql[pos..], "TOPK") and
-        !startsWithIC(sql[pos..], "LIMIT")) {
+        !startsWithIC(sql[pos..], "LIMIT") and
+        !startsWithIC(sql[pos..], "UNION") and
+        !startsWithIC(sql[pos..], "INTERSECT") and
+        !startsWithIC(sql[pos..], "EXCEPT")) {
         const alias_start = pos;
         while (pos < sql.len and isIdent(sql[pos])) pos += 1;
         query.table_alias = sql[alias_start..pos];
@@ -8049,15 +8691,56 @@ fn getScalarFunc(name: []const u8) ScalarFunc {
     if (std.ascii.eqlIgnoreCase(name, "RIGHT")) return .right;
     if (std.ascii.eqlIgnoreCase(name, "REPEAT")) return .repeat;
     if (std.ascii.eqlIgnoreCase(name, "POSITION")) return .instr;
+    // Conditional
+    if (std.ascii.eqlIgnoreCase(name, "IIF")) return .iif;
+    if (std.ascii.eqlIgnoreCase(name, "GREATEST")) return .greatest;
+    if (std.ascii.eqlIgnoreCase(name, "LEAST")) return .least;
+    if (std.ascii.eqlIgnoreCase(name, "PI")) return .pi;
+    if (std.ascii.eqlIgnoreCase(name, "LOG")) return .log;
+    if (std.ascii.eqlIgnoreCase(name, "LN")) return .ln;
+    if (std.ascii.eqlIgnoreCase(name, "EXP")) return .exp;
+    if (std.ascii.eqlIgnoreCase(name, "SIN")) return .sin;
+    if (std.ascii.eqlIgnoreCase(name, "COS")) return .cos;
+    if (std.ascii.eqlIgnoreCase(name, "TAN")) return .tan;
+    if (std.ascii.eqlIgnoreCase(name, "ASIN")) return .asin;
+    if (std.ascii.eqlIgnoreCase(name, "ACOS")) return .acos;
+    if (std.ascii.eqlIgnoreCase(name, "ATAN")) return .atan;
+    if (std.ascii.eqlIgnoreCase(name, "DEGREES")) return .degrees;
+    if (std.ascii.eqlIgnoreCase(name, "RADIANS")) return .radians;
+    if (std.ascii.eqlIgnoreCase(name, "TRUNCATE")) return .truncate;
+    // Type conversion
+    if (std.ascii.eqlIgnoreCase(name, "CAST")) return .cast;
+    // JSON functions
+    if (std.ascii.eqlIgnoreCase(name, "JSON_EXTRACT")) return .json_extract;
+    if (std.ascii.eqlIgnoreCase(name, "JSON_ARRAY_LENGTH")) return .json_array_length;
+    if (std.ascii.eqlIgnoreCase(name, "JSON_OBJECT")) return .json_object;
+    if (std.ascii.eqlIgnoreCase(name, "JSON_ARRAY")) return .json_array;
+    // UUID
+    if (std.ascii.eqlIgnoreCase(name, "UUID")) return .uuid;
+    if (std.ascii.eqlIgnoreCase(name, "UUID_STRING")) return .uuid_string;
+    // Bitwise
+    if (std.ascii.eqlIgnoreCase(name, "BIT_AND")) return .bit_and;
+    if (std.ascii.eqlIgnoreCase(name, "BIT_OR")) return .bit_or;
+    if (std.ascii.eqlIgnoreCase(name, "BIT_XOR")) return .bit_xor;
+    if (std.ascii.eqlIgnoreCase(name, "BIT_NOT")) return .bit_not;
+    if (std.ascii.eqlIgnoreCase(name, "LSHIFT")) return .lshift;
+    if (std.ascii.eqlIgnoreCase(name, "RSHIFT")) return .rshift;
+    // REGEXP
+    if (std.ascii.eqlIgnoreCase(name, "REGEXP_MATCH")) return .regexp_match;
+    if (std.ascii.eqlIgnoreCase(name, "REGEXP_REPLACE")) return .regexp_replace;
+    if (std.ascii.eqlIgnoreCase(name, "REGEXP_EXTRACT")) return .regexp_extract;
+    // Date/Time
+    if (std.ascii.eqlIgnoreCase(name, "EXTRACT")) return .extract;
+    if (std.ascii.eqlIgnoreCase(name, "DATE_PART")) return .date_part;
     return .none;
 }
 
 fn parseScalarExpr(sql: []const u8, pos: *usize) ?SelectExpr {
     pos.* = skipWs(sql, pos.*);
-    
+
     var expr = SelectExpr{};
 
-    // 1. Literal Numbers
+    // 1. Literal Numbers (negative numbers handled separately to avoid conflict with subtraction)
     if (pos.* < sql.len and (std.ascii.isDigit(sql[pos.*]) or sql[pos.*] == '-')) {
         const num_start = pos.*;
         if (sql[pos.*] == '-') pos.* += 1;
@@ -8068,6 +8751,7 @@ fn parseScalarExpr(sql: []const u8, pos: *usize) ?SelectExpr {
         } else {
             expr.val_int = std.fmt.parseInt(i64, num_str, 10) catch 0;
         }
+
         return expr;
     }
 
@@ -8191,17 +8875,67 @@ fn parseScalarExpr(sql: []const u8, pos: *usize) ?SelectExpr {
         
         expr.func = getScalarFunc(name);
         
-        // Parse Arg 1
-        if (parseScalarExpr(sql, pos)) |arg1| {
-            if (arg1.val_str) |s| expr.val_str = s;
-            if (arg1.val_int) |i| expr.val_int = i;
-            if (arg1.val_float) |f| expr.val_float = f;
-            if (arg1.col_name.len > 0) expr.col_name = arg1.col_name;
-            // Nested? Flatten to 1 level for now/hack
+        if (expr.func == .iif) {
+            // IIF(cond, then, else) -> CASE WHEN cond THEN then ELSE else END
+            expr.func = .case;
+            if (parseOrExpr(sql, pos)) |cond| {
+                expr.case_clauses[0].when_cond = cond;
+                expr.case_count = 1;
+            }
+            
+            pos.* = skipWs(sql, pos.*);
+            if (pos.* < sql.len and sql[pos.*] == ',') {
+                pos.* += 1;
+                // Parse THEN part
+                if (parseScalarExpr(sql, pos)) |then_expr| {
+                    expr.case_clauses[0].then_val_int = then_expr.val_int;
+                    expr.case_clauses[0].then_val_float = then_expr.val_float;
+                    expr.case_clauses[0].then_val_str = then_expr.val_str;
+                    expr.case_clauses[0].then_col_name = if (then_expr.col_name.len > 0) then_expr.col_name else null;
+                }
+                
+                pos.* = skipWs(sql, pos.*);
+                if (pos.* < sql.len and sql[pos.*] == ',') {
+                    pos.* += 1;
+                    // Parse ELSE part
+                    if (parseScalarExpr(sql, pos)) |else_expr| {
+                        expr.else_val_int = else_expr.val_int;
+                        expr.else_val_float = else_expr.val_float;
+                        expr.else_val_str = else_expr.val_str;
+                        expr.else_col_name = if (else_expr.col_name.len > 0) else_expr.col_name else null;
+                    }
+                }
+            }
+        } else {
+            // Parse Arg 1
+            if (parseScalarExpr(sql, pos)) |arg1| {
+                if (arg1.val_str) |s| expr.val_str = s;
+                if (arg1.val_int) |i| expr.val_int = i;
+                if (arg1.val_float) |f| expr.val_float = f;
+                if (arg1.col_name.len > 0) expr.col_name = arg1.col_name;
+            }
         }
         
         pos.* = skipWs(sql, pos.*);
-        if (pos.* < sql.len and sql[pos.*] == ',') {
+        if (pos.* < sql.len and std.ascii.eqlIgnoreCase(name, "EXTRACT") and startsWithIC(sql[pos.*..], "FROM")) {
+             pos.* += 4;
+             pos.* = skipWs(sql, pos.*);
+             if (parseScalarExpr(sql, pos)) |arg2| {
+                 if (arg2.val_str) |s| expr.arg_2_val_str = s;
+                 if (arg2.val_int) |i| expr.arg_2_val_int = i;
+                 if (arg2.val_float) |f| expr.arg_2_val_float = f;
+                 if (arg2.col_name.len > 0) expr.arg_2_col = arg2.col_name;
+             }
+        } else if (pos.* < sql.len and std.ascii.eqlIgnoreCase(name, "CAST") and startsWithIC(sql[pos.*..], "AS")) {
+             // Parse CAST(value AS type) - store target type in arg_2_val_str
+             pos.* += 2;
+             pos.* = skipWs(sql, pos.*);
+             const type_start = pos.*;
+             while (pos.* < sql.len and isIdent(sql[pos.*])) pos.* += 1;
+             if (pos.* > type_start) {
+                 expr.arg_2_val_str = sql[type_start..pos.*];
+             }
+        } else if (pos.* < sql.len and sql[pos.*] == ',') {
             pos.* += 1;
             // Parse Arg 2
             if (parseScalarExpr(sql, pos)) |arg2| {
@@ -8271,6 +9005,17 @@ fn parseSelectList(sql: []const u8, start: usize, query: *ParsedQuery) ?usize {
     // Parse column list, aggregates, or window functions
     while (pos < sql.len) {
         pos = skipWs(sql, pos);
+
+        // Stop if we hit a reserved keyword (indicates end of select list)
+        // Check for keyword followed by space, tab, or end of string
+        if (isKeywordAtPos(sql, pos, "FROM") or isKeywordAtPos(sql, pos, "WHERE") or
+            isKeywordAtPos(sql, pos, "GROUP") or isKeywordAtPos(sql, pos, "ORDER") or
+            isKeywordAtPos(sql, pos, "LIMIT") or isKeywordAtPos(sql, pos, "UNION") or
+            isKeywordAtPos(sql, pos, "INTERSECT") or isKeywordAtPos(sql, pos, "EXCEPT") or
+            isKeywordAtPos(sql, pos, "HAVING") or isKeywordAtPos(sql, pos, "JOIN")) {
+            break;
+        }
+
         var parsed_window = false;
         var parsed_agg = false;
 
@@ -8469,6 +9214,12 @@ fn parseAggregate(sql: []const u8, pos: *usize, query: *ParsedQuery) bool {
         .{ .name = "AVG", .func = .avg },
         .{ .name = "MIN", .func = .min },
         .{ .name = "MAX", .func = .max },
+        .{ .name = "STDDEV_POP", .func = .stddev_pop },
+        .{ .name = "STDDEV", .func = .stddev },
+        .{ .name = "VAR_POP", .func = .var_pop },
+        .{ .name = "VARIANCE", .func = .variance },
+        .{ .name = "VAR", .func = .variance },
+        .{ .name = "MEDIAN", .func = .median },
     };
 
     for (funcs) |f| {
@@ -8561,6 +9312,41 @@ fn parseAndExpr(sql: []const u8, pos: *usize) ?WhereClause {
     return left;
 }
 
+fn invertOp(op: WhereOp) WhereOp {
+    return switch (op) {
+        .lt => .gt,
+        .le => .ge,
+        .gt => .lt,
+        .ge => .le,
+        else => op,
+    };
+}
+
+fn evaluateLiteralComparison(l_int: ?i64, l_float: ?f64, l_str: ?[]const u8, op: WhereOp, r_int: ?i64, r_float: ?f64, r_str: ?[]const u8) bool {
+    if (l_str) |s1| {
+        const s2 = r_str orelse "";
+        const match = std.mem.eql(u8, s1, s2);
+        return switch (op) {
+            .eq => match,
+            .ne => !match,
+            else => false, // String inequality not supported for literals yet
+        };
+    }
+
+    const val1 = if (l_float) |f| f else if (l_int) |i| @as(f64, @floatFromInt(i)) else 0;
+    const val2 = if (r_float) |f| f else if (r_int) |i| @as(f64, @floatFromInt(i)) else 0;
+
+    return switch (op) {
+        .eq => val1 == val2,
+        .ne => val1 != val2,
+        .lt => val1 < val2,
+        .le => val1 <= val2,
+        .gt => val1 > val2,
+        .ge => val1 >= val2,
+        else => false,
+    };
+}
+
 fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
     pos.* = skipWs(sql, pos.*);
 
@@ -8615,15 +9401,54 @@ fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
         return inner;
     }
 
-    // Column name
-    const col_start = pos.*;
-    while (pos.* < sql.len and (isIdent(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
-    if (pos.* == col_start) return null;
-    const column = sql[col_start..pos.*];
+    // LHS: Column name or literal
+    var lhs_val_int: ?i64 = null;
+    var lhs_val_float: ?f64 = null;
+    var lhs_val_str: ?[]const u8 = null;
+    var lhs_col_name: ?[]const u8 = null;
+
+    if (pos.* < sql.len and sql[pos.*] == '\'') {
+        pos.* += 1;
+        const s = pos.*;
+        while (pos.* < sql.len and sql[pos.*] != '\'') pos.* += 1;
+        lhs_val_str = sql[s..pos.*];
+        if (pos.* < sql.len) pos.* += 1;
+    } else {
+        const start = pos.*;
+        while (pos.* < sql.len and (isIdent(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+        if (pos.* == start) return null;
+        // Parse Left Hand Side
+        var ident = sql[start..pos.*];
+        
+        // Check if it is a string literal (quoted)
+        var is_lhs_str_literal = false;
+        if (ident.len > 0 and ident[0] == '\'') {
+            is_lhs_str_literal = true;
+            ident = ident[1..ident.len-1]; // strip quotes
+        }
+        
+        // Try to parse as number if not quoted
+        // lhs_val_int and lhs_val_float are already declared at the function scope
+        
+        if (!is_lhs_str_literal) {
+            lhs_val_int = std.fmt.parseInt(i64, ident, 10) catch null;
+            lhs_val_float = std.fmt.parseFloat(f64, ident) catch null;
+            
+            // Log EVERYTHING to see what is happening
+            // setDebug("Parsing Ident '{s}' -> Int: {?d}, Float: {?d}", .{ident, lhs_val_int, lhs_val_float});
+        }
+        
+        // Original logic for determining if it's a column name or a literal
+        if (lhs_val_int == null and lhs_val_float == null and !is_lhs_str_literal) {
+            lhs_col_name = ident;
+        } else if (is_lhs_str_literal) {
+            lhs_val_str = ident;
+        }
+    }
 
     pos.* = skipWs(sql, pos.*);
 
-    // Skip function call arguments for aggregate functions like COUNT(*), SUM(col), etc.
+    // Skip function call arguments
     if (pos.* < sql.len and sql[pos.*] == '(') {
         var depth: usize = 1;
         pos.* += 1;
@@ -8639,17 +9464,20 @@ fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
     if (startsWithIC(sql[pos.*..], "IS")) {
         pos.* += 2;
         pos.* = skipWs(sql, pos.*);
-        const is_not = startsWithIC(sql[pos.*..], "NOT");
-        if (is_not) {
+        const is_not_null = startsWithIC(sql[pos.*..], "NOT");
+        if (is_not_null) {
             pos.* += 3;
             pos.* = skipWs(sql, pos.*);
         }
         if (startsWithIC(sql[pos.*..], "NULL")) {
             pos.* += 4;
-            return WhereClause{
-                .op = if (is_not) .is_not_null else .is_null,
-                .column = column,
-            };
+            if (lhs_col_name) |column| {
+                return WhereClause{
+                    .op = if (is_not_null) .is_not_null else .is_null,
+                    .column = column,
+                };
+            }
+            return null;
         }
     }
 
@@ -8670,78 +9498,80 @@ fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
             pos.* = skipWs(sql, pos.*);
 
             if (startsWithIC(sql[pos.*..], "SELECT")) {
-                 // Subquery
-                 var clause = WhereClause{
-                     .op = if (is_not) .not_in_subquery else .in_subquery,
-                     .column = column,
-                     .subquery_start = pos.*,
-                 };
-                 // Find matching ')'
-                 var depth: usize = 1;
-                 const start_pos = pos.*;
-                 while (pos.* < sql.len and depth > 0) {
-                     if (sql[pos.*] == '(') {
-                         depth += 1;
-                     } else if (sql[pos.*] == ')') {
-                         depth -= 1;
+                if (lhs_col_name) |column| {
+                     // Subquery
+                     var clause = WhereClause{
+                         .op = if (is_not) .not_in_subquery else .in_subquery,
+                         .column = column,
+                         .subquery_start = pos.*,
+                     };
+                     // Find matching ')'
+                     var depth: usize = 1;
+                     const start_pos = pos.*;
+                     while (pos.* < sql.len and depth > 0) {
+                         if (sql[pos.*] == '(') {
+                             depth += 1;
+                         } else if (sql[pos.*] == ')') {
+                             depth -= 1;
+                         }
+                         pos.* += 1;
                      }
-                     pos.* += 1;
-                 }
-                 clause.subquery_len = if (pos.* > start_pos) pos.* - start_pos - 1 else 0;
-                 return clause;
+                     clause.subquery_len = if (pos.* > start_pos) pos.* - start_pos - 1 else 0;
+                     return clause;
+                }
+                return null;
             }
 
-            var clause = WhereClause{
-                .op = if (is_not) .not_in_list else .in_list,
-                .column = column,
-            };
-            // Parse value list
-            while (pos.* < sql.len and clause.in_values_count < 32) {
-                pos.* = skipWs(sql, pos.*);
-                if (sql[pos.*] == ')') {
-                    pos.* += 1;
-                    break;
-                }
-                
-                const prev_pos = pos.*;
-                if (sql[pos.*] == '\'') {
-                    // String literal
-                    pos.* += 1;
-                    const val_start = pos.*;
-                    while (pos.* < sql.len and sql[pos.*] != '\'') pos.* += 1;
-                    const val = sql[val_start..pos.*];
-                    if (pos.* < sql.len) pos.* += 1;
+            if (lhs_col_name) |column| {
+                var clause = WhereClause{
+                    .op = if (is_not) .not_in_list else .in_list,
+                    .column = column,
+                };
+                // Parse value list
+                while (pos.* < sql.len and clause.in_values_count < 32) {
+                    pos.* = skipWs(sql, pos.*);
+                    if (sql[pos.*] == ')') {
+                        pos.* += 1;
+                        break;
+                    }
                     
-                    if (clause.in_values_count < 32) {
-                        clause.in_values_str[clause.in_values_count] = val;
-                        clause.in_values_count += 1;
-                    }
-                } else {
-                    // Numeric literal
-                    const num_start = pos.*;
-                    if (sql[pos.*] == '-') pos.* += 1;
-                    while (pos.* < sql.len and (std.ascii.isDigit(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
-                    if (pos.* > num_start) {
-                        const num_str = sql[num_start..pos.*];
-                        if (std.mem.indexOf(u8, num_str, ".") != null) {
-                             // Fallback or handle floats in IN? Parser just has in_values_int for now.
-                             // For now convert to int or skip.
+                    const prev_pos = pos.*;
+                    if (sql[pos.*] == '\'') {
+                        // String literal
+                        pos.* += 1;
+                        const val_start = pos.*;
+                        while (pos.* < sql.len and sql[pos.*] != '\'') pos.* += 1;
+                        const val = sql[val_start..pos.*];
+                        if (pos.* < sql.len) pos.* += 1;
+                        
+                        if (clause.in_values_count < 32) {
+                            clause.in_values_str[clause.in_values_count] = val;
+                            clause.in_values_count += 1;
                         }
-                        if (std.fmt.parseInt(i64, num_str, 10)) |v| {
-                            if (clause.in_values_count < 32) {
-                                clause.in_values_int[clause.in_values_count] = v;
-                                clause.in_values_count += 1;
-                            }
-                        } else |_| {}
+                    } else {
+                        // Numeric literal
+                        const num_start = pos.*;
+                        if (sql[pos.*] == '-') pos.* += 1;
+                        while (pos.* < sql.len and (std.ascii.isDigit(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+                        if (pos.* > num_start) {
+                            const num_str = sql[num_start..pos.*];
+                            if (std.fmt.parseInt(i64, num_str, 10)) |v| {
+                                if (clause.in_values_count < 32) {
+                                    clause.in_values_int[clause.in_values_count] = v;
+                                    clause.in_values_count += 1;
+                                }
+                            } else |_| {}
+                        }
                     }
-                }
-                
-                if (pos.* == prev_pos) pos.* += 1; // Safety advance
+                    
+                    if (pos.* == prev_pos) pos.* += 1; // Safety advance
 
-                pos.* = skipWs(sql, pos.*);
-                if (pos.* < sql.len and sql[pos.*] == ',') pos.* += 1;
+                    pos.* = skipWs(sql, pos.*);
+                    if (pos.* < sql.len and sql[pos.*] == ',') pos.* += 1;
+                }
+                return clause;
             }
-            return clause;
+            return null;
         }
     }
 
@@ -8756,11 +9586,14 @@ fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
             while (pos.* < sql.len and sql[pos.*] != '\'') pos.* += 1;
             const pattern = sql[pat_start..pos.*];
             if (pos.* < sql.len) pos.* += 1; // skip closing quote
-            return WhereClause{
-                .op = if (is_not) .not_like else .like,
-                .column = column,
-                .value_str = pattern,
-            };
+            if (lhs_col_name) |column| {
+                return WhereClause{
+                    .op = if (is_not) .not_like else .like,
+                    .column = column,
+                    .value_str = pattern,
+                };
+            }
+            return null;
         }
     }
 
@@ -8803,14 +9636,17 @@ fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
             }
         }
         
-        return WhereClause{
-            .op = if (is_not) .not_between else .between,
-            .column = column,
-            .value_int = val_int_1,
-            .value_float = val_float_1,
-            .value_int_2 = val_int_2,
-            .value_float_2 = val_float_2,
-        };
+        if (lhs_col_name) |column| {
+            return WhereClause{
+                .op = if (is_not) .not_between else .between,
+                .column = column,
+                .value_int = val_int_1,
+                .value_float = val_float_1,
+                .value_int_2 = val_int_2,
+                .value_float_2 = val_float_2,
+            };
+        }
+        return null;
     }
 
     // Check for NEAR
@@ -8846,23 +9682,29 @@ fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
                 if (pos.* < sql.len and sql[pos.*] == ',') pos.* += 1;
             }
             
-            return WhereClause{
-                .op = .near,
-                .column = column,
-                .near_vector = vec,
-                .near_dim = dim,
-            };
+            if (lhs_col_name) |column| {
+                return WhereClause{
+                    .op = .near,
+                    .column = column,
+                    .near_vector = vec,
+                    .near_dim = dim,
+                };
+            }
+            return null;
         } else {
             // Check for NEAR <number> (row ID)
             const num_start = pos.*;
             while (pos.* < sql.len and std.ascii.isDigit(sql[pos.*])) pos.* += 1;
             if (pos.* > num_start) {
                 if (std.fmt.parseInt(u32, sql[num_start..pos.*], 10)) |row_id| {
-                    return WhereClause{
-                        .op = .near,
-                        .column = column,
-                        .near_target_row = row_id,
-                    };
+                    if (lhs_col_name) |column| {
+                        return WhereClause{
+                            .op = .near,
+                            .column = column,
+                            .near_target_row = row_id,
+                        };
+                    }
+                    return null;
                 } else |_| {}
             }
         }
@@ -8930,23 +9772,40 @@ fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
         const val_start = pos.*;
         while (pos.* < sql.len and (isIdent(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
         if (pos.* > val_start) {
-             const rhs_name = sql[val_start..pos.*];
-             return WhereClause{
-                 .op = op,
-                 .column = column,
-                 .arg_2_col = rhs_name,
-             };
+            const rhs_name = sql[val_start..pos.*];
+            if (lhs_col_name) |lc| {
+                 return WhereClause{
+                     .op = op,
+                     .column = lc,
+                     .arg_2_col = rhs_name,
+                 };
+            } else {
+                 // literal OP column -> column INV_OP literal
+                 return WhereClause{
+                     .op = invertOp(op),
+                     .column = rhs_name,
+                     .value_int = lhs_val_int,
+                     .value_float = lhs_val_float,
+                     .value_str = lhs_val_str,
+                 };
+            }
         }
     }
-
-
-    return WhereClause{
-        .op = op,
-        .column = column,
-        .value_int = value_int,
-        .value_float = value_float,
-        .value_str = value_str,
-    };
+    
+    if (lhs_col_name) |lc| {
+        return WhereClause{
+            .op = op,
+            .column = lc,
+            .value_int = value_int,
+            .value_float = value_float,
+            .value_str = value_str,
+        };
+    } else {
+        // Literal-literal
+        const res = evaluateLiteralComparison(lhs_val_int, lhs_val_float, lhs_val_str, op, value_int, value_float, value_str);
+        // setDebug("Literal comparison: lhs_int={?d}, lhs_str={?s}, op={}, rhs_int={?d}, rhs_str={?s} -> result={}", .{lhs_val_int, lhs_val_str, op, value_int, value_str, res});
+        return WhereClause{ .op = if (res) .always_true else .always_false };
+    }
 }
 
 fn parseGroupBy(sql: []const u8, start: usize, query: *ParsedQuery) usize {
@@ -8981,21 +9840,37 @@ fn parseGroupBy(sql: []const u8, start: usize, query: *ParsedQuery) usize {
 
 fn parseOrderBy(sql: []const u8, start: usize, query: *ParsedQuery) usize {
     var pos = start;
-    pos = skipWs(sql, pos);
-
-    const col_start = pos;
-    while (pos < sql.len and isIdent(sql[pos])) pos += 1;
-    if (pos > col_start) {
-        query.order_by_col = sql[col_start..pos];
+    
+    while (query.order_by_count < 4) {
+        pos = skipWs(sql, pos);
+        const col_start = pos;
+        while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+        if (pos <= col_start) break;
+        
+        query.order_by_cols[query.order_by_count] = sql[col_start..pos];
+        query.order_by_dirs[query.order_by_count] = .asc; // default
+        
+        pos = skipWs(sql, pos);
+        if (startsWithIC(sql[pos..], "DESC")) {
+            query.order_by_dirs[query.order_by_count] = .desc;
+            pos += 4;
+        } else if (startsWithIC(sql[pos..], "ASC")) {
+            pos += 3;
+        }
+        query.order_by_count += 1;
+        
+        pos = skipWs(sql, pos);
+        if (pos >= sql.len or sql[pos] != ',') break;
+        pos += 1; // skip comma
     }
 
     pos = skipWs(sql, pos);
-    if (startsWithIC(sql[pos..], "DESC")) {
-        query.order_dir = .desc;
-        pos += 4;
-    } else if (startsWithIC(sql[pos..], "ASC")) {
-        query.order_dir = .asc;
-        pos += 3;
+    if (startsWithIC(sql[pos..], "NULLS FIRST")) {
+        query.order_nulls_first = true;
+        pos += 11;
+    } else if (startsWithIC(sql[pos..], "NULLS LAST")) {
+        query.order_nulls_last = true;
+        pos += 10;
     }
 
     return pos;
@@ -9029,6 +9904,17 @@ fn eqlIgnoreCase(a: []const u8, b: []const u8) bool {
         if (std.ascii.toLower(c1) != std.ascii.toLower(c2)) return false;
     }
     return true;
+}
+
+fn isKeywordAtPos(sql: []const u8, pos: usize, keyword: []const u8) bool {
+    // Check if keyword matches at position, followed by non-identifier char or end of string
+    if (pos + keyword.len > sql.len) return false;
+    if (!startsWithIC(sql[pos..], keyword)) return false;
+    // Check that keyword ends at word boundary (space, tab, end of string, or non-ident char)
+    const end_pos = pos + keyword.len;
+    if (end_pos >= sql.len) return true;  // Keyword at end of string
+    const next_char = sql[end_pos];
+    return !isIdent(next_char);  // True if followed by non-identifier char
 }
 
 fn allocResultBuffer(size: usize) ?[]u8 {
