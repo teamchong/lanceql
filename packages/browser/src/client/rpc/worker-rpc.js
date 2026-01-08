@@ -313,7 +313,7 @@ function handleWorkerMessage(data, port, resolveReady) {
                     for (const col of columns) {
                         const colVal = colData[col];
                         if (colVal && colVal._arrowString) {
-                            const { offsets, bytes, isList } = colVal;
+                            const { offsets, bytes, isList, nullable } = colVal;
                             if (isList) console.log(`[WorkerRPC] Column ${col} is list mode`);
                             const decoder = new TextDecoder();
                             const items = new Array(rowCount);
@@ -327,6 +327,11 @@ function handleWorkerMessage(data, port, resolveReady) {
                                             for (let j = 0; j < rowCount; j++) {
                                                 const start = offsets[j];
                                                 const end = offsets[j + 1];
+                                                // Empty strings in nullable columns are NULL
+                                                if (nullable && start === end) {
+                                                    target[j] = null;
+                                                    continue;
+                                                }
                                                 const s = decoder.decode(bytes.subarray(start, end));
                                                 try {
                                                     target[j] = isList ? JSON.parse(s) : s;
@@ -343,6 +348,11 @@ function handleWorkerMessage(data, port, resolveReady) {
                                             for (let j = 0; j < rowCount; j++) {
                                                 const start = offsets[j];
                                                 const end = offsets[j + 1];
+                                                // Empty strings in nullable columns are NULL
+                                                if (nullable && start === end) {
+                                                    target[j] = null;
+                                                    continue;
+                                                }
                                                 const s = decoder.decode(bytes.subarray(start, end));
                                                 try {
                                                     target[j] = isList ? JSON.parse(s) : s;

@@ -587,7 +587,8 @@ export class WasmSqlExecutor {
                 // Offsets start after data bytes
                 const offsets = new Uint32Array(buffer, absDataOffset + dataBytesLen, rowCount + 1).slice();
 
-                colData[colName] = { _arrowString: true, offsets, bytes, isList: typeStr === 'list' };
+                // If column is nullable, mark empty strings as null by setting nullable flag
+                colData[colName] = { _arrowString: true, offsets, bytes, isList: typeStr === 'list', nullable: nullable === 1 };
             }
         }
 

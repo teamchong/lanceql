@@ -356,6 +356,10 @@ pub const ParsedQuery = struct {
     group_by_cols: [MAX_GROUP_COLS][]const u8 = undefined,
     group_by_count: usize = 0,
     group_by_top_k: ?u32 = null,
+    // ROLLUP/CUBE/GROUPING SETS
+    grouping_type: enum { none, rollup, cube, grouping_sets } = .none,
+    grouping_sets_count: usize = 0,  // Number of explicit grouping sets
+    grouping_sets: [8][MAX_GROUP_COLS]bool = undefined,  // Which columns are included in each set
     order_by_cols: [4][]const u8 = undefined,
     order_by_dirs: [4]OrderDir = undefined,
     order_by_count: usize = 0,
@@ -384,6 +388,13 @@ pub const ParsedQuery = struct {
     pivot_col: []const u8 = "",
     pivot_values: [8][]const u8 = undefined,
     pivot_value_count: usize = 0,
+
+    // UNPIVOT support
+    has_unpivot: bool = false,
+    unpivot_value_col: []const u8 = "",  // New column for values
+    unpivot_name_col: []const u8 = "",   // New column for column names
+    unpivot_cols: [16][]const u8 = undefined,  // Columns to unpivot
+    unpivot_col_count: usize = 0,
 };
 
 // Global state
@@ -436,15 +447,16 @@ pub export fn setCurrentTimestamp(ms: i64) void {
     }
     const day: u32 = @intCast(days + 1);
 
-    // Format ISO string
+    // Format ISO string (cast year to u32 to avoid + sign prefix)
+    const year_u: u32 = @intCast(year);
     if (std.fmt.bufPrint(&current_timestamp_str, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
-        year, month, day, hour, min, sec, @as(u32, @intCast(millis))
+        year_u, month, day, hour, min, sec, @as(u32, @intCast(millis))
     })) |s| {
         current_timestamp_str_len = s.len;
     } else |_| {}
 
     // Format date string
-    if (std.fmt.bufPrint(&current_date_str, "{d:0>4}-{d:0>2}-{d:0>2}", .{ year, month, day })) |s| {
+    if (std.fmt.bufPrint(&current_date_str, "{d:0>4}-{d:0>2}-{d:0>2}", .{ year_u, month, day })) |s| {
         current_date_str_len = s.len;
     } else |_| {}
 }
@@ -4767,6 +4779,7 @@ pub export fn executeSql() u32 {
             return 0;
         };
     } else if (query.agg_count > 0 or query.group_by_count > 0) {
+        setDebug("SELECT routing to aggregate: agg_count={d}, gb_count={d}", .{query.agg_count, query.group_by_count});
         executeAggregateQuery(tbl, query) catch |err| {
             log("{s}", .{@errorName(err)});
             return 0;
@@ -5381,6 +5394,12 @@ fn executeSelectQuery(table: *const TableInfo, query: *ParsedQuery) !void {
         return;
     }
 
+    // Handle UNPIVOT if present
+    if (query.has_unpivot) {
+        try executeUnpivotQuery(table, query, match_indices[start..end], final_count);
+        return;
+    }
+
     // Write result
     // Must pass query to handle expressions
     try writeSelectResult(table, query, match_indices[start..end], final_count);
@@ -5513,6 +5532,209 @@ fn executePivotQuery(table: *const TableInfo, query: *const ParsedQuery, row_ind
         }
 
         _ = lw.fragmentAddFloat64Column(pivot_val.ptr, pivot_val.len, col_data.ptr, group_count, false);
+    }
+
+    // Finalize
+    const final_size = lw.fragmentEnd();
+    if (final_size == 0) return error.WriteFailed;
+    if (lw.writerGetBuffer()) |buf| {
+        result_buffer = buf[0..final_size];
+        result_size = final_size;
+    }
+}
+
+/// Execute an UNPIVOT transformation query (columns to rows)
+fn executeUnpivotQuery(table: *const TableInfo, query: *const ParsedQuery, row_indices: []const u32, row_count: usize) !void {
+    setDebug("UNPIVOT: value_col={s}, name_col={s}, cols={d}", .{query.unpivot_value_col, query.unpivot_name_col, query.unpivot_col_count});
+
+    if (query.unpivot_col_count == 0) return error.InvalidQuery;
+
+    // Find the columns to unpivot
+    var unpivot_col_data: [16]*const ColumnData = undefined;
+    for (query.unpivot_cols[0..query.unpivot_col_count], 0..) |col_name, i| {
+        unpivot_col_data[i] = findTableColumn(table, col_name) orelse return error.ColumnNotFound;
+    }
+
+    // Find preserved columns (columns from SELECT that are not in unpivot list)
+    var preserved_cols: [16]*const ColumnData = undefined;
+    var preserved_count: usize = 0;
+    for (query.select_exprs[0..query.select_count]) |expr| {
+        if (expr.col_name.len > 0) {
+            var is_unpivot_col = false;
+            for (query.unpivot_cols[0..query.unpivot_col_count]) |uc| {
+                if (std.mem.eql(u8, expr.col_name, uc)) {
+                    is_unpivot_col = true;
+                    break;
+                }
+            }
+            if (!is_unpivot_col) {
+                if (findTableColumn(table, expr.col_name)) |col| {
+                    preserved_cols[preserved_count] = col;
+                    preserved_count += 1;
+                }
+            }
+        }
+    }
+
+    // Calculate output rows: for each input row, create one output row per unpivot column
+    // But skip NULL values
+    var output_row_count: usize = 0;
+    var ctx: ?FragmentContext = null;
+
+    // First pass: count non-null values
+    for (row_indices[0..row_count]) |idx| {
+        for (0..query.unpivot_col_count) |ci| {
+            const col = unpivot_col_data[ci];
+            const val = getFloatValueOptimized(table, col, idx, &ctx);
+            if (!std.math.isNan(val)) {
+                output_row_count += 1;
+            }
+        }
+    }
+
+    if (output_row_count == 0) {
+        // Return empty result
+        const capacity: usize = 4096;
+        if (lw.fragmentBegin(capacity) == 0) return error.OutOfMemory;
+        const final_size = lw.fragmentEnd();
+        if (lw.writerGetBuffer()) |buf| {
+            result_buffer = buf[0..final_size];
+            result_size = final_size;
+        }
+        return;
+    }
+
+    // Initialize fragment writer
+    const capacity = output_row_count * (preserved_count + 2) * 64 + 4096;
+    if (lw.fragmentBegin(capacity) == 0) return error.OutOfMemory;
+
+    // Build output data
+    // Columns: preserved columns + name_col + value_col
+
+    // Write preserved columns (each value repeated for each unpivot column)
+    for (preserved_cols[0..preserved_count]) |col| {
+        const col_type = col.col_type;
+        if (col_type == .string) {
+            const offsets = try memory.wasm_allocator.alloc(u32, output_row_count + 1);
+            defer memory.wasm_allocator.free(offsets);
+            var total_len: usize = 0;
+
+            // First pass: calculate offsets
+            offsets[0] = 0;
+            var out_idx: usize = 0;
+            ctx = null;
+            for (row_indices[0..row_count]) |idx| {
+                const str_val = getStringValueOptimized(table, col, idx, &ctx);
+                for (0..query.unpivot_col_count) |ci| {
+                    const ucol = unpivot_col_data[ci];
+                    const val = getFloatValueOptimized(table, ucol, idx, &ctx);
+                    if (!std.math.isNan(val)) {
+                        total_len += str_val.len;
+                        out_idx += 1;
+                        offsets[out_idx] = @intCast(total_len);
+                    }
+                }
+            }
+
+            // Second pass: copy data
+            const data = try memory.wasm_allocator.alloc(u8, total_len);
+            defer memory.wasm_allocator.free(data);
+            var offset: usize = 0;
+            ctx = null;
+            for (row_indices[0..row_count]) |idx| {
+                const str_val = getStringValueOptimized(table, col, idx, &ctx);
+                for (0..query.unpivot_col_count) |ci| {
+                    const ucol = unpivot_col_data[ci];
+                    const val = getFloatValueOptimized(table, ucol, idx, &ctx);
+                    if (!std.math.isNan(val)) {
+                        @memcpy(data[offset .. offset + str_val.len], str_val);
+                        offset += str_val.len;
+                    }
+                }
+            }
+
+            _ = lw.fragmentAddStringColumn(col.name.ptr, col.name.len, data.ptr, total_len, offsets.ptr, output_row_count, false);
+        } else {
+            // Numeric column
+            const col_data = try memory.wasm_allocator.alloc(f64, output_row_count);
+            defer memory.wasm_allocator.free(col_data);
+            var out_idx: usize = 0;
+            ctx = null;
+            for (row_indices[0..row_count]) |idx| {
+                const num_val = getFloatValueOptimized(table, col, idx, &ctx);
+                for (0..query.unpivot_col_count) |ci| {
+                    const ucol = unpivot_col_data[ci];
+                    const val = getFloatValueOptimized(table, ucol, idx, &ctx);
+                    if (!std.math.isNan(val)) {
+                        col_data[out_idx] = num_val;
+                        out_idx += 1;
+                    }
+                }
+            }
+            _ = lw.fragmentAddFloat64Column(col.name.ptr, col.name.len, col_data.ptr, output_row_count, false);
+        }
+    }
+
+    // Write name column (column names as values)
+    {
+        const offsets = try memory.wasm_allocator.alloc(u32, output_row_count + 1);
+        defer memory.wasm_allocator.free(offsets);
+        var total_len: usize = 0;
+
+        // Calculate offsets
+        offsets[0] = 0;
+        var out_idx: usize = 0;
+        ctx = null;
+        for (row_indices[0..row_count]) |idx| {
+            for (0..query.unpivot_col_count) |ci| {
+                const ucol = unpivot_col_data[ci];
+                const val = getFloatValueOptimized(table, ucol, idx, &ctx);
+                if (!std.math.isNan(val)) {
+                    const col_name = query.unpivot_cols[ci];
+                    total_len += col_name.len;
+                    out_idx += 1;
+                    offsets[out_idx] = @intCast(total_len);
+                }
+            }
+        }
+
+        // Copy data
+        const data = try memory.wasm_allocator.alloc(u8, total_len);
+        defer memory.wasm_allocator.free(data);
+        var offset: usize = 0;
+        ctx = null;
+        for (row_indices[0..row_count]) |idx| {
+            for (0..query.unpivot_col_count) |ci| {
+                const ucol = unpivot_col_data[ci];
+                const val = getFloatValueOptimized(table, ucol, idx, &ctx);
+                if (!std.math.isNan(val)) {
+                    const col_name = query.unpivot_cols[ci];
+                    @memcpy(data[offset .. offset + col_name.len], col_name);
+                    offset += col_name.len;
+                }
+            }
+        }
+
+        _ = lw.fragmentAddStringColumn(query.unpivot_name_col.ptr, query.unpivot_name_col.len, data.ptr, total_len, offsets.ptr, output_row_count, false);
+    }
+
+    // Write value column (actual values from unpivoted columns)
+    {
+        const col_data = try memory.wasm_allocator.alloc(f64, output_row_count);
+        defer memory.wasm_allocator.free(col_data);
+        var out_idx: usize = 0;
+        ctx = null;
+        for (row_indices[0..row_count]) |idx| {
+            for (0..query.unpivot_col_count) |ci| {
+                const ucol = unpivot_col_data[ci];
+                const val = getFloatValueOptimized(table, ucol, idx, &ctx);
+                if (!std.math.isNan(val)) {
+                    col_data[out_idx] = val;
+                    out_idx += 1;
+                }
+            }
+        }
+        _ = lw.fragmentAddFloat64Column(query.unpivot_value_col.ptr, query.unpivot_value_col.len, col_data.ptr, output_row_count, false);
     }
 
     // Finalize
@@ -6683,7 +6905,12 @@ fn executeAggregateQuery(table: *const TableInfo, query: *const ParsedQuery) !vo
     // OPTIMIZATION: If no filter, skip index building pass
     if (query.where_clause == null) {
         if (query.group_by_count > 0) {
-            try executeGroupByQuery(table, query, null);
+            // Check for ROLLUP/CUBE/GROUPING SETS
+            if (query.grouping_type != .none) {
+                try executeMultiDimAggQuery(table, query, null);
+            } else {
+                try executeGroupByQuery(table, query, null);
+            }
         } else {
             try executeSimpleAggQuery(table, query, null);
         }
@@ -6790,9 +7017,15 @@ fn executeAggregateQuery(table: *const TableInfo, query: *const ParsedQuery) !vo
         }
     }
 
+    setDebug("executeAggregateQuery: gb_count={d}, agg_count={d}, grouping_type={any}", .{query.group_by_count, query.agg_count, query.grouping_type});
     if (query.group_by_count > 0) {
-        // GROUP BY aggregation
-        try executeGroupByQuery(table, query, match_indices[0..match_count]);
+        // Check for ROLLUP/CUBE/GROUPING SETS
+        if (query.grouping_type != .none) {
+            try executeMultiDimAggQuery(table, query, match_indices[0..match_count]);
+        } else {
+            // Regular GROUP BY aggregation
+            try executeGroupByQuery(table, query, match_indices[0..match_count]);
+        }
     } else {
         // Simple aggregation (no GROUP BY)
         try executeSimpleAggQuery(table, query, match_indices[0..match_count]);
@@ -7326,6 +7559,260 @@ fn executeSimpleAggQuery(table: *const TableInfo, query: *const ParsedQuery, may
     if (lw.writerGetBuffer()) |buf| {
         result_buffer = buf[0..res];
         result_size = res;
+    }
+}
+
+/// Execute ROLLUP/CUBE/GROUPING SETS aggregation
+fn executeMultiDimAggQuery(table: *const TableInfo, query: *const ParsedQuery, maybe_indices: ?[]const u32) !void {
+    const num_cols = query.group_by_count;
+    const num_aggs = query.agg_count;
+    setDebug("executeMultiDimAggQuery: cols={d}, aggs={d}, type={any}", .{num_cols, num_aggs, query.grouping_type});
+    if (num_cols == 0 or num_cols > 8) return error.UnsupportedGroupBy;
+
+    // Find group columns
+    var group_cols: [8]*const ColumnData = undefined;
+    for (query.group_by_cols[0..num_cols], 0..) |col_name, i| {
+        group_cols[i] = findTableColumn(table, col_name) orelse return error.ColumnNotFound;
+    }
+
+    // Generate grouping sets based on type
+    const MAX_SETS: usize = 64;
+    var grouping_sets: [MAX_SETS][8]bool = undefined;
+    var num_sets: usize = 0;
+
+    switch (query.grouping_type) {
+        .rollup => {
+            // ROLLUP(a,b) = (a,b), (a,NULL), (NULL,NULL)
+            // Start with all columns, then progressively drop from right
+            for (0..num_cols + 1) |drop| {
+                const keep = num_cols - drop;
+                for (&grouping_sets[num_sets]) |*v| v.* = false;
+                for (0..keep) |i| {
+                    grouping_sets[num_sets][i] = true;
+                }
+                num_sets += 1;
+            }
+        },
+        .cube => {
+            // CUBE(a,b) = all 2^n combinations
+            const combos: usize = @as(usize, 1) << @intCast(num_cols);
+            for (0..combos) |mask| {
+                for (&grouping_sets[num_sets]) |*v| v.* = false;
+                for (0..num_cols) |i| {
+                    if ((mask >> @intCast(i)) & 1 == 1) {
+                        grouping_sets[num_sets][i] = true;
+                    }
+                }
+                num_sets += 1;
+            }
+        },
+        .grouping_sets => {
+            // Use explicit grouping sets from query
+            for (0..query.grouping_sets_count) |si| {
+                for (0..8) |ci| {
+                    grouping_sets[num_sets][ci] = query.grouping_sets[si][ci];
+                }
+                num_sets += 1;
+            }
+        },
+        .none => return error.InvalidQuery,
+    }
+
+    // Build composite groups: (grouping_set_idx, col_values...) -> row_indices
+    // Use smaller buffer to avoid stack overflow
+    const MAX_OUT_ROWS: usize = 256;
+    var out_rows: usize = 0;
+
+    // Use heap allocation for output buffers to avoid stack overflow
+    const out_col_vals_flat = try memory.wasm_allocator.alloc([]const u8, 8 * MAX_OUT_ROWS);
+    defer memory.wasm_allocator.free(out_col_vals_flat);
+    const out_col_is_null_flat = try memory.wasm_allocator.alloc(bool, 8 * MAX_OUT_ROWS);
+    defer memory.wasm_allocator.free(out_col_is_null_flat);
+    const out_agg_vals_flat = try memory.wasm_allocator.alloc(f64, MAX_AGGREGATES * MAX_OUT_ROWS);
+    defer memory.wasm_allocator.free(out_agg_vals_flat);
+
+    const indices = maybe_indices orelse blk: {
+        // Build full index array
+        const full = &global_indices_1;
+        for (0..table.row_count) |i| {
+            full[i] = @intCast(i);
+        }
+        break :blk full[0..table.row_count];
+    };
+
+    // For each grouping set
+    const MAX_GROUPS: usize = 256;
+    const MAX_ROWS_PER_GROUP: usize = 8192;  // Limit rows per group to save memory
+
+    for (grouping_sets[0..num_sets]) |gset| {
+        // Build groups for this set (using simpler approach - just store first/count)
+        var group_keys: [MAX_GROUPS][8][]const u8 = undefined;
+        var group_counts: [MAX_GROUPS]usize = [_]usize{0} ** MAX_GROUPS;
+        var num_groups: usize = 0;
+
+        var ctx: ?FragmentContext = null;
+
+        // First pass: identify unique groups
+        for (indices) |idx| {
+            // Build key for this row
+            var row_key: [8][]const u8 = undefined;
+            for (0..num_cols) |ci| {
+                if (gset[ci]) {
+                    row_key[ci] = getStringValueOptimized(table, group_cols[ci], idx, &ctx);
+                } else {
+                    row_key[ci] = "";  // NULL marker
+                }
+            }
+
+            // Find or add group
+            var found = false;
+            for (0..num_groups) |gi| {
+                var match = true;
+                for (0..num_cols) |ci| {
+                    if (!std.mem.eql(u8, group_keys[gi][ci], row_key[ci])) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    group_counts[gi] += 1;
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found and num_groups < MAX_GROUPS) {
+                for (0..num_cols) |ci| {
+                    group_keys[num_groups][ci] = row_key[ci];
+                }
+                group_counts[num_groups] = 1;
+                num_groups += 1;
+            }
+        }
+
+        // For each group, compute aggregates
+        for (0..num_groups) |gi| {
+            if (out_rows >= MAX_OUT_ROWS) break;
+
+            // Store column values with NULL markers
+            for (0..num_cols) |ci| {
+                out_col_is_null_flat[ci * MAX_OUT_ROWS + out_rows] = !gset[ci];
+                out_col_vals_flat[ci * MAX_OUT_ROWS + out_rows] = group_keys[gi][ci];
+            }
+
+            // Collect indices for this group (re-scan)
+            const group_indices_buf = &global_group_indices;
+            var group_idx_count: usize = 0;
+            ctx = null;
+
+            for (indices) |idx| {
+                var row_key: [8][]const u8 = undefined;
+                for (0..num_cols) |ci| {
+                    if (gset[ci]) {
+                        row_key[ci] = getStringValueOptimized(table, group_cols[ci], idx, &ctx);
+                    } else {
+                        row_key[ci] = "";
+                    }
+                }
+
+                var match = true;
+                for (0..num_cols) |ci| {
+                    if (!std.mem.eql(u8, group_keys[gi][ci], row_key[ci])) {
+                        match = false;
+                        break;
+                    }
+                }
+
+                if (match and group_idx_count < MAX_ROWS_PER_GROUP) {
+                    group_indices_buf[group_idx_count] = idx;
+                    group_idx_count += 1;
+                }
+            }
+
+            // Compute aggregates
+            var agg_results: [MAX_AGGREGATES]f64 = undefined;
+            try executeMultiAggregate(table, query.aggregates[0..num_aggs], group_indices_buf[0..group_idx_count], agg_results[0..num_aggs]);
+            for (0..num_aggs) |ai| {
+                out_agg_vals_flat[ai * MAX_OUT_ROWS + out_rows] = agg_results[ai];
+            }
+
+            out_rows += 1;
+        }
+    }
+
+    // Write output
+    if (lw.fragmentBegin(65536 + out_rows * 32 * (num_cols + num_aggs)) == 0) return error.OutOfMemory;
+
+    // Write group columns (with NULL handling)
+    for (0..num_cols) |ci| {
+        const col_name = query.group_by_cols[ci];
+        const col_type = group_cols[ci].col_type;
+
+        if (col_type == .string or col_type == .list) {
+            // String column - calculate total length
+            var total_len: usize = 0;
+            for (0..out_rows) |ri| {
+                if (!out_col_is_null_flat[ci * MAX_OUT_ROWS + ri]) {
+                    total_len += out_col_vals_flat[ci * MAX_OUT_ROWS + ri].len;
+                }
+            }
+
+            const str_data = try memory.wasm_allocator.alloc(u8, total_len + out_rows);
+            defer memory.wasm_allocator.free(str_data);
+            const offsets = try memory.wasm_allocator.alloc(u32, out_rows + 1);
+            defer memory.wasm_allocator.free(offsets);
+
+            var pos: usize = 0;
+            offsets[0] = 0;
+            for (0..out_rows) |ri| {
+                if (out_col_is_null_flat[ci * MAX_OUT_ROWS + ri]) {
+                    // NULL - empty string
+                } else {
+                    const s = out_col_vals_flat[ci * MAX_OUT_ROWS + ri];
+                    @memcpy(str_data[pos..][0..s.len], s);
+                    pos += s.len;
+                }
+                offsets[ri + 1] = @intCast(pos);
+            }
+
+            _ = lw.fragmentAddStringColumn(col_name.ptr, col_name.len, str_data.ptr, pos, offsets.ptr, out_rows, true);
+        } else {
+            // Numeric column - use NaN for NULL
+            const col_data = try memory.wasm_allocator.alloc(f64, out_rows);
+            defer memory.wasm_allocator.free(col_data);
+
+            for (0..out_rows) |ri| {
+                if (out_col_is_null_flat[ci * MAX_OUT_ROWS + ri]) {
+                    col_data[ri] = std.math.nan(f64);
+                } else {
+                    // Try to parse as number
+                    col_data[ri] = std.fmt.parseFloat(f64, out_col_vals_flat[ci * MAX_OUT_ROWS + ri]) catch 0;
+                }
+            }
+
+            _ = lw.fragmentAddFloat64Column(col_name.ptr, col_name.len, col_data.ptr, out_rows, false);
+        }
+    }
+
+    // Write aggregate columns
+    for (query.aggregates[0..num_aggs], 0..) |agg, ai| {
+        var name_buf: [64]u8 = undefined;
+        const name = if (agg.alias) |alias| alias else std.fmt.bufPrint(&name_buf, "agg_{d}", .{ai}) catch "agg";
+
+        const col_data = try memory.wasm_allocator.alloc(f64, out_rows);
+        defer memory.wasm_allocator.free(col_data);
+        for (0..out_rows) |ri| {
+            col_data[ri] = out_agg_vals_flat[ai * MAX_OUT_ROWS + ri];
+        }
+
+        _ = lw.fragmentAddFloat64Column(name.ptr, name.len, col_data.ptr, out_rows, false);
+    }
+
+    const final_size = lw.fragmentEnd();
+    if (final_size == 0) return error.WriteFailed;
+    if (lw.writerGetBuffer()) |buf| {
+        result_buffer = buf[0..final_size];
+        result_size = final_size;
     }
 }
 
@@ -12075,6 +12562,65 @@ pub fn parseSql(sql: []const u8) ?*ParsedQuery {
         pos = skipWs(sql, pos);
     }
 
+    // Check for UNPIVOT clause: UNPIVOT (value_col FOR name_col IN (col1, col2, ...))
+    if (startsWithIC(sql[pos..], "UNPIVOT")) {
+        pos += 7;
+        pos = skipWs(sql, pos);
+        if (pos < sql.len and sql[pos] == '(') {
+            pos += 1;
+            pos = skipWs(sql, pos);
+
+            // Parse value column name
+            const value_col_start = pos;
+            while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+            query.unpivot_value_col = sql[value_col_start..pos];
+            pos = skipWs(sql, pos);
+
+            // Parse FOR name_col IN (...)
+            if (startsWithIC(sql[pos..], "FOR")) {
+                pos += 3;
+                pos = skipWs(sql, pos);
+                const name_col_start = pos;
+                while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+                query.unpivot_name_col = sql[name_col_start..pos];
+                pos = skipWs(sql, pos);
+
+                if (startsWithIC(sql[pos..], "IN")) {
+                    pos += 2;
+                    pos = skipWs(sql, pos);
+                    if (pos < sql.len and sql[pos] == '(') {
+                        pos += 1;
+                        pos = skipWs(sql, pos);
+
+                        // Parse column names: col1, col2, col3
+                        while (pos < sql.len and sql[pos] != ')' and query.unpivot_col_count < 16) {
+                            pos = skipWs(sql, pos);
+                            const col_start = pos;
+                            while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+                            if (pos > col_start) {
+                                query.unpivot_cols[query.unpivot_col_count] = sql[col_start..pos];
+                                query.unpivot_col_count += 1;
+                            }
+                            pos = skipWs(sql, pos);
+                            if (pos < sql.len and sql[pos] == ',') pos += 1;
+                        }
+                        if (pos < sql.len and sql[pos] == ')') pos += 1;
+                    }
+                }
+            }
+
+            // Skip closing paren of UNPIVOT()
+            pos = skipWs(sql, pos);
+            if (pos < sql.len and sql[pos] == ')') pos += 1;
+
+            query.has_unpivot = true;
+            setDebug("UNPIVOT parsed: value_col={s}, name_col={s}, cols={d}", .{
+                query.unpivot_value_col, query.unpivot_name_col, query.unpivot_col_count
+            });
+        }
+        pos = skipWs(sql, pos);
+    }
+
     while (query.join_count < MAX_JOINS) {
 
         pos = skipWs(sql, pos);
@@ -14086,6 +14632,91 @@ fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
 
 fn parseGroupBy(sql: []const u8, start: usize, query: *ParsedQuery) usize {
     var pos = start;
+
+    // Check for ROLLUP, CUBE, or GROUPING SETS
+    if (startsWithIC(sql[pos..], "ROLLUP")) {
+        pos += 6;
+        pos = skipWs(sql, pos);
+        query.grouping_type = .rollup;
+        if (pos < sql.len and sql[pos] == '(') {
+            pos += 1;
+            pos = parseGroupByColumnList(sql, pos, query);
+            if (pos < sql.len and sql[pos] == ')') pos += 1;
+        }
+        return pos;
+    }
+
+    if (startsWithIC(sql[pos..], "CUBE")) {
+        pos += 4;
+        pos = skipWs(sql, pos);
+        query.grouping_type = .cube;
+        if (pos < sql.len and sql[pos] == '(') {
+            pos += 1;
+            pos = parseGroupByColumnList(sql, pos, query);
+            if (pos < sql.len and sql[pos] == ')') pos += 1;
+        }
+        return pos;
+    }
+
+    if (startsWithIC(sql[pos..], "GROUPING SETS") or startsWithIC(sql[pos..], "GROUPING")) {
+        if (startsWithIC(sql[pos..], "GROUPING SETS")) {
+            pos += 13;
+        } else if (startsWithIC(sql[pos..], "GROUPING")) {
+            pos += 8;
+            pos = skipWs(sql, pos);
+            if (startsWithIC(sql[pos..], "SETS")) {
+                pos += 4;
+            }
+        }
+        pos = skipWs(sql, pos);
+        query.grouping_type = .grouping_sets;
+        if (pos < sql.len and sql[pos] == '(') {
+            pos += 1;
+            pos = skipWs(sql, pos);
+            // Parse sets: ((col1, col2), (col1), ())
+            while (pos < sql.len and sql[pos] != ')' and query.grouping_sets_count < 8) {
+                pos = skipWs(sql, pos);
+                if (sql[pos] == '(') {
+                    pos += 1;
+                    // Parse columns in this set
+                    for (&query.grouping_sets[query.grouping_sets_count]) |*flag| flag.* = false;
+                    pos = skipWs(sql, pos);
+                    while (pos < sql.len and sql[pos] != ')') {
+                        pos = skipWs(sql, pos);
+                        const col_start = pos;
+                        while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+                        if (pos > col_start) {
+                            const col_name = sql[col_start..pos];
+                            // Find or add column
+                            var found = false;
+                            for (query.group_by_cols[0..query.group_by_count], 0..) |gc, ci| {
+                                if (std.mem.eql(u8, gc, col_name)) {
+                                    query.grouping_sets[query.grouping_sets_count][ci] = true;
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (!found and query.group_by_count < MAX_GROUP_COLS) {
+                                query.group_by_cols[query.group_by_count] = col_name;
+                                query.grouping_sets[query.grouping_sets_count][query.group_by_count] = true;
+                                query.group_by_count += 1;
+                            }
+                        }
+                        pos = skipWs(sql, pos);
+                        if (pos < sql.len and sql[pos] == ',') pos += 1;
+                    }
+                    if (pos < sql.len and sql[pos] == ')') pos += 1;
+                    query.grouping_sets_count += 1;
+                }
+                pos = skipWs(sql, pos);
+                if (pos < sql.len and sql[pos] == ',') pos += 1;
+            }
+            if (pos < sql.len and sql[pos] == ')') pos += 1;
+        }
+        return pos;
+    }
+
+    // Regular GROUP BY columns
     while (pos < sql.len and query.group_by_count < MAX_GROUP_COLS) {
         pos = skipWs(sql, pos);
         const col_start = pos;
@@ -14110,7 +14741,25 @@ fn parseGroupBy(sql: []const u8, start: usize, query: *ParsedQuery) usize {
         }
         pos = skipWs(sql, pos);
     }
-    
+
+    return pos;
+}
+
+fn parseGroupByColumnList(sql: []const u8, start: usize, query: *ParsedQuery) usize {
+    var pos = start;
+    while (pos < sql.len and query.group_by_count < MAX_GROUP_COLS) {
+        pos = skipWs(sql, pos);
+        if (sql[pos] == ')') break;
+        const col_start = pos;
+        while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+        if (pos > col_start) {
+            query.group_by_cols[query.group_by_count] = sql[col_start..pos];
+            query.group_by_count += 1;
+        }
+        pos = skipWs(sql, pos);
+        if (pos >= sql.len or sql[pos] != ',') break;
+        pos += 1;
+    }
     return pos;
 }
 
