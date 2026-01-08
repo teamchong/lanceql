@@ -366,6 +366,17 @@ export class WasmSqlExecutor {
 
         const memory = getWasmMemory();
 
+        // Set current timestamp for NOW(), CURRENT_DATE() functions
+        // Note: WASM i64 accepts BigInt in modern browsers
+        if (wasm.setCurrentTimestamp) {
+            try {
+                wasm.setCurrentTimestamp(BigInt(Date.now()));
+            } catch (e) {
+                // Fallback for environments that don't support BigInt with WASM
+                console.warn('setCurrentTimestamp failed:', e);
+            }
+        }
+
         // Get SQL input buffer from WASM
         const sqlInputPtr = wasm.getSqlInputBuffer();
         const sqlInputSize = wasm.getSqlInputBufferSize();

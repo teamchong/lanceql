@@ -190,13 +190,13 @@ pub const ScalarFunc = enum {
     // JSON functions
     json_extract, json_array_length, json_object, json_array,
     // UUID functions
-    uuid, uuid_string,
+    uuid, uuid_string, gen_random_uuid, is_uuid,
     // Bitwise operations
     bit_and, bit_or, bit_xor, bit_not, lshift, rshift,
     // REGEXP functions
     regexp_match, regexp_replace, regexp_extract,
     // Date/Time
-    extract, date_part,
+    extract, date_part, now, current_date, current_timestamp, date, year, month, day, hour, minute, second, strftime,
     // Additional Math
     pi, log, ln, exp, sin, cos, tan, asin, acos, atan, degrees, radians, random, truncate,
 };
@@ -336,6 +336,61 @@ var result_size: usize = 0;
 export var sql_input: [131072]u8 = undefined;
 export var sql_input_len: usize = 0;
 
+// Current timestamp (set by JavaScript)
+var current_timestamp_ms: i64 = 0;
+var current_timestamp_str: [64]u8 = [_]u8{'0'} ** 64;  // Initialize with zeros
+var current_timestamp_str_len: usize = 0;
+var current_date_str: [16]u8 = [_]u8{'0'} ** 16;
+var current_date_str_len: usize = 0;
+
+pub export fn setCurrentTimestamp(ms: i64) void {
+    current_timestamp_ms = ms;
+    // Convert ms to ISO string: YYYY-MM-DDTHH:MM:SS.sssZ
+    // Simple calculation (approximate, doesn't handle leap seconds)
+    const secs_since_epoch = @divFloor(ms, 1000);
+    const millis = @mod(ms, 1000);
+
+    // Days since epoch
+    var days = @divFloor(secs_since_epoch, 86400);
+    var secs_in_day = @mod(secs_since_epoch, 86400);
+
+    const hour: u32 = @intCast(@divFloor(secs_in_day, 3600));
+    secs_in_day = @mod(secs_in_day, 3600);
+    const min: u32 = @intCast(@divFloor(secs_in_day, 60));
+    const sec: u32 = @intCast(@mod(secs_in_day, 60));
+
+    // Calculate year/month/day from days since 1970-01-01
+    var year: i32 = 1970;
+    while (true) {
+        const days_in_year: i64 = if (@mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0)) 366 else 365;
+        if (days < days_in_year) break;
+        days -= days_in_year;
+        year += 1;
+    }
+
+    const is_leap = @mod(year, 4) == 0 and (@mod(year, 100) != 0 or @mod(year, 400) == 0);
+    const days_in_month = [_]i64{ 31, if (is_leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    var month: u32 = 1;
+    for (days_in_month) |dim| {
+        if (days < dim) break;
+        days -= dim;
+        month += 1;
+    }
+    const day: u32 = @intCast(days + 1);
+
+    // Format ISO string
+    if (std.fmt.bufPrint(&current_timestamp_str, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
+        year, month, day, hour, min, sec, @as(u32, @intCast(millis))
+    })) |s| {
+        current_timestamp_str_len = s.len;
+    } else |_| {}
+
+    // Format date string
+    if (std.fmt.bufPrint(&current_date_str, "{d:0>4}-{d:0>2}-{d:0>2}", .{ year, month, day })) |s| {
+        current_date_str_len = s.len;
+    } else |_| {}
+}
+
 // Global scratch buffers to avoid stack overflow
 const JoinRow = struct { indices: [MAX_JOINS + 1]u32 };
 var global_indices_1: [MAX_ROWS]u32 = undefined;
@@ -367,6 +422,54 @@ fn getColByName(table: *const TableInfo, name: []const u8) ?*const ColumnData {
         }
     }
     return null;
+}
+
+// Date parsing helper - extracts year, month, day, hour, minute, second from date string
+// Supports formats: YYYY-MM-DD, YYYY-MM-DD HH:MM:SS, YYYY-MM-DDTHH:MM:SSZ, etc.
+const DateParts = struct {
+    year: i32 = 0,
+    month: i32 = 0,
+    day: i32 = 0,
+    hour: i32 = 0,
+    minute: i32 = 0,
+    second: i32 = 0,
+};
+
+fn parseDateString(s: []const u8) DateParts {
+    var parts = DateParts{};
+    if (s.len < 10) return parts;
+
+    // Parse YYYY-MM-DD
+    parts.year = std.fmt.parseInt(i32, s[0..4], 10) catch 0;
+    if (s.len >= 7 and s[4] == '-') {
+        parts.month = std.fmt.parseInt(i32, s[5..7], 10) catch 0;
+    }
+    if (s.len >= 10 and s[7] == '-') {
+        parts.day = std.fmt.parseInt(i32, s[8..10], 10) catch 0;
+    }
+
+    // Parse time if present (after space or T)
+    if (s.len >= 19) {
+        const time_start: usize = if (s[10] == ' ' or s[10] == 'T') 11 else return parts;
+        if (time_start + 8 <= s.len) {
+            parts.hour = std.fmt.parseInt(i32, s[time_start..time_start+2], 10) catch 0;
+            if (s[time_start+2] == ':') {
+                parts.minute = std.fmt.parseInt(i32, s[time_start+3..time_start+5], 10) catch 0;
+            }
+            if (s[time_start+5] == ':') {
+                parts.second = std.fmt.parseInt(i32, s[time_start+6..time_start+8], 10) catch 0;
+            }
+        }
+    }
+
+    return parts;
+}
+
+fn extractDateOnly(s: []const u8) []const u8 {
+    if (s.len >= 10) {
+        return s[0..10];
+    }
+    return s;
 }
 
 /// Context for optimized fragment access
@@ -716,6 +819,74 @@ fn evaluateScalarFloat(table: *const TableInfo, expr: *const SelectExpr, idx: u3
             if (shift < 0 or shift >= 64) break :blk 0;
             break :blk @floatFromInt(@as(i64, @intFromFloat(v1)) >> @as(u6, @intCast(shift)));
         },
+        .year => blk: {
+            // YEAR(date_string) - extract year from date
+            var date_str: []const u8 = "";
+            if (arg1_col) |col| date_str = getStringValueOptimized(table, col, idx, context)
+            else if (expr.val_str) |s| date_str = s;
+            const dp = parseDateString(date_str);
+            break :blk @floatFromInt(dp.year);
+        },
+        .month => blk: {
+            var date_str: []const u8 = "";
+            if (arg1_col) |col| date_str = getStringValueOptimized(table, col, idx, context)
+            else if (expr.val_str) |s| date_str = s;
+            const dp = parseDateString(date_str);
+            break :blk @floatFromInt(dp.month);
+        },
+        .day => blk: {
+            var date_str: []const u8 = "";
+            if (arg1_col) |col| date_str = getStringValueOptimized(table, col, idx, context)
+            else if (expr.val_str) |s| date_str = s;
+            const dp = parseDateString(date_str);
+            break :blk @floatFromInt(dp.day);
+        },
+        .hour => blk: {
+            var date_str: []const u8 = "";
+            if (arg1_col) |col| date_str = getStringValueOptimized(table, col, idx, context)
+            else if (expr.val_str) |s| date_str = s;
+            const dp = parseDateString(date_str);
+            break :blk @floatFromInt(dp.hour);
+        },
+        .minute => blk: {
+            var date_str: []const u8 = "";
+            if (arg1_col) |col| date_str = getStringValueOptimized(table, col, idx, context)
+            else if (expr.val_str) |s| date_str = s;
+            const dp = parseDateString(date_str);
+            break :blk @floatFromInt(dp.minute);
+        },
+        .second => blk: {
+            var date_str: []const u8 = "";
+            if (arg1_col) |col| date_str = getStringValueOptimized(table, col, idx, context)
+            else if (expr.val_str) |s| date_str = s;
+            const dp = parseDateString(date_str);
+            break :blk @floatFromInt(dp.second);
+        },
+        .is_uuid => blk: {
+            // IS_UUID returns 1 if valid UUID, 0 otherwise
+            // UUID format: xxxxxxxx-xxxx-Vxxx-Txxx-xxxxxxxxxxxx (36 chars)
+            var uuid_str: []const u8 = "";
+            if (arg1_col) |col| uuid_str = getStringValueOptimized(table, col, idx, context)
+            else if (expr.val_str) |s| uuid_str = s;
+
+            if (uuid_str.len != 36) break :blk 0;
+            if (uuid_str[8] != '-' or uuid_str[13] != '-' or uuid_str[18] != '-' or uuid_str[23] != '-') break :blk 0;
+
+            // Check version (position 14 should be 1-5)
+            const ver = uuid_str[14];
+            if (ver < '1' or ver > '5') break :blk 0;
+
+            // Check variant (position 19 should be 8, 9, a, or b)
+            const variant = uuid_str[19];
+            if (variant != '8' and variant != '9' and variant != 'a' and variant != 'b' and variant != 'A' and variant != 'B') break :blk 0;
+
+            // Check all other characters are hex
+            for (uuid_str, 0..) |c, i| {
+                if (i == 8 or i == 13 or i == 14 or i == 18 or i == 19 or i == 23) continue;
+                if (!((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F'))) break :blk 0;
+            }
+            break :blk 1;
+        },
         else => v1,
     };
 }
@@ -731,7 +902,14 @@ fn evaluateScalarString(table: *const TableInfo, expr: *const SelectExpr, idx: u
 
     // For now, simple single-threaded buffer for results
     // Limitation: nested calls not supported yet
-    
+
+    // UUID counter for uniqueness within same row
+    const uuid_counter = struct {
+        var count: u32 = 0;
+    };
+    uuid_counter.count +%= 1;
+    const uuid_seq = uuid_counter.count;
+
     return switch (expr.func) {
         .iif => blk: {
              const v1 = if (arg1_col) |col| getFloatValueOptimized(table, col, idx, context) else (expr.val_float orelse @as(f64, @floatFromInt(expr.val_int orelse 0)));
@@ -1139,17 +1317,22 @@ fn evaluateScalarString(table: *const TableInfo, expr: *const SelectExpr, idx: u
         .regexp_extract => {
             return s1; // Placeholder
         },
-        .uuid => {
-            // Random UUID: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+        .uuid, .gen_random_uuid => {
+            // Random UUID v4: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+            // Position 14 = version (4), Position 19 = variant (8, 9, a, or b)
             const hex = "0123456789abcdef";
+            const variant = "89ab";
             var i: usize = 0;
             while (i < 36) : (i += 1) {
                 if (i == 8 or i == 13 or i == 18 or i == 23) {
                     scalar_str_buf[i] = '-';
                 } else if (i == 14) {
-                    scalar_str_buf[i] = '4';
+                    scalar_str_buf[i] = '4';  // UUID version 4
+                } else if (i == 19) {
+                    scalar_str_buf[i] = variant[@mod(idx + uuid_seq, 4)];  // RFC4122 variant
                 } else {
-                    const r = @as(usize, @intCast(@mod(idx + i + 1234, 16))); // Semi-random based on index
+                    // Use uuid_seq for uniqueness within same row
+                    const r = @as(usize, @intCast(@mod(idx + uuid_seq + i * 7 + 1234, 16)));
                     scalar_str_buf[i] = hex[r];
                 }
             }
@@ -1157,14 +1340,17 @@ fn evaluateScalarString(table: *const TableInfo, expr: *const SelectExpr, idx: u
         },
         .uuid_string => {
             const hex = "0123456789abcdef";
+            const variant = "89ab";
             var i: usize = 0;
             while (i < 36) : (i += 1) {
                 if (i == 8 or i == 13 or i == 18 or i == 23) {
                     scalar_str_buf[i] = '-';
                 } else if (i == 14) {
-                    scalar_str_buf[i] = '4';
+                    scalar_str_buf[i] = '4';  // UUID version 4
+                } else if (i == 19) {
+                    scalar_str_buf[i] = variant[@mod(idx + uuid_seq + 1, 4)];  // RFC4122 variant
                 } else {
-                    const r = @as(usize, @intCast(@mod(idx + i + 5678, 16)));
+                    const r = @as(usize, @intCast(@mod(idx + uuid_seq + i * 11 + 5678, 16)));
                     scalar_str_buf[i] = hex[r];
                 }
             }
@@ -1188,6 +1374,59 @@ fn evaluateScalarString(table: *const TableInfo, expr: *const SelectExpr, idx: u
                 if (getColByName(table, col_name)) |c| return getStringValueOptimized(table, c, idx, context);
             }
             return "";
+        },
+        .now, .current_timestamp => {
+            // Return current timestamp string (set via setCurrentTimestamp export)
+            if (current_timestamp_str_len > 0) return current_timestamp_str[0..current_timestamp_str_len];
+            // Fallback: return a default timestamp if not set
+            return "1970-01-01T00:00:00.000Z";
+        },
+        .current_date => {
+            // Return current date string (YYYY-MM-DD)
+            if (current_date_str_len > 0) return current_date_str[0..current_date_str_len];
+            return "1970-01-01";
+        },
+        .date => {
+            // Extract date portion from datetime string
+            return extractDateOnly(s1);
+        },
+        .strftime => {
+            // STRFTIME(format, datetime)
+            // Basic strftime: %Y=year, %m=month, %d=day, %H=hour, %M=minute, %S=second
+            var fmt: []const u8 = "%Y-%m-%d";
+            if (expr.val_str) |f| fmt = f;
+
+            var date_str = s1;
+            if (expr.arg_2_val_str) |d| date_str = d;
+            if (expr.arg_2_col) |col_name| {
+                if (getColByName(table, col_name)) |col| date_str = getStringValueOptimized(table, col, idx, context);
+            }
+
+            const dp = parseDateString(date_str);
+            var out_pos: usize = 0;
+            var i: usize = 0;
+            while (i < fmt.len and out_pos < scalar_str_buf.len - 10) {
+                if (fmt[i] == '%' and i + 1 < fmt.len) {
+                    const spec = fmt[i + 1];
+                    // Cast to unsigned to avoid '+' sign in output
+                    const written = switch (spec) {
+                        'Y' => std.fmt.bufPrint(scalar_str_buf[out_pos..], "{d:0>4}", .{@as(u32, @intCast(@max(0, dp.year)))}) catch "",
+                        'm' => std.fmt.bufPrint(scalar_str_buf[out_pos..], "{d:0>2}", .{@as(u32, @intCast(@max(0, dp.month)))}) catch "",
+                        'd' => std.fmt.bufPrint(scalar_str_buf[out_pos..], "{d:0>2}", .{@as(u32, @intCast(@max(0, dp.day)))}) catch "",
+                        'H' => std.fmt.bufPrint(scalar_str_buf[out_pos..], "{d:0>2}", .{@as(u32, @intCast(@max(0, dp.hour)))}) catch "",
+                        'M' => std.fmt.bufPrint(scalar_str_buf[out_pos..], "{d:0>2}", .{@as(u32, @intCast(@max(0, dp.minute)))}) catch "",
+                        'S' => std.fmt.bufPrint(scalar_str_buf[out_pos..], "{d:0>2}", .{@as(u32, @intCast(@max(0, dp.second)))}) catch "",
+                        else => "",
+                    };
+                    out_pos += written.len;
+                    i += 2;
+                } else {
+                    scalar_str_buf[out_pos] = fmt[i];
+                    out_pos += 1;
+                    i += 1;
+                }
+            }
+            return scalar_str_buf[0..out_pos];
         },
         else => s1,
     };
@@ -6561,7 +6800,8 @@ fn writeSelectResult(table: *const TableInfo, query: *const ParsedQuery, row_ind
         } else {
             // Infer type from function
              switch (expr.func) {
-                 .trim, .ltrim, .rtrim, .concat, .replace, .reverse, .upper, .lower, .left, .substr, .lpad, .rpad, .right, .repeat => col_type = .string,
+                 .trim, .ltrim, .rtrim, .concat, .replace, .reverse, .upper, .lower, .left, .substr, .lpad, .rpad, .right, .repeat,
+                 .now, .current_timestamp, .current_date, .date, .strftime, .uuid, .uuid_string, .gen_random_uuid, .json_extract, .regexp_extract => col_type = .string,
                  .split, .array_slice => col_type = .list,
                  .array_length, .length, .instr => col_type = .int64,
                  .nullif, .coalesce, .iif, .greatest, .least, .case => {
@@ -8638,6 +8878,8 @@ fn getScalarFunc(name: []const u8) ScalarFunc {
     // UUID
     if (std.ascii.eqlIgnoreCase(name, "UUID")) return .uuid;
     if (std.ascii.eqlIgnoreCase(name, "UUID_STRING")) return .uuid_string;
+    if (std.ascii.eqlIgnoreCase(name, "GEN_RANDOM_UUID")) return .gen_random_uuid;
+    if (std.ascii.eqlIgnoreCase(name, "IS_UUID")) return .is_uuid;
     // Bitwise
     if (std.ascii.eqlIgnoreCase(name, "BIT_AND")) return .bit_and;
     if (std.ascii.eqlIgnoreCase(name, "BIT_OR")) return .bit_or;
@@ -8652,6 +8894,17 @@ fn getScalarFunc(name: []const u8) ScalarFunc {
     // Date/Time
     if (std.ascii.eqlIgnoreCase(name, "EXTRACT")) return .extract;
     if (std.ascii.eqlIgnoreCase(name, "DATE_PART")) return .date_part;
+    if (std.ascii.eqlIgnoreCase(name, "NOW")) return .now;
+    if (std.ascii.eqlIgnoreCase(name, "CURRENT_DATE")) return .current_date;
+    if (std.ascii.eqlIgnoreCase(name, "CURRENT_TIMESTAMP")) return .current_timestamp;
+    if (std.ascii.eqlIgnoreCase(name, "DATE")) return .date;
+    if (std.ascii.eqlIgnoreCase(name, "YEAR")) return .year;
+    if (std.ascii.eqlIgnoreCase(name, "MONTH")) return .month;
+    if (std.ascii.eqlIgnoreCase(name, "DAY")) return .day;
+    if (std.ascii.eqlIgnoreCase(name, "HOUR")) return .hour;
+    if (std.ascii.eqlIgnoreCase(name, "MINUTE")) return .minute;
+    if (std.ascii.eqlIgnoreCase(name, "SECOND")) return .second;
+    if (std.ascii.eqlIgnoreCase(name, "STRFTIME")) return .strftime;
     return .none;
 }
 
