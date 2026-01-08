@@ -1058,48 +1058,41 @@ test.describe('Phase 7: CTE, Set Operations, Window Functions', () => {
 
     test('Window function ROW_NUMBER execution', async ({ page }) => {
         const result = await page.evaluate(async () => {
-            const { SQLExecutor } = await import('./lanceql.js');
-
-            const executor = new SQLExecutor({ columnNames: ['id', 'dept', 'salary'] });
-
-            // Simulate data
-            const rows = [
-                [1, 'HR', 50000],
-                [2, 'HR', 60000],
-                [3, 'IT', 70000],
-                [4, 'IT', 80000]
-            ];
-            const columnData = {
-                id: [1, 2, 3, 4],
-                dept: ['HR', 'HR', 'IT', 'IT'],
-                salary: [50000, 60000, 70000, 80000]
-            };
-
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
             const tests = [];
 
-            // Test ROW_NUMBER() without partition
-            const over1 = { partitionBy: [], orderBy: [{ column: 'id', direction: 'ASC' }] };
-            const result1 = executor._computeWindowFunction('ROW_NUMBER', [], over1, rows, columnData);
+            // Setup test data
+            await v.exec('CREATE TABLE emp (id INT, dept TEXT, salary INT)');
+            await v.exec(`INSERT INTO emp VALUES (1, 'HR', 50000), (2, 'HR', 60000), (3, 'IT', 70000), (4, 'IT', 80000)`);
 
-            tests.push({
-                name: 'ROW_NUMBER without partition',
-                pass: JSON.stringify(result1) === JSON.stringify([1, 2, 3, 4]),
-                actual: JSON.stringify(result1)
-            });
+            // Test ROW_NUMBER() without partition
+            try {
+                const res = await v.exec('SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM emp ORDER BY id');
+                const rns = res.rows.map(r => r.rn);
+                tests.push({
+                    name: 'ROW_NUMBER without partition',
+                    pass: JSON.stringify(rns) === JSON.stringify([1, 2, 3, 4]),
+                    actual: JSON.stringify(rns)
+                });
+            } catch (e) {
+                tests.push({ name: 'ROW_NUMBER without partition', pass: false, actual: e.message });
+            }
 
             // Test ROW_NUMBER() with PARTITION BY
-            const over2 = {
-                partitionBy: [{ type: 'column', column: 'dept' }],
-                orderBy: [{ column: 'salary', direction: 'ASC' }]
-            };
-            const result2 = executor._computeWindowFunction('ROW_NUMBER', [], over2, rows, columnData);
+            try {
+                const res = await v.exec('SELECT id, dept, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary) AS rn FROM emp ORDER BY id');
+                const rns = res.rows.map(r => r.rn);
+                tests.push({
+                    name: 'ROW_NUMBER with partition',
+                    pass: rns[0] === 1 && rns[1] === 2 && rns[2] === 1 && rns[3] === 2,
+                    actual: JSON.stringify(rns)
+                });
+            } catch (e) {
+                tests.push({ name: 'ROW_NUMBER with partition', pass: false, actual: e.message });
+            }
 
-            tests.push({
-                name: 'ROW_NUMBER with partition',
-                pass: result2[0] === 1 && result2[1] === 2 && result2[2] === 1 && result2[3] === 2,
-                actual: JSON.stringify(result2)
-            });
-
+            await v.exec('DROP TABLE emp');
             return tests;
         });
 
