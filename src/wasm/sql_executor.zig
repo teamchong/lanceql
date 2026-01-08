@@ -1217,15 +1217,27 @@ fn evaluateScalarString(table: *const TableInfo, expr: *const SelectExpr, idx: u
                         out_pos += 1;
                     }
                     if (out_pos + trimmed.len + 2 > scalar_str_buf.len) break;
-                    
-                    // Add quotes if it's not already a bracketed thing or a number?
-                    // For simplicity, always add quotes for now as it's likely strings.
-                    // But wait, what if it's numbers? 
-                    // Let's check the test.
-                    scalar_str_buf[out_pos] = '"';
-                    @memcpy(scalar_str_buf[out_pos + 1 .. out_pos + 1 + trimmed.len], trimmed);
-                    scalar_str_buf[out_pos + 1 + trimmed.len] = '"';
-                    out_pos += trimmed.len + 2;
+
+                    // Check if value is numeric (don't add quotes for numbers)
+                    var is_numeric = trimmed.len > 0;
+                    for (trimmed) |c| {
+                        if (!std.ascii.isDigit(c) and c != '-' and c != '.') {
+                            is_numeric = false;
+                            break;
+                        }
+                    }
+
+                    if (is_numeric) {
+                        // Number - no quotes
+                        @memcpy(scalar_str_buf[out_pos .. out_pos + trimmed.len], trimmed);
+                        out_pos += trimmed.len;
+                    } else {
+                        // String - add quotes
+                        scalar_str_buf[out_pos] = '"';
+                        @memcpy(scalar_str_buf[out_pos + 1 .. out_pos + 1 + trimmed.len], trimmed);
+                        scalar_str_buf[out_pos + 1 + trimmed.len] = '"';
+                        out_pos += trimmed.len + 2;
+                    }
                     first = false;
                 }
             }
