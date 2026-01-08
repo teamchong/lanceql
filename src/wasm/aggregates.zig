@@ -119,7 +119,7 @@ export fn avgFloat64Column(col_idx: u32) f64 {
 /// SIMD vector type for 4x f64
 const Vec4f64 = @Vector(4, f64);
 
-pub const AggFunc = enum { sum, count, avg, min, max, stddev, variance, stddev_pop, var_pop, median };
+pub const AggFunc = enum { sum, count, avg, min, max, stddev, variance, stddev_pop, var_pop, median, string_agg };
 
 pub const AggState = struct {
     val: f64 = 0,
@@ -186,6 +186,7 @@ pub const AggState = struct {
                 break :blk @sqrt(@max(0, var_val));
             },
             .median => 0, // MEDIAN is handled separately - requires collecting all values
+            .string_agg => 0, // STRING_AGG is handled separately - produces strings, not numbers
         };
     }
 };
@@ -208,6 +209,7 @@ pub const MetricSet = struct {
             .max => set.max = true,
             .stddev, .variance, .stddev_pop, .var_pop => { set.sum = true; set.sum_sq = true; set.count = true; },
             .median => { set.needs_values = true; set.count = true; },
+            .string_agg => {}, // STRING_AGG doesn't need numeric metrics
         }
         return set;
     }
@@ -279,6 +281,7 @@ pub const MultiAggState = struct {
                 break :blk @sqrt(@max(0, var_val));
             },
             .median => 0, // MEDIAN is handled separately - requires collecting all values
+            .string_agg => 0, // STRING_AGG is handled separately - produces strings, not numbers
         };
     }
 
