@@ -2692,12 +2692,24 @@ fn executeInsert(query: *ParsedQuery) !void {
                     const f_rows = @as(u32, @intCast(frag.getRowCount()));
                     var processed: u32 = 0;
                     
+                    var frag_ctx: ?FragmentContext = FragmentContext{
+                        .frag = frag,
+                        .start_idx = current_idx,
+                        .end_idx = current_idx + f_rows,
+                    };
+
                     while (processed < f_rows) {
                         const chunk_size = @min(VECTOR_SIZE, f_rows - processed);
                         for (0..chunk_size) |k| {
                             if (inserted_count >= limit) break;
                             const global_idx = current_idx + processed + @as(u32, @intCast(k));
-                            
+
+                            // Apply WHERE filter if present
+                            if (query.where_clause) |*where| {
+                                const w = @constCast(where);
+                                if (!evaluateWhere(src, w, global_idx, &frag_ctx)) continue;
+                            }
+
                             for (0..src.column_count) |c_idx| {
                                 if (c_idx >= tbl.column_count) break;
                                 const src_col = &src.columns[c_idx].?;
@@ -2734,9 +2746,20 @@ fn executeInsert(query: *ParsedQuery) !void {
             if (inserted_count < limit and src.row_count > current_idx) {
                 const total_mem = src.row_count - current_idx;
                 var processed: u32 = 0;
+                var mem_ctx: ?FragmentContext = null;
                 while (processed < total_mem) {
                     if (inserted_count >= limit) break;
                     const global_idx = current_idx + processed;
+
+                    // Apply WHERE filter if present
+                    if (query.where_clause) |*where| {
+                        const w = @constCast(where);
+                        if (!evaluateWhere(src, w, global_idx, &mem_ctx)) {
+                            processed += 1;
+                            continue;
+                        }
+                    }
+
                     for (0..src.column_count) |c_idx| {
                          if (c_idx >= tbl.column_count) break;
                          const src_col = &src.columns[c_idx].?;
@@ -8718,7 +8741,15 @@ pub fn parseSql(sql: []const u8) ?*ParsedQuery {
                      
                      var rest_pos = from_pos;
                      rest_pos = skipWs(sql, rest_pos);
-                     
+
+                     // Parse WHERE clause if present
+                     if (rest_pos < sql.len and startsWithIC(sql[rest_pos..], "WHERE")) {
+                         rest_pos += 5;
+                         rest_pos = skipWs(sql, rest_pos);
+                         query.where_clause = parseWhere(sql, &rest_pos);
+                         rest_pos = skipWs(sql, rest_pos);
+                     }
+
                      if (rest_pos < sql.len and startsWithIC(sql[rest_pos..], "LIMIT")) {
                          rest_pos += 5;
                          rest_pos = skipWs(sql, rest_pos);
