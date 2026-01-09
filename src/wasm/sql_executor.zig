@@ -303,6 +303,7 @@ pub const CTEDef = struct {
     name: []const u8,
     query_start: usize, // Position in sql_input where CTE query starts
     query_end: usize, // Position where CTE query ends
+    is_recursive: bool = false, // True for WITH RECURSIVE
 };
 
 const MAX_CTES: usize = 4;
@@ -9149,6 +9150,169 @@ fn executeWindowQuery(table: *const TableInfo, query: *const ParsedQuery) !void 
 // CTE Execution
 // ============================================================================
 
+/// Find UNION ALL position in SQL (case-insensitive)
+fn findUnionAllPos(sql: []const u8) ?usize {
+    var i: usize = 0;
+    while (i + 9 <= sql.len) : (i += 1) {
+        if (startsWithIC(sql[i..], "UNION")) {
+            var j = i + 5;
+            j = skipWs(sql, j);
+            if (startsWithIC(sql[j..], "ALL")) {
+                return i;
+            }
+        }
+    }
+    return null;
+}
+
+/// Materialize a recursive CTE (WITH RECURSIVE)
+fn materializeRecursiveCTE(cte_sql: []const u8, cte: *const CTEDef) !void {
+    // Recursive CTEs have: base_case UNION ALL recursive_case
+    const union_pos = findUnionAllPos(cte_sql) orelse return error.InvalidSql;
+
+    // Split into base case and recursive case
+    const base_sql = cte_sql[0..union_pos];
+    var rec_start = union_pos + 5; // skip UNION
+    rec_start = skipWs(cte_sql, rec_start);
+    rec_start += 3; // skip ALL
+    rec_start = skipWs(cte_sql, rec_start);
+    const recursive_sql = cte_sql[rec_start..];
+
+    // Parse base case - typically "SELECT literal AS col"
+    const base_query = parseSql(base_sql) orelse return error.InvalidSql;
+
+    // Determine column names from base case
+    var col_names: [MAX_COLUMNS][]const u8 = undefined;
+    var col_count: usize = 0;
+    for (base_query.select_exprs[0..base_query.select_count]) |expr| {
+        col_names[col_count] = if (expr.alias) |a| a else if (expr.col_name.len > 0) expr.col_name else "?";
+        col_count += 1;
+    }
+
+    // Execute base case - collect literal values
+    var all_values: [1024]f64 = undefined;
+    var value_count: usize = 0;
+
+    // For base case with no table (like SELECT 1 as n) - uses __DUAL__ sentinel
+    if (std.mem.eql(u8, base_query.table_name, "__DUAL__") or base_query.table_name.len == 0) {
+        for (base_query.select_exprs[0..base_query.select_count], 0..) |expr, i| {
+            if (expr.val_int) |v| {
+                all_values[i] = @floatFromInt(v);
+            } else if (expr.val_float) |v| {
+                all_values[i] = v;
+            } else {
+                all_values[i] = 0;
+            }
+        }
+        value_count = 1; // One row with base value
+    }
+
+    if (value_count == 0) return error.InvalidSql;
+
+    // Create the CTE table with base case result
+    const tbl_idx = table_count;
+    var new_table = TableInfo{
+        .name = cte.name,
+        .row_count = value_count,
+        .column_count = col_count,
+        .columns = .{null} ** MAX_COLUMNS,
+        .fragments = .{null} ** MAX_FRAGMENTS,
+        .fragment_count = 0,
+    };
+
+    // Allocate column data for base case
+    for (0..col_count) |c| {
+        const col_data = memory.wasm_allocator.alloc(f64, 1024) catch return error.OutOfMemory;
+        col_data[0] = all_values[c];
+        new_table.columns[c] = ColumnData{
+            .name = col_names[c],
+            .col_type = .float64,
+            .data = .{ .float64 = col_data[0..value_count] },
+            .row_count = value_count,
+        };
+    }
+
+    tables[tbl_idx] = new_table;
+    table_count += 1;
+
+    // Parse recursive case once
+    const rec_query = parseSql(recursive_sql) orelse return error.InvalidSql;
+
+    // Iteratively execute recursive case until no new rows
+    const MAX_ITERS = 1000;
+    var iter: usize = 0;
+    var start_row: usize = 0;
+    var end_row: usize = value_count;
+
+    // Allocate per-column staging buffers on heap
+    var col_buffers: [MAX_COLUMNS]?[]f64 = .{null} ** MAX_COLUMNS;
+    for (0..col_count) |c| {
+        col_buffers[c] = memory.wasm_allocator.alloc(f64, 256) catch return error.OutOfMemory;
+    }
+
+    while (iter < MAX_ITERS) : (iter += 1) {
+        if (start_row >= end_row) break;
+
+        // Get the CTE table we're building
+        const rtbl = &(tables[tbl_idx] orelse break);
+
+        // Process rows in working set
+        var new_count: usize = 0;
+        var ctx: ?FragmentContext = null;
+
+        for (start_row..end_row) |ri| {
+            const row_idx: u32 = @intCast(ri);
+
+            // Check WHERE clause
+            if (rec_query.where_clause) |*where| {
+                if (!evaluateWhere(rtbl, where, row_idx, &ctx)) continue;
+            }
+
+            // Evaluate SELECT expressions for each column
+            for (rec_query.select_exprs[0..rec_query.select_count], 0..) |expr, col_i| {
+                const val = evaluateScalarFloat(rtbl, &expr, row_idx, &ctx, null, null);
+                if (col_buffers[col_i]) |buf| {
+                    if (new_count < buf.len) {
+                        buf[new_count] = val;
+                    }
+                }
+            }
+            new_count += 1;
+            if (new_count >= 256) break;
+        }
+
+        if (new_count == 0) break;
+
+        // Append new rows to column data
+        const prev_count = rtbl.row_count;
+        const total_count = prev_count + new_count;
+
+        for (0..col_count) |c| {
+            if (rtbl.columns[c]) |*col| {
+                // Get old data and allocate new
+                const old_data = col.data.float64;
+                const new_data = memory.wasm_allocator.alloc(f64, total_count) catch return error.OutOfMemory;
+
+                // Copy old and new values
+                @memcpy(new_data[0..prev_count], old_data);
+                if (col_buffers[c]) |buf| {
+                    for (0..new_count) |j| {
+                        new_data[prev_count + j] = buf[j];
+                    }
+                }
+
+                col.data = .{ .float64 = new_data[0..total_count] };
+                col.row_count = total_count;
+            }
+        }
+        rtbl.row_count = total_count;
+
+        // Update working set
+        start_row = prev_count;
+        end_row = total_count;
+    }
+}
+
 /// Materialize a CTE into a temporary in-memory TableInfo
 fn materializeCTE(sql: []const u8, cte: *const CTEDef) !void {
     _ = sql;
@@ -9157,6 +9321,13 @@ fn materializeCTE(sql: []const u8, cte: *const CTEDef) !void {
     // Parse the CTE's inner query
     const cte_sql_input = &sql_input;
     const cte_sql = cte_sql_input[cte.query_start..cte.query_end];
+
+    // Handle recursive CTEs differently
+    if (cte.is_recursive) {
+        try materializeRecursiveCTE(cte_sql, cte);
+        return;
+    }
+
     const inner_query = parseSql(cte_sql) orelse return error.InvalidSql;
 
     // Find the source table referenced by the inner query
@@ -11901,8 +12072,10 @@ pub fn parseSql(sql: []const u8) ?*ParsedQuery {
         pos += 4;
         pos = skipWs(sql, pos);
 
-        // Skip RECURSIVE keyword if present
+        // Check for RECURSIVE keyword
+        var is_recursive_cte = false;
         if (startsWithIC(sql[pos..], "RECURSIVE")) {
+            is_recursive_cte = true;
             pos += 9;
             pos = skipWs(sql, pos);
         }
@@ -11939,6 +12112,7 @@ pub fn parseSql(sql: []const u8) ?*ParsedQuery {
                 .name = cte_name,
                 .query_start = query_start,
                 .query_end = query_end,
+                .is_recursive = is_recursive_cte,
             };
             query.cte_count += 1;
 
