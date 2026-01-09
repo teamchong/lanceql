@@ -2294,21 +2294,30 @@ LIMIT 20</textarea>
     </div>
 
     <script type="module">
-        import Alpine from 'https://esm.sh/alpinejs@3.14.3';
-        import { atom, computed } from 'https://esm.sh/nanostores@0.10.3';
+        // Use local copies for reliable testing (bundled from esm.sh)
+        import Alpine from './alpine.mjs';
+        import { atom, computed } from './nanostores.mjs';
+
+        // Expose Alpine globally for Playwright tests
+        window.Alpine = Alpine;
+
         // Import from local lanceql.js (synced from packages/browser/src/lanceql.js)
         // Run: cp packages/browser/src/lanceql.js examples/wasm/lanceql.js
         import LanceQL, {
             SQLExecutor, SQLLexer, SQLParser, initSqlJs,
             // OPFS and storage APIs
-            opfsStorage, OPFSStorage, ChunkedLanceReader, LRUCache,
+            OPFSStorage, ChunkedLanceReader, LRUCache,
             // Memory management
-            memoryManager, MemoryManager, StreamUtils,
+            MemoryManager,
             // Unified data access
-            openLance, LanceDataBase, OPFSLanceData, RemoteLanceData,
+            LanceDataBase, OPFSLanceData, RemoteLanceData,
             // Local database
             LocalDatabase
         } from './lanceql.js';
+
+        // Create instances (not exported from lanceql.js, only classes)
+        const opfsStorage = new OPFSStorage();
+        const memoryManager = new MemoryManager();
 
         let lanceql;
 
@@ -3329,12 +3338,6 @@ LIMIT 20`;
             if (Math.abs(num) >= 1e3) return (num / 1e3).toFixed(1) + 'K';
             if (!Number.isInteger(num)) return num.toFixed(4);
             return num.toLocaleString();
-        }
-
-        function formatBytes(bytes) {
-            if (bytes >= 1024 * 1024) return (bytes / 1024 / 1024).toFixed(2) + ' MB';
-            if (bytes >= 1024) return (bytes / 1024).toFixed(2) + ' KB';
-            return bytes + ' B';
         }
 
         // Progress bar functions
