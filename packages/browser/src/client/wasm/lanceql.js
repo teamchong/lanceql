@@ -3,6 +3,10 @@
  */
 
 import { getWebGPUAccelerator } from '../gpu/accelerator.js';
+import { LanceFile } from '../lance/lance-file.js';
+import { RemoteLanceFile } from '../lance/remote-file.js';
+import { RemoteLanceDataset } from '../lance/remote-dataset.js';
+import { LanceDatabase } from '../database/lance-database.js';
 
 class LocalSQLParser {
     constructor(tokens) {
@@ -665,7 +669,15 @@ class LanceQL {
     static async load(wasmPath = './lanceql.wasm') {
         const response = await fetch(wasmPath);
         const wasmBytes = await response.arrayBuffer();
-        const wasmModule = await WebAssembly.instantiate(wasmBytes, {});
+        const wasmModule = await WebAssembly.instantiate(wasmBytes, {
+            env: {
+                opfs_open: (ptr, len) => 0,
+                opfs_read: (h, p, l, o) => 0,
+                opfs_size: (handle) => 0n,
+                opfs_close: (handle) => {},
+                js_log: (ptr, len) => {}
+            }
+        });
 
         _w = wasmModule.instance.exports;
         _m = _w.memory;

@@ -167,7 +167,8 @@ export function evaluateExpr(executor, expr, columnData, rowIdx) {
             return expr.value;
 
         case 'column': {
-            const data = columnData[expr.name.toLowerCase()];
+            const colName = (expr.name || expr.column || '').toLowerCase();
+            const data = columnData[colName];
             return data ? data[rowIdx] : null;
         }
 
@@ -391,7 +392,7 @@ export function collectColumnsFromExpr(expr, columns) {
 
     switch (expr.type) {
         case 'column':
-            columns.add(expr.name.toLowerCase());
+            columns.add((expr.name || expr.column || '').toLowerCase());
             break;
         case 'binary':
             collectColumnsFromExpr(expr.left, columns);

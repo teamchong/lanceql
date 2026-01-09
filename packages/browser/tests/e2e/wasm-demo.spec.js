@@ -1,114 +1,134 @@
 // @ts-check
 import { test, expect } from '@playwright/test';
 
-// Skip these tests - they depend on external CDN resources (Alpine.js, data.metal0.dev)
-// which may not be available in CI/test environments
-test.describe.skip('Demo Page - Push-Down Filtering + JOIN + Vector Search', () => {
-  test.beforeEach(async ({ context }) => {
-    // Disable CORS for CDN requests
-    await context.route('**/*', route => {
-      route.continue();
+// These tests verify the demo page works with bundled Alpine.js and nanostores
+test.describe('Demo Page - Push-Down Filtering + JOIN + Vector Search', () => {
+
+  async function waitForAlpine(page, timeout = 45000) {
+    await page.waitForFunction(() => {
+      // @ts-ignore
+      return typeof Alpine !== 'undefined' && Alpine.store && Alpine.store('app');
+    }, { timeout });
+  }
+
+  /**
+   * Track network data transfers to the Lance dataset.
+   * Returns a tracker object with getTotalBytes() method.
+   */
+  function trackDataTransfers(page) {
+    let totalBytes = 0;
+    let requestCount = 0;
+
+    page.on('response', async (response) => {
+      const url = response.url();
+      // Only track actual data files (.lance) from our dataset
+      if (url.includes('data.metal0.dev') && url.includes('/data/')) {
+        const status = response.status();
+        // 206 = Range request (partial content), 200 = full file
+        if (status === 206 || status === 200) {
+          const headers = response.headers();
+          const contentLength = parseInt(headers['content-length'] || '0', 10);
+          totalBytes += contentLength;
+          requestCount++;
+        }
+      }
     });
+
+    return {
+      getTotalBytes: () => totalBytes,
+      getTotalMB: () => totalBytes / (1024 * 1024),
+      getRequestCount: () => requestCount
+    };
+  }
+
+  test('page loads and Alpine initializes', async ({ page }) => {
+    test.setTimeout(60000);
+
+    page.on('console', msg => console.log('PAGE:', msg.text()));
+
+    await page.goto('/examples/wasm/');
+
+    // Wait for Alpine.js to initialize
+    await waitForAlpine(page);
+
+    // Wait for SQL input to be visible
+    const sqlInput = page.locator('#sql-input');
+    await expect(sqlInput).toBeVisible({ timeout: 15000 });
+
+    // Verify Run button exists
+    const runButton = page.locator('#run-sql-btn');
+    await expect(runButton).toBeVisible();
+
+    console.log('Demo page loaded successfully with Alpine.js');
   });
 
-  test('default query shows results with JOIN + NEAR', async ({ page }) => {
-    test.setTimeout(90000);
+  test('basic SELECT query works', async ({ page }) => {
+    test.setTimeout(180000);
+
+    page.on('console', msg => console.log('PAGE:', msg.text()));
 
     await page.goto('/examples/wasm/');
 
-    // Wait for Alpine.js to initialize and make the SQL tab visible
-    await page.waitForSelector('.tab-content.active', { timeout: 15000 });
+    await waitForAlpine(page);
 
-    // Now wait for the SQL input to be visible
-    await page.waitForSelector('#sql-input', { state: 'visible', timeout: 10000 });
-    await page.waitForTimeout(1000);
+    // Start tracking AFTER page load to exclude metadata fetches
+    const tracker = trackDataTransfers(page);
 
-    // Verify default query has our power features
     const sqlInput = page.locator('#sql-input');
-    const sqlContent = await sqlInput.inputValue();
-    expect(sqlContent).toContain('JOIN');
-    expect(sqlContent).toContain('NEAR');
-    expect(sqlContent).toContain('Push-Down Filtering');
+    await expect(sqlInput).toBeVisible({ timeout: 15000 });
 
-    // Click Run button
-    const runButton = page.locator('button:has-text("Run")').first();
-    await runButton.click();
+    // Simple SELECT without NEAR (no text embedding needed)
+    await sqlInput.fill(`SELECT url, width, height, aesthetic FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 10`);
 
-    // Wait for results to appear (network requests to CDN)
-    // Look for actual data rows in the results table
-    const resultsBody = page.locator('.results-body, .data-table tbody, table tbody');
-
-    // Wait up to 60 seconds for results (CDN may be slow)
-    await expect(resultsBody).toBeVisible({ timeout: 60000 });
-
-    // Verify we have actual data rows displayed
-    const dataRows = page.locator('.data-table tr, table tr').filter({ hasNot: page.locator('th') });
-    const rowCount = await dataRows.count();
-
-    console.log(`Results: ${rowCount} rows displayed`);
-
-    // We should have at least 1 row of results
-    expect(rowCount).toBeGreaterThan(0);
-
-    // Verify the result contains expected columns from the JOIN
-    // The query selects: i.url, i.text, t.text_zh, t.text_es
-    const headerRow = page.locator('.data-table th, table th').first();
-    await expect(headerRow).toBeVisible();
-  });
-
-  test('vector search (NEAR) returns relevant results', async ({ page }) => {
-    test.setTimeout(90000);
-
-    await page.goto('/examples/wasm/');
-    await page.waitForSelector('.tab-content.active', { timeout: 15000 });
-    await page.waitForSelector('#sql-input', { state: 'visible', timeout: 10000 });
-    await page.waitForTimeout(1000);
-
-    // Clear and enter a simple NEAR query
-    const sqlInput = page.locator('#sql-input');
-    await sqlInput.fill(`SELECT url, text FROM read_lance('https://data.metal0.dev/laion-1m/images.lance')
-WHERE embedding NEAR 'cat'
-LIMIT 10`);
-
-    // Run
-    const runButton = page.locator('button:has-text("Run")').first();
-    await runButton.click();
+    await page.locator('#run-sql-btn').click();
 
     // Wait for results
-    const resultsBody = page.locator('.results-body, .data-table tbody, table tbody');
-    await expect(resultsBody).toBeVisible({ timeout: 60000 });
+    await page.waitForFunction(() => {
+      const results = document.querySelector('.results-body');
+      const status = document.querySelector('.status');
+      return (results && results.children.length > 0) ||
+             (status && status.textContent && status.textContent.includes('rows'));
+    }, { timeout: 120000 });
 
-    // Verify we got rows
-    const dataRows = page.locator('.data-table tr, table tr').filter({ hasNot: page.locator('th') });
-    const rowCount = await dataRows.count();
-
-    console.log(`NEAR 'cat' returned ${rowCount} rows`);
-    expect(rowCount).toBeGreaterThan(0);
+    // Log download metrics - push-down filtering should ideally download < 5MB
+    const downloadMB = tracker.getTotalMB();
+    const requestCount = tracker.getRequestCount();
+    console.log(`Basic SELECT query completed - downloaded ${downloadMB.toFixed(2)}MB in ${requestCount} requests`);
+    // TODO: Enable once push-down filtering is fully implemented
+    // expect(downloadMB).toBeLessThan(5);
   });
 
-  test('aggregation query (SUM, AVG, COUNT) works', async ({ page }) => {
-    test.setTimeout(90000);
+  test('aggregation query works', async ({ page }) => {
+    test.setTimeout(180000);
+
+    page.on('console', msg => console.log('PAGE:', msg.text()));
 
     await page.goto('/examples/wasm/');
-    await page.waitForSelector('.tab-content.active', { timeout: 15000 });
-    await page.waitForSelector('#sql-input', { state: 'visible', timeout: 10000 });
-    await page.waitForTimeout(1000);
 
-    // Click the Stats 100K example button
-    const statsButton = page.locator('button:has-text("Stats")');
-    if (await statsButton.count() > 0) {
-      await statsButton.first().click();
+    await waitForAlpine(page);
 
-      // Run 
-      const runButton = page.locator('button:has-text("Run")').first();
-      await runButton.click();
+    // Start tracking AFTER page load to exclude metadata fetches
+    const tracker = trackDataTransfers(page);
 
-      // Wait for aggregation results
-      await page.waitForTimeout(10000);
+    const sqlInput = page.locator('#sql-input');
+    await expect(sqlInput).toBeVisible({ timeout: 15000 });
 
-      // Should show aggregation result (single row with SUM, AVG, etc)
-      const resultsBody = page.locator('.results-body');
-      await expect(resultsBody).toBeVisible({ timeout: 60000 });
-    }
+    await sqlInput.fill(`SELECT SUM(aesthetic), AVG(aesthetic), COUNT(*) FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 1000`);
+
+    await page.locator('#run-sql-btn').click();
+
+    await page.waitForFunction(() => {
+      const results = document.querySelector('.results-body');
+      const status = document.querySelector('.status');
+      return (results && results.children.length > 0) ||
+             (status && status.textContent && status.textContent.includes('rows'));
+    }, { timeout: 120000 });
+
+    // Log download metrics - push-down filtering should ideally download < 10MB
+    const downloadMB = tracker.getTotalMB();
+    const requestCount = tracker.getRequestCount();
+    console.log(`Aggregation query completed - downloaded ${downloadMB.toFixed(2)}MB in ${requestCount} requests`);
+    // TODO: Enable once push-down filtering is fully implemented
+    // expect(downloadMB).toBeLessThan(10);
   });
 });
