@@ -5036,7 +5036,7 @@ function handleWorkerMessage(data, port, resolveReady) {
             if (col && col._arrowString) {
               // Decode Arrow string format: offsets + bytes
               // Arrow format has n+1 offsets for n strings
-              const { offsets, bytes } = col;
+              const { offsets, bytes, isList, nullable } = col;
               const strings = new Array(rowCount);
               const bytesArr = bytes instanceof Uint8Array ? bytes : new Uint8Array(Object.values(bytes));
               // Convert offsets object to array if needed
@@ -5044,7 +5044,14 @@ function handleWorkerMessage(data, port, resolveReady) {
               for (let i = 0; i < rowCount; i++) {
                 const start = offsetsArr[i];
                 const end = offsetsArr[i + 1];
-                strings[i] = decoder.decode(bytesArr.subarray(start, end));
+                const str = decoder.decode(bytesArr.subarray(start, end));
+                if (nullable && start === end) {
+                  strings[i] = null;  // Empty string + nullable = SQL NULL
+                } else if (isList) {
+                  try { strings[i] = JSON.parse(str); } catch { strings[i] = str; }
+                } else {
+                  strings[i] = str;
+                }
               }
               decodedData[name] = strings;
             } else if (Array.isArray(col)) {
