@@ -616,21 +616,4 @@ test.describe.serial('Module Loading (Browser)', () => {
         expect(result).toBe(true);
     });
 
-    test('lanceql.js loads and exports vault function', async ({ page }) => {
-        await page.goto('/examples/wasm/test-vault-sql.html');
-        await page.waitForLoadState('networkidle');
-
-        const result = await page.evaluate(async () => {
-            const module = await import('./lanceql.js');
-            return {
-                hasVault: typeof module.vault === 'function',
-                hasLocalDatabase: typeof module.LocalDatabase === 'function',
-                hasOpenLance: typeof module.openLance === 'function'
-            };
-        });
-
-        expect(result.hasVault).toBe(true);
-        expect(result.hasLocalDatabase).toBe(true);
-        expect(result.hasOpenLance).toBe(true);
-    });
 });

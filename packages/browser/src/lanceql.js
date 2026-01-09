@@ -1197,9 +1197,9 @@ var init_lance_reader = __esm({
        * Read and parse the Lance footer
        */
       async _readFooter() {
-        const footerData = await this.fileReader.readFromEnd(LANCE_FOOTER_SIZE);
+        const footerData = await this.fileReader.readFromEnd(40);
         const magic = footerData.slice(36, 40);
-        if (!this._arraysEqual(magic, LANCE_MAGIC)) {
+        if (!this._arraysEqual(magic, LANCE_MAGIC2)) {
           throw new Error("Invalid Lance file: magic bytes mismatch");
         }
         const view = new DataView(footerData.buffer, footerData.byteOffset);
@@ -5028,16 +5028,44 @@ function handleWorkerMessage(data, port, resolveReady) {
           });
         } else if (result && result._format === "columnar") {
           const { columns, rowCount, data: colData } = result;
+          // Decode Arrow string columns if present
+          const decodedData = {};
+          const decoder = new TextDecoder();
+          for (const name of columns) {
+            const col = colData[name];
+            if (col && col._arrowString) {
+              // Decode Arrow string format: offsets + bytes
+              // Arrow format has n+1 offsets for n strings
+              const { offsets, bytes } = col;
+              const strings = new Array(rowCount);
+              const bytesArr = bytes instanceof Uint8Array ? bytes : new Uint8Array(Object.values(bytes));
+              // Convert offsets object to array if needed
+              const offsetsArr = Array.isArray(offsets) ? offsets : Object.values(offsets);
+              for (let i = 0; i < rowCount; i++) {
+                const start = offsetsArr[i];
+                const end = offsetsArr[i + 1];
+                strings[i] = decoder.decode(bytesArr.subarray(start, end));
+              }
+              decodedData[name] = strings;
+            } else if (Array.isArray(col)) {
+              decodedData[name] = col;
+            } else if (col && typeof col === "object") {
+              // Handle plain object with numeric keys (serialized array)
+              decodedData[name] = Object.values(col);
+            } else {
+              decodedData[name] = col;
+            }
+          }
           Object.defineProperty(result, "rows", {
             configurable: true,
             enumerable: true,
             get() {
               const rows = new Array(rowCount);
-              const colArrays = columns.map((name) => colData[name]);
+              const colArrays = columns.map((name) => decodedData[name]);
               for (let i = 0; i < rowCount; i++) {
                 const row = {};
                 for (let j = 0; j < columns.length; j++) {
-                  row[columns[j]] = colArrays[j][i];
+                  row[columns[j]] = colArrays[j] ? colArrays[j][i] : undefined;
                 }
                 rows[i] = row;
               }
@@ -6092,7 +6120,7 @@ var init_lanceql = __esm({
        */
       async openDataset(baseUrl, options = {}) {
         await getWebGPUAccelerator().init();
-        return await RemoteLanceDataset.open(proxy, baseUrl, options);
+        return await RemoteLanceDataset2.open(proxy, baseUrl, options);
       },
       /**
        * Parse footer from Lance file data.
@@ -6155,7 +6183,15 @@ var init_lanceql = __esm({
       static async load(wasmPath = "./lanceql.wasm") {
         const response = await fetch(wasmPath);
         const wasmBytes = await response.arrayBuffer();
-        const wasmModule = await WebAssembly.instantiate(wasmBytes, {});
+        const wasmModule = await WebAssembly.instantiate(wasmBytes, {
+      env: {
+        opfs_open: (ptr, len) => 0,
+        opfs_read: (h, p, l, o) => 0,
+        opfs_size: (handle) => 0n,
+        opfs_close: (handle) => {},
+        js_log: (ptr, len) => {}
+      }
+    });
         _w = wasmModule.instance.exports;
         _m = _w.memory;
         let _methods = null;
@@ -7559,7 +7595,7 @@ var PureLanceWriter2 = class {
     currentOffset += offsetTableBytes.length;
     const globalBuffOffsetsStart = currentOffset;
     const numGlobalBuffers = 0;
-    const footer = new ArrayBuffer(LANCE_FOOTER_SIZE);
+    const footer = new ArrayBuffer(40);
     const footerView = new DataView(footer);
     footerView.setBigUint64(0, BigInt(columnMetaStart), true);
     footerView.setBigUint64(8, BigInt(columnMetaOffsetsStart), true);
@@ -7568,9 +7604,9 @@ var PureLanceWriter2 = class {
     footerView.setUint32(28, this.columns.length, true);
     footerView.setUint16(32, this.majorVersion, true);
     footerView.setUint16(34, this.minorVersion, true);
-    new Uint8Array(footer, 36, 4).set(LANCE_MAGIC);
+    new Uint8Array(footer, 36, 4).set(LANCE_MAGIC2);
     chunks.push(new Uint8Array(footer));
-    const totalSize = currentOffset + LANCE_FOOTER_SIZE;
+    const totalSize = currentOffset + 40;
     const result = new Uint8Array(totalSize);
     let writeOffset = 0;
     for (const chunk of chunks) {
@@ -10593,7 +10629,8 @@ function evaluateExpr(executor, expr, columnData, rowIdx) {
     case "literal":
       return expr.value;
     case "column": {
-      const data = columnData[expr.name.toLowerCase()];
+      const colName = (expr.name || expr.column || "").toLowerCase();
+      const data = columnData[colName];
       return data ? data[rowIdx] : null;
     }
     case "star":
@@ -10812,7 +10849,7 @@ function collectColumnsFromExpr2(expr, columns) {
   if (!expr) return;
   switch (expr.type) {
     case "column":
-      columns.add(expr.name.toLowerCase());
+      columns.add((expr.name || expr.column || "").toLowerCase());
       break;
     case "binary":
       collectColumnsFromExpr2(expr.left, columns);
@@ -14724,11 +14761,7 @@ var MemoryTable = class {
    * Convert to in-memory data format for executor
    */
   toInMemoryData() {
-    const columnData = {};
-    this.columns.forEach((col, idx) => {
-      columnData[col.toLowerCase()] = this.rows.map((row) => row[idx]);
-    });
-    return { columnData, columnNames: this.columns };
+    return { columns: this.columns, rows: this.rows };
   }
 };
 function executeCreateTable(db, ast) {
@@ -16146,7 +16179,7 @@ var Vault = class {
     if (!dataResult || !dataResult.rows || dataResult.rows.length === 0) {
       throw new Error(`Table '${tableName}' is empty`);
     }
-    const writer = new PureLanceWriter();
+    const writer = new PureLanceWriter2();
     const columns = dataResult.columns;
     const rows = dataResult.rows;
     for (let colIdx = 0; colIdx < columns.length; colIdx++) {
