@@ -17,6 +17,26 @@ Query Lance columnar files in the browser with SQL and vector search. No server 
 npm install lanceql
 ```
 
+## Quick Start - Local SQL Database
+
+Create a persistent SQL database in the browser with just 4 lines:
+
+```javascript
+import { vault } from 'lanceql';
+
+const v = await vault();
+await v.exec('CREATE TABLE users (id INT, name TEXT)');
+await v.exec("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')");
+const result = await v.query('SELECT * FROM users');
+// → { columns: ['id', 'name'], rows: [[1, 'Alice'], [2, 'Bob']] }
+```
+
+**Features:**
+- **OPFS-backed** - Data persists across browser sessions
+- **Full SQL** - JOINs, GROUP BY, window functions, CTEs
+- **Time Travel** - Query historical versions with `VERSION AS OF`
+- **Vector Search** - Semantic search with `NEAR` clause
+
 ## Quick Start - CSS-Driven (Zero JavaScript)
 
 ```html

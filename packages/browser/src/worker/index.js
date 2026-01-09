@@ -14,10 +14,13 @@ import { WorkerStore } from './worker-store.js';
 import { WorkerDatabase } from './worker-database.js';
 import { WorkerVault } from './worker-vault.js';
 
-
 import { BufferPool } from './buffer-pool.js';
 import { getWasmSqlExecutor } from './wasm-sql-bridge.js';
 import { E } from './data-types.js';
+
+// SQL Parser for intercepting time travel commands
+import { SQLLexer } from '../client/sql/lexer.js';
+import { SQLParser } from '../client/sql/parser.js';
 
 // ============================================================================
 // WASM SQL Execution (execute queries entirely in WASM for zero-copy transfer)
@@ -694,14 +697,69 @@ async function handleMessage(port, data) {
         } else if (method === 'db:exec') {
             const db = await getDatabase(args.db);
 
-            // Try WASM SQL executor first for SELECT queries on large tables
-            const executor = getWasmSqlExecutor();
-            const tableNames = executor.getTableNames(args.sql);
-            const primaryTable = tableNames[0] ? db.tables.get(tableNames[0]) : null;
-            const rowCount = primaryTable ? primaryTable.rowCount : 0;
+            // Parse SQL to check for time travel commands
+            const lexer = new SQLLexer(args.sql);
+            const tokens = lexer.tokenize();
+            const parser = new SQLParser(tokens);
+            const ast = parser.parse();
 
-            // Always use WASM SQL executor (including DDL/DML)
-            result = await executeWasmSqlFull(db, args.sql);
+            // Handle time travel commands
+            if (ast.type === 'SHOW_VERSIONS') {
+                const versions = await db.listVersions(ast.table);
+                result = {
+                    _format: 'columnar',
+                    columns: ['version', 'timestamp', 'operation', 'rowCount'],
+                    rowCount: versions.length,
+                    data: {
+                        version: new Float64Array(versions.map(v => v.version)),
+                        timestamp: versions.map(v => new Date(v.timestamp).toISOString()),
+                        operation: versions.map(v => v.operation),
+                        rowCount: new Float64Array(versions.map(v => v.rowCount))
+                    }
+                };
+            } else if (ast.type === 'RESTORE_TABLE') {
+                const restoreResult = await db.restoreToVersion(ast.table, ast.version);
+                result = {
+                    _format: 'columnar',
+                    columns: ['status', 'newVersion'],
+                    rowCount: 1,
+                    data: {
+                        status: ['restored'],
+                        newVersion: new Float64Array([restoreResult.newVersion])
+                    }
+                };
+            } else if (ast.type === 'SELECT' && ast.from?.asOfVersion) {
+                // SELECT with VERSION AS OF - route to selectAtVersion
+                const rows = await db.selectAtVersion(ast.from.name || ast.from.table, ast.from.asOfVersion, {
+                    limit: ast.limit,
+                    offset: ast.offset
+                });
+                // Convert rows to columnar format
+                if (rows.length > 0) {
+                    const columns = Object.keys(rows[0]);
+                    const data = {};
+                    for (const col of columns) {
+                        data[col] = rows.map(r => r[col]);
+                    }
+                    result = {
+                        _format: 'columnar',
+                        columns,
+                        rowCount: rows.length,
+                        data
+                    };
+                } else {
+                    result = { _format: 'columnar', columns: [], rowCount: 0, data: {} };
+                }
+            } else {
+                // Standard SQL - use WASM executor
+                const executor = getWasmSqlExecutor();
+                const tableNames = executor.getTableNames(args.sql);
+                const primaryTable = tableNames[0] ? db.tables.get(tableNames[0]) : null;
+                const rowCount = primaryTable ? primaryTable.rowCount : 0;
+
+                // Always use WASM SQL executor (including DDL/DML)
+                result = await executeWasmSqlFull(db, args.sql);
+            }
 
             // For large results (>= 100k rows), use lazy transfer - store data in worker, return handle
             // This avoids blocking the main thread with massive message deserialization
@@ -738,6 +796,21 @@ async function handleMessage(port, data) {
             const db = await getDatabase(args.db);
             result = db.scanNext(args.streamId);
         }
+        // Time travel (versioning) operations
+        else if (method === 'db:listVersions') {
+            const db = await getDatabase(args.db);
+            result = await db.listVersions(args.tableName);
+        } else if (method === 'db:selectAtVersion') {
+            const db = await getDatabase(args.db);
+            const options = { ...args.options };
+            if (args.where) {
+                options.where = (row) => evalWhere(args.where, row);
+            }
+            result = await db.selectAtVersion(args.tableName, args.version, options);
+        } else if (method === 'db:restoreTable') {
+            const db = await getDatabase(args.db);
+            result = await db.restoreToVersion(args.tableName, args.version);
+        }
         // Vault operations
         else if (method === 'vault:open') {
             await getVault(args.encryption);
@@ -756,15 +829,71 @@ async function handleMessage(port, data) {
             result = await (await getVault()).has(args.key);
         } else if (method === 'vault:exec') {
             const vault = await getVault();
+            const db = vault._db;
 
-            // Try WASM SQL executor first for SELECT queries on large tables
-            const executor = getWasmSqlExecutor();
-            const tableNames = executor.getTableNames(args.sql);
-            const primaryTable = tableNames[0] ? vault._db.tables.get(tableNames[0]) : null;
-            const rowCount = primaryTable ? primaryTable.rowCount : 0;
+            // Parse SQL to check for time travel commands
+            const lexer = new SQLLexer(args.sql);
+            const tokens = lexer.tokenize();
+            const parser = new SQLParser(tokens);
+            const ast = parser.parse();
 
-            // Always use WASM SQL executor (including DDL/DML)
-            result = await executeWasmSqlFull(vault._db, args.sql);
+            // Handle time travel commands
+            if (ast.type === 'SHOW_VERSIONS') {
+                const versions = await db.listVersions(ast.table);
+                result = {
+                    _format: 'columnar',
+                    columns: ['version', 'timestamp', 'operation', 'rowCount'],
+                    rowCount: versions.length,
+                    data: {
+                        version: new Float64Array(versions.map(v => v.version)),
+                        timestamp: versions.map(v => new Date(v.timestamp).toISOString()),
+                        operation: versions.map(v => v.operation),
+                        rowCount: new Float64Array(versions.map(v => v.rowCount))
+                    }
+                };
+            } else if (ast.type === 'RESTORE_TABLE') {
+                const restoreResult = await db.restoreToVersion(ast.table, ast.version);
+                result = {
+                    _format: 'columnar',
+                    columns: ['status', 'newVersion'],
+                    rowCount: 1,
+                    data: {
+                        status: ['restored'],
+                        newVersion: new Float64Array([restoreResult.newVersion])
+                    }
+                };
+            } else if (ast.type === 'SELECT' && ast.from?.asOfVersion) {
+                // SELECT with VERSION AS OF - route to selectAtVersion
+                const rows = await db.selectAtVersion(ast.from.name || ast.from.table, ast.from.asOfVersion, {
+                    limit: ast.limit,
+                    offset: ast.offset
+                });
+                // Convert rows to columnar format
+                if (rows.length > 0) {
+                    const columns = Object.keys(rows[0]);
+                    const data = {};
+                    for (const col of columns) {
+                        data[col] = rows.map(r => r[col]);
+                    }
+                    result = {
+                        _format: 'columnar',
+                        columns,
+                        rowCount: rows.length,
+                        data
+                    };
+                } else {
+                    result = { _format: 'columnar', columns: [], rowCount: 0, data: {} };
+                }
+            } else {
+                // Standard SQL - use WASM executor
+                const executor = getWasmSqlExecutor();
+                const tableNames = executor.getTableNames(args.sql);
+                const primaryTable = tableNames[0] ? db.tables.get(tableNames[0]) : null;
+                const rowCount = primaryTable ? primaryTable.rowCount : 0;
+
+                // Always use WASM SQL executor (including DDL/DML)
+                result = await executeWasmSqlFull(db, args.sql);
+            }
 
             // For large results (>= 100k rows), use lazy transfer
             if (result && result._format === 'columnar' && result.rowCount >= 100000) {

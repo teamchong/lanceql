@@ -617,3 +617,145 @@ test.describe.serial('Module Loading (Browser)', () => {
     });
 
 });
+
+test.describe('Time Travel SQL (Browser)', () => {
+    test('lexer tokenizes VERSION AS OF', async ({ page }) => {
+        await page.goto('/examples/wasm/test-vault-sql.html');
+
+        const result = await page.evaluate(async () => {
+            const { SQLLexer } = await import('./src/client/sql/lexer.js');
+            const lexer = new SQLLexer('SELECT * FROM users VERSION AS OF 5');
+            const tokens = lexer.tokenize();
+            return {
+                hasVersion: tokens.some(t => t.type === 'VERSION'),
+                hasAs: tokens.some(t => t.type === 'AS'),
+                hasNumber: tokens.some(t => t.type === 'NUMBER' && t.value === '5')
+            };
+        });
+
+        expect(result.hasVersion).toBe(true);
+        expect(result.hasAs).toBe(true);
+        expect(result.hasNumber).toBe(true);
+    });
+
+    test('lexer tokenizes SHOW VERSIONS', async ({ page }) => {
+        await page.goto('/examples/wasm/test-vault-sql.html');
+
+        const result = await page.evaluate(async () => {
+            const { SQLLexer } = await import('./src/client/sql/lexer.js');
+            const lexer = new SQLLexer('SHOW VERSIONS FROM users');
+            const tokens = lexer.tokenize();
+            return {
+                hasShow: tokens.some(t => t.type === 'SHOW'),
+                hasVersions: tokens.some(t => t.type === 'VERSIONS'),
+                hasFrom: tokens.some(t => t.type === 'FROM')
+            };
+        });
+
+        expect(result.hasShow).toBe(true);
+        expect(result.hasVersions).toBe(true);
+        expect(result.hasFrom).toBe(true);
+    });
+
+    test('lexer tokenizes RESTORE TABLE', async ({ page }) => {
+        await page.goto('/examples/wasm/test-vault-sql.html');
+
+        const result = await page.evaluate(async () => {
+            const { SQLLexer } = await import('./src/client/sql/lexer.js');
+            const lexer = new SQLLexer('RESTORE TABLE users TO VERSION 3');
+            const tokens = lexer.tokenize();
+            return {
+                hasRestore: tokens.some(t => t.type === 'RESTORE'),
+                hasTable: tokens.some(t => t.type === 'TABLE'),
+                hasTo: tokens.some(t => t.type === 'TO'),
+                hasVersion: tokens.some(t => t.type === 'VERSION')
+            };
+        });
+
+        expect(result.hasRestore).toBe(true);
+        expect(result.hasTable).toBe(true);
+        expect(result.hasTo).toBe(true);
+        expect(result.hasVersion).toBe(true);
+    });
+
+    test('parser parses SELECT with VERSION AS OF', async ({ page }) => {
+        await page.goto('/examples/wasm/test-vault-sql.html');
+
+        const result = await page.evaluate(async () => {
+            const { SQLLexer } = await import('./src/client/sql/lexer.js');
+            const { SQLParser } = await import('./src/client/sql/parser.js');
+            const lexer = new SQLLexer('SELECT * FROM users VERSION AS OF 5');
+            const tokens = lexer.tokenize();
+            const parser = new SQLParser(tokens);
+            const ast = parser.parse();
+            return {
+                type: ast.type,
+                tableName: ast.from?.name || ast.from?.table,
+                asOfVersion: ast.from?.asOfVersion
+            };
+        });
+
+        expect(result.type).toBe('SELECT');
+        expect(result.tableName).toBe('users');
+        expect(result.asOfVersion).toBe(5);
+    });
+
+    test('parser parses SHOW VERSIONS FROM table', async ({ page }) => {
+        await page.goto('/examples/wasm/test-vault-sql.html');
+
+        const result = await page.evaluate(async () => {
+            const { SQLLexer } = await import('./src/client/sql/lexer.js');
+            const { SQLParser } = await import('./src/client/sql/parser.js');
+            const lexer = new SQLLexer('SHOW VERSIONS FROM users');
+            const tokens = lexer.tokenize();
+            const parser = new SQLParser(tokens);
+            const ast = parser.parse();
+            return { type: ast.type, table: ast.table };
+        });
+
+        expect(result.type).toBe('SHOW_VERSIONS');
+        expect(result.table).toBe('users');
+    });
+
+    test('parser parses RESTORE TABLE TO VERSION', async ({ page }) => {
+        await page.goto('/examples/wasm/test-vault-sql.html');
+
+        const result = await page.evaluate(async () => {
+            const { SQLLexer } = await import('./src/client/sql/lexer.js');
+            const { SQLParser } = await import('./src/client/sql/parser.js');
+            const lexer = new SQLLexer('RESTORE TABLE users TO VERSION 3');
+            const tokens = lexer.tokenize();
+            const parser = new SQLParser(tokens);
+            const ast = parser.parse();
+            return { type: ast.type, table: ast.table, version: ast.version };
+        });
+
+        expect(result.type).toBe('RESTORE_TABLE');
+        expect(result.table).toBe('users');
+        expect(result.version).toBe(3);
+    });
+
+    test('parser handles VERSION AS OF with table alias', async ({ page }) => {
+        await page.goto('/examples/wasm/test-vault-sql.html');
+
+        const result = await page.evaluate(async () => {
+            const { SQLLexer } = await import('./src/client/sql/lexer.js');
+            const { SQLParser } = await import('./src/client/sql/parser.js');
+            const lexer = new SQLLexer('SELECT * FROM users u VERSION AS OF 10');
+            const tokens = lexer.tokenize();
+            const parser = new SQLParser(tokens);
+            const ast = parser.parse();
+            return {
+                type: ast.type,
+                tableName: ast.from?.name || ast.from?.table,
+                alias: ast.from?.alias,
+                asOfVersion: ast.from?.asOfVersion
+            };
+        });
+
+        expect(result.type).toBe('SELECT');
+        expect(result.tableName).toBe('users');
+        expect(result.alias).toBe('u');
+        expect(result.asOfVersion).toBe(10);
+    });
+});

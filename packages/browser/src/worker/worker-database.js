@@ -43,6 +43,15 @@ export class WorkerDatabase {
             const manifest = JSON.parse(D.decode(manifestData));
             this.version = manifest.version || 0;
             this.tables = new Map(Object.entries(manifest.tables || {}));
+
+            // Migrate legacy tables to versioned format
+            for (const [tableName, tableState] of this.tables) {
+                const hasVersions = await this._getLatestVersion(tableName);
+                if (hasVersions === 0 && tableState.fragments?.length > 0) {
+                    // Create version 1 from current state (migration)
+                    await this._createVersion(tableName, 'MIGRATE');
+                }
+            }
         }
         return this;
     }
@@ -57,6 +66,203 @@ export class WorkerDatabase {
         const data = E.encode(JSON.stringify(manifest));
         await opfsStorage.save(this.manifestKey, data);
     }
+
+    // ==================== Time Travel (Versioning) ====================
+
+    /**
+     * Get the latest version number for a table
+     */
+    async _getLatestVersion(tableName) {
+        const path = `${this.name}/${tableName}/_latest`;
+        try {
+            const data = await opfsStorage.load(path);
+            if (!data) return 0;
+            return parseInt(D.decode(data), 10);
+        } catch {
+            return 0;
+        }
+    }
+
+    /**
+     * Set the latest version number for a table
+     */
+    async _setLatestVersion(tableName, version) {
+        const path = `${this.name}/${tableName}/_latest`;
+        await opfsStorage.save(path, E.encode(String(version)));
+    }
+
+    /**
+     * Load a specific version's manifest
+     */
+    async _loadTableVersion(tableName, version) {
+        const path = `${this.name}/${tableName}/_versions/${version}.manifest`;
+        const data = await opfsStorage.load(path);
+        if (!data) {
+            throw new Error(`Version ${version} not found for table '${tableName}'`);
+        }
+        return JSON.parse(D.decode(data));
+    }
+
+    /**
+     * Save a version manifest
+     */
+    async _saveTableVersion(tableName, versionManifest) {
+        const path = `${this.name}/${tableName}/_versions/${versionManifest.version}.manifest`;
+        await opfsStorage.save(path, E.encode(JSON.stringify(versionManifest)));
+    }
+
+    /**
+     * Create a new version for a table
+     */
+    async _createVersion(tableName, operation) {
+        const table = this.tables.get(tableName);
+        if (!table) return 0;
+
+        const currentVersion = await this._getLatestVersion(tableName);
+        const newVersion = currentVersion + 1;
+
+        const versionManifest = {
+            version: newVersion,
+            timestamp: Date.now(),
+            parentVersion: currentVersion,
+            operation,
+            schema: table.schema,
+            fragments: [...table.fragments],
+            deletionVector: [...table.deletionVector],
+            rowCount: table.rowCount,
+            nextRowId: table.nextRowId
+        };
+
+        await this._saveTableVersion(tableName, versionManifest);
+        await this._setLatestVersion(tableName, newVersion);
+        return newVersion;
+    }
+
+    /**
+     * List all versions for a table
+     */
+    async listVersions(tableName) {
+        const latest = await this._getLatestVersion(tableName);
+        const versions = [];
+        for (let v = 1; v <= latest; v++) {
+            try {
+                const manifest = await this._loadTableVersion(tableName, v);
+                versions.push({
+                    version: manifest.version,
+                    timestamp: manifest.timestamp,
+                    operation: manifest.operation,
+                    rowCount: manifest.rowCount
+                });
+            } catch {
+                // Version file missing, skip
+            }
+        }
+        return versions;
+    }
+
+    /**
+     * Select data at a specific version (time travel)
+     */
+    async selectAtVersion(tableName, version, options = {}) {
+        const versionManifest = await this._loadTableVersion(tableName, version);
+        const deletedSet = new Set(versionManifest.deletionVector);
+        const table = this.tables.get(tableName);
+
+        // Load rows from version's fragments
+        const rows = [];
+        for (const fragPath of versionManifest.fragments) {
+            const fragData = await opfsStorage.load(fragPath);
+            if (fragData) {
+                const fragRows = this._parseFragment(fragData, versionManifest.schema);
+                for (const row of fragRows) {
+                    if (!deletedSet.has(row.__rowId)) {
+                        rows.push(row);
+                    }
+                }
+            }
+        }
+
+        // Apply options (WHERE, ORDER BY, LIMIT, OFFSET, columns)
+        let result = rows;
+
+        if (options.where) {
+            result = result.filter(options.where);
+        }
+
+        if (options.orderBy) {
+            const { column, desc } = options.orderBy;
+            result.sort((a, b) => {
+                const cmp = a[column] < b[column] ? -1 : a[column] > b[column] ? 1 : 0;
+                return desc ? -cmp : cmp;
+            });
+        }
+
+        if (options.offset) {
+            result = result.slice(options.offset);
+        }
+
+        if (options.limit) {
+            result = result.slice(0, options.limit);
+        }
+
+        // Column projection and __rowId removal
+        const projectCols = options.columns && options.columns.length > 0 && options.columns[0] !== '*'
+            ? options.columns : null;
+
+        return result.map(row => {
+            if (projectCols) {
+                const projected = {};
+                for (const col of projectCols) {
+                    projected[col] = row[col];
+                }
+                return projected;
+            } else {
+                const { __rowId, ...rest } = row;
+                return rest;
+            }
+        });
+    }
+
+    /**
+     * Restore table to a previous version (creates a new version)
+     */
+    async restoreToVersion(tableName, targetVersion) {
+        const targetManifest = await this._loadTableVersion(tableName, targetVersion);
+        const currentVersion = await this._getLatestVersion(tableName);
+        const newVersion = currentVersion + 1;
+
+        // Create new version with target's state
+        const restoredManifest = {
+            ...targetManifest,
+            version: newVersion,
+            timestamp: Date.now(),
+            parentVersion: currentVersion,
+            operation: `RESTORE_FROM_${targetVersion}`
+        };
+
+        await this._saveTableVersion(tableName, restoredManifest);
+        await this._setLatestVersion(tableName, newVersion);
+
+        // Update in-memory state
+        const table = this.tables.get(tableName);
+        if (table) {
+            table.fragments = [...targetManifest.fragments];
+            table.deletionVector = [...targetManifest.deletionVector];
+            table.rowCount = targetManifest.rowCount;
+            table.nextRowId = targetManifest.nextRowId;
+
+            // Clear write buffer
+            this._columnarBuffer.delete(tableName);
+            this._writeBuffer.delete(tableName);
+
+            // Save to global manifest
+            await this._saveManifest();
+        }
+
+        return { restored: true, newVersion };
+    }
+
+    // ==================== End Time Travel ====================
 
     async createTable(tableName, columns, ifNotExists = false) {
         if (this.tables.has(tableName)) {
@@ -86,6 +292,9 @@ export class WorkerDatabase {
 
         this.tables.set(tableName, tableState);
         await this._saveManifest();
+
+        // Create version 1 for new table (CREATE operation)
+        await this._createVersion(tableName, 'CREATE');
 
         return { success: true, table: tableName };
     }
@@ -276,6 +485,9 @@ export class WorkerDatabase {
 
         table.fragments.push(fragKey);
         await this._saveManifest();
+
+        // Create a new version for this flush (INSERT operation)
+        await this._createVersion(tableName, 'INSERT');
     }
 
     async delete(tableName, predicateFn) {
@@ -327,6 +539,11 @@ export class WorkerDatabase {
         table.version = (table.version || 0) + 1;
         await this._saveManifest();
 
+        // Create a new version for this delete operation
+        if (deletedCount > 0) {
+            await this._createVersion(tableName, 'DELETE');
+        }
+
         return { success: true, deleted: deletedCount };
     }
 
@@ -373,6 +590,12 @@ export class WorkerDatabase {
             await this.insert(tableName, persistedUpdates);
         } else {
             await this._saveManifest();
+        }
+
+        // Create a new version for this update operation
+        // Note: insert already creates a version, so only create if no inserts
+        if (updatedCount > 0 && persistedUpdates.length === 0) {
+            await this._createVersion(tableName, 'UPDATE');
         }
 
         return { success: true, updated: updatedCount };
@@ -440,6 +663,12 @@ export class WorkerDatabase {
             await this.insert(tableName, persistedUpdates);
         } else {
             await this._saveManifest();
+        }
+
+        // Create a new version for this update operation
+        // Note: insert already creates a version, so only create if no inserts
+        if (updatedCount > 0 && persistedUpdates.length === 0) {
+            await this._createVersion(tableName, 'UPDATE');
         }
 
         return { success: true, updated: updatedCount };

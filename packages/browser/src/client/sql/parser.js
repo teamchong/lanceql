@@ -74,8 +74,12 @@ class SQLParser {
             return this.parseCreateTable();
         } else if (this.check(TokenType.DROP)) {
             return this.parseDropTable();
+        } else if (this.check(TokenType.SHOW)) {
+            return this.parseShowVersions();
+        } else if (this.check(TokenType.RESTORE)) {
+            return this.parseRestoreTable();
         } else {
-            throw new Error(`Unexpected token: ${this.current().type}. Expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, or EXPLAIN`);
+            throw new Error(`Unexpected token: ${this.current().type}. Expected SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, SHOW, RESTORE, or EXPLAIN`);
         }
     }
 
@@ -482,8 +486,19 @@ class SQLParser {
         if (from) {
             if (this.match(TokenType.AS)) {
                 from.alias = this.expect(TokenType.IDENTIFIER).value;
-            } else if (this.check(TokenType.IDENTIFIER) && !this.check(TokenType.WHERE, TokenType.ORDER, TokenType.LIMIT, TokenType.TOPK, TokenType.GROUP, TokenType.NEAR, TokenType.JOIN, TokenType.INNER, TokenType.LEFT, TokenType.RIGHT, TokenType.COMMA)) {
+            } else if (this.check(TokenType.IDENTIFIER) && !this.check(TokenType.WHERE, TokenType.ORDER, TokenType.LIMIT, TokenType.TOPK, TokenType.GROUP, TokenType.NEAR, TokenType.JOIN, TokenType.INNER, TokenType.LEFT, TokenType.RIGHT, TokenType.COMMA, TokenType.VERSION)) {
                 from.alias = this.advance().value;
+            }
+
+            // VERSION AS OF <number> - time travel for local tables
+            if (this.match(TokenType.VERSION)) {
+                this.expect(TokenType.AS);
+                // OF is not a keyword, check for identifier "OF"
+                const ofToken = this.expect(TokenType.IDENTIFIER);
+                if (ofToken.value.toUpperCase() !== 'OF') {
+                    throw new Error(`Expected OF after VERSION AS, got ${ofToken.value}`);
+                }
+                from.asOfVersion = parseInt(this.expect(TokenType.NUMBER).value, 10);
             }
         }
 
@@ -561,6 +576,30 @@ class SQLParser {
     // Window function OVER clause - delegate to parser-advanced.js
     parseOverClause() {
         return Advanced.parseOverClause(this);
+    }
+
+    /**
+     * Parse SHOW VERSIONS FROM <table>
+     */
+    parseShowVersions() {
+        this.expect(TokenType.SHOW);
+        this.expect(TokenType.VERSIONS);
+        this.expect(TokenType.FROM);
+        const table = this.expect(TokenType.IDENTIFIER).value;
+        return { type: 'SHOW_VERSIONS', table };
+    }
+
+    /**
+     * Parse RESTORE TABLE <table> TO VERSION <number>
+     */
+    parseRestoreTable() {
+        this.expect(TokenType.RESTORE);
+        this.expect(TokenType.TABLE);
+        const table = this.expect(TokenType.IDENTIFIER).value;
+        this.expect(TokenType.TO);
+        this.expect(TokenType.VERSION);
+        const version = parseInt(this.expect(TokenType.NUMBER).value, 10);
+        return { type: 'RESTORE_TABLE', table, version };
     }
 }
 

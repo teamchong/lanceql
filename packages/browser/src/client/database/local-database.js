@@ -654,6 +654,51 @@ class LocalDatabase {
         await this._ensureOpen();
         await this.flush();
     }
+
+    // ==================== Time Travel (Versioning) ====================
+
+    /**
+     * List all versions for a table
+     * @param {string} tableName - Table name
+     * @returns {Promise<Array<{version: number, timestamp: number, operation: string, rowCount: number}>>}
+     */
+    async listVersions(tableName) {
+        await this._ensureOpen();
+        return workerRPC('db:listVersions', { db: this.name, tableName });
+    }
+
+    /**
+     * SELECT at a specific version (time travel)
+     * @param {string} tableName - Table name
+     * @param {number} version - Version number to query
+     * @param {Object} options - Query options {columns, where, limit, offset, orderBy}
+     * @returns {Promise<Array>}
+     */
+    async selectAtVersion(tableName, version, options = {}) {
+        await this._ensureOpen();
+
+        const rpcOptions = { ...options };
+        delete rpcOptions.where;
+
+        return workerRPC('db:selectAtVersion', {
+            db: this.name,
+            tableName,
+            version,
+            options: rpcOptions,
+            where: options.whereAST || null
+        });
+    }
+
+    /**
+     * Restore table to a previous version (creates new version with old state)
+     * @param {string} tableName - Table name
+     * @param {number} version - Version number to restore to
+     * @returns {Promise<{restored: boolean, newVersion: number}>}
+     */
+    async restoreToVersion(tableName, version) {
+        await this._ensureOpen();
+        return workerRPC('db:restoreTable', { db: this.name, tableName, version });
+    }
 }
 
 
