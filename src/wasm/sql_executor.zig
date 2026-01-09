@@ -1585,6 +1585,18 @@ fn evaluateScalarFloat(table: *const TableInfo, expr: *const SelectExpr, idx: u3
 }
 
 fn evaluateScalarString(table: *const TableInfo, expr: *const SelectExpr, idx: u32, context: *?FragmentContext, arg1_col: ?*const ColumnData) []const u8 {
+    // Handle simple column reference (func == .none and col_name is set)
+    if (expr.func == .none and expr.col_name.len > 0) {
+        for (table.columns[0..table.column_count]) |maybe_col| {
+            if (maybe_col) |*c| {
+                if (std.mem.eql(u8, c.name, expr.col_name) and c.col_type == .string) {
+                    return getStringValueOptimized(table, c, idx, context);
+                }
+            }
+        }
+        return "";
+    }
+
     // Resolve Arg 1 String - check for nested function first
     var s1: []const u8 = "";
     if (arg1_col) |col| {
@@ -5158,14 +5170,70 @@ fn executeVectorSearch(table: *const TableInfo, near: *const WhereClause, limit:
     return result_count;
 }
 
+/// Match if cell contains ANY word from search text (case-insensitive)
+fn textNearMatches(cell_text: []const u8, search_text: []const u8) bool {
+    var iter = std.mem.splitScalar(u8, search_text, ' ');
+    while (iter.next()) |word| {
+        if (word.len > 0 and containsIgnoreCase(cell_text, word)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Case-insensitive substring search
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+
+    var i: usize = 0;
+    while (i <= haystack.len - needle.len) : (i += 1) {
+        var match = true;
+        for (needle, 0..) |nc, j| {
+            const hc = haystack[i + j];
+            if (std.ascii.toLower(hc) != std.ascii.toLower(nc)) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
 fn resolveNearClauses(table: *const TableInfo, where: *WhereClause, limit: usize) !void {
     if (where.op == .near) {
-        // Check for text-based NEAR that requires embedding model
-        if (where.is_text_near) {
-            setError("NEAR with text requires embedding model - no model loaded");
-            return error.NoModelLoaded;
-        }
         if (!where.is_near_evaluated) {
+            // Text-based NEAR - do simple substring matching
+            if (where.is_text_near and where.value_str != null) {
+                const search_text = where.value_str.?;
+                const col_name = where.column orelse return;
+                const col = findTableColumn(table, col_name) orelse return;
+
+                const top_k = if (limit > 0) limit else MAX_ROWS;
+                const alloc_size = @min(top_k, MAX_ROWS);
+                const match_ptr = memory.wasmAlloc(alloc_size * 4) orelse return error.OutOfMemory;
+                const matches = @as([*]u32, @ptrCast(@alignCast(match_ptr)))[0..alloc_size];
+
+                var ctx: ?FragmentContext = null;
+                var match_count: usize = 0;
+
+                for (0..table.row_count) |i| {
+                    const idx: u32 = @intCast(i);
+                    const cell_text = getStringValueOptimized(table, col, idx, &ctx);
+                    if (textNearMatches(cell_text, search_text)) {
+                        matches[match_count] = idx;
+                        match_count += 1;
+                        if (match_count >= alloc_size) break;
+                    }
+                }
+
+                where.near_matches = matches[0..match_count];
+                where.is_near_evaluated = true;
+                return;
+            }
+
+            // Vector-based NEAR
             const top_k = if (limit > 0) limit else 10;
             const match_ptr = memory.wasmAlloc(top_k * 4) orelse return error.OutOfMemory;
             const matches = @as([*]u32, @ptrCast(@alignCast(match_ptr)))[0..top_k];
@@ -6949,6 +7017,13 @@ fn executeAggregateQuery(table: *const TableInfo, query: *const ParsedQuery) !vo
         return;
     }
 
+    // Resolve any NEAR clauses first (pre-calculate text/vector search results)
+    if (query.where_clause) |*where| {
+        const limit = if (query.top_k) |l| l else 20;
+        const mut_where = @constCast(where);
+        try resolveNearClauses(table, mut_where, limit);
+    }
+
     // Apply WHERE filter first
     const match_indices = &global_indices_1;
     var match_count: usize = 0;
@@ -7973,6 +8048,21 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
         }
     } else {
         survivor_count = num_groups;
+    }
+
+    // Handle empty result case early
+    if (survivor_count == 0) {
+        // Write empty result
+        _ = allocResultBuffer(HEADER_SIZE) orelse return error.OutOfMemory;
+        _ = writeU32(RESULT_VERSION);
+        _ = writeU32(0); // 0 columns
+        _ = writeU64(0); // 0 rows
+        _ = writeU32(HEADER_SIZE);
+        _ = writeU32(HEADER_SIZE);
+        _ = writeU32(HEADER_SIZE);
+        _ = writeU32(0);
+        _ = writeU32(HEADER_SIZE);
+        return;
     }
 
     // Use Lance Writer
@@ -9196,6 +9286,181 @@ fn findUnionAllPos(sql: []const u8) ?usize {
     return null;
 }
 
+/// Get string column value from one of two tables based on column name/alias for CTE recursion
+fn getJoinColStrValueForCte(
+    ptbl: *const TableInfo,
+    ctbl: *const TableInfo,
+    primary_idx: u32,
+    cte_idx: u32,
+    col_name: []const u8,
+    primary_alias: ?[]const u8,
+    cte_alias: ?[]const u8,
+    ctx: *?FragmentContext,
+) []const u8 {
+    // Parse table.column format
+    var tbl_prefix: ?[]const u8 = null;
+    var col_only: []const u8 = col_name;
+
+    if (std.mem.indexOf(u8, col_name, ".")) |dot_pos| {
+        tbl_prefix = col_name[0..dot_pos];
+        col_only = col_name[dot_pos + 1 ..];
+    }
+
+    // Determine which table to read from
+    var use_primary = true;
+    if (tbl_prefix) |prefix| {
+        if (cte_alias) |ca| {
+            if (std.mem.eql(u8, prefix, ca)) use_primary = false;
+        }
+        if (std.mem.eql(u8, prefix, ctbl.name)) use_primary = false;
+    } else if (primary_alias) |_| {
+        // Check if column exists in primary table
+        var found_in_primary = false;
+        for (ptbl.columns[0..ptbl.column_count]) |maybe_c| {
+            if (maybe_c) |*c| {
+                if (std.mem.eql(u8, c.name, col_only)) {
+                    found_in_primary = true;
+                    break;
+                }
+            }
+        }
+        if (!found_in_primary) use_primary = false;
+    }
+
+    const tbl = if (use_primary) ptbl else ctbl;
+    const idx = if (use_primary) primary_idx else cte_idx;
+
+    // Find and return column string value
+    for (tbl.columns[0..tbl.column_count]) |maybe_c| {
+        if (maybe_c) |*c| {
+            if (std.mem.eql(u8, c.name, col_only)) {
+                if (c.col_type == .string) {
+                    return getStringValueOptimized(tbl, c, idx, ctx);
+                }
+                return "";
+            }
+        }
+    }
+    return "";
+}
+
+/// Get column value from one of two tables based on column name/alias for CTE recursion
+fn getJoinColValueForCte(
+    ptbl: *const TableInfo,
+    ctbl: *const TableInfo,
+    primary_idx: u32,
+    cte_idx: u32,
+    col_name: []const u8,
+    primary_alias: ?[]const u8,
+    cte_alias: ?[]const u8,
+) f64 {
+    // Parse table.column format
+    var tbl_prefix: ?[]const u8 = null;
+    var col_only: []const u8 = col_name;
+
+    if (std.mem.indexOf(u8, col_name, ".")) |dot_pos| {
+        tbl_prefix = col_name[0..dot_pos];
+        col_only = col_name[dot_pos + 1 ..];
+    }
+
+    // Determine which table to read from
+    var use_primary = true;
+    if (tbl_prefix) |prefix| {
+        if (cte_alias) |ca| {
+            if (std.mem.eql(u8, prefix, ca)) use_primary = false;
+        }
+        if (std.mem.eql(u8, prefix, ctbl.name)) use_primary = false;
+    } else if (primary_alias) |_| {
+        // Check if column exists in primary table
+        var found_in_primary = false;
+        for (ptbl.columns[0..ptbl.column_count]) |maybe_c| {
+            if (maybe_c) |*c| {
+                if (std.mem.eql(u8, c.name, col_only)) {
+                    found_in_primary = true;
+                    break;
+                }
+            }
+        }
+        if (!found_in_primary) use_primary = false;
+    }
+
+    const tbl = if (use_primary) ptbl else ctbl;
+    const idx = if (use_primary) primary_idx else cte_idx;
+
+    // Find and return column value
+    for (tbl.columns[0..tbl.column_count]) |maybe_c| {
+        if (maybe_c) |*c| {
+            if (std.mem.eql(u8, c.name, col_only)) {
+                return switch (c.col_type) {
+                    .float64 => c.data.float64[idx],
+                    .int64 => @floatFromInt(c.data.int64[idx]),
+                    .float32 => @floatCast(c.data.float32[idx]),
+                    .int32 => @floatFromInt(c.data.int32[idx]),
+                    else => 0,
+                };
+            }
+        }
+    }
+    return 0;
+}
+
+/// Evaluate expression with two table contexts for recursive CTE JOINs
+fn evaluateRecursiveExprForCte(
+    ptbl: *const TableInfo,
+    ctbl: *const TableInfo,
+    expr: *const SelectExpr,
+    primary_idx: u32,
+    cte_idx: u32,
+    primary_alias: ?[]const u8,
+    cte_alias: ?[]const u8,
+) f64 {
+    // Handle literal values first
+    if (expr.val_int) |v| {
+        if (expr.func == .none) return @floatFromInt(v);
+    }
+    if (expr.val_float) |v| {
+        if (expr.func == .none) return v;
+    }
+
+    // Handle column reference (no function)
+    if (expr.func == .none and expr.col_name.len > 0) {
+        return getJoinColValueForCte(ptbl, ctbl, primary_idx, cte_idx, expr.col_name, primary_alias, cte_alias);
+    }
+
+    // Handle binary operations (e.g., o.level + 1)
+    if (expr.func == .add or expr.func == .sub or expr.func == .mul or expr.func == .div) {
+        // Left operand - from col_name or val
+        const left_val = if (expr.col_name.len > 0)
+            getJoinColValueForCte(ptbl, ctbl, primary_idx, cte_idx, expr.col_name, primary_alias, cte_alias)
+        else if (expr.val_int) |v|
+            @as(f64, @floatFromInt(v))
+        else if (expr.val_float) |v|
+            v
+        else
+            0;
+
+        // Right operand - from arg_2_col or arg_2_val
+        const right_val = if (expr.arg_2_col) |col|
+            getJoinColValueForCte(ptbl, ctbl, primary_idx, cte_idx, col, primary_alias, cte_alias)
+        else if (expr.arg_2_val_int) |v|
+            @as(f64, @floatFromInt(v))
+        else if (expr.arg_2_val_float) |v|
+            v
+        else
+            0;
+
+        return switch (expr.func) {
+            .add => left_val + right_val,
+            .sub => left_val - right_val,
+            .mul => left_val * right_val,
+            .div => if (right_val != 0) left_val / right_val else 0,
+            else => 0,
+        };
+    }
+
+    return 0;
+}
+
 /// Materialize a recursive CTE (WITH RECURSIVE)
 fn materializeRecursiveCTE(cte_sql: []const u8, cte: *const CTEDef) !void {
     // Recursive CTEs have: base_case UNION ALL recursive_case
@@ -9221,9 +9486,14 @@ fn materializeRecursiveCTE(cte_sql: []const u8, cte: *const CTEDef) !void {
     }
 
     // Execute base case - allocate per-column buffers on heap
+    // Now we also track column types to support string columns
     var base_col_buffers: [MAX_COLUMNS]?[]f64 = .{null} ** MAX_COLUMNS;
+    var base_str_buffers: [MAX_COLUMNS]?[][]const u8 = .{null} ** MAX_COLUMNS;
+    var col_types: [MAX_COLUMNS]ColumnType = .{.float64} ** MAX_COLUMNS;
+
     for (0..col_count) |c| {
         base_col_buffers[c] = memory.wasm_allocator.alloc(f64, 256) catch return error.OutOfMemory;
+        base_str_buffers[c] = memory.wasm_allocator.alloc([]const u8, 256) catch return error.OutOfMemory;
     }
     var value_count: usize = 0;
 
@@ -9232,10 +9502,8 @@ fn materializeRecursiveCTE(cte_sql: []const u8, cte: *const CTEDef) !void {
         // Check for WHERE clause that eliminates all rows (e.g., WHERE 1 = 0)
         var where_is_false = false;
         if (base_query.where_clause) |*where| {
-            const col = where.column orelse "";
-            if (col.len == 0 and where.op == .eq) {
-                // No column reference - this is a literal comparison like WHERE 1 = 0
-                // For tableless queries, literal comparisons are always false
+            // Parser evaluates literal comparisons and sets .always_false
+            if (where.op == .always_false) {
                 where_is_false = true;
             }
         }
@@ -9263,6 +9531,20 @@ fn materializeRecursiveCTE(cte_sql: []const u8, cte: *const CTEDef) !void {
         }
 
         if (base_table) |tbl| {
+            // First pass: determine column types from source table
+            for (base_query.select_exprs[0..base_query.select_count], 0..) |expr, col_i| {
+                if (expr.func == .none and expr.col_name.len > 0) {
+                    for (tbl.columns[0..tbl.column_count]) |maybe_col| {
+                        if (maybe_col) |*src_col| {
+                            if (std.mem.eql(u8, src_col.name, expr.col_name)) {
+                                col_types[col_i] = src_col.col_type;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
             var ctx: ?FragmentContext = null;
             for (0..tbl.row_count) |ri| {
                 const row_idx: u32 = @intCast(ri);
@@ -9274,10 +9556,21 @@ fn materializeRecursiveCTE(cte_sql: []const u8, cte: *const CTEDef) !void {
 
                 // Collect column values into per-column buffers
                 for (base_query.select_exprs[0..base_query.select_count], 0..) |expr, col_i| {
-                    const val = evaluateScalarFloat(tbl, &expr, row_idx, &ctx, null, null);
-                    if (base_col_buffers[col_i]) |buf| {
-                        if (value_count < buf.len) {
-                            buf[value_count] = val;
+                    if (col_types[col_i] == .string) {
+                        // String column - use evaluateScalarString
+                        const str_val = evaluateScalarString(tbl, &expr, row_idx, &ctx, null);
+                        if (base_str_buffers[col_i]) |buf| {
+                            if (value_count < buf.len) {
+                                buf[value_count] = str_val;
+                            }
+                        }
+                    } else {
+                        // Numeric column
+                        const val = evaluateScalarFloat(tbl, &expr, row_idx, &ctx, null, null);
+                        if (base_col_buffers[col_i]) |buf| {
+                            if (value_count < buf.len) {
+                                buf[value_count] = val;
+                            }
                         }
                     }
                 }
@@ -9337,20 +9630,61 @@ fn materializeRecursiveCTE(cte_sql: []const u8, cte: *const CTEDef) !void {
     };
 
     // Allocate column data for base case (may have multiple rows)
+    // Now with proper column type support
     for (0..col_count) |c| {
-        const col_data = memory.wasm_allocator.alloc(f64, 1024) catch return error.OutOfMemory;
-        // Copy all base case rows for this column from the per-column buffer
-        if (base_col_buffers[c]) |buf| {
-            for (0..value_count) |r| {
-                col_data[r] = buf[r];
+        if (col_types[c] == .string) {
+            // String column - copy string slices
+            if (base_str_buffers[c]) |str_buf| {
+                // Calculate total string length
+                var total_len: usize = 0;
+                for (0..value_count) |r| {
+                    total_len += str_buf[r].len;
+                }
+
+                // Allocate string storage
+                const str_data = memory.wasm_allocator.alloc(u8, total_len) catch return error.OutOfMemory;
+                const str_offsets = memory.wasm_allocator.alloc(u32, value_count) catch return error.OutOfMemory;
+                const str_lengths = memory.wasm_allocator.alloc(u32, value_count) catch return error.OutOfMemory;
+
+                // Copy string data
+                var offset: usize = 0;
+                for (0..value_count) |r| {
+                    const s = str_buf[r];
+                    @memcpy(str_data[offset .. offset + s.len], s);
+                    str_offsets[r] = @intCast(offset);
+                    str_lengths[r] = @intCast(s.len);
+                    offset += s.len;
+                }
+
+                new_table.columns[c] = ColumnData{
+                    .name = col_name_copies[c],
+                    .col_type = .string,
+                    .data = .{
+                        .strings = .{
+                            .data = str_data,
+                            .offsets = str_offsets,
+                            .lengths = str_lengths,
+                        },
+                    },
+                    .row_count = value_count,
+                };
             }
+        } else {
+            // Numeric column
+            const col_data = memory.wasm_allocator.alloc(f64, 1024) catch return error.OutOfMemory;
+            // Copy all base case rows for this column from the per-column buffer
+            if (base_col_buffers[c]) |buf| {
+                for (0..value_count) |r| {
+                    col_data[r] = buf[r];
+                }
+            }
+            new_table.columns[c] = ColumnData{
+                .name = col_name_copies[c],
+                .col_type = .float64,
+                .data = .{ .float64 = col_data[0..value_count] },
+                .row_count = value_count,
+            };
         }
-        new_table.columns[c] = ColumnData{
-            .name = col_name_copies[c],
-            .col_type = .float64,
-            .data = .{ .float64 = col_data[0..value_count] },
-            .row_count = value_count,
-        };
     }
 
     tables[tbl_idx] = new_table;
@@ -9366,9 +9700,14 @@ fn materializeRecursiveCTE(cte_sql: []const u8, cte: *const CTEDef) !void {
     var end_row: usize = value_count;
 
     // Allocate per-column staging buffers on heap
+    // We need both numeric and string buffers for the recursive case
     var col_buffers: [MAX_COLUMNS]?[]f64 = .{null} ** MAX_COLUMNS;
+    var str_col_buffers: [MAX_COLUMNS]?[][]const u8 = .{null} ** MAX_COLUMNS;
     for (0..col_count) |c| {
         col_buffers[c] = memory.wasm_allocator.alloc(f64, 256) catch return error.OutOfMemory;
+        if (col_types[c] == .string) {
+            str_col_buffers[c] = memory.wasm_allocator.alloc([]const u8, 256) catch return error.OutOfMemory;
+        }
     }
 
     while (iter < MAX_ITERS) : (iter += 1) {
@@ -9381,25 +9720,89 @@ fn materializeRecursiveCTE(cte_sql: []const u8, cte: *const CTEDef) !void {
         var new_count: usize = 0;
         var ctx: ?FragmentContext = null;
 
-        for (start_row..end_row) |ri| {
-            const row_idx: u32 = @intCast(ri);
-
-            // Check WHERE clause
-            if (rec_query.where_clause) |*where| {
-                if (!evaluateWhere(rtbl, where, row_idx, &ctx)) continue;
-            }
-
-            // Evaluate SELECT expressions for each column
-            for (rec_query.select_exprs[0..rec_query.select_count], 0..) |expr, col_i| {
-                const val = evaluateScalarFloat(rtbl, &expr, row_idx, &ctx, null, null);
-                if (col_buffers[col_i]) |buf| {
-                    if (new_count < buf.len) {
-                        buf[new_count] = val;
+        // Check if recursive case has JOINs (e.g., FROM employees e JOIN org o ON ...)
+        if (rec_query.join_count > 0) {
+            // Find the primary table (e.g., employees)
+            var primary_tbl: ?*const TableInfo = null;
+            for (0..table_count) |i| {
+                if (tables[i]) |*tbl| {
+                    if (std.mem.eql(u8, tbl.name, rec_query.table_name)) {
+                        primary_tbl = tbl;
+                        break;
                     }
                 }
             }
-            new_count += 1;
-            if (new_count >= 256) break;
+
+            if (primary_tbl) |ptbl| {
+                const join = rec_query.joins[0];
+
+                // For each row in primary table
+                for (0..ptbl.row_count) |pi| {
+                    const primary_idx: u32 = @intCast(pi);
+
+                    // For each row in working set of CTE
+                    for (start_row..end_row) |cte_ri| {
+                        const cte_idx: u32 = @intCast(cte_ri);
+
+                        // Evaluate simple a.col = b.col JOIN condition
+                        const left_val = getJoinColValueForCte(ptbl, rtbl, primary_idx, cte_idx, join.left_col, rec_query.table_alias, join.alias);
+                        const right_val = getJoinColValueForCte(ptbl, rtbl, primary_idx, cte_idx, join.right_col, rec_query.table_alias, join.alias);
+
+                        if (left_val != right_val) continue;
+
+                        // Check WHERE clause if present
+                        if (rec_query.where_clause) |*where| {
+                            if (!evaluateWhere(ptbl, where, primary_idx, &ctx)) continue;
+                        }
+
+                        // Evaluate SELECT expressions with both table contexts
+                        for (rec_query.select_exprs[0..rec_query.select_count], 0..) |expr, col_i| {
+                            if (col_types[col_i] == .string) {
+                                // String column - get string value from primary table
+                                const str_val = getJoinColStrValueForCte(ptbl, rtbl, primary_idx, cte_idx, expr.col_name, rec_query.table_alias, join.alias, &ctx);
+                                if (str_col_buffers[col_i]) |buf| {
+                                    if (new_count < buf.len) {
+                                        buf[new_count] = str_val;
+                                    }
+                                }
+                            } else {
+                                // Numeric column
+                                const val = evaluateRecursiveExprForCte(ptbl, rtbl, &expr, primary_idx, cte_idx, rec_query.table_alias, join.alias);
+                                if (col_buffers[col_i]) |buf| {
+                                    if (new_count < buf.len) {
+                                        buf[new_count] = val;
+                                    }
+                                }
+                            }
+                        }
+                        new_count += 1;
+                        if (new_count >= 256) break;
+                    }
+                    if (new_count >= 256) break;
+                }
+            }
+        } else {
+            // No JOINs - original logic
+            for (start_row..end_row) |ri| {
+                const row_idx: u32 = @intCast(ri);
+
+                // Check WHERE clause
+                if (rec_query.where_clause) |*where| {
+                    if (!evaluateWhere(rtbl, where, row_idx, &ctx)) continue;
+                }
+
+                // Evaluate SELECT expressions for each column
+                for (rec_query.select_exprs[0..rec_query.select_count], 0..) |expr, col_i| {
+                    const val = evaluateScalarFloat(rtbl, &expr, row_idx, &ctx, null, null);
+                    if (col_buffers[col_i]) |buf| {
+                        if (new_count < buf.len) {
+                            buf[new_count] = val;
+                        }
+                    }
+                }
+                new_count += 1;
+                if (new_count >= 256) break;
+            }
         }
 
         if (new_count == 0) break;
@@ -9410,20 +9813,70 @@ fn materializeRecursiveCTE(cte_sql: []const u8, cte: *const CTEDef) !void {
 
         for (0..col_count) |c| {
             if (rtbl.columns[c]) |*col| {
-                // Get old data and allocate new
-                const old_data = col.data.float64;
-                const new_data = memory.wasm_allocator.alloc(f64, total_count) catch return error.OutOfMemory;
+                if (col_types[c] == .string) {
+                    // String column - need to append string data
+                    if (str_col_buffers[c]) |str_buf| {
+                        // Calculate total new string length
+                        var new_str_len: usize = 0;
+                        for (0..new_count) |j| {
+                            new_str_len += str_buf[j].len;
+                        }
 
-                // Copy old and new values
-                @memcpy(new_data[0..prev_count], old_data);
-                if (col_buffers[c]) |buf| {
-                    for (0..new_count) |j| {
-                        new_data[prev_count + j] = buf[j];
+                        // Get old string data
+                        const old_data = col.data.strings.data;
+                        const old_offsets = col.data.strings.offsets;
+                        const old_lengths = col.data.strings.lengths;
+                        const old_str_len = if (prev_count > 0 and old_lengths.len > 0)
+                            old_offsets[prev_count - 1] + old_lengths[prev_count - 1]
+                        else
+                            0;
+
+                        // Allocate new storage
+                        const total_str_len = old_str_len + new_str_len;
+                        const new_data = memory.wasm_allocator.alloc(u8, total_str_len) catch return error.OutOfMemory;
+                        const new_offsets = memory.wasm_allocator.alloc(u32, total_count) catch return error.OutOfMemory;
+                        const new_lengths = memory.wasm_allocator.alloc(u32, total_count) catch return error.OutOfMemory;
+
+                        // Copy old data
+                        @memcpy(new_data[0..old_str_len], old_data[0..old_str_len]);
+                        @memcpy(new_offsets[0..prev_count], old_offsets[0..prev_count]);
+                        @memcpy(new_lengths[0..prev_count], old_lengths[0..prev_count]);
+
+                        // Append new string data
+                        var offset: usize = old_str_len;
+                        for (0..new_count) |j| {
+                            const s = str_buf[j];
+                            @memcpy(new_data[offset .. offset + s.len], s);
+                            new_offsets[prev_count + j] = @intCast(offset);
+                            new_lengths[prev_count + j] = @intCast(s.len);
+                            offset += s.len;
+                        }
+
+                        col.data = .{
+                            .strings = .{
+                                .data = new_data,
+                                .offsets = new_offsets,
+                                .lengths = new_lengths,
+                            },
+                        };
+                        col.row_count = total_count;
                     }
-                }
+                } else {
+                    // Numeric column - original logic
+                    const old_data = col.data.float64;
+                    const new_data = memory.wasm_allocator.alloc(f64, total_count) catch return error.OutOfMemory;
 
-                col.data = .{ .float64 = new_data[0..total_count] };
-                col.row_count = total_count;
+                    // Copy old and new values
+                    @memcpy(new_data[0..prev_count], old_data);
+                    if (col_buffers[c]) |buf| {
+                        for (0..new_count) |j| {
+                            new_data[prev_count + j] = buf[j];
+                        }
+                    }
+
+                    col.data = .{ .float64 = new_data[0..total_count] };
+                    col.row_count = total_count;
+                }
             }
         }
         rtbl.row_count = total_count;
@@ -10581,39 +11034,64 @@ fn writeSelectResult(table: *const TableInfo, query: *const ParsedQuery, row_ind
         // Handle scalar subquery
         if (expr.is_scalar_subquery) {
             if (expr.subquery_sql) |subquery_sql| {
-                const subq_result = executeScalarSubquery(subquery_sql);
-                if (subq_result.str_val != null) {
-                    // String result
-                    const str_val = subq_result.str_val.?;
-                    const offsets = try memory.wasm_allocator.alloc(u32, row_count + 1);
-                    defer memory.wasm_allocator.free(offsets);
-                    const total_len = str_val.len * row_count;
-                    const data = try memory.wasm_allocator.alloc(u8, total_len);
-                    defer memory.wasm_allocator.free(data);
+                // Check if this is a correlated subquery by parsing and checking WHERE clause
+                const outer_alias = query.table_alias orelse "";
+                var is_correlated = false;
 
-                    for (0..row_count) |i| {
-                        offsets[i] = @intCast(i * str_val.len);
-                        @memcpy(data[i * str_val.len .. (i + 1) * str_val.len], str_val);
+                if (outer_alias.len > 0) {
+                    if (parseSql(subquery_sql)) |sub_query| {
+                        if (sub_query.where_clause) |*where| {
+                            is_correlated = whereReferencesOuterTable(where, outer_alias);
+                        }
                     }
-                    offsets[row_count] = @intCast(total_len);
-                    _ = lw.fragmentAddStringColumn(col_name.ptr, col_name.len, data.ptr, total_len, offsets.ptr, row_count, false);
-                } else if (subq_result.float_val != null) {
-                    // Numeric result
-                    const float_val = subq_result.float_val.?;
+                }
+
+                if (is_correlated) {
+                    // Correlated subquery - execute per row
                     const data = try memory.wasm_allocator.alloc(f64, row_count);
                     defer memory.wasm_allocator.free(data);
-                    for (0..row_count) |i| {
-                        data[i] = float_val;
+
+                    for (row_indices, 0..) |ri, i| {
+                        const subq_result = executeCorrelatedScalarSubquery(subquery_sql, table, ri, outer_alias);
+                        data[i] = subq_result.float_val orelse 0;
                     }
                     _ = lw.fragmentAddFloat64Column(col_name.ptr, col_name.len, data.ptr, row_count, false);
                 } else {
-                    // Null result - write zeros
-                    const data = try memory.wasm_allocator.alloc(f64, row_count);
-                    defer memory.wasm_allocator.free(data);
-                    for (0..row_count) |i| {
-                        data[i] = 0;
+                    // Non-correlated subquery - execute once
+                    const subq_result = executeScalarSubquery(subquery_sql);
+                    if (subq_result.str_val != null) {
+                        // String result
+                        const str_val = subq_result.str_val.?;
+                        const offsets = try memory.wasm_allocator.alloc(u32, row_count + 1);
+                        defer memory.wasm_allocator.free(offsets);
+                        const total_len = str_val.len * row_count;
+                        const data = try memory.wasm_allocator.alloc(u8, total_len);
+                        defer memory.wasm_allocator.free(data);
+
+                        for (0..row_count) |i| {
+                            offsets[i] = @intCast(i * str_val.len);
+                            @memcpy(data[i * str_val.len .. (i + 1) * str_val.len], str_val);
+                        }
+                        offsets[row_count] = @intCast(total_len);
+                        _ = lw.fragmentAddStringColumn(col_name.ptr, col_name.len, data.ptr, total_len, offsets.ptr, row_count, false);
+                    } else if (subq_result.float_val != null) {
+                        // Numeric result
+                        const float_val = subq_result.float_val.?;
+                        const data = try memory.wasm_allocator.alloc(f64, row_count);
+                        defer memory.wasm_allocator.free(data);
+                        for (0..row_count) |i| {
+                            data[i] = float_val;
+                        }
+                        _ = lw.fragmentAddFloat64Column(col_name.ptr, col_name.len, data.ptr, row_count, false);
+                    } else {
+                        // Null result - write zeros
+                        const data = try memory.wasm_allocator.alloc(f64, row_count);
+                        defer memory.wasm_allocator.free(data);
+                        for (0..row_count) |i| {
+                            data[i] = 0;
+                        }
+                        _ = lw.fragmentAddFloat64Column(col_name.ptr, col_name.len, data.ptr, row_count, false);
                     }
-                    _ = lw.fragmentAddFloat64Column(col_name.ptr, col_name.len, data.ptr, row_count, false);
                 }
             }
             continue;
@@ -11342,6 +11820,233 @@ const ScalarSubqueryValue = struct {
     is_null: bool = true,
 };
 
+/// Check if WHERE clause references an outer table alias
+fn whereReferencesOuterTable(where: *const WhereClause, outer_alias: []const u8) bool {
+    // Check if arg_2_col starts with outer alias (e.g., "d.id" when outer_alias = "d")
+    if (where.arg_2_col) |col| {
+        if (std.mem.indexOf(u8, col, ".")) |dot_pos| {
+            const prefix = col[0..dot_pos];
+            if (std.mem.eql(u8, prefix, outer_alias)) return true;
+        }
+    }
+    // Check column reference
+    if (where.column) |col| {
+        if (std.mem.indexOf(u8, col, ".")) |dot_pos| {
+            const prefix = col[0..dot_pos];
+            if (std.mem.eql(u8, prefix, outer_alias)) return true;
+        }
+    }
+    // Check nested clauses
+    if (where.left) |left| {
+        if (whereReferencesOuterTable(left, outer_alias)) return true;
+    }
+    if (where.right) |right| {
+        if (whereReferencesOuterTable(right, outer_alias)) return true;
+    }
+    return false;
+}
+
+/// Execute a correlated scalar subquery for a specific outer row
+fn executeCorrelatedScalarSubquery(sql: []const u8, outer_table: *const TableInfo, outer_row: u32, outer_alias: []const u8) ScalarSubqueryValue {
+    var result = ScalarSubqueryValue{};
+
+    const sub_query = parseSql(sql) orelse return result;
+
+    // Handle constant subquery: SELECT 100
+    if (sub_query.table_name.len == 0 or std.mem.eql(u8, sub_query.table_name, "__DUAL__")) {
+        if (sub_query.select_count > 0) {
+            const expr = sub_query.select_exprs[0];
+            if (expr.val_int) |v| {
+                result.int_val = v;
+                result.float_val = @floatFromInt(v);
+                result.is_null = false;
+            } else if (expr.val_float) |v| {
+                result.float_val = v;
+                result.is_null = false;
+            }
+        }
+        return result;
+    }
+
+    const table = findTable(sub_query.table_name) orelse return result;
+
+    // Handle aggregate subquery with correlation
+    if (sub_query.agg_count > 0) {
+        const agg = sub_query.aggregates[0];
+        var col: ?*const ColumnData = null;
+        if (agg.func != .count or agg.column.len > 0) {
+            col = findTableColumn(table, agg.column);
+        }
+
+        var ctx: ?FragmentContext = null;
+        var match_count: usize = 0;
+        var agg_val: f64 = 0;
+        var initialized = false;
+
+        for (0..table.row_count) |i| {
+            const idx = @as(u32, @intCast(i));
+
+            // Evaluate WHERE with outer table correlation
+            var matches = true;
+            if (sub_query.where_clause) |*where| {
+                matches = evaluateCorrelatedWhere(table, where, idx, outer_table, outer_row, outer_alias, &ctx);
+            }
+
+            if (matches) {
+                match_count += 1;
+
+                switch (agg.func) {
+                    .count => {
+                        initialized = true;
+                    },
+                    .sum, .avg => {
+                        if (col) |c| {
+                            agg_val += getFloatValueOptimized(table, c, idx, &ctx);
+                        }
+                        initialized = true;
+                    },
+                    .max => {
+                        if (col) |c| {
+                            const val = getFloatValueOptimized(table, c, idx, &ctx);
+                            if (!initialized or val > agg_val) {
+                                agg_val = val;
+                                initialized = true;
+                            }
+                        }
+                    },
+                    .min => {
+                        if (col) |c| {
+                            const val = getFloatValueOptimized(table, c, idx, &ctx);
+                            if (!initialized or val < agg_val) {
+                                agg_val = val;
+                                initialized = true;
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
+        if (agg.func == .count) {
+            agg_val = @floatFromInt(match_count);
+            initialized = true;
+        } else if (agg.func == .avg and match_count > 0) {
+            agg_val /= @floatFromInt(match_count);
+        }
+
+        result.float_val = agg_val;
+        result.is_null = !initialized;
+        return result;
+    }
+
+    return result;
+}
+
+/// Evaluate WHERE clause with outer table correlation support
+fn evaluateCorrelatedWhere(table: *const TableInfo, where: *const WhereClause, row_idx: u32, outer_table: *const TableInfo, outer_row: u32, outer_alias: []const u8, ctx: *?FragmentContext) bool {
+    switch (where.op) {
+        .and_op => {
+            if (where.left) |left| {
+                if (!evaluateCorrelatedWhere(table, left, row_idx, outer_table, outer_row, outer_alias, ctx)) return false;
+            }
+            if (where.right) |right| {
+                return evaluateCorrelatedWhere(table, right, row_idx, outer_table, outer_row, outer_alias, ctx);
+            }
+            return true;
+        },
+        .or_op => {
+            var result = false;
+            if (where.left) |left| {
+                result = evaluateCorrelatedWhere(table, left, row_idx, outer_table, outer_row, outer_alias, ctx);
+            }
+            if (!result and where.right != null) {
+                result = evaluateCorrelatedWhere(table, where.right.?, row_idx, outer_table, outer_row, outer_alias, ctx);
+            }
+            return result;
+        },
+        .eq, .ne, .lt, .le, .gt, .ge => {
+            // Get left side value (from subquery table)
+            var left_val: f64 = 0;
+            if (where.column) |col_name| {
+                // Check if it's a reference to the outer table
+                if (std.mem.indexOf(u8, col_name, ".")) |dot_pos| {
+                    const prefix = col_name[0..dot_pos];
+                    const actual_col = col_name[dot_pos + 1 ..];
+                    if (std.mem.eql(u8, prefix, outer_alias)) {
+                        // It's from outer table
+                        if (findTableColumn(outer_table, actual_col)) |col| {
+                            left_val = getFloatValueOptimized(outer_table, col, outer_row, ctx);
+                        }
+                    } else {
+                        // It's from inner table with alias
+                        if (findTableColumn(table, actual_col)) |col| {
+                            left_val = getFloatValueOptimized(table, col, row_idx, ctx);
+                        }
+                    }
+                } else {
+                    // No dot - try inner table
+                    if (findTableColumn(table, col_name)) |col| {
+                        left_val = getFloatValueOptimized(table, col, row_idx, ctx);
+                    }
+                }
+            }
+
+            // Get right side value
+            var right_val: f64 = 0;
+            if (where.arg_2_col) |col_name| {
+                // Column-to-column comparison
+                if (std.mem.indexOf(u8, col_name, ".")) |dot_pos| {
+                    const prefix = col_name[0..dot_pos];
+                    const actual_col = col_name[dot_pos + 1 ..];
+                    if (std.mem.eql(u8, prefix, outer_alias)) {
+                        // It's from outer table
+                        if (findTableColumn(outer_table, actual_col)) |col| {
+                            right_val = getFloatValueOptimized(outer_table, col, outer_row, ctx);
+                        }
+                    } else {
+                        // It's from inner table with alias
+                        if (findTableColumn(table, actual_col)) |col| {
+                            right_val = getFloatValueOptimized(table, col, row_idx, ctx);
+                        }
+                    }
+                } else {
+                    // No dot - try inner table
+                    if (findTableColumn(table, col_name)) |col| {
+                        right_val = getFloatValueOptimized(table, col, row_idx, ctx);
+                    }
+                }
+            } else if (where.value_int) |v| {
+                right_val = @floatFromInt(v);
+            } else if (where.value_float) |v| {
+                right_val = v;
+            }
+
+            return switch (where.op) {
+                .eq => left_val == right_val,
+                .ne => left_val != right_val,
+                .lt => left_val < right_val,
+                .le => left_val <= right_val,
+                .gt => left_val > right_val,
+                .ge => left_val >= right_val,
+                else => false,
+            };
+        },
+        .is_null => {
+            // For correlated subqueries, fall back to regular evaluation
+            return evaluateWhere(table, where, row_idx, ctx);
+        },
+        .is_not_null => {
+            // For correlated subqueries, fall back to regular evaluation
+            return evaluateWhere(table, where, row_idx, ctx);
+        },
+        else => {
+            // Fall back to regular WHERE evaluation for unsupported operations
+            return evaluateWhere(table, where, row_idx, ctx);
+        },
+    }
+}
+
 /// Execute a scalar subquery and return its single value
 fn executeScalarSubquery(sql: []const u8) ScalarSubqueryValue {
     setDebug("Scalar subquery SQL: {s}", .{sql});
@@ -11350,7 +12055,7 @@ fn executeScalarSubquery(sql: []const u8) ScalarSubqueryValue {
     const sub_query = parseSql(sql) orelse return result;
 
     // Handle constant subquery: SELECT 100
-    if (sub_query.table_name.len == 0 and sub_query.select_count > 0) {
+    if ((sub_query.table_name.len == 0 or std.mem.eql(u8, sub_query.table_name, "__DUAL__")) and sub_query.select_count > 0) {
         const expr = sub_query.select_exprs[0];
         if (expr.val_int) |v| {
             result.int_val = v;
@@ -12681,7 +13386,16 @@ pub fn parseSql(sql: []const u8) ?*ParsedQuery {
         // No FROM clause - this is a tableless scalar query (e.g., SELECT 1+1, SELECT GREATEST(1,2))
         query.table_name = "__DUAL__"; // Sentinel for tableless queries
         log("Tableless query detected (pos={d}, len={d})", .{pos, sql.len});
-        setDebug("Tableless query detected, returning early", .{});
+
+        // Check for WHERE clause in tableless query (e.g., SELECT 1 WHERE 1 = 0)
+        if (pos < sql.len and startsWithIC(sql[pos..], "WHERE")) {
+            pos += 5;
+            pos = skipWs(sql, pos);
+            query.where_clause = parseWhere(sql, &pos);
+            log("Tableless query has WHERE clause", .{});
+        }
+
+        setDebug("Tableless query detected, returning", .{});
         return query;
     }
     pos += 4;
@@ -14848,13 +15562,20 @@ fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
             }
             return null;
         } else if (pos.* < sql.len and (sql[pos.*] == '\'' or sql[pos.*] == '"')) {
-            // NEAR 'text' - requires text embedding model
-            // Mark this as a text search NEAR that will fail at runtime
+            // NEAR 'text' - text-based search
+            const quote = sql[pos.*];
+            pos.* += 1;
+            const text_start = pos.*;
+            while (pos.* < sql.len and sql[pos.*] != quote) pos.* += 1;
+            const search_text = sql[text_start..pos.*];
+            if (pos.* < sql.len) pos.* += 1; // skip closing quote
+
             if (lhs_col_name) |column| {
                 return WhereClause{
                     .op = .near,
                     .column = column,
-                    .is_text_near = true, // Flag for text search requiring model
+                    .value_str = search_text, // Store the search text
+                    .is_text_near = true,
                 };
             }
             return null;
