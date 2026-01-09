@@ -233,6 +233,12 @@ pub const SelectExpr = struct {
     arg_2_val_float: ?f64 = null,
     arg_2_val_str: ?[]const u8 = null,
 
+    // Nested expression support for arg2 (for expressions like `col * (n + 1)`)
+    arg_2_func: ScalarFunc = .none,          // The operation in arg2
+    arg_2_nested_val_int: ?i64 = null,       // Second operand of arg2's operation
+    arg_2_nested_val_float: ?f64 = null,
+    arg_2_nested_col: ?[]const u8 = null,
+
     // Third argument (for SLICE, etc)
     arg_3_col: ?[]const u8 = null,
     arg_3_val_int: ?i64 = null,
@@ -1106,6 +1112,31 @@ fn evaluateScalarFloat(table: *const TableInfo, expr: *const SelectExpr, idx: u3
     // Resolve Arg 2
     if (arg2_col) |col| {
         v2 = getFloatValueOptimized(table, col, idx, context);
+    } else if (expr.arg_2_col) |col_name| {
+        // arg2 is a column reference (possibly with nested expression)
+        if (getColByName(table, col_name)) |col| {
+            v2 = getFloatValueOptimized(table, col, idx, context);
+        }
+        // Apply nested expression operation if present (for `col * (n + 1)` patterns)
+        if (expr.arg_2_func != .none) {
+            var nested_v: f64 = 0;
+            if (expr.arg_2_nested_val_int) |nv| {
+                nested_v = @floatFromInt(nv);
+            } else if (expr.arg_2_nested_val_float) |nv| {
+                nested_v = nv;
+            } else if (expr.arg_2_nested_col) |nc| {
+                if (getColByName(table, nc)) |col| {
+                    nested_v = getFloatValueOptimized(table, col, idx, context);
+                }
+            }
+            v2 = switch (expr.arg_2_func) {
+                .add => v2 + nested_v,
+                .sub => v2 - nested_v,
+                .mul => v2 * nested_v,
+                .div => if (nested_v != 0) v2 / nested_v else 0.0,
+                else => v2,
+            };
+        }
     } else if (expr.arg_2_val_float) |v| {
         v2 = v;
     } else if (expr.arg_2_val_int) |v| {
@@ -9189,30 +9220,115 @@ fn materializeRecursiveCTE(cte_sql: []const u8, cte: *const CTEDef) !void {
         col_count += 1;
     }
 
-    // Execute base case - collect literal values
-    var all_values: [1024]f64 = undefined;
+    // Execute base case - allocate per-column buffers on heap
+    var base_col_buffers: [MAX_COLUMNS]?[]f64 = .{null} ** MAX_COLUMNS;
+    for (0..col_count) |c| {
+        base_col_buffers[c] = memory.wasm_allocator.alloc(f64, 256) catch return error.OutOfMemory;
+    }
     var value_count: usize = 0;
 
     // For base case with no table (like SELECT 1 as n) - uses __DUAL__ sentinel
     if (std.mem.eql(u8, base_query.table_name, "__DUAL__") or base_query.table_name.len == 0) {
-        for (base_query.select_exprs[0..base_query.select_count], 0..) |expr, i| {
-            if (expr.val_int) |v| {
-                all_values[i] = @floatFromInt(v);
-            } else if (expr.val_float) |v| {
-                all_values[i] = v;
-            } else {
-                all_values[i] = 0;
+        // Check for WHERE clause that eliminates all rows (e.g., WHERE 1 = 0)
+        var where_is_false = false;
+        if (base_query.where_clause) |*where| {
+            const col = where.column orelse "";
+            if (col.len == 0 and where.op == .eq) {
+                // No column reference - this is a literal comparison like WHERE 1 = 0
+                // For tableless queries, literal comparisons are always false
+                where_is_false = true;
             }
         }
-        value_count = 1; // One row with base value
+
+        // Only add the base row if no WHERE or WHERE doesn't evaluate to false
+        if (!where_is_false) {
+            for (base_query.select_exprs[0..base_query.select_count], 0..) |expr, i| {
+                const val: f64 = if (expr.val_int) |v| @floatFromInt(v) else if (expr.val_float) |v| v else 0;
+                if (base_col_buffers[i]) |buf| {
+                    buf[0] = val;
+                }
+            }
+            value_count = 1;
+        }
+    } else {
+        // Base case reads from a real table - execute the SELECT
+        var base_table: ?*const TableInfo = null;
+        for (0..table_count) |i| {
+            if (tables[i]) |*tbl| {
+                if (std.mem.eql(u8, tbl.name, base_query.table_name)) {
+                    base_table = tbl;
+                    break;
+                }
+            }
+        }
+
+        if (base_table) |tbl| {
+            var ctx: ?FragmentContext = null;
+            for (0..tbl.row_count) |ri| {
+                const row_idx: u32 = @intCast(ri);
+
+                // Check WHERE clause
+                if (base_query.where_clause) |*where| {
+                    if (!evaluateWhere(tbl, where, row_idx, &ctx)) continue;
+                }
+
+                // Collect column values into per-column buffers
+                for (base_query.select_exprs[0..base_query.select_count], 0..) |expr, col_i| {
+                    const val = evaluateScalarFloat(tbl, &expr, row_idx, &ctx, null, null);
+                    if (base_col_buffers[col_i]) |buf| {
+                        if (value_count < buf.len) {
+                            buf[value_count] = val;
+                        }
+                    }
+                }
+                value_count += 1;
+                if (value_count >= 256) break;
+            }
+        }
     }
 
-    if (value_count == 0) return error.InvalidSql;
+    // Empty base case is valid for recursive CTEs (produces empty result)
+    if (value_count == 0) {
+        // Create empty CTE table
+        const cte_name = memory.wasm_allocator.dupe(u8, cte.name) catch return error.OutOfMemory;
+        var col_name_copies: [MAX_COLUMNS][]const u8 = undefined;
+        for (0..col_count) |c| {
+            col_name_copies[c] = memory.wasm_allocator.dupe(u8, col_names[c]) catch return error.OutOfMemory;
+        }
+
+        const tbl_idx = table_count;
+        var new_table = TableInfo{
+            .name = cte_name,
+            .row_count = 0,
+            .column_count = col_count,
+            .columns = .{null} ** MAX_COLUMNS,
+            .fragments = .{null} ** MAX_FRAGMENTS,
+            .fragment_count = 0,
+        };
+        for (0..col_count) |c| {
+            new_table.columns[c] = ColumnData{
+                .name = col_name_copies[c],
+                .col_type = .float64,
+                .data = .{ .float64 = &[_]f64{} },
+                .row_count = 0,
+            };
+        }
+        tables[tbl_idx] = new_table;
+        table_count += 1;
+        return;
+    }
+
+    // Duplicate names to persistent memory (sql_input buffer gets reused)
+    const cte_name = memory.wasm_allocator.dupe(u8, cte.name) catch return error.OutOfMemory;
+    var col_name_copies: [MAX_COLUMNS][]const u8 = undefined;
+    for (0..col_count) |c| {
+        col_name_copies[c] = memory.wasm_allocator.dupe(u8, col_names[c]) catch return error.OutOfMemory;
+    }
 
     // Create the CTE table with base case result
     const tbl_idx = table_count;
     var new_table = TableInfo{
-        .name = cte.name,
+        .name = cte_name,
         .row_count = value_count,
         .column_count = col_count,
         .columns = .{null} ** MAX_COLUMNS,
@@ -9220,12 +9336,17 @@ fn materializeRecursiveCTE(cte_sql: []const u8, cte: *const CTEDef) !void {
         .fragment_count = 0,
     };
 
-    // Allocate column data for base case
+    // Allocate column data for base case (may have multiple rows)
     for (0..col_count) |c| {
         const col_data = memory.wasm_allocator.alloc(f64, 1024) catch return error.OutOfMemory;
-        col_data[0] = all_values[c];
+        // Copy all base case rows for this column from the per-column buffer
+        if (base_col_buffers[c]) |buf| {
+            for (0..value_count) |r| {
+                col_data[r] = buf[r];
+            }
+        }
         new_table.columns[c] = ColumnData{
-            .name = col_names[c],
+            .name = col_name_copies[c],
             .col_type = .float64,
             .data = .{ .float64 = col_data[0..value_count] },
             .row_count = value_count,
@@ -13450,8 +13571,10 @@ fn parseScalarExpr(sql: []const u8, pos: *usize) ?SelectExpr {
 
     // 1. Check for parenthesized expression first
     if (pos.* < sql.len and sql[pos.*] == '(') {
+        const paren_start = pos.*;
         pos.* += 1;
         pos.* = skipWs(sql, pos.*);
+        const inner_start = pos.*;
         // Try to evaluate constant arithmetic inside parens
         if (evaluateConstantArithmetic(sql, pos)) |result| {
             pos.* = skipWs(sql, pos.*);
@@ -13486,8 +13609,49 @@ fn parseScalarExpr(sql: []const u8, pos: *usize) ?SelectExpr {
             }
             return expr;
         }
-        // Not a constant expression, back up and let other parsing handle it
-        pos.* -= 1;
+        // Not a constant expression - parse column expression directly (avoid recursion)
+        pos.* = inner_start;
+        // Parse identifier
+        const col_start = pos.*;
+        while (pos.* < sql.len and (isIdent(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+        if (pos.* > col_start) {
+            expr.col_name = sql[col_start..pos.*];
+            pos.* = skipWs(sql, pos.*);
+            // Check for operator inside parentheses
+            if (pos.* < sql.len and (sql[pos.*] == '+' or sql[pos.*] == '-' or sql[pos.*] == '*' or sql[pos.*] == '/')) {
+                const op_char = sql[pos.*];
+                pos.* += 1;
+                switch (op_char) {
+                    '+' => expr.func = .add,
+                    '-' => expr.func = .sub,
+                    '*' => expr.func = .mul,
+                    '/' => expr.func = .div,
+                    else => {},
+                }
+                pos.* = skipWs(sql, pos.*);
+                // Parse RHS (number or column)
+                if (pos.* < sql.len and (std.ascii.isDigit(sql[pos.*]) or sql[pos.*] == '-')) {
+                    const num_start = pos.*;
+                    if (sql[pos.*] == '-') pos.* += 1;
+                    while (pos.* < sql.len and (std.ascii.isDigit(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+                    const num_str = sql[num_start..pos.*];
+                    if (std.mem.indexOf(u8, num_str, ".") != null) {
+                        expr.arg_2_val_float = std.fmt.parseFloat(f64, num_str) catch 0;
+                    } else {
+                        expr.arg_2_val_int = std.fmt.parseInt(i64, num_str, 10) catch 0;
+                    }
+                } else if (pos.* < sql.len and isIdent(sql[pos.*])) {
+                    const rhs_start = pos.*;
+                    while (pos.* < sql.len and (isIdent(sql[pos.*]) or sql[pos.*] == '.')) pos.* += 1;
+                    expr.arg_2_col = sql[rhs_start..pos.*];
+                }
+            }
+            pos.* = skipWs(sql, pos.*);
+            if (pos.* < sql.len and sql[pos.*] == ')') pos.* += 1;
+            return expr;
+        }
+        // Failed to parse - restore to before '('
+        pos.* = paren_start;
     }
 
     // 2. Check for unary minus on column: -column_name
@@ -13797,11 +13961,18 @@ fn parseScalarExpr(sql: []const u8, pos: *usize) ?SelectExpr {
                      if (rhs.val_int) |i| expr.arg_2_val_int = i;
                      if (rhs.val_float) |f| expr.arg_2_val_float = f;
                      if (rhs.col_name.len > 0) expr.arg_2_col = rhs.col_name;
+                     // Store nested expression info if RHS is itself an expression
+                     if (rhs.func != .none) {
+                         expr.arg_2_func = rhs.func;
+                         expr.arg_2_nested_val_int = rhs.arg_2_val_int;
+                         expr.arg_2_nested_val_float = rhs.arg_2_val_float;
+                         expr.arg_2_nested_col = rhs.arg_2_col;
+                     }
                 }
             }
         }
     }
-    
+
     return expr;
 }
 
