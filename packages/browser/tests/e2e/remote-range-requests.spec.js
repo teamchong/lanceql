@@ -30,6 +30,10 @@ test.describe('Remote Range Request Efficiency', () => {
             const url = response.url();
             // Only track requests to our Lance dataset data files
             if (url.includes('data.metal0.dev') && url.includes('/data/')) {
+                // Skip HEAD requests - they return 200 with content-length but no body
+                const method = response.request().method();
+                if (method === 'HEAD') return;
+
                 const status = response.status();
                 const headers = response.headers();
                 const contentLength = parseInt(headers['content-length'] || '0', 10);

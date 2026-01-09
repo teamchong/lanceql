@@ -93,11 +93,18 @@ class RemoteLanceFile {
         // Try to detect and load schema from manifest
         await tryLoadSchema(file);
 
-        // Try to load IVF index for ANN search
-        await file._tryLoadIndex();
+        // Skip IVF index for fragment files - index is loaded at dataset level
+        // Fragment URLs contain /data/ (e.g., dataset.lance/data/fragment.lance)
+        const isFragmentFile = url.includes('/data/');
+        if (!isFragmentFile) {
+            // Try to load IVF index for ANN search (only for dataset-level files)
+            await file._tryLoadIndex();
+        }
 
-        // Log summary
-        console.log(`[LanceQL] Loaded: ${file._numColumns} columns, ${(fileSize / 1024 / 1024).toFixed(1)}MB, schema: ${file._schema ? 'yes' : 'no'}, index: ${file.hasIndex() ? 'yes' : 'no'}`);
+        // Log summary (quieter for fragments)
+        if (!isFragmentFile) {
+            console.log(`[LanceQL] Loaded: ${file._numColumns} columns, ${(fileSize / 1024 / 1024).toFixed(1)}MB, schema: ${file._schema ? 'yes' : 'no'}, index: ${file.hasIndex() ? 'yes' : 'no'}`);
+        }
 
         return file;
     }

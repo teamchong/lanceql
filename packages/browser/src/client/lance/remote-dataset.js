@@ -77,9 +77,9 @@ class RemoteLanceDataset {
 
         await dataset._tryLoadIndex();
 
-        // Prefetch fragment metadata for faster first query
-        // Default: prefetch if <= 5 fragments
-        const shouldPrefetch = options.prefetch ?? (dataset._fragments.length <= 5);
+        // Prefetch fragment metadata - default OFF for remote to avoid downloading full fragments
+        // Set prefetch: true explicitly if you want to warm fragment caches
+        const shouldPrefetch = options.prefetch ?? false;
         if (shouldPrefetch && dataset._fragments.length > 0) {
             dataset._prefetchFragments();
         }

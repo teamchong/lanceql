@@ -2303,7 +2303,8 @@ LIMIT 20</textarea>
 
         // Import from local lanceql.js (synced from packages/browser/src/lanceql.js)
         // Run: cp packages/browser/src/lanceql.js examples/wasm/lanceql.js
-        import LanceQL, {
+        import {
+            LanceQL,
             SQLExecutor, SQLLexer, SQLParser, initSqlJs,
             // OPFS and storage APIs
             OPFSStorage, ChunkedLanceReader, LRUCache,

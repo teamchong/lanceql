@@ -2,6 +2,10 @@ import * as Manifest from './ivf-manifest.js';
 import * as Auxiliary from './ivf-auxiliary.js';
 import * as Partitions from './ivf-partitions.js';
 
+// Global cache for IVF indexes to avoid duplicate loads
+const _indexCache = new Map();
+const _pendingLoads = new Map();
+
 /**
  * Quickselect algorithm to find top-k elements in O(n) average time.
  * Partitions array in-place so indices 0..k-1 contain the k largest elements.
@@ -66,6 +70,32 @@ class IVFIndex {
     static async tryLoad(datasetBaseUrl) {
         if (!datasetBaseUrl) return null;
 
+        // Check global cache first
+        if (_indexCache.has(datasetBaseUrl)) {
+            return _indexCache.get(datasetBaseUrl);
+        }
+
+        // Check if load is already in progress (dedup concurrent loads)
+        if (_pendingLoads.has(datasetBaseUrl)) {
+            return _pendingLoads.get(datasetBaseUrl);
+        }
+
+        // Start loading and cache the promise to dedup concurrent calls
+        const loadPromise = IVFIndex._doLoad(datasetBaseUrl);
+        _pendingLoads.set(datasetBaseUrl, loadPromise);
+
+        try {
+            const index = await loadPromise;
+            if (index) {
+                _indexCache.set(datasetBaseUrl, index);
+            }
+            return index;
+        } finally {
+            _pendingLoads.delete(datasetBaseUrl);
+        }
+    }
+
+    static async _doLoad(datasetBaseUrl) {
         try {
             const manifestVersion = await Manifest.findLatestManifestVersion(datasetBaseUrl);
             if (!manifestVersion) return null;
