@@ -111,7 +111,21 @@ pub const Executor = struct {
     /// Minimum row count to trigger compilation (below this, interpretation is faster)
     compile_threshold: usize = 10_000,
 
+    /// Vector index metadata storage
+    /// Key: "table_name.column_name", Value: VectorIndexInfo
+    vector_indexes: std.StringHashMap(VectorIndexInfo),
+
     const Self = @This();
+
+    /// Vector index metadata
+    pub const VectorIndexInfo = struct {
+        table_name: []const u8,
+        column_name: []const u8,
+        model: []const u8,
+        shadow_column: []const u8, // e.g., "__vec_text_minilm"
+        dimension: u32,
+        created_at: i64,
+    };
 
     pub fn init(table: ?*Table, allocator: std.mem.Allocator) Self {
         return .{
@@ -131,6 +145,7 @@ pub const Executor = struct {
             .tables = std.StringHashMap(*Table).init(allocator),
             .method_results_cache = std.StringHashMap([]const f64).init(allocator),
             .compiled_query_cache = std.AutoHashMap(u64, CompiledQuery).init(allocator),
+            .vector_indexes = std.StringHashMap(VectorIndexInfo).init(allocator),
         };
     }
 
@@ -1625,6 +1640,154 @@ pub const Executor = struct {
         }
 
         return result;
+    }
+
+    // ========================================================================
+    // Statement Execution (handles all statement types)
+    // ========================================================================
+
+    /// Result type for non-SELECT statements
+    pub const StatementResult = union(enum) {
+        select: Result,
+        vector_index_created: VectorIndexInfo,
+        vector_index_dropped: struct { table: []const u8, column: []const u8 },
+        vector_indexes_list: []const VectorIndexInfo,
+        no_op: void,
+    };
+
+    /// Execute any SQL statement (SELECT, CREATE VECTOR INDEX, etc.)
+    pub fn executeStatement(self: *Self, stmt: *const ast.Statement, params: []const Value) !StatementResult {
+        return switch (stmt.*) {
+            .select => |*select| StatementResult{ .select = try self.execute(select, params) },
+            .create_vector_index => |vi| StatementResult{ .vector_index_created = try self.executeCreateVectorIndex(&vi) },
+            .drop_vector_index => |vi| StatementResult{ .vector_index_dropped = try self.executeDropVectorIndex(&vi) },
+            .show_vector_indexes => |vi| StatementResult{ .vector_indexes_list = try self.executeShowVectorIndexes(&vi) },
+        };
+    }
+
+    // ========================================================================
+    // Vector Index Execution
+    // ========================================================================
+
+    /// Default dimensions for supported embedding models
+    fn getModelDimension(model: []const u8) u32 {
+        // Case-insensitive comparison
+        var upper_buf: [32]u8 = undefined;
+        const model_len = @min(model.len, upper_buf.len);
+        for (model[0..model_len], 0..) |ch, i| {
+            upper_buf[i] = std.ascii.toUpper(ch);
+        }
+        const upper = upper_buf[0..model_len];
+
+        if (std.mem.eql(u8, upper, "MINILM")) return 384;
+        if (std.mem.eql(u8, upper, "CLIP")) return 512;
+        if (std.mem.eql(u8, upper, "BGE-SMALL")) return 384;
+        if (std.mem.eql(u8, upper, "BGE-BASE")) return 768;
+        if (std.mem.eql(u8, upper, "BGE-LARGE")) return 1024;
+        if (std.mem.eql(u8, upper, "OPENAI")) return 1536;
+        if (std.mem.eql(u8, upper, "COHERE")) return 1024;
+
+        // Default to MiniLM dimension
+        return 384;
+    }
+
+    /// Execute CREATE VECTOR INDEX statement
+    fn executeCreateVectorIndex(self: *Self, stmt: *const ast.CreateVectorIndexStmt) !VectorIndexInfo {
+        // Build the index key: "table.column"
+        var key_buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ stmt.table_name, stmt.column_name }) catch return error.KeyTooLong;
+
+        // Check if index already exists
+        if (self.vector_indexes.contains(key)) {
+            if (stmt.if_not_exists) {
+                // Return existing index info
+                return self.vector_indexes.get(key).?;
+            }
+            return error.VectorIndexAlreadyExists;
+        }
+
+        // Determine dimension
+        const dimension = stmt.dimension orelse getModelDimension(stmt.model);
+
+        // Build shadow column name: "__vec_{column}_{model}"
+        var shadow_buf: [128]u8 = undefined;
+        const shadow_column = std.fmt.bufPrint(&shadow_buf, "__vec_{s}_{s}", .{ stmt.column_name, stmt.model }) catch return error.ShadowColumnNameTooLong;
+
+        // Allocate strings for persistent storage
+        const alloc_key = try self.allocator.dupe(u8, key);
+        const alloc_shadow = try self.allocator.dupe(u8, shadow_column);
+
+        const info = VectorIndexInfo{
+            .table_name = stmt.table_name,
+            .column_name = stmt.column_name,
+            .model = stmt.model,
+            .shadow_column = alloc_shadow,
+            .dimension = dimension,
+            .created_at = std.time.timestamp(),
+        };
+
+        try self.vector_indexes.put(alloc_key, info);
+
+        return info;
+    }
+
+    /// Execute DROP VECTOR INDEX statement
+    fn executeDropVectorIndex(self: *Self, stmt: *const ast.DropVectorIndexStmt) !struct { table: []const u8, column: []const u8 } {
+        // Build the index key: "table.column"
+        var key_buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ stmt.table_name, stmt.column_name }) catch return error.KeyTooLong;
+
+        // Check if index exists
+        if (!self.vector_indexes.contains(key)) {
+            if (stmt.if_exists) {
+                return .{ .table = stmt.table_name, .column = stmt.column_name };
+            }
+            return error.VectorIndexNotFound;
+        }
+
+        // Remove the index
+        const kv = self.vector_indexes.fetchRemove(key);
+        if (kv) |entry| {
+            // Free allocated strings
+            self.allocator.free(entry.key);
+            self.allocator.free(entry.value.shadow_column);
+        }
+
+        return .{ .table = stmt.table_name, .column = stmt.column_name };
+    }
+
+    /// Execute SHOW VECTOR INDEXES statement
+    fn executeShowVectorIndexes(self: *Self, stmt: *const ast.ShowVectorIndexesStmt) ![]const VectorIndexInfo {
+        var results = std.ArrayList(VectorIndexInfo).init(self.allocator);
+        errdefer results.deinit();
+
+        var it = self.vector_indexes.iterator();
+        while (it.next()) |entry| {
+            const info = entry.value_ptr.*;
+
+            // Filter by table name if specified
+            if (stmt.table_name) |table| {
+                if (!std.mem.eql(u8, info.table_name, table)) {
+                    continue;
+                }
+            }
+
+            try results.append(info);
+        }
+
+        return results.toOwnedSlice();
+    }
+
+    /// Get vector index info for a table.column
+    pub fn getVectorIndex(self: *Self, table_name: []const u8, column_name: []const u8) ?VectorIndexInfo {
+        var key_buf: [256]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ table_name, column_name }) catch return null;
+        return self.vector_indexes.get(key);
+    }
+
+    /// Check if a column has a vector index
+    pub fn hasVectorIndex(self: *Self, table_name: []const u8, column_name: []const u8) bool {
+        return self.getVectorIndex(table_name, column_name) != null;
     }
 
     // ========================================================================

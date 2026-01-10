@@ -350,10 +350,51 @@ pub const SelectStmt = struct {
     set_operation: ?SetOperation,
 };
 
+/// CREATE VECTOR INDEX statement
+/// Example: CREATE VECTOR INDEX [IF NOT EXISTS] ON table(column) USING model
+pub const CreateVectorIndexStmt = struct {
+    /// Table name to create index on
+    table_name: []const u8,
+
+    /// Column to index
+    column_name: []const u8,
+
+    /// Embedding model to use (e.g., "minilm", "clip")
+    model: []const u8,
+
+    /// Whether to skip if index already exists
+    if_not_exists: bool,
+
+    /// Optional dimension override (defaults to model's native dimension)
+    dimension: ?u32,
+};
+
+/// DROP VECTOR INDEX statement
+/// Example: DROP VECTOR INDEX [IF EXISTS] ON table(column)
+pub const DropVectorIndexStmt = struct {
+    /// Table name
+    table_name: []const u8,
+
+    /// Column name
+    column_name: []const u8,
+
+    /// Whether to skip if index doesn't exist
+    if_exists: bool,
+};
+
+/// SHOW VECTOR INDEXES statement
+/// Example: SHOW VECTOR INDEXES [ON table]
+pub const ShowVectorIndexesStmt = struct {
+    /// Optional table name filter (null = show all)
+    table_name: ?[]const u8,
+};
+
 /// Top-level statement (extensible for INSERT/UPDATE/DELETE later)
 pub const Statement = union(enum) {
     select: SelectStmt,
-    // Future: insert, update, delete, create_table, etc.
+    create_vector_index: CreateVectorIndexStmt,
+    drop_vector_index: DropVectorIndexStmt,
+    show_vector_indexes: ShowVectorIndexesStmt,
 };
 
 // ============================================================================

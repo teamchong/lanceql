@@ -84,7 +84,142 @@ pub const Parser = struct {
         return switch (tok.type) {
             .SELECT => Statement{ .select = try self.parseSelect() },
             .WITH => Statement{ .select = try self.parseWithSelect() },
+            .CREATE => try self.parseCreateStatement(),
+            .DROP => try self.parseDropStatement(),
+            .SHOW => try self.parseShowStatement(),
             else => error.UnsupportedStatement,
+        };
+    }
+
+    /// Parse CREATE statement (CREATE VECTOR INDEX)
+    fn parseCreateStatement(self: *Self) !Statement {
+        _ = try self.expect(.CREATE);
+
+        // Check for VECTOR INDEX
+        if (self.match(&[_]TokenType{.VECTOR})) {
+            _ = try self.expect(.INDEX);
+            return Statement{ .create_vector_index = try self.parseCreateVectorIndex() };
+        }
+
+        return error.UnsupportedStatement;
+    }
+
+    /// Parse CREATE VECTOR INDEX [IF NOT EXISTS] ON table(column) USING model
+    fn parseCreateVectorIndex(self: *Self) !ast.CreateVectorIndexStmt {
+        // Optional IF NOT EXISTS
+        var if_not_exists = false;
+        if (self.match(&[_]TokenType{.IF})) {
+            _ = try self.expect(.NOT);
+            _ = try self.expect(.EXISTS);
+            if_not_exists = true;
+        }
+
+        // ON keyword
+        _ = try self.expect(.ON);
+
+        // Table name
+        const table_tok = try self.expect(.IDENTIFIER);
+        const table_name = table_tok.lexeme;
+
+        // (column)
+        _ = try self.expect(.LPAREN);
+        const column_tok = try self.expect(.IDENTIFIER);
+        const column_name = column_tok.lexeme;
+        _ = try self.expect(.RPAREN);
+
+        // USING model
+        _ = try self.expect(.USING);
+        const model_tok = try self.expect(.IDENTIFIER);
+        const model = model_tok.lexeme;
+
+        // Optional dimension: WITH (dim = N)
+        var dimension: ?u32 = null;
+        if (self.match(&[_]TokenType{.WITH})) {
+            _ = try self.expect(.LPAREN);
+            const opt_tok = try self.expect(.IDENTIFIER);
+            if (std.mem.eql(u8, opt_tok.lexeme, "dim") or std.mem.eql(u8, opt_tok.lexeme, "DIM")) {
+                _ = try self.expect(.EQ);
+                const dim_tok = try self.expect(.NUMBER);
+                dimension = try std.fmt.parseInt(u32, dim_tok.lexeme, 10);
+            }
+            _ = try self.expect(.RPAREN);
+        }
+
+        return ast.CreateVectorIndexStmt{
+            .table_name = table_name,
+            .column_name = column_name,
+            .model = model,
+            .if_not_exists = if_not_exists,
+            .dimension = dimension,
+        };
+    }
+
+    /// Parse DROP statement (DROP VECTOR INDEX)
+    fn parseDropStatement(self: *Self) !Statement {
+        _ = try self.expect(.DROP);
+
+        // Check for VECTOR INDEX
+        if (self.match(&[_]TokenType{.VECTOR})) {
+            _ = try self.expect(.INDEX);
+            return Statement{ .drop_vector_index = try self.parseDropVectorIndex() };
+        }
+
+        return error.UnsupportedStatement;
+    }
+
+    /// Parse DROP VECTOR INDEX [IF EXISTS] ON table(column)
+    fn parseDropVectorIndex(self: *Self) !ast.DropVectorIndexStmt {
+        // Optional IF EXISTS
+        var if_exists = false;
+        if (self.match(&[_]TokenType{.IF})) {
+            _ = try self.expect(.EXISTS);
+            if_exists = true;
+        }
+
+        // ON keyword
+        _ = try self.expect(.ON);
+
+        // Table name
+        const table_tok = try self.expect(.IDENTIFIER);
+        const table_name = table_tok.lexeme;
+
+        // (column)
+        _ = try self.expect(.LPAREN);
+        const column_tok = try self.expect(.IDENTIFIER);
+        const column_name = column_tok.lexeme;
+        _ = try self.expect(.RPAREN);
+
+        return ast.DropVectorIndexStmt{
+            .table_name = table_name,
+            .column_name = column_name,
+            .if_exists = if_exists,
+        };
+    }
+
+    /// Parse SHOW statement (SHOW VECTOR INDEXES)
+    fn parseShowStatement(self: *Self) !Statement {
+        _ = try self.expect(.SHOW);
+
+        // Check for VECTOR INDEXES
+        if (self.match(&[_]TokenType{.VECTOR})) {
+            _ = try self.expect(.INDEXES);
+            return Statement{ .show_vector_indexes = try self.parseShowVectorIndexes() };
+        }
+
+        return error.UnsupportedStatement;
+    }
+
+    /// Parse SHOW VECTOR INDEXES [ON table]
+    fn parseShowVectorIndexes(self: *Self) !ast.ShowVectorIndexesStmt {
+        // Optional ON table
+        var table_name: ?[]const u8 = null;
+        if (self.match(&[_]TokenType{.ON})) {
+            const table_tok = try self.expect(.IDENTIFIER);
+            table_name = table_tok.lexeme;
+        }
+
+        return ast.ShowVectorIndexesStmt{
+            .table_name = table_name,
         };
     }
 
@@ -1485,4 +1620,101 @@ test "parse chained UNION" {
     try std.testing.expect(set_op1.right.set_operation != null);
     const set_op2 = set_op1.right.set_operation.?;
     try std.testing.expectEqual(ast.SetOperationType.union_distinct, set_op2.op_type);
+}
+
+// ============================================================================
+// Vector Index Tests
+// ============================================================================
+
+test "parse CREATE VECTOR INDEX" {
+    const allocator = std.testing.allocator;
+
+    const sql = "CREATE VECTOR INDEX ON docs(text) USING minilm";
+    const stmt = try parseSQL(sql, allocator);
+
+    try std.testing.expect(stmt == .create_vector_index);
+    const vi = stmt.create_vector_index;
+    try std.testing.expectEqualStrings("docs", vi.table_name);
+    try std.testing.expectEqualStrings("text", vi.column_name);
+    try std.testing.expectEqualStrings("minilm", vi.model);
+    try std.testing.expect(!vi.if_not_exists);
+    try std.testing.expect(vi.dimension == null);
+}
+
+test "parse CREATE VECTOR INDEX IF NOT EXISTS" {
+    const allocator = std.testing.allocator;
+
+    const sql = "CREATE VECTOR INDEX IF NOT EXISTS ON products(description) USING clip";
+    const stmt = try parseSQL(sql, allocator);
+
+    try std.testing.expect(stmt == .create_vector_index);
+    const vi = stmt.create_vector_index;
+    try std.testing.expectEqualStrings("products", vi.table_name);
+    try std.testing.expectEqualStrings("description", vi.column_name);
+    try std.testing.expectEqualStrings("clip", vi.model);
+    try std.testing.expect(vi.if_not_exists);
+}
+
+test "parse CREATE VECTOR INDEX WITH dimension" {
+    const allocator = std.testing.allocator;
+
+    const sql = "CREATE VECTOR INDEX ON embeddings(content) USING minilm WITH (dim = 384)";
+    const stmt = try parseSQL(sql, allocator);
+
+    try std.testing.expect(stmt == .create_vector_index);
+    const vi = stmt.create_vector_index;
+    try std.testing.expectEqualStrings("embeddings", vi.table_name);
+    try std.testing.expectEqualStrings("content", vi.column_name);
+    try std.testing.expectEqualStrings("minilm", vi.model);
+    try std.testing.expect(vi.dimension != null);
+    try std.testing.expectEqual(@as(u32, 384), vi.dimension.?);
+}
+
+test "parse DROP VECTOR INDEX" {
+    const allocator = std.testing.allocator;
+
+    const sql = "DROP VECTOR INDEX ON docs(text)";
+    const stmt = try parseSQL(sql, allocator);
+
+    try std.testing.expect(stmt == .drop_vector_index);
+    const vi = stmt.drop_vector_index;
+    try std.testing.expectEqualStrings("docs", vi.table_name);
+    try std.testing.expectEqualStrings("text", vi.column_name);
+    try std.testing.expect(!vi.if_exists);
+}
+
+test "parse DROP VECTOR INDEX IF EXISTS" {
+    const allocator = std.testing.allocator;
+
+    const sql = "DROP VECTOR INDEX IF EXISTS ON products(description)";
+    const stmt = try parseSQL(sql, allocator);
+
+    try std.testing.expect(stmt == .drop_vector_index);
+    const vi = stmt.drop_vector_index;
+    try std.testing.expectEqualStrings("products", vi.table_name);
+    try std.testing.expectEqualStrings("description", vi.column_name);
+    try std.testing.expect(vi.if_exists);
+}
+
+test "parse SHOW VECTOR INDEXES" {
+    const allocator = std.testing.allocator;
+
+    const sql = "SHOW VECTOR INDEXES";
+    const stmt = try parseSQL(sql, allocator);
+
+    try std.testing.expect(stmt == .show_vector_indexes);
+    const vi = stmt.show_vector_indexes;
+    try std.testing.expect(vi.table_name == null);
+}
+
+test "parse SHOW VECTOR INDEXES ON table" {
+    const allocator = std.testing.allocator;
+
+    const sql = "SHOW VECTOR INDEXES ON docs";
+    const stmt = try parseSQL(sql, allocator);
+
+    try std.testing.expect(stmt == .show_vector_indexes);
+    const vi = stmt.show_vector_indexes;
+    try std.testing.expect(vi.table_name != null);
+    try std.testing.expectEqualStrings("docs", vi.table_name.?);
 }

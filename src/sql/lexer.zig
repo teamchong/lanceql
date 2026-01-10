@@ -30,6 +30,17 @@ pub const TokenType = enum {
     GROUP,
     HAVING,
 
+    // DDL keywords
+    CREATE,
+    DROP,
+    ALTER,
+    TABLE,
+    INDEX,
+    VECTOR,
+    IF,
+    SHOW,
+    INDEXES,
+
     // JOIN keywords
     JOIN,
     LEFT,
@@ -381,6 +392,7 @@ fn keywordOrIdentifier(word: []const u8) TokenType {
 
     // Keywords (alphabetically sorted for binary search)
     if (std.mem.eql(u8, upper, "ALL")) return .ALL;
+    if (std.mem.eql(u8, upper, "ALTER")) return .ALTER;
     if (std.mem.eql(u8, upper, "AND")) return .AND;
     if (std.mem.eql(u8, upper, "AS")) return .AS;
     if (std.mem.eql(u8, upper, "ASC")) return .ASC;
@@ -390,6 +402,7 @@ fn keywordOrIdentifier(word: []const u8) TokenType {
     if (std.mem.eql(u8, upper, "CASE")) return .CASE;
     if (std.mem.eql(u8, upper, "CAST")) return .CAST;
     if (std.mem.eql(u8, upper, "COUNT")) return .COUNT;
+    if (std.mem.eql(u8, upper, "CREATE")) return .CREATE;
     if (std.mem.eql(u8, upper, "CROSS")) return .CROSS;
     if (std.mem.eql(u8, upper, "CUME_DIST")) return .CUME_DIST;
     if (std.mem.eql(u8, upper, "CURRENT")) return .CURRENT;
@@ -397,6 +410,7 @@ fn keywordOrIdentifier(word: []const u8) TokenType {
     if (std.mem.eql(u8, upper, "DENSE_RANK")) return .DENSE_RANK;
     if (std.mem.eql(u8, upper, "DESC")) return .DESC;
     if (std.mem.eql(u8, upper, "DISTINCT")) return .DISTINCT;
+    if (std.mem.eql(u8, upper, "DROP")) return .DROP;
     if (std.mem.eql(u8, upper, "ELSE")) return .ELSE;
     if (std.mem.eql(u8, upper, "END")) return .END;
     if (std.mem.eql(u8, upper, "EXCEPT")) return .EXCEPT;
@@ -409,7 +423,10 @@ fn keywordOrIdentifier(word: []const u8) TokenType {
     if (std.mem.eql(u8, upper, "GROUP")) return .GROUP;
     if (std.mem.eql(u8, upper, "HAVING")) return .HAVING;
     if (std.mem.eql(u8, upper, "HOP")) return .HOP;
+    if (std.mem.eql(u8, upper, "IF")) return .IF;
     if (std.mem.eql(u8, upper, "IN")) return .IN;
+    if (std.mem.eql(u8, upper, "INDEX")) return .INDEX;
+    if (std.mem.eql(u8, upper, "INDEXES")) return .INDEXES;
     if (std.mem.eql(u8, upper, "INNER")) return .INNER;
     if (std.mem.eql(u8, upper, "INTERSECT")) return .INTERSECT;
     if (std.mem.eql(u8, upper, "INTERVAL")) return .INTERVAL;
@@ -447,13 +464,16 @@ fn keywordOrIdentifier(word: []const u8) TokenType {
     if (std.mem.eql(u8, upper, "ROW_NUMBER")) return .ROW_NUMBER;
     if (std.mem.eql(u8, upper, "SELECT")) return .SELECT;
     if (std.mem.eql(u8, upper, "SESSION")) return .SESSION;
+    if (std.mem.eql(u8, upper, "SHOW")) return .SHOW;
     if (std.mem.eql(u8, upper, "SUM")) return .SUM;
+    if (std.mem.eql(u8, upper, "TABLE")) return .TABLE;
     if (std.mem.eql(u8, upper, "THEN")) return .THEN;
     if (std.mem.eql(u8, upper, "TOPK")) return .TOPK;
     if (std.mem.eql(u8, upper, "TUMBLE")) return .TUMBLE;
     if (std.mem.eql(u8, upper, "UNBOUNDED")) return .UNBOUNDED;
     if (std.mem.eql(u8, upper, "UNION")) return .UNION;
     if (std.mem.eql(u8, upper, "USING")) return .USING;
+    if (std.mem.eql(u8, upper, "VECTOR")) return .VECTOR;
     if (std.mem.eql(u8, upper, "WHEN")) return .WHEN;
     if (std.mem.eql(u8, upper, "WHERE")) return .WHERE;
     if (std.mem.eql(u8, upper, "WITH")) return .WITH;
@@ -466,7 +486,7 @@ fn keywordOrIdentifier(word: []const u8) TokenType {
 // ============================================================================
 
 test "lexer basic tokens" {
-    const sql = "SELECT * FROM table WHERE id = 42";
+    const sql = "SELECT * FROM users WHERE id = 42";
     var lexer = Lexer.init(sql);
 
     const allocator = std.testing.allocator;
