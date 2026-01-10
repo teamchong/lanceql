@@ -3,6 +3,7 @@
  */
 import { workerRPC } from '../rpc/worker-rpc.js';
 import { PureLanceWriter } from '../storage/lance-writer.js';
+import { openExplorer } from '../explorer/index.js';
 
 class Vault {
     /**
@@ -302,6 +303,101 @@ class Vault {
             size: lanceBytes.length,
             url: signedUrl.split('?')[0], // Return URL without query params
         };
+    }
+
+    // =========================================================================
+    // Developer Tools
+    // =========================================================================
+
+    /**
+     * Open the Data Explorer in a new window.
+     *
+     * DevTools-style debugging UI with:
+     * - SQL editor
+     * - DataView (virtualized table)
+     * - Timeline (version history)
+     *
+     * @param {Object} [options] - Explorer options
+     * @param {string} [options.table] - Pre-select table
+     * @param {number} [options.version] - Start at specific version
+     * @param {number} [options.width=1200] - Window width
+     * @param {number} [options.height=800] - Window height
+     * @returns {Object} Controller for the explorer window
+     *
+     * @example
+     * const v = await vault();
+     * v.explorer(); // Opens debug window
+     *
+     * // With options
+     * v.explorer({ table: 'users', width: 1400 });
+     *
+     * // Use controller
+     * const exp = v.explorer();
+     * exp.runSQL('SELECT * FROM users LIMIT 10');
+     * exp.close();
+     */
+    explorer(options = {}) {
+        return openExplorer(this, options);
+    }
+
+    // =========================================================================
+    // Time Travel APIs
+    // =========================================================================
+
+    /**
+     * Get version timeline for a table.
+     * @param {string} table - Table name
+     * @returns {Promise<Array>} Version history with deltas
+     *
+     * @example
+     * const history = await v.timeline('users');
+     * // [{ version: 3, timestamp: ..., operation: 'INSERT', delta: '+5' }, ...]
+     */
+    async timeline(table) {
+        const result = await this.exec(`SHOW VERSIONS FOR ${table}`);
+        return result?.rows?.map(row => ({
+            version: row[0],
+            timestamp: row[1],
+            operation: row[2],
+            rowCount: row[3],
+            delta: row[4]
+        })) || [];
+    }
+
+    /**
+     * Get diff between two versions.
+     * @param {string} table - Table name
+     * @param {Object} options - Diff options
+     * @param {number} options.from - From version
+     * @param {number} [options.to] - To version (defaults to HEAD)
+     * @param {number} [options.limit=100] - Max rows
+     * @returns {Promise<Object>} Diff result with added/deleted rows
+     *
+     * @example
+     * const diff = await v.diff('users', { from: 2, to: 3 });
+     * // { added: [...], deleted: [...], fromVersion: 2, toVersion: 3 }
+     */
+    async diff(table, { from, to, limit = 100 } = {}) {
+        let sql = `DIFF ${table} VERSION ${from}`;
+        if (to !== undefined) sql += ` AND VERSION ${to}`;
+        sql += ` LIMIT ${limit}`;
+
+        const result = await this.exec(sql);
+        return {
+            added: result?.added || [],
+            deleted: result?.deleted || [],
+            fromVersion: result?.from_version || from,
+            toVersion: result?.to_version || to || 'HEAD'
+        };
+    }
+
+    /**
+     * Get what changed in the last version.
+     * @param {string} table - Table name
+     * @returns {Promise<Object>} Last change diff
+     */
+    async lastChange(table) {
+        return this.diff(table, { from: -1 });
     }
 }
 

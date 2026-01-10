@@ -389,12 +389,74 @@ pub const ShowVectorIndexesStmt = struct {
     table_name: ?[]const u8,
 };
 
+/// Version reference for time travel queries
+/// Supports: VERSION 3, VERSION -1, VERSION HEAD, VERSION HEAD~2, VERSION CURRENT
+pub const VersionRef = union(enum) {
+    /// Explicit version number (VERSION 3)
+    absolute: u32,
+
+    /// Relative to HEAD (VERSION -1 means HEAD~1, VERSION -3 means HEAD~3)
+    relative: i32,
+
+    /// HEAD keyword (current version)
+    head: void,
+
+    /// HEAD~N syntax
+    head_offset: u32,
+
+    /// CURRENT keyword (alias for HEAD)
+    current: void,
+};
+
+/// DIFF statement for comparing versions
+/// Example: DIFF table VERSION 2 AND VERSION 3 [LIMIT 100]
+/// Example: DIFF table VERSION -1 (shorthand for HEAD~1 vs HEAD)
+pub const DiffStmt = struct {
+    /// Table name (or table function like read_lance('url'))
+    table_ref: TableRef,
+
+    /// From version (older)
+    from_version: VersionRef,
+
+    /// To version (newer) - null means HEAD
+    to_version: ?VersionRef,
+
+    /// Maximum rows to return (default 100)
+    limit: u32,
+};
+
+/// SHOW VERSIONS statement (enhanced with delta counts)
+/// Example: SHOW VERSIONS FOR table [LIMIT 10]
+pub const ShowVersionsStmt = struct {
+    /// Table name (or table function like read_lance('url'))
+    table_ref: TableRef,
+
+    /// Maximum versions to return (optional)
+    limit: ?u32,
+};
+
+/// SHOW CHANGES statement
+/// Example: SHOW CHANGES FOR table SINCE VERSION 2
+pub const ShowChangesStmt = struct {
+    /// Table name (or table function like read_lance('url'))
+    table_ref: TableRef,
+
+    /// Version to show changes since
+    since_version: VersionRef,
+
+    /// Maximum rows to return (optional)
+    limit: ?u32,
+};
+
 /// Top-level statement (extensible for INSERT/UPDATE/DELETE later)
 pub const Statement = union(enum) {
     select: SelectStmt,
     create_vector_index: CreateVectorIndexStmt,
     drop_vector_index: DropVectorIndexStmt,
     show_vector_indexes: ShowVectorIndexesStmt,
+    diff: DiffStmt,
+    show_versions: ShowVersionsStmt,
+    show_changes: ShowChangesStmt,
 };
 
 // ============================================================================

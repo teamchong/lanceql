@@ -41,6 +41,15 @@ pub const TokenType = enum {
     SHOW,
     INDEXES,
 
+    // Time travel / diff keywords
+    DIFF,
+    VERSION,
+    VERSIONS,
+    CHANGES,
+    SINCE,
+    FOR,
+    HEAD,
+
     // JOIN keywords
     JOIN,
     LEFT,
@@ -401,6 +410,7 @@ fn keywordOrIdentifier(word: []const u8) TokenType {
     if (std.mem.eql(u8, upper, "BY")) return .BY;
     if (std.mem.eql(u8, upper, "CASE")) return .CASE;
     if (std.mem.eql(u8, upper, "CAST")) return .CAST;
+    if (std.mem.eql(u8, upper, "CHANGES")) return .CHANGES;
     if (std.mem.eql(u8, upper, "COUNT")) return .COUNT;
     if (std.mem.eql(u8, upper, "CREATE")) return .CREATE;
     if (std.mem.eql(u8, upper, "CROSS")) return .CROSS;
@@ -409,6 +419,7 @@ fn keywordOrIdentifier(word: []const u8) TokenType {
     if (std.mem.eql(u8, upper, "DATA")) return .DATA;
     if (std.mem.eql(u8, upper, "DENSE_RANK")) return .DENSE_RANK;
     if (std.mem.eql(u8, upper, "DESC")) return .DESC;
+    if (std.mem.eql(u8, upper, "DIFF")) return .DIFF;
     if (std.mem.eql(u8, upper, "DISTINCT")) return .DISTINCT;
     if (std.mem.eql(u8, upper, "DROP")) return .DROP;
     if (std.mem.eql(u8, upper, "ELSE")) return .ELSE;
@@ -418,10 +429,12 @@ fn keywordOrIdentifier(word: []const u8) TokenType {
     if (std.mem.eql(u8, upper, "FILE")) return .FILE;
     if (std.mem.eql(u8, upper, "FIRST_VALUE")) return .FIRST_VALUE;
     if (std.mem.eql(u8, upper, "FOLLOWING")) return .FOLLOWING;
+    if (std.mem.eql(u8, upper, "FOR")) return .FOR;
     if (std.mem.eql(u8, upper, "FROM")) return .FROM;
     if (std.mem.eql(u8, upper, "FULL")) return .FULL;
     if (std.mem.eql(u8, upper, "GROUP")) return .GROUP;
     if (std.mem.eql(u8, upper, "HAVING")) return .HAVING;
+    if (std.mem.eql(u8, upper, "HEAD")) return .HEAD;
     if (std.mem.eql(u8, upper, "HOP")) return .HOP;
     if (std.mem.eql(u8, upper, "IF")) return .IF;
     if (std.mem.eql(u8, upper, "IN")) return .IN;
@@ -465,6 +478,7 @@ fn keywordOrIdentifier(word: []const u8) TokenType {
     if (std.mem.eql(u8, upper, "SELECT")) return .SELECT;
     if (std.mem.eql(u8, upper, "SESSION")) return .SESSION;
     if (std.mem.eql(u8, upper, "SHOW")) return .SHOW;
+    if (std.mem.eql(u8, upper, "SINCE")) return .SINCE;
     if (std.mem.eql(u8, upper, "SUM")) return .SUM;
     if (std.mem.eql(u8, upper, "TABLE")) return .TABLE;
     if (std.mem.eql(u8, upper, "THEN")) return .THEN;
@@ -474,6 +488,8 @@ fn keywordOrIdentifier(word: []const u8) TokenType {
     if (std.mem.eql(u8, upper, "UNION")) return .UNION;
     if (std.mem.eql(u8, upper, "USING")) return .USING;
     if (std.mem.eql(u8, upper, "VECTOR")) return .VECTOR;
+    if (std.mem.eql(u8, upper, "VERSION")) return .VERSION;
+    if (std.mem.eql(u8, upper, "VERSIONS")) return .VERSIONS;
     if (std.mem.eql(u8, upper, "WHEN")) return .WHEN;
     if (std.mem.eql(u8, upper, "WHERE")) return .WHERE;
     if (std.mem.eql(u8, upper, "WITH")) return .WITH;

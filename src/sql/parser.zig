@@ -87,6 +87,7 @@ pub const Parser = struct {
             .CREATE => try self.parseCreateStatement(),
             .DROP => try self.parseDropStatement(),
             .SHOW => try self.parseShowStatement(),
+            .DIFF => Statement{ .diff = try self.parseDiff() },
             else => error.UnsupportedStatement,
         };
     }
@@ -196,7 +197,7 @@ pub const Parser = struct {
         };
     }
 
-    /// Parse SHOW statement (SHOW VECTOR INDEXES)
+    /// Parse SHOW statement (SHOW VECTOR INDEXES, SHOW VERSIONS, SHOW CHANGES)
     fn parseShowStatement(self: *Self) !Statement {
         _ = try self.expect(.SHOW);
 
@@ -204,6 +205,16 @@ pub const Parser = struct {
         if (self.match(&[_]TokenType{.VECTOR})) {
             _ = try self.expect(.INDEXES);
             return Statement{ .show_vector_indexes = try self.parseShowVectorIndexes() };
+        }
+
+        // Check for VERSIONS
+        if (self.match(&[_]TokenType{.VERSIONS})) {
+            return Statement{ .show_versions = try self.parseShowVersions() };
+        }
+
+        // Check for CHANGES
+        if (self.match(&[_]TokenType{.CHANGES})) {
+            return Statement{ .show_changes = try self.parseShowChanges() };
         }
 
         return error.UnsupportedStatement;
@@ -221,6 +232,136 @@ pub const Parser = struct {
         return ast.ShowVectorIndexesStmt{
             .table_name = table_name,
         };
+    }
+
+    /// Parse DIFF table VERSION n [AND VERSION m] [LIMIT l]
+    /// Examples:
+    ///   DIFF users VERSION 2 AND VERSION 3
+    ///   DIFF users VERSION -1  (shorthand for HEAD~1 vs HEAD)
+    ///   DIFF read_lance('url') VERSION HEAD~2 AND HEAD
+    fn parseDiff(self: *Self) !ast.DiffStmt {
+        _ = try self.expect(.DIFF);
+
+        // Parse table reference (can be read_lance('url') or simple table name)
+        const table_ref = try self.parsePrimaryTableRef();
+
+        // VERSION keyword
+        _ = try self.expect(.VERSION);
+
+        // Parse from version
+        const from_version = try self.parseVersionRef();
+
+        // Optional AND VERSION (for explicit to_version)
+        var to_version: ?ast.VersionRef = null;
+        if (self.match(&[_]TokenType{.AND})) {
+            // Allow optional VERSION keyword after AND
+            _ = self.match(&[_]TokenType{.VERSION});
+            to_version = try self.parseVersionRef();
+        }
+
+        // Optional LIMIT
+        var limit: u32 = 100; // Default limit
+        if (self.match(&[_]TokenType{.LIMIT})) {
+            limit = try self.parseLimitValue();
+        }
+
+        return ast.DiffStmt{
+            .table_ref = table_ref,
+            .from_version = from_version,
+            .to_version = to_version,
+            .limit = limit,
+        };
+    }
+
+    /// Parse SHOW VERSIONS FOR table [LIMIT l]
+    fn parseShowVersions(self: *Self) !ast.ShowVersionsStmt {
+        // FOR keyword
+        _ = try self.expect(.FOR);
+
+        // Parse table reference
+        const table_ref = try self.parsePrimaryTableRef();
+
+        // Optional LIMIT
+        var limit: ?u32 = null;
+        if (self.match(&[_]TokenType{.LIMIT})) {
+            limit = try self.parseLimitValue();
+        }
+
+        return ast.ShowVersionsStmt{
+            .table_ref = table_ref,
+            .limit = limit,
+        };
+    }
+
+    /// Parse SHOW CHANGES FOR table SINCE VERSION n [LIMIT l]
+    fn parseShowChanges(self: *Self) !ast.ShowChangesStmt {
+        // FOR keyword
+        _ = try self.expect(.FOR);
+
+        // Parse table reference
+        const table_ref = try self.parsePrimaryTableRef();
+
+        // SINCE keyword
+        _ = try self.expect(.SINCE);
+
+        // VERSION keyword
+        _ = try self.expect(.VERSION);
+
+        // Parse version reference
+        const since_version = try self.parseVersionRef();
+
+        // Optional LIMIT
+        var limit: ?u32 = null;
+        if (self.match(&[_]TokenType{.LIMIT})) {
+            limit = try self.parseLimitValue();
+        }
+
+        return ast.ShowChangesStmt{
+            .table_ref = table_ref,
+            .since_version = since_version,
+            .limit = limit,
+        };
+    }
+
+    /// Parse version reference: absolute (3), relative (-1), HEAD, HEAD~N, CURRENT
+    fn parseVersionRef(self: *Self) !ast.VersionRef {
+        // Check for HEAD or CURRENT
+        if (self.match(&[_]TokenType{.HEAD})) {
+            // Check for ~N suffix (HEAD~2)
+            if (self.check(.IDENTIFIER)) {
+                const tok = self.current().?;
+                // Check if it starts with ~ (like "~2")
+                if (tok.lexeme.len > 0 and tok.lexeme[0] == '~') {
+                    self.advance();
+                    // Parse the number after ~
+                    const offset_str = tok.lexeme[1..];
+                    const offset = std.fmt.parseInt(u32, offset_str, 10) catch return error.InvalidVersionOffset;
+                    return ast.VersionRef{ .head_offset = offset };
+                }
+            }
+            return ast.VersionRef{ .head = {} };
+        }
+
+        if (self.match(&[_]TokenType{.CURRENT})) {
+            return ast.VersionRef{ .current = {} };
+        }
+
+        // Check for number (positive or negative)
+        if (self.check(.NUMBER)) {
+            const tok = self.current().?;
+            self.advance();
+            const num = std.fmt.parseInt(i64, tok.lexeme, 10) catch return error.InvalidVersionNumber;
+            return ast.VersionRef{ .absolute = @intCast(num) };
+        }
+
+        // Check for negative number (MINUS followed by NUMBER)
+        if (self.match(&[_]TokenType{.MINUS})) {
+            const num_tok = try self.expect(.NUMBER);
+            const num = std.fmt.parseInt(i32, num_tok.lexeme, 10) catch return error.InvalidVersionNumber;
+            return ast.VersionRef{ .relative = -num };
+        }
+
+        return error.ExpectedVersionNumber;
     }
 
     /// Parse WITH DATA ... SELECT statement
@@ -1717,4 +1858,127 @@ test "parse SHOW VECTOR INDEXES ON table" {
     const vi = stmt.show_vector_indexes;
     try std.testing.expect(vi.table_name != null);
     try std.testing.expectEqualStrings("docs", vi.table_name.?);
+}
+
+test "parse DIFF with absolute versions" {
+    const allocator = std.testing.allocator;
+
+    const sql = "DIFF users VERSION 2 AND VERSION 3";
+    const stmt = try parseSQL(sql, allocator);
+
+    try std.testing.expect(stmt == .diff);
+    const diff = stmt.diff;
+    try std.testing.expect(diff.table_ref == .simple);
+    try std.testing.expectEqualStrings("users", diff.table_ref.simple.name);
+    try std.testing.expect(diff.from_version == .absolute);
+    try std.testing.expectEqual(@as(u32, 2), diff.from_version.absolute);
+    try std.testing.expect(diff.to_version != null);
+    try std.testing.expect(diff.to_version.? == .absolute);
+    try std.testing.expectEqual(@as(u32, 3), diff.to_version.?.absolute);
+    try std.testing.expectEqual(@as(u32, 100), diff.limit); // default
+}
+
+test "parse DIFF with relative version (shorthand)" {
+    const allocator = std.testing.allocator;
+
+    const sql = "DIFF users VERSION -1";
+    const stmt = try parseSQL(sql, allocator);
+
+    try std.testing.expect(stmt == .diff);
+    const diff = stmt.diff;
+    try std.testing.expect(diff.from_version == .relative);
+    try std.testing.expectEqual(@as(i32, -1), diff.from_version.relative);
+    try std.testing.expect(diff.to_version == null); // defaults to HEAD
+}
+
+test "parse DIFF with HEAD" {
+    const allocator = std.testing.allocator;
+
+    const sql = "DIFF users VERSION 2 AND HEAD";
+    const stmt = try parseSQL(sql, allocator);
+
+    try std.testing.expect(stmt == .diff);
+    const diff = stmt.diff;
+    try std.testing.expect(diff.to_version != null);
+    try std.testing.expect(diff.to_version.? == .head);
+}
+
+test "parse DIFF with CURRENT" {
+    const allocator = std.testing.allocator;
+
+    const sql = "DIFF users VERSION 2 AND CURRENT";
+    const stmt = try parseSQL(sql, allocator);
+
+    try std.testing.expect(stmt == .diff);
+    const diff = stmt.diff;
+    try std.testing.expect(diff.to_version != null);
+    try std.testing.expect(diff.to_version.? == .current);
+}
+
+test "parse DIFF with LIMIT" {
+    const allocator = std.testing.allocator;
+
+    const sql = "DIFF users VERSION 2 AND VERSION 3 LIMIT 500";
+    const stmt = try parseSQL(sql, allocator);
+
+    try std.testing.expect(stmt == .diff);
+    const diff = stmt.diff;
+    try std.testing.expectEqual(@as(u32, 500), diff.limit);
+}
+
+test "parse DIFF with table function" {
+    const allocator = std.testing.allocator;
+
+    const sql = "DIFF read_lance('https://example.com/data.lance') VERSION 1 AND VERSION 2";
+    const stmt = try parseSQL(sql, allocator);
+    defer {
+        // Free function args
+        if (stmt.diff.table_ref == .function) {
+            allocator.free(stmt.diff.table_ref.function.func.args);
+        }
+    }
+
+    try std.testing.expect(stmt == .diff);
+    const diff = stmt.diff;
+    try std.testing.expect(diff.table_ref == .function);
+    try std.testing.expectEqualStrings("read_lance", diff.table_ref.function.func.name);
+}
+
+test "parse SHOW VERSIONS FOR table" {
+    const allocator = std.testing.allocator;
+
+    const sql = "SHOW VERSIONS FOR users";
+    const stmt = try parseSQL(sql, allocator);
+
+    try std.testing.expect(stmt == .show_versions);
+    const sv = stmt.show_versions;
+    try std.testing.expect(sv.table_ref == .simple);
+    try std.testing.expectEqualStrings("users", sv.table_ref.simple.name);
+    try std.testing.expect(sv.limit == null);
+}
+
+test "parse SHOW VERSIONS FOR table LIMIT" {
+    const allocator = std.testing.allocator;
+
+    const sql = "SHOW VERSIONS FOR users LIMIT 10";
+    const stmt = try parseSQL(sql, allocator);
+
+    try std.testing.expect(stmt == .show_versions);
+    const sv = stmt.show_versions;
+    try std.testing.expect(sv.limit != null);
+    try std.testing.expectEqual(@as(u32, 10), sv.limit.?);
+}
+
+test "parse SHOW CHANGES FOR table SINCE VERSION" {
+    const allocator = std.testing.allocator;
+
+    const sql = "SHOW CHANGES FOR users SINCE VERSION 5";
+    const stmt = try parseSQL(sql, allocator);
+
+    try std.testing.expect(stmt == .show_changes);
+    const sc = stmt.show_changes;
+    try std.testing.expect(sc.table_ref == .simple);
+    try std.testing.expectEqualStrings("users", sc.table_ref.simple.name);
+    try std.testing.expect(sc.since_version == .absolute);
+    try std.testing.expectEqual(@as(u32, 5), sc.since_version.absolute);
 }

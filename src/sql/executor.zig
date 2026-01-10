@@ -1647,11 +1647,35 @@ pub const Executor = struct {
     // ========================================================================
 
     /// Result type for non-SELECT statements
+    /// Diff result - shows added and deleted rows between versions
+    pub const DiffResult = struct {
+        /// Added rows (in to_version but not in from_version)
+        added: Result,
+        /// Deleted rows (in from_version but not in to_version)
+        deleted: Result,
+        /// From version number (resolved)
+        from_version: u32,
+        /// To version number (resolved)
+        to_version: u32,
+    };
+
+    /// Version info for SHOW VERSIONS result
+    pub const VersionInfo = struct {
+        version: u32,
+        timestamp: i64, // Unix timestamp
+        operation: []const u8, // INSERT, DELETE, UPDATE
+        row_count: u32,
+        delta: []const u8, // "+3", "-1", etc.
+    };
+
     pub const StatementResult = union(enum) {
         select: Result,
         vector_index_created: VectorIndexInfo,
         vector_index_dropped: struct { table: []const u8, column: []const u8 },
         vector_indexes_list: []const VectorIndexInfo,
+        diff_result: DiffResult,
+        versions_list: []const VersionInfo,
+        changes_list: Result, // Uses standard Result with change column
         no_op: void,
     };
 
@@ -1662,6 +1686,9 @@ pub const Executor = struct {
             .create_vector_index => |vi| StatementResult{ .vector_index_created = try self.executeCreateVectorIndex(&vi) },
             .drop_vector_index => |vi| StatementResult{ .vector_index_dropped = try self.executeDropVectorIndex(&vi) },
             .show_vector_indexes => |vi| StatementResult{ .vector_indexes_list = try self.executeShowVectorIndexes(&vi) },
+            .diff => |d| StatementResult{ .diff_result = try self.executeDiff(&d) },
+            .show_versions => |sv| StatementResult{ .versions_list = try self.executeShowVersions(&sv) },
+            .show_changes => |sc| StatementResult{ .changes_list = try self.executeShowChanges(&sc) },
         };
     }
 
@@ -1788,6 +1815,143 @@ pub const Executor = struct {
     /// Check if a column has a vector index
     pub fn hasVectorIndex(self: *Self, table_name: []const u8, column_name: []const u8) bool {
         return self.getVectorIndex(table_name, column_name) != null;
+    }
+
+    // ========================================================================
+    // Time Travel / Diff Execution
+    // ========================================================================
+
+    /// Resolve a VersionRef to an absolute version number
+    fn resolveVersion(self: *Self, ref: ast.VersionRef, table_ref: *const ast.TableRef) !u32 {
+        _ = table_ref; // Will be used when we load manifest to get current version
+
+        // Get current version from table (if available)
+        const current_version: u32 = if (self.table) |t| blk: {
+            // Try to get version from table's lance file
+            if (t.lance_file) |lf| {
+                break :blk lf.footer.major_version;
+            }
+            break :blk 1; // Default
+        } else 1;
+
+        return switch (ref) {
+            .absolute => |v| v,
+            .relative => |offset| blk: {
+                // -1 means HEAD~1, -2 means HEAD~2
+                const abs_offset: u32 = @intCast(if (offset < 0) -offset else offset);
+                if (current_version < abs_offset) return error.VersionBeforeStart;
+                break :blk current_version - abs_offset;
+            },
+            .head => current_version,
+            .head_offset => |offset| blk: {
+                if (current_version < offset) return error.VersionBeforeStart;
+                break :blk current_version - offset;
+            },
+            .current => current_version,
+        };
+    }
+
+    /// Execute DIFF statement - compare two versions
+    fn executeDiff(self: *Self, stmt: *const ast.DiffStmt) !DiffResult {
+        // Resolve version numbers
+        const from_version = try self.resolveVersion(stmt.from_version, &stmt.table_ref);
+        const to_version = if (stmt.to_version) |tv|
+            try self.resolveVersion(tv, &stmt.table_ref)
+        else blk: {
+            // Default to current version (HEAD)
+            if (self.table) |t| {
+                if (t.lance_file) |lf| {
+                    break :blk lf.footer.major_version;
+                }
+            }
+            break :blk 1;
+        };
+
+        // For now, return empty results as placeholder
+        // Full implementation requires manifest loading and row comparison
+        // This will be implemented when we add manifest parsing support
+
+        const empty_columns = try self.allocator.alloc([]const u8, 0);
+        const empty_int_data = try self.allocator.alloc([]const i64, 0);
+        const empty_float_data = try self.allocator.alloc([]const f64, 0);
+        const empty_string_data = try self.allocator.alloc([]const []const u8, 0);
+        const empty_types = try self.allocator.alloc(LanceColumnType, 0);
+
+        return DiffResult{
+            .added = Result{
+                .columns = empty_columns,
+                .int_data = empty_int_data,
+                .float_data = empty_float_data,
+                .string_data = empty_string_data,
+                .column_types = empty_types,
+                .row_count = 0,
+            },
+            .deleted = Result{
+                .columns = try self.allocator.alloc([]const u8, 0),
+                .int_data = try self.allocator.alloc([]const i64, 0),
+                .float_data = try self.allocator.alloc([]const f64, 0),
+                .string_data = try self.allocator.alloc([]const []const u8, 0),
+                .column_types = try self.allocator.alloc(LanceColumnType, 0),
+                .row_count = 0,
+            },
+            .from_version = from_version,
+            .to_version = to_version,
+        };
+    }
+
+    /// Execute SHOW VERSIONS - list version history with deltas
+    fn executeShowVersions(self: *Self, stmt: *const ast.ShowVersionsStmt) ![]const VersionInfo {
+        _ = stmt; // Will use table_ref to load manifests
+
+        var results = std.ArrayList(VersionInfo).init(self.allocator);
+        errdefer results.deinit();
+
+        // Get current version info from table
+        if (self.table) |t| {
+            if (t.lance_file) |lf| {
+                // Add current version entry
+                try results.append(VersionInfo{
+                    .version = lf.footer.major_version,
+                    .timestamp = std.time.timestamp(),
+                    .operation = "CURRENT",
+                    .row_count = @intCast(t.row_count),
+                    .delta = "+0",
+                });
+            }
+        }
+
+        // Full implementation requires:
+        // 1. List _versions/*.manifest files
+        // 2. Parse each manifest for row counts
+        // 3. Calculate deltas between adjacent versions
+        // This placeholder returns basic info from current table
+
+        return results.toOwnedSlice();
+    }
+
+    /// Execute SHOW CHANGES - list changes since a version
+    fn executeShowChanges(self: *Self, stmt: *const ast.ShowChangesStmt) !Result {
+        // Resolve the since version
+        const since_version = try self.resolveVersion(stmt.since_version, &stmt.table_ref);
+        _ = since_version;
+
+        // Return empty result as placeholder
+        // Full implementation requires walking version chain
+
+        const empty_columns = try self.allocator.alloc([]const u8, 0);
+        const empty_int_data = try self.allocator.alloc([]const i64, 0);
+        const empty_float_data = try self.allocator.alloc([]const f64, 0);
+        const empty_string_data = try self.allocator.alloc([]const []const u8, 0);
+        const empty_types = try self.allocator.alloc(LanceColumnType, 0);
+
+        return Result{
+            .columns = empty_columns,
+            .int_data = empty_int_data,
+            .float_data = empty_float_data,
+            .string_data = empty_string_data,
+            .column_types = empty_types,
+            .row_count = 0,
+        };
     }
 
     // ========================================================================
