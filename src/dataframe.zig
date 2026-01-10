@@ -29,12 +29,28 @@ const Expr = query.Expr;
 const SelectStmt = query.SelectStmt;
 const SelectItem = query.SelectItem;
 const OrderBy = query.OrderBy;
-const AggregateType = query.AggregateType;
 const Executor = query.Executor;
 const ResultSet = query.ResultSet;
 const Aggregate = query.Aggregate;
 const table_mod = @import("lanceql.table");
 const Table = table_mod.Table;
+
+// Reuse SQL layer types for consistency
+const sql_ast = @import("sql").ast;
+const sql_agg = @import("sql").aggregate_functions;
+
+/// Reuse SQL layer's AggregateType for all aggregate operations
+pub const AggregateType = sql_agg.AggregateType;
+
+/// Reuse SQL layer's JoinType
+pub const JoinType = sql_ast.JoinType;
+
+/// Reuse SQL layer's SetOperationType
+pub const SetOpType = sql_ast.SetOperationType;
+
+/// Reuse SQL layer's WindowSpec for window functions
+pub const WindowFrame = sql_ast.WindowFrame;
+pub const FrameBound = sql_ast.FrameBound;
 
 /// DataFrame for building and executing queries.
 pub const DataFrame = struct {
@@ -51,6 +67,7 @@ pub const DataFrame = struct {
     limit_value: ?u64 = null,
     offset_value: ?u64 = null,
     distinct_flag: bool = false,
+    having_expr: ?*Expr = null,
 
     // Join state
     join_spec: ?JoinSpec = null,
@@ -69,16 +86,7 @@ pub const DataFrame = struct {
 
     const Self = @This();
 
-    /// Join types matching SQL
-    pub const JoinType = enum {
-        inner,
-        left,
-        right,
-        full,
-        cross,
-    };
-
-    /// Join specification
+    /// Join specification (reuses JoinType from SQL layer)
     pub const JoinSpec = struct {
         other: *const DataFrame,
         join_type: JoinType,
@@ -92,6 +100,9 @@ pub const DataFrame = struct {
         partition_by: ?[]const []const u8 = null,
         order_by: ?[]const []const u8 = null, // "col DESC" format
         alias: ?[]const u8 = null,
+        offset: ?i64 = null, // For lag/lead offset
+        default_value: ?[]const u8 = null, // For lag/lead default value
+        n_tiles: ?u32 = null, // For ntile(n)
     };
 
     /// Pivot specification
@@ -101,15 +112,7 @@ pub const DataFrame = struct {
         agg_type: AggregateType, // How to aggregate
     };
 
-    /// Set operation types
-    pub const SetOpType = enum {
-        union_all,
-        union_distinct,
-        intersect,
-        except,
-    };
-
-    /// Set operation specification
+    /// Set operation specification (reuses SetOpType from SQL layer)
     pub const SetOpSpec = struct {
         other: *const DataFrame,
         op_type: SetOpType,
@@ -255,6 +258,9 @@ pub const DataFrame = struct {
         partition_by: ?[]const []const u8 = null,
         order_by: ?[]const []const u8 = null,
         alias: ?[]const u8 = null,
+        offset: ?i64 = null,
+        default_value: ?[]const u8 = null,
+        n_tiles: ?u32 = null,
     }) Self {
         var new = self;
         const win_spec = WindowSpec{
@@ -263,6 +269,9 @@ pub const DataFrame = struct {
             .partition_by = spec.partition_by,
             .order_by = spec.order_by,
             .alias = spec.alias,
+            .offset = spec.offset,
+            .default_value = spec.default_value,
+            .n_tiles = spec.n_tiles,
         };
 
         if (new.window_specs) |existing| {
@@ -305,23 +314,126 @@ pub const DataFrame = struct {
         });
     }
 
-    /// Lag window function.
-    pub fn lag(self: Self, column: []const u8, offset_val: usize, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
-        _ = offset_val; // TODO: Support offset
+    /// Lag window function - access previous row's value.
+    pub fn lag(self: Self, column: []const u8, offset_val: i64, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
         return self.window("lag", &.{column}, .{
             .partition_by = partition_by,
             .order_by = order_by,
             .alias = "lag_value",
+            .offset = offset_val,
         });
     }
 
-    /// Lead window function.
-    pub fn lead(self: Self, column: []const u8, offset_val: usize, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
-        _ = offset_val; // TODO: Support offset
+    /// Lead window function - access next row's value.
+    pub fn lead(self: Self, column: []const u8, offset_val: i64, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
         return self.window("lead", &.{column}, .{
             .partition_by = partition_by,
             .order_by = order_by,
             .alias = "lead_value",
+            .offset = offset_val,
+        });
+    }
+
+    /// Ntile window function - divide rows into N buckets.
+    pub fn ntile(self: Self, n: u32, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
+        return self.window("ntile", &.{}, .{
+            .partition_by = partition_by,
+            .order_by = order_by,
+            .alias = "ntile",
+            .n_tiles = n,
+        });
+    }
+
+    /// Percent rank window function - relative rank as percentage.
+    pub fn percentRank(self: Self, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
+        return self.window("percent_rank", &.{}, .{
+            .partition_by = partition_by,
+            .order_by = order_by,
+            .alias = "percent_rank",
+        });
+    }
+
+    /// Cume_dist window function - cumulative distribution.
+    pub fn cumeDist(self: Self, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
+        return self.window("cume_dist", &.{}, .{
+            .partition_by = partition_by,
+            .order_by = order_by,
+            .alias = "cume_dist",
+        });
+    }
+
+    /// First value window function - first value in partition.
+    pub fn firstValue(self: Self, column: []const u8, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
+        return self.window("first_value", &.{column}, .{
+            .partition_by = partition_by,
+            .order_by = order_by,
+            .alias = "first_value",
+        });
+    }
+
+    /// Last value window function - last value in partition.
+    pub fn lastValue(self: Self, column: []const u8, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
+        return self.window("last_value", &.{column}, .{
+            .partition_by = partition_by,
+            .order_by = order_by,
+            .alias = "last_value",
+        });
+    }
+
+    /// Nth value window function - nth value in partition.
+    pub fn nthValue(self: Self, column: []const u8, n: i64, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
+        return self.window("nth_value", &.{column}, .{
+            .partition_by = partition_by,
+            .order_by = order_by,
+            .alias = "nth_value",
+            .offset = n, // Reuse offset for n
+        });
+    }
+
+    // Aggregate window functions - run aggregates over window frames
+
+    /// Sum over window.
+    pub fn sumOver(self: Self, column: []const u8, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
+        return self.window("sum", &.{column}, .{
+            .partition_by = partition_by,
+            .order_by = order_by,
+            .alias = "sum_over",
+        });
+    }
+
+    /// Avg over window.
+    pub fn avgOver(self: Self, column: []const u8, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
+        return self.window("avg", &.{column}, .{
+            .partition_by = partition_by,
+            .order_by = order_by,
+            .alias = "avg_over",
+        });
+    }
+
+    /// Min over window.
+    pub fn minOver(self: Self, column: []const u8, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
+        return self.window("min", &.{column}, .{
+            .partition_by = partition_by,
+            .order_by = order_by,
+            .alias = "min_over",
+        });
+    }
+
+    /// Max over window.
+    pub fn maxOver(self: Self, column: []const u8, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
+        return self.window("max", &.{column}, .{
+            .partition_by = partition_by,
+            .order_by = order_by,
+            .alias = "max_over",
+        });
+    }
+
+    /// Count over window.
+    pub fn countOver(self: Self, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
+        return self.window("count", &.{}, .{
+            .partition_by = partition_by,
+            .order_by = order_by,
+            .alias = "count_over",
         });
     }
 
@@ -604,6 +716,69 @@ pub const GroupedFrame = struct {
             .column = column,
             .alias = null,
         }});
+    }
+
+    /// Sample standard deviation per group.
+    pub fn stddev(self: Self, column: []const u8) DataFrame {
+        return self.agg(&.{.{
+            .agg_type = .stddev,
+            .column = column,
+            .alias = null,
+        }});
+    }
+
+    /// Population standard deviation per group.
+    pub fn stddevPop(self: Self, column: []const u8) DataFrame {
+        return self.agg(&.{.{
+            .agg_type = .stddev_pop,
+            .column = column,
+            .alias = null,
+        }});
+    }
+
+    /// Sample variance per group.
+    pub fn variance(self: Self, column: []const u8) DataFrame {
+        return self.agg(&.{.{
+            .agg_type = .variance,
+            .column = column,
+            .alias = null,
+        }});
+    }
+
+    /// Population variance per group.
+    pub fn varPop(self: Self, column: []const u8) DataFrame {
+        return self.agg(&.{.{
+            .agg_type = .var_pop,
+            .column = column,
+            .alias = null,
+        }});
+    }
+
+    /// Median (50th percentile) per group.
+    pub fn median(self: Self, column: []const u8) DataFrame {
+        return self.agg(&.{.{
+            .agg_type = .median,
+            .column = column,
+            .alias = null,
+        }});
+    }
+
+    /// Arbitrary percentile per group (0.0-1.0).
+    pub fn percentile(self: Self, column: []const u8, pct: f64) DataFrame {
+        _ = pct; // Percentile value is passed via args in SQL layer
+        return self.agg(&.{.{
+            .agg_type = .percentile,
+            .column = column,
+            .alias = null,
+        }});
+    }
+
+    /// Apply HAVING clause to filter groups.
+    pub fn having(self: Self, predicate: *Expr) DataFrame {
+        var new_df = self.df;
+        new_df.group_columns = self.group_columns;
+        new_df.having_expr = predicate;
+        return new_df;
     }
 };
 
