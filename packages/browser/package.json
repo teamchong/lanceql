@@ -12,6 +12,11 @@
       "require": "./dist/lanceql.js",
       "types": "./dist/lanceql.d.ts"
     },
+    "./browser": {
+      "import": "./dist/lanceql.esm.js",
+      "require": "./dist/lanceql.js",
+      "types": "./dist/lanceql.d.ts"
+    },
     "./wasm": "./dist/lanceql.wasm"
   },
   "files": [

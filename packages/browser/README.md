@@ -22,7 +22,7 @@ npm install @metal0/lanceql
 ### Local SQL Database
 
 ```javascript
-import { vault } from '@metal0/lanceql';
+import { vault } from '@metal0/lanceql/browser';
 
 const v = await vault();
 await v.exec('CREATE TABLE users (id INT, name TEXT)');
@@ -34,7 +34,7 @@ const result = await v.query('SELECT * FROM users');
 ### Remote Lance Dataset
 
 ```javascript
-import { LanceQL } from '@metal0/lanceql';
+import { LanceQL } from '@metal0/lanceql/browser';
 
 const lanceql = await LanceQL.load();
 const dataset = await lanceql.openDataset('https://example.com/data.lance');
@@ -52,7 +52,7 @@ const similar = await dataset.executeSQL(`
 
 ```jsx
 import { useState, useEffect } from 'react';
-import { vault } from '@metal0/lanceql';
+import { vault } from '@metal0/lanceql/browser';
 
 function useQuery(sql) {
   const [data, setData] = useState(null);
@@ -77,7 +77,7 @@ function UserList() {
 ```vue
 <script setup>
 import { ref, onMounted } from 'vue';
-import { vault } from '@metal0/lanceql';
+import { vault } from '@metal0/lanceql/browser';
 
 const users = ref([]);
 
@@ -100,7 +100,7 @@ onMounted(async () => {
 ```svelte
 <script>
   import { onMount } from 'svelte';
-  import { vault } from '@metal0/lanceql';
+  import { vault } from '@metal0/lanceql/browser';
 
   let users = [];
 
@@ -122,7 +122,7 @@ onMounted(async () => {
 
 ```javascript
 // Core
-import { vault, LanceQL } from '@metal0/lanceql';
+import { vault, LanceQL } from '@metal0/lanceql/browser';
 
 // Advanced
 import {
@@ -130,7 +130,7 @@ import {
   TableRef,           // Table reference
   LocalDatabase,      // Lower-level DB
   RemoteLanceDataset  // Direct remote access
-} from '@metal0/lanceql';
+} from '@metal0/lanceql/browser';
 
 // GPU Acceleration (optional)
 import {
@@ -139,7 +139,7 @@ import {
   getGPUGrouper,      // GPU GROUP BY
   getGPUVectorSearch, // GPU vector ops
   DistanceMetric      // COSINE, L2, DOT_PRODUCT
-} from '@metal0/lanceql';
+} from '@metal0/lanceql/browser';
 ```
 
 ## CSS-Driven (Zero JavaScript)
