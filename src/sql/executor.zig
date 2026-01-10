@@ -1951,87 +1951,170 @@ pub const Executor = struct {
             try to_fragments.put(frag.file_path, frag.physical_rows);
         }
 
-        // Find added fragments (in to but not in from)
+        // Collect added fragment paths (in to but not in from)
+        var added_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer added_paths.deinit(self.allocator);
         var added_rows: u64 = 0;
-        var added_count: u32 = 0;
         var to_iter = to_fragments.iterator();
         while (to_iter.next()) |entry| {
             if (!from_fragments.contains(entry.key_ptr.*)) {
+                try added_paths.append(self.allocator, entry.key_ptr.*);
                 added_rows += entry.value_ptr.*;
-                added_count += 1;
             }
         }
 
-        // Find deleted fragments (in from but not in to)
+        // Collect deleted fragment paths (in from but not in to)
+        var deleted_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer deleted_paths.deinit(self.allocator);
         var deleted_rows: u64 = 0;
-        var deleted_count: u32 = 0;
         var from_iter = from_fragments.iterator();
         while (from_iter.next()) |entry| {
             if (!to_fragments.contains(entry.key_ptr.*)) {
+                try deleted_paths.append(self.allocator, entry.key_ptr.*);
                 deleted_rows += entry.value_ptr.*;
-                deleted_count += 1;
             }
         }
 
-        // Apply limit
-        const effective_added = @min(added_rows, limit);
-        const effective_deleted = @min(deleted_rows, limit);
-
-        // Create result columns showing the summary
-        // For v1, we return summary info as a single-column result
-        // Full row-level diff would require loading and comparing actual data
-
-        // Allocate data for added result
-        var added_change_types = try self.allocator.alloc([]const u8, 1);
-        added_change_types[0] = "ADDED";
-        var added_row_counts = try self.allocator.alloc(i64, 1);
-        added_row_counts[0] = @intCast(effective_added);
-
-        var added_columns = try self.allocator.alloc(Result.Column, 2);
-        added_columns[0] = Result.Column{
-            .name = "change_type",
-            .data = .{ .string = added_change_types },
-        };
-        added_columns[1] = Result.Column{
-            .name = "row_count",
-            .data = .{ .int64 = added_row_counts },
-        };
-
-        // Allocate data for deleted result
-        var deleted_change_types = try self.allocator.alloc([]const u8, 1);
-        deleted_change_types[0] = "DELETED";
-        var deleted_row_counts = try self.allocator.alloc(i64, 1);
-        deleted_row_counts[0] = @intCast(effective_deleted);
-
-        var deleted_columns = try self.allocator.alloc(Result.Column, 2);
-        deleted_columns[0] = Result.Column{
-            .name = "change_type",
-            .data = .{ .string = deleted_change_types },
-        };
-        deleted_columns[1] = Result.Column{
-            .name = "row_count",
-            .data = .{ .int64 = deleted_row_counts },
-        };
+        // Load actual row data from fragments
+        const added_result = try self.loadFragmentData(dataset_path, added_paths.items, limit, "ADD");
+        const deleted_result = try self.loadFragmentData(dataset_path, deleted_paths.items, limit, "DELETE");
 
         return DiffResult{
-            .added = Result{
-                .columns = added_columns,
-                .row_count = if (effective_added > 0) 1 else 0,
-                .allocator = self.allocator,
-                .owns_data = true,
-            },
-            .deleted = Result{
-                .columns = deleted_columns,
-                .row_count = if (effective_deleted > 0) 1 else 0,
-                .allocator = self.allocator,
-                .owns_data = true,
-            },
+            .added = added_result,
+            .deleted = deleted_result,
             .from_version = from_version,
             .to_version = to_version,
-            .fragments_added = added_count,
-            .fragments_deleted = deleted_count,
+            .fragments_added = @intCast(added_paths.items.len),
+            .fragments_deleted = @intCast(deleted_paths.items.len),
             .rows_added = added_rows,
             .rows_deleted = deleted_rows,
+        };
+    }
+
+    /// Load row data from fragment files
+    fn loadFragmentData(self: *Self, dataset_path: []const u8, fragment_paths: []const []const u8, limit: u32, change_type: []const u8) !Result {
+        if (fragment_paths.len == 0) {
+            return Result{
+                .columns = try self.allocator.alloc(Result.Column, 0),
+                .row_count = 0,
+                .allocator = self.allocator,
+                .owns_data = true,
+            };
+        }
+
+        // Collect all rows from all fragments
+        var all_rows: std.ArrayListUnmanaged([]Result.Column) = .empty;
+        defer {
+            for (all_rows.items) |row| {
+                self.allocator.free(row);
+            }
+            all_rows.deinit(self.allocator);
+        }
+
+        var schema_columns: ?[][]const u8 = null;
+        var total_rows: usize = 0;
+
+        for (fragment_paths) |frag_path| {
+            if (total_rows >= limit) break;
+
+            // Build full path: dataset_path/data/fragment_path
+            const full_path = std.fs.path.join(self.allocator, &.{ dataset_path, "data", frag_path }) catch continue;
+            defer self.allocator.free(full_path);
+
+            // Read fragment file
+            const file_data = std.fs.cwd().readFileAlloc(self.allocator, full_path, 100 * 1024 * 1024) catch continue;
+            defer self.allocator.free(file_data);
+
+            // Parse as Table
+            var table = Table.init(self.allocator, file_data) catch continue;
+            defer table.deinit();
+
+            // Get schema on first fragment
+            if (schema_columns == null) {
+                schema_columns = table.columnNames() catch continue;
+            }
+
+            // Get row count for this fragment
+            const frag_row_count = table.rowCount(0) catch continue;
+            const rows_to_read = @min(frag_row_count, limit - total_rows);
+
+            total_rows += rows_to_read;
+        }
+
+        // If we couldn't read any fragments, return empty result
+        if (schema_columns == null or total_rows == 0) {
+            return Result{
+                .columns = try self.allocator.alloc(Result.Column, 0),
+                .row_count = 0,
+                .allocator = self.allocator,
+                .owns_data = true,
+            };
+        }
+
+        // Now actually load the data
+        const col_names = schema_columns.?;
+        defer self.allocator.free(col_names);
+
+        // Create columns: change_type + original columns
+        const num_cols = col_names.len + 1;
+        var columns = try self.allocator.alloc(Result.Column, num_cols);
+
+        // First column is change_type
+        const change_types = try self.allocator.alloc([]const u8, total_rows);
+        for (change_types) |*ct| {
+            ct.* = change_type;
+        }
+        columns[0] = Result.Column{
+            .name = "change",
+            .data = .{ .string = change_types },
+        };
+
+        // Initialize other columns based on first fragment's schema
+        // For simplicity, we'll read all as int64 (can be extended for other types)
+        for (col_names, 0..) |col_name, i| {
+            const int_data = try self.allocator.alloc(i64, total_rows);
+            @memset(int_data, 0); // Initialize to zero
+            columns[i + 1] = Result.Column{
+                .name = col_name,
+                .data = .{ .int64 = int_data },
+            };
+        }
+
+        // Now read actual data from fragments
+        var row_offset: usize = 0;
+        for (fragment_paths) |frag_path| {
+            if (row_offset >= total_rows) break;
+
+            const full_path = std.fs.path.join(self.allocator, &.{ dataset_path, "data", frag_path }) catch continue;
+            defer self.allocator.free(full_path);
+
+            const file_data = std.fs.cwd().readFileAlloc(self.allocator, full_path, 100 * 1024 * 1024) catch continue;
+            defer self.allocator.free(file_data);
+
+            var table = Table.init(self.allocator, file_data) catch continue;
+            defer table.deinit();
+
+            const frag_row_count = table.rowCount(0) catch continue;
+            const rows_to_read = @min(frag_row_count, total_rows - row_offset);
+
+            // Read each column
+            for (col_names, 0..) |_, col_idx| {
+                const col_data = table.readInt64Column(@intCast(col_idx)) catch continue;
+                defer self.allocator.free(col_data);
+
+                const dest = columns[col_idx + 1].data.int64;
+                const copy_len = @min(col_data.len, rows_to_read);
+                @memcpy(dest[row_offset .. row_offset + copy_len], col_data[0..copy_len]);
+            }
+
+            row_offset += rows_to_read;
+        }
+
+        return Result{
+            .columns = columns,
+            .row_count = total_rows,
+            .allocator = self.allocator,
+            .owns_data = true,
         };
     }
 

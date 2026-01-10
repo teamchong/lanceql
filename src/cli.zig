@@ -358,10 +358,11 @@ fn cmdDiff(allocator: std.mem.Allocator, opts: args.DiffOptions) !void {
     // Output results
     switch (stmt_result) {
         .diff_result => |diff| {
+            var mutable_diff = diff;
             if (opts.json) {
-                outputDiffJson(&diff);
+                outputDiffJson(&mutable_diff);
             } else {
-                outputDiffTable(&diff);
+                outputDiffTable(&mutable_diff);
             }
         },
         else => {
@@ -390,21 +391,40 @@ fn outputVersionsTable(versions: []const executor.Executor.VersionInfo) void {
 }
 
 /// Output diff result as JSON
-fn outputDiffJson(diff: *const executor.Executor.DiffResult) void {
-    std.debug.print("{{\"fragments_added\":{d},\"rows_added\":{d},\"fragments_deleted\":{d},\"rows_deleted\":{d}}}\n", .{
+fn outputDiffJson(diff: *executor.Executor.DiffResult) void {
+    std.debug.print("{{\"fragments_added\":{d},\"rows_added\":{d},\"fragments_deleted\":{d},\"rows_deleted\":{d},\"added\":", .{
         diff.fragments_added,
         diff.rows_added,
         diff.fragments_deleted,
         diff.rows_deleted,
     });
+    output.printResultsJson(&diff.added);
+    std.debug.print(",\"deleted\":", .{});
+    output.printResultsJson(&diff.deleted);
+    std.debug.print("}}\n", .{});
 }
 
 /// Output diff result as table
-fn outputDiffTable(diff: *const executor.Executor.DiffResult) void {
-    std.debug.print("=== Diff v{d} → v{d} (fragment-level) ===\n", .{ diff.from_version, diff.to_version });
-    std.debug.print("Fragments added:   {d} ({d} rows)\n", .{ diff.fragments_added, diff.rows_added });
-    std.debug.print("Fragments deleted: {d} ({d} rows)\n", .{ diff.fragments_deleted, diff.rows_deleted });
-    std.debug.print("\nNote: Row-level diff (showing actual changed data) not yet implemented.\n", .{});
+fn outputDiffTable(diff: *executor.Executor.DiffResult) void {
+    std.debug.print("=== Diff v{d} → v{d} ===\n", .{ diff.from_version, diff.to_version });
+    std.debug.print("Summary: +{d} added, -{d} deleted (from {d} fragments)\n\n", .{ diff.rows_added, diff.rows_deleted, diff.fragments_added + diff.fragments_deleted });
+
+    // Show added rows
+    if (diff.added.row_count > 0) {
+        std.debug.print("--- Added rows ({d}) ---\n", .{diff.added.row_count});
+        output.outputResults(&diff.added, false, false);
+        std.debug.print("\n", .{});
+    }
+
+    // Show deleted rows
+    if (diff.deleted.row_count > 0) {
+        std.debug.print("--- Deleted rows ({d}) ---\n", .{diff.deleted.row_count});
+        output.outputResults(&diff.deleted, false, false);
+    }
+
+    if (diff.added.row_count == 0 and diff.deleted.row_count == 0) {
+        std.debug.print("No row-level changes detected.\n", .{});
+    }
 }
 
 /// Run pipeline from config file
