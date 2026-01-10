@@ -97,6 +97,8 @@ fn reduce_max_final(@builtin(local_invocation_id) lid: vec3<u32>) {
 }
 `;
 
+import { getBufferPool } from './gpu-buffer-pool.js';
+
 // Minimum rows to benefit from GPU acceleration
 // GPU has overhead - use typed arrays for medium data, GPU for large
 const GPU_THRESHOLD = 10000;
@@ -109,6 +111,7 @@ export class GPUAggregator {
         this.device = null;
         this.pipelines = new Map();
         this.available = false;
+        this.bufferPool = null;
     }
 
     /**
@@ -138,6 +141,7 @@ export class GPUAggregator {
             });
 
             await this._compileShaders();
+            this.bufferPool = getBufferPool(this.device);
             this.available = true;
             console.log('[GPUAggregator] Initialized');
             return true;
@@ -181,13 +185,14 @@ export class GPUAggregator {
     /**
      * Compute SUM of numeric values.
      * @param {number[]|Float32Array|Float64Array} values - Input values
+     * @param {string} [bufferKey] - Optional key for buffer caching (e.g., "table:column")
      * @returns {Promise<number>} Sum result
      */
-    async sum(values) {
+    async sum(values, bufferKey) {
         if (values.length < GPU_THRESHOLD || !this.available) {
             return this._cpuSum(values);
         }
-        return this._gpuReduce(values, 'sum');
+        return this._gpuReduce(values, 'sum', bufferKey);
     }
 
     /**
@@ -214,27 +219,29 @@ export class GPUAggregator {
     /**
      * Compute MIN of numeric values.
      * @param {number[]|Float32Array|Float64Array} values - Input values
+     * @param {string} [bufferKey] - Optional key for buffer caching
      * @returns {Promise<number>} Minimum result
      */
-    async min(values) {
+    async min(values, bufferKey) {
         if (values.length === 0) return null;
         if (values.length < GPU_THRESHOLD || !this.available) {
             return this._cpuMin(values);
         }
-        return this._gpuReduce(values, 'min');
+        return this._gpuReduce(values, 'min', bufferKey);
     }
 
     /**
      * Compute MAX of numeric values.
      * @param {number[]|Float32Array|Float64Array} values - Input values
+     * @param {string} [bufferKey] - Optional key for buffer caching
      * @returns {Promise<number>} Maximum result
      */
-    async max(values) {
+    async max(values, bufferKey) {
         if (values.length === 0) return null;
         if (values.length < GPU_THRESHOLD || !this.available) {
             return this._cpuMax(values);
         }
-        return this._gpuReduce(values, 'max');
+        return this._gpuReduce(values, 'max', bufferKey);
     }
 
     /**
@@ -279,8 +286,11 @@ export class GPUAggregator {
     /**
      * Run GPU reduction.
      * @private
+     * @param {Float32Array|number[]} values - Input values
+     * @param {string} op - Operation (sum, min, max)
+     * @param {string} [bufferKey] - Optional key for buffer caching
      */
-    async _gpuReduce(values, op) {
+    async _gpuReduce(values, op, bufferKey) {
         const n = values.length;
         const workgroupSize = 256;
         const numWorkgroups = Math.ceil(n / workgroupSize);
@@ -290,12 +300,20 @@ export class GPUAggregator {
             ? values
             : new Float32Array(values);
 
-        // Create buffers
-        const inputBuffer = this.device.createBuffer({
-            size: inputData.byteLength,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-        });
-        this.device.queue.writeBuffer(inputBuffer, 0, inputData);
+        // Get or create input buffer (cached if key provided)
+        let inputBuffer;
+        let usingCachedBuffer = false;
+
+        if (bufferKey && this.bufferPool) {
+            inputBuffer = this.bufferPool.getStorageBuffer(bufferKey, inputData);
+            usingCachedBuffer = true;
+        } else {
+            inputBuffer = this.device.createBuffer({
+                size: inputData.byteLength,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+            this.device.queue.writeBuffer(inputBuffer, 0, inputData);
+        }
 
         // Intermediate buffer for partial results
         const partialBuffer = this.device.createBuffer({
@@ -380,8 +398,10 @@ export class GPUAggregator {
         const result = new Float32Array(stagingBuffer.getMappedRange())[0];
         stagingBuffer.unmap();
 
-        // Cleanup
-        inputBuffer.destroy();
+        // Cleanup - don't destroy input buffer if it's cached
+        if (!usingCachedBuffer) {
+            inputBuffer.destroy();
+        }
         partialBuffer.destroy();
         outputBuffer.destroy();
         stagingBuffer.destroy();
@@ -428,9 +448,31 @@ export class GPUAggregator {
     }
 
     /**
+     * Get the buffer pool for external cache management.
+     * @returns {GPUBufferPool|null}
+     */
+    getBufferPool() {
+        return this.bufferPool;
+    }
+
+    /**
+     * Invalidate cached buffers for a table.
+     * @param {string} tableId
+     */
+    invalidateTable(tableId) {
+        if (this.bufferPool) {
+            this.bufferPool.invalidatePrefix(tableId + ':');
+        }
+    }
+
+    /**
      * Dispose GPU resources.
      */
     dispose() {
+        if (this.bufferPool) {
+            this.bufferPool.clear();
+            this.bufferPool = null;
+        }
         this.pipelines.clear();
         this.device = null;
         this.available = false;

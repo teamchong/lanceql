@@ -5,6 +5,8 @@
  * Falls back to CPU for small datasets where GPU overhead exceeds benefit.
  */
 
+import { getBufferPool } from './gpu-buffer-pool.js';
+
 // Hash grouping shaders - embedded for bundler compatibility
 const GROUP_BY_SHADER = `
 struct BP { size: u32, cap: u32 }
@@ -127,6 +129,7 @@ export class GPUGrouper {
         this.pipelines = new Map();
         this.available = false;
         this._initPromise = null;
+        this.bufferPool = null;
     }
 
     /**
@@ -160,6 +163,7 @@ export class GPUGrouper {
             });
 
             await this._compileShaders();
+            this.bufferPool = getBufferPool(this.device);
             this.available = true;
             console.log('[GPUGrouper] Initialized');
             return true;
@@ -543,7 +547,29 @@ export class GPUGrouper {
         return p;
     }
 
+    /**
+     * Get the buffer pool for external cache management.
+     * @returns {GPUBufferPool|null}
+     */
+    getBufferPool() {
+        return this.bufferPool;
+    }
+
+    /**
+     * Invalidate cached buffers for a table.
+     * @param {string} tableId
+     */
+    invalidateTable(tableId) {
+        if (this.bufferPool) {
+            this.bufferPool.invalidatePrefix(tableId + ':');
+        }
+    }
+
     dispose() {
+        if (this.bufferPool) {
+            this.bufferPool.clear();
+            this.bufferPool = null;
+        }
         this.pipelines.clear();
         this.device = null;
         this.available = false;

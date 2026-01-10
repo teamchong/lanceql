@@ -9,6 +9,7 @@
  * GPU-accelerated vector search (distance computation and top-K selection).
  */
 
+export { GPUBufferPool, getBufferPool } from './gpu-buffer-pool.js';
 export { GPUBufferManager, ModelWeightCache } from './gpu-buffers.js';
 export { WebGPUAccelerator, getWebGPUAccelerator } from './accelerator.js';
 export { GGUFLoader, MODEL_REGISTRY, resolveModelUrl } from './gguf-loader.js';

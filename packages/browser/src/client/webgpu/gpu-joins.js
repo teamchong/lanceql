@@ -5,6 +5,8 @@
  * Falls back to CPU for small datasets where GPU overhead exceeds benefit.
  */
 
+import { getBufferPool } from './gpu-buffer-pool.js';
+
 // Hash join shaders - embedded for bundler compatibility
 const JOIN_SHADER = `
 struct BuildParams { size: u32, capacity: u32 }
@@ -90,6 +92,7 @@ export class GPUJoiner {
         this.pipelines = new Map();
         this.available = false;
         this._initPromise = null;
+        this.bufferPool = null;
     }
 
     /**
@@ -123,6 +126,7 @@ export class GPUJoiner {
             });
 
             await this._compileShaders();
+            this.bufferPool = getBufferPool(this.device);
             this.available = true;
             console.log('[GPUJoiner] Initialized');
             return true;
@@ -160,9 +164,12 @@ export class GPUJoiner {
      * @param {string} leftKey - Left join column name
      * @param {string} rightKey - Right join column name
      * @param {string} joinType - 'INNER', 'LEFT', 'RIGHT'
+     * @param {Object} [options] - Optional settings
+     * @param {string} [options.leftBufferKey] - Cache key for left keys buffer
+     * @param {string} [options.rightBufferKey] - Cache key for right keys buffer
      * @returns {Promise<{leftIndices: Uint32Array, rightIndices: Uint32Array}>}
      */
-    async hashJoin(leftRows, rightRows, leftKey, rightKey, joinType = 'INNER') {
+    async hashJoin(leftRows, rightRows, leftKey, rightKey, joinType = 'INNER', options = {}) {
         const leftSize = leftRows.length;
         const rightSize = rightRows.length;
 
@@ -179,9 +186,23 @@ export class GPUJoiner {
         const capacity = this._nextPowerOf2(rightSize * 4);
         const maxMatches = Math.max(leftSize * 10, 100000); // Allow many-to-many
 
-        // Create GPU buffers
-        const rightKeysBuf = this._createBuffer(rightKeys, GPUBufferUsage.STORAGE);
-        const leftKeysBuf = this._createBuffer(leftKeys, GPUBufferUsage.STORAGE);
+        // Create GPU buffers (use pool if cache keys provided)
+        let rightKeysBuf, leftKeysBuf;
+        let rightCached = false, leftCached = false;
+
+        if (options.rightBufferKey && this.bufferPool) {
+            rightKeysBuf = this.bufferPool.getStorageBuffer(options.rightBufferKey, rightKeys);
+            rightCached = true;
+        } else {
+            rightKeysBuf = this._createBuffer(rightKeys, GPUBufferUsage.STORAGE);
+        }
+
+        if (options.leftBufferKey && this.bufferPool) {
+            leftKeysBuf = this.bufferPool.getStorageBuffer(options.leftBufferKey, leftKeys);
+            leftCached = true;
+        } else {
+            leftKeysBuf = this._createBuffer(leftKeys, GPUBufferUsage.STORAGE);
+        }
         const hashTableBuf = this.device.createBuffer({
             size: capacity * 2 * 4,
             usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
@@ -295,9 +316,9 @@ export class GPUJoiner {
             rightIndices[i] = matchData[i * 2 + 1];
         }
 
-        // Cleanup
-        rightKeysBuf.destroy();
-        leftKeysBuf.destroy();
+        // Cleanup - don't destroy cached buffers
+        if (!rightCached) rightKeysBuf.destroy();
+        if (!leftCached) leftKeysBuf.destroy();
         hashTableBuf.destroy();
         matchesBuf.destroy();
         matchCountBuf.destroy();
@@ -409,7 +430,29 @@ export class GPUJoiner {
         return p;
     }
 
+    /**
+     * Get the buffer pool for external cache management.
+     * @returns {GPUBufferPool|null}
+     */
+    getBufferPool() {
+        return this.bufferPool;
+    }
+
+    /**
+     * Invalidate cached buffers for a table.
+     * @param {string} tableId
+     */
+    invalidateTable(tableId) {
+        if (this.bufferPool) {
+            this.bufferPool.invalidatePrefix(tableId + ':');
+        }
+    }
+
     dispose() {
+        if (this.bufferPool) {
+            this.bufferPool.clear();
+            this.bufferPool = null;
+        }
         this.pipelines.clear();
         this.device = null;
         this.available = false;

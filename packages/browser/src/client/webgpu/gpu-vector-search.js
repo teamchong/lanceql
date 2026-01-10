@@ -5,6 +5,8 @@
  * Falls back to CPU for small datasets where GPU overhead exceeds benefit.
  */
 
+import { getBufferPool } from './gpu-buffer-pool.js';
+
 // Thresholds for GPU acceleration
 const GPU_DISTANCE_THRESHOLD = 5000;    // Min vectors for GPU distance
 const GPU_TOPK_THRESHOLD = 10000;       // Min scores for GPU top-K
@@ -299,6 +301,7 @@ export class GPUVectorSearch {
         this.pipelines = new Map();
         this.available = false;
         this._initPromise = null;
+        this.bufferPool = null;
     }
 
     async init() {
@@ -325,6 +328,7 @@ export class GPUVectorSearch {
             });
 
             await this._compileShaders();
+            this.bufferPool = getBufferPool(this.device);
             this.available = true;
             console.log('[GPUVectorSearch] Initialized');
             return true;
@@ -368,8 +372,14 @@ export class GPUVectorSearch {
 
     /**
      * Compute distances between query vector(s) and database vectors.
+     * @param {Float32Array} queryVec - Query vector(s)
+     * @param {Float32Array[]} vectors - Database vectors
+     * @param {number} numQueries - Number of query vectors
+     * @param {number} metric - Distance metric
+     * @param {Object} [options] - Options
+     * @param {string} [options.vectorsBufferKey] - Cache key for vectors buffer (e.g., "table:column")
      */
-    async computeDistances(queryVec, vectors, numQueries = 1, metric = DistanceMetric.COSINE) {
+    async computeDistances(queryVec, vectors, numQueries = 1, metric = DistanceMetric.COSINE, options = {}) {
         const numVectors = vectors.length;
         const dim = queryVec.length / numQueries;
 
@@ -397,11 +407,20 @@ export class GPUVectorSearch {
         });
         this.device.queue.writeBuffer(queryBuffer, 0, queryVec);
 
-        const vectorsBuffer = this.device.createBuffer({
-            size: flatVectors.byteLength,
-            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-        });
-        this.device.queue.writeBuffer(vectorsBuffer, 0, flatVectors);
+        // Get or create vectors buffer (cached if key provided)
+        let vectorsBuffer;
+        let vectorsCached = false;
+
+        if (options.vectorsBufferKey && this.bufferPool) {
+            vectorsBuffer = this.bufferPool.getStorageBuffer(options.vectorsBufferKey, flatVectors);
+            vectorsCached = true;
+        } else {
+            vectorsBuffer = this.device.createBuffer({
+                size: flatVectors.byteLength,
+                usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+            });
+            this.device.queue.writeBuffer(vectorsBuffer, 0, flatVectors);
+        }
 
         const distanceBuffer = this.device.createBuffer({
             size: numQueries * numVectors * 4,
@@ -440,10 +459,10 @@ export class GPUVectorSearch {
         const distances = new Float32Array(readBuffer.getMappedRange().slice(0));
         readBuffer.unmap();
 
-        // Cleanup
+        // Cleanup - don't destroy vectors buffer if cached
         paramsBuffer.destroy();
         queryBuffer.destroy();
-        vectorsBuffer.destroy();
+        if (!vectorsCached) vectorsBuffer.destroy();
         distanceBuffer.destroy();
         readBuffer.destroy();
 
@@ -687,7 +706,29 @@ export class GPUVectorSearch {
         };
     }
 
+    /**
+     * Get the buffer pool for external cache management.
+     * @returns {GPUBufferPool|null}
+     */
+    getBufferPool() {
+        return this.bufferPool;
+    }
+
+    /**
+     * Invalidate cached buffers for a table/column.
+     * @param {string} tableId
+     */
+    invalidateTable(tableId) {
+        if (this.bufferPool) {
+            this.bufferPool.invalidatePrefix(tableId + ':');
+        }
+    }
+
     dispose() {
+        if (this.bufferPool) {
+            this.bufferPool.clear();
+            this.bufferPool = null;
+        }
         this.pipelines.clear();
         this.device = null;
         this.available = false;
