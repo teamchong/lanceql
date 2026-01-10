@@ -174,4 +174,115 @@ test.describe('WebGPU Features', () => {
         expect(result.matchCount).toBe(2);
         console.log(`Chunked Join Matches: ${result.matchCount}`);
     });
+
+    test('Chunked Vector Search initializes', async ({ page }) => {
+        const result = await page.evaluate(async () => {
+            try {
+                const { getChunkedGPUVectorSearch } = await import('./src/client/webgpu/chunked-gpu-vector-search.js');
+                const search = getChunkedGPUVectorSearch();
+                const available = await search.init();
+                return { available, error: null };
+            } catch (e) {
+                return { available: false, error: e.message };
+            }
+        });
+
+        console.log(`ChunkedGPUVectorSearch Available: ${result.available}`);
+        expect(result.error).toBeNull();
+    });
+
+    test('Chunked Vector Search finds nearest vectors', async ({ page }) => {
+        const result = await page.evaluate(async () => {
+            try {
+                const { ChunkedGPUVectorSearch, DistanceMetric } = await import('./src/client/webgpu/chunked-gpu-vector-search.js');
+                const search = new ChunkedGPUVectorSearch();
+                // Don't init GPU - force CPU fallback
+
+                // Create test vectors (4 dimensions)
+                const queryVec = new Float32Array([1, 0, 0, 0]);
+                const vectors = [
+                    new Float32Array([1, 0, 0, 0]),    // idx 0: exact match
+                    new Float32Array([0.9, 0.1, 0, 0]), // idx 1: close
+                    new Float32Array([0, 1, 0, 0]),    // idx 2: orthogonal
+                    new Float32Array([-1, 0, 0, 0]),   // idx 3: opposite
+                ];
+
+                const results = await search.searchFlat(queryVec, vectors, {
+                    k: 2,
+                    metric: DistanceMetric.COSINE
+                });
+
+                return {
+                    topIndices: Array.from(results.indices),
+                    topScores: Array.from(results.scores),
+                    error: null
+                };
+            } catch (e) {
+                return { topIndices: [], topScores: [], error: e.message };
+            }
+        });
+
+        expect(result.error).toBeNull();
+        expect(result.topIndices.length).toBe(2);
+        // Index 0 should be first (exact match), index 1 should be second (close)
+        expect(result.topIndices[0]).toBe(0);
+        expect(result.topIndices[1]).toBe(1);
+        console.log(`Vector Search Results: indices=${result.topIndices}, scores=${result.topScores.map(s => s.toFixed(3))}`);
+    });
+
+    test('Chunked Sorter initializes', async ({ page }) => {
+        const result = await page.evaluate(async () => {
+            try {
+                const { getChunkedGPUSorter } = await import('./src/client/webgpu/chunked-gpu-sort.js');
+                const sorter = getChunkedGPUSorter();
+                const available = await sorter.init();
+                return { available, error: null };
+            } catch (e) {
+                return { available: false, error: e.message };
+            }
+        });
+
+        console.log(`ChunkedGPUSorter Available: ${result.available}`);
+        expect(result.error).toBeNull();
+    });
+
+    test('Chunked Sort with LIMIT works', async ({ page }) => {
+        const result = await page.evaluate(async () => {
+            try {
+                const { ChunkedGPUSorter } = await import('./src/client/webgpu/chunked-gpu-sort.js');
+                const sorter = new ChunkedGPUSorter();
+                // Don't init GPU - force CPU fallback
+
+                // Create test data
+                async function* generateChunks() {
+                    yield {
+                        keys: new Float32Array([5, 2, 8, 1]),
+                        indices: new Uint32Array([0, 1, 2, 3])
+                    };
+                    yield {
+                        keys: new Float32Array([9, 3, 7, 4]),
+                        indices: new Uint32Array([4, 5, 6, 7])
+                    };
+                }
+
+                // Sort descending, get top 3
+                const results = await sorter.sortWithLimit(generateChunks(), 3, true);
+
+                return {
+                    keys: Array.from(results.keys),
+                    indices: Array.from(results.indices),
+                    error: null
+                };
+            } catch (e) {
+                return { keys: [], indices: [], error: e.message };
+            }
+        });
+
+        expect(result.error).toBeNull();
+        expect(result.keys.length).toBe(3);
+        // Top 3 descending should be: 9, 8, 7
+        expect(result.keys).toEqual([9, 8, 7]);
+        expect(result.indices).toEqual([4, 2, 6]);
+        console.log(`Chunked Sort Top 3: keys=${result.keys}, indices=${result.indices}`);
+    });
 });

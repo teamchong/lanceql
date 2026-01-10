@@ -55,6 +55,16 @@ export {
     ChunkedGPUGrouper,
     getChunkedGPUGrouper,
 } from './chunked-gpu-group.js';
+export {
+    ChunkedGPUVectorSearch,
+    getChunkedGPUVectorSearch,
+    estimateVectorSearchMemory,
+    DistanceMetric as ChunkedDistanceMetric,
+} from './chunked-gpu-vector-search.js';
+export {
+    ChunkedGPUSorter,
+    getChunkedGPUSorter,
+} from './chunked-gpu-sort.js';
 
 // OPFS result buffer for streaming large results
 export {
