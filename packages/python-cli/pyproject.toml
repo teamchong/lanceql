@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lanceql-cli"
+version = "0.2.0"
+description = "SQL for Lance/Parquet files - query columnar data from terminal"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.8"
+authors = [
+    {name = "Metal0 Team"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering",
+]
+keywords = ["lance", "parquet", "sql", "query", "cli", "database", "analytics"]
+
+[project.scripts]
+lanceql = "lanceql_cli:main"
+
+[project.urls]
+Homepage = "https://github.com/teamchong/lanceql"
+Repository = "https://github.com/teamchong/lanceql"
+Issues = "https://github.com/teamchong/lanceql/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lanceql_cli*"]

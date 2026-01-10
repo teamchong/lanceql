@@ -1,0 +1,139 @@
+name: Release CLI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., 0.2.0)'
+        required: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-macos
+            npm-pkg: darwin-arm64
+            artifact: lanceql
+          - os: macos-13
+            target: x86_64-macos
+            npm-pkg: darwin-x64
+            artifact: lanceql
+          - os: ubuntu-latest
+            target: x86_64-linux-gnu
+            npm-pkg: linux-x64
+            artifact: lanceql
+          - os: ubuntu-24.04-arm
+            target: aarch64-linux-gnu
+            npm-pkg: linux-arm64
+            artifact: lanceql
+          - os: windows-latest
+            target: x86_64-windows
+            npm-pkg: win32-x64
+            artifact: lanceql.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Build CLI
+        run: zig build cli -Doptimize=ReleaseFast
+
+      - name: Copy binary to package
+        shell: bash
+        run: |
+          mkdir -p packages/lanceql-${{ matrix.npm-pkg }}/bin
+          cp zig-out/bin/${{ matrix.artifact }} packages/lanceql-${{ matrix.npm-pkg }}/bin/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lanceql-${{ matrix.npm-pkg }}
+          path: packages/lanceql-${{ matrix.npm-pkg }}/
+
+      - name: Upload release binary
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: zig-out/bin/${{ matrix.artifact }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-npm:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Prepare platform packages
+        run: |
+          for platform in darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-x64; do
+            cp -r artifacts/lanceql-$platform/* packages/lanceql-$platform/
+            chmod +x packages/lanceql-$platform/bin/* 2>/dev/null || true
+          done
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for platform in darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-x64; do
+            cd packages/lanceql-$platform
+            npm publish --access public || true
+            cd ../..
+          done
+
+      - name: Publish CLI wrapper
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd packages/cli
+          npm publish --access public
+
+  publish-pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build tools
+        run: pip install build twine
+
+      - name: Build Python package
+        run: |
+          cd packages/python-cli
+          python -m build
+
+      - name: Publish to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          cd packages/python-cli
+          twine upload dist/*

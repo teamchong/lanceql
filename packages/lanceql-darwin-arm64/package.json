@@ -1,0 +1,14 @@
+{
+  "name": "@metal0/lanceql-darwin-arm64",
+  "version": "0.2.0",
+  "description": "LanceQL CLI binary for macOS ARM64 (Apple Silicon)",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/teamchong/lanceql.git",
+    "directory": "packages/lanceql-darwin-arm64"
+  },
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "files": ["bin"]
+}
