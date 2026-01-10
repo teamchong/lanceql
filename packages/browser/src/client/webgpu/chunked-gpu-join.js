@@ -691,3 +691,14 @@ export function getChunkedGPUJoiner() {
     }
     return chunkedJoinerInstance;
 }
+
+// Backward-compatible aliases (for drop-in replacement of gpu-joins.js)
+export const GPUJoiner = ChunkedGPUJoiner;
+export const getGPUJoiner = getChunkedGPUJoiner;
+
+// Threshold for GPU join acceleration
+const GPU_JOIN_THRESHOLD = 10000;
+
+export function shouldUseGPUJoin(leftSize, rightSize) {
+    return leftSize * rightSize >= GPU_JOIN_THRESHOLD * GPU_JOIN_THRESHOLD;
+}

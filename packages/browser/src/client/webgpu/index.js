@@ -24,47 +24,39 @@ export {
     getGPUAggregator,
     shouldUseGPU,
 } from './gpu-aggregations.js';
-export {
-    GPUJoiner,
-    getGPUJoiner,
-    shouldUseGPUJoin,
-} from './gpu-joins.js';
-export {
-    GPUSorter,
-    getGPUSorter,
-    shouldUseGPUSort,
-} from './gpu-sort.js';
-export {
-    GPUGrouper,
-    getGPUGrouper,
-    shouldUseGPUGroup,
-} from './gpu-group-by.js';
-export {
-    GPUVectorSearch,
-    getGPUVectorSearch,
-    shouldUseGPUVectorSearch,
-    DistanceMetric,
-} from './gpu-vector-search.js';
 
-// Chunked GPU operations (memory-safe for large datasets)
+// GPU operations using chunked implementations (memory-safe for large datasets)
+// These provide backward-compatible aliases (GPUJoiner, GPUSorter, etc.)
 export {
     ChunkedGPUJoiner,
     getChunkedGPUJoiner,
+    GPUJoiner,
+    getGPUJoiner,
+    shouldUseGPUJoin,
 } from './chunked-gpu-join.js';
+export {
+    ChunkedGPUSorter,
+    getChunkedGPUSorter,
+    GPUSorter,
+    getGPUSorter,
+    shouldUseGPUSort,
+} from './chunked-gpu-sort.js';
 export {
     ChunkedGPUGrouper,
     getChunkedGPUGrouper,
+    GPUGrouper,
+    getGPUGrouper,
+    shouldUseGPUGroup,
 } from './chunked-gpu-group.js';
 export {
     ChunkedGPUVectorSearch,
     getChunkedGPUVectorSearch,
+    GPUVectorSearch,
+    getGPUVectorSearch,
+    shouldUseGPUVectorSearch,
+    DistanceMetric,
     estimateVectorSearchMemory,
-    DistanceMetric as ChunkedDistanceMetric,
 } from './chunked-gpu-vector-search.js';
-export {
-    ChunkedGPUSorter,
-    getChunkedGPUSorter,
-} from './chunked-gpu-sort.js';
 
 // OPFS result buffer for streaming large results
 export {

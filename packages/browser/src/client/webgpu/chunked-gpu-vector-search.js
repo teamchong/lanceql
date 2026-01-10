@@ -490,6 +490,96 @@ export class ChunkedGPUVectorSearch {
     isAvailable() {
         return this.available;
     }
+
+    /**
+     * Find top-K from scores array.
+     * Backward-compatible method for drop-in replacement of GPUVectorSearch.
+     *
+     * @param {Float32Array} scores - Scores array
+     * @param {Uint32Array|null} indices - Indices array (auto-creates 0..n-1 if null)
+     * @param {number} k - Number of results (default 10)
+     * @param {boolean} descending - Sort order (default true)
+     * @returns {Promise<{indices: Uint32Array, scores: Float32Array}>}
+     */
+    async topK(scores, indices = null, k = 10, descending = true) {
+        const n = scores.length;
+
+        // Initialize indices if not provided
+        if (!indices) {
+            indices = new Uint32Array(n);
+            for (let i = 0; i < n; i++) indices[i] = i;
+        }
+
+        // Use CPU implementation - simple and reliable
+        // For very large arrays, GPU could help, but top-K is already O(n log k)
+        return this._cpuTopKWithIndices(scores, indices, k, descending);
+    }
+
+    /**
+     * CPU top-K selection with provided indices array.
+     */
+    _cpuTopKWithIndices(scores, indices, k, descending) {
+        // Create index-score pairs
+        const pairs = [];
+        for (let i = 0; i < scores.length; i++) {
+            pairs.push({ index: indices[i], score: scores[i] });
+        }
+
+        // Sort by score
+        pairs.sort((a, b) => descending ? b.score - a.score : a.score - b.score);
+
+        // Take top K
+        const topK = pairs.slice(0, Math.min(k, pairs.length));
+
+        return {
+            indices: new Uint32Array(topK.map(p => p.index)),
+            scores: new Float32Array(topK.map(p => p.score))
+        };
+    }
+
+    /**
+     * Compute distances between query vector(s) and database vectors.
+     * Backward-compatible method for drop-in replacement of GPUVectorSearch.
+     *
+     * @param {Float32Array} queryVec - Query vector(s)
+     * @param {Float32Array[]} vectors - Database vectors
+     * @param {number} numQueries - Number of query vectors (default 1)
+     * @param {number} metric - Distance metric
+     * @returns {Promise<Float32Array>}
+     */
+    async computeDistances(queryVec, vectors, numQueries = 1, metric = DistanceMetric.COSINE) {
+        // For single query, delegate to existing chunk distance computation
+        if (numQueries === 1) {
+            return this._computeChunkDistances(queryVec, vectors, metric);
+        }
+
+        // Multiple queries - compute per query
+        const dim = queryVec.length / numQueries;
+        const numVectors = vectors.length;
+        const allDistances = new Float32Array(numQueries * numVectors);
+
+        for (let q = 0; q < numQueries; q++) {
+            const queryOffset = q * dim;
+            const singleQuery = queryVec.slice(queryOffset, queryOffset + dim);
+            const distances = await this._computeChunkDistances(singleQuery, vectors, metric);
+            allDistances.set(distances, q * numVectors);
+        }
+
+        return allDistances;
+    }
+
+    /**
+     * Full vector search: distance + top-K.
+     * Backward-compatible method for drop-in replacement of GPUVectorSearch.
+     */
+    async searchSimple(queryVec, vectors, k = 10, options = {}) {
+        const { metric = DistanceMetric.COSINE } = options;
+
+        const scores = await this.computeDistances(queryVec, vectors, 1, metric);
+        const descending = metric === DistanceMetric.COSINE || metric === DistanceMetric.DOT_PRODUCT;
+
+        return await this.topK(scores, null, k, descending);
+    }
 }
 
 // Singleton instance
@@ -500,6 +590,17 @@ export function getChunkedGPUVectorSearch() {
         chunkedVectorSearchInstance = new ChunkedGPUVectorSearch();
     }
     return chunkedVectorSearchInstance;
+}
+
+// Backward-compatible aliases (for drop-in replacement of gpu-vector-search.js)
+export const GPUVectorSearch = ChunkedGPUVectorSearch;
+export const getGPUVectorSearch = getChunkedGPUVectorSearch;
+
+// Threshold for GPU acceleration
+const GPU_DISTANCE_THRESHOLD = 5000;
+
+export function shouldUseGPUVectorSearch(numVectors) {
+    return numVectors >= GPU_DISTANCE_THRESHOLD;
 }
 
 /**

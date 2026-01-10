@@ -471,3 +471,11 @@ export function getChunkedGPUSorter() {
     }
     return chunkedSorterInstance;
 }
+
+// Backward-compatible aliases (for drop-in replacement of gpu-sort.js)
+export const GPUSorter = ChunkedGPUSorter;
+export const getGPUSorter = getChunkedGPUSorter;
+
+export function shouldUseGPUSort(rowCount) {
+    return rowCount >= GPU_SORT_THRESHOLD;
+}

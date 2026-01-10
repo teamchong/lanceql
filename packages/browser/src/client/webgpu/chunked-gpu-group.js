@@ -532,3 +532,11 @@ export function getChunkedGPUGrouper() {
     }
     return chunkedGrouperInstance;
 }
+
+// Backward-compatible aliases (for drop-in replacement of gpu-group-by.js)
+export const GPUGrouper = ChunkedGPUGrouper;
+export const getGPUGrouper = getChunkedGPUGrouper;
+
+export function shouldUseGPUGroup(rowCount) {
+    return rowCount >= GPU_GROUP_THRESHOLD;
+}
