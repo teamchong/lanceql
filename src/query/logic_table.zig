@@ -20,7 +20,7 @@
 //! ```
 
 const std = @import("std");
-const metal = @import("lanceql.metal");
+const metal = @import("lanceql.gpu");
 
 /// Dispatch threshold for GPU vs CPU
 const GPU_THRESHOLD: usize = 10_000;

@@ -25,16 +25,12 @@ pub const GPUContext = struct {
         };
 
         const adapter_response = instance.requestAdapterSync(null, 200_000_000);
-        const adapter = switch (adapter_response.status) {
-            .success => adapter_response.adapter orelse return error.AdapterRequestFailed,
-            else => return error.AdapterRequestFailed,
-        };
+        // Check the adapter
+        const adapter = adapter_response.adapter orelse return error.AdapterRequestFailed;
 
-        const device_response = adapter.requestDeviceSync(null, 200_000_000);
-        const device = switch (device_response.status) {
-            .success => device_response.device orelse return error.DeviceRequestFailed,
-            else => return error.DeviceRequestFailed,
-        };
+        const device_response = adapter.requestDeviceSync(instance, null, 200_000_000);
+        // Check the device
+        const device = device_response.device orelse return error.DeviceRequestFailed;
 
         const queue = device.getQueue() orelse return error.QueueCreationFailed;
 

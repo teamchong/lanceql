@@ -16,7 +16,7 @@
 //! Generates Zig batch function:
 //! ```zig
 //! fn score_batch(embeddings: []const f32, pattern: []const f32, dim: usize, out: []f32) void {
-//!     metal.gpuCosineSimilarityBatch(pattern, embeddings, dim, out);
+//!     gpu.gpuCosineSimilarityBatch(pattern, embeddings, dim, out);
 //! }
 //! ```
 
@@ -239,10 +239,10 @@ pub const BatchCodeGen = struct {
         switch (op.op) {
             .cosine_sim => {
                 try self.output.appendSlice(self.allocator,
-                    \\    const metal = @import("lanceql.metal");
+                    \\    const gpu = @import("lanceql.gpu");
                     \\    // GPU dispatch on Apple Silicon, SIMD fallback
-                    \\    if (comptime metal.is_apple_silicon) {
-                    \\        metal.gpuCosineSimilarityBatch(
+                    \\    if (comptime gpu.use_metal) {
+                    \\        gpu.gpuCosineSimilarityBatch(
                     \\
                 );
                 // First input is query, second is vectors
@@ -260,7 +260,7 @@ pub const BatchCodeGen = struct {
                     \\            out,
                     \\        );
                     \\    } else {
-                    \\        metal.batchCosineSimilarity(
+                    \\        gpu.gpuCosineSimilarityBatch(
                     \\
                 );
                 if (op.inputs.len >= 1) {
@@ -282,7 +282,7 @@ pub const BatchCodeGen = struct {
             },
             .l2_distance => {
                 try self.output.appendSlice(self.allocator,
-                    \\    const metal = @import("lanceql.metal");
+                    \\    const gpu = @import("lanceql.gpu");
                     \\    const num_vectors = out.len;
                     \\    for (0..num_vectors) |i| {
                     \\        const vec =
@@ -292,7 +292,7 @@ pub const BatchCodeGen = struct {
                 }
                 try self.output.appendSlice(self.allocator,
                     \\[i * dim ..][0..dim];
-                    \\        out[i] = metal.l2DistanceSquared(
+                    \\        out[i] = gpu.l2DistanceSquared(
                 );
                 if (op.inputs.len >= 1) {
                     try self.generateColumnAccess(op.inputs[0]);
@@ -305,8 +305,8 @@ pub const BatchCodeGen = struct {
             },
             .dot_product => {
                 try self.output.appendSlice(self.allocator,
-                    \\    const metal = @import("lanceql.metal");
-                    \\    metal.gpuDotProductBatch(
+                    \\    const gpu = @import("lanceql.gpu");
+                    \\    gpu.gpuDotProductBatch(
                 );
                 if (op.inputs.len >= 1) {
                     try self.generateColumnAccess(op.inputs[0]);
@@ -320,32 +320,32 @@ pub const BatchCodeGen = struct {
             },
             .add => {
                 try self.output.appendSlice(self.allocator,
-                    \\    const metal = @import("lanceql.metal");
-                    \\    metal.gpuBatchAddArrays(
+                    \\    const gpu = @import("lanceql.gpu");
+                    \\    gpu.batchAdd(
                 );
                 try self.generateBinaryOpArgs(op);
                 try self.output.appendSlice(self.allocator, ", out);\n");
             },
             .sub => {
                 try self.output.appendSlice(self.allocator,
-                    \\    const metal = @import("lanceql.metal");
-                    \\    metal.gpuBatchSubArrays(
+                    \\    const gpu = @import("lanceql.gpu");
+                    \\    gpu.batchSub(
                 );
                 try self.generateBinaryOpArgs(op);
                 try self.output.appendSlice(self.allocator, ", out);\n");
             },
             .mul => {
                 try self.output.appendSlice(self.allocator,
-                    \\    const metal = @import("lanceql.metal");
-                    \\    metal.gpuBatchMulArrays(
+                    \\    const gpu = @import("lanceql.gpu");
+                    \\    gpu.batchMul(
                 );
                 try self.generateBinaryOpArgs(op);
                 try self.output.appendSlice(self.allocator, ", out);\n");
             },
             .div => {
                 try self.output.appendSlice(self.allocator,
-                    \\    const metal = @import("lanceql.metal");
-                    \\    metal.gpuBatchDivArrays(
+                    \\    const gpu = @import("lanceql.gpu");
+                    \\    gpu.batchDiv(
                 );
                 try self.generateBinaryOpArgs(op);
                 try self.output.appendSlice(self.allocator, ", out);\n");

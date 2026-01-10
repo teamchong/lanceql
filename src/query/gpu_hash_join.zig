@@ -1,7 +1,7 @@
 //! GPU-accelerated Hash JOIN operations
 //!
-//! Uses Metal GPU hash tables for parallel join on macOS.
-//! Falls back to CPU implementation on other platforms.
+//! Uses wgpu-native GPU hash tables for cross-platform parallel join.
+//! Falls back to CPU implementation for small datasets.
 //!
 //! Supports:
 //! - INNER JOIN on int64 keys
@@ -23,7 +23,7 @@
 //! ```
 
 const std = @import("std");
-const metal = @import("lanceql.metal");
+const gpu = @import("lanceql.gpu");
 
 /// Join result containing matching row indices from both tables
 pub const JoinResult = struct {
@@ -50,27 +50,27 @@ pub const LeftJoinResult = struct {
 /// GPU-accelerated Hash JOIN for int64 keys
 pub const GPUHashJoin = struct {
     allocator: std.mem.Allocator,
-    hash_table: metal.GPUHashTable,
+    hash_table: gpu.GPUHashTable64,
     /// Stores build row IDs for lookup (value in hash table is index into this)
     build_row_ids: ?[]const usize,
 
     const Self = @This();
 
     /// Initialize Hash JOIN
-    pub fn init(allocator: std.mem.Allocator) metal.HashTableError!Self {
+    pub fn init(allocator: std.mem.Allocator) gpu.HashTableError!Self {
         return Self{
             .allocator = allocator,
-            .hash_table = try metal.GPUHashTable.init(allocator, 1024),
+            .hash_table = try gpu.GPUHashTable64.init(allocator, 1024),
             .build_row_ids = null,
         };
     }
 
     /// Initialize with capacity hint for build table size
-    pub fn initWithCapacity(allocator: std.mem.Allocator, build_size: usize) metal.HashTableError!Self {
+    pub fn initWithCapacity(allocator: std.mem.Allocator, build_size: usize) gpu.HashTableError!Self {
         return Self{
             .allocator = allocator,
             // Use 4x capacity for good load factor
-            .hash_table = try metal.GPUHashTable.init(allocator, build_size * 4),
+            .hash_table = try gpu.GPUHashTable64.init(allocator, build_size * 4),
             .build_row_ids = null,
         };
     }
@@ -84,14 +84,14 @@ pub const GPUHashJoin = struct {
     ///
     /// Note: For duplicate keys, only the last row ID is retained.
     /// For full duplicate handling, use buildWithDuplicates.
-    pub fn build(self: *Self, keys: []const u64, row_ids: []const usize) metal.HashTableError!void {
+    pub fn build(self: *Self, keys: []const u64, row_ids: []const usize) gpu.HashTableError!void {
         std.debug.assert(keys.len == row_ids.len);
 
         self.build_row_ids = row_ids;
 
         // Convert row IDs to u64 for hash table
         const values = self.allocator.alloc(u64, keys.len) catch
-            return metal.HashTableError.OutOfMemory;
+            return gpu.HashTableError.OutOfMemory;
         defer self.allocator.free(values);
 
         for (row_ids, 0..) |row_id, i| {
@@ -102,16 +102,16 @@ pub const GPUHashJoin = struct {
     }
 
     /// Inner join: Return only matching rows from both tables
-    pub fn innerJoin(self: *Self, probe_keys: []const u64, probe_row_ids: []const usize) metal.HashTableError!JoinResult {
+    pub fn innerJoin(self: *Self, probe_keys: []const u64, probe_row_ids: []const usize) gpu.HashTableError!JoinResult {
         std.debug.assert(probe_keys.len == probe_row_ids.len);
 
         // Probe the hash table
         const probe_results = self.allocator.alloc(u64, probe_keys.len) catch
-            return metal.HashTableError.OutOfMemory;
+            return gpu.HashTableError.OutOfMemory;
         defer self.allocator.free(probe_results);
 
         const found = self.allocator.alloc(bool, probe_keys.len) catch
-            return metal.HashTableError.OutOfMemory;
+            return gpu.HashTableError.OutOfMemory;
         defer self.allocator.free(found);
 
         try self.hash_table.probe(probe_keys, probe_results, found);
@@ -124,12 +124,12 @@ pub const GPUHashJoin = struct {
 
         // Allocate result arrays
         const build_indices = self.allocator.alloc(usize, match_count) catch
-            return metal.HashTableError.OutOfMemory;
+            return gpu.HashTableError.OutOfMemory;
         errdefer self.allocator.free(build_indices);
 
         const probe_indices = self.allocator.alloc(usize, match_count) catch {
             self.allocator.free(build_indices);
-            return metal.HashTableError.OutOfMemory;
+            return gpu.HashTableError.OutOfMemory;
         };
         errdefer self.allocator.free(probe_indices);
 
@@ -151,35 +151,35 @@ pub const GPUHashJoin = struct {
     }
 
     /// Left outer join: Return all probe rows, with nulls for non-matches
-    pub fn leftJoin(self: *Self, probe_keys: []const u64, probe_row_ids: []const usize) metal.HashTableError!LeftJoinResult {
+    pub fn leftJoin(self: *Self, probe_keys: []const u64, probe_row_ids: []const usize) gpu.HashTableError!LeftJoinResult {
         std.debug.assert(probe_keys.len == probe_row_ids.len);
 
         // Probe the hash table
         const probe_results = self.allocator.alloc(u64, probe_keys.len) catch
-            return metal.HashTableError.OutOfMemory;
+            return gpu.HashTableError.OutOfMemory;
         defer self.allocator.free(probe_results);
 
         const found = self.allocator.alloc(bool, probe_keys.len) catch
-            return metal.HashTableError.OutOfMemory;
+            return gpu.HashTableError.OutOfMemory;
         defer self.allocator.free(found);
 
         try self.hash_table.probe(probe_keys, probe_results, found);
 
         // Allocate result arrays (same size as probe table)
         const build_indices = self.allocator.alloc(usize, probe_keys.len) catch
-            return metal.HashTableError.OutOfMemory;
+            return gpu.HashTableError.OutOfMemory;
         errdefer self.allocator.free(build_indices);
 
         const probe_indices = self.allocator.alloc(usize, probe_keys.len) catch {
             self.allocator.free(build_indices);
-            return metal.HashTableError.OutOfMemory;
+            return gpu.HashTableError.OutOfMemory;
         };
         errdefer self.allocator.free(probe_indices);
 
         const matched = self.allocator.alloc(bool, probe_keys.len) catch {
             self.allocator.free(build_indices);
             self.allocator.free(probe_indices);
-            return metal.HashTableError.OutOfMemory;
+            return gpu.HashTableError.OutOfMemory;
         };
 
         // Fill result arrays

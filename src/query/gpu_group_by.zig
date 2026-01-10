@@ -1,7 +1,7 @@
 //! GPU-accelerated GROUP BY operations
 //!
-//! Uses Metal GPU hash tables for parallel aggregation on macOS.
-//! Falls back to CPU implementation on other platforms.
+//! Uses wgpu-native GPU hash tables for cross-platform parallel aggregation.
+//! Falls back to CPU implementation for small datasets.
 //!
 //! Supports:
 //! - GROUP BY single int64 column
@@ -20,7 +20,7 @@
 //! ```
 
 const std = @import("std");
-const metal = @import("lanceql.metal");
+const gpu = @import("lanceql.gpu");
 
 /// Aggregation type for GROUP BY
 pub const AggType = enum {
@@ -40,25 +40,25 @@ pub const GroupByResult = struct {
 /// GPU-accelerated GROUP BY for int64 keys and values
 pub const GPUGroupBy = struct {
     allocator: std.mem.Allocator,
-    hash_table: metal.GPUHashTable,
+    hash_table: gpu.GPUHashTable64,
     agg_type: AggType,
 
     const Self = @This();
 
     /// Initialize GROUP BY with specified aggregation type
-    pub fn init(allocator: std.mem.Allocator, agg_type: AggType) metal.HashTableError!Self {
+    pub fn init(allocator: std.mem.Allocator, agg_type: AggType) gpu.HashTableError!Self {
         return Self{
             .allocator = allocator,
-            .hash_table = try metal.GPUHashTable.init(allocator, 1024),
+            .hash_table = try gpu.GPUHashTable64.init(allocator, 1024),
             .agg_type = agg_type,
         };
     }
 
     /// Initialize with specific capacity hint
-    pub fn initWithCapacity(allocator: std.mem.Allocator, agg_type: AggType, capacity: usize) metal.HashTableError!Self {
+    pub fn initWithCapacity(allocator: std.mem.Allocator, agg_type: AggType, capacity: usize) gpu.HashTableError!Self {
         return Self{
             .allocator = allocator,
-            .hash_table = try metal.GPUHashTable.init(allocator, capacity),
+            .hash_table = try gpu.GPUHashTable64.init(allocator, capacity),
             .agg_type = agg_type,
         };
     }
@@ -70,7 +70,7 @@ pub const GPUGroupBy = struct {
     /// Process a batch of group keys and values
     /// For SUM/COUNT: values are accumulated
     /// For MIN/MAX: CPU post-processing is needed
-    pub fn process(self: *Self, group_keys: []const u64, values: []const u64) metal.HashTableError!void {
+    pub fn process(self: *Self, group_keys: []const u64, values: []const u64) gpu.HashTableError!void {
         std.debug.assert(group_keys.len == values.len);
 
         switch (self.agg_type) {
@@ -87,7 +87,7 @@ pub const GPUGroupBy = struct {
     }
 
     /// Process batch for MIN/MAX aggregations
-    fn processMinMax(self: *Self, group_keys: []const u64, values: []const u64) metal.HashTableError!void {
+    fn processMinMax(self: *Self, group_keys: []const u64, values: []const u64) gpu.HashTableError!void {
         for (group_keys, values) |key, value| {
             if (self.hash_table.get(key)) |existing| {
                 // Update if new value is better
@@ -110,16 +110,16 @@ pub const GPUGroupBy = struct {
     }
 
     /// Get aggregation results
-    pub fn getResults(self: *Self) metal.HashTableError!GroupByResult {
+    pub fn getResults(self: *Self) gpu.HashTableError!GroupByResult {
         const capacity = self.hash_table.capacity;
 
         const keys = self.allocator.alloc(u64, capacity) catch
-            return metal.HashTableError.OutOfMemory;
+            return gpu.HashTableError.OutOfMemory;
         errdefer self.allocator.free(keys);
 
         const aggregates = self.allocator.alloc(u64, capacity) catch {
             self.allocator.free(keys);
-            return metal.HashTableError.OutOfMemory;
+            return gpu.HashTableError.OutOfMemory;
         };
         errdefer self.allocator.free(aggregates);
 
@@ -146,7 +146,7 @@ pub const GPUGroupByF64 = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator, agg_type: AggType) metal.HashTableError!Self {
+    pub fn init(allocator: std.mem.Allocator, agg_type: AggType) gpu.HashTableError!Self {
         return Self{
             .allocator = allocator,
             .inner = try GPUGroupBy.init(allocator, agg_type),
@@ -158,13 +158,13 @@ pub const GPUGroupByF64 = struct {
     }
 
     /// Process batch with f64 values
-    pub fn process(self: *Self, group_keys: []const u64, values: []const f64) metal.HashTableError!void {
+    pub fn process(self: *Self, group_keys: []const u64, values: []const f64) gpu.HashTableError!void {
         // For SUM, we need to handle floating point differently
         // Convert to fixed-point for GPU processing
         const scale: f64 = 1000000.0; // 6 decimal places
 
         const scaled_values = self.allocator.alloc(u64, values.len) catch
-            return metal.HashTableError.OutOfMemory;
+            return gpu.HashTableError.OutOfMemory;
         defer self.allocator.free(scaled_values);
 
         for (values, 0..) |v, i| {
@@ -177,7 +177,7 @@ pub const GPUGroupByF64 = struct {
     }
 
     /// Get results with f64 aggregates
-    pub fn getResults(self: *Self) metal.HashTableError!struct {
+    pub fn getResults(self: *Self) gpu.HashTableError!struct {
         keys: []u64,
         aggregates: []f64,
         count: usize,
@@ -189,7 +189,7 @@ pub const GPUGroupByF64 = struct {
 
         const f64_aggregates = self.allocator.alloc(f64, result.count) catch {
             self.allocator.free(result.keys);
-            return metal.HashTableError.OutOfMemory;
+            return gpu.HashTableError.OutOfMemory;
         };
 
         for (result.aggregates[0..result.count], 0..) |agg, i| {

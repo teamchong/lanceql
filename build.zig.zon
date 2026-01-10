@@ -7,8 +7,9 @@
             .hash = "zstd-1.5.7-KEItkJ8vAAC5_rRlKmLflYQ-eKXbAIQBWZNmmJtS18q0",
         },
         .wgpu_native_zig = .{
-            .url = "https://github.com/bronter/wgpu_native_zig/archive/refs/tags/v6.5.0.tar.gz",
-            .hash = "wgpu_native_zig-6.5.0-B9jeDFtzAwB1vPOiXTd2BqrP1j4phYk-oBbxbpLKY3xD",
+            // Fork with Zig 0.15 compatibility (callconv(.C) -> callconv(.c))
+            .url = "git+https://github.com/apotema/wgpu_native_zig#fb54d9c8cbefa0b8d0e8224aa8323b7974ae454f",
+            .hash = "1220ec8a938a2b278c3e5f8dc624b98342f610dfd42099f0d8fe85f3aaf3fe8dd1a3",
         },
     },
     .paths = .{""},

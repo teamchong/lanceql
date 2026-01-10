@@ -5,24 +5,23 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // === Platform Detection (comptime) ===
-    // Auto-detect Metal support on macOS (legacy, being replaced by wgpu)
-    const use_metal = target.result.os.tag == .macos;
+    // Accelerate framework for SIMD on macOS
     const use_accelerate = target.result.os.tag == .macos;
 
-    // === wgpu-native (cross-platform GPU) ===
-    // Replaces Metal with cross-platform WebGPU via wgpu-native
+    // === GPU Module ===
+    // Cross-platform GPU via wgpu-native
     // Uses same WGSL shaders as browser for code sharing
-    const wgpu_dep = b.dependency("wgpu_native_zig", .{ .target = target });
-    const wgpu_mod = wgpu_dep.module("wgpu");
+    const wgpu_dep = b.dependency("wgpu_native_zig", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
-    // GPU module - cross-platform GPU acceleration
     const gpu_mod = b.addModule("lanceql.gpu", .{
         .root_source_file = b.path("src/gpu/gpu.zig"),
         .imports = &.{
-            .{ .name = "wgpu", .module = wgpu_mod },
+            .{ .name = "wgpu", .module = wgpu_dep.module("wgpu") },
         },
     });
-    _ = gpu_mod; // Used in Phase 5 when replacing Metal
 
     // === Optional ONNX Runtime Support ===
     // Enable with: zig build -Donnx=/path/to/onnxruntime
@@ -56,16 +55,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/value.zig"),
     });
 
-    // Metal/Accelerate module for macOS GPU acceleration (defined early for query module)
-    const metal_mod = b.addModule("lanceql.metal", .{
-        .root_source_file = b.path("src/metal/metal.zig"),
-    });
-
     const query_mod = b.addModule("lanceql.query", .{
         .root_source_file = b.path("src/query/query.zig"),
         .imports = &.{
             .{ .name = "lanceql.value", .module = value_mod },
-            .{ .name = "lanceql.metal", .module = metal_mod },
+            .{ .name = "lanceql.gpu", .module = gpu_mod },
         },
     });
 
@@ -325,7 +319,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lanceql.query", .module = query_mod },
             .{ .name = "lanceql.value", .module = value_mod },
             .{ .name = "lanceql.dataframe", .module = dataframe_mod },
-            .{ .name = "lanceql.metal", .module = metal_mod },
+            .{ .name = "lanceql.gpu", .module = gpu_mod },
             .{ .name = "lanceql.logic_table", .module = logic_table_mod },
             .{ .name = "lanceql.codegen", .module = codegen_mod },
         },
@@ -333,10 +327,10 @@ pub fn build(b: *std.Build) void {
 
     // Pass build options to modules
     const build_options = b.addOptions();
-    build_options.addOption(bool, "use_metal", use_metal);
+    build_options.addOption(bool, "use_gpu", true); // GPU via wgpu-native (cross-platform)
     build_options.addOption(bool, "use_accelerate", use_accelerate);
     build_options.addOption(bool, "use_onnx", onnx_path != null);
-    metal_mod.addOptions("build_options", build_options);
+    gpu_mod.addOptions("build_options", build_options);
     lanceql_mod.addOptions("build_options", build_options);
 
     // === Tests ===
@@ -426,22 +420,35 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "lanceql.value", .module = value_mod },
-                .{ .name = "lanceql.metal", .module = metal_mod },
+                .{ .name = "lanceql.gpu", .module = gpu_mod },
             },
         }),
     });
 
-    // Link macOS frameworks for Metal/Accelerate support in logic_table tests
-    if (use_metal) {
-        test_query.root_module.linkFramework("Metal", .{});
-        test_query.root_module.linkFramework("Foundation", .{});
-        test_query.root_module.addCSourceFiles(.{
-            .files = &.{"src/metal/metal_backend.m"},
-            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
-        });
-    }
+    // Link Accelerate framework on macOS for SIMD acceleration
     if (use_accelerate) {
         test_query.root_module.linkFramework("Accelerate", .{});
+    }
+    // wgpu-native requires platform-specific libraries
+    switch (target.result.os.tag) {
+        .macos => {
+            test_query.root_module.linkFramework("Metal", .{});
+            test_query.root_module.linkFramework("QuartzCore", .{});
+            test_query.root_module.linkFramework("Foundation", .{});
+            test_query.root_module.linkFramework("CoreFoundation", .{});
+            test_query.linkLibC();
+        },
+        .linux => {
+            test_query.root_module.linkSystemLibrary("vulkan", .{});
+            test_query.linkLibC();
+        },
+        .windows => {
+            test_query.root_module.linkSystemLibrary("d3d12", .{});
+            test_query.root_module.linkSystemLibrary("dxgi", .{});
+            test_query.root_module.linkSystemLibrary("dxguid", .{});
+            test_query.linkLibC();
+        },
+        else => {},
     }
 
     const run_test_query = b.addRunArtifact(test_query);
@@ -494,17 +501,30 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Link macOS frameworks for Metal/Accelerate support
-    if (use_metal) {
-        test_logic_table_e2e.root_module.linkFramework("Metal", .{});
-        test_logic_table_e2e.root_module.linkFramework("Foundation", .{});
-        test_logic_table_e2e.root_module.addCSourceFiles(.{
-            .files = &.{"src/metal/metal_backend.m"},
-            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
-        });
-    }
+    // Link Accelerate framework on macOS for SIMD acceleration
     if (use_accelerate) {
         test_logic_table_e2e.root_module.linkFramework("Accelerate", .{});
+    }
+    // wgpu-native requires platform-specific libraries
+    switch (target.result.os.tag) {
+        .macos => {
+            test_logic_table_e2e.root_module.linkFramework("Metal", .{});
+            test_logic_table_e2e.root_module.linkFramework("QuartzCore", .{});
+            test_logic_table_e2e.root_module.linkFramework("Foundation", .{});
+            test_logic_table_e2e.root_module.linkFramework("CoreFoundation", .{});
+            test_logic_table_e2e.linkLibC();
+        },
+        .linux => {
+            test_logic_table_e2e.root_module.linkSystemLibrary("vulkan", .{});
+            test_logic_table_e2e.linkLibC();
+        },
+        .windows => {
+            test_logic_table_e2e.root_module.linkSystemLibrary("d3d12", .{});
+            test_logic_table_e2e.root_module.linkSystemLibrary("dxgi", .{});
+            test_logic_table_e2e.root_module.linkSystemLibrary("dxguid", .{});
+            test_logic_table_e2e.linkLibC();
+        },
+        else => {},
     }
 
     const run_test_logic_table_e2e = b.addRunArtifact(test_logic_table_e2e);
@@ -537,25 +557,20 @@ pub fn build(b: *std.Build) void {
     const test_ingest_step = b.step("test-ingest", "Run ingest command tests (CSV, TSV, JSON, JSONL, Parquet)");
     test_ingest_step.dependOn(&run_test_ingest.step);
 
-    // Metal module tests (with framework linking on macOS)
-    const test_metal = b.addTest(.{
+    // GPU module tests (cross-platform via wgpu-native, currently CPU fallback)
+    const test_gpu = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/metal/metal.zig"),
+            .root_source_file = b.path("src/gpu/gpu.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
 
-    // Link Accelerate framework on macOS for vDSP
-    if (use_accelerate) {
-        test_metal.root_module.linkFramework("Accelerate", .{});
-    }
+    const run_test_gpu = b.addRunArtifact(test_gpu);
+    test_step.dependOn(&run_test_gpu.step);
 
-    const run_test_metal = b.addRunArtifact(test_metal);
-    test_step.dependOn(&run_test_metal.step);
-
-    const test_metal_step = b.step("test-metal", "Run Metal/Accelerate module tests");
-    test_metal_step.dependOn(&run_test_metal.step);
+    const test_gpu_step = b.step("test-gpu", "Run GPU module tests (wgpu-native)");
+    test_gpu_step.dependOn(&run_test_gpu.step);
 
     // Vector benchmark (Column-first I/O)
     const bench_vector = b.addExecutable(.{
@@ -754,19 +769,11 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = .ReleaseFast,
             .imports = &.{
-                .{ .name = "lanceql.metal", .module = metal_mod },
+                .{ .name = "lanceql.gpu", .module = gpu_mod },
                 .{ .name = "lanceql.table", .module = table_mod },
             },
         }),
     });
-    if (use_metal) {
-        bench_hybrid.root_module.linkFramework("Metal", .{});
-        bench_hybrid.root_module.linkFramework("Foundation", .{});
-        bench_hybrid.root_module.addCSourceFiles(.{
-            .files = &.{"src/metal/metal_backend.m"},
-            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
-        });
-    }
     if (use_accelerate) {
         bench_hybrid.root_module.linkFramework("Accelerate", .{});
     }
@@ -832,7 +839,7 @@ pub fn build(b: *std.Build) void {
             .optimize = .ReleaseFast,
             .imports = &.{
                 .{ .name = "lanceql", .module = lanceql_mod },
-                .{ .name = "lanceql.metal", .module = metal_mod },
+                .{ .name = "lanceql.gpu", .module = gpu_mod },
                 .{ .name = "lanceql.query", .module = query_mod },
                 .{ .name = "lanceql.table", .module = table_mod },
                 .{ .name = "lanceql.parquet_table", .module = parquet_table_mod },
@@ -850,16 +857,31 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    if (use_metal) {
-        cli.root_module.linkFramework("Metal", .{});
-        cli.root_module.linkFramework("Foundation", .{});
-        cli.root_module.addCSourceFiles(.{
-            .files = &.{"src/metal/metal_backend.m"},
-            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
-        });
-    }
     if (use_accelerate) {
         cli.root_module.linkFramework("Accelerate", .{});
+    }
+    // wgpu-native requires platform-specific libraries
+    switch (target.result.os.tag) {
+        .macos => {
+            cli.root_module.linkFramework("Metal", .{});
+            cli.root_module.linkFramework("QuartzCore", .{});
+            cli.root_module.linkFramework("Foundation", .{});
+            cli.root_module.linkFramework("CoreFoundation", .{});
+            cli.linkLibC();
+        },
+        .linux => {
+            // Vulkan backend on Linux
+            cli.root_module.linkSystemLibrary("vulkan", .{});
+            cli.linkLibC();
+        },
+        .windows => {
+            // DirectX 12 backend on Windows (d3d12, dxgi)
+            cli.root_module.linkSystemLibrary("d3d12", .{});
+            cli.root_module.linkSystemLibrary("dxgi", .{});
+            cli.root_module.linkSystemLibrary("dxguid", .{});
+            cli.linkLibC();
+        },
+        else => {},
     }
     // ONNX Runtime for embedding support
     if (onnx_path) |path| {
@@ -990,40 +1012,6 @@ pub fn build(b: *std.Build) void {
     const test_stress_step = b.step("test-stress", "Run stress tests (large datasets, memory, edge cases)");
     test_stress_step.dependOn(&run_test_stress.step);
 
-    // === Metal Shader Compilation (macOS with Xcode) ===
-    // Compiles .metal shaders to .metallib for faster startup
-    if (use_metal) {
-        // Step 1: Compile .metal to .air (Metal IR)
-        const metal_compile = b.addSystemCommand(&.{
-            "xcrun", "-sdk", "macosx", "metal",
-            "-O3", // Optimize for performance
-            "-c", "src/metal/vector_search.metal",
-            "-o",
-        });
-        const air_output = metal_compile.addOutputFileArg("vector_search.air");
-
-        // Step 2: Link .air to .metallib
-        const metallib_link = b.addSystemCommand(&.{
-            "xcrun", "-sdk", "macosx", "metallib",
-        });
-        metallib_link.addFileArg(air_output);
-        metallib_link.addArg("-o");
-        const metallib_output = metallib_link.addOutputFileArg("vector_search.metallib");
-
-        // Install to zig-out/lib/
-        const install_metallib = b.addInstallFileWithDir(
-            metallib_output,
-            .lib,
-            "vector_search.metallib",
-        );
-
-        const metal_shaders_step = b.step("metal-shaders", "Compile Metal shaders to .metallib (requires Xcode)");
-        metal_shaders_step.dependOn(&install_metallib.step);
-
-        // Make lib and bench-vector depend on metal shaders
-        // install_lib.step.dependOn(&install_metallib.step); // Optional: auto-build shaders
-    }
-
     // === WASM Build ===
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
@@ -1080,22 +1068,13 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "lanceql.io", .module = io_mod },
                 .{ .name = "lanceql.encoding", .module = encoding_mod },
                 .{ .name = "lanceql.value", .module = value_mod },
-                .{ .name = "lanceql.metal", .module = metal_mod },
+                .{ .name = "lanceql.gpu", .module = gpu_mod },
                 .{ .name = "arrow_c", .module = arrow_c_mod },
             },
         }),
     });
 
-    // Link macOS frameworks for Metal/Accelerate support
-    if (use_metal) {
-        lib.root_module.linkFramework("Metal", .{});
-        lib.root_module.linkFramework("Foundation", .{});
-        // Add Objective-C Metal backend
-        lib.root_module.addCSourceFiles(.{
-            .files = &.{"src/metal/metal_backend.m"},
-            .flags = &.{ "-fobjc-arc", "-fno-objc-exceptions" },
-        });
-    }
+    // Link Accelerate framework on macOS for SIMD acceleration
     if (use_accelerate) {
         lib.root_module.linkFramework("Accelerate", .{});
     }
