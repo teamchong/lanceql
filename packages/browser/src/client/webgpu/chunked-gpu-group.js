@@ -169,6 +169,10 @@ export class ChunkedGPUGrouper {
         return this._initPromise;
     }
 
+    isAvailable() {
+        return this.available;
+    }
+
     async _doInit() {
         if (typeof navigator === 'undefined' || !navigator.gpu) {
             console.log('[ChunkedGPUGrouper] WebGPU not available');

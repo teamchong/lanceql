@@ -158,6 +158,10 @@ export class ChunkedGPUJoiner {
         return this._initPromise;
     }
 
+    isAvailable() {
+        return this.available;
+    }
+
     async _doInit() {
         if (typeof navigator === 'undefined' || !navigator.gpu) {
             console.log('[ChunkedGPUJoiner] WebGPU not available');
