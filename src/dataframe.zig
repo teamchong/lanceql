@@ -531,6 +531,116 @@ pub const DataFrame = struct {
         return self.limit(n);
     }
 
+    // =========================================================================
+    // SQL Generation
+    // =========================================================================
+
+    /// Generate SQL string from DataFrame operations.
+    /// Enables interoperability with browser DataFrame and external SQL engines.
+    pub fn toSQL(self: Self) ![]const u8 {
+        var sql: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer sql.deinit(self.allocator);
+
+        // SELECT clause
+        try sql.appendSlice(self.allocator, "SELECT ");
+        if (self.distinct_flag) {
+            try sql.appendSlice(self.allocator, "DISTINCT ");
+        }
+
+        if (self.select_columns) |cols| {
+            for (cols, 0..) |col, i| {
+                if (i > 0) try sql.appendSlice(self.allocator, ", ");
+                try sql.appendSlice(self.allocator, col);
+            }
+        } else if (self.aggregates) |aggs| {
+            // Group columns first
+            if (self.group_columns) |gcols| {
+                for (gcols, 0..) |col, i| {
+                    if (i > 0) try sql.appendSlice(self.allocator, ", ");
+                    try sql.appendSlice(self.allocator, col);
+                }
+                if (aggs.len > 0) try sql.appendSlice(self.allocator, ", ");
+            }
+            // Then aggregates
+            for (aggs, 0..) |a, i| {
+                if (i > 0) try sql.appendSlice(self.allocator, ", ");
+                try sql.appendSlice(self.allocator, aggTypeStr(a.agg_type));
+                try sql.append(self.allocator, '(');
+                try sql.appendSlice(self.allocator, a.column orelse "*");
+                try sql.append(self.allocator, ')');
+                if (a.alias) |alias_name| {
+                    try sql.appendSlice(self.allocator, " AS ");
+                    try sql.appendSlice(self.allocator, alias_name);
+                }
+            }
+        } else {
+            try sql.appendSlice(self.allocator, "*");
+        }
+
+        // FROM clause
+        try sql.appendSlice(self.allocator, " FROM ");
+        if (self.table) |tbl| {
+            const name = tbl.getName() catch "data";
+            try sql.appendSlice(self.allocator, name);
+        } else {
+            try sql.appendSlice(self.allocator, "data");
+        }
+
+        // JOIN clause
+        if (self.join_spec) |js| {
+            try sql.append(self.allocator, ' ');
+            try sql.appendSlice(self.allocator, joinTypeStr(js.join_type));
+            try sql.appendSlice(self.allocator, " JOIN ");
+            if (js.other.table) |other_tbl| {
+                const name = other_tbl.getName() catch "other";
+                try sql.appendSlice(self.allocator, name);
+            } else {
+                try sql.appendSlice(self.allocator, "other");
+            }
+            if (js.on_condition.len > 0) {
+                try sql.appendSlice(self.allocator, " ON ");
+                try sql.appendSlice(self.allocator, js.on_condition);
+            }
+        }
+
+        // GROUP BY clause
+        if (self.group_columns) |cols| {
+            try sql.appendSlice(self.allocator, " GROUP BY ");
+            for (cols, 0..) |col, i| {
+                if (i > 0) try sql.appendSlice(self.allocator, ", ");
+                try sql.appendSlice(self.allocator, col);
+            }
+        }
+
+        // ORDER BY clause
+        if (self.order_columns) |orders| {
+            try sql.appendSlice(self.allocator, " ORDER BY ");
+            for (orders, 0..) |o, i| {
+                if (i > 0) try sql.appendSlice(self.allocator, ", ");
+                try sql.appendSlice(self.allocator, o.column);
+                if (o.descending) {
+                    try sql.appendSlice(self.allocator, " DESC");
+                }
+            }
+        }
+
+        // LIMIT clause
+        if (self.limit_value) |lim| {
+            var buf: [32]u8 = undefined;
+            const lim_str = std.fmt.bufPrint(&buf, " LIMIT {d}", .{lim}) catch return error.FormatError;
+            try sql.appendSlice(self.allocator, lim_str);
+        }
+
+        // OFFSET clause
+        if (self.offset_value) |off| {
+            var buf: [32]u8 = undefined;
+            const off_str = std.fmt.bufPrint(&buf, " OFFSET {d}", .{off}) catch return error.FormatError;
+            try sql.appendSlice(self.allocator, off_str);
+        }
+
+        return try sql.toOwnedSlice(self.allocator);
+    }
+
     /// Execute the query and return results.
     pub fn collect(self: Self) !ResultSet {
         // Build SelectStmt from DataFrame state
@@ -781,6 +891,66 @@ pub const GroupedFrame = struct {
         return new_df;
     }
 };
+
+// ============================================================================
+// SQL Generation Helpers
+// ============================================================================
+
+/// Convert AggregateType to SQL string.
+fn aggTypeStr(agg_type: AggregateType) []const u8 {
+    return switch (agg_type) {
+        .count => "COUNT",
+        .sum => "SUM",
+        .avg => "AVG",
+        .min => "MIN",
+        .max => "MAX",
+        .stddev => "STDDEV",
+        .stddev_pop => "STDDEV_POP",
+        .variance => "VARIANCE",
+        .var_pop => "VAR_POP",
+        .median => "MEDIAN",
+        .percentile => "PERCENTILE",
+        .count_distinct => "COUNT_DISTINCT",
+        .first => "FIRST",
+        .last => "LAST",
+        .group_concat => "GROUP_CONCAT",
+        .array_agg => "ARRAY_AGG",
+        .string_agg => "STRING_AGG",
+        .bit_and => "BIT_AND",
+        .bit_or => "BIT_OR",
+        .bit_xor => "BIT_XOR",
+        .bool_and => "BOOL_AND",
+        .bool_or => "BOOL_OR",
+        .any_value => "ANY_VALUE",
+        .corr => "CORR",
+        .covar_pop => "COVAR_POP",
+        .covar_samp => "COVAR_SAMP",
+        .regr_avgx => "REGR_AVGX",
+        .regr_avgy => "REGR_AVGY",
+        .regr_count => "REGR_COUNT",
+        .regr_intercept => "REGR_INTERCEPT",
+        .regr_r2 => "REGR_R2",
+        .regr_slope => "REGR_SLOPE",
+        .regr_sxx => "REGR_SXX",
+        .regr_sxy => "REGR_SXY",
+        .regr_syy => "REGR_SYY",
+        .rollup_sum, .rollup_count, .rollup_avg, .rollup_min, .rollup_max => "ROLLUP",
+    };
+}
+
+/// Convert JoinType to SQL string.
+fn joinTypeStr(join_type: JoinType) []const u8 {
+    return switch (join_type) {
+        .inner => "INNER",
+        .left => "LEFT",
+        .right => "RIGHT",
+        .full => "FULL",
+        .cross => "CROSS",
+        .natural => "NATURAL",
+        .left_semi => "LEFT SEMI",
+        .left_anti => "LEFT ANTI",
+    };
+}
 
 // ============================================================================
 // Expression Builder Helpers

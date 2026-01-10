@@ -1,6 +1,8 @@
 /**
  * LanceData - DataFrame query builder
  * Extracted from lance-data.js for modularity
+ *
+ * API aligned with CLI DataFrame (src/dataframe.zig) for consistency.
  */
 
 // Forward declaration for LanceFile.Op enum
@@ -8,7 +10,7 @@ let LanceFile;
 
 /**
  * DataFrame query builder with Immer-style immutability.
- * Supports filter, select, limit operations.
+ * Supports filter, select, limit, orderBy, offset, distinct, groupBy operations.
  */
 class DataFrame {
     constructor(file) {
@@ -16,7 +18,30 @@ class DataFrame {
         this._filterOps = [];  // Array of {colIdx, op, value, type, opStr}
         this._selectCols = null;
         this._limitValue = null;
+        this._offsetValue = null;
+        this._orderByCols = [];  // Array of {colIdx, descending}
+        this._distinct = false;
+        this._groupByCols = null;  // Array of column indices
+        this._aggregates = [];  // Array of {func, colIdx, alias}
         this._isRemote = file._isRemote || file.baseUrl !== undefined;
+    }
+
+    /**
+     * Clone this DataFrame with all state preserved.
+     * @returns {DataFrame}
+     */
+    _clone() {
+        const df = new DataFrame(this.file);
+        df._filterOps = [...this._filterOps];
+        df._selectCols = this._selectCols;
+        df._limitValue = this._limitValue;
+        df._offsetValue = this._offsetValue;
+        df._orderByCols = [...this._orderByCols];
+        df._distinct = this._distinct;
+        df._groupByCols = this._groupByCols;
+        df._aggregates = [...this._aggregates];
+        df._isRemote = this._isRemote;
+        return df;
     }
 
     /**
@@ -38,11 +63,8 @@ class DataFrame {
             '>=': LanceFile?.Op?.GE ?? 5
         };
 
-        const df = new DataFrame(this.file);
-        df._filterOps = [...this._filterOps, { colIdx, op: opMap[op], opStr: op, value, type }];
-        df._selectCols = this._selectCols;
-        df._limitValue = this._limitValue;
-        df._isRemote = this._isRemote;
+        const df = this._clone();
+        df._filterOps.push({ colIdx, op: opMap[op], opStr: op, value, type });
         return df;
     }
 
@@ -54,27 +76,63 @@ class DataFrame {
      */
     select(...colIndices) {
         const cols = Array.isArray(colIndices[0]) ? colIndices[0] : colIndices;
-        const df = new DataFrame(this.file);
-        df._filterOps = [...this._filterOps];
+        const df = this._clone();
         df._selectCols = cols;
-        df._limitValue = this._limitValue;
-        df._isRemote = this._isRemote;
         return df;
     }
 
     /**
      * Limit number of results.
-     * Immer-style: returns new DataFrame, original unchanged.
      * @param {number} n - Maximum rows
      * @returns {DataFrame}
      */
     limit(n) {
-        const df = new DataFrame(this.file);
-        df._filterOps = [...this._filterOps];
-        df._selectCols = this._selectCols;
+        const df = this._clone();
         df._limitValue = n;
-        df._isRemote = this._isRemote;
         return df;
+    }
+
+    /**
+     * Offset results (skip first n rows).
+     * @param {number} n - Rows to skip
+     * @returns {DataFrame}
+     */
+    offset(n) {
+        const df = this._clone();
+        df._offsetValue = n;
+        return df;
+    }
+
+    /**
+     * Order by column.
+     * @param {number} colIdx - Column index
+     * @param {boolean} descending - Sort descending (default: false)
+     * @returns {DataFrame}
+     */
+    orderBy(colIdx, descending = false) {
+        const df = this._clone();
+        df._orderByCols.push({ colIdx, descending });
+        return df;
+    }
+
+    /**
+     * Select distinct rows.
+     * @returns {DataFrame}
+     */
+    distinct() {
+        const df = this._clone();
+        df._distinct = true;
+        return df;
+    }
+
+    /**
+     * Group by columns.
+     * @param {...number} colIndices - Column indices to group by
+     * @returns {GroupedFrame}
+     */
+    groupBy(...colIndices) {
+        const cols = Array.isArray(colIndices[0]) ? colIndices[0] : colIndices;
+        return new GroupedFrame(this, cols);
     }
 
     /**
@@ -87,11 +145,26 @@ class DataFrame {
 
         // SELECT clause
         let selectClause;
-        if (this._selectCols && this._selectCols.length > 0) {
+        if (this._aggregates.length > 0) {
+            // GROUP BY with aggregates
+            const parts = [];
+            if (this._groupByCols) {
+                parts.push(...this._groupByCols.map(i => colNames[i] || `col_${i}`));
+            }
+            parts.push(...this._aggregates.map(a => {
+                const col = a.colIdx !== null ? (colNames[a.colIdx] || `col_${a.colIdx}`) : '*';
+                const alias = a.alias ? ` AS ${a.alias}` : '';
+                return `${a.func}(${col})${alias}`;
+            }));
+            selectClause = parts.join(', ');
+        } else if (this._selectCols && this._selectCols.length > 0) {
             selectClause = this._selectCols.map(i => colNames[i] || `col_${i}`).join(', ');
         } else {
             selectClause = '*';
         }
+
+        // DISTINCT
+        const distinctClause = this._distinct ? 'DISTINCT ' : '';
 
         // WHERE clause
         let whereClause = '';
@@ -104,10 +177,29 @@ class DataFrame {
             whereClause = ` WHERE ${conditions.join(' AND ')}`;
         }
 
+        // GROUP BY clause
+        let groupByClause = '';
+        if (this._groupByCols && this._groupByCols.length > 0) {
+            groupByClause = ` GROUP BY ${this._groupByCols.map(i => colNames[i] || `col_${i}`).join(', ')}`;
+        }
+
+        // ORDER BY clause
+        let orderByClause = '';
+        if (this._orderByCols.length > 0) {
+            const orders = this._orderByCols.map(o => {
+                const colName = colNames[o.colIdx] || `col_${o.colIdx}`;
+                return o.descending ? `${colName} DESC` : colName;
+            });
+            orderByClause = ` ORDER BY ${orders.join(', ')}`;
+        }
+
         // LIMIT clause
         const limitClause = this._limitValue ? ` LIMIT ${this._limitValue}` : '';
 
-        return `SELECT ${selectClause} FROM dataset${whereClause}${limitClause}`;
+        // OFFSET clause
+        const offsetClause = this._offsetValue ? ` OFFSET ${this._offsetValue}` : '';
+
+        return `SELECT ${distinctClause}${selectClause} FROM dataset${whereClause}${groupByClause}${orderByClause}${limitClause}${offsetClause}`;
     }
 
     /**
@@ -211,4 +303,77 @@ class DataFrame {
 }
 
 
-export { DataFrame };
+/**
+ * GroupedFrame - DataFrame with GROUP BY columns set.
+ * Returned by DataFrame.groupBy(), provides aggregate methods.
+ */
+class GroupedFrame {
+    constructor(df, groupByCols) {
+        this._df = df;
+        this._groupByCols = groupByCols;
+    }
+
+    /**
+     * Apply aggregates to grouped data.
+     * @param {Array<{func: string, colIdx: number|null, alias?: string}>} specs - Aggregate specifications
+     * @returns {DataFrame}
+     */
+    agg(specs) {
+        const df = this._df._clone();
+        df._groupByCols = this._groupByCols;
+        df._aggregates = specs;
+        return df;
+    }
+
+    /**
+     * Count rows per group.
+     * @param {string} [alias] - Optional alias for the count column
+     * @returns {DataFrame}
+     */
+    count(alias = 'count') {
+        return this.agg([{ func: 'COUNT', colIdx: null, alias }]);
+    }
+
+    /**
+     * Sum a column per group.
+     * @param {number} colIdx - Column index to sum
+     * @param {string} [alias] - Optional alias
+     * @returns {DataFrame}
+     */
+    sum(colIdx, alias) {
+        return this.agg([{ func: 'SUM', colIdx, alias }]);
+    }
+
+    /**
+     * Average a column per group.
+     * @param {number} colIdx - Column index to average
+     * @param {string} [alias] - Optional alias
+     * @returns {DataFrame}
+     */
+    avg(colIdx, alias) {
+        return this.agg([{ func: 'AVG', colIdx, alias }]);
+    }
+
+    /**
+     * Min of a column per group.
+     * @param {number} colIdx - Column index
+     * @param {string} [alias] - Optional alias
+     * @returns {DataFrame}
+     */
+    min(colIdx, alias) {
+        return this.agg([{ func: 'MIN', colIdx, alias }]);
+    }
+
+    /**
+     * Max of a column per group.
+     * @param {number} colIdx - Column index
+     * @param {string} [alias] - Optional alias
+     * @returns {DataFrame}
+     */
+    max(colIdx, alias) {
+        return this.agg([{ func: 'MAX', colIdx, alias }]);
+    }
+}
+
+
+export { DataFrame, GroupedFrame };
