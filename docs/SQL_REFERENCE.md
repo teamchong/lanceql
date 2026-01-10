@@ -3,6 +3,7 @@
 ## Table of Contents
 
 - [Data Sources](#data-sources)
+- [Time Travel](#time-travel)
 - [SELECT](#select)
 - [WHERE](#where)
 - [GROUP BY / HAVING](#group-by--having)
@@ -84,6 +85,57 @@ SELECT * FROM read_xlsx('path/to/file.xlsx')
 -- Read specific sheet
 SELECT * FROM read_xlsx('path/to/file.xlsx', 'Sheet2')
 ```
+
+---
+
+## Time Travel
+
+Lance datasets are versioned - each write creates a new version. LanceQL provides SQL commands to explore version history and compare changes.
+
+### VERSION AS OF
+
+Query data at a specific version:
+
+```sql
+-- Query version 3
+SELECT * FROM users VERSION AS OF 3
+
+-- With read_lance function
+SELECT * FROM read_lance('data.lance', 3) LIMIT 50
+```
+
+### SHOW VERSIONS
+
+List version history with metadata:
+
+```sql
+SHOW VERSIONS FOR users
+SHOW VERSIONS FOR read_lance('data.lance')
+SHOW VERSIONS FOR users LIMIT 10  -- Last 10 versions
+```
+
+Output columns:
+- `version` - Version number
+- `timestamp` - When the version was created
+- `operation` - Type of operation (INSERT, DELETE, etc.)
+- `rowCount` - Total rows at this version
+- `delta` - Change from previous version (+N or -N rows)
+
+### DIFF
+
+Compare two versions and see what rows changed:
+
+```sql
+-- Compare versions 2 and 3
+DIFF users VERSION 2 AND VERSION 3
+
+-- With limit (default 100)
+DIFF users VERSION 1 AND VERSION 5 LIMIT 1000
+```
+
+Output includes:
+- `change` column - "ADD" or "DELETE"
+- All original columns with their values
 
 ---
 

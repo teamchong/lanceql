@@ -122,6 +122,54 @@ LIMIT 30
 
 See [Vector Search Guide](./docs/VECTOR_SEARCH.md) for IVF-PQ indices, encoders, and performance tuning.
 
+## CLI Commands
+
+### Query
+
+```bash
+lanceql query "SELECT * FROM 'data.lance' LIMIT 10"
+lanceql query "SELECT * FROM 'data.lance' WHERE id > 100" --json
+```
+
+### Time Travel
+
+```bash
+# Show version history
+lanceql history data.lance
+# version | timestamp                 | operation | rowCount | delta
+# --------|---------------------------|-----------|----------|------
+#       3 | 2024-01-10T10:30:00.000Z  | INSERT    |        9 | +3
+#       2 | 2024-01-10T10:25:00.000Z  | INSERT    |        6 | +3
+#       1 | 2024-01-10T10:20:00.000Z  | INSERT    |        3 | +3
+
+# Compare versions (shows actual changed rows)
+lanceql diff data.lance --from 1 --to 2
+# === Diff v1 → v2 ===
+# Summary: +3 added, -0 deleted (from 1 fragments)
+#
+# --- Added rows (3) ---
+# change  id
+# ADD     4
+# ADD     5
+# ADD     6
+
+# JSON output
+lanceql diff data.lance --from 1 --to 2 --json
+```
+
+### Data Pipeline
+
+```bash
+# Convert CSV to Lance
+lanceql ingest data.csv -o dataset.lance
+
+# Add embeddings
+lanceql enrich dataset.lance --embed text --model minilm
+
+# Start web server
+lanceql serve dataset.lance
+```
+
 ## Vector Index (Auto-Encode)
 
 Create indexes that automatically encode text to embeddings:
