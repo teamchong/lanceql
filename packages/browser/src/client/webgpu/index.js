@@ -46,6 +46,22 @@ export {
     DistanceMetric,
 } from './gpu-vector-search.js';
 
+// Chunked GPU operations (memory-safe for large datasets)
+export {
+    ChunkedGPUJoiner,
+    getChunkedGPUJoiner,
+} from './chunked-gpu-join.js';
+export {
+    ChunkedGPUGrouper,
+    getChunkedGPUGrouper,
+} from './chunked-gpu-group.js';
+
+// OPFS result buffer for streaming large results
+export {
+    OPFSResultBuffer,
+    createTempBuffer,
+} from '../cache/opfs-result-buffer.js';
+
 // Shader sources (for advanced users)
 export const SHADERS = {
     GEMM: './shaders/gemm.wgsl',

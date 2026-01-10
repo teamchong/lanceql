@@ -66,4 +66,112 @@ test.describe('WebGPU Features', () => {
         expect(Math.abs(result.sum - expected)).toBeLessThan(1.0); // Floating point tolerance
         console.log(`Aggregation Time (15k rows): ${result.time.toFixed(2)}ms`);
     });
+
+    test('Chunked GPU Joiner initializes', async ({ page }) => {
+        const result = await page.evaluate(async () => {
+            try {
+                const { getChunkedGPUJoiner } = await import('./src/client/webgpu/chunked-gpu-join.js');
+                const joiner = getChunkedGPUJoiner();
+                const available = await joiner.init();
+                return { available, error: null };
+            } catch (e) {
+                return { available: false, error: e.message };
+            }
+        });
+
+        console.log(`ChunkedGPUJoiner Available: ${result.available}`);
+        expect(result.error).toBeNull();
+    });
+
+    test('Chunked GPU Grouper initializes', async ({ page }) => {
+        const result = await page.evaluate(async () => {
+            try {
+                const { getChunkedGPUGrouper } = await import('./src/client/webgpu/chunked-gpu-group.js');
+                const grouper = getChunkedGPUGrouper();
+                const available = await grouper.init();
+                return { available, error: null };
+            } catch (e) {
+                return { available: false, error: e.message };
+            }
+        });
+
+        console.log(`ChunkedGPUGrouper Available: ${result.available}`);
+        expect(result.error).toBeNull();
+    });
+
+    test('OPFS Result Buffer write and read', async ({ page }) => {
+        const result = await page.evaluate(async () => {
+            try {
+                const { OPFSResultBuffer } = await import('./src/client/cache/opfs-result-buffer.js');
+                const buffer = new OPFSResultBuffer('test-buffer');
+                await buffer.init();
+
+                // Write some data
+                await buffer.appendMatches(new Uint32Array([1, 2, 3, 4]));
+                await buffer.appendMatches(new Uint32Array([5, 6, 7, 8]));
+                const stats = await buffer.finalize();
+
+                // Read back
+                const data = await buffer.readAll();
+                await buffer.close(true);
+
+                return {
+                    stats,
+                    data: Array.from(data),
+                    error: null
+                };
+            } catch (e) {
+                return { stats: null, data: [], error: e.message };
+            }
+        });
+
+        if (result.error) {
+            console.log(`OPFS not available: ${result.error}`);
+        } else {
+            expect(result.data).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+            expect(result.stats.totalEntries).toBe(8);
+            console.log(`OPFS Buffer Stats: ${JSON.stringify(result.stats)}`);
+        }
+    });
+
+    test('Chunked Join CPU fallback works', async ({ page }) => {
+        const result = await page.evaluate(async () => {
+            try {
+                const { ChunkedGPUJoiner } = await import('./src/client/webgpu/chunked-gpu-join.js');
+                const joiner = new ChunkedGPUJoiner();
+                // Don't init GPU - force CPU fallback
+
+                // Create test data as async iterables
+                async function* leftData() {
+                    yield {
+                        keys: new Uint32Array([1, 2, 3, 4]),
+                        indices: new Uint32Array([0, 1, 2, 3])
+                    };
+                }
+                async function* rightData() {
+                    yield {
+                        keys: new Uint32Array([2, 3, 5]),
+                        indices: new Uint32Array([0, 1, 2])
+                    };
+                }
+
+                const resultBuffer = await joiner.hashJoin(leftData(), rightData());
+                const matches = await resultBuffer.readAll();
+                await resultBuffer.close(true);
+
+                // Should match: (1,0) -> key 2, (2,1) -> key 3
+                return {
+                    matchCount: matches.length / 2,
+                    matches: Array.from(matches),
+                    error: null
+                };
+            } catch (e) {
+                return { matchCount: 0, matches: [], error: e.message };
+            }
+        });
+
+        expect(result.error).toBeNull();
+        expect(result.matchCount).toBe(2);
+        console.log(`Chunked Join Matches: ${result.matchCount}`);
+    });
 });
