@@ -260,6 +260,7 @@ pub fn evaluateExprForRow(ctx: WhereContext, expr: *const Expr, row_idx: u32) an
             break :blk if (in.negated) !result else result;
         },
         .in_subquery => |in| try evaluateInSubquery(ctx, in.expr, in.subquery, in.negated, row_idx),
+        .between => |bet| try evaluateBetween(ctx, bet.expr, bet.low, bet.high, row_idx),
         else => error.UnsupportedExpression,
     };
 }
@@ -359,6 +360,27 @@ fn evaluateInSubquery(ctx: WhereContext, expr: *const Expr, subquery: *ast.Selec
     return if (negated) true else false;
 }
 
+/// Evaluate BETWEEN expression: expr BETWEEN low AND high
+/// Returns true if low <= expr <= high (inclusive)
+/// Returns false if any operand is NULL
+fn evaluateBetween(ctx: WhereContext, expr: *const Expr, low: *const Expr, high: *const Expr, row_idx: u32) anyerror!bool {
+    const val = try evaluateToValue(ctx, expr, row_idx);
+    const low_val = try evaluateToValue(ctx, low, row_idx);
+    const high_val = try evaluateToValue(ctx, high, row_idx);
+
+    // NULL handling: BETWEEN with any NULL operand returns false (two-valued logic)
+    if (val == .null or low_val == .null or high_val == .null) {
+        return false;
+    }
+
+    // Compare val >= low AND val <= high
+    const ge_low = try compareValuesOp(val, low_val, .ge);
+    if (!ge_low) return false;
+
+    const le_high = try compareValuesOp(val, high_val, .le);
+    return le_high;
+}
+
 /// Evaluate binary operation (returns boolean)
 fn evaluateBinaryOp(ctx: WhereContext, op: BinaryOp, left: *const Expr, right: *const Expr, row_idx: u32) anyerror!bool {
     return switch (op) {
@@ -367,6 +389,7 @@ fn evaluateBinaryOp(ctx: WhereContext, op: BinaryOp, left: *const Expr, right: *
         .@"or" => (try evaluateExprForRow(ctx, left, row_idx)) or
             (try evaluateExprForRow(ctx, right, row_idx)),
         .eq, .ne, .lt, .le, .gt, .ge => try evaluateComparison(ctx, op, left, right, row_idx),
+        .like => try evaluateLike(ctx, left, right, row_idx),
         else => error.UnsupportedOperator,
     };
 }
@@ -404,6 +427,147 @@ fn evaluateComparison(ctx: WhereContext, op: BinaryOp, left: *const Expr, right:
         .null => op == .ne,
         else => error.UnsupportedType,
     };
+}
+
+/// Compare two Values with a specific operator (helper for BETWEEN)
+fn compareValuesOp(left_val: Value, right_val: Value, op: BinaryOp) !bool {
+    return switch (left_val) {
+        .integer => |left_int| blk: {
+            const right_num = switch (right_val) {
+                .integer => |i| @as(f64, @floatFromInt(i)),
+                .float => |f| f,
+                else => return error.TypeMismatch,
+            };
+            const left_num = @as(f64, @floatFromInt(left_int));
+            break :blk scalar_functions.compareNumbers(op, left_num, right_num);
+        },
+        .float => |left_float| blk: {
+            const right_num = switch (right_val) {
+                .integer => |i| @as(f64, @floatFromInt(i)),
+                .float => |f| f,
+                else => return error.TypeMismatch,
+            };
+            break :blk scalar_functions.compareNumbers(op, left_float, right_num);
+        },
+        .string => |left_str| blk: {
+            const right_str = switch (right_val) {
+                .string => |s| s,
+                else => return error.TypeMismatch,
+            };
+            break :blk scalar_functions.compareStrings(op, left_str, right_str);
+        },
+        .null => false,
+        else => error.UnsupportedType,
+    };
+}
+
+/// Evaluate LIKE pattern matching
+/// Supports SQL wildcards: % (any sequence), _ (single char)
+/// Escape sequences: \% and \_ for literal match
+fn evaluateLike(ctx: WhereContext, left: *const Expr, right: *const Expr, row_idx: u32) !bool {
+    const left_val = try evaluateToValue(ctx, left, row_idx);
+    const right_val = try evaluateToValue(ctx, right, row_idx);
+
+    // NULL handling: LIKE with NULL returns false
+    if (left_val == .null or right_val == .null) {
+        return false;
+    }
+
+    const str = switch (left_val) {
+        .string => |s| s,
+        else => return error.TypeMismatch,
+    };
+
+    const pattern = switch (right_val) {
+        .string => |s| s,
+        else => return error.TypeMismatch,
+    };
+
+    return matchLikePattern(str, pattern);
+}
+
+/// Match a string against a SQL LIKE pattern
+/// % matches any sequence of characters (including empty)
+/// _ matches exactly one character
+/// \% and \_ match literal % and _
+fn matchLikePattern(str: []const u8, pattern: []const u8) bool {
+    var s_idx: usize = 0;
+    var p_idx: usize = 0;
+
+    // For backtracking when % doesn't match
+    var star_idx: ?usize = null;
+    var match_idx: usize = 0;
+
+    while (s_idx < str.len or p_idx < pattern.len) {
+        if (p_idx < pattern.len) {
+            const p_char = pattern[p_idx];
+
+            // Handle escape sequences
+            if (p_char == '\\' and p_idx + 1 < pattern.len) {
+                const next = pattern[p_idx + 1];
+                if (next == '%' or next == '_' or next == '\\') {
+                    // Literal match of escaped character
+                    if (s_idx < str.len and str[s_idx] == next) {
+                        s_idx += 1;
+                        p_idx += 2;
+                        continue;
+                    }
+                    // No match for escaped literal
+                    if (star_idx) |si| {
+                        p_idx = si + 1;
+                        match_idx += 1;
+                        s_idx = match_idx;
+                        continue;
+                    }
+                    return false;
+                }
+            }
+
+            // % matches any sequence
+            if (p_char == '%') {
+                star_idx = p_idx;
+                match_idx = s_idx;
+                p_idx += 1;
+                continue;
+            }
+
+            // _ matches single character
+            if (p_char == '_') {
+                if (s_idx < str.len) {
+                    s_idx += 1;
+                    p_idx += 1;
+                    continue;
+                }
+                // No character to match
+                if (star_idx) |si| {
+                    p_idx = si + 1;
+                    match_idx += 1;
+                    s_idx = match_idx;
+                    continue;
+                }
+                return false;
+            }
+
+            // Regular character match
+            if (s_idx < str.len and str[s_idx] == p_char) {
+                s_idx += 1;
+                p_idx += 1;
+                continue;
+            }
+        }
+
+        // Backtrack to last % if possible
+        if (star_idx) |si| {
+            p_idx = si + 1;
+            match_idx += 1;
+            s_idx = match_idx;
+            if (s_idx <= str.len) continue;
+        }
+
+        return false;
+    }
+
+    return true;
 }
 
 /// Evaluate unary operation
@@ -492,4 +656,67 @@ test "where: evaluateToValue column lookup" {
     const val = try evaluateToValue(ctx, &col_expr, 1);
 
     try std.testing.expectEqual(@as(i64, 200), val.integer);
+}
+
+test "LIKE: exact match" {
+    try std.testing.expect(matchLikePattern("foo", "foo"));
+    try std.testing.expect(!matchLikePattern("foo", "bar"));
+    try std.testing.expect(!matchLikePattern("foo", "foobar"));
+}
+
+test "LIKE: percent wildcard" {
+    // % matches any sequence
+    try std.testing.expect(matchLikePattern("foobar", "foo%"));
+    try std.testing.expect(matchLikePattern("foo", "foo%"));
+    try std.testing.expect(!matchLikePattern("bar", "foo%"));
+
+    // Suffix match
+    try std.testing.expect(matchLikePattern("foobar", "%bar"));
+    try std.testing.expect(matchLikePattern("bar", "%bar"));
+    try std.testing.expect(!matchLikePattern("barfoo", "%bar"));
+
+    // Contains
+    try std.testing.expect(matchLikePattern("foobar", "%oba%"));
+    try std.testing.expect(matchLikePattern("abc", "%b%"));
+
+    // Match all
+    try std.testing.expect(matchLikePattern("anything", "%"));
+    try std.testing.expect(matchLikePattern("", "%"));
+}
+
+test "LIKE: underscore wildcard" {
+    // _ matches single character
+    try std.testing.expect(matchLikePattern("foo", "f_o"));
+    try std.testing.expect(!matchLikePattern("fo", "f_o"));
+    try std.testing.expect(!matchLikePattern("fooo", "f_o"));
+
+    // Multiple underscores
+    try std.testing.expect(matchLikePattern("bar", "b__"));
+    try std.testing.expect(!matchLikePattern("ba", "b__"));
+}
+
+test "LIKE: mixed patterns" {
+    try std.testing.expect(matchLikePattern("foobar", "f%r"));
+    try std.testing.expect(matchLikePattern("foobar", "f_o%"));
+    try std.testing.expect(matchLikePattern("foobar", "%o_a%"));
+}
+
+test "LIKE: escape sequences" {
+    // \% matches literal %
+    try std.testing.expect(matchLikePattern("100%", "100\\%"));
+    try std.testing.expect(!matchLikePattern("100x", "100\\%"));
+
+    // \_ matches literal _
+    try std.testing.expect(matchLikePattern("foo_bar", "foo\\_bar"));
+    try std.testing.expect(!matchLikePattern("fooxbar", "foo\\_bar"));
+
+    // Combined
+    try std.testing.expect(matchLikePattern("50% off", "%\\% off"));
+}
+
+test "LIKE: empty strings" {
+    try std.testing.expect(matchLikePattern("", ""));
+    try std.testing.expect(matchLikePattern("", "%"));
+    try std.testing.expect(!matchLikePattern("", "_"));
+    try std.testing.expect(!matchLikePattern("", "a"));
 }

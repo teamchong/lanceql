@@ -1030,6 +1030,26 @@ pub fn build(b: *std.Build) void {
     const test_stress_step = b.step("test-stress", "Run stress tests (large datasets, memory, edge cases)");
     test_stress_step.dependOn(&run_test_stress.step);
 
+    // === Conformance Tests (PyLance reference) ===
+    // Python-based conformance tests that validate against PyLance
+    // Requires: pip install pylance pyarrow numpy pytest
+    const conformance_generate = b.addSystemCommand(&.{ "python3", "tests/conformance/generate_sql_fixtures.py" });
+    const conformance_generate_step = b.step("conformance-generate", "Generate SQL conformance fixtures from PyLance");
+    conformance_generate_step.dependOn(&conformance_generate.step);
+
+    const conformance_vector = b.addSystemCommand(&.{ "pytest", "tests/conformance/test_vector_conformance.py", "-v" });
+    const conformance_vector_step = b.step("conformance-vector", "Run vector algorithm conformance tests");
+    conformance_vector_step.dependOn(&conformance_vector.step);
+
+    const conformance_fuzz = b.addSystemCommand(&.{ "python3", "tests/conformance/fuzz_sql.py", "--iterations", "100" });
+    const conformance_fuzz_step = b.step("conformance-fuzz", "Run SQL differential fuzzing (quick mode)");
+    conformance_fuzz_step.dependOn(&conformance_fuzz.step);
+
+    // Combined conformance test step
+    const conformance_step = b.step("test-conformance", "Run all PyLance conformance tests");
+    conformance_step.dependOn(&conformance_generate.step);
+    conformance_step.dependOn(&conformance_vector.step);
+
     // === WASM Build ===
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
