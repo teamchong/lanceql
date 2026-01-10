@@ -6,7 +6,6 @@ import { getWebGPUAccelerator } from '../gpu/accelerator.js';
 import { LanceFile } from '../lance/lance-file.js';
 import { RemoteLanceFile } from '../lance/remote-file.js';
 import { RemoteLanceDataset } from '../lance/remote-dataset.js';
-import { LanceDatabase } from '../database/lance-database.js';
 
 class LocalSQLParser {
     constructor(tokens) {
@@ -643,19 +642,6 @@ const _createLanceqlMethods = (proxy) => ({
         }
     },
 
-    /**
-     * Create a new LanceDatabase for multi-table queries with JOINs.
-     * @returns {LanceDatabase}
-     */
-    createDatabase() {
-        // Store reference to lanceql instance for registerRemote()
-        if (typeof window !== 'undefined') {
-            window.lanceql = proxy;
-        } else if (typeof globalThis !== 'undefined') {
-            globalThis.lanceql = proxy;
-        }
-        return new LanceDatabase();
-    }
 });
 
 

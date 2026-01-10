@@ -18,9 +18,29 @@ import { BufferPool } from './buffer-pool.js';
 import { getWasmSqlExecutor } from './wasm-sql-bridge.js';
 import { E } from './data-types.js';
 
-// SQL Parser for intercepting time travel commands
-import { SQLLexer } from '../client/sql/lexer.js';
-import { SQLParser } from '../client/sql/parser.js';
+// Simple regex patterns for time travel commands (no heavy SQL parser needed)
+const TIME_TRAVEL_PATTERNS = {
+    // SHOW VERSIONS FOR table_name
+    showVersions: /^\s*SHOW\s+VERSIONS\s+FOR\s+(\w+)\s*$/i,
+    // RESTORE table_name TO VERSION n
+    restoreTable: /^\s*RESTORE\s+(\w+)\s+TO\s+VERSION\s+(\d+)\s*$/i,
+    // SELECT ... FROM table VERSION AS OF n
+    versionAsOf: /FROM\s+(\w+)\s+VERSION\s+AS\s+OF\s+(\d+)/i,
+};
+
+function parseTimeTravelCommand(sql) {
+    let match;
+    if ((match = sql.match(TIME_TRAVEL_PATTERNS.showVersions))) {
+        return { type: 'SHOW_VERSIONS', table: match[1] };
+    }
+    if ((match = sql.match(TIME_TRAVEL_PATTERNS.restoreTable))) {
+        return { type: 'RESTORE_TABLE', table: match[1], version: parseInt(match[2], 10) };
+    }
+    if ((match = sql.match(TIME_TRAVEL_PATTERNS.versionAsOf))) {
+        return { type: 'SELECT_VERSION', table: match[1], version: parseInt(match[2], 10), sql };
+    }
+    return null;
+}
 
 // ============================================================================
 // WASM SQL Execution (execute queries entirely in WASM for zero-copy transfer)
@@ -697,15 +717,11 @@ async function handleMessage(port, data) {
         } else if (method === 'db:exec') {
             const db = await getDatabase(args.db);
 
-            // Parse SQL to check for time travel commands
-            const lexer = new SQLLexer(args.sql);
-            const tokens = lexer.tokenize();
-            const parser = new SQLParser(tokens);
-            const ast = parser.parse();
+            // Check for time travel commands (simple regex, no heavy parser)
+            const ttCmd = parseTimeTravelCommand(args.sql);
 
-            // Handle time travel commands
-            if (ast.type === 'SHOW_VERSIONS') {
-                const versions = await db.listVersions(ast.table);
+            if (ttCmd?.type === 'SHOW_VERSIONS') {
+                const versions = await db.listVersions(ttCmd.table);
                 result = {
                     _format: 'columnar',
                     columns: ['version', 'timestamp', 'operation', 'rowCount'],
@@ -717,8 +733,8 @@ async function handleMessage(port, data) {
                         rowCount: new Float64Array(versions.map(v => v.rowCount))
                     }
                 };
-            } else if (ast.type === 'RESTORE_TABLE') {
-                const restoreResult = await db.restoreToVersion(ast.table, ast.version);
+            } else if (ttCmd?.type === 'RESTORE_TABLE') {
+                const restoreResult = await db.restoreToVersion(ttCmd.table, ttCmd.version);
                 result = {
                     _format: 'columnar',
                     columns: ['status', 'newVersion'],
@@ -728,12 +744,9 @@ async function handleMessage(port, data) {
                         newVersion: new Float64Array([restoreResult.newVersion])
                     }
                 };
-            } else if (ast.type === 'SELECT' && ast.from?.asOfVersion) {
+            } else if (ttCmd?.type === 'SELECT_VERSION') {
                 // SELECT with VERSION AS OF - route to selectAtVersion
-                const rows = await db.selectAtVersion(ast.from.name || ast.from.table, ast.from.asOfVersion, {
-                    limit: ast.limit,
-                    offset: ast.offset
-                });
+                const rows = await db.selectAtVersion(ttCmd.table, ttCmd.version, {});
                 // Convert rows to columnar format
                 if (rows.length > 0) {
                     const columns = Object.keys(rows[0]);
@@ -752,12 +765,6 @@ async function handleMessage(port, data) {
                 }
             } else {
                 // Standard SQL - use WASM executor
-                const executor = getWasmSqlExecutor();
-                const tableNames = executor.getTableNames(args.sql);
-                const primaryTable = tableNames[0] ? db.tables.get(tableNames[0]) : null;
-                const rowCount = primaryTable ? primaryTable.rowCount : 0;
-
-                // Always use WASM SQL executor (including DDL/DML)
                 result = await executeWasmSqlFull(db, args.sql);
             }
 
@@ -831,15 +838,11 @@ async function handleMessage(port, data) {
             const vault = await getVault();
             const db = vault._db;
 
-            // Parse SQL to check for time travel commands
-            const lexer = new SQLLexer(args.sql);
-            const tokens = lexer.tokenize();
-            const parser = new SQLParser(tokens);
-            const ast = parser.parse();
+            // Check for time travel commands (simple regex, no heavy parser)
+            const ttCmd = parseTimeTravelCommand(args.sql);
 
-            // Handle time travel commands
-            if (ast.type === 'SHOW_VERSIONS') {
-                const versions = await db.listVersions(ast.table);
+            if (ttCmd?.type === 'SHOW_VERSIONS') {
+                const versions = await db.listVersions(ttCmd.table);
                 result = {
                     _format: 'columnar',
                     columns: ['version', 'timestamp', 'operation', 'rowCount'],
@@ -851,8 +854,8 @@ async function handleMessage(port, data) {
                         rowCount: new Float64Array(versions.map(v => v.rowCount))
                     }
                 };
-            } else if (ast.type === 'RESTORE_TABLE') {
-                const restoreResult = await db.restoreToVersion(ast.table, ast.version);
+            } else if (ttCmd?.type === 'RESTORE_TABLE') {
+                const restoreResult = await db.restoreToVersion(ttCmd.table, ttCmd.version);
                 result = {
                     _format: 'columnar',
                     columns: ['status', 'newVersion'],
@@ -862,12 +865,9 @@ async function handleMessage(port, data) {
                         newVersion: new Float64Array([restoreResult.newVersion])
                     }
                 };
-            } else if (ast.type === 'SELECT' && ast.from?.asOfVersion) {
+            } else if (ttCmd?.type === 'SELECT_VERSION') {
                 // SELECT with VERSION AS OF - route to selectAtVersion
-                const rows = await db.selectAtVersion(ast.from.name || ast.from.table, ast.from.asOfVersion, {
-                    limit: ast.limit,
-                    offset: ast.offset
-                });
+                const rows = await db.selectAtVersion(ttCmd.table, ttCmd.version, {});
                 // Convert rows to columnar format
                 if (rows.length > 0) {
                     const columns = Object.keys(rows[0]);
@@ -886,12 +886,6 @@ async function handleMessage(port, data) {
                 }
             } else {
                 // Standard SQL - use WASM executor
-                const executor = getWasmSqlExecutor();
-                const tableNames = executor.getTableNames(args.sql);
-                const primaryTable = tableNames[0] ? db.tables.get(tableNames[0]) : null;
-                const rowCount = primaryTable ? primaryTable.rowCount : 0;
-
-                // Always use WASM SQL executor (including DDL/DML)
                 result = await executeWasmSqlFull(db, args.sql);
             }
 
