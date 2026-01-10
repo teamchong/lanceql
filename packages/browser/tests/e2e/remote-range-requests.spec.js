@@ -79,13 +79,12 @@ test.describe('Remote Range Request Efficiency', () => {
     }
 
     /**
-     * Helper to wait for Alpine.js initialization
+     * Helper to wait for page to be ready (Alpine + DOM).
+     * Don't use networkidle - worker keeps loading WASM.
      */
-    async function waitForAlpine(page, timeout = 45000) {
-        await page.waitForFunction(() => {
-            // @ts-ignore
-            return typeof Alpine !== 'undefined' && Alpine.store && Alpine.store('app');
-        }, { timeout });
+    async function waitForPageReady(page, timeout = 15000) {
+        // Wait for main UI element to exist (Alpine has rendered)
+        await page.waitForSelector('#sql-input', { timeout });
     }
 
     /**
@@ -114,7 +113,7 @@ test.describe('Remote Range Request Efficiency', () => {
             page.on('console', msg => console.log('PAGE:', msg.text()));
 
             await page.goto('/examples/wasm/');
-            await waitForAlpine(page);
+            await waitForPageReady(page);
 
             // Start tracking after page load
             const tracker = createNetworkTracker(page);
@@ -145,7 +144,7 @@ test.describe('Remote Range Request Efficiency', () => {
             page.on('console', msg => console.log('PAGE:', msg.text()));
 
             await page.goto('/examples/wasm/');
-            await waitForAlpine(page);
+            await waitForPageReady(page);
 
             const tracker = createNetworkTracker(page);
 
@@ -174,7 +173,7 @@ test.describe('Remote Range Request Efficiency', () => {
             page.on('console', msg => console.log('PAGE:', msg.text()));
 
             await page.goto('/examples/wasm/');
-            await waitForAlpine(page);
+            await waitForPageReady(page);
 
             const tracker = createNetworkTracker(page);
 
@@ -206,7 +205,7 @@ test.describe('Remote Range Request Efficiency', () => {
             page.on('console', msg => console.log('PAGE:', msg.text()));
 
             await page.goto('/examples/wasm/');
-            await waitForAlpine(page);
+            await waitForPageReady(page);
 
             const tracker = createNetworkTracker(page);
             await executeQuery(page, `
@@ -232,7 +231,7 @@ test.describe('Remote Range Request Efficiency', () => {
             page.on('console', msg => console.log('PAGE:', msg.text()));
 
             await page.goto('/examples/wasm/');
-            await waitForAlpine(page);
+            await waitForPageReady(page);
 
             const tracker = createNetworkTracker(page);
 
@@ -260,7 +259,7 @@ test.describe('Remote Range Request Efficiency', () => {
             page.on('console', msg => console.log('PAGE:', msg.text()));
 
             await page.goto('/examples/wasm/');
-            await waitForAlpine(page);
+            await waitForPageReady(page);
 
             const tracker = createNetworkTracker(page);
 
@@ -291,7 +290,7 @@ test.describe('Remote Range Request Efficiency', () => {
             page.on('console', msg => console.log('PAGE:', msg.text()));
 
             await page.goto('/examples/wasm/');
-            await waitForAlpine(page);
+            await waitForPageReady(page);
 
             const tracker = createNetworkTracker(page);
 
@@ -322,7 +321,7 @@ test.describe('Remote Range Request Efficiency', () => {
             page.on('console', msg => console.log('PAGE:', msg.text()));
 
             await page.goto('/examples/wasm/');
-            await waitForAlpine(page);
+            await waitForPageReady(page);
 
             const tracker = createNetworkTracker(page);
 
@@ -360,7 +359,7 @@ test.describe('Remote Range Request Efficiency', () => {
             page.on('console', msg => console.log('PAGE:', msg.text()));
 
             await page.goto('/examples/wasm/');
-            await waitForAlpine(page);
+            await waitForPageReady(page);
 
             const tracker = createNetworkTracker(page);
 
@@ -397,11 +396,9 @@ test.describe('Remote Range Request Efficiency', () => {
 
 test.describe('Remote Dataset Operations', () => {
 
-    async function waitForAlpine(page, timeout = 45000) {
-        await page.waitForFunction(() => {
-            // @ts-ignore
-            return typeof Alpine !== 'undefined' && Alpine.store && Alpine.store('app');
-        }, { timeout });
+    async function waitForPageReady(page, timeout = 15000) {
+        // Wait for main UI element to exist (Alpine has rendered)
+        await page.waitForSelector('#sql-input', { timeout });
     }
 
     test('remote dataset metadata loads correctly', async ({ page }) => {
@@ -409,7 +406,7 @@ test.describe('Remote Dataset Operations', () => {
         page.on('console', msg => console.log('PAGE:', msg.text()));
 
         await page.goto('/examples/wasm/');
-        await waitForAlpine(page);
+        await waitForPageReady(page);
 
         // The page should show dataset info after loading
         const result = await page.evaluate(async () => {
@@ -444,7 +441,7 @@ test.describe('Remote Dataset Operations', () => {
         page.on('console', msg => console.log('PAGE:', msg.text()));
 
         await page.goto('/examples/wasm/');
-        await waitForAlpine(page);
+        await waitForPageReady(page);
 
         const result = await page.evaluate(async () => {
             // @ts-ignore
@@ -479,7 +476,7 @@ test.describe('Remote Dataset Operations', () => {
         page.on('console', msg => console.log('PAGE:', msg.text()));
 
         await page.goto('/examples/wasm/');
-        await waitForAlpine(page);
+        await waitForPageReady(page);
 
         const result = await page.evaluate(async () => {
             // @ts-ignore

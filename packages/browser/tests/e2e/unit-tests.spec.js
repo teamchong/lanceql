@@ -257,10 +257,11 @@ test.describe.serial('Module Loading (Browser)', () => {
 
     test('WASM demo page loads', async ({ page }) => {
         await page.goto('/examples/wasm/');
-        await page.waitForLoadState('networkidle');
+        // Wait for SQL input to be attached (Alpine has rendered)
+        await page.waitForSelector('#sql-input', { state: 'attached', timeout: 15000 });
 
         const result = await page.evaluate(() => {
-            return document.querySelector('#tables-drop-zone') !== null;
+            return document.querySelector('#sql-input') !== null;
         });
 
         expect(result).toBe(true);

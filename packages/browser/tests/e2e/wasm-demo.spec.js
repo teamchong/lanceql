@@ -4,11 +4,12 @@ import { test, expect } from '@playwright/test';
 // These tests verify the demo page works with bundled Alpine.js and nanostores
 test.describe('Demo Page - Push-Down Filtering + JOIN + Vector Search', () => {
 
-  async function waitForAlpine(page, timeout = 45000) {
-    await page.waitForFunction(() => {
-      // @ts-ignore
-      return typeof Alpine !== 'undefined' && Alpine.store && Alpine.store('app');
-    }, { timeout });
+  /**
+   * Wait for page to be ready (Alpine has rendered).
+   * Don't use networkidle - worker keeps loading WASM.
+   */
+  async function waitForPageReady(page, timeout = 15000) {
+    await page.waitForSelector('#sql-input', { timeout });
   }
 
   /**
@@ -48,8 +49,7 @@ test.describe('Demo Page - Push-Down Filtering + JOIN + Vector Search', () => {
 
     await page.goto('/examples/wasm/');
 
-    // Wait for Alpine.js to initialize
-    await waitForAlpine(page);
+    await waitForPageReady(page);
 
     // Wait for SQL input to be visible
     const sqlInput = page.locator('#sql-input');
@@ -69,7 +69,7 @@ test.describe('Demo Page - Push-Down Filtering + JOIN + Vector Search', () => {
 
     await page.goto('/examples/wasm/');
 
-    await waitForAlpine(page);
+    await waitForPageReady(page);
 
     // Start tracking AFTER page load to exclude metadata fetches
     const tracker = trackDataTransfers(page);
@@ -105,7 +105,7 @@ test.describe('Demo Page - Push-Down Filtering + JOIN + Vector Search', () => {
 
     await page.goto('/examples/wasm/');
 
-    await waitForAlpine(page);
+    await waitForPageReady(page);
 
     // Start tracking AFTER page load to exclude metadata fetches
     const tracker = trackDataTransfers(page);

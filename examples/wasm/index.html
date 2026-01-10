@@ -3211,7 +3211,7 @@ LIMIT 20`;
                 detectedTypes[i] = type;
             }
             $columnTypes.set(detectedTypes);
-            // Also store on file object for SQLExecutor
+            // Store lanceql reference on file object
             currentFile._columnTypes = detectedTypes;
 
             // Update UI via Alpine store
@@ -4241,11 +4241,8 @@ LIMIT 20`;
 
                 let result;
 
-                // Use SQLExecutor which handles read_lance() inline URL loading
-                const executor = new SQLExecutor(targetFile);
-                result = await executor.execute(sql, (msg, current, total) => {
-                    showProgress(msg, current, total);
-                });
+                // Execute SQL using built-in handlers (WASM handles read_lance() internally)
+                result = await executeSimpleSql(sql);
 
                 // Format the result for display
                 const formattedResult = {
