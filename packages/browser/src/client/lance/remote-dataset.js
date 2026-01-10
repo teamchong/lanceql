@@ -8,7 +8,6 @@ import { MetadataCache } from '../cache/metadata-cache.js';
 import { parseDeletionFile, loadDeletedRows } from './remote-dataset-del.js';
 import * as SearchModule from './remote-dataset-search.js';
 import * as FragModule from './remote-dataset-frag.js';
-import * as SQLModule from './remote-dataset-sql.js';
 
 // Singleton metadata cache
 const metadataCache = new MetadataCache();

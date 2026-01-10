@@ -11,6 +11,3 @@ export { DataFrame } from './lance-data-frame.js';
 
 // CSS-driven rendering system
 export { LanceData } from './lance-data-render.js';
-
-// sql.js-compatible API
-export { Statement, Database, initSqlJs, SqlJsDatabase, SqlJsStatement } from './lance-data-sqljs.js';
