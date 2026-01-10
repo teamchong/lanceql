@@ -126,7 +126,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
 
     <script type="module">
-        import { initSqlJs as initLanceQL } from '../../packages/browser/dist/lanceql.esm.js';
+        import { vault } from '../../packages/browser/dist/lanceql.esm.js';
 
         let sqljsDb = null;
         let lanceqlDb = null;
@@ -243,8 +243,7 @@
         async function initLanceQLDb() {
             if (lanceqlDb) return lanceqlDb;
             logLanceql('Loading LanceQL WASM...');
-            const SQL = await initLanceQL();
-            lanceqlDb = new SQL.Database();
+            lanceqlDb = await vault();
             logLanceql('LanceQL ready', 'pass');
             return lanceqlDb;
         }
@@ -261,18 +260,15 @@
         }
 
         async function lanceqlExec(db, sql) {
-            // LanceQL exec() is async
+            // Vault exec() returns { columns, rows }
             const result = await db.exec(sql);
-            if (!result || result.length === 0) return [];
-            if (result[0]?.columns) {
-                const cols = result[0].columns;
-                return result[0].values.map(row => {
-                    const obj = {};
-                    cols.forEach((col, i) => obj[col] = row[i]);
-                    return obj;
-                });
-            }
-            return result;
+            if (!result || !result.columns || !result.rows) return [];
+            const cols = result.columns;
+            return result.rows.map(row => {
+                const obj = {};
+                cols.forEach((col, i) => obj[col] = row[i]);
+                return obj;
+            });
         }
 
         window.runCompatTests = async function() {
@@ -309,11 +305,11 @@
                     try {
                         if (test.setup) {
                             for (const sql of test.setup) {
-                                await lanceql.run(sql);
+                                await lanceql.exec(sql);
                             }
                         }
                         if (test.sql) {
-                            await lanceql.run(test.sql);
+                            await lanceql.exec(test.sql);
                         }
                         const verifySql = test.verify || test.sql;
                         const result = verifySql?.startsWith('SELECT') ? await lanceqlExec(lanceql, verifySql) : [];
@@ -347,7 +343,9 @@
                 run: (db, execFn, isAsync) => {
                     const promises = [];
                     for (let i = 0; i < 1000; i++) {
-                        const p = db.run(`INSERT INTO bench VALUES (${i}, ${Math.random()}, 'item_${i}')`);
+                        // sql.js uses .run(), lanceql uses .exec()
+                        const sql = `INSERT INTO bench VALUES (${i}, ${Math.random()}, 'item_${i}')`;
+                        const p = isAsync ? db.exec(sql) : db.run(sql);
                         if (isAsync) promises.push(p);
                     }
                     return isAsync ? Promise.all(promises) : null;
@@ -397,7 +395,7 @@
                     // Setup
                     if (bench.setup) {
                         try { sqljs.run(bench.setup); } catch(e) {}
-                        try { await lanceql.run(bench.setup); } catch(e) {}
+                        try { await lanceql.exec(bench.setup); } catch(e) {}
                     }
 
                     // sql.js benchmark (sync)
