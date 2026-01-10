@@ -778,7 +778,75 @@ class RemoteLanceDataset {
      * @returns {Promise<{columns: Array[], columnNames: string[], total: number}>}
      */
     async executeSQL(sql) {
-        return SQLModule.executeSQL(this, sql);
+        // Parse LIMIT/OFFSET from SQL
+        const upper = sql.toUpperCase();
+        let limit = null, offset = null, hasWhere = false;
+
+        if (upper.includes('LIMIT')) {
+            const match = sql.match(/LIMIT\s+(\d+)/i);
+            if (match) limit = parseInt(match[1]);
+        }
+        if (upper.includes('OFFSET')) {
+            const match = sql.match(/OFFSET\s+(\d+)/i);
+            if (match) offset = parseInt(match[1]);
+        }
+        if (upper.includes('WHERE')) {
+            hasWhere = true;
+        }
+
+        // For simple SELECT * with LIMIT (no WHERE), use readRows
+        if (!hasWhere && upper.includes('SELECT') && (upper.includes('*') || upper.includes('SELECT *'))) {
+            return await this.readRows({ offset: offset || 0, limit: limit || 50 });
+        }
+
+        // For queries with WHERE or complex operations, execute on each fragment in parallel
+        const fetchPromises = this._fragments.map(async (frag, idx) => {
+            const file = await this.openFragment(idx);
+            try {
+                return await file.executeSQL(sql);
+            } catch (e) {
+                console.warn(`Fragment ${idx} query failed:`, e);
+                return { columns: [], columnNames: [], total: 0 };
+            }
+        });
+
+        const results = await Promise.all(fetchPromises);
+
+        // Merge results
+        if (results.length === 0 || results.every(r => r.columns.length === 0)) {
+            return { columns: [], columnNames: this.columnNames, total: 0 };
+        }
+
+        const firstValid = results.find(r => r.columns.length > 0);
+        if (!firstValid) {
+            return { columns: [], columnNames: this.columnNames, total: 0 };
+        }
+
+        const numCols = firstValid.columns.length;
+        const colNames = firstValid.columnNames;
+        const mergedColumns = Array.from({ length: numCols }, () => []);
+
+        let totalRows = 0;
+        for (const r of results) {
+            for (let c = 0; c < numCols && c < r.columns.length; c++) {
+                mergedColumns[c].push(...r.columns[c]);
+            }
+            totalRows += r.total;
+        }
+
+        // Apply LIMIT if present (after merging)
+        if (limit) {
+            const off = offset || 0;
+            for (let c = 0; c < numCols; c++) {
+                mergedColumns[c] = mergedColumns[c].slice(off, off + limit);
+            }
+        }
+
+        return {
+            columns: mergedColumns,
+            columnNames: colNames,
+            total: totalRows
+        };
     }
 
     /**
