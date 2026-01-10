@@ -19,6 +19,7 @@ const int64_fixture = @embedFile("fixtures/simple_int64.lance/data/0011101111110
 const float64_fixture = @embedFile("fixtures/simple_float64.lance/data/111100011001011101011011e9643e40abbeac7897d4a95cc3.lance");
 const mixed_fixture = @embedFile("fixtures/mixed_types.lance/data/110101110101011000001010a45f35499b9af0396c9ed741b0.lance");
 const sqlite_fixture = @embedFile("fixtures/mixed_types.lance/data/110101110101011000001010a45f35499b9af0396c9ed741b0.lance");
+const with_nulls_fixture = @embedFile("fixtures/with_nulls.lance/data/10010011001000000000001166409f4102b3c1e02271ce9ab7.lance");
 
 // ============================================================================
 // Test Context Helper
@@ -1485,3 +1486,25 @@ test "compiled filter with AND" {
     const result = try ctx.exec("SELECT id FROM t WHERE id > 1 AND id < 5");
     try std.testing.expectEqual(@as(usize, 3), result.row_count);
 }
+
+// ============================================================================
+// ORDER BY with NULLs Tests
+// ============================================================================
+// NOTE: JIT codegen currently doesn't support NULL bitmap handling.
+// These tests are documented here for future implementation when JIT is
+// enhanced to handle nullable columns properly.
+//
+// SQL standard NULL ordering behavior:
+// - NULLS FIRST: NULLs appear before non-NULL values
+// - NULLS LAST: NULLs appear after non-NULL values
+// - Default ASC: implementation-defined (we use NULLS LAST)
+// - Default DESC: implementation-defined (we use NULLS FIRST)
+//
+// Test cases to implement:
+// - "ORDER BY ASC with NULLs (default NULLS LAST)"
+// - "ORDER BY DESC with NULLs (default NULLS FIRST)"
+// - "ORDER BY with NULLS FIRST explicit"
+// - "ORDER BY with NULLS LAST explicit"
+// - "ORDER BY float column with NULLs"
+// - "IS NULL filter"
+// - "IS NOT NULL filter with ORDER BY"
