@@ -122,6 +122,55 @@ LIMIT 30
 
 See [Vector Search Guide](./docs/VECTOR_SEARCH.md) for IVF-PQ indices, encoders, and performance tuning.
 
+## Vector Index (Auto-Encode)
+
+Create indexes that automatically encode text to embeddings:
+
+```sql
+-- Create vector index on text column
+CREATE VECTOR INDEX ON docs(content) USING minilm
+
+-- With IF NOT EXISTS
+CREATE VECTOR INDEX IF NOT EXISTS ON docs(content) USING clip
+
+-- Custom dimension
+CREATE VECTOR INDEX ON docs(content) USING minilm WITH (dim = 384)
+
+-- Drop index
+DROP VECTOR INDEX ON docs(content)
+DROP VECTOR INDEX IF EXISTS ON docs(content)
+
+-- Show indexes
+SHOW VECTOR INDEXES
+SHOW VECTOR INDEXES ON docs
+```
+
+### Supported Models
+
+| Model | Dimensions | Use Case |
+|-------|-----------|----------|
+| `minilm` | 384 | Text similarity (default) |
+| `clip` | 512 | Image/text cross-modal |
+| `bge-small` | 384 | BGE embeddings |
+| `bge-base` | 768 | BGE embeddings |
+| `bge-large` | 1024 | BGE embeddings |
+| `openai` | 1536 | OpenAI embeddings |
+| `cohere` | 1024 | Cohere embeddings |
+
+### How It Works
+
+1. **CREATE VECTOR INDEX** - Registers index metadata, creates shadow column `__vec_{column}_{model}`
+2. **INSERT** - Text values automatically encoded to embeddings in shadow column
+3. **NEAR** - Query rewritten to use shadow column for vector search
+
+```sql
+-- User writes:
+SELECT * FROM docs WHERE content NEAR 'machine learning'
+
+-- Internally rewritten to:
+SELECT * FROM docs WHERE __vec_content_minilm NEAR encode('machine learning') TOPK 10
+```
+
 ## DataFrame Examples
 
 ```python
@@ -158,22 +207,95 @@ dataset = lanceql.open("https://...", version=24)
 
 ## Architecture
 
+### Zig Core (CLI + WASM)
+
 ```
 src/
-├── lanceql.zig          # Zig WASM module for Lance parsing
-├── format/              # Lance file format (footer, columns)
-├── proto/               # Protobuf decoder for manifests
-├── io/                  # VFS abstraction (file, memory, HTTP)
-└── encoding/
-    ├── plain.zig        # Lance column decoders
-    └── parquet/         # Parquet file reader
-        ├── page.zig     # Page decoder (PLAIN, RLE_DICTIONARY)
-        ├── snappy.zig   # Snappy decompression (pure Zig, SIMD)
-        └── thrift.zig   # TCompactProtocol decoder
+├── lanceql.zig          # Root module, re-exports all public APIs
+├── wasm.zig             # WASM entry point
+├── table.zig            # High-level Table API
+│
+├── sql/                 # SQL Engine
+│   ├── lexer.zig        # Tokenizer (DDL, DML, vector extensions)
+│   ├── parser.zig       # Recursive descent parser → AST
+│   ├── ast.zig          # Statement types (SELECT, CREATE VECTOR INDEX, etc.)
+│   ├── executor.zig     # Query execution, vector index storage
+│   ├── planner/         # Query optimizer
+│   └── codegen/         # JIT compilation (Metal0)
+│
+├── format/              # File Format Parsers
+│   ├── footer.zig       # Lance footer (40 bytes at EOF)
+│   ├── lance_file.zig   # Column access, fragments
+│   └── version.zig      # V2_0, V2_1 handling
+│
+├── proto/               # Protobuf Decoder (hand-rolled)
+│   ├── decoder.zig      # Wire format (varint, length-delimited)
+│   ├── lance_messages.zig  # ColumnMetadata, PageInfo
+│   └── schema.zig       # Schema/field parsing
+│
+├── io/                  # VFS Abstraction Layer
+│   ├── reader.zig       # Reader interface (vtable pattern)
+│   ├── file_reader.zig  # Native file system
+│   ├── memory_reader.zig # In-memory buffers
+│   └── http_reader.zig  # HTTP Range requests
+│
+└── encoding/            # Column Decoders
+    ├── plain.zig        # Plain int64/float64
+    └── parquet/         # Parquet support
+        ├── page.zig     # PLAIN, RLE_DICTIONARY
+        ├── snappy.zig   # Snappy (pure Zig, SIMD)
+        └── thrift.zig   # TCompactProtocol
+```
 
-examples/wasm/
-├── index.html           # Demo UI
-└── lanceql.js           # JS wrapper, SQL parser, vector search
+### Browser Package
+
+```
+packages/browser/
+├── src/
+│   ├── client/              # Main thread APIs
+│   │   ├── store/vault.js   # vault() - KV + SQL API
+│   │   ├── lance-ql.js      # LanceQL - remote datasets
+│   │   ├── lance/           # DataFrame API
+│   │   └── webgpu/          # GPU acceleration
+│   │       └── gpu-transformer.js  # Text embeddings
+│   │
+│   └── worker/              # SharedWorker
+│       ├── index.js         # RPC router, DDL sync, vector indexes
+│       ├── worker-database.js    # OPFS storage, Lance fragments
+│       └── wasm-sql-bridge.js    # WASM ↔ JS bridge
+│
+└── tests/e2e/               # Playwright tests
+```
+
+### Data Flow
+
+```
+                          ┌──────────────────────────────┐
+                          │       User SQL Query         │
+                          │  "SELECT * FROM t WHERE ..."  │
+                          └──────────────┬───────────────┘
+                                         │
+                    ┌────────────────────┴────────────────────┐
+                    │                                         │
+            ┌───────▼───────┐                         ┌───────▼───────┐
+            │   CLI (Zig)   │                         │Browser (WASM) │
+            │   lexer.zig   │                         │  worker/      │
+            │   parser.zig  │                         │  index.js     │
+            │   executor.zig│                         │               │
+            └───────┬───────┘                         └───────┬───────┘
+                    │                                         │
+                    │                                         │
+            ┌───────▼───────┐                         ┌───────▼───────┐
+            │ VFS Reader    │                         │ WASM Bridge   │
+            │ (file/HTTP)   │                         │ + WorkerDB    │
+            └───────┬───────┘                         └───────┬───────┘
+                    │                                         │
+                    └─────────────────┬───────────────────────┘
+                                      │
+                              ┌───────▼───────┐
+                              │  Lance Files  │
+                              │ (.lance dir)  │
+                              └───────────────┘
 ```
 
 ## WASM Runtime

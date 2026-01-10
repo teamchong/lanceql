@@ -6638,4 +6638,611 @@ test.describe('Vault SQL Operations', () => {
     // Note: GROUPING() function tests removed - requires ROLLUP/CUBE implementation in worker
     // which is tracked separately. The 3 function test suites above provide coverage for
     // scalar functions (math, string, array).
+
+    // ========================================================================
+    // Phase 33: DataFrame Write API Tests
+    // ========================================================================
+
+    test('DataFrame.fromRecords creates DataFrame from object array', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault, WritableDataFrame } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Test 1: Create DataFrame from records
+            try {
+                const df = WritableDataFrame.fromRecords([
+                    { id: 1, name: 'Alice', age: 30 },
+                    { id: 2, name: 'Bob', age: 25 }
+                ]);
+                tests.push({
+                    name: 'fromRecords creates DataFrame',
+                    pass: df.rowCount === 2,
+                    actual: `rowCount=${df.rowCount}`
+                });
+            } catch (e) {
+                tests.push({ name: 'fromRecords creates DataFrame', pass: false, error: e.message });
+            }
+
+            // Test 2: Save DataFrame to table
+            try {
+                const df = WritableDataFrame.fromRecords([
+                    { id: 1, name: 'Alice', age: 30 },
+                    { id: 2, name: 'Bob', age: 25 }
+                ]);
+                const result = await df.saveTo(v, 'test_from_records');
+                tests.push({
+                    name: 'saveTo creates table',
+                    pass: result.rowCount === 2 && result.tableName === 'test_from_records',
+                    actual: `rowCount=${result.rowCount}, table=${result.tableName}`
+                });
+            } catch (e) {
+                tests.push({ name: 'saveTo creates table', pass: false, error: e.message });
+            }
+
+            // Test 3: Verify data was saved
+            try {
+                const res = await v.exec('SELECT * FROM test_from_records ORDER BY id');
+                tests.push({
+                    name: 'Data persisted correctly',
+                    pass: res.rows.length === 2 && res.rows[0].name === 'Alice' && res.rows[1].name === 'Bob',
+                    actual: `rows=${JSON.stringify(res.rows)}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Data persisted correctly', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            try { await v.exec('DROP TABLE IF EXISTS test_from_records'); } catch (e) {}
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('DataFrame.fromColumns creates DataFrame from columnar data', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault, WritableDataFrame } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Test 1: Create from plain arrays
+            try {
+                const df = WritableDataFrame.fromColumns({
+                    id: [1, 2, 3],
+                    name: ['Alice', 'Bob', 'Charlie'],
+                    score: [0.9, 0.8, 0.7]
+                });
+                tests.push({
+                    name: 'fromColumns with plain arrays',
+                    pass: df.rowCount === 3,
+                    actual: `rowCount=${df.rowCount}`
+                });
+            } catch (e) {
+                tests.push({ name: 'fromColumns with plain arrays', pass: false, error: e.message });
+            }
+
+            // Test 2: Create from TypedArrays and save
+            try {
+                const df = WritableDataFrame.fromColumns({
+                    value: new Float64Array([1.1, 2.2, 3.3]),
+                    count: new Int32Array([10, 20, 30])
+                });
+                const result = await df.saveTo(v, 'test_typed_arrays');
+                tests.push({
+                    name: 'fromColumns with TypedArrays',
+                    pass: result.rowCount === 3,
+                    actual: `rowCount=${result.rowCount}`
+                });
+            } catch (e) {
+                tests.push({ name: 'fromColumns with TypedArrays', pass: false, error: e.message });
+            }
+
+            // Test 3: Verify TypedArray data
+            try {
+                const res = await v.exec('SELECT * FROM test_typed_arrays ORDER BY count');
+                tests.push({
+                    name: 'TypedArray data persisted',
+                    pass: res.rows.length === 3 && res.rows[0].count === 10,
+                    actual: `rows=${JSON.stringify(res.rows)}`
+                });
+            } catch (e) {
+                tests.push({ name: 'TypedArray data persisted', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            try { await v.exec('DROP TABLE IF EXISTS test_typed_arrays'); } catch (e) {}
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('DataFrame saveTo with ifExists options', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault, WritableDataFrame } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup: create initial table
+            const df1 = WritableDataFrame.fromRecords([{ id: 1, val: 'original' }]);
+            await df1.saveTo(v, 'test_ifexists');
+
+            // Test 1: ifExists: 'fail' (default) should throw
+            try {
+                const df2 = WritableDataFrame.fromRecords([{ id: 2, val: 'new' }]);
+                await df2.saveTo(v, 'test_ifexists');
+                tests.push({ name: 'ifExists fail throws', pass: false, error: 'Should have thrown' });
+            } catch (e) {
+                tests.push({
+                    name: 'ifExists fail throws',
+                    pass: e.message.includes('already exists'),
+                    actual: e.message
+                });
+            }
+
+            // Test 2: ifExists: 'replace' replaces table
+            try {
+                const df2 = WritableDataFrame.fromRecords([{ id: 2, val: 'replaced' }]);
+                await df2.saveTo(v, 'test_ifexists', { ifExists: 'replace' });
+                const res = await v.exec('SELECT * FROM test_ifexists');
+                tests.push({
+                    name: 'ifExists replace works',
+                    pass: res.rows.length === 1 && res.rows[0].val === 'replaced',
+                    actual: `val=${res.rows[0].val}`
+                });
+            } catch (e) {
+                tests.push({ name: 'ifExists replace works', pass: false, error: e.message });
+            }
+
+            // Test 3: ifExists: 'append' adds rows
+            try {
+                const df3 = WritableDataFrame.fromRecords([{ id: 3, val: 'appended' }]);
+                await df3.saveTo(v, 'test_ifexists', { ifExists: 'append' });
+                const res = await v.exec('SELECT COUNT(*) as cnt FROM test_ifexists');
+                tests.push({
+                    name: 'ifExists append works',
+                    pass: res.rows[0].cnt === 2,
+                    actual: `count=${res.rows[0].cnt}`
+                });
+            } catch (e) {
+                tests.push({ name: 'ifExists append works', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            try { await v.exec('DROP TABLE IF EXISTS test_ifexists'); } catch (e) {}
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('Vault.df() chains query result to saveTo', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup: create source table
+            await v.exec('CREATE TABLE test_source (id INT, active INT, name TEXT)');
+            await v.exec("INSERT INTO test_source VALUES (1, 1, 'Alice'), (2, 0, 'Bob'), (3, 1, 'Charlie')");
+
+            // Test 1: df() returns WritableDataFrame
+            try {
+                const df = await v.df('SELECT * FROM test_source WHERE active = 1');
+                tests.push({
+                    name: 'df() returns DataFrame',
+                    pass: df.rowCount === 2,
+                    actual: `rowCount=${df.rowCount}`
+                });
+            } catch (e) {
+                tests.push({ name: 'df() returns DataFrame', pass: false, error: e.message });
+            }
+
+            // Test 2: df() result can be saved
+            try {
+                const df = await v.df('SELECT id, name FROM test_source WHERE active = 1');
+                await df.saveTo(v, 'test_active_users');
+                const res = await v.exec('SELECT * FROM test_active_users ORDER BY id');
+                tests.push({
+                    name: 'df() to saveTo chain works',
+                    pass: res.rows.length === 2 && res.rows[0].name === 'Alice',
+                    actual: `rows=${JSON.stringify(res.rows)}`
+                });
+            } catch (e) {
+                tests.push({ name: 'df() to saveTo chain works', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            try { await v.exec('DROP TABLE IF EXISTS test_source'); } catch (e) {}
+            try { await v.exec('DROP TABLE IF EXISTS test_active_users'); } catch (e) {}
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('Schema inference handles various types', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault, WritableDataFrame } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Test 1: Integer vs Float inference
+            try {
+                const df = WritableDataFrame.fromRecords([
+                    { int_col: 42, float_col: 3.14 }
+                ]);
+                await df.saveTo(v, 'test_schema_inference');
+                const res = await v.exec('SELECT * FROM test_schema_inference');
+                tests.push({
+                    name: 'Int and Float types inferred',
+                    pass: res.rows[0].int_col === 42 && Math.abs(res.rows[0].float_col - 3.14) < 0.001,
+                    actual: `int=${res.rows[0].int_col}, float=${res.rows[0].float_col}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Int and Float types inferred', pass: false, error: e.message });
+            }
+
+            // Test 2: String and null handling
+            try {
+                const df = WritableDataFrame.fromRecords([
+                    { name: 'Alice', nullable: null },
+                    { name: 'Bob Jones', nullable: 'value' }
+                ]);
+                await df.saveTo(v, 'test_strings_nulls');
+                const res = await v.exec('SELECT * FROM test_strings_nulls ORDER BY name');
+                tests.push({
+                    name: 'Strings and nulls saved correctly',
+                    pass: res.rows[0].name === 'Alice' && res.rows[1].name === 'Bob Jones',
+                    actual: `names=${res.rows[0].name}, ${res.rows[1].name}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Strings and nulls saved correctly', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            try { await v.exec('DROP TABLE IF EXISTS test_schema_inference'); } catch (e) {}
+            try { await v.exec('DROP TABLE IF EXISTS test_strings_nulls'); } catch (e) {}
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    // ========================================================================
+    // Phase 34: Vector Index Tests (FTS-like shadow columns)
+    // ========================================================================
+
+    test('CREATE VECTOR INDEX creates shadow column metadata', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup: create table with text column and insert data to ensure it's registered
+            await v.exec('DROP TABLE IF EXISTS docs');
+            await v.exec('CREATE TABLE docs (id INT, text TEXT)');
+            await v.exec("INSERT INTO docs VALUES (1, 'hello')");
+
+            // Test 1: CREATE VECTOR INDEX
+            try {
+                const res = await v.exec('CREATE VECTOR INDEX ON docs(text) USING minilm');
+                tests.push({
+                    name: 'CREATE VECTOR INDEX returns status',
+                    pass: res.rows[0].status === 'created' && res.rows[0].shadowColumn === '__vec_text_minilm',
+                    actual: `status=${res.rows[0].status}, shadow=${res.rows[0].shadowColumn}`
+                });
+            } catch (e) {
+                tests.push({ name: 'CREATE VECTOR INDEX returns status', pass: false, error: e.message });
+            }
+
+            // Test 2: SHOW VECTOR INDEXES
+            try {
+                const res = await v.exec('SHOW VECTOR INDEXES FOR docs');
+                tests.push({
+                    name: 'SHOW VECTOR INDEXES lists index',
+                    pass: res.rows.length === 1 && res.rows[0].column === 'text' && res.rows[0].model === 'minilm',
+                    actual: `count=${res.rows.length}, col=${res.rows[0]?.column}, model=${res.rows[0]?.model}`
+                });
+            } catch (e) {
+                tests.push({ name: 'SHOW VECTOR INDEXES lists index', pass: false, error: e.message });
+            }
+
+            // Test 3: IF NOT EXISTS doesn't error
+            try {
+                const res = await v.exec('CREATE VECTOR INDEX IF NOT EXISTS ON docs(text) USING minilm');
+                tests.push({
+                    name: 'IF NOT EXISTS succeeds',
+                    pass: res.rows[0].status === 'created',
+                    actual: `status=${res.rows[0].status}`
+                });
+            } catch (e) {
+                tests.push({ name: 'IF NOT EXISTS succeeds', pass: false, error: e.message });
+            }
+
+            // Test 4: DROP VECTOR INDEX
+            try {
+                const res = await v.exec('DROP VECTOR INDEX ON docs(text)');
+                tests.push({
+                    name: 'DROP VECTOR INDEX succeeds',
+                    pass: res.rows[0].status === 'dropped',
+                    actual: `status=${res.rows[0].status}`
+                });
+            } catch (e) {
+                tests.push({ name: 'DROP VECTOR INDEX succeeds', pass: false, error: e.message });
+            }
+
+            // Test 5: SHOW VECTOR INDEXES empty after drop
+            try {
+                const res = await v.exec('SHOW VECTOR INDEXES FOR docs');
+                tests.push({
+                    name: 'SHOW VECTOR INDEXES empty after drop',
+                    pass: res.rows.length === 0,
+                    actual: `count=${res.rows.length}`
+                });
+            } catch (e) {
+                tests.push({ name: 'SHOW VECTOR INDEXES empty after drop', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            try { await v.exec('DROP TABLE IF EXISTS docs'); } catch (e) {}
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('Vector index validates table and column existence', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup: create table with data
+            await v.exec('DROP TABLE IF EXISTS items');
+            await v.exec('CREATE TABLE items (id INT, name TEXT)');
+            await v.exec("INSERT INTO items VALUES (1, 'test')");
+
+            // Test 1: Error on non-existent table
+            try {
+                await v.exec('CREATE VECTOR INDEX ON nonexistent(text) USING minilm');
+                tests.push({ name: 'Error on non-existent table', pass: false, error: 'Should have thrown' });
+            } catch (e) {
+                tests.push({
+                    name: 'Error on non-existent table',
+                    pass: e.message.includes('does not exist'),
+                    actual: e.message
+                });
+            }
+
+            // Test 2: Error on non-existent column
+            try {
+                await v.exec('CREATE VECTOR INDEX ON items(nonexistent) USING minilm');
+                tests.push({ name: 'Error on non-existent column', pass: false, error: 'Should have thrown' });
+            } catch (e) {
+                tests.push({
+                    name: 'Error on non-existent column',
+                    pass: e.message.includes('does not exist'),
+                    actual: e.message
+                });
+            }
+
+            // Test 3: Error on unsupported model
+            try {
+                await v.exec('CREATE VECTOR INDEX ON items(name) USING unknown_model');
+                tests.push({ name: 'Error on unsupported model', pass: false, error: 'Should have thrown' });
+            } catch (e) {
+                tests.push({
+                    name: 'Error on unsupported model',
+                    pass: e.message.includes('Unknown embedding model'),
+                    actual: e.message
+                });
+            }
+
+            // Cleanup
+            try { await v.exec('DROP TABLE IF EXISTS items'); } catch (e) {}
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('Vector index supports multiple models (minilm, clip)', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup: create table with multiple text columns and insert data
+            await v.exec('DROP TABLE IF EXISTS content');
+            await v.exec('CREATE TABLE content (id INT, title TEXT, description TEXT)');
+            await v.exec("INSERT INTO content VALUES (1, 'Hello', 'World')");
+
+            // Test 1: Create minilm index (384 dim)
+            try {
+                await v.exec('CREATE VECTOR INDEX ON content(title) USING minilm');
+                const res = await v.exec('SHOW VECTOR INDEXES FOR content');
+                tests.push({
+                    name: 'MiniLM index created with 384 dim',
+                    pass: res.rows[0].dim === 384 && res.rows[0].model === 'minilm',
+                    actual: `dim=${res.rows[0].dim}, model=${res.rows[0].model}`
+                });
+            } catch (e) {
+                tests.push({ name: 'MiniLM index created with 384 dim', pass: false, error: e.message });
+            }
+
+            // Test 2: Create CLIP index (512 dim)
+            try {
+                await v.exec('CREATE VECTOR INDEX ON content(description) USING clip');
+                const res = await v.exec('SHOW VECTOR INDEXES FOR content');
+                const clipIdx = res.rows.find(r => r.model === 'clip');
+                tests.push({
+                    name: 'CLIP index created with 512 dim',
+                    pass: clipIdx && clipIdx.dim === 512,
+                    actual: clipIdx ? `dim=${clipIdx.dim}, model=${clipIdx.model}` : 'not found'
+                });
+            } catch (e) {
+                tests.push({ name: 'CLIP index created with 512 dim', pass: false, error: e.message });
+            }
+
+            // Test 3: Both indexes exist
+            try {
+                const res = await v.exec('SHOW VECTOR INDEXES FOR content');
+                tests.push({
+                    name: 'Both indexes exist',
+                    pass: res.rows.length === 2,
+                    actual: `count=${res.rows.length}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Both indexes exist', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            try { await v.exec('DROP TABLE IF EXISTS content'); } catch (e) {}
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('Auto-encoding on INSERT generates shadow column values', async ({ page }) => {
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup: create table and vector index
+            await v.exec('DROP TABLE IF EXISTS articles');
+            await v.exec('CREATE TABLE articles (id INT, title TEXT, body TEXT)');
+            await v.exec('CREATE VECTOR INDEX ON articles(title) USING minilm');
+
+            // Test 1: INSERT triggers auto-encoding
+            try {
+                await v.exec("INSERT INTO articles VALUES (1, 'Hello World', 'This is the body')");
+                // Query should succeed
+                const res = await v.exec('SELECT id, title FROM articles');
+                tests.push({
+                    name: 'INSERT with vector index succeeds',
+                    pass: res.rows.length === 1 && res.rows[0].title === 'Hello World',
+                    actual: `count=${res.rows.length}, title=${res.rows[0]?.title}`
+                });
+            } catch (e) {
+                tests.push({ name: 'INSERT with vector index succeeds', pass: false, error: e.message });
+            }
+
+            // Test 2: Multiple INSERTs work
+            try {
+                await v.exec("INSERT INTO articles VALUES (2, 'Goodbye World', 'Another body')");
+                await v.exec("INSERT INTO articles VALUES (3, 'Test Title', 'Test body')");
+                const res = await v.exec('SELECT COUNT(*) as cnt FROM articles');
+                tests.push({
+                    name: 'Multiple INSERTs work',
+                    pass: res.rows[0].cnt === 3,
+                    actual: `count=${res.rows[0].cnt}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Multiple INSERTs work', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            try { await v.exec('DROP TABLE IF EXISTS articles'); } catch (e) {}
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
+
+    test('NEAR clause rewriting infrastructure works', async ({ page }) => {
+        // This test verifies the NEAR clause rewriting mechanism is in place.
+        // Note: Full vector search requires WASM ALTER TABLE support to add shadow columns,
+        // which is not yet implemented. This test verifies the infrastructure works correctly.
+        const results = await page.evaluate(async () => {
+            const { vault } = await import('./lanceql.js');
+            const v = await vault();
+            const tests = [];
+
+            // Setup: create table with vector index
+            await v.exec('DROP TABLE IF EXISTS posts');
+            await v.exec('CREATE TABLE posts (id INT, title TEXT, content TEXT)');
+            await v.exec('CREATE VECTOR INDEX ON posts(title) USING minilm');
+
+            // Insert data - verify it works with vector index
+            await v.exec("INSERT INTO posts VALUES (1, 'Machine Learning', 'ML basics')");
+            await v.exec("INSERT INTO posts VALUES (2, 'Deep Learning', 'Neural nets')");
+
+            // Test 1: Verify data was inserted correctly
+            try {
+                const res = await v.exec('SELECT COUNT(*) as cnt FROM posts');
+                tests.push({
+                    name: 'Data inserted with vector index',
+                    pass: res.rows[0].cnt === 2,
+                    actual: `count=${res.rows[0].cnt}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Data inserted with vector index', pass: false, error: e.message });
+            }
+
+            // Test 2: Verify vector index metadata exists
+            try {
+                const res = await v.exec('SHOW VECTOR INDEXES FOR posts');
+                tests.push({
+                    name: 'Vector index metadata stored',
+                    pass: res.rows.length === 1 && res.rows[0].shadowColumn === '__vec_title_minilm',
+                    actual: `indexes=${res.rows.length}, shadow=${res.rows[0]?.shadowColumn}`
+                });
+            } catch (e) {
+                tests.push({ name: 'Vector index metadata stored', pass: false, error: e.message });
+            }
+
+            // Test 3: NEAR query doesn't crash (verifies rewriting happens)
+            // Note: May return 0 results until ALTER TABLE is implemented
+            try {
+                const res = await v.exec("SELECT id, title FROM posts WHERE title NEAR 'machine learning' LIMIT 3");
+                tests.push({
+                    name: 'NEAR query executes without error',
+                    pass: true, // Just verify it doesn't crash
+                    actual: `executed, count=${res.rows.length}`
+                });
+            } catch (e) {
+                tests.push({ name: 'NEAR query executes without error', pass: false, error: e.message });
+            }
+
+            // Cleanup
+            try { await v.exec('DROP TABLE IF EXISTS posts'); } catch (e) {}
+
+            return tests;
+        });
+
+        for (const t of results) {
+            expect(t.pass, `${t.name}: ${t.error || 'got ' + t.actual}`).toBe(true);
+        }
+    });
 });

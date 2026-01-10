@@ -6,10 +6,65 @@ SQL database in the browser with vector search. No server required.
 
 - **SQL Queries** - Full SQL: SELECT, JOIN, GROUP BY, window functions, CTEs
 - **Vector Search** - Semantic search with NEAR clause using MiniLM/CLIP
+- **Auto Vector Index** - Automatic text→embedding encoding on INSERT
+- **DataFrame API** - fromRecords/fromColumns/saveTo for ETL workflows
 - **OPFS Persistence** - Data persists across browser sessions
 - **HTTP Range** - Only fetch bytes you need from remote Lance files
 - **GPU Accelerated** - Optional WebGPU for JOINs, sorts, vector search
 - **Zero Dependencies** - Pure JavaScript + WebAssembly
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         Browser Main Thread                          │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────┐   │
+│  │    vault()   │  │   LanceQL    │  │     GPU Transformer      │   │
+│  │  (client API)│  │  (remote)    │  │   (WebGPU text encode)   │   │
+│  └──────┬───────┘  └──────┬───────┘  └────────────┬─────────────┘   │
+│         │                 │                       │                  │
+│         │    workerRPC()  │                       │                  │
+│         └────────┬────────┘                       │                  │
+│                  │                                │                  │
+└──────────────────┼────────────────────────────────┼──────────────────┘
+                   │ MessagePort                    │
+┌──────────────────┼────────────────────────────────┼──────────────────┐
+│                  ▼           SharedWorker         │                  │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                      Worker Index (index.js)                   │  │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌──────────────────────┐   │  │
+│  │  │ Vector Index│  │  DDL Sync   │  │   Query Rewriting    │   │  │
+│  │  │  Metadata   │  │ CREATE/DROP │  │  (NEAR → shadow col) │   │  │
+│  │  └─────────────┘  └─────────────┘  └──────────────────────┘   │  │
+│  │                           │                                    │  │
+│  │                           ▼                                    │  │
+│  │  ┌─────────────────────────────────────────────────────────┐  │  │
+│  │  │               WorkerDatabase (OPFS storage)              │  │  │
+│  │  │  - Tables (Lance fragments)                              │  │  │
+│  │  │  - Vector indexes (__vec_* shadow columns)               │  │  │
+│  │  │  - KV store (encrypted)                                  │  │  │
+│  │  └─────────────────────────────────────────────────────────┘  │  │
+│  │                           │                                    │  │
+│  │                           ▼                                    │  │
+│  │  ┌─────────────────────────────────────────────────────────┐  │  │
+│  │  │            WASM SQL Bridge (wasm-sql-bridge.js)          │  │  │
+│  │  │  - Schema registration                                   │  │  │
+│  │  │  - Query execution via lanceql.wasm                      │  │  │
+│  │  └─────────────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Component Responsibilities
+
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| `vault()` | `client/store/vault.js` | High-level API for KV + SQL |
+| `LanceQL` | `client/lance-ql.js` | Remote Lance dataset access |
+| `WorkerDatabase` | `worker/worker-database.js` | OPFS persistence, Lance storage |
+| `WasmSqlBridge` | `worker/wasm-sql-bridge.js` | Schema→WASM, query execution |
+| `GPUTransformer` | `client/webgpu/gpu-transformer.js` | WebGPU text embedding |
+| `Worker Index` | `worker/index.js` | RPC router, DDL sync, vector indexes |
 
 ## Installation
 
@@ -248,6 +303,101 @@ SELECT category, COUNT(*) FROM data GROUP BY category
 SELECT * FROM data NEAR 'search text' TOPK 20
 SELECT * FROM data NEAR embedding 'query' WHERE score > 0.5
 ```
+
+## Auto Vector Index
+
+Create indexes that automatically encode text to embeddings on INSERT:
+
+```javascript
+const v = await vault();
+
+// Create table with text column
+await v.exec('CREATE TABLE docs (id INT, content TEXT)');
+
+// Create vector index - auto-encodes on INSERT
+await v.exec('CREATE VECTOR INDEX ON docs(content) USING minilm');
+
+// Insert text - automatically generates __vec_content_minilm column
+await v.exec("INSERT INTO docs VALUES (1, 'Machine learning basics')");
+await v.exec("INSERT INTO docs VALUES (2, 'Deep neural networks')");
+
+// Semantic search - uses vector index automatically
+const results = await v.query("SELECT * FROM docs WHERE content NEAR 'AI fundamentals' LIMIT 5");
+```
+
+### Supported Models
+
+| Model | Dimensions | Use Case |
+|-------|-----------|----------|
+| `minilm` | 384 | Text similarity (default) |
+| `clip` | 512 | Image/text cross-modal |
+
+### Vector Index SQL
+
+```sql
+-- Create index
+CREATE VECTOR INDEX ON table(column) USING model
+CREATE VECTOR INDEX IF NOT EXISTS ON table(column) USING minilm
+
+-- Drop index
+DROP VECTOR INDEX ON table(column)
+DROP VECTOR INDEX IF EXISTS ON table(column)
+
+-- Show indexes
+SHOW VECTOR INDEXES
+SHOW VECTOR INDEXES ON table
+```
+
+## DataFrame API
+
+Write data from JavaScript objects or columnar arrays:
+
+```javascript
+import { WritableDataFrame } from '@metal0/lanceql/browser';
+
+// From array of records
+const df = WritableDataFrame.fromRecords([
+  { id: 1, name: 'Alice', score: 0.95 },
+  { id: 2, name: 'Bob', score: 0.87 },
+  { id: 3, name: 'Charlie', score: 0.92 }
+]);
+await df.saveTo(vault, 'scores');
+
+// From columnar data (efficient for large datasets)
+const df2 = WritableDataFrame.fromColumns({
+  id: new Int32Array([1, 2, 3]),
+  value: new Float64Array([1.5, 2.5, 3.5]),
+  name: ['Alice', 'Bob', 'Charlie']
+});
+await df2.saveTo(vault, 'users', { ifExists: 'replace' });
+
+// Chain from query result
+await vault.df('SELECT * FROM source WHERE active = true')
+  .saveTo(vault, 'active_users', { ifExists: 'append' });
+```
+
+### saveTo Options
+
+| Option | Values | Description |
+|--------|--------|-------------|
+| `ifExists` | `'fail'` (default) | Error if table exists |
+| | `'replace'` | Drop and recreate table |
+| | `'append'` | Insert into existing table |
+| `schema` | `{col: 'TYPE'}` | Explicit schema (auto-inferred if omitted) |
+
+### Schema Inference
+
+| JavaScript Type | SQL Type |
+|-----------------|----------|
+| `number` (integer) | `INT` |
+| `number` (float) | `FLOAT` |
+| `bigint` | `BIGINT` |
+| `boolean` | `BOOLEAN` |
+| `string` | `TEXT` |
+| `Array<number>` | `VECTOR(N)` |
+| `Int32Array` | `INT` |
+| `Float64Array` | `FLOAT` |
+| `BigInt64Array` | `BIGINT` |
 
 ## API Reference
 
