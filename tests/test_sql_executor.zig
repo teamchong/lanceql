@@ -71,7 +71,7 @@ test "execute simple SELECT *" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT * FROM table");
+    const result = try ctx.exec("SELECT * FROM t");
 
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 5), result.row_count);
@@ -89,7 +89,7 @@ test "execute SELECT with WHERE clause" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT * FROM table WHERE id > 2");
+    const result = try ctx.exec("SELECT * FROM t WHERE id > 2");
 
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 3), result.row_count);
@@ -105,7 +105,7 @@ test "execute SELECT with ORDER BY DESC" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT * FROM table ORDER BY id DESC");
+    const result = try ctx.exec("SELECT * FROM t ORDER BY id DESC");
 
     try std.testing.expectEqual(@as(usize, 5), result.row_count);
 
@@ -122,7 +122,7 @@ test "execute SELECT with LIMIT" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT * FROM table LIMIT 3");
+    const result = try ctx.exec("SELECT * FROM t LIMIT 3");
 
     try std.testing.expectEqual(@as(usize, 3), result.row_count);
 
@@ -137,7 +137,7 @@ test "execute SELECT with OFFSET" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT * FROM table LIMIT 2 OFFSET 2");
+    const result = try ctx.exec("SELECT * FROM t LIMIT 2 OFFSET 2");
 
     try std.testing.expectEqual(@as(usize, 2), result.row_count);
 
@@ -151,7 +151,7 @@ test "execute SELECT with float64 column" {
     try ctx.init(std.testing.allocator, float64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT * FROM table WHERE value > 3.0");
+    const result = try ctx.exec("SELECT * FROM t WHERE value > 3.0");
 
     try std.testing.expectEqual(@as(usize, 3), result.row_count);
 
@@ -166,7 +166,7 @@ test "execute SELECT with mixed types" {
     try ctx.init(std.testing.allocator, mixed_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT * FROM table");
+    const result = try ctx.exec("SELECT * FROM t");
 
     try std.testing.expectEqual(@as(usize, 3), result.columns.len);
     try std.testing.expectEqual(@as(usize, 3), result.row_count);
@@ -190,7 +190,7 @@ test "execute SELECT * on mixed_types fixture" {
     try std.testing.expectEqual(@as(usize, 3), schema.fields.len);
 
     // Parse SQL
-    const sql = "SELECT * FROM table";
+    const sql = "SELECT * FROM t";
     var stmt = try parser.parseSQL(sql, allocator);
     defer ast.deinitSelectStmt(&stmt.select, allocator);
 
@@ -235,7 +235,7 @@ test "execute SELECT COUNT(*)" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT COUNT(*) FROM table");
+    const result = try ctx.exec("SELECT COUNT(*) FROM t");
 
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 1), result.row_count);
@@ -248,7 +248,7 @@ test "execute SELECT SUM(id)" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT SUM(id) FROM table");
+    const result = try ctx.exec("SELECT SUM(id) FROM t");
 
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 1), result.row_count);
@@ -261,7 +261,7 @@ test "execute SELECT AVG(id)" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT AVG(id) FROM table");
+    const result = try ctx.exec("SELECT AVG(id) FROM t");
 
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 1), result.row_count);
@@ -275,11 +275,11 @@ test "execute SELECT MIN/MAX(id)" {
     defer ctx.deinit();
 
     // Test MIN
-    var result = try ctx.exec("SELECT MIN(id) FROM table");
+    var result = try ctx.exec("SELECT MIN(id) FROM t");
     try std.testing.expectEqual(@as(i64, 1), result.columns[0].data.int64[0]);
 
     // Test MAX
-    result = try ctx.exec("SELECT MAX(id) FROM table");
+    result = try ctx.exec("SELECT MAX(id) FROM t");
     try std.testing.expectEqual(@as(i64, 5), result.columns[0].data.int64[0]);
 }
 
@@ -291,20 +291,20 @@ test "execute SELECT STDDEV and VARIANCE" {
     // For values 1,2,3,4,5: Mean=3, PopVar=2.0, SampleVar=2.5
 
     // Test VARIANCE (sample)
-    var result = try ctx.exec("SELECT VARIANCE(id) FROM table");
+    var result = try ctx.exec("SELECT VARIANCE(id) FROM t");
     try std.testing.expect(result.columns[0].data == .float64);
     try std.testing.expectApproxEqAbs(@as(f64, 2.5), result.columns[0].data.float64[0], 0.0001);
 
     // Test VAR_POP (population)
-    result = try ctx.exec("SELECT VAR_POP(id) FROM table");
+    result = try ctx.exec("SELECT VAR_POP(id) FROM t");
     try std.testing.expectApproxEqAbs(@as(f64, 2.0), result.columns[0].data.float64[0], 0.0001);
 
     // Test STDDEV (sample)
-    result = try ctx.exec("SELECT STDDEV(id) FROM table");
+    result = try ctx.exec("SELECT STDDEV(id) FROM t");
     try std.testing.expectApproxEqAbs(@as(f64, 1.5811388300841898), result.columns[0].data.float64[0], 0.0001);
 
     // Test STDDEV_POP (population)
-    result = try ctx.exec("SELECT STDDEV_POP(id) FROM table");
+    result = try ctx.exec("SELECT STDDEV_POP(id) FROM t");
     try std.testing.expectApproxEqAbs(@as(f64, 1.4142135623730951), result.columns[0].data.float64[0], 0.0001);
 }
 
@@ -316,24 +316,24 @@ test "execute SELECT MEDIAN and PERCENTILE" {
     // For sorted values [1,2,3,4,5]: MEDIAN=3.0
 
     // Test MEDIAN
-    var result = try ctx.exec("SELECT MEDIAN(id) FROM table");
+    var result = try ctx.exec("SELECT MEDIAN(id) FROM t");
     try std.testing.expect(result.columns[0].data == .float64);
     try std.testing.expectApproxEqAbs(@as(f64, 3.0), result.columns[0].data.float64[0], 0.0001);
 
     // Test PERCENTILE 0th (min)
-    result = try ctx.exec("SELECT PERCENTILE(id, 0.0) FROM table");
+    result = try ctx.exec("SELECT PERCENTILE(id, 0.0) FROM t");
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), result.columns[0].data.float64[0], 0.0001);
 
     // Test PERCENTILE 25th
-    result = try ctx.exec("SELECT PERCENTILE(id, 0.25) FROM table");
+    result = try ctx.exec("SELECT PERCENTILE(id, 0.25) FROM t");
     try std.testing.expectApproxEqAbs(@as(f64, 2.0), result.columns[0].data.float64[0], 0.0001);
 
     // Test PERCENTILE 75th
-    result = try ctx.exec("SELECT PERCENTILE(id, 0.75) FROM table");
+    result = try ctx.exec("SELECT PERCENTILE(id, 0.75) FROM t");
     try std.testing.expectApproxEqAbs(@as(f64, 4.0), result.columns[0].data.float64[0], 0.0001);
 
     // Test PERCENTILE 100th (max)
-    result = try ctx.exec("SELECT PERCENTILE(id, 1.0) FROM table");
+    result = try ctx.exec("SELECT PERCENTILE(id, 1.0) FROM t");
     try std.testing.expectApproxEqAbs(@as(f64, 5.0), result.columns[0].data.float64[0], 0.0001);
 }
 
@@ -342,7 +342,7 @@ test "execute SELECT with GROUP BY" {
     try ctx.init(std.testing.allocator, sqlite_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT name, COUNT(*) FROM table GROUP BY name");
+    const result = try ctx.exec("SELECT name, COUNT(*) FROM t GROUP BY name");
 
     try std.testing.expectEqual(@as(usize, 2), result.columns.len);
     try std.testing.expectEqual(@as(usize, 3), result.row_count);
@@ -360,7 +360,7 @@ test "execute SELECT with GROUP BY and SUM" {
     try ctx.init(std.testing.allocator, sqlite_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT name, SUM(id) FROM table GROUP BY name");
+    const result = try ctx.exec("SELECT name, SUM(id) FROM t GROUP BY name");
 
     try std.testing.expectEqual(@as(usize, 2), result.columns.len);
     try std.testing.expectEqual(@as(usize, 3), result.row_count);
@@ -384,7 +384,7 @@ test "execute SELECT with arithmetic multiplication" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT id * 2 AS doubled FROM table");
+    const result = try ctx.exec("SELECT id * 2 AS doubled FROM t");
 
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 5), result.row_count);
@@ -403,7 +403,7 @@ test "execute SELECT with arithmetic addition" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT id + 10 AS plus_ten FROM table");
+    const result = try ctx.exec("SELECT id + 10 AS plus_ten FROM t");
 
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 5), result.row_count);
@@ -421,7 +421,7 @@ test "execute SELECT with division" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT id / 2 AS halved FROM table");
+    const result = try ctx.exec("SELECT id / 2 AS halved FROM t");
 
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 5), result.row_count);
@@ -439,7 +439,7 @@ test "execute SELECT with complex expression" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT id * 2 + 1 AS computed FROM table");
+    const result = try ctx.exec("SELECT id * 2 + 1 AS computed FROM t");
 
     try std.testing.expectEqual(@as(usize, 5), result.row_count);
 
@@ -456,7 +456,7 @@ test "execute SELECT with mixed column and expression" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT id, id * 2 AS doubled FROM table");
+    const result = try ctx.exec("SELECT id, id * 2 AS doubled FROM t");
 
     // Verify results - 2 columns
     try std.testing.expectEqual(@as(usize, 2), result.columns.len);
@@ -480,7 +480,7 @@ test "execute SELECT with UPPER function" {
     try ctx.init(std.testing.allocator, sqlite_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT UPPER(name) AS upper_name FROM table LIMIT 3");
+    const result = try ctx.exec("SELECT UPPER(name) AS upper_name FROM t LIMIT 3");
 
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 3), result.row_count);
@@ -497,7 +497,7 @@ test "execute SELECT with LENGTH function" {
     try ctx.init(std.testing.allocator, sqlite_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT name, LENGTH(name) AS len FROM table LIMIT 3");
+    const result = try ctx.exec("SELECT name, LENGTH(name) AS len FROM t LIMIT 3");
 
     try std.testing.expectEqual(@as(usize, 2), result.columns.len);
     try std.testing.expectEqual(@as(usize, 3), result.row_count);
@@ -519,7 +519,7 @@ test "execute SELECT with ABS function" {
     defer ctx.deinit();
 
     // ABS(id - 3) gives: |1-3|=2, |2-3|=1, |3-3|=0, |4-3|=1, |5-3|=2
-    const result = try ctx.exec("SELECT ABS(id - 3) AS abs_val FROM table");
+    const result = try ctx.exec("SELECT ABS(id - 3) AS abs_val FROM t");
 
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 5), result.row_count);
@@ -539,7 +539,7 @@ test "execute SELECT with string concatenation" {
     try ctx.init(std.testing.allocator, sqlite_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT name || '_suffix' AS with_suffix FROM table LIMIT 3");
+    const result = try ctx.exec("SELECT name || '_suffix' AS with_suffix FROM t LIMIT 3");
 
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
     try std.testing.expectEqual(@as(usize, 3), result.row_count);
@@ -563,8 +563,8 @@ test "execute SELECT with single integer parameter" {
     var table = try Table.init(allocator, lance_data);
     defer table.deinit();
 
-    // Parse SQL: SELECT * FROM table WHERE id = ?
-    const sql = "SELECT * FROM table WHERE id = ?";
+    // Parse SQL: SELECT * FROM t WHERE id = ?
+    const sql = "SELECT * FROM t WHERE id = ?";
     var stmt = try parser.parseSQL(sql, allocator);
     defer ast.deinitSelectStmt(&stmt.select, allocator);
 
@@ -592,8 +592,8 @@ test "execute SELECT with multiple integer parameters" {
     var table = try Table.init(allocator, lance_data);
     defer table.deinit();
 
-    // Parse SQL: SELECT * FROM table WHERE id > ? AND id < ?
-    const sql = "SELECT * FROM table WHERE id > ? AND id < ?";
+    // Parse SQL: SELECT * FROM t WHERE id > ? AND id < ?
+    const sql = "SELECT * FROM t WHERE id > ? AND id < ?";
     var stmt = try parser.parseSQL(sql, allocator);
     defer ast.deinitSelectStmt(&stmt.select, allocator);
 
@@ -622,8 +622,8 @@ test "execute SELECT with float parameter" {
     var table = try Table.init(allocator, lance_data);
     defer table.deinit();
 
-    // Parse SQL: SELECT * FROM table WHERE value > ?
-    const sql = "SELECT * FROM table WHERE value > ?";
+    // Parse SQL: SELECT * FROM t WHERE value > ?
+    const sql = "SELECT * FROM t WHERE value > ?";
     var stmt = try parser.parseSQL(sql, allocator);
     defer ast.deinitSelectStmt(&stmt.select, allocator);
 
@@ -654,8 +654,8 @@ test "execute SELECT with string parameter" {
     var table = try Table.init(allocator, data);
     defer table.deinit();
 
-    // Parse SQL: SELECT id FROM table WHERE name = ?
-    const sql = "SELECT id FROM table WHERE name = ?";
+    // Parse SQL: SELECT id FROM t WHERE name = ?
+    const sql = "SELECT id FROM t WHERE name = ?";
     var stmt = try parser.parseSQL(sql, allocator);
     defer ast.deinitSelectStmt(&stmt.select, allocator);
 
@@ -683,8 +683,8 @@ test "parameter out of bounds returns error" {
     var table = try Table.init(allocator, lance_data);
     defer table.deinit();
 
-    // Parse SQL with 2 parameters: SELECT * FROM table WHERE id > ? AND id < ?
-    const sql = "SELECT * FROM table WHERE id > ? AND id < ?";
+    // Parse SQL with 2 parameters: SELECT * FROM t WHERE id > ? AND id < ?
+    const sql = "SELECT * FROM t WHERE id > ? AND id < ?";
     var stmt = try parser.parseSQL(sql, allocator);
     defer ast.deinitSelectStmt(&stmt.select, allocator);
 
@@ -708,7 +708,7 @@ test "execute SELECT DISTINCT on unique values" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT DISTINCT id FROM table");
+    const result = try ctx.exec("SELECT DISTINCT id FROM t");
 
     // All values are unique, so DISTINCT should return all 5 rows
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
@@ -727,7 +727,7 @@ test "execute SELECT DISTINCT with WHERE clause" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT DISTINCT id FROM table WHERE id > 2");
+    const result = try ctx.exec("SELECT DISTINCT id FROM t WHERE id > 2");
 
     // Should return 3 unique rows (3, 4, 5)
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
@@ -744,7 +744,7 @@ test "execute SELECT DISTINCT with ORDER BY" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT DISTINCT id FROM table ORDER BY id DESC");
+    const result = try ctx.exec("SELECT DISTINCT id FROM t ORDER BY id DESC");
 
     // Should return all 5 rows in descending order
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
@@ -763,7 +763,7 @@ test "execute SELECT DISTINCT with LIMIT" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT DISTINCT id FROM table LIMIT 3");
+    const result = try ctx.exec("SELECT DISTINCT id FROM t LIMIT 3");
 
     // Should return only 3 rows
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
@@ -775,7 +775,7 @@ test "execute SELECT DISTINCT on strings" {
     try ctx.init(std.testing.allocator, sqlite_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT DISTINCT name FROM table");
+    const result = try ctx.exec("SELECT DISTINCT name FROM t");
 
     // Verify results - should have unique string values
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
@@ -1106,7 +1106,7 @@ test "parse UNION" {
     const allocator = std.testing.allocator;
 
     // Parse UNION SQL
-    const sql = "SELECT id FROM table1 UNION SELECT id FROM table2";
+    const sql = "SELECT id FROM t1 UNION SELECT id FROM t2";
     var stmt = try parser.parseSQL(sql, allocator);
     defer ast.deinitSelectStmt(&stmt.select, allocator);
 
@@ -1119,7 +1119,7 @@ test "parse UNION ALL" {
     const allocator = std.testing.allocator;
 
     // Parse UNION ALL SQL
-    const sql = "SELECT id FROM table1 UNION ALL SELECT id FROM table2";
+    const sql = "SELECT id FROM t1 UNION ALL SELECT id FROM t2";
     var stmt = try parser.parseSQL(sql, allocator);
     defer ast.deinitSelectStmt(&stmt.select, allocator);
 
@@ -1132,7 +1132,7 @@ test "parse INTERSECT" {
     const allocator = std.testing.allocator;
 
     // Parse INTERSECT SQL
-    const sql = "SELECT id FROM table1 INTERSECT SELECT id FROM table2";
+    const sql = "SELECT id FROM t1 INTERSECT SELECT id FROM t2";
     var stmt = try parser.parseSQL(sql, allocator);
     defer ast.deinitSelectStmt(&stmt.select, allocator);
 
@@ -1145,7 +1145,7 @@ test "parse EXCEPT" {
     const allocator = std.testing.allocator;
 
     // Parse EXCEPT SQL
-    const sql = "SELECT id FROM table1 EXCEPT SELECT id FROM table2";
+    const sql = "SELECT id FROM t1 EXCEPT SELECT id FROM t2";
     var stmt = try parser.parseSQL(sql, allocator);
     defer ast.deinitSelectStmt(&stmt.select, allocator);
 
@@ -1160,7 +1160,7 @@ test "execute UNION ALL" {
     defer ctx.deinit();
 
     // Left: [1, 2], Right: [4, 5], Union All: [1, 2, 4, 5]
-    const result = try ctx.exec("SELECT id FROM table WHERE id <= 2 UNION ALL SELECT id FROM table WHERE id >= 4");
+    const result = try ctx.exec("SELECT id FROM t WHERE id <= 2 UNION ALL SELECT id FROM t WHERE id >= 4");
 
     try std.testing.expectEqual(@as(usize, 4), result.row_count);
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
@@ -1178,7 +1178,7 @@ test "execute UNION (distinct)" {
     defer ctx.deinit();
 
     // Left: [1, 2, 3], Right: [2, 3, 4, 5], Union (distinct): [1, 2, 3, 4, 5]
-    const result = try ctx.exec("SELECT id FROM table WHERE id <= 3 UNION SELECT id FROM table WHERE id >= 2");
+    const result = try ctx.exec("SELECT id FROM t WHERE id <= 3 UNION SELECT id FROM t WHERE id >= 2");
 
     try std.testing.expectEqual(@as(usize, 5), result.row_count);
 }
@@ -1189,7 +1189,7 @@ test "execute INTERSECT" {
     defer ctx.deinit();
 
     // Left: [1, 2, 3], Right: [2, 3, 4, 5], Intersect: [2, 3]
-    const result = try ctx.exec("SELECT id FROM table WHERE id <= 3 INTERSECT SELECT id FROM table WHERE id >= 2");
+    const result = try ctx.exec("SELECT id FROM t WHERE id <= 3 INTERSECT SELECT id FROM t WHERE id >= 2");
 
     try std.testing.expectEqual(@as(usize, 2), result.row_count);
 
@@ -1204,7 +1204,7 @@ test "execute EXCEPT" {
     defer ctx.deinit();
 
     // Left: [1, 2, 3, 4, 5], Right: [3, 4, 5], Except: [1, 2]
-    const result = try ctx.exec("SELECT id FROM table EXCEPT SELECT id FROM table WHERE id >= 3");
+    const result = try ctx.exec("SELECT id FROM t EXCEPT SELECT id FROM t WHERE id >= 3");
 
     try std.testing.expectEqual(@as(usize, 2), result.row_count);
 
@@ -1220,7 +1220,7 @@ test "execute EXCEPT" {
 test "parse IN list" {
     const allocator = std.testing.allocator;
 
-    const sql = "SELECT id FROM table WHERE id IN (1, 2, 3)";
+    const sql = "SELECT id FROM t WHERE id IN (1, 2, 3)";
     var stmt = try parser.parseSQL(sql, allocator);
     defer ast.deinitSelectStmt(&stmt.select, allocator);
 
@@ -1231,7 +1231,7 @@ test "parse IN list" {
 test "parse NOT IN list" {
     const allocator = std.testing.allocator;
 
-    const sql = "SELECT id FROM table WHERE id NOT IN (4, 5)";
+    const sql = "SELECT id FROM t WHERE id NOT IN (4, 5)";
     var stmt = try parser.parseSQL(sql, allocator);
     defer ast.deinitSelectStmt(&stmt.select, allocator);
 
@@ -1268,7 +1268,7 @@ test "execute IN list" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT id FROM table WHERE id IN (2, 4)");
+    const result = try ctx.exec("SELECT id FROM t WHERE id IN (2, 4)");
 
     try std.testing.expectEqual(@as(usize, 2), result.row_count);
 
@@ -1282,7 +1282,7 @@ test "execute NOT IN list" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT id FROM table WHERE id NOT IN (2, 4)");
+    const result = try ctx.exec("SELECT id FROM t WHERE id NOT IN (2, 4)");
 
     try std.testing.expectEqual(@as(usize, 3), result.row_count);
 
@@ -1298,7 +1298,7 @@ test "execute EXISTS subquery" {
     defer ctx.deinit();
 
     // EXISTS subquery returns true (there are rows with id > 3), so all rows are returned
-    const result = try ctx.exec("SELECT id FROM table WHERE EXISTS (SELECT id FROM table WHERE id > 3)");
+    const result = try ctx.exec("SELECT id FROM t WHERE EXISTS (SELECT id FROM t WHERE id > 3)");
 
     try std.testing.expectEqual(@as(usize, 5), result.row_count);
 }
@@ -1309,7 +1309,7 @@ test "execute NOT EXISTS subquery" {
     defer ctx.deinit();
 
     // NOT EXISTS subquery returns true (no rows with id > 10), so all rows are returned
-    const result = try ctx.exec("SELECT id FROM table WHERE NOT EXISTS (SELECT id FROM table WHERE id > 10)");
+    const result = try ctx.exec("SELECT id FROM t WHERE NOT EXISTS (SELECT id FROM t WHERE id > 10)");
 
     try std.testing.expectEqual(@as(usize, 5), result.row_count);
 }
@@ -1320,7 +1320,7 @@ test "execute IN subquery" {
     defer ctx.deinit();
 
     // Subquery returns [4, 5], so we get rows where id IN (4, 5)
-    const result = try ctx.exec("SELECT id FROM table WHERE id IN (SELECT id FROM table WHERE id > 3)");
+    const result = try ctx.exec("SELECT id FROM t WHERE id IN (SELECT id FROM t WHERE id > 3)");
 
     try std.testing.expectEqual(@as(usize, 2), result.row_count);
 
@@ -1343,7 +1343,7 @@ test "execute YEAR function on column" {
     defer ctx.deinit();
 
     // YEAR(id) where id = [1,2,3,4,5] (all 1970 since they're tiny epoch values)
-    const result = try ctx.exec("SELECT YEAR(id) FROM table LIMIT 1");
+    const result = try ctx.exec("SELECT YEAR(id) FROM t LIMIT 1");
 
     try std.testing.expectEqual(@as(usize, 1), result.row_count);
     try std.testing.expectEqual(@as(usize, 1), result.columns.len);
@@ -1356,7 +1356,7 @@ test "execute MONTH and DAY functions on column" {
     try ctx.init(std.testing.allocator, int64_fixture);
     defer ctx.deinit();
 
-    const result = try ctx.exec("SELECT MONTH(id), DAY(id) FROM table LIMIT 1");
+    const result = try ctx.exec("SELECT MONTH(id), DAY(id) FROM t LIMIT 1");
 
     try std.testing.expectEqual(@as(usize, 1), result.row_count);
     try std.testing.expectEqual(@as(usize, 2), result.columns.len);
@@ -1370,7 +1370,7 @@ test "execute HOUR/MINUTE/SECOND functions on column" {
     defer ctx.deinit();
 
     // id=1 is epoch second 1 = 00:00:01 on Jan 1, 1970
-    const result = try ctx.exec("SELECT HOUR(id), MINUTE(id), SECOND(id) FROM table LIMIT 1");
+    const result = try ctx.exec("SELECT HOUR(id), MINUTE(id), SECOND(id) FROM t LIMIT 1");
 
     try std.testing.expectEqual(@as(usize, 1), result.row_count);
     try std.testing.expectEqual(@as(usize, 3), result.columns.len);
@@ -1385,7 +1385,7 @@ test "execute DAYOFWEEK function on column" {
     defer ctx.deinit();
 
     // id=1 is epoch second 1 = Jan 1, 1970 = Thursday (day 4)
-    const result = try ctx.exec("SELECT DAYOFWEEK(id) FROM table LIMIT 1");
+    const result = try ctx.exec("SELECT DAYOFWEEK(id) FROM t LIMIT 1");
 
     try std.testing.expectEqual(@as(usize, 1), result.row_count);
     // Jan 1, 1970 was a Thursday (day 4, 0-indexed from Sunday)
@@ -1398,7 +1398,7 @@ test "execute QUARTER function on column" {
     defer ctx.deinit();
 
     // id=1 is Jan 1970 = Q1
-    const result = try ctx.exec("SELECT QUARTER(id) FROM table LIMIT 1");
+    const result = try ctx.exec("SELECT QUARTER(id) FROM t LIMIT 1");
 
     try std.testing.expectEqual(@as(usize, 1), result.row_count);
     try std.testing.expectEqual(@as(i64, 1), result.columns[0].data.int64[0]); // Q1
@@ -1410,7 +1410,7 @@ test "execute DATE_TRUNC on column" {
     defer ctx.deinit();
 
     // DATE_TRUNC('day', id) should truncate to 0 (start of Jan 1, 1970)
-    const result = try ctx.exec("SELECT DATE_TRUNC('day', id) FROM table LIMIT 1");
+    const result = try ctx.exec("SELECT DATE_TRUNC('day', id) FROM t LIMIT 1");
 
     try std.testing.expectEqual(@as(usize, 1), result.row_count);
     try std.testing.expectEqual(@as(i64, 0), result.columns[0].data.int64[0]); // Truncated to day start
@@ -1422,7 +1422,7 @@ test "execute DATE_ADD on column" {
     defer ctx.deinit();
 
     // DATE_ADD(id, 1, 'day') adds 86400 seconds
-    const result = try ctx.exec("SELECT DATE_ADD(id, 1, 'day') FROM table LIMIT 1");
+    const result = try ctx.exec("SELECT DATE_ADD(id, 1, 'day') FROM t LIMIT 1");
 
     try std.testing.expectEqual(@as(usize, 1), result.row_count);
     // id=1 + 86400 = 86401
@@ -1435,7 +1435,7 @@ test "execute EPOCH function on column" {
     defer ctx.deinit();
 
     // EPOCH(id) should return the same value
-    const result = try ctx.exec("SELECT EPOCH(id) FROM table LIMIT 1");
+    const result = try ctx.exec("SELECT EPOCH(id) FROM t LIMIT 1");
 
     try std.testing.expectEqual(@as(usize, 1), result.row_count);
     try std.testing.expectEqual(@as(i64, 1), result.columns[0].data.int64[0]);
@@ -1452,12 +1452,12 @@ test "compiled vs interpreted produce same results" {
 
     // Force compilation with low threshold
     ctx.executor.setCompileThreshold(0);
-    const r1 = try ctx.exec("SELECT id FROM table WHERE id > 2");
+    const r1 = try ctx.exec("SELECT id FROM t WHERE id > 2");
     const compiled_count = r1.row_count;
 
     // Disable compilation, run same query
     ctx.executor.enableCompiledExecution(false);
-    const r2 = try ctx.exec("SELECT id FROM table WHERE id > 2");
+    const r2 = try ctx.exec("SELECT id FROM t WHERE id > 2");
 
     try std.testing.expectEqual(compiled_count, r2.row_count);
 }
@@ -1469,7 +1469,7 @@ test "fallback to interpreted on GROUP BY" {
 
     ctx.executor.setCompileThreshold(0);
     // GROUP BY not compiled - should fallback gracefully
-    const result = try ctx.exec("SELECT COUNT(*) FROM table GROUP BY id");
+    const result = try ctx.exec("SELECT COUNT(*) FROM t GROUP BY id");
     try std.testing.expect(result.row_count > 0);
 }
 
@@ -1482,6 +1482,6 @@ test "compiled filter with AND" {
     defer ctx.deinit();
 
     ctx.executor.setCompileThreshold(0);
-    const result = try ctx.exec("SELECT id FROM table WHERE id > 1 AND id < 5");
+    const result = try ctx.exec("SELECT id FROM t WHERE id > 1 AND id < 5");
     try std.testing.expectEqual(@as(usize, 3), result.row_count);
 }
