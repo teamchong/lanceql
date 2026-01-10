@@ -457,6 +457,18 @@ export class ChunkedGPUSorter {
         return p;
     }
 
+    /**
+     * Backward-compatible sort method.
+     * @param {Float32Array} values - Values to sort
+     * @param {boolean} ascending - Sort direction (true = ascending, false = descending)
+     * @returns {Promise<Uint32Array>} Sorted indices
+     */
+    async sort(values, ascending = true) {
+        const indices = new Uint32Array(values.length).map((_, i) => i);
+        const result = await this._sortChunk(values, indices, !ascending);
+        return result.indices;
+    }
+
     isAvailable() {
         return this.available;
     }

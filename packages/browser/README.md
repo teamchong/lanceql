@@ -1,28 +1,28 @@
-# lanceql
+# @metal0/lanceql
 
-Query Lance columnar files in the browser with SQL and vector search. No server required.
+SQL database in the browser with vector search. No server required.
 
 ## Features
 
-- **CSS-Driven** - Zero JavaScript! Just add `lq-*` attributes to HTML elements
-- **SQL Queries** - SELECT, WHERE, ORDER BY, LIMIT, GROUP BY, aggregations
-- **Vector Search** - Semantic search with NEAR clause using MiniLM/CLIP embeddings
-- **HTTP Range Requests** - Only fetch the bytes you need from remote files
-- **Local + Remote** - Load local files or remote URLs
+- **SQL Queries** - Full SQL: SELECT, JOIN, GROUP BY, window functions, CTEs
+- **Vector Search** - Semantic search with NEAR clause using MiniLM/CLIP
+- **OPFS Persistence** - Data persists across browser sessions
+- **HTTP Range** - Only fetch bytes you need from remote Lance files
+- **GPU Accelerated** - Optional WebGPU for JOINs, sorts, vector search
 - **Zero Dependencies** - Pure JavaScript + WebAssembly
 
 ## Installation
 
 ```bash
-npm install lanceql
+npm install @metal0/lanceql
 ```
 
-## Quick Start - Local SQL Database
+## Quick Start
 
-Create a persistent SQL database in the browser with just 4 lines:
+### Local SQL Database
 
 ```javascript
-import { vault } from 'lanceql';
+import { vault } from '@metal0/lanceql/browser';
 
 const v = await vault();
 await v.exec('CREATE TABLE users (id INT, name TEXT)');
@@ -31,13 +31,46 @@ const result = await v.query('SELECT * FROM users');
 // → { columns: ['id', 'name'], rows: [[1, 'Alice'], [2, 'Bob']] }
 ```
 
-**Features:**
-- **OPFS-backed** - Data persists across browser sessions
-- **Full SQL** - JOINs, GROUP BY, window functions, CTEs
-- **Time Travel** - Query historical versions with `VERSION AS OF`
-- **Vector Search** - Semantic search with `NEAR` clause
+### Remote Lance Dataset
 
-## Quick Start - CSS-Driven (Zero JavaScript)
+```javascript
+import { LanceQL } from '@metal0/lanceql/browser';
+
+const lanceql = await LanceQL.load();
+const dataset = await lanceql.openDataset('https://example.com/data.lance');
+const result = await dataset.executeSQL('SELECT * FROM data LIMIT 10');
+
+// Vector search
+const similar = await dataset.executeSQL(`
+  SELECT * FROM data WHERE embedding NEAR 'sunset beach' LIMIT 20
+`);
+```
+
+## API Exports
+
+```javascript
+// Core (use these)
+import { vault, LanceQL } from '@metal0/lanceql/browser';
+
+// Advanced
+import {
+  Vault,          // Vault class
+  TableRef,       // Table reference
+  LocalDatabase,  // Lower-level DB
+  RemoteLanceDataset  // Direct remote access
+} from '@metal0/lanceql/browser';
+
+// GPU Acceleration (optional)
+import {
+  getGPUJoiner,   // GPU hash joins
+  getGPUSorter,   // GPU bitonic sort
+  getGPUGrouper,  // GPU GROUP BY
+  getGPUVectorSearch,  // GPU vector ops
+  DistanceMetric  // COSINE, L2, DOT_PRODUCT
+} from '@metal0/lanceql/browser';
+```
+
+## CSS-Driven (Zero JavaScript)
 
 ```html
 <!-- Just include the script -->

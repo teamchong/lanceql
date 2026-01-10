@@ -57,9 +57,9 @@ fn assign_partitions(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (idx >= params.size) { return; }
 
     let key = keys[idx];
-    let partition = hash_partition(key) % params.num_partitions;
-    partition_ids[idx] = partition;
-    atomicAdd(&partition_counts[partition], 1u);
+    let part_id = hash_partition(key) % params.num_partitions;
+    partition_ids[idx] = part_id;
+    atomicAdd(&partition_counts[part_id], 1u);
 }
 `;
 
@@ -217,16 +217,26 @@ export class ChunkedGPUJoiner {
     /**
      * Perform a chunked hash join.
      *
-     * @param {AsyncIterable<{keys: Uint32Array, indices: Uint32Array}>} leftChunks
-     * @param {AsyncIterable<{keys: Uint32Array, indices: Uint32Array}>} rightChunks
-     * @param {Object} options
-     * @param {number} options.gpuMemoryBudget - Max GPU memory (default 256MB)
-     * @param {string} options.joinType - 'INNER' or 'LEFT' (default 'INNER')
-     * @returns {Promise<OPFSResultBuffer>} Buffer containing match pairs
+     * Supports both new chunked API and legacy flat array API:
+     * - New: hashJoin(leftChunks, rightChunks, options)
+     * - Legacy: hashJoin(leftRows, rightRows, leftKey, rightKey, joinType)
+     *
+     * @param {AsyncIterable|Array} leftChunks - Async chunks or row array
+     * @param {AsyncIterable|Array} rightChunks - Async chunks or row array
+     * @param {Object|string} optionsOrLeftKey - Options object or left join key (legacy)
+     * @param {string} rightKey - Right join key (legacy only)
+     * @param {string} joinType - Join type (legacy only)
+     * @returns {Promise<OPFSResultBuffer|Object>} Buffer or match indices
      */
-    async hashJoin(leftChunks, rightChunks, options = {}) {
+    async hashJoin(leftChunks, rightChunks, optionsOrLeftKey = {}, rightKey, joinType) {
+        // Detect legacy API: hashJoin(leftRows, rightRows, leftKey, rightKey, joinType?)
+        if (typeof optionsOrLeftKey === 'string') {
+            return this.hashJoinFlat(leftChunks, rightChunks, optionsOrLeftKey, rightKey, joinType || 'INNER');
+        }
+
+        const options = optionsOrLeftKey;
         const gpuMemoryBudget = options.gpuMemoryBudget || DEFAULT_GPU_MEMORY_BUDGET;
-        const joinType = options.joinType || 'INNER';
+        const effectiveJoinType = options.joinType || 'INNER';
 
         // Collect all data first to determine partitioning strategy
         const leftData = await this._collectChunks(leftChunks);
@@ -237,11 +247,11 @@ export class ChunkedGPUJoiner {
 
         // If small enough, use simple GPU join
         if (estimatedMemory < gpuMemoryBudget && totalSize < MIN_PARTITION_THRESHOLD) {
-            return this._simpleJoin(leftData, rightData, joinType);
+            return this._simpleJoin(leftData, rightData, effectiveJoinType);
         }
 
         // Use partitioned join for large data
-        return this._partitionedJoin(leftData, rightData, gpuMemoryBudget, joinType);
+        return this._partitionedJoin(leftData, rightData, gpuMemoryBudget, effectiveJoinType);
     }
 
     /**
@@ -658,7 +668,11 @@ export class ChunkedGPUJoiner {
             rightMatchIndices[i] = matches[i * 2 + 1];
         }
 
-        return { leftIndices: leftMatchIndices, rightIndices: rightMatchIndices };
+        return {
+            leftIndices: leftMatchIndices,
+            rightIndices: rightMatchIndices,
+            matchCount: numMatches
+        };
     }
 
     /**

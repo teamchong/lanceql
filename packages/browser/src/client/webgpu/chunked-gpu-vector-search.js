@@ -236,15 +236,29 @@ export class ChunkedGPUVectorSearch {
     /**
      * Search for top-K nearest vectors using chunked processing.
      *
+     * Supports both new chunked API and legacy flat array API:
+     * - New: search(queryVec, chunks, options)
+     * - Legacy: search(query, vectors, k, options)
+     *
      * @param {Float32Array} queryVec - Query vector
-     * @param {AsyncIterable<{vectors: Float32Array[], startIndex: number}>} chunks - Vector chunks
-     * @param {Object} options
-     * @param {number} options.k - Number of results (default 10)
-     * @param {number} options.metric - Distance metric (default COSINE)
-     * @param {number} options.gpuMemoryBudget - GPU memory budget (default 256MB)
+     * @param {AsyncIterable|Array} chunks - Vector chunks or flat array (legacy)
+     * @param {Object|number} optionsOrK - Options object or k value (legacy)
+     * @param {Object} legacyOptions - Options (legacy only)
      * @returns {Promise<{indices: Uint32Array, scores: Float32Array}>}
      */
-    async search(queryVec, chunks, options = {}) {
+    async search(queryVec, chunks, optionsOrK = {}, legacyOptions = {}) {
+        // Detect legacy API: search(query, vectors, k, options) where k is number
+        if (typeof optionsOrK === 'number') {
+            const k = optionsOrK;
+            return this.searchFlat(queryVec, chunks, { k, ...legacyOptions });
+        }
+
+        // Detect if chunks is an array (legacy flat API)
+        if (Array.isArray(chunks)) {
+            return this.searchFlat(queryVec, chunks, optionsOrK);
+        }
+
+        const options = optionsOrK;
         const k = options.k || 10;
         const metric = options.metric ?? DistanceMetric.COSINE;
         const descending = metric === DistanceMetric.COSINE || metric === DistanceMetric.DOT_PRODUCT;

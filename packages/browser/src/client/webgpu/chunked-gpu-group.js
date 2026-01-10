@@ -218,14 +218,21 @@ export class ChunkedGPUGrouper {
     /**
      * Perform chunked GROUP BY with aggregation.
      *
-     * @param {AsyncIterable<{keys: Uint32Array, values: Float32Array}>} chunks
+     * Supports both new chunked API and legacy flat array API:
+     * - New: groupBy(chunks, aggType, options)
+     * - Legacy: groupBy(keys) - returns {groupIds, numGroups}
+     *
+     * @param {AsyncIterable|Uint32Array} chunks - Async chunks or keys array (legacy)
      * @param {string} aggType - 'COUNT', 'SUM', 'MIN', 'MAX', or 'AVG'
      * @param {Object} options
-     * @param {number} options.gpuMemoryBudget - Max GPU memory (default 256MB)
-     * @param {number} options.estimatedGroups - Estimated unique groups (helps sizing)
-     * @returns {Promise<Map<number, number>>} Map of groupKey -> aggregateValue
+     * @returns {Promise<Map<number, number>|Object>}
      */
     async groupBy(chunks, aggType, options = {}) {
+        // Detect legacy API: groupBy(keys) with Uint32Array
+        if (chunks instanceof Uint32Array) {
+            return this.groupByFlat(chunks);
+        }
+
         const gpuMemoryBudget = options.gpuMemoryBudget || DEFAULT_GPU_MEMORY_BUDGET;
         const estimatedGroups = options.estimatedGroups || 100000;
         const isAvg = aggType === 'AVG';
@@ -524,6 +531,94 @@ export class ChunkedGPUGrouper {
         const view = new DataView(new ArrayBuffer(4));
         view.setUint32(0, bits, true);
         return view.getFloat32(0, true);
+    }
+
+    // =========================================================================
+    // Backward-compatible API (matches original GPUGrouper)
+    // =========================================================================
+
+    /**
+     * Group keys and return group IDs (backward-compatible).
+     * @param {Uint32Array} keys - Keys to group
+     * @returns {Promise<{groupIds: Uint32Array, numGroups: number}>}
+     */
+    async groupByFlat(keys) {
+        const groupMap = new Map();
+        const groupIds = new Uint32Array(keys.length);
+        let nextGroupId = 0;
+
+        for (let i = 0; i < keys.length; i++) {
+            const key = keys[i];
+            if (!groupMap.has(key)) {
+                groupMap.set(key, nextGroupId++);
+            }
+            groupIds[i] = groupMap.get(key);
+        }
+
+        return { groupIds, numGroups: groupMap.size };
+    }
+
+    /**
+     * Aggregate values by group (backward-compatible).
+     * @param {Float32Array} values - Values to aggregate
+     * @param {Uint32Array} groupIds - Group ID for each value
+     * @param {number} numGroups - Number of groups
+     * @param {string} aggType - 'COUNT', 'SUM', 'AVG', 'MIN', 'MAX'
+     * @returns {Promise<Float32Array>} Aggregated value per group
+     */
+    async groupAggregateFlat(values, groupIds, numGroups, aggType) {
+        const result = new Float32Array(numGroups);
+        const counts = new Uint32Array(numGroups);
+
+        // Initialize
+        if (aggType === 'MIN') {
+            result.fill(Infinity);
+        } else if (aggType === 'MAX') {
+            result.fill(-Infinity);
+        }
+
+        // Accumulate
+        for (let i = 0; i < values.length; i++) {
+            const g = groupIds[i];
+            const v = values[i];
+            counts[g]++;
+
+            switch (aggType) {
+                case 'COUNT':
+                    result[g]++;
+                    break;
+                case 'SUM':
+                case 'AVG':
+                    result[g] += v;
+                    break;
+                case 'MIN':
+                    result[g] = Math.min(result[g], v);
+                    break;
+                case 'MAX':
+                    result[g] = Math.max(result[g], v);
+                    break;
+            }
+        }
+
+        // Finalize AVG
+        if (aggType === 'AVG') {
+            for (let g = 0; g < numGroups; g++) {
+                if (counts[g] > 0) {
+                    result[g] /= counts[g];
+                }
+            }
+        }
+
+        return result;
+    }
+
+    // Legacy method names for backward compatibility
+    async groupBySimple(keys) {
+        return this.groupByFlat(keys);
+    }
+
+    async groupAggregate(values, groupIds, numGroups, aggType) {
+        return this.groupAggregateFlat(values, groupIds, numGroups, aggType);
     }
 }
 
