@@ -297,9 +297,11 @@ pub const Executor = struct {
         // Check if plan is compilable (has inlined bodies, no unsupported ops)
         if (!plan.compilable) return error.NotImplemented;
 
-        // 2. Build type map from table schema for type resolution
+        // 2. Build type and nullable maps from table schema
         var type_map = self.buildSchemaTypeMap() catch return error.NoSchema;
         defer type_map.deinit();
+        var nullable_map = self.buildSchemaNullableMap() catch return error.NoSchema;
+        defer nullable_map.deinit();
 
         // 3. Generate fused Zig code with layout metadata and resolved types
         var codegen = fused_codegen.FusedCodeGen.init(self.allocator);
@@ -370,7 +372,7 @@ pub const Executor = struct {
             }
         }
 
-        var gen_result = try codegen.generateWithLayoutAndTypes(&plan, &type_map);
+        var gen_result = try codegen.generateWithLayoutTypesAndNullability(&plan, &type_map, &nullable_map);
         const needs_string_arena = codegen.needsStringArena();
 
         // Hash the generated source to use as cache key
@@ -422,11 +424,16 @@ pub const Executor = struct {
         const column_data = try self.loadColumnDataForLayout(input_columns);
         defer self.freeCompiledColumnData(column_data);
 
-        // 5. Build runtime columns struct (input)
-        var columns = try RuntimeColumns.buildInput(
+        // 4b. Load validity bitmaps for nullable columns
+        const validity_bitmaps = try self.loadValidityBitmapsForLayout(input_columns, row_count);
+        defer self.freeValidityBitmaps(validity_bitmaps);
+
+        // 5. Build runtime columns struct (input) with validity bitmaps
+        var columns = try RuntimeColumns.buildInputWithValidity(
             self.allocator,
             input_columns,
             column_data,
+            validity_bitmaps,
             row_count,
         );
         defer columns.deinit();
@@ -488,6 +495,65 @@ pub const Executor = struct {
             };
         }
         return data;
+    }
+
+    /// Load validity bitmaps for columns based on layout
+    /// Returns array of optional validity bitmaps (null means column is non-nullable)
+    /// Reads actual validity bitmaps from Lance file if column is nullable
+    fn loadValidityBitmapsForLayout(
+        self: *Self,
+        layout: []const fused_codegen.ColumnInfo,
+        row_count: usize,
+    ) ![]?[]const u8 {
+        var validity = try self.allocator.alloc(?[]const u8, layout.len);
+        errdefer self.allocator.free(validity);
+
+        const bytes_needed = (row_count + 7) / 8; // Round up to nearest byte
+
+        for (layout, 0..) |col, i| {
+            if (col.nullable) {
+                // Try to read actual validity bitmap from Lance file
+                const col_idx = self.getPhysicalColumnIndex(col.name) orelse {
+                    // Column not found - create all-valid bitmap
+                    const bitmap = try self.allocator.alloc(u8, bytes_needed);
+                    @memset(bitmap, 0xFF);
+                    validity[i] = bitmap;
+                    continue;
+                };
+
+                // Read validity bitmap from Lance table
+                const maybe_bitmap = self.tbl().readValidityBitmap(col_idx) catch {
+                    // Error reading - create all-valid bitmap as fallback
+                    const bitmap = try self.allocator.alloc(u8, bytes_needed);
+                    @memset(bitmap, 0xFF);
+                    validity[i] = bitmap;
+                    continue;
+                };
+
+                if (maybe_bitmap) |bitmap| {
+                    // Got actual validity bitmap from file
+                    validity[i] = bitmap;
+                } else {
+                    // Column has no validity bitmap (all values valid)
+                    const bitmap = try self.allocator.alloc(u8, bytes_needed);
+                    @memset(bitmap, 0xFF);
+                    validity[i] = bitmap;
+                }
+            } else {
+                validity[i] = null;
+            }
+        }
+        return validity;
+    }
+
+    /// Free validity bitmaps loaded by loadValidityBitmapsForLayout
+    fn freeValidityBitmaps(self: *Self, validity: []?[]const u8) void {
+        for (validity) |maybe_bitmap| {
+            if (maybe_bitmap) |bitmap| {
+                self.allocator.free(bitmap);
+            }
+        }
+        self.allocator.free(validity);
     }
 
     /// Read int64 column - handles typed tables (Parquet, Arrow, etc.) and Lance
@@ -719,6 +785,31 @@ pub const Executor = struct {
             try type_map.put(field.name, col_type);
         }
         return type_map;
+    }
+
+    /// Build a map of column names to their nullable status from table schema
+    fn buildSchemaNullableMap(self: *Self) !std.StringHashMap(bool) {
+        var nullable_map = std.StringHashMap(bool).init(self.allocator);
+        errdefer nullable_map.deinit();
+
+        // Handle typed tables (Parquet, Arrow, etc.)
+        // Note: For typed tables, default to non-nullable (conservative)
+        inline for (typed_table_fields) |field| {
+            if (@field(self, field)) |t| {
+                const col_names = t.getColumnNames();
+                for (col_names) |name| {
+                    try nullable_map.put(name, false);
+                }
+                return nullable_map;
+            }
+        }
+
+        // Handle Lance Table - uses schema nullable field
+        const schema = self.tbl().getSchema() orelse return error.NoSchema;
+        for (schema.fields) |field| {
+            try nullable_map.put(field.name, field.nullable);
+        }
+        return nullable_map;
     }
 
     /// Map Parquet Type to plan_nodes.ColumnType

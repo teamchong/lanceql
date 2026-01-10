@@ -68,6 +68,7 @@ pub const ColumnInfo = struct {
     name: []const u8,
     col_type: ColumnType,
     offset: usize, // Byte offset in struct
+    nullable: bool = false, // Whether column can contain NULLs
 };
 
 /// Layout metadata for generated Columns and OutputBuffers structs
@@ -394,6 +395,17 @@ pub const FusedCodeGen = struct {
         }
     }
 
+    /// Update column nullability based on schema
+    /// Call this after analyze but before generateCode if nullability is unknown
+    pub fn updateColumnNullability(self: *Self, nullable_map: *const std.StringHashMap(bool)) void {
+        // Update input_column_order ArrayList
+        for (self.input_column_order.items) |*col| {
+            if (nullable_map.get(col.name)) |is_nullable| {
+                col.nullable = is_nullable;
+            }
+        }
+    }
+
     /// Set query parameters for inlining during code generation
     pub fn setParams(self: *Self, params: []const Value) void {
         self.params = params;
@@ -425,16 +437,32 @@ pub const FusedCodeGen = struct {
         plan: *const QueryPlan,
         type_map: *const std.StringHashMap(ColumnType),
     ) CodeGenError!GenerateResult {
+        return self.generateWithLayoutTypesAndNullability(plan, type_map, null);
+    }
+
+    /// Generate fused code with type and nullability resolution from schema
+    /// This is the complete method for proper NULL handling in JIT
+    pub fn generateWithLayoutTypesAndNullability(
+        self: *Self,
+        plan: *const QueryPlan,
+        type_map: *const std.StringHashMap(ColumnType),
+        nullable_map: ?*const std.StringHashMap(bool),
+    ) CodeGenError!GenerateResult {
         // Step 1: Analyze to collect column info
         try self.analyze(plan);
 
         // Step 2: Resolve unknown types from schema
         self.updateColumnTypes(type_map);
 
-        // Step 3: Generate code with resolved types
+        // Step 3: Resolve nullability from schema
+        if (nullable_map) |nm| {
+            self.updateColumnNullability(nm);
+        }
+
+        // Step 4: Generate code with resolved types and nullability
         const source = try self.generateCode();
 
-        // Step 4: Build layout
+        // Step 5: Build layout
         const layout = try self.buildLayout();
 
         return GenerateResult{
@@ -448,6 +476,7 @@ pub const FusedCodeGen = struct {
         const ptr_size: usize = @sizeOf(usize); // Size of a pointer (8 bytes on 64-bit)
 
         // Calculate input column offsets
+        // For nullable columns, we need an extra pointer for the validity bitmap
         var input_cols = self.allocator.alloc(ColumnInfo, self.input_column_order.items.len) catch
             return CodeGenError.OutOfMemory;
         var offset: usize = 0;
@@ -456,8 +485,13 @@ pub const FusedCodeGen = struct {
                 .name = col.name,
                 .col_type = col.col_type,
                 .offset = offset,
+                .nullable = col.nullable,
             };
             offset += ptr_size;
+            // Add validity bitmap pointer for nullable columns
+            if (col.nullable) {
+                offset += ptr_size;
+            }
         }
         // Add len field offset
         const columns_size = offset + ptr_size;
@@ -899,6 +933,14 @@ pub const FusedCodeGen = struct {
             \\
             \\const std = @import("std");
             \\
+            \\/// Check if a value is valid (not NULL) in a validity bitmap.
+            \\/// Arrow format: bit=1 means valid, bit=0 means NULL.
+            \\inline fn isValid(validity: [*]const u8, index: usize) bool {
+            \\    const byte_idx = index / 8;
+            \\    const bit_idx: u3 = @intCast(index % 8);
+            \\    return (validity[byte_idx] & (@as(u8, 1) << bit_idx)) != 0;
+            \\}
+            \\
             \\
         );
 
@@ -934,6 +976,13 @@ pub const FusedCodeGen = struct {
             try self.write(": [*]const ");
             try self.write(col.col_type.toZigType());
             try self.write(",\n");
+
+            // Add validity bitmap pointer for nullable columns
+            if (col.nullable) {
+                try self.writeIndent();
+                try self.write(col.name);
+                try self.write("_validity: [*]const u8,\n");
+            }
         }
 
         // Add length field
@@ -2075,12 +2124,85 @@ pub const FusedCodeGen = struct {
         for (self.sort_specs.items) |spec| {
             const col = spec.column.column;
             const desc = spec.direction == .desc;
-            if (desc) {
+            const nulls_first = spec.nulls_first;
+
+            // Check if column is nullable
+            const is_nullable = self.isColumnNullable(col);
+
+            if (is_nullable) {
+                // Generate NULL-safe comparison
+                // Check validity of both values
                 try self.writeIndent();
-                try self.fmt("if (ctx.cols.{s}[a] != ctx.cols.{s}[b]) return ctx.cols.{s}[a] > ctx.cols.{s}[b];\n", .{ col, col, col, col });
+                try self.write("{\n");
+                self.indent += 1;
+
+                try self.writeIndent();
+                try self.fmt("const a_valid = isValid(ctx.cols.{s}_validity, a);\n", .{col});
+                try self.writeIndent();
+                try self.fmt("const b_valid = isValid(ctx.cols.{s}_validity, b);\n", .{col});
+
+                // Handle NULL ordering
+                try self.writeIndent();
+                try self.write("if (!a_valid and !b_valid) {\n");
+                self.indent += 1;
+                try self.writeIndent();
+                try self.write("// Both NULL, equal for this column - continue to next\n");
+                self.indent -= 1;
+                try self.writeIndent();
+                if (nulls_first) {
+                    try self.write("} else if (!a_valid) {\n");
+                    self.indent += 1;
+                    try self.writeIndent();
+                    try self.write("return true;  // NULL < non-NULL (NULLS FIRST)\n");
+                    self.indent -= 1;
+                    try self.writeIndent();
+                    try self.write("} else if (!b_valid) {\n");
+                    self.indent += 1;
+                    try self.writeIndent();
+                    try self.write("return false; // non-NULL > NULL (NULLS FIRST)\n");
+                    self.indent -= 1;
+                    try self.writeIndent();
+                } else {
+                    try self.write("} else if (!a_valid) {\n");
+                    self.indent += 1;
+                    try self.writeIndent();
+                    try self.write("return false; // NULL > non-NULL (NULLS LAST)\n");
+                    self.indent -= 1;
+                    try self.writeIndent();
+                    try self.write("} else if (!b_valid) {\n");
+                    self.indent += 1;
+                    try self.writeIndent();
+                    try self.write("return true;  // non-NULL < NULL (NULLS LAST)\n");
+                    self.indent -= 1;
+                    try self.writeIndent();
+                }
+                try self.write("} else {\n");
+                self.indent += 1;
+
+                // Both non-NULL: compare values
+                if (desc) {
+                    try self.writeIndent();
+                    try self.fmt("if (ctx.cols.{s}[a] != ctx.cols.{s}[b]) return ctx.cols.{s}[a] > ctx.cols.{s}[b];\n", .{ col, col, col, col });
+                } else {
+                    try self.writeIndent();
+                    try self.fmt("if (ctx.cols.{s}[a] != ctx.cols.{s}[b]) return ctx.cols.{s}[a] < ctx.cols.{s}[b];\n", .{ col, col, col, col });
+                }
+
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.write("}\n");
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.write("}\n");
             } else {
-                try self.writeIndent();
-                try self.fmt("if (ctx.cols.{s}[a] != ctx.cols.{s}[b]) return ctx.cols.{s}[a] < ctx.cols.{s}[b];\n", .{ col, col, col, col });
+                // Non-nullable column: simple comparison
+                if (desc) {
+                    try self.writeIndent();
+                    try self.fmt("if (ctx.cols.{s}[a] != ctx.cols.{s}[b]) return ctx.cols.{s}[a] > ctx.cols.{s}[b];\n", .{ col, col, col, col });
+                } else {
+                    try self.writeIndent();
+                    try self.fmt("if (ctx.cols.{s}[a] != ctx.cols.{s}[b]) return ctx.cols.{s}[a] < ctx.cols.{s}[b];\n", .{ col, col, col, col });
+                }
             }
         }
 
@@ -2096,6 +2218,16 @@ pub const FusedCodeGen = struct {
         // Call sort
         try self.writeIndent();
         try self.write("std.mem.sort(u32, sorted_indices[0..columns.len], OrderSortCtx{ .cols = columns }, OrderSortCtx.lessThan);\n");
+    }
+
+    /// Check if a column is nullable by looking it up in input_column_order
+    fn isColumnNullable(self: *Self, col_name: []const u8) bool {
+        for (self.input_column_order.items) |col| {
+            if (std.mem.eql(u8, col.name, col_name)) {
+                return col.nullable;
+            }
+        }
+        return false;
     }
 
     /// Generate GROUP BY function with hash grouping

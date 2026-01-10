@@ -172,6 +172,7 @@ pub const LazyLanceFile = struct {
     }
 
     /// Generic helper to read numeric column data
+    /// Handles both nullable (2+ buffers) and non-nullable (1 buffer) columns
     fn readNumericColumn(self: *Self, comptime T: type, col_idx: u32) LazyLanceFileError![]T {
         var col_meta = try self.readColumnMetadata(col_idx);
         defer col_meta.deinit(self.allocator);
@@ -181,7 +182,10 @@ pub const LazyLanceFile = struct {
         var total_values: usize = 0;
         for (col_meta.pages) |page| {
             if (page.buffer_sizes.len > 0) {
-                total_values += page.buffer_sizes[0] / @sizeOf(T);
+                // For nullable columns (2+ buffers): data is in buffer[1]
+                // For non-nullable columns (1 buffer): data is in buffer[0]
+                const data_buf_idx: usize = if (page.buffer_sizes.len >= 2) 1 else 0;
+                total_values += page.buffer_sizes[data_buf_idx] / @sizeOf(T);
             }
         }
 
@@ -192,10 +196,14 @@ pub const LazyLanceFile = struct {
         for (col_meta.pages) |page| {
             if (page.buffer_offsets.len == 0 or page.buffer_sizes.len == 0) continue;
 
-            const buffer_data = self.allocator.alloc(u8, page.buffer_sizes[0]) catch return LazyLanceFileError.OutOfMemory;
+            // For nullable columns (2+ buffers): data is in buffer[1]
+            // For non-nullable columns (1 buffer): data is in buffer[0]
+            const data_buf_idx: usize = if (page.buffer_sizes.len >= 2) 1 else 0;
+
+            const buffer_data = self.allocator.alloc(u8, page.buffer_sizes[data_buf_idx]) catch return LazyLanceFileError.OutOfMemory;
             defer self.allocator.free(buffer_data);
 
-            self.reader.readExact(page.buffer_offsets[0], buffer_data) catch return LazyLanceFileError.IoError;
+            self.reader.readExact(page.buffer_offsets[data_buf_idx], buffer_data) catch return LazyLanceFileError.IoError;
 
             const decoder = PlainDecoder.init(buffer_data);
             const page_values = (switch (T) {
@@ -220,6 +228,55 @@ pub const LazyLanceFile = struct {
 
     pub fn readInt64Column(self: *Self, col_idx: u32) LazyLanceFileError![]i64 {
         return self.readNumericColumn(i64, col_idx);
+    }
+
+    /// Read validity bitmap for a nullable column
+    /// Returns null if column has no validity bitmap (all values valid)
+    /// The bitmap uses Arrow format: bit 1 = valid, bit 0 = null
+    pub fn readValidityBitmap(self: *Self, col_idx: u32) LazyLanceFileError!?[]u8 {
+        var col_meta = try self.readColumnMetadata(col_idx);
+        defer col_meta.deinit(self.allocator);
+
+        if (col_meta.pages.len == 0) return LazyLanceFileError.NoPages;
+
+        // Check if column has validity bitmap by looking at buffer count
+        // Nullable columns have 2+ buffers: [validity_bitmap, data, ...]
+        // Non-nullable columns have 1 buffer: [data]
+        var has_validity = false;
+        for (col_meta.pages) |page| {
+            if (page.buffer_sizes.len >= 2) {
+                has_validity = true;
+                break;
+            }
+        }
+
+        if (!has_validity) return null;
+
+        // Calculate total bitmap size
+        var total_bytes: usize = 0;
+        for (col_meta.pages) |page| {
+            if (page.buffer_sizes.len >= 2) {
+                total_bytes += page.buffer_sizes[0];
+            }
+        }
+
+        if (total_bytes == 0) return null;
+
+        var result = self.allocator.alloc(u8, total_bytes) catch return LazyLanceFileError.OutOfMemory;
+        errdefer self.allocator.free(result);
+
+        var offset: usize = 0;
+        for (col_meta.pages) |page| {
+            if (page.buffer_offsets.len >= 2 and page.buffer_sizes.len >= 2) {
+                const bitmap_size = page.buffer_sizes[0];
+                if (bitmap_size > 0) {
+                    self.reader.readExact(page.buffer_offsets[0], result[offset .. offset + bitmap_size]) catch return LazyLanceFileError.IoError;
+                    offset += bitmap_size;
+                }
+            }
+        }
+
+        return result;
     }
 
     /// Get bytes read stats (for benchmarking)

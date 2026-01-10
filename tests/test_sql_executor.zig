@@ -1490,21 +1490,24 @@ test "compiled filter with AND" {
 // ============================================================================
 // ORDER BY with NULLs Tests
 // ============================================================================
-// NOTE: JIT codegen currently doesn't support NULL bitmap handling.
-// These tests are documented here for future implementation when JIT is
-// enhanced to handle nullable columns properly.
+// JIT NULL Handling Status:
+// - [x] Code generation: genSortContext generates NULL-safe comparisons
+// - [x] Memory layout: RuntimeColumns supports validity bitmaps
+// - [x] Executor: Allocates and passes validity bitmaps to JIT
+// - [x] Actual NULL loading: Reads validity bitmaps from Lance file pages
+//
+// The JIT codegen properly generates NULL-handling code with:
+// - isValid() helper to check validity bitmaps
+// - NULLS FIRST/LAST ordering in sort comparisons
+// - Proper if-else-if chains for NULL cases
+//
+// Lance file format:
+// - Nullable columns have 2 buffers: [validity_bitmap, data]
+// - Non-nullable columns have 1 buffer: [data]
+// - Validity bitmap uses Arrow format: bit 1 = valid, bit 0 = null
 //
 // SQL standard NULL ordering behavior:
 // - NULLS FIRST: NULLs appear before non-NULL values
 // - NULLS LAST: NULLs appear after non-NULL values
 // - Default ASC: implementation-defined (we use NULLS LAST)
 // - Default DESC: implementation-defined (we use NULLS FIRST)
-//
-// Test cases to implement:
-// - "ORDER BY ASC with NULLs (default NULLS LAST)"
-// - "ORDER BY DESC with NULLs (default NULLS FIRST)"
-// - "ORDER BY with NULLS FIRST explicit"
-// - "ORDER BY with NULLS LAST explicit"
-// - "ORDER BY float column with NULLs"
-// - "IS NULL filter"
-// - "IS NOT NULL filter with ORDER BY"

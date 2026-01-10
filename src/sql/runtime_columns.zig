@@ -109,6 +109,10 @@ pub const RuntimeColumns = struct {
     /// Column data pointers (kept alive during function call)
     column_data: []ColumnDataPtr,
 
+    /// Validity bitmaps for nullable columns (same length as column_data)
+    /// null entry means column is not nullable
+    validity_bitmaps: []?[]const u8,
+
     /// Column names (for SELECT * output mapping)
     column_names: []const []const u8,
 
@@ -123,17 +127,41 @@ pub const RuntimeColumns = struct {
     const Self = @This();
 
     /// Build a RuntimeColumns for input data (Columns struct)
+    /// validity parameter is optional - if null, all columns are treated as non-nullable
     pub fn buildInput(
         allocator: std.mem.Allocator,
         layout: []const ColumnInfo,
         data: []const ColumnDataPtr,
         row_count: usize,
     ) !Self {
+        return buildInputWithValidity(allocator, layout, data, null, row_count);
+    }
+
+    /// Build a RuntimeColumns for input data with validity bitmaps
+    pub fn buildInputWithValidity(
+        allocator: std.mem.Allocator,
+        layout: []const ColumnInfo,
+        data: []const ColumnDataPtr,
+        validity: ?[]const ?[]const u8,
+        row_count: usize,
+    ) !Self {
         if (layout.len != data.len) return error.LayoutDataMismatch;
+        if (validity) |v| {
+            if (v.len != data.len) return error.ValidityDataMismatch;
+        }
 
         const ptr_size = @sizeOf(usize);
-        // Buffer size = (num columns * ptr_size) + ptr_size (for len field)
-        const buffer_size = (layout.len * ptr_size) + ptr_size;
+
+        // Calculate buffer size accounting for nullable columns
+        // Each column: ptr_size, plus additional ptr_size for validity if nullable
+        var buffer_size: usize = 0;
+        for (layout) |col| {
+            buffer_size += ptr_size; // data pointer
+            if (col.nullable) {
+                buffer_size += ptr_size; // validity pointer
+            }
+        }
+        buffer_size += ptr_size; // len field
 
         const buffer = try allocator.alignedAlloc(u8, .@"8", buffer_size);
         @memset(buffer, 0);
@@ -142,16 +170,33 @@ pub const RuntimeColumns = struct {
         const column_data = try allocator.alloc(ColumnDataPtr, data.len);
         @memcpy(column_data, data);
 
+        // Create validity bitmaps array
+        const validity_bitmaps = try allocator.alloc(?[]const u8, data.len);
+        for (0..data.len) |i| {
+            validity_bitmaps[i] = if (validity) |v| v[i] else null;
+        }
+
         // Write pointers into buffer at their offsets
+        var offset: usize = 0;
         for (layout, 0..) |col, i| {
+            // Write data pointer
             const ptr_value = data[i].rawPtr();
-            const offset = col.offset;
             @as(*usize, @ptrCast(@alignCast(buffer.ptr + offset))).* = ptr_value;
+            offset += ptr_size;
+
+            // Write validity bitmap pointer for nullable columns
+            if (col.nullable) {
+                if (validity) |v| {
+                    if (v[i]) |vb| {
+                        @as(*usize, @ptrCast(@alignCast(buffer.ptr + offset))).* = @intFromPtr(vb.ptr);
+                    }
+                }
+                offset += ptr_size;
+            }
         }
 
         // Write len field at the end
-        const len_offset = layout.len * ptr_size;
-        @as(*usize, @ptrCast(@alignCast(buffer.ptr + len_offset))).* = row_count;
+        @as(*usize, @ptrCast(@alignCast(buffer.ptr + offset))).* = row_count;
 
         // Extract column names from layout
         const column_names = try allocator.alloc([]const u8, layout.len);
@@ -162,6 +207,7 @@ pub const RuntimeColumns = struct {
         return Self{
             .buffer = buffer,
             .column_data = column_data,
+            .validity_bitmaps = validity_bitmaps,
             .column_names = column_names,
             .row_count = row_count,
             .is_input = true,
@@ -195,9 +241,16 @@ pub const RuntimeColumns = struct {
             @as(*usize, @ptrCast(@alignCast(buffer.ptr + offset))).* = ptr_value;
         }
 
+        // Output doesn't have validity bitmaps (yet)
+        const validity_bitmaps = try allocator.alloc(?[]const u8, layout.len);
+        for (0..layout.len) |i| {
+            validity_bitmaps[i] = null;
+        }
+
         return Self{
             .buffer = buffer,
             .column_data = column_data,
+            .validity_bitmaps = validity_bitmaps,
             .column_names = column_names,
             .row_count = max_rows,
             .is_input = false,
@@ -223,6 +276,7 @@ pub const RuntimeColumns = struct {
             }
         }
         self.allocator.free(self.column_data);
+        self.allocator.free(self.validity_bitmaps);
         self.allocator.free(self.column_names);
         self.allocator.free(self.buffer);
     }

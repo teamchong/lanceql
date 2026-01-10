@@ -657,6 +657,18 @@ pub const Table = struct {
         return simd.dotProduct(data_a, data_b);
     }
 
+    /// Read validity bitmap for a nullable column
+    /// Returns null if column has no validity bitmap (non-nullable or all values valid)
+    /// The bitmap uses Arrow format: bit 1 = valid, bit 0 = null
+    /// NOTE: This in-memory Table doesn't support validity bitmaps yet - returns null
+    pub fn readValidityBitmap(self: Self, col_idx: u32) TableError!?[]u8 {
+        _ = self;
+        _ = col_idx;
+        // In-memory Table uses LanceFile which doesn't have validity bitmap support yet
+        // Return null to indicate all values are valid
+        return null;
+    }
+
     /// Batch dot product: compute dot products of f32 embeddings against a query vector.
     /// Returns array of scores (one per row).
     /// Caller must free the returned slice.
@@ -851,6 +863,20 @@ pub const LazyTable = struct {
     /// Read string column by physical ID
     pub fn readStringColumn(self: *Self, col_idx: u32) TableError![][]const u8 {
         return self.lazy_file.readStringColumn(col_idx) catch |err| {
+            return switch (err) {
+                error.ColumnOutOfBounds => TableError.ColumnOutOfBounds,
+                error.NoPages => TableError.NoPages,
+                error.OutOfMemory => TableError.OutOfMemory,
+                else => TableError.ReadError,
+            };
+        };
+    }
+
+    /// Read validity bitmap for a nullable column
+    /// Returns null if column has no validity bitmap (non-nullable or all values valid)
+    /// The bitmap uses Arrow format: bit 1 = valid, bit 0 = null
+    pub fn readValidityBitmap(self: *Self, col_idx: u32) TableError!?[]u8 {
+        return self.lazy_file.readValidityBitmap(col_idx) catch |err| {
             return switch (err) {
                 error.ColumnOutOfBounds => TableError.ColumnOutOfBounds,
                 error.NoPages => TableError.NoPages,
