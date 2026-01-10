@@ -3,7 +3,7 @@
 //! Defines the structure of parsed SQL SELECT statements.
 
 const std = @import("std");
-const Expr = @import("expr.zig").Expr;
+const Expr = @import("lanceql.query.expr").Expr;
 
 /// A SELECT statement.
 pub const SelectStmt = struct {

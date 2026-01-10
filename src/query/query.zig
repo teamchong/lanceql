@@ -8,7 +8,7 @@ const std = @import("std");
 pub const value = @import("lanceql.value");
 pub const Value = value.Value;
 
-pub const expr = @import("expr.zig");
+pub const expr = @import("lanceql.query.expr");
 pub const lexer = @import("lexer.zig");
 pub const parser = @import("parser.zig");
 pub const ast = @import("ast.zig");

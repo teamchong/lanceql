@@ -55,11 +55,21 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/value.zig"),
     });
 
+    // Query expression module - for predicate fusion in codegen
+    // Defined here before query_mod to avoid circular dependency
+    const query_expr_mod = b.addModule("lanceql.query.expr", .{
+        .root_source_file = b.path("src/query/expr.zig"),
+        .imports = &.{
+            .{ .name = "lanceql.value", .module = value_mod },
+        },
+    });
+
     const query_mod = b.addModule("lanceql.query", .{
         .root_source_file = b.path("src/query/query.zig"),
         .imports = &.{
             .{ .name = "lanceql.value", .module = value_mod },
             .{ .name = "lanceql.gpu", .module = gpu_mod },
+            .{ .name = "lanceql.query.expr", .module = query_expr_mod },
         },
     });
 
@@ -232,14 +242,6 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("deps/metal0/src/main.zig"),
     });
 
-    // Query expression module - for predicate fusion in codegen
-    const query_expr_mod = b.addModule("lanceql.query.expr", .{
-        .root_source_file = b.path("src/query/expr.zig"),
-        .imports = &.{
-            .{ .name = "lanceql.value", .module = value_mod },
-        },
-    });
-
     // Codegen module - JIT compilation integration with metal0
     const codegen_mod = b.addModule("lanceql.codegen", .{
         .root_source_file = b.path("src/codegen/metal0_jit.zig"),
@@ -307,6 +309,20 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Dataset module - high-level API mirroring browser vault.js
+    const dataset_mod = b.addModule("lanceql.dataset", .{
+        .root_source_file = b.path("src/dataset.zig"),
+        .imports = &.{
+            .{ .name = "lanceql.sql.executor", .module = sql_executor_mod },
+            .{ .name = "lexer", .module = sql_lexer_mod },
+            .{ .name = "parser", .module = sql_parser_mod },
+            .{ .name = "ast", .module = sql_ast_mod },
+            .{ .name = "lanceql.table", .module = table_mod },
+            .{ .name = "lanceql.dataframe", .module = dataframe_mod },
+            .{ .name = "lanceql.format", .module = format_mod },
+        },
+    });
+
     // Root module exports all
     const lanceql_mod = b.addModule("lanceql", .{
         .root_source_file = b.path("src/lanceql.zig"),
@@ -319,6 +335,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lanceql.query", .module = query_mod },
             .{ .name = "lanceql.value", .module = value_mod },
             .{ .name = "lanceql.dataframe", .module = dataframe_mod },
+            .{ .name = "lanceql.dataset", .module = dataset_mod },
             .{ .name = "lanceql.gpu", .module = gpu_mod },
             .{ .name = "lanceql.logic_table", .module = logic_table_mod },
             .{ .name = "lanceql.codegen", .module = codegen_mod },
@@ -421,6 +438,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "lanceql.value", .module = value_mod },
                 .{ .name = "lanceql.gpu", .module = gpu_mod },
+                .{ .name = "lanceql.query.expr", .module = query_expr_mod },
             },
         }),
     });
