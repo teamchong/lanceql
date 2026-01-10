@@ -607,6 +607,79 @@ export class ChunkedGPUJoiner {
 
         return new Uint32Array(matches);
     }
+
+    // =========================================================================
+    // Backward-compatible API (matches original GPUJoiner)
+    // =========================================================================
+
+    /**
+     * Hash join with flat arrays (backward-compatible API).
+     * Automatically chunks data if needed.
+     *
+     * @param {Object[]} leftRows - Left table rows
+     * @param {Object[]} rightRows - Right table rows
+     * @param {string} leftKey - Left join key column name
+     * @param {string} rightKey - Right join key column name
+     * @param {string} joinType - 'INNER' or 'LEFT'
+     * @param {Object} options
+     * @returns {Promise<{leftIndices: Uint32Array, rightIndices: Uint32Array}>}
+     */
+    async hashJoinFlat(leftRows, rightRows, leftKey, rightKey, joinType = 'INNER', options = {}) {
+        // Extract keys as numeric values
+        const leftKeys = this._extractKeysFromRows(leftRows, leftKey);
+        const rightKeys = this._extractKeysFromRows(rightRows, rightKey);
+        const leftIndices = new Uint32Array(leftRows.length).map((_, i) => i);
+        const rightIndices = new Uint32Array(rightRows.length).map((_, i) => i);
+
+        // Create single-chunk iterators
+        const self = this;
+        async function* leftChunks() {
+            yield { keys: leftKeys, indices: leftIndices };
+        }
+        async function* rightChunks() {
+            yield { keys: rightKeys, indices: rightIndices };
+        }
+
+        const resultBuffer = await this.hashJoin(leftChunks(), rightChunks(), { joinType, ...options });
+        const matches = await resultBuffer.readAll();
+        await resultBuffer.close(true);
+
+        // Convert to left/right index arrays
+        const numMatches = matches.length / 2;
+        const leftMatchIndices = new Uint32Array(numMatches);
+        const rightMatchIndices = new Uint32Array(numMatches);
+
+        for (let i = 0; i < numMatches; i++) {
+            leftMatchIndices[i] = matches[i * 2];
+            rightMatchIndices[i] = matches[i * 2 + 1];
+        }
+
+        return { leftIndices: leftMatchIndices, rightIndices: rightMatchIndices };
+    }
+
+    /**
+     * Extract numeric keys from row objects.
+     */
+    _extractKeysFromRows(rows, keyName) {
+        const keys = new Uint32Array(rows.length);
+        for (let i = 0; i < rows.length; i++) {
+            const val = rows[i][keyName];
+            keys[i] = typeof val === 'number' ? val : this._hashStringKey(String(val));
+        }
+        return keys;
+    }
+
+    /**
+     * Simple string hash for non-numeric keys.
+     */
+    _hashStringKey(str) {
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+            hash = ((hash << 5) - hash) + str.charCodeAt(i);
+            hash |= 0;
+        }
+        return hash >>> 0;
+    }
 }
 
 // Singleton instance
