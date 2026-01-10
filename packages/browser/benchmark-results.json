@@ -27415,5 +27415,239 @@
         "winner": "DuckDB"
       }
     ]
+  },
+  {
+    "rowCount": 1000,
+    "timestamp": "2026-01-10T06:09:58.560Z",
+    "commit": "local",
+    "results": [
+      {
+        "query": "Simple SELECT",
+        "rows": 1000,
+        "lanceql": "0.80",
+        "duckdb": "0.50",
+        "ratio": "1.60x",
+        "winner": "DuckDB"
+      },
+      {
+        "query": "Aggregation",
+        "rows": 1000,
+        "lanceql": "0.75",
+        "duckdb": "0.40",
+        "ratio": "1.88x",
+        "winner": "DuckDB"
+      },
+      {
+        "query": "JOIN",
+        "rows": 1000,
+        "lanceql": "0.82",
+        "duckdb": "0.58",
+        "ratio": "1.41x",
+        "winner": "DuckDB"
+      },
+      {
+        "query": "Complex WHERE",
+        "rows": 1000,
+        "lanceql": "0.89",
+        "duckdb": "0.52",
+        "ratio": "1.71x",
+        "winner": "DuckDB"
+      }
+    ]
+  },
+  {
+    "rowCount": 10000,
+    "timestamp": "2026-01-10T06:09:59.280Z",
+    "commit": "local",
+    "results": [
+      {
+        "query": "Simple SELECT",
+        "rows": 10000,
+        "lanceql": "0.70",
+        "duckdb": "0.94",
+        "ratio": "0.74x",
+        "winner": "LanceQL"
+      },
+      {
+        "query": "Aggregation",
+        "rows": 10000,
+        "lanceql": "0.85",
+        "duckdb": "0.53",
+        "ratio": "1.60x",
+        "winner": "DuckDB"
+      },
+      {
+        "query": "JOIN",
+        "rows": 10000,
+        "lanceql": "2.00",
+        "duckdb": "0.96",
+        "ratio": "2.08x",
+        "winner": "DuckDB"
+      },
+      {
+        "query": "Complex WHERE",
+        "rows": 10000,
+        "lanceql": "1.63",
+        "duckdb": "1.05",
+        "ratio": "1.55x",
+        "winner": "DuckDB"
+      }
+    ]
+  },
+  {
+    "rowCount": 100000,
+    "timestamp": "2026-01-10T06:10:00.933Z",
+    "commit": "local",
+    "results": [
+      {
+        "query": "Simple SELECT",
+        "rows": 100000,
+        "lanceql": "0.89",
+        "duckdb": "4.05",
+        "ratio": "0.22x",
+        "winner": "LanceQL"
+      },
+      {
+        "query": "Aggregation",
+        "rows": 100000,
+        "lanceql": "0.66",
+        "duckdb": "0.70",
+        "ratio": "0.94x",
+        "winner": "LanceQL"
+      },
+      {
+        "query": "JOIN",
+        "rows": 100000,
+        "lanceql": "7.64",
+        "duckdb": "3.16",
+        "ratio": "2.42x",
+        "winner": "DuckDB"
+      },
+      {
+        "query": "Complex WHERE",
+        "rows": 100000,
+        "lanceql": "7.85",
+        "duckdb": "3.20",
+        "ratio": "2.45x",
+        "winner": "DuckDB"
+      }
+    ]
+  },
+  {
+    "rowCount": 1000,
+    "timestamp": "2026-01-10T06:14:47.615Z",
+    "commit": "local",
+    "results": [
+      {
+        "query": "Simple SELECT",
+        "rows": 1000,
+        "lanceql": "0.69",
+        "duckdb": "0.50",
+        "ratio": "1.38x",
+        "winner": "DuckDB"
+      },
+      {
+        "query": "Aggregation",
+        "rows": 1000,
+        "lanceql": "0.68",
+        "duckdb": "0.42",
+        "ratio": "1.62x",
+        "winner": "DuckDB"
+      },
+      {
+        "query": "JOIN",
+        "rows": 1000,
+        "lanceql": "0.84",
+        "duckdb": "0.65",
+        "ratio": "1.29x",
+        "winner": "DuckDB"
+      },
+      {
+        "query": "Complex WHERE",
+        "rows": 1000,
+        "lanceql": "0.90",
+        "duckdb": "0.61",
+        "ratio": "1.48x",
+        "winner": "DuckDB"
+      }
+    ]
+  },
+  {
+    "rowCount": 10000,
+    "timestamp": "2026-01-10T06:14:48.381Z",
+    "commit": "local",
+    "results": [
+      {
+        "query": "Simple SELECT",
+        "rows": 10000,
+        "lanceql": "0.70",
+        "duckdb": "0.94",
+        "ratio": "0.74x",
+        "winner": "LanceQL"
+      },
+      {
+        "query": "Aggregation",
+        "rows": 10000,
+        "lanceql": "0.85",
+        "duckdb": "0.47",
+        "ratio": "1.81x",
+        "winner": "DuckDB"
+      },
+      {
+        "query": "JOIN",
+        "rows": 10000,
+        "lanceql": "2.04",
+        "duckdb": "1.05",
+        "ratio": "1.94x",
+        "winner": "DuckDB"
+      },
+      {
+        "query": "Complex WHERE",
+        "rows": 10000,
+        "lanceql": "1.69",
+        "duckdb": "0.95",
+        "ratio": "1.78x",
+        "winner": "DuckDB"
+      }
+    ]
+  },
+  {
+    "rowCount": 100000,
+    "timestamp": "2026-01-10T06:14:50.098Z",
+    "commit": "local",
+    "results": [
+      {
+        "query": "Simple SELECT",
+        "rows": 100000,
+        "lanceql": "0.82",
+        "duckdb": "4.25",
+        "ratio": "0.19x",
+        "winner": "LanceQL"
+      },
+      {
+        "query": "Aggregation",
+        "rows": 100000,
+        "lanceql": "0.69",
+        "duckdb": "0.73",
+        "ratio": "0.95x",
+        "winner": "LanceQL"
+      },
+      {
+        "query": "JOIN",
+        "rows": 100000,
+        "lanceql": "7.45",
+        "duckdb": "3.13",
+        "ratio": "2.38x",
+        "winner": "DuckDB"
+      },
+      {
+        "query": "Complex WHERE",
+        "rows": 100000,
+        "lanceql": "7.65",
+        "duckdb": "3.22",
+        "ratio": "2.38x",
+        "winner": "DuckDB"
+      }
+    ]
   }
 ]

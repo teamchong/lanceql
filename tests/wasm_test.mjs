@@ -62,7 +62,7 @@ function assertFloatArrayEqual(actual, expected, message, tolerance = 1e-6) {
 const wasmBytes = fs.readFileSync(WASM_PATH);
 const wasm = new WebAssembly.Instance(new WebAssembly.Module(wasmBytes), {
     env: {
-        log_value: () => {},
+        js_log: () => {},
         opfs_open: () => 0,
         opfs_close: () => {},
         opfs_size: () => 0,

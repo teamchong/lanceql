@@ -1,0 +1,22 @@
+# Test files
+tests/
+test-results/
+playwright-report/
+playwright.config.js
+
+# Temp files
+*.txt
+benchmark-results.json
+
+# Source maps (optional - remove if you want them published)
+# dist/*.map
+
+# Build config
+esbuild.config.js
+scripts/
+
+# Packages (symlink)
+packages/
+
+# Source (dist is published)
+src/

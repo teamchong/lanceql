@@ -8,4 +8,8 @@ node_modules/
 # Build outputs
 dist/
 *.tsbuildinfo
-test-results/
+
+# Temp files
+*.txt
+benchmark-results.json
+logs.test

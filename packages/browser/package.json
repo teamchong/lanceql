@@ -12,23 +12,6 @@
       "require": "./dist/lanceql.js",
       "types": "./dist/lanceql.d.ts"
     },
-    "./browser": {
-      "import": "./dist/lanceql.esm.js",
-      "require": "./dist/lanceql.js",
-      "types": "./dist/lanceql.d.ts"
-    },
-    "./browser/react": {
-      "import": "./dist/react.js",
-      "types": "./dist/react.d.ts"
-    },
-    "./browser/svelte": {
-      "import": "./dist/svelte.js",
-      "types": "./dist/svelte.d.ts"
-    },
-    "./browser/vue": {
-      "import": "./dist/vue.js",
-      "types": "./dist/vue.d.ts"
-    },
     "./wasm": "./dist/lanceql.wasm"
   },
   "files": [

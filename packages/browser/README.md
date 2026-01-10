@@ -22,7 +22,7 @@ npm install @metal0/lanceql
 ### Local SQL Database
 
 ```javascript
-import { vault } from '@metal0/lanceql/browser';
+import { vault } from '@metal0/lanceql';
 
 const v = await vault();
 await v.exec('CREATE TABLE users (id INT, name TEXT)');
@@ -34,7 +34,7 @@ const result = await v.query('SELECT * FROM users');
 ### Remote Lance Dataset
 
 ```javascript
-import { LanceQL } from '@metal0/lanceql/browser';
+import { LanceQL } from '@metal0/lanceql';
 
 const lanceql = await LanceQL.load();
 const dataset = await lanceql.openDataset('https://example.com/data.lance');
@@ -46,28 +46,100 @@ const similar = await dataset.executeSQL(`
 `);
 ```
 
+## Framework Integration
+
+### React
+
+```jsx
+import { useState, useEffect } from 'react';
+import { vault } from '@metal0/lanceql';
+
+function useQuery(sql) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    vault().then(v => v.query(sql)).then(setData).finally(() => setLoading(false));
+  }, [sql]);
+
+  return { data, loading };
+}
+
+function UserList() {
+  const { data, loading } = useQuery('SELECT * FROM users LIMIT 10');
+  if (loading) return <div>Loading...</div>;
+  return <ul>{data.rows.map(([id, name]) => <li key={id}>{name}</li>)}</ul>;
+}
+```
+
+### Vue
+
+```vue
+<script setup>
+import { ref, onMounted } from 'vue';
+import { vault } from '@metal0/lanceql';
+
+const users = ref([]);
+
+onMounted(async () => {
+  const v = await vault();
+  const result = await v.query('SELECT * FROM users LIMIT 10');
+  users.value = result.rows;
+});
+</script>
+
+<template>
+  <ul>
+    <li v-for="[id, name] in users" :key="id">{{ name }}</li>
+  </ul>
+</template>
+```
+
+### Svelte
+
+```svelte
+<script>
+  import { onMount } from 'svelte';
+  import { vault } from '@metal0/lanceql';
+
+  let users = [];
+
+  onMount(async () => {
+    const v = await vault();
+    const result = await v.query('SELECT * FROM users LIMIT 10');
+    users = result.rows;
+  });
+</script>
+
+<ul>
+  {#each users as [id, name]}
+    <li>{name}</li>
+  {/each}
+</ul>
+```
+
 ## API Exports
 
 ```javascript
-// Core (use these)
-import { vault, LanceQL } from '@metal0/lanceql/browser';
+// Core
+import { vault, LanceQL } from '@metal0/lanceql';
 
 // Advanced
 import {
-  Vault,          // Vault class
-  TableRef,       // Table reference
-  LocalDatabase,  // Lower-level DB
+  Vault,              // Vault class
+  TableRef,           // Table reference
+  LocalDatabase,      // Lower-level DB
   RemoteLanceDataset  // Direct remote access
-} from '@metal0/lanceql/browser';
+} from '@metal0/lanceql';
 
 // GPU Acceleration (optional)
 import {
-  getGPUJoiner,   // GPU hash joins
-  getGPUSorter,   // GPU bitonic sort
-  getGPUGrouper,  // GPU GROUP BY
-  getGPUVectorSearch,  // GPU vector ops
-  DistanceMetric  // COSINE, L2, DOT_PRODUCT
-} from '@metal0/lanceql/browser';
+  getGPUJoiner,       // GPU hash joins
+  getGPUSorter,       // GPU bitonic sort
+  getGPUGrouper,      // GPU GROUP BY
+  getGPUVectorSearch, // GPU vector ops
+  DistanceMetric      // COSINE, L2, DOT_PRODUCT
+} from '@metal0/lanceql';
 ```
 
 ## CSS-Driven (Zero JavaScript)
