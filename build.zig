@@ -5,9 +5,24 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     // === Platform Detection (comptime) ===
-    // Auto-detect Metal support on macOS
+    // Auto-detect Metal support on macOS (legacy, being replaced by wgpu)
     const use_metal = target.result.os.tag == .macos;
     const use_accelerate = target.result.os.tag == .macos;
+
+    // === wgpu-native (cross-platform GPU) ===
+    // Replaces Metal with cross-platform WebGPU via wgpu-native
+    // Uses same WGSL shaders as browser for code sharing
+    const wgpu_dep = b.dependency("wgpu_native_zig", .{ .target = target });
+    const wgpu_mod = wgpu_dep.module("wgpu");
+
+    // GPU module - cross-platform GPU acceleration
+    const gpu_mod = b.addModule("lanceql.gpu", .{
+        .root_source_file = b.path("src/gpu/gpu.zig"),
+        .imports = &.{
+            .{ .name = "wgpu", .module = wgpu_mod },
+        },
+    });
+    _ = gpu_mod; // Used in Phase 5 when replacing Metal
 
     // === Optional ONNX Runtime Support ===
     // Enable with: zig build -Donnx=/path/to/onnxruntime
