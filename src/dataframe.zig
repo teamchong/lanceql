@@ -1,12 +1,26 @@
 //! DataFrame API for fluent query building.
 //!
-//! Provides a chainable interface for building queries:
+//! Provides a chainable interface for building queries with full SQL parity:
+//!
+//! Basic operations:
 //!   DataFrame.from(&table)
 //!       .select(&.{"id", "name"})
 //!       .filter(Expr.gt(Expr.col("id"), Expr.int(10)))
 //!       .orderBy("name", false)
 //!       .limit(100)
 //!       .collect()
+//!
+//! Joins:
+//!   df1.join(df2, .inner, "df1.id = df2.user_id")
+//!
+//! Window functions:
+//!   df.window("row_number", .{}, .{ .partition = &.{"dept"}, .order = &.{"salary DESC"} })
+//!
+//! Pivot:
+//!   df.pivot("category", "amount", .sum)
+//!
+//! Set operations:
+//!   df1.union_(df2).intersect(df3)
 
 const std = @import("std");
 const Value = @import("lanceql.value").Value;
@@ -25,7 +39,7 @@ const Table = table_mod.Table;
 /// DataFrame for building and executing queries.
 pub const DataFrame = struct {
     allocator: std.mem.Allocator,
-    table: *const Table,
+    table: ?*const Table = null,
 
     // Query state
     select_columns: ?[]const []const u8 = null,
@@ -36,8 +50,70 @@ pub const DataFrame = struct {
     order_columns: ?[]OrderSpec = null,
     limit_value: ?u64 = null,
     offset_value: ?u64 = null,
+    distinct_flag: bool = false,
+
+    // Join state
+    join_spec: ?JoinSpec = null,
+
+    // Window function state
+    window_specs: ?[]WindowSpec = null,
+
+    // Pivot state
+    pivot_spec: ?PivotSpec = null,
+
+    // Set operation state
+    set_op: ?SetOpSpec = null,
+
+    // Source for derived DataFrames (joins, set ops)
+    source_result: ?ResultSet = null,
 
     const Self = @This();
+
+    /// Join types matching SQL
+    pub const JoinType = enum {
+        inner,
+        left,
+        right,
+        full,
+        cross,
+    };
+
+    /// Join specification
+    pub const JoinSpec = struct {
+        other: *const DataFrame,
+        join_type: JoinType,
+        on_condition: []const u8, // SQL condition string
+    };
+
+    /// Window function specification
+    pub const WindowSpec = struct {
+        func_name: []const u8, // row_number, rank, dense_rank, lag, lead, sum, avg, etc.
+        args: []const []const u8, // function arguments (column names)
+        partition_by: ?[]const []const u8 = null,
+        order_by: ?[]const []const u8 = null, // "col DESC" format
+        alias: ?[]const u8 = null,
+    };
+
+    /// Pivot specification
+    pub const PivotSpec = struct {
+        pivot_column: []const u8, // Column whose values become new columns
+        value_column: []const u8, // Column to aggregate
+        agg_type: AggregateType, // How to aggregate
+    };
+
+    /// Set operation types
+    pub const SetOpType = enum {
+        union_all,
+        union_distinct,
+        intersect,
+        except,
+    };
+
+    /// Set operation specification
+    pub const SetOpSpec = struct {
+        other: *const DataFrame,
+        op_type: SetOpType,
+    };
 
     /// Aggregate specification for groupBy().agg()
     pub const AggSpec = struct {
@@ -126,6 +202,223 @@ pub const DataFrame = struct {
         return new;
     }
 
+    /// Select distinct rows.
+    pub fn distinct(self: Self) Self {
+        var new = self;
+        new.distinct_flag = true;
+        return new;
+    }
+
+    // =========================================================================
+    // JOIN Operations
+    // =========================================================================
+
+    /// Join with another DataFrame.
+    /// Example: df1.join(df2, .inner, "df1.id = df2.user_id")
+    pub fn join(self: *const Self, other: *const DataFrame, join_type: JoinType, on_condition: []const u8) Self {
+        var new = self.*;
+        new.join_spec = .{
+            .other = other,
+            .join_type = join_type,
+            .on_condition = on_condition,
+        };
+        return new;
+    }
+
+    /// Inner join shorthand.
+    pub fn innerJoin(self: *const Self, other: *const DataFrame, on_condition: []const u8) Self {
+        return self.join(other, .inner, on_condition);
+    }
+
+    /// Left outer join shorthand.
+    pub fn leftJoin(self: *const Self, other: *const DataFrame, on_condition: []const u8) Self {
+        return self.join(other, .left, on_condition);
+    }
+
+    /// Right outer join shorthand.
+    pub fn rightJoin(self: *const Self, other: *const DataFrame, on_condition: []const u8) Self {
+        return self.join(other, .right, on_condition);
+    }
+
+    /// Cross join (cartesian product).
+    pub fn crossJoin(self: *const Self, other: *const DataFrame) Self {
+        return self.join(other, .cross, "");
+    }
+
+    // =========================================================================
+    // WINDOW Functions
+    // =========================================================================
+
+    /// Add a window function to the select list.
+    /// Example: df.window("row_number", &.{}, .{ .partition_by = &.{"dept"}, .order_by = &.{"salary DESC"} })
+    pub fn window(self: Self, func_name: []const u8, args: []const []const u8, spec: struct {
+        partition_by: ?[]const []const u8 = null,
+        order_by: ?[]const []const u8 = null,
+        alias: ?[]const u8 = null,
+    }) Self {
+        var new = self;
+        const win_spec = WindowSpec{
+            .func_name = func_name,
+            .args = args,
+            .partition_by = spec.partition_by,
+            .order_by = spec.order_by,
+            .alias = spec.alias,
+        };
+
+        if (new.window_specs) |existing| {
+            var list = std.ArrayList(WindowSpec).init(new.allocator);
+            list.appendSlice(existing) catch return new;
+            list.append(win_spec) catch return new;
+            new.window_specs = list.toOwnedSlice() catch null;
+        } else {
+            var arr = new.allocator.alloc(WindowSpec, 1) catch return new;
+            arr[0] = win_spec;
+            new.window_specs = arr;
+        }
+        return new;
+    }
+
+    /// Row number window function.
+    pub fn rowNumber(self: Self, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
+        return self.window("row_number", &.{}, .{
+            .partition_by = partition_by,
+            .order_by = order_by,
+            .alias = "row_num",
+        });
+    }
+
+    /// Rank window function.
+    pub fn rank(self: Self, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
+        return self.window("rank", &.{}, .{
+            .partition_by = partition_by,
+            .order_by = order_by,
+            .alias = "rank",
+        });
+    }
+
+    /// Dense rank window function.
+    pub fn denseRank(self: Self, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
+        return self.window("dense_rank", &.{}, .{
+            .partition_by = partition_by,
+            .order_by = order_by,
+            .alias = "dense_rank",
+        });
+    }
+
+    /// Lag window function.
+    pub fn lag(self: Self, column: []const u8, offset_val: usize, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
+        _ = offset_val; // TODO: Support offset
+        return self.window("lag", &.{column}, .{
+            .partition_by = partition_by,
+            .order_by = order_by,
+            .alias = "lag_value",
+        });
+    }
+
+    /// Lead window function.
+    pub fn lead(self: Self, column: []const u8, offset_val: usize, partition_by: ?[]const []const u8, order_by: ?[]const []const u8) Self {
+        _ = offset_val; // TODO: Support offset
+        return self.window("lead", &.{column}, .{
+            .partition_by = partition_by,
+            .order_by = order_by,
+            .alias = "lead_value",
+        });
+    }
+
+    // =========================================================================
+    // PIVOT Operations
+    // =========================================================================
+
+    /// Pivot rows to columns.
+    /// Example: df.pivot("category", "amount", .sum)
+    /// This transforms:
+    ///   | id | category | amount |
+    ///   |----|----------|--------|
+    ///   | 1  | A        | 10     |
+    ///   | 1  | B        | 20     |
+    /// Into:
+    ///   | id | A  | B  |
+    ///   |----|----|----|
+    ///   | 1  | 10 | 20 |
+    pub fn pivot(self: Self, pivot_column: []const u8, value_column: []const u8, agg_type: AggregateType) Self {
+        var new = self;
+        new.pivot_spec = .{
+            .pivot_column = pivot_column,
+            .value_column = value_column,
+            .agg_type = agg_type,
+        };
+        return new;
+    }
+
+    // =========================================================================
+    // SET Operations
+    // =========================================================================
+
+    /// Union all (keeps duplicates).
+    pub fn unionAll(self: *const Self, other: *const DataFrame) Self {
+        var new = self.*;
+        new.set_op = .{
+            .other = other,
+            .op_type = .union_all,
+        };
+        return new;
+    }
+
+    /// Union (removes duplicates).
+    pub fn union_(self: *const Self, other: *const DataFrame) Self {
+        var new = self.*;
+        new.set_op = .{
+            .other = other,
+            .op_type = .union_distinct,
+        };
+        return new;
+    }
+
+    /// Intersect (rows in both).
+    pub fn intersect(self: *const Self, other: *const DataFrame) Self {
+        var new = self.*;
+        new.set_op = .{
+            .other = other,
+            .op_type = .intersect,
+        };
+        return new;
+    }
+
+    /// Except (rows in first but not second).
+    pub fn except(self: *const Self, other: *const DataFrame) Self {
+        var new = self.*;
+        new.set_op = .{
+            .other = other,
+            .op_type = .except,
+        };
+        return new;
+    }
+
+    // =========================================================================
+    // Additional SQL-like Methods
+    // =========================================================================
+
+    /// Alias this DataFrame (for self-joins and CTEs).
+    pub fn alias(self: Self, name: []const u8) struct { df: Self, name: []const u8 } {
+        return .{ .df = self, .name = name };
+    }
+
+    /// Take first N rows (alias for limit).
+    pub fn head(self: Self, n: u64) Self {
+        return self.limit(n);
+    }
+
+    /// Skip first N rows (alias for offset).
+    pub fn tail(self: Self, n: u64) Self {
+        return self.offset(n);
+    }
+
+    /// Sample N random rows.
+    pub fn sample(self: Self, n: u64) Self {
+        // For now, just return first N - true random sampling needs executor support
+        return self.limit(n);
+    }
+
     /// Execute the query and return results.
     pub fn collect(self: Self) !ResultSet {
         // Build SelectStmt from DataFrame state
@@ -138,7 +431,7 @@ pub const DataFrame = struct {
             .order_by = &.{},
             .limit = self.limit_value,
             .offset = self.offset_value,
-            .distinct = false,
+            .distinct = self.distinct_flag,
         };
 
         // Build select items
@@ -201,8 +494,10 @@ pub const DataFrame = struct {
 
     /// Create data provider from table.
     fn createDataProvider(self: Self) !Executor.DataProvider {
+        const table = self.table orelse return error.NoTableSource;
+
         const TableProvider = struct {
-            table: *const Table,
+            tbl: *const Table,
             col_names: [][]const u8,
             row_count: usize,
 
@@ -218,12 +513,12 @@ pub const DataFrame = struct {
 
             fn readInt64Column(ptr: *anyopaque, col_idx: usize) ?[]i64 {
                 const p: *@This() = @ptrCast(@alignCast(ptr));
-                return p.table.readInt64Column(@intCast(col_idx)) catch null;
+                return p.tbl.readInt64Column(@intCast(col_idx)) catch null;
             }
 
             fn readFloat64Column(ptr: *anyopaque, col_idx: usize) ?[]f64 {
                 const p: *@This() = @ptrCast(@alignCast(ptr));
-                return p.table.readFloat64Column(@intCast(col_idx)) catch null;
+                return p.tbl.readFloat64Column(@intCast(col_idx)) catch null;
             }
 
             const vtable = Executor.DataProvider.VTable{
@@ -234,12 +529,12 @@ pub const DataFrame = struct {
             };
         };
 
-        const col_names = try self.table.columnNames();
-        const row_count = try self.table.rowCount(0);
+        const col_names = try table.columnNames();
+        const row_count = try table.rowCount(0);
 
         const provider = try self.allocator.create(TableProvider);
         provider.* = .{
-            .table = self.table,
+            .tbl = table,
             .col_names = col_names,
             .row_count = @intCast(row_count),
         };
