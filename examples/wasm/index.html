@@ -2301,24 +2301,44 @@ LIMIT 20</textarea>
         // Expose Alpine globally for Playwright tests
         window.Alpine = Alpine;
 
-        // Import from local lanceql.js (synced from packages/browser/src/lanceql.js)
-        // Run: cp packages/browser/src/lanceql.js examples/wasm/lanceql.js
-        import {
-            LanceQL,
-            SQLExecutor, SQLLexer, SQLParser, initSqlJs,
-            // OPFS and storage APIs
-            OPFSStorage, ChunkedLanceReader, LRUCache,
-            // Memory management
-            MemoryManager,
-            // Unified data access
-            LanceDataBase, OPFSLanceData, RemoteLanceData,
-            // Local database
-            LocalDatabase
-        } from './lanceql.js';
+        // Import from local lanceql.js (synced from packages/browser build)
+        // Only public API exports are available
+        import { vault, LanceQL } from './lanceql.js';
 
-        // Create instances (not exported from lanceql.js, only classes)
-        const opfsStorage = new OPFSStorage();
-        const memoryManager = new MemoryManager();
+        // Simple OPFS support check (no internal OPFSStorage needed)
+        const opfsStorage = {
+            async isSupported() {
+                return typeof navigator !== 'undefined' &&
+                       navigator.storage &&
+                       typeof navigator.storage.getDirectory === 'function';
+            },
+            async getStats() {
+                if (!await this.isSupported()) return { used: 0, available: 0 };
+                try {
+                    const estimate = await navigator.storage.estimate();
+                    return { used: estimate.usage || 0, available: estimate.quota || 0 };
+                } catch { return { used: 0, available: 0 }; }
+            },
+            async listFiles() {
+                // Simplified - full file listing requires internal API
+                return [];
+            },
+            async delete() { /* no-op for simplified demo */ },
+            async clearAll() { return 0; },
+            async save() { /* no-op */ },
+            async load() { return null; }
+        };
+
+        // Helper to extract URL from read_lance('url') syntax
+        function extractUrlFromSql(sql) {
+            const match = sql.match(/read_lance\s*\(\s*['"]([^'"]+)['"]/i);
+            return match ? match[1] : null;
+        }
+
+        // Helper to check if SQL uses read_lance()
+        function hasRemoteUrl(sql) {
+            return /read_lance\s*\(/i.test(sql);
+        }
 
         let lanceql;
 
@@ -4046,18 +4066,15 @@ LIMIT 20`;
             try {
                 setLoading(true);
 
-                // Pre-parse SQL to check for URL in FROM clause
-                const lexer = new SQLLexer(sql);
-                const tokens = lexer.tokenize();
-                const parser = new SQLParser(tokens);
-                const ast = parser.parse();
+                // Check for read_lance('url') in SQL using regex
+                const extractedUrl = extractUrlFromSql(sql);
 
                 // If FROM clause has URL, load dataset first
                 let targetFile = currentFile;
-                if (ast.from && ast.from.type === 'url' && ast.from.url) {
-                    const url = ast.from.url;
-                    const version = ast.from.version || null;
-                    const versionMsg = version ? ` (v${version})` : '';
+                if (extractedUrl) {
+                    const url = extractedUrl;
+                    const version = null; // Version parsing would need full parser
+                    const versionMsg = '';
                     showStatus(`Loading dataset from ${url}${versionMsg}...`, 'info');
 
                     // Load dataset (detect if it's a dataset or single file)
