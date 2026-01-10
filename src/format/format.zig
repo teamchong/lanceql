@@ -11,6 +11,7 @@ pub const footer = @import("footer.zig");
 pub const version = @import("version.zig");
 pub const lance_file = @import("lance_file.zig");
 pub const lazy_lance_file = @import("lazy_lance_file.zig");
+pub const manifest = @import("manifest.zig");
 
 // Parquet format
 pub const parquet_metadata = @import("parquet_metadata.zig");
@@ -24,6 +25,11 @@ pub const FOOTER_SIZE = footer.FOOTER_SIZE;
 pub const LanceFile = lance_file.LanceFile;
 pub const readFile = lance_file.readFile;
 pub const LazyLanceFile = lazy_lance_file.LazyLanceFile;
+pub const Manifest = manifest.Manifest;
+pub const Fragment = manifest.Fragment;
+pub const loadManifest = manifest.loadManifest;
+pub const listVersions = manifest.listVersions;
+pub const latestVersion = manifest.latestVersion;
 
 // Re-export Parquet types
 pub const ParquetFile = parquet_file.ParquetFile;

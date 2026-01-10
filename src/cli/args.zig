@@ -20,6 +20,8 @@ pub const Command = enum {
     transform,
     enrich,
     serve,
+    history,
+    diff,
     help,
     version,
     none, // No command specified - auto-detect mode
@@ -115,6 +117,24 @@ pub const ServeOptions = struct {
     help: bool = false,
 };
 
+/// History command options
+pub const HistoryOptions = struct {
+    input: ?[]const u8 = null, // Positional: Lance file/table
+    limit: ?usize = null, // --limit N
+    json: bool = false, // --json output
+    help: bool = false,
+};
+
+/// Diff command options
+pub const DiffOptions = struct {
+    input: ?[]const u8 = null, // Positional: Lance file/table
+    from: ?i64 = null, // --from N (version number, or -N for relative)
+    to: ?i64 = null, // --to N (version number, defaults to HEAD)
+    limit: ?usize = null, // --limit N (default 100)
+    json: bool = false, // --json output
+    help: bool = false,
+};
+
 /// Parsed arguments
 pub const Args = struct {
     command: Command,
@@ -124,6 +144,8 @@ pub const Args = struct {
     transform: TransformOptions,
     enrich: EnrichOptions,
     serve: ServeOptions,
+    history: HistoryOptions,
+    diff_opts: DiffOptions,
     remaining: []const []const u8, // Unparsed args
 };
 
@@ -138,6 +160,8 @@ pub fn parse(allocator: std.mem.Allocator) !Args {
         .transform = .{},
         .enrich = .{},
         .serve = .{},
+        .history = .{},
+        .diff_opts = .{},
         .remaining = &[_][]const u8{},
     };
 
@@ -193,6 +217,14 @@ pub fn parse(allocator: std.mem.Allocator) !Args {
         args.command = .serve;
         i += 1;
         try parseServeOptions(&args.serve, argv, &i);
+    } else if (std.mem.eql(u8, cmd_str, "history") or std.mem.eql(u8, cmd_str, "h")) {
+        args.command = .history;
+        i += 1;
+        try parseHistoryOptions(&args.history, argv, &i);
+    } else if (std.mem.eql(u8, cmd_str, "diff") or std.mem.eql(u8, cmd_str, "d")) {
+        args.command = .diff;
+        i += 1;
+        try parseDiffOptions(&args.diff_opts, argv, &i);
     } else if (std.mem.eql(u8, cmd_str, "help")) {
         args.command = .help;
     } else if (std.mem.eql(u8, cmd_str, "version")) {
@@ -379,6 +411,52 @@ fn parseServeOptions(opts: *ServeOptions, argv: []const []const u8, i: *usize) !
     }
 }
 
+fn parseHistoryOptions(opts: *HistoryOptions, argv: []const []const u8, i: *usize) !void {
+    while (i.* < argv.len) : (i.* += 1) {
+        const arg = argv[i.*];
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            opts.help = true;
+        } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--limit")) {
+            i.* += 1;
+            if (i.* < argv.len) {
+                opts.limit = std.fmt.parseInt(usize, argv[i.*], 10) catch null;
+            }
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            opts.json = true;
+        } else if (!std.mem.startsWith(u8, arg, "-")) {
+            if (opts.input == null) opts.input = arg;
+        }
+    }
+}
+
+fn parseDiffOptions(opts: *DiffOptions, argv: []const []const u8, i: *usize) !void {
+    while (i.* < argv.len) : (i.* += 1) {
+        const arg = argv[i.*];
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            opts.help = true;
+        } else if (std.mem.eql(u8, arg, "--from") or std.mem.eql(u8, arg, "-f")) {
+            i.* += 1;
+            if (i.* < argv.len) {
+                opts.from = std.fmt.parseInt(i64, argv[i.*], 10) catch null;
+            }
+        } else if (std.mem.eql(u8, arg, "--to") or std.mem.eql(u8, arg, "-t")) {
+            i.* += 1;
+            if (i.* < argv.len) {
+                opts.to = std.fmt.parseInt(i64, argv[i.*], 10) catch null;
+            }
+        } else if (std.mem.eql(u8, arg, "-l") or std.mem.eql(u8, arg, "--limit")) {
+            i.* += 1;
+            if (i.* < argv.len) {
+                opts.limit = std.fmt.parseInt(usize, argv[i.*], 10) catch null;
+            }
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            opts.json = true;
+        } else if (!std.mem.startsWith(u8, arg, "-")) {
+            if (opts.input == null) opts.input = arg;
+        }
+    }
+}
+
 // Re-export help functions for backward compatibility
 pub const printHelp = help.printHelp;
 pub const printQueryHelp = help.printQueryHelp;
@@ -386,6 +464,8 @@ pub const printIngestHelp = help.printIngestHelp;
 pub const printServeHelp = help.printServeHelp;
 pub const printTransformHelp = help.printTransformHelp;
 pub const printEnrichHelp = help.printEnrichHelp;
+pub const printHistoryHelp = help.printHistoryHelp;
+pub const printDiffHelp = help.printDiffHelp;
 
 // ============================================================================
 // Tests

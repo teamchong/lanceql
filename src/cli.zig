@@ -91,6 +91,20 @@ pub fn main() !void {
             }
             try cmdServe(allocator, parsed.serve);
         },
+        .history => {
+            if (parsed.global.help or parsed.history.help) {
+                args.printHistoryHelp();
+                return;
+            }
+            try cmdHistory(allocator, parsed.history);
+        },
+        .diff => {
+            if (parsed.global.help or parsed.diff_opts.help) {
+                args.printDiffHelp();
+                return;
+            }
+            try cmdDiff(allocator, parsed.diff_opts);
+        },
         .none => {
             // No command - auto-detect mode
             // Check for config file or start serve
@@ -211,6 +225,186 @@ fn cmdServe(allocator: std.mem.Allocator, opts: args.ServeOptions) !void {
         std.debug.print("Serve command failed: {}\n", .{err});
         return err;
     };
+}
+
+/// History command - show version history for a Lance table
+fn cmdHistory(allocator: std.mem.Allocator, opts: args.HistoryOptions) !void {
+    const table_path = opts.input orelse {
+        args.printHistoryHelp();
+        return;
+    };
+
+    // Load the Lance file
+    const data = file_utils.openFileOrDataset(allocator, table_path) orelse {
+        std.debug.print("Error opening '{s}': file not found or unreadable\n", .{table_path});
+        return;
+    };
+    defer allocator.free(data);
+
+    // Initialize table
+    var table = Table.init(allocator, data) catch |err| {
+        std.debug.print("Error loading Lance file '{s}': {}\n", .{ table_path, err });
+        return;
+    };
+    defer table.deinit();
+
+    // Create executor with dataset path for manifest access
+    var exec = executor.Executor.init(&table, allocator);
+    defer exec.deinit();
+    exec.setDatasetPath(table_path);
+
+    // Build and parse SQL query
+    var sql_buf: [1024]u8 = undefined;
+    const sql = if (opts.limit) |limit|
+        std.fmt.bufPrint(&sql_buf, "SHOW VERSIONS FOR t LIMIT {d}", .{limit}) catch {
+            std.debug.print("Error: Query too long\n", .{});
+            return;
+        }
+    else
+        std.fmt.bufPrint(&sql_buf, "SHOW VERSIONS FOR t", .{}) catch {
+            std.debug.print("Error: Query too long\n", .{});
+            return;
+        };
+
+    // Parse and execute
+    const parsed = tokenizeAndParse(allocator, sql) catch |err| {
+        std.debug.print("Parse error: {}\n", .{err});
+        return;
+    };
+    var tokens = parsed.tokens;
+    defer tokens.deinit(allocator);
+
+    const stmt_result = exec.executeStatement(&parsed.stmt, &[_]ast.Value{}) catch |err| {
+        std.debug.print("Execution error: {}\n", .{err});
+        return;
+    };
+
+    // Output results
+    switch (stmt_result) {
+        .versions_list => |versions| {
+            if (opts.json) {
+                outputVersionsJson(versions);
+            } else {
+                outputVersionsTable(versions);
+            }
+            allocator.free(versions);
+        },
+        else => {
+            std.debug.print("Unexpected result type\n", .{});
+        },
+    }
+}
+
+/// Diff command - show differences between versions
+fn cmdDiff(allocator: std.mem.Allocator, opts: args.DiffOptions) !void {
+    const table_path = opts.input orelse {
+        args.printDiffHelp();
+        return;
+    };
+
+    const from_version = opts.from orelse {
+        std.debug.print("Error: --from version is required\n\n", .{});
+        args.printDiffHelp();
+        return;
+    };
+
+    // Load the Lance file
+    const data = file_utils.openFileOrDataset(allocator, table_path) orelse {
+        std.debug.print("Error opening '{s}': file not found or unreadable\n", .{table_path});
+        return;
+    };
+    defer allocator.free(data);
+
+    // Initialize table
+    var table = Table.init(allocator, data) catch |err| {
+        std.debug.print("Error loading Lance file '{s}': {}\n", .{ table_path, err });
+        return;
+    };
+    defer table.deinit();
+
+    // Create executor with dataset path for manifest access
+    var exec = executor.Executor.init(&table, allocator);
+    defer exec.deinit();
+    exec.setDatasetPath(table_path);
+
+    // Build SQL query
+    var sql_buf: [1024]u8 = undefined;
+    const limit = opts.limit orelse 100;
+
+    const sql = if (opts.to) |to_version|
+        std.fmt.bufPrint(&sql_buf, "DIFF t VERSION {d} AND VERSION {d} LIMIT {d}", .{ from_version, to_version, limit }) catch {
+            std.debug.print("Error: Query too long\n", .{});
+            return;
+        }
+    else
+        std.fmt.bufPrint(&sql_buf, "DIFF t VERSION {d} AND VERSION HEAD LIMIT {d}", .{ from_version, limit }) catch {
+            std.debug.print("Error: Query too long\n", .{});
+            return;
+        };
+
+    // Parse and execute
+    const parsed = tokenizeAndParse(allocator, sql) catch |err| {
+        std.debug.print("Parse error: {}\n", .{err});
+        return;
+    };
+    var tokens = parsed.tokens;
+    defer tokens.deinit(allocator);
+
+    const stmt_result = exec.executeStatement(&parsed.stmt, &[_]ast.Value{}) catch |err| {
+        std.debug.print("Execution error: {}\n", .{err});
+        return;
+    };
+
+    // Output results
+    switch (stmt_result) {
+        .diff_result => |diff| {
+            if (opts.json) {
+                outputDiffJson(&diff);
+            } else {
+                outputDiffTable(&diff);
+            }
+        },
+        else => {
+            std.debug.print("Unexpected result type\n", .{});
+        },
+    }
+}
+
+/// Output version list as JSON
+fn outputVersionsJson(versions: []const executor.Executor.VersionInfo) void {
+    std.debug.print("[", .{});
+    for (versions, 0..) |v, i| {
+        if (i > 0) std.debug.print(",", .{});
+        std.debug.print("\n  {{\"version\":{d},\"timestamp\":{d},\"operation\":\"{s}\",\"rowCount\":{d},\"delta\":\"{s}\"}}", .{ v.version, v.timestamp, v.operation, v.row_count, v.delta });
+    }
+    std.debug.print("\n]\n", .{});
+}
+
+/// Output version list as table
+fn outputVersionsTable(versions: []const executor.Executor.VersionInfo) void {
+    std.debug.print("version | timestamp                 | operation | rowCount | delta\n", .{});
+    std.debug.print("--------|---------------------------|-----------|----------|------\n", .{});
+    for (versions) |v| {
+        std.debug.print("{d:>7} | {s:<25} | {s:<9} | {d:>8} | {s}\n", .{ v.version, v.timestamp_str, v.operation, v.row_count, v.delta });
+    }
+}
+
+/// Output diff result as JSON
+fn outputDiffJson(diff: *const executor.Executor.DiffResult) void {
+    std.debug.print("{{\"fragments_added\":{d},\"rows_added\":{d},\"fragments_deleted\":{d},\"rows_deleted\":{d}}}\n", .{
+        diff.fragments_added,
+        diff.rows_added,
+        diff.fragments_deleted,
+        diff.rows_deleted,
+    });
+}
+
+/// Output diff result as table
+fn outputDiffTable(diff: *const executor.Executor.DiffResult) void {
+    std.debug.print("=== Diff v{d} → v{d} (fragment-level) ===\n", .{ diff.from_version, diff.to_version });
+    std.debug.print("Fragments added:   {d} ({d} rows)\n", .{ diff.fragments_added, diff.rows_added });
+    std.debug.print("Fragments deleted: {d} ({d} rows)\n", .{ diff.fragments_deleted, diff.rows_deleted });
+    std.debug.print("\nNote: Row-level diff (showing actual changed data) not yet implemented.\n", .{});
 }
 
 /// Run pipeline from config file

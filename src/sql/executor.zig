@@ -115,6 +115,10 @@ pub const Executor = struct {
     /// Key: "table_name.column_name", Value: VectorIndexInfo
     vector_indexes: std.StringHashMap(VectorIndexInfo),
 
+    /// Dataset path for accessing _versions/ manifests
+    /// Set via setDatasetPath() after initialization
+    dataset_path: ?[]const u8 = null,
+
     const Self = @This();
 
     /// Vector index metadata
@@ -212,6 +216,13 @@ pub const Executor = struct {
             .xlsx => |*t| self.xlsx_table = t,
         }
         return self;
+    }
+
+    /// Set the dataset path for manifest access (required for DIFF/SHOW VERSIONS)
+    /// The path should be the root of the Lance dataset (e.g., "data.lance")
+    /// not a specific .lance fragment file.
+    pub fn setDatasetPath(self: *Self, path: []const u8) void {
+        self.dataset_path = path;
     }
 
     // ========================================================================
@@ -1657,21 +1668,32 @@ pub const Executor = struct {
         from_version: u32,
         /// To version number (resolved)
         to_version: u32,
+        /// Number of fragments added
+        fragments_added: u32 = 0,
+        /// Number of fragments deleted
+        fragments_deleted: u32 = 0,
+        /// Total rows in added fragments
+        rows_added: u64 = 0,
+        /// Total rows in deleted fragments
+        rows_deleted: u64 = 0,
     };
 
     /// Version info for SHOW VERSIONS result
     pub const VersionInfo = struct {
         version: u32,
-        timestamp: i64, // Unix timestamp
+        timestamp: i64, // Unix timestamp (milliseconds)
+        timestamp_str: []const u8 = "", // ISO 8601 formatted timestamp
         operation: []const u8, // INSERT, DELETE, UPDATE
-        row_count: u32,
+        row_count: u64, // Total rows in this version
         delta: []const u8, // "+3", "-1", etc.
     };
+
+    pub const DropVectorIndexResult = struct { table: []const u8, column: []const u8 };
 
     pub const StatementResult = union(enum) {
         select: Result,
         vector_index_created: VectorIndexInfo,
-        vector_index_dropped: struct { table: []const u8, column: []const u8 },
+        vector_index_dropped: DropVectorIndexResult,
         vector_indexes_list: []const VectorIndexInfo,
         diff_result: DiffResult,
         versions_list: []const VersionInfo,
@@ -1759,7 +1781,7 @@ pub const Executor = struct {
     }
 
     /// Execute DROP VECTOR INDEX statement
-    fn executeDropVectorIndex(self: *Self, stmt: *const ast.DropVectorIndexStmt) !struct { table: []const u8, column: []const u8 } {
+    fn executeDropVectorIndex(self: *Self, stmt: *const ast.DropVectorIndexStmt) !DropVectorIndexResult {
         // Build the index key: "table.column"
         var key_buf: [256]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ stmt.table_name, stmt.column_name }) catch return error.KeyTooLong;
@@ -1785,8 +1807,8 @@ pub const Executor = struct {
 
     /// Execute SHOW VECTOR INDEXES statement
     fn executeShowVectorIndexes(self: *Self, stmt: *const ast.ShowVectorIndexesStmt) ![]const VectorIndexInfo {
-        var results = std.ArrayList(VectorIndexInfo).init(self.allocator);
-        errdefer results.deinit();
+        var results = std.ArrayList(VectorIndexInfo){};
+        errdefer results.deinit(self.allocator);
 
         var it = self.vector_indexes.iterator();
         while (it.next()) |entry| {
@@ -1799,10 +1821,10 @@ pub const Executor = struct {
                 }
             }
 
-            try results.append(info);
+            try results.append(self.allocator, info);
         }
 
-        return results.toOwnedSlice();
+        return results.toOwnedSlice(self.allocator);
     }
 
     /// Get vector index info for a table.column
@@ -1826,13 +1848,10 @@ pub const Executor = struct {
         _ = table_ref; // Will be used when we load manifest to get current version
 
         // Get current version from table (if available)
-        const current_version: u32 = if (self.table) |t| blk: {
-            // Try to get version from table's lance file
-            if (t.lance_file) |lf| {
-                break :blk lf.footer.major_version;
-            }
-            break :blk 1; // Default
-        } else 1;
+        const current_version: u32 = if (self.table) |t|
+            t.lance_file.footer.major_version
+        else
+            1;
 
         return switch (ref) {
             .absolute => |v| v,
@@ -1857,76 +1876,254 @@ pub const Executor = struct {
         const from_version = try self.resolveVersion(stmt.from_version, &stmt.table_ref);
         const to_version = if (stmt.to_version) |tv|
             try self.resolveVersion(tv, &stmt.table_ref)
-        else blk: {
-            // Default to current version (HEAD)
-            if (self.table) |t| {
-                if (t.lance_file) |lf| {
-                    break :blk lf.footer.major_version;
-                }
+        else if (self.table) |t|
+            t.lance_file.footer.major_version
+        else
+            1;
+
+        // Get dataset path
+        const dataset_path = self.dataset_path orelse {
+            // Try to get from table_ref if it's a function call
+            switch (stmt.table_ref) {
+                .function => |func| {
+                    if (func.func.args.len > 0) {
+                        switch (func.func.args[0]) {
+                            .value => |val| switch (val) {
+                                .string => |s| return self.computeDiff(s, from_version, to_version, stmt.limit),
+                                else => {},
+                            },
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
             }
-            break :blk 1;
+            // No path - return empty diff
+            return self.emptyDiffResult(from_version, to_version);
         };
 
-        // For now, return empty results as placeholder
-        // Full implementation requires manifest loading and row comparison
-        // This will be implemented when we add manifest parsing support
+        return self.computeDiff(dataset_path, from_version, to_version, stmt.limit);
+    }
 
-        const empty_columns = try self.allocator.alloc([]const u8, 0);
-        const empty_int_data = try self.allocator.alloc([]const i64, 0);
-        const empty_float_data = try self.allocator.alloc([]const f64, 0);
-        const empty_string_data = try self.allocator.alloc([]const []const u8, 0);
-        const empty_types = try self.allocator.alloc(LanceColumnType, 0);
-
+    /// Create an empty DiffResult
+    fn emptyDiffResult(self: *Self, from_version: u32, to_version: u32) !DiffResult {
         return DiffResult{
             .added = Result{
-                .columns = empty_columns,
-                .int_data = empty_int_data,
-                .float_data = empty_float_data,
-                .string_data = empty_string_data,
-                .column_types = empty_types,
+                .columns = try self.allocator.alloc(Result.Column, 0),
                 .row_count = 0,
+                .allocator = self.allocator,
+                .owns_data = true,
             },
             .deleted = Result{
-                .columns = try self.allocator.alloc([]const u8, 0),
-                .int_data = try self.allocator.alloc([]const i64, 0),
-                .float_data = try self.allocator.alloc([]const f64, 0),
-                .string_data = try self.allocator.alloc([]const []const u8, 0),
-                .column_types = try self.allocator.alloc(LanceColumnType, 0),
+                .columns = try self.allocator.alloc(Result.Column, 0),
                 .row_count = 0,
+                .allocator = self.allocator,
+                .owns_data = true,
             },
             .from_version = from_version,
             .to_version = to_version,
         };
     }
 
-    /// Execute SHOW VERSIONS - list version history with deltas
-    fn executeShowVersions(self: *Self, stmt: *const ast.ShowVersionsStmt) ![]const VersionInfo {
-        _ = stmt; // Will use table_ref to load manifests
+    /// Compute diff between two versions
+    fn computeDiff(self: *Self, dataset_path: []const u8, from_version: u32, to_version: u32, limit: u32) !DiffResult {
+        // Load both manifests
+        var from_manifest = format.manifest.loadManifest(self.allocator, dataset_path, from_version) catch {
+            return self.emptyDiffResult(from_version, to_version);
+        };
+        defer from_manifest.deinit();
 
-        var results = std.ArrayList(VersionInfo).init(self.allocator);
-        errdefer results.deinit();
+        var to_manifest = format.manifest.loadManifest(self.allocator, dataset_path, to_version) catch {
+            return self.emptyDiffResult(from_version, to_version);
+        };
+        defer to_manifest.deinit();
 
-        // Get current version info from table
-        if (self.table) |t| {
-            if (t.lance_file) |lf| {
-                // Add current version entry
-                try results.append(VersionInfo{
-                    .version = lf.footer.major_version,
-                    .timestamp = std.time.timestamp(),
-                    .operation = "CURRENT",
-                    .row_count = @intCast(t.row_count),
-                    .delta = "+0",
-                });
+        // Build sets of fragment paths for comparison
+        var from_fragments = std.StringHashMap(u64).init(self.allocator);
+        defer from_fragments.deinit();
+        for (from_manifest.fragments) |frag| {
+            try from_fragments.put(frag.file_path, frag.physical_rows);
+        }
+
+        var to_fragments = std.StringHashMap(u64).init(self.allocator);
+        defer to_fragments.deinit();
+        for (to_manifest.fragments) |frag| {
+            try to_fragments.put(frag.file_path, frag.physical_rows);
+        }
+
+        // Find added fragments (in to but not in from)
+        var added_rows: u64 = 0;
+        var added_count: u32 = 0;
+        var to_iter = to_fragments.iterator();
+        while (to_iter.next()) |entry| {
+            if (!from_fragments.contains(entry.key_ptr.*)) {
+                added_rows += entry.value_ptr.*;
+                added_count += 1;
             }
         }
 
-        // Full implementation requires:
-        // 1. List _versions/*.manifest files
-        // 2. Parse each manifest for row counts
-        // 3. Calculate deltas between adjacent versions
-        // This placeholder returns basic info from current table
+        // Find deleted fragments (in from but not in to)
+        var deleted_rows: u64 = 0;
+        var deleted_count: u32 = 0;
+        var from_iter = from_fragments.iterator();
+        while (from_iter.next()) |entry| {
+            if (!to_fragments.contains(entry.key_ptr.*)) {
+                deleted_rows += entry.value_ptr.*;
+                deleted_count += 1;
+            }
+        }
 
-        return results.toOwnedSlice();
+        // Apply limit
+        const effective_added = @min(added_rows, limit);
+        const effective_deleted = @min(deleted_rows, limit);
+
+        // Create result columns showing the summary
+        // For v1, we return summary info as a single-column result
+        // Full row-level diff would require loading and comparing actual data
+
+        // Allocate data for added result
+        var added_change_types = try self.allocator.alloc([]const u8, 1);
+        added_change_types[0] = "ADDED";
+        var added_row_counts = try self.allocator.alloc(i64, 1);
+        added_row_counts[0] = @intCast(effective_added);
+
+        var added_columns = try self.allocator.alloc(Result.Column, 2);
+        added_columns[0] = Result.Column{
+            .name = "change_type",
+            .data = .{ .string = added_change_types },
+        };
+        added_columns[1] = Result.Column{
+            .name = "row_count",
+            .data = .{ .int64 = added_row_counts },
+        };
+
+        // Allocate data for deleted result
+        var deleted_change_types = try self.allocator.alloc([]const u8, 1);
+        deleted_change_types[0] = "DELETED";
+        var deleted_row_counts = try self.allocator.alloc(i64, 1);
+        deleted_row_counts[0] = @intCast(effective_deleted);
+
+        var deleted_columns = try self.allocator.alloc(Result.Column, 2);
+        deleted_columns[0] = Result.Column{
+            .name = "change_type",
+            .data = .{ .string = deleted_change_types },
+        };
+        deleted_columns[1] = Result.Column{
+            .name = "row_count",
+            .data = .{ .int64 = deleted_row_counts },
+        };
+
+        return DiffResult{
+            .added = Result{
+                .columns = added_columns,
+                .row_count = if (effective_added > 0) 1 else 0,
+                .allocator = self.allocator,
+                .owns_data = true,
+            },
+            .deleted = Result{
+                .columns = deleted_columns,
+                .row_count = if (effective_deleted > 0) 1 else 0,
+                .allocator = self.allocator,
+                .owns_data = true,
+            },
+            .from_version = from_version,
+            .to_version = to_version,
+            .fragments_added = added_count,
+            .fragments_deleted = deleted_count,
+            .rows_added = added_rows,
+            .rows_deleted = deleted_rows,
+        };
+    }
+
+    /// Execute SHOW VERSIONS - list version history with deltas
+    fn executeShowVersions(self: *Self, stmt: *const ast.ShowVersionsStmt) ![]const VersionInfo {
+        var results = std.ArrayList(VersionInfo){};
+        errdefer results.deinit(self.allocator);
+
+        // Get dataset path from executor or try to extract from table_ref
+        const dataset_path = self.dataset_path orelse {
+            // Fall back to table name if it looks like a path
+            switch (stmt.table_ref) {
+                .function => |func| {
+                    if (func.func.args.len > 0) {
+                        switch (func.func.args[0]) {
+                            .value => |val| switch (val) {
+                                .string => |s| return self.showVersionsFromPath(s, stmt.limit, &results),
+                                else => {},
+                            },
+                            else => {},
+                        }
+                    }
+                },
+                else => {},
+            }
+            // No path available - return empty results
+            return results.toOwnedSlice(self.allocator);
+        };
+
+        return self.showVersionsFromPath(dataset_path, stmt.limit, &results);
+    }
+
+    /// Helper to load version history from a dataset path
+    fn showVersionsFromPath(self: *Self, dataset_path: []const u8, limit: ?u32, results: *std.ArrayList(VersionInfo)) ![]const VersionInfo {
+        // List all versions in the dataset
+        const versions = format.manifest.listVersions(self.allocator, dataset_path) catch {
+            // If we can't list versions (e.g., no _versions dir), return empty results
+            return results.toOwnedSlice(self.allocator);
+        };
+        defer self.allocator.free(versions);
+
+        // Apply limit (descending order - newest first)
+        const max_versions = limit orelse @as(u32, @intCast(versions.len));
+
+        // Process versions in reverse order (newest first) up to limit
+        var count: u32 = 0;
+        var i: usize = versions.len;
+        while (i > 0 and count < max_versions) : (count += 1) {
+            i -= 1;
+            const v = versions[i];
+
+            // Load manifest to get row count and timestamp
+            var manifest = format.manifest.loadManifest(self.allocator, dataset_path, v) catch continue;
+            defer manifest.deinit();
+
+            // Load previous version to calculate delta
+            const prev_row_count: u64 = if (i > 0) blk: {
+                var prev_manifest = format.manifest.loadManifest(self.allocator, dataset_path, versions[i - 1]) catch break :blk 0;
+                defer prev_manifest.deinit();
+                break :blk prev_manifest.total_rows;
+            } else 0;
+
+            // Calculate delta (this version's rows minus previous version's rows)
+            const current_rows = manifest.total_rows;
+            const diff = @as(i64, @intCast(current_rows)) - @as(i64, @intCast(prev_row_count));
+
+            const delta_str = blk: {
+                var buf: [32]u8 = undefined;
+                const len = if (diff >= 0)
+                    std.fmt.bufPrint(&buf, "+{d}", .{@as(u64, @intCast(diff))}) catch break :blk "+0"
+                else
+                    std.fmt.bufPrint(&buf, "{d}", .{diff}) catch break :blk "-0";
+                break :blk self.allocator.dupe(u8, len) catch break :blk "+0";
+            };
+
+            // Determine operation type based on delta
+            const operation = if (diff > 0) "INSERT" else if (diff < 0) "DELETE" else "COMPACT";
+
+            // Format timestamp
+            const timestamp_str = manifest.timestamp.format(self.allocator) catch "unknown";
+
+            try results.append(self.allocator, VersionInfo{
+                .version = @intCast(v),
+                .timestamp_str = timestamp_str,
+                .timestamp = manifest.timestamp.toMillis(),
+                .operation = operation,
+                .row_count = manifest.total_rows,
+                .delta = delta_str,
+            });
+        }
+
+        return results.toOwnedSlice(self.allocator);
     }
 
     /// Execute SHOW CHANGES - list changes since a version
@@ -1938,19 +2135,11 @@ pub const Executor = struct {
         // Return empty result as placeholder
         // Full implementation requires walking version chain
 
-        const empty_columns = try self.allocator.alloc([]const u8, 0);
-        const empty_int_data = try self.allocator.alloc([]const i64, 0);
-        const empty_float_data = try self.allocator.alloc([]const f64, 0);
-        const empty_string_data = try self.allocator.alloc([]const []const u8, 0);
-        const empty_types = try self.allocator.alloc(LanceColumnType, 0);
-
         return Result{
-            .columns = empty_columns,
-            .int_data = empty_int_data,
-            .float_data = empty_float_data,
-            .string_data = empty_string_data,
-            .column_types = empty_types,
+            .columns = try self.allocator.alloc(Result.Column, 0),
             .row_count = 0,
+            .allocator = self.allocator,
+            .owns_data = true,
         };
     }
 

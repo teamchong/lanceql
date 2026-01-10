@@ -17,6 +17,8 @@ pub fn printHelp() void {
         \\  transform, t  Transform Lance data (select, filter, rename)
         \\  enrich, e     Add embeddings and indexes to Lance data
         \\  serve, s      Start interactive web server with WebGPU UI
+        \\  history, h    Show version history for a Lance table
+        \\  diff, d       Show differences between versions
         \\  help          Show this help message
         \\  version       Show version
         \\
@@ -161,6 +163,64 @@ pub fn printEnrichHelp() void {
         \\Examples:
         \\  lanceql enrich data.lance --embed text -o enriched.lance
         \\  lanceql enrich data.parquet --embed desc --model clip -o out.lance
+        \\
+    , .{});
+}
+
+/// Print history command help
+pub fn printHistoryHelp() void {
+    std.debug.print(
+        \\Usage: lanceql history <table.lance> [options]
+        \\
+        \\Show version history for a Lance table.
+        \\
+        \\Options:
+        \\  -l, --limit <N>        Limit to last N versions
+        \\      --json             Output as JSON
+        \\  -h, --help             Show this help
+        \\
+        \\Output columns:
+        \\  version    Version number
+        \\  timestamp  When the version was created
+        \\  operation  Type of operation (INSERT, DELETE, UPDATE)
+        \\  rowCount   Number of rows at this version
+        \\  delta      Change in row count (+N or -N)
+        \\
+        \\Examples:
+        \\  lanceql history users.lance
+        \\  lanceql history users.lance --limit 5
+        \\  lanceql history users.lance --json
+        \\
+    , .{});
+}
+
+/// Print diff command help
+pub fn printDiffHelp() void {
+    std.debug.print(
+        \\Usage: lanceql diff <table.lance> --from <N> [--to <M>] [options]
+        \\
+        \\Show differences between two versions of a Lance table.
+        \\
+        \\Options:
+        \\  -f, --from <N>         Source version (required, or -N for relative)
+        \\  -t, --to <M>           Target version (default: HEAD/current)
+        \\  -l, --limit <N>        Limit output rows (default: 100)
+        \\      --json             Output as JSON
+        \\  -h, --help             Show this help
+        \\
+        \\Version syntax:
+        \\  N                      Absolute version number
+        \\  -N                     Relative: N versions ago (e.g., -1 = previous)
+        \\
+        \\Output columns:
+        \\  change     Type of change (ADD or DELETE)
+        \\  ...        All columns from the table
+        \\
+        \\Examples:
+        \\  lanceql diff users.lance --from 2 --to 3
+        \\  lanceql diff users.lance --from -1          # What changed last?
+        \\  lanceql diff users.lance -f 1               # Changes since version 1
+        \\  lanceql diff users.lance -f 2 --limit 1000
         \\
     , .{});
 }
