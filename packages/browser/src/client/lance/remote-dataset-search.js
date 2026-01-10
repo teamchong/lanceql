@@ -1,4 +1,4 @@
-import { getWebGPUAccelerator } from '../gpu/accelerator.js';
+import { getWebGPUAccelerator } from '../webgpu/index.js';
 
 export async function vectorSearch(dataset, colIdx, queryVec, topK = 10, onProgress = null, options = {}) {
     const { normalized = true, workerPool = null, useIndex = true, nprobe = 20 } = options;

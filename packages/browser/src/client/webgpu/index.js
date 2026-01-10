@@ -10,6 +10,7 @@
  */
 
 export { GPUBufferManager, ModelWeightCache } from './gpu-buffers.js';
+export { WebGPUAccelerator, getWebGPUAccelerator } from './accelerator.js';
 export { GGUFLoader, MODEL_REGISTRY, resolveModelUrl } from './gguf-loader.js';
 export {
     GPUTransformer,

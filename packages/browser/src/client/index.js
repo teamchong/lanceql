@@ -76,6 +76,23 @@ export { RemoteLanceDataset } from './lance/remote-dataset.js';
 export { LocalDatabase } from './database/local-database.js';
 
 // =============================================================================
+// GPU Acceleration (WebGPU)
+// =============================================================================
+
+/**
+ * GPU-accelerated operations for SQL and vector search.
+ * Falls back to CPU if WebGPU is unavailable.
+ */
+export {
+    getGPUAggregator,
+    getGPUSorter,
+    getGPUJoiner,
+    getGPUGrouper,
+    getGPUVectorSearch,
+    DistanceMetric,
+} from './webgpu/index.js';
+
+// =============================================================================
 // Default Export
 // =============================================================================
 

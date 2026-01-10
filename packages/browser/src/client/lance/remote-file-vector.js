@@ -4,7 +4,7 @@
  */
 
 import { batchIndices } from './remote-file-proto.js';
-import { getWebGPUAccelerator } from '../gpu/accelerator.js';
+import { getWebGPUAccelerator } from '../webgpu/index.js';
 
 /**
  * Get vector info for a column via Range requests.

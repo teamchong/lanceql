@@ -148,6 +148,14 @@ export class GPUAggregator {
     }
 
     /**
+     * Check if GPU aggregation is available.
+     * @returns {boolean}
+     */
+    isAvailable() {
+        return this.available;
+    }
+
+    /**
      * Compile reduction shaders.
      * @private
      */
@@ -185,9 +193,9 @@ export class GPUAggregator {
     /**
      * Compute COUNT of non-null values.
      * @param {any[]} values - Input values (nulls excluded)
-     * @returns {Promise<number>} Count result
+     * @returns {number} Count result
      */
-    async count(values) {
+    count(values) {
         // COUNT is always fast on CPU - just return length
         return values.length;
     }

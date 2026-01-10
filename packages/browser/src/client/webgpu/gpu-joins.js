@@ -67,13 +67,13 @@ fn probe(@builtin(global_invocation_id) gid: vec3<u32>) {
 }
 
 @group(0) @binding(0) var<uniform> init_params: InitParams;
-@group(0) @binding(1) var<storage, read_write> init_table: array<u32>;
+@group(0) @binding(1) var<storage, read_write> table_data: array<u32>;
 
 @compute @workgroup_size(256)
-fn init_table(@builtin(global_invocation_id) gid: vec3<u32>) {
+fn clear_table(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= init_params.capacity * 2u) { return; }
-    init_table[idx] = select(0u, 0xFFFFFFFFu, idx % 2u == 0u);
+    table_data[idx] = select(0u, 0xFFFFFFFFu, idx % 2u == 0u);
 }
 `;
 
@@ -137,7 +137,7 @@ export class GPUJoiner {
 
         this.pipelines.set('init', this.device.createComputePipeline({
             layout: 'auto',
-            compute: { module, entryPoint: 'init_table' },
+            compute: { module, entryPoint: 'clear_table' },
         }));
 
         this.pipelines.set('build', this.device.createComputePipeline({

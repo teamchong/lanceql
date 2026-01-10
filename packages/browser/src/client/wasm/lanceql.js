@@ -2,7 +2,7 @@
  * LanceQL - WASM loader and utilities
  */
 
-import { getWebGPUAccelerator } from '../gpu/accelerator.js';
+import { getWebGPUAccelerator } from '../webgpu/index.js';
 import { LanceFile } from '../lance/lance-file.js';
 import { RemoteLanceFile } from '../lance/remote-file.js';
 import { RemoteLanceDataset } from '../lance/remote-dataset.js';

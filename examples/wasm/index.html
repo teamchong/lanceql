@@ -4220,8 +4220,19 @@ LIMIT 20`;
                     return;
                 }
 
-                // Check if this is a vector search query
-                if (ast.search) {
+                // Check if this is a vector search query (NEAR clause)
+                if (query.search || query.searchRow !== undefined) {
+                    // Create minimal AST for vector search
+                    const ast = {
+                        search: {
+                            query: query.search,
+                            searchRow: query.searchRow,
+                            column: query.vectorColumn,
+                            topK: query.topK || 20
+                        },
+                        columns: [{ type: 'star' }],
+                        limit: query.limit
+                    };
                     await runVectorSearchQuery(ast, targetFile);
                     return;
                 }

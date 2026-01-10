@@ -2,8 +2,7 @@
  * LanceFile - In-memory Lance file API
  */
 
-import { getWebGPUAccelerator } from '../gpu/accelerator.js';
-import { getGPUVectorSearch } from '../gpu/vector-search.js';
+import { getWebGPUAccelerator, getGPUVectorSearch } from '../webgpu/index.js';
 
 class LanceFile {
     constructor(lanceql, data) {
