@@ -185,6 +185,16 @@ pub const QueryJitContext = struct {
         try zig_file.writeAll(zig_source);
 
         // Compile with zig build-lib
+        // Explicitly pass env_map to avoid Linux panic when /proc/self/environ is unavailable
+        var env_map = std.process.EnvMap.init(self.allocator);
+        defer env_map.deinit();
+        const env_vars = [_][]const u8{ "PATH", "HOME", "USER", "TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "ZIG_LOCAL_CACHE_DIR", "ZIG_GLOBAL_CACHE_DIR" };
+        for (env_vars) |key| {
+            if (std.posix.getenv(key)) |value| {
+                env_map.put(key, value) catch {};
+            }
+        }
+
         const result = try std.process.Child.run(.{
             .allocator = self.allocator,
             .argv = &.{
@@ -195,6 +205,7 @@ pub const QueryJitContext = struct {
                 "-femit-bin=" ++ lib_path,
                 zig_path,
             },
+            .env_map = &env_map,
         });
         defer self.allocator.free(result.stdout);
         defer self.allocator.free(result.stderr);

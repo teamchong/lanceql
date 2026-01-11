@@ -795,10 +795,21 @@ fn compileLogicTableSubprocess(
         lib_path,
     };
 
+    // Explicitly build env_map to avoid Linux panic when /proc/self/environ is unavailable
+    var env_map = std.process.EnvMap.init(allocator);
+    defer env_map.deinit();
+    const env_vars = [_][]const u8{ "PATH", "HOME", "USER", "TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "ZIG_LOCAL_CACHE_DIR", "ZIG_GLOBAL_CACHE_DIR" };
+    for (env_vars) |key| {
+        if (std.posix.getenv(key)) |value| {
+            env_map.put(key, value) catch {};
+        }
+    }
+
     var child = std.process.Child.init(&argv, allocator);
     child.cwd = metal0_dir;
     child.stderr_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
+    child.env_map = &env_map;
 
     child.spawn() catch return error.CannotSpawnCompiler;
 
@@ -927,9 +938,20 @@ fn jitCompileSource(
         src_path,
     };
 
+    // Explicitly build env_map to avoid Linux panic when /proc/self/environ is unavailable
+    var env_map2 = std.process.EnvMap.init(allocator);
+    defer env_map2.deinit();
+    const env_vars2 = [_][]const u8{ "PATH", "HOME", "USER", "TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "ZIG_LOCAL_CACHE_DIR", "ZIG_GLOBAL_CACHE_DIR" };
+    for (env_vars2) |key| {
+        if (std.posix.getenv(key)) |value| {
+            env_map2.put(key, value) catch {};
+        }
+    }
+
     var child = std.process.Child.init(&argv, allocator);
     child.stderr_behavior = .Pipe;
     child.stdout_behavior = .Ignore;
+    child.env_map = &env_map2;
 
     child.spawn() catch return error.CannotSpawnCompiler;
 

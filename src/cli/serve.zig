@@ -708,7 +708,18 @@ pub fn openBrowser(allocator: std.mem.Allocator, url: []const u8) void {
         else => return,
     };
 
+    // Explicitly build env_map to avoid Linux panic when /proc/self/environ is unavailable
+    var env_map = std.process.EnvMap.init(allocator);
+    defer env_map.deinit();
+    const env_vars = [_][]const u8{ "PATH", "HOME", "USER", "DISPLAY", "XDG_RUNTIME_DIR" };
+    for (env_vars) |key| {
+        if (std.posix.getenv(key)) |value| {
+            env_map.put(key, value) catch {};
+        }
+    }
+
     var child = std.process.Child.init(cmd, allocator);
+    child.env_map = &env_map;
     child.spawn() catch return;
 }
 
