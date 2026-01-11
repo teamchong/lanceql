@@ -1151,6 +1151,42 @@ pub fn build(b: *std.Build) void {
     // Default build includes lib-nodejs
     b.default_step.dependOn(&install_nodejs_lib.step);
 
+    // === Metal Shaders (macOS only) ===
+    // Compiles .metal shader files to .metallib for GPU acceleration
+    const metal_shaders_step = b.step("metal-shaders", "Build Metal shaders (macOS only)");
+    if (target.result.os.tag == .macos) {
+        // Ensure zig-out directory exists
+        const mkdir = b.addSystemCommand(&.{ "mkdir", "-p", "zig-out" });
+
+        // Compile metal0 kernel shaders
+        const metal_kernels = b.addSystemCommand(&.{
+            "xcrun", "-sdk", "macosx", "metal",
+            "-c", "deps/metal0/packages/runtime/src/metal/kernels/metal_kernels.metal",
+            "-o", "zig-out/metal_kernels.air",
+        });
+        metal_kernels.step.dependOn(&mkdir.step);
+
+        const matmul_kernels = b.addSystemCommand(&.{
+            "xcrun", "-sdk", "macosx", "metal",
+            "-c", "deps/metal0/packages/metal/kernels/matmul.metal",
+            "-o", "zig-out/matmul.air",
+        });
+        matmul_kernels.step.dependOn(&mkdir.step);
+
+        // Link into metallib
+        const metallib = b.addSystemCommand(&.{
+            "xcrun", "-sdk", "macosx", "metallib",
+            "zig-out/metal_kernels.air",
+            "zig-out/matmul.air",
+            "-o", "zig-out/lanceql.metallib",
+        });
+        metallib.step.dependOn(&metal_kernels.step);
+        metallib.step.dependOn(&matmul_kernels.step);
+
+        metal_shaders_step.dependOn(&metallib.step);
+    }
+    // On non-macOS, step exists but does nothing
+
     // === Cross-compilation targets for NPM prebuilds ===
     const prebuild_step = b.step("prebuild", "Build prebuilt binaries for all platforms");
 

@@ -43,7 +43,7 @@ jobs:
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libbz2-dev liblzma-dev
+        run: sudo apt-get update && sudo apt-get install -y libbz2-dev liblzma-dev libvulkan-dev
 
       - name: Build metal0 compiler
         run: |
@@ -83,6 +83,10 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev
 
       - name: Run Zig tests
         run: zig build test

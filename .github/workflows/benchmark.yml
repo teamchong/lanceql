@@ -63,7 +63,8 @@ jobs:
           ls -la benchmarks/*.lance benchmarks/*.parquet 2>/dev/null || echo "Some files missing"
 
       - name: Build Metal shaders
-        run: zig build metal-shaders
+        continue-on-error: true
+        run: zig build metal-shaders || echo "Metal shaders skipped (optional)"
 
       - name: Build library and CLI
         run: |
@@ -185,7 +186,12 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev
+
+      - name: Install Python dependencies
         run: |
           pip install polars numpy pyarrow pylance duckdb pandas
 

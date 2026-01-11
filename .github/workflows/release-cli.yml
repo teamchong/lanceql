@@ -44,7 +44,13 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.13.0
+          version: 0.15.2
+
+      - name: Install Vulkan SDK (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev
 
       - name: Build CLI
         run: zig build cli -Doptimize=ReleaseFast
