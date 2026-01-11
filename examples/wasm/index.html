@@ -2034,11 +2034,10 @@
                 <div class="sql-editor">
                     <div class="sql-editor-container">
                         <textarea class="sql-textarea" id="sql-input"
-                            placeholder="SELECT * FROM read_lance('https://...') LIMIT 50">-- 🚀 Push-Down Filtering + JOIN (downloads ~200KB, not 1.5GB!)
-SELECT i.url, i.text, t.text_zh, t.text_es
-FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') i
-JOIN read_lance('https://data.metal0.dev/laion-1m/translations.lance') t ON i.rowid = t.row_id
-WHERE i.embedding NEAR 'sunset'
+                            placeholder="SELECT * FROM read_lance('https://...') LIMIT 50">-- 🔍 Vector Search: Find images similar to "sunset beach"
+SELECT url, text, aesthetic
+FROM read_lance('https://data.metal0.dev/laion-1m/images.lance')
+WHERE embedding NEAR 'sunset beach'
 LIMIT 20</textarea>
                         <div class="sql-highlight" id="sql-highlight" aria-hidden="true"></div>
                     </div>
@@ -2059,7 +2058,7 @@ LIMIT 20</textarea>
                             data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 50">First
                             50</button>
                         <button class="sql-example"
-                            data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/translations.lance') LIMIT 50">Translations</button>
+                            data-sql="SELECT url, text, aesthetic FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') WHERE aesthetic > 6.0 ORDER BY aesthetic DESC LIMIT 20">High Aesthetic</button>
                         <button class="sql-example" id="create-demo-join-table"
                             title="Create small in-memory table for JOIN demo" style="background: #334155;">+ Demo
                             Table</button>
@@ -2820,11 +2819,10 @@ LIMIT 20</textarea>
 
         // Default demo dataset URL - LAION 1M images dataset
         const DEFAULT_DATASET_URL = 'https://data.metal0.dev/laion-1m/images.lance';
-        const DEFAULT_QUERY = `-- 🚀 Push-Down Filtering + JOIN (downloads ~200KB, not 1.5GB!)
-SELECT i.url, i.text, t.text_zh, t.text_es
-FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') i
-JOIN read_lance('https://data.metal0.dev/laion-1m/translations.lance') t ON i.rowid = t.row_id
-WHERE i.embedding NEAR 'sunset'
+        const DEFAULT_QUERY = `-- 🔍 Vector Search: Find images similar to "sunset beach"
+SELECT url, text, aesthetic
+FROM read_lance('https://data.metal0.dev/laion-1m/images.lance')
+WHERE embedding NEAR 'sunset beach'
 LIMIT 20`;
 
         // Initialize
