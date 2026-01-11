@@ -33,7 +33,10 @@ Thumbs.db
 benchmarks/*.lance/
 benchmarks/*.parquet
 benchmarks/*_results.json
-data/
+/data/
+
+# Allow test fixture data
+!tests/fixtures/**/data/
 *.dylib
 *.wasm
 !zig-out/bin/*.wasm
