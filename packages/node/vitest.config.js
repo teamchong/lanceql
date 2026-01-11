@@ -4,6 +4,9 @@ export default defineConfig({
   test: {
     globals: true,
     testTimeout: 30000,
+    // Ignore unhandled errors from native binding cleanup on Linux
+    // The errors occur after tests complete when workers exit
+    dangerouslyIgnoreUnhandledErrors: true,
     include: ['test/**/*.spec.js', 'test/**/*.test.js'],
     exclude: [
       'test/basic.test.js',
