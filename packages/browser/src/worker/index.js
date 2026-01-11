@@ -707,36 +707,138 @@ async function loadOPFSLance(path, limit = 10000) {
             return null;
         }
 
-        // Parse the Lance file - extract schema from metadata
+        // Parse the Lance file footer to get schema
         const view = new DataView(data.buffer, data.byteOffset);
         const footerOffset = data.length - 40;
         const colMetaOffsetsStart = Number(view.getBigUint64(footerOffset + 8, true));
         const numColumns = view.getUint32(footerOffset + 28, true);
 
-        // Build schema from column metadata
+        // Build schema from column metadata (protobuf format)
         const schema = [];
         const columnTypes = [];
         for (let i = 0; i < numColumns; i++) {
             const offsetPos = colMetaOffsetsStart + i * 8;
+            if (offsetPos + 8 > data.length) continue;
             const metaPos = Number(view.getBigUint64(offsetPos, true));
+            if (metaPos >= data.length) continue;
 
             let localOffset = metaPos;
-            // Name
-            data[localOffset++]; // tag
-            const nameLen = data[localOffset++];
-            const name = new TextDecoder().decode(data.slice(localOffset, localOffset + nameLen));
-            localOffset += nameLen;
+            let name = `col_${i}`;
+            let typeStr = 'unknown';
 
-            // Type
-            data[localOffset++]; // tag
-            const typeLen = data[localOffset++];
-            const typeStr = new TextDecoder().decode(data.slice(localOffset, localOffset + typeLen));
+            // Parse protobuf - field 1 is name, field 2 is type
+            while (localOffset < data.length && localOffset < metaPos + 200) {
+                const tagByte = data[localOffset];
+                if (tagByte === 0) break;
+                const fieldNum = tagByte >> 3;
+                const wireType = tagByte & 0x7;
+                localOffset++;
+
+                if (wireType === 2) { // Length-delimited (string)
+                    const len = data[localOffset++];
+                    if (len > 0 && localOffset + len <= data.length) {
+                        const str = new TextDecoder().decode(data.slice(localOffset, localOffset + len));
+                        if (fieldNum === 1) name = str;
+                        else if (fieldNum === 2) typeStr = str;
+                    }
+                    localOffset += len;
+                } else if (wireType === 0) { // Varint
+                    while (localOffset < data.length && (data[localOffset] & 0x80)) localOffset++;
+                    localOffset++;
+                } else if (wireType === 1) { // Fixed 64-bit
+                    localOffset += 8;
+                } else if (wireType === 5) { // Fixed 32-bit
+                    localOffset += 4;
+                } else {
+                    break;
+                }
+            }
 
             schema.push({ name, type: typeStr });
             columnTypes.push(typeStr);
+            console.log(`[Worker] OPFS column ${i}: name=${name}, type=${typeStr}`);
         }
 
-        return parseLanceFileData(data, schema, columnTypes, limit);
+        // Ensure WASM is loaded
+        if (!wasm) {
+            await loadWasm();
+            if (!wasm) throw new Error('WASM not loaded');
+        }
+
+        // Load into WASM memory
+        const dataPtr = wasm.alloc(data.length);
+        if (!dataPtr || dataPtr < 0) {
+            throw new Error('Failed to allocate WASM memory for OPFS file');
+        }
+        new Uint8Array(wasmMemory.buffer, dataPtr, data.length).set(data);
+
+        // Open the file in WASM
+        const openResult = wasm.openFile(dataPtr, data.length);
+        if (openResult === 0) {
+            throw new Error('WASM openFile failed: invalid Lance file');
+        }
+
+        // Get row count from WASM
+        const rowCount = Number(wasm.getRowCount(0));
+        const actualRows = Math.min(rowCount, limit);
+
+        console.log(`[Worker] OPFS file has ${numColumns} columns, ${rowCount} rows, reading ${actualRows}`);
+
+        const columns = {};
+        const columnNames = [];
+
+        // Read columns using WASM with correct names from schema
+        for (let i = 0; i < schema.length; i++) {
+            const { name, type } = schema[i];
+            columnNames.push(name);
+
+            if (type === 'float64' || type === 'double') {
+                const outPtr = wasm.allocFloat64Buffer(actualRows);
+                if (outPtr) {
+                    const count = wasm.readFloat64Column(i, outPtr, actualRows);
+                    columns[name] = new Float64Array(wasmMemory.buffer, outPtr, count).slice();
+                } else {
+                    columns[name] = new Float64Array(actualRows).fill(0);
+                }
+            } else if (type === 'int64') {
+                const outPtr = wasm.allocInt64Buffer(actualRows);
+                if (outPtr) {
+                    const count = wasm.readInt64Column(i, outPtr, actualRows);
+                    const bigArr = new BigInt64Array(wasmMemory.buffer, outPtr, count);
+                    const floatArr = new Float64Array(count);
+                    for (let j = 0; j < count; j++) floatArr[j] = Number(bigArr[j]);
+                    columns[name] = floatArr;
+                } else {
+                    columns[name] = new Float64Array(actualRows).fill(0);
+                }
+            } else if (type === 'string') {
+                // String columns - placeholder for now
+                columns[name] = Array(actualRows).fill('(string)');
+            } else if (type.includes('vector') || type.includes('list')) {
+                // Vector columns - skip
+                columns[name] = [];
+            } else {
+                // Default to float64
+                const outPtr = wasm.allocFloat64Buffer(actualRows);
+                if (outPtr) {
+                    const count = wasm.readFloat64Column(i, outPtr, actualRows);
+                    if (count > 0) {
+                        columns[name] = new Float64Array(wasmMemory.buffer, outPtr, count).slice();
+                    } else {
+                        columns[name] = Array(actualRows).fill('');
+                    }
+                } else {
+                    columns[name] = [];
+                }
+            }
+        }
+
+        // Close the file
+        wasm.closeFile();
+
+        console.log(`[Worker] OPFS read ${actualRows} rows from ${columnNames.length} columns: ${columnNames.join(', ')}`);
+
+        return { columns, rowCount: actualRows, columnNames };
     } catch (e) {
         console.error(`[Worker] Failed to load OPFS Lance:`, e);
         return null;
@@ -799,11 +901,25 @@ async function executeWasmSqlFull(db, sql) {
         }
 
         if (data) {
-            console.log(`[Worker] Registering table ${alias} with ${data.rowCount} rows, columns: ${Object.keys(data.columns).join(', ')}`);
-            executor.registerTable(alias, data.columns, data.rowCount, url);
+            const colNames = Object.keys(data.columns);
+            const nonEmptyCols = colNames.filter(c => {
+                const d = data.columns[c];
+                return d && (Array.isArray(d) ? d.length > 0 : d.length > 0);
+            });
+            console.log(`[Worker] Registering table ${alias} with ${data.rowCount} rows, columns: ${colNames.join(', ')}, non-empty: ${nonEmptyCols.join(', ')}`);
+
+            try {
+                executor.registerTable(alias, data.columns, data.rowCount, url);
+            } catch (regError) {
+                console.error(`[Worker] Registration error for ${alias}:`, regError);
+                throw new Error(`Failed to register table ${alias}: ${regError.message}`);
+            }
+
             // Verify registration succeeded
-            if (!executor.hasTable(alias)) {
-                throw new Error(`Failed to register table ${alias} from ${url}`);
+            const registered = executor.hasTable(alias);
+            console.log(`[Worker] hasTable(${alias}) = ${registered}`);
+            if (!registered) {
+                throw new Error(`Failed to register table ${alias} from ${url} - hasTable returned false`);
             }
         } else {
             const reason = loadError ? loadError.message : 'file may not exist or returned empty data';
