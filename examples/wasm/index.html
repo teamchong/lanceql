@@ -5882,7 +5882,7 @@ LIMIT 20`;
 
         // Run vector search from SQL SEARCH clause
         async function runVectorSearchQuery(ast, targetFile) {
-            const { query, searchRow, encoder, column, topK: searchTopK } = ast.search;
+            const { query, searchRow, encoder = 'minilm', column, topK: searchTopK = 20 } = ast.search;
             const topK = searchTopK || ast.limit || 20;
 
             // Check if this is an aggregation query (COUNT, SUM, etc. with SEARCH)
