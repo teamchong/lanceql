@@ -75,6 +75,24 @@ export { RemoteLanceDataset } from './lance/remote-dataset.js';
  */
 export { LocalDatabase } from './database/local-database.js';
 
+/**
+ * Create Lance files programmatically.
+ * Useful for generating test data or exporting results.
+ *
+ * @example
+ * const writer = new PureLanceWriter();
+ * writer.addStringColumn('name', ['Alice', 'Bob']);
+ * writer.addFloat32Column('embedding', new Float32Array([...]));
+ * const bytes = writer.finalize();
+ * await opfsStorage.save('data.lance', bytes);
+ */
+export { PureLanceWriter } from './storage/lance-writer.js';
+
+/**
+ * OPFS storage for Lance files.
+ */
+export { opfsStorage } from './storage/opfs.js';
+
 // =============================================================================
 // GPU Acceleration (WebGPU)
 // =============================================================================

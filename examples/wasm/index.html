@@ -2060,7 +2060,7 @@ LIMIT 20</textarea>
                         <button class="sql-example"
                             data-sql="SELECT url, text, aesthetic FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') WHERE aesthetic > 6.0 ORDER BY aesthetic DESC LIMIT 20">High Aesthetic</button>
                         <button class="sql-example" id="create-demo-join-table"
-                            title="Create small in-memory table for JOIN demo" style="background: #334155;">+ Demo
+                            title="Create emoji.lance with embeddings for vector JOIN demo" style="background: #334155;">+ Emoji
                             Table</button>
                         <button class="sql-example copy-link-btn" id="copy-link-btn" title="Copy shareable link">
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -2302,7 +2302,7 @@ LIMIT 20</textarea>
 
         // Import from local lanceql.js (synced from packages/browser build)
         // Only public API exports are available
-        import { vault, LanceQL } from './lanceql.js';
+        import { vault, LanceQL, PureLanceWriter, opfsStorage as lanceOpfsStorage } from './lanceql.js';
 
         // Simple OPFS support check (no internal OPFSStorage needed)
         const opfsStorage = {
@@ -6320,45 +6320,95 @@ LIMIT 20`;
             btn.textContent = 'Creating...';
 
             try {
-                showStatus('Creating demo translations table...', 'info');
+                showStatus('Creating emoji table with embeddings...', 'info');
 
-                if (!demoTableDb) {
-                    demoTableDb = new LocalDatabase();
+                // Emoji data with semantic descriptions
+                const emojiData = [
+                    { emoji: '🌅', description: 'sunset sunrise dawn sky' },
+                    { emoji: '🏖️', description: 'beach ocean sand vacation' },
+                    { emoji: '🌊', description: 'wave ocean water sea' },
+                    { emoji: '🏔️', description: 'mountain peak summit snow' },
+                    { emoji: '🌲', description: 'tree forest nature pine' },
+                    { emoji: '🌸', description: 'flower cherry blossom spring' },
+                    { emoji: '🐕', description: 'dog puppy pet animal' },
+                    { emoji: '🐈', description: 'cat kitten pet feline' },
+                    { emoji: '🍕', description: 'pizza food italian cheese' },
+                    { emoji: '🚗', description: 'car vehicle driving road' },
+                    { emoji: '✈️', description: 'airplane flight travel sky' },
+                    { emoji: '🏠', description: 'house home building residence' },
+                    { emoji: '👨‍👩‍👧', description: 'family people parents child' },
+                    { emoji: '🎨', description: 'art painting creative color' },
+                    { emoji: '🎵', description: 'music song melody audio' },
+                    { emoji: '📚', description: 'books reading library education' },
+                    { emoji: '💻', description: 'computer laptop technology work' },
+                    { emoji: '🌙', description: 'moon night dark evening' },
+                    { emoji: '☀️', description: 'sun bright sunny day' },
+                    { emoji: '🌈', description: 'rainbow colors sky weather' },
+                ];
+
+                // Load MiniLM model for embeddings
+                if (!minilmModelLoaded) {
+                    showStatus('Loading MiniLM model...', 'info');
+                    const loaded = await ensureMinilmModelLoaded();
+                    if (!loaded) {
+                        throw new Error('Failed to load MiniLM model');
+                    }
                 }
 
-                await demoTableDb.exec("CREATE TABLE IF NOT EXISTS translations (row_id INT, text_zh TEXT, text_es TEXT)");
+                showStatus('Generating embeddings...', 'info');
 
-                const demoData = [];
-                for (let i = 0; i < 100; i++) {
-                    const zh = `[ZH] Translation ${i}`;
-                    const es = `[ES] Traducción ${i}`;
-                    demoData.push(`(${i}, '${zh}', '${es}')`);
+                // Generate embeddings for each description
+                const embeddings = [];
+                for (const item of emojiData) {
+                    const vec = encodeTextWithMinilm(item.description);
+                    embeddings.push(vec);
                 }
 
-                const insertSql = `INSERT INTO translations VALUES ${demoData.join(', ')}`;
-                await demoTableDb.exec(insertSql);
+                // Create Lance file using PureLanceWriter
+                const writer = new PureLanceWriter();
 
-                registerTable('translations', {
-                    type: 'memory',
-                    database: demoTableDb,
-                    rows: 100,
-                    cols: 3
-                });
+                // Add emoji column (strings)
+                writer.addStringColumn('emoji', emojiData.map(d => d.emoji));
 
-                showStatus('Demo table created! Try: SELECT i.text, t.text_zh FROM read_lance(...) i JOIN translations t ON i.rowid = t.row_id LIMIT 10', 'success');
+                // Add description column (strings)
+                writer.addStringColumn('description', emojiData.map(d => d.description));
 
-                btn.textContent = '✓ Table Created';
+                // Add embedding column (384-dim vectors as flat Float32Array)
+                const dim = embeddings[0].length;
+                const flatEmbeddings = new Float32Array(emojiData.length * dim);
+                for (let i = 0; i < embeddings.length; i++) {
+                    flatEmbeddings.set(embeddings[i], i * dim);
+                }
+                writer.addFloat32Column('embedding', flatEmbeddings);
+
+                // Finalize and save to OPFS
+                const lanceBytes = writer.finalize();
+                await lanceOpfsStorage.save('emoji.lance', lanceBytes);
+
+                console.log(`[Demo] Created emoji.lance: ${emojiData.length} rows, ${lanceBytes.length} bytes`);
+                showStatus(`Emoji table created (${emojiData.length} rows with embeddings)`, 'success');
+
+                // Reload OPFS tables
+                await loadOPFSTables();
+
+                btn.textContent = '✓ Emoji Table';
                 btn.style.background = '#22c55e';
 
+                // Update SQL with vector JOIN example
                 const sqlInput = document.getElementById('sql-input');
-                sqlInput.value = "SELECT i.text, i.aesthetic, t.text_zh, t.text_es\nFROM read_lance('https://data.metal0.dev/laion-1m/images.lance') i\nJOIN translations t ON i.rowid = t.row_id\nLIMIT 20";
+                sqlInput.value = `-- 🚀 Vector JOIN: Remote images + Local emoji tags
+SELECT r.url, r.text, e.emoji, e.description
+FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') r
+JOIN read_lance('opfs://emoji.lance') e ON r.embedding = e.embedding
+LIMIT 20`;
                 document.getElementById('sql-highlight').innerHTML = highlightSQL(sqlInput.value) + '\n';
 
             } catch (error) {
-                showStatus(`Error creating demo table: ${error.message}`, 'error');
+                showStatus(`Error creating emoji table: ${error.message}`, 'error');
+                console.error(error);
                 btn.disabled = false;
-                btn.textContent = '+ Demo JOIN Table';
-                btn.style.background = '#059669';
+                btn.textContent = '+ Emoji Table';
+                btn.style.background = '#334155';
             }
         }
 

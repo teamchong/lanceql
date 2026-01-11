@@ -1325,7 +1325,15 @@ pub const Executor = struct {
         defer self.releaseTableSource(&right_source);
         const right_table = right_source.getTable();
 
-        const join_keys = try self.extractJoinKeys(join_clause.on_condition orelse return error.JoinRequiresOnCondition);
+        // Get table names for vector index resolution
+        const left_table_name = getTableRefName(left_ref);
+        const right_table_name = getTableRefName(join_clause.table);
+
+        const join_keys = try self.extractJoinKeys(
+            join_clause.on_condition orelse return error.JoinRequiresOnCondition,
+            left_table_name,
+            right_table_name,
+        );
 
         const left_key_col_idx = left_table.physicalColumnId(join_keys.left_col) orelse return error.JoinColumnNotFound;
         const right_key_col_idx = right_table.physicalColumnId(join_keys.right_col) orelse return error.JoinColumnNotFound;
@@ -1544,22 +1552,31 @@ pub const Executor = struct {
     }
 
     /// Extract left and right column names from JOIN ON condition
-    fn extractJoinKeys(self: *Self, condition: ast.Expr) !struct { left_col: []const u8, right_col: []const u8 } {
-        _ = self;
+    /// Auto-resolves columns with vector indexes to their shadow columns
+    fn extractJoinKeys(self: *Self, condition: ast.Expr, left_table_name: []const u8, right_table_name: []const u8) !struct { left_col: []const u8, right_col: []const u8 } {
         // ON condition should be: left.col = right.col
         switch (condition) {
             .binary => |bin| {
                 if (bin.op != .eq) return error.JoinConditionMustBeEquality;
 
-                const left_col = switch (bin.left.*) {
+                var left_col = switch (bin.left.*) {
                     .column => |col| col.name, // column.table is optional qualifier
                     else => return error.JoinConditionMustBeColumn,
                 };
 
-                const right_col = switch (bin.right.*) {
+                var right_col = switch (bin.right.*) {
                     .column => |col| col.name,
                     else => return error.JoinConditionMustBeColumn,
                 };
+
+                // Auto-resolve vector index columns to shadow columns
+                // If a column has a vector index, use the shadow column for vector operations
+                if (self.getVectorIndex(left_table_name, left_col)) |idx_info| {
+                    left_col = idx_info.shadow_column;
+                }
+                if (self.getVectorIndex(right_table_name, right_col)) |idx_info| {
+                    right_col = idx_info.shadow_column;
+                }
 
                 return .{ .left_col = left_col, .right_col = right_col };
             },
@@ -2931,6 +2948,15 @@ pub const Executor = struct {
     }
 
 };
+
+/// Get table name from a TableRef (uses alias if available, otherwise the actual name)
+fn getTableRefName(ref: *const ast.TableRef) []const u8 {
+    return switch (ref.*) {
+        .simple => |s| s.alias orelse s.name,
+        .function => |f| f.alias orelse "func",
+        .join => |j| getTableRefName(j.left), // For nested joins, use the left table name
+    };
+}
 
 /// Check if an expression is a simple column reference (no computation needed)
 fn isSimpleColumnRef(expr: *const ast.Expr) bool {
