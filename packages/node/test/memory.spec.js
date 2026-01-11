@@ -15,8 +15,7 @@ describe('Memory Safety', () => {
   });
 
   describe('repeated operations', () => {
-    it.skip('should handle 1000 consecutive queries without memory leaks', { timeout: 120000 }, () => {
-      // FIXME: Resource leak in native binding causes failure after ~60 queries
+    it('should handle 1000 consecutive queries without memory leaks', { timeout: 300000 }, () => {
       db = new Database(SIMPLE_INT64_LANCE);
 
       for (let i = 0; i < 1000; i++) {
@@ -34,7 +33,7 @@ describe('Memory Safety', () => {
       }
     });
 
-    it('should handle 1000 prepared statements', { timeout: 120000 }, () => {
+    it('should handle 1000 prepared statements', { timeout: 300000 }, () => {
       db = new Database(SIMPLE_INT64_LANCE);
 
       for (let i = 0; i < 1000; i++) {

@@ -24,8 +24,7 @@ class VectorOps:
 `;
 
 describe('LogicTableCompiler', () => {
-    it.skip('should compile and call dot_product', async () => {
-        // FIXME: metal0 eval() codegen issue - list indexing uses Python eval instead of native code
+    it('should compile and call dot_product', async () => {
         const ops = await compileLogicTable(VECTOR_OPS_SOURCE);
 
         // Test basic dot product
@@ -45,8 +44,7 @@ describe('LogicTableCompiler', () => {
         expect(result1).toBe(result2);
     });
 
-    it.skip('should force recompile when requested', async () => {
-        // FIXME: metal0 eval() codegen issue
+    it('should force recompile when requested', async () => {
         const ops = await compileLogicTable(VECTOR_OPS_SOURCE, { force: true });
         const result = ops.VectorOps.dot_product([2.0, 3.0], [4.0, 5.0]);
         expect(result).toBeCloseTo(23.0, 2); // 2*4 + 3*5 = 23
