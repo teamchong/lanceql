@@ -25,6 +25,10 @@ const allocator = gpa.allocator();
 // Global State for Handle Management
 // ============================================================================
 
+/// Flag to indicate cleanup has started - prevents double-free when JavaScript
+/// destructors run after lance_cleanup() has already freed handles
+var cleanup_started: bool = false;
+
 var tables_lock = std.Thread.Mutex{};
 var tables = std.AutoHashMap(*Handle, *Table).init(allocator);
 
@@ -238,6 +242,9 @@ export fn lance_open_memory(data: [*]const u8, len: usize) ?*Handle {
 
 /// Close a Lance file and free resources
 export fn lance_close(handle: *Handle) void {
+    // Skip if cleanup already happened (prevents double-free from JS destructors)
+    if (cleanup_started) return;
+
     tables_lock.lock();
     defer tables_lock.unlock();
 
@@ -472,6 +479,9 @@ export fn lance_sql_execute_params(
 
 /// Close a SQL statement and free resources
 export fn lance_sql_close(sql_handle: *SQLHandle) void {
+    // Skip if cleanup already happened (prevents double-free from JS destructors)
+    if (cleanup_started) return;
+
     statements_lock.lock();
     defer statements_lock.unlock();
 
@@ -626,6 +636,9 @@ export fn lance_result_read_bool(result: *ResultHandle, col_idx: u32, out: [*]u8
 
 /// Close a result and free resources
 export fn lance_result_close(result: *ResultHandle) void {
+    // Skip if cleanup already happened (prevents double-free from JS destructors)
+    if (cleanup_started) return;
+
     results_lock.lock();
     defer results_lock.unlock();
 
@@ -714,6 +727,10 @@ export fn lance_transaction_rollback(handle: *Handle) bool {
 /// Cleanup all resources when the module is unloaded.
 /// Call this from Node.js module unload handler.
 export fn lance_cleanup() void {
+    // Set flag first to prevent JS destructors from double-freeing handles
+    // that we're about to free here
+    cleanup_started = true;
+
     // Close all open tables
     tables_lock.lock();
     defer tables_lock.unlock();
