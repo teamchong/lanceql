@@ -4,8 +4,6 @@ export default defineConfig({
   test: {
     globals: true,
     testTimeout: 30000,
-    // Use threads pool instead of forks - more compatible with native bindings
-    pool: 'threads',
     include: ['test/**/*.spec.js', 'test/**/*.test.js'],
     exclude: [
       'test/basic.test.js',
