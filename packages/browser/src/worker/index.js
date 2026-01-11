@@ -642,10 +642,16 @@ async function executeWasmSqlFull(db, sql) {
         if (!wasm) throw new Error('WASM not loaded');
     }
 
+    // Strip SQL comments (-- line comments and /* block comments */)
+    const cleanSql = sql
+        .replace(/--[^\n]*/g, '') // Remove -- line comments
+        .replace(/\/\*[\s\S]*?\*\//g, '') // Remove /* block comments */
+        .trim();
+
     const executor = getWasmSqlExecutor();
 
     // Step 1: Extract and handle read_lance('url') URLs BEFORE parsing
-    const urlMappings = extractReadLanceUrls(sql);
+    const urlMappings = extractReadLanceUrls(cleanSql);
 
     for (const { url, alias } of urlMappings) {
         // Skip if already registered
@@ -672,7 +678,7 @@ async function executeWasmSqlFull(db, sql) {
     }
 
     // Step 2: Rewrite SQL to use aliases instead of read_lance() calls
-    const rewrittenSql = urlMappings.length > 0 ? rewriteSqlWithAliases(sql, urlMappings) : sql;
+    const rewrittenSql = urlMappings.length > 0 ? rewriteSqlWithAliases(cleanSql, urlMappings) : cleanSql;
 
     // Step 3: Extract remaining table names from rewritten SQL
     const tableNames = executor.getTableNames(rewrittenSql);
