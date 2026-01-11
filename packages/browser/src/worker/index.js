@@ -351,41 +351,159 @@ function parseManifestBasic(bytes) {
 async function fetchAndParseFragment(url, schema, columnTypes, limit) {
     console.log(`[Worker] Fetching fragment: ${url}`);
 
-    // For now, return schema-based placeholder data
-    // The actual Lance fragment format is complex (uses pages with buffer offsets)
-    // and requires the full parsing infrastructure from RemoteLanceFile
-    // TODO: Implement proper fragment parsing or use RemoteLanceDataset
+    // Ensure WASM is loaded
+    if (!wasm) {
+        await loadWasm();
+        if (!wasm) throw new Error('WASM not loaded');
+    }
+
+    // Check file size first with HEAD request
+    const headResponse = await fetch(url, { method: 'HEAD' });
+    if (!headResponse.ok) {
+        throw new Error(`Failed to check fragment size: HTTP ${headResponse.status}`);
+    }
+    const contentLength = parseInt(headResponse.headers.get('Content-Length') || '0', 10);
+    const MAX_FRAGMENT_SIZE = 100 * 1024 * 1024; // 100MB max for full download
+
+    if (contentLength > MAX_FRAGMENT_SIZE) {
+        console.warn(`[Worker] Fragment too large (${(contentLength / 1024 / 1024).toFixed(1)}MB) - using schema-based placeholder data`);
+        // Return placeholder data for large files
+        const columns = {};
+        const columnNames = [];
+        const actualRows = Math.min(limit, 100);
+        for (let i = 0; i < schema.length; i++) {
+            const name = schema[i].name;
+            const type = columnTypes[i];
+            columnNames.push(name);
+            if (type === 'float64' || type === 'double' || type === 'int64' || type === 'int32' || type === 'float32') {
+                columns[name] = new Float64Array(actualRows).fill(0);
+            } else if (type === 'string') {
+                columns[name] = Array(actualRows).fill('(large file - use RemoteLanceDataset)');
+            } else {
+                columns[name] = [];
+            }
+        }
+        return { columns, rowCount: actualRows, columnNames };
+    }
+
+    // Fetch the entire fragment file (only for small files)
+    const response = await fetch(url);
+    if (!response.ok) {
+        throw new Error(`Failed to fetch fragment: HTTP ${response.status}`);
+    }
+    const data = new Uint8Array(await response.arrayBuffer());
+    console.log(`[Worker] Fetched fragment: ${data.length} bytes`);
+
+    // Verify Lance magic
+    if (data.length < 40) {
+        throw new Error('Fragment too small');
+    }
+    const magic = String.fromCharCode(data[data.length - 4], data[data.length - 3], data[data.length - 2], data[data.length - 1]);
+    if (magic !== 'LANC') {
+        throw new Error(`Invalid Lance magic: ${magic}`);
+    }
+
+    // Load fragment into WASM memory
+    const dataPtr = wasm.alloc(data.length);
+    if (!dataPtr || dataPtr < 0) {
+        throw new Error('Failed to allocate WASM memory for fragment');
+    }
+    new Uint8Array(wasmMemory.buffer, dataPtr, data.length).set(data);
+
+    // Open the file in WASM
+    const openResult = wasm.openFile(dataPtr, data.length);
+    if (openResult !== 0) {
+        throw new Error(`WASM openFile failed: ${openResult}`);
+    }
+
+    // Get actual row count from WASM
+    const numColumns = wasm.getNumColumns();
+    const rowCount = Number(wasm.getRowCount(0)); // Get row count from first column
+    const actualRows = Math.min(rowCount, limit);
+
+    console.log(`[Worker] Fragment has ${numColumns} columns, ${rowCount} rows, reading ${actualRows}`);
 
     const columns = {};
     const columnNames = [];
 
-    // Use smaller row count to avoid WASM memory issues
-    const actualRows = Math.min(limit, 100);
-
-    for (let i = 0; i < schema.length; i++) {
+    // Read each column using WASM
+    for (let i = 0; i < schema.length && i < numColumns; i++) {
         const name = schema[i].name;
         const type = columnTypes[i];
         columnNames.push(name);
 
-        // Create placeholder data based on type
-        // Use Float64Array for numeric types to simplify WASM registration
-        if (type === 'float64' || type === 'double' || type === 'int64') {
-            columns[name] = new Float64Array(actualRows).fill(0);
-        } else if (type === 'int32') {
-            columns[name] = new Float64Array(actualRows).fill(0); // Convert to float64 for WASM compat
-        } else if (type === 'float32') {
-            columns[name] = new Float64Array(actualRows).fill(0); // Convert to float64 for WASM compat
-        } else if (type === 'string') {
-            columns[name] = Array(actualRows).fill('');
-        } else if (type === 'vector') {
-            // Skip vectors
-            columns[name] = [];
-        } else {
+        try {
+            if (type === 'float64' || type === 'double') {
+                const outPtr = wasm.allocFloat64Buffer(actualRows);
+                if (outPtr) {
+                    const count = wasm.readFloat64Column(i, outPtr, actualRows);
+                    columns[name] = new Float64Array(wasmMemory.buffer, outPtr, count).slice();
+                } else {
+                    columns[name] = new Float64Array(actualRows).fill(0);
+                }
+            } else if (type === 'int64') {
+                const outPtr = wasm.allocInt64Buffer(actualRows);
+                if (outPtr) {
+                    const count = wasm.readInt64Column(i, outPtr, actualRows);
+                    // Convert BigInt64Array to Float64Array for WASM SQL registration
+                    const bigArr = new BigInt64Array(wasmMemory.buffer, outPtr, count);
+                    const floatArr = new Float64Array(count);
+                    for (let j = 0; j < count; j++) {
+                        floatArr[j] = Number(bigArr[j]);
+                    }
+                    columns[name] = floatArr;
+                } else {
+                    columns[name] = new Float64Array(actualRows).fill(0);
+                }
+            } else if (type === 'int32') {
+                const outPtr = wasm.allocInt32Buffer(actualRows);
+                if (outPtr) {
+                    const count = wasm.readInt32Column(i, outPtr, actualRows);
+                    const intArr = new Int32Array(wasmMemory.buffer, outPtr, count);
+                    // Convert to Float64Array for WASM SQL registration
+                    const floatArr = new Float64Array(count);
+                    for (let j = 0; j < count; j++) {
+                        floatArr[j] = intArr[j];
+                    }
+                    columns[name] = floatArr;
+                } else {
+                    columns[name] = new Float64Array(actualRows).fill(0);
+                }
+            } else if (type === 'float32') {
+                // Use regular alloc for float32 (4 bytes per element)
+                const outPtr = wasm.alloc(actualRows * 4);
+                if (outPtr && outPtr > 0) {
+                    const count = wasm.readFloat32Column(i, outPtr, actualRows);
+                    const floatArr = new Float32Array(wasmMemory.buffer, outPtr, count);
+                    // Convert to Float64Array for WASM SQL registration
+                    const f64Arr = new Float64Array(count);
+                    for (let j = 0; j < count; j++) {
+                        f64Arr[j] = floatArr[j];
+                    }
+                    columns[name] = f64Arr;
+                } else {
+                    columns[name] = new Float64Array(actualRows).fill(0);
+                }
+            } else if (type === 'string') {
+                // String columns are more complex - use the string reading functions
+                // For now, create placeholder - strings need offset/length arrays
+                columns[name] = Array(actualRows).fill('(string data)');
+            } else if (type === 'vector') {
+                // Skip vectors - too large
+                columns[name] = [];
+            } else {
+                columns[name] = [];
+            }
+        } catch (e) {
+            console.warn(`[Worker] Failed to read column ${name}:`, e);
             columns[name] = [];
         }
     }
 
-    console.log(`[Worker] Created placeholder data with ${actualRows} rows for ${schema.length} columns`);
+    // Close the file to free WASM resources
+    wasm.closeFile();
+
+    console.log(`[Worker] Read ${actualRows} rows from ${columnNames.length} columns`);
 
     return { columns, rowCount: actualRows, columnNames };
 }

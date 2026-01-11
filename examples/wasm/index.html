@@ -2668,8 +2668,7 @@ LIMIT 20</textarea>
                 // Get file list using package API
                 const files = await opfsStorage.listFiles();
 
-                // Update hasUnsavedData flag
-                hasUnsavedData = files.length > 0;
+                // Files in OPFS are already saved - no warning needed
 
                 // Render file list with table details from registry
                 const listEl = document.getElementById('storage-files-list');
