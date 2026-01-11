@@ -162,6 +162,40 @@ class Vault {
         return workerRPC('vault:tables', {});
     }
 
+    /**
+     * Execute a SQL query and return a WritableDataFrame.
+     * @param {string} sql - SELECT statement
+     * @returns {Promise<WritableDataFrame>} DataFrame with query results
+     *
+     * @example
+     * const df = await v.df('SELECT * FROM users WHERE active = 1');
+     * await df.saveTo(v, 'active_users');
+     */
+    async df(sql) {
+        const result = await this.exec(sql);
+        if (!result || !result.columns || !result.rows) {
+            return new WritableDataFrame({}, []);
+        }
+
+        const columns = {};
+        const columnNames = result.columns;
+
+        // Initialize column arrays
+        for (const name of columnNames) {
+            columns[name] = [];
+        }
+
+        // Fill column arrays from rows
+        for (const row of result.rows) {
+            for (let i = 0; i < columnNames.length; i++) {
+                const name = columnNames[i];
+                columns[name].push(row[name] !== undefined ? row[name] : row[i]);
+            }
+        }
+
+        return new WritableDataFrame(columns, columnNames);
+    }
+
     // =========================================================================
     // Export Operations
     // =========================================================================
@@ -556,6 +590,267 @@ class TableRef {
 }
 
 /**
+ * WritableDataFrame - DataFrame for creating and saving data to vault tables.
+ *
+ * @example
+ * const df = WritableDataFrame.fromRecords([
+ *   { id: 1, name: 'Alice' },
+ *   { id: 2, name: 'Bob' }
+ * ]);
+ * await df.saveTo(vault, 'users');
+ */
+class WritableDataFrame {
+    /**
+     * Create a WritableDataFrame with columnar data.
+     * @param {Object} columns - Column name -> array of values
+     * @param {string[]} columnNames - Column names in order
+     */
+    constructor(columns, columnNames) {
+        this._columns = columns;
+        this._columnNames = columnNames;
+        this._rowCount = columnNames.length > 0 ? (columns[columnNames[0]]?.length || 0) : 0;
+    }
+
+    /**
+     * Number of rows in the DataFrame.
+     */
+    get rowCount() {
+        return this._rowCount;
+    }
+
+    /**
+     * Column names.
+     */
+    get columns() {
+        return [...this._columnNames];
+    }
+
+    /**
+     * Create a DataFrame from an array of record objects.
+     * @param {Object[]} records - Array of row objects
+     * @returns {WritableDataFrame}
+     *
+     * @example
+     * const df = WritableDataFrame.fromRecords([
+     *   { id: 1, name: 'Alice', age: 30 },
+     *   { id: 2, name: 'Bob', age: 25 }
+     * ]);
+     */
+    static fromRecords(records) {
+        if (!records || records.length === 0) {
+            return new WritableDataFrame({}, []);
+        }
+
+        // Get column names from first record
+        const columnNames = Object.keys(records[0]);
+        const columns = {};
+
+        // Initialize column arrays
+        for (const name of columnNames) {
+            columns[name] = [];
+        }
+
+        // Fill column arrays
+        for (const record of records) {
+            for (const name of columnNames) {
+                columns[name].push(record[name] !== undefined ? record[name] : null);
+            }
+        }
+
+        return new WritableDataFrame(columns, columnNames);
+    }
+
+    /**
+     * Create a DataFrame from columnar data.
+     * @param {Object} columns - Column name -> array or TypedArray
+     * @returns {WritableDataFrame}
+     *
+     * @example
+     * const df = WritableDataFrame.fromColumns({
+     *   id: [1, 2, 3],
+     *   name: ['Alice', 'Bob', 'Charlie'],
+     *   score: new Float64Array([0.9, 0.8, 0.7])
+     * });
+     */
+    static fromColumns(columns) {
+        const columnNames = Object.keys(columns);
+        const normalizedColumns = {};
+
+        for (const name of columnNames) {
+            const data = columns[name];
+            // Convert TypedArrays to regular arrays for uniform handling
+            if (ArrayBuffer.isView(data) && !(data instanceof Uint8Array)) {
+                normalizedColumns[name] = Array.from(data);
+            } else {
+                normalizedColumns[name] = Array.isArray(data) ? data : [data];
+            }
+        }
+
+        return new WritableDataFrame(normalizedColumns, columnNames);
+    }
+
+    /**
+     * Save the DataFrame to a vault table.
+     * @param {Vault} vault - The vault instance
+     * @param {string} tableName - Target table name
+     * @param {Object} [options] - Save options
+     * @param {string} [options.ifExists='fail'] - Action if table exists: 'fail', 'replace', 'append'
+     * @returns {Promise<{rowCount: number}>}
+     *
+     * @example
+     * const df = WritableDataFrame.fromRecords([{ id: 1, name: 'Alice' }]);
+     * await df.saveTo(v, 'users');
+     * await df.saveTo(v, 'users', { ifExists: 'replace' });
+     * await df.saveTo(v, 'users', { ifExists: 'append' });
+     */
+    async saveTo(vault, tableName, options = {}) {
+        const { ifExists = 'fail' } = options;
+
+        switch (ifExists) {
+            case 'replace':
+                // Drop if exists, then create
+                await vault.exec(`DROP TABLE IF EXISTS ${tableName}`);
+                await this._createTableAndInsert(vault, tableName);
+                return { rowCount: this._rowCount, tableName };
+
+            case 'append':
+                // Just insert data (assume table exists)
+                try {
+                    await this._insertInto(vault, tableName);
+                    return { rowCount: this._rowCount, tableName };
+                } catch (e) {
+                    // Table doesn't exist, create it
+                    if (e.message && e.message.includes('not found')) {
+                        await this._createTableAndInsert(vault, tableName);
+                        return { rowCount: this._rowCount, tableName };
+                    }
+                    throw e;
+                }
+
+            case 'fail':
+            default:
+                // Try to create - will fail if exists
+                try {
+                    await this._createTableAndInsert(vault, tableName);
+                    return { rowCount: this._rowCount, tableName };
+                } catch (e) {
+                    // If table already exists, throw with friendly message
+                    if (e.message && (e.message.includes('AlreadyExists') || e.message.includes('already exists'))) {
+                        throw new Error(`Table '${tableName}' already exists`);
+                    }
+                    throw e;
+                }
+        }
+    }
+
+    /**
+     * Infer SQL type from value.
+     * @private
+     */
+    _inferType(values) {
+        for (const v of values) {
+            if (v === null || v === undefined) continue;
+            if (typeof v === 'bigint') return 'INT64';
+            if (typeof v === 'number') {
+                if (Number.isInteger(v) && v <= 2147483647 && v >= -2147483648) {
+                    return 'INT';
+                }
+                return 'FLOAT64';
+            }
+            if (typeof v === 'boolean') return 'INT';
+            if (Array.isArray(v)) return `FLOAT32[${v.length}]`;
+            return 'TEXT';
+        }
+        return 'TEXT'; // Default for all nulls
+    }
+
+    /**
+     * Format value for SQL.
+     * @private
+     */
+    _formatValue(value) {
+        if (value === null || value === undefined) return 'NULL';
+        if (typeof value === 'number' || typeof value === 'bigint') return String(value);
+        if (typeof value === 'boolean') return value ? '1' : '0';
+        if (Array.isArray(value)) return `[${value.join(',')}]`;
+        // Escape single quotes in strings
+        return `'${String(value).replace(/'/g, "''")}'`;
+    }
+
+    /**
+     * Create table and insert data.
+     * @private
+     */
+    async _createTableAndInsert(vault, tableName) {
+        // Build CREATE TABLE statement
+        const columnDefs = this._columnNames.map(name => {
+            const type = this._inferType(this._columns[name]);
+            return `${name} ${type}`;
+        }).join(', ');
+
+        await vault.exec(`CREATE TABLE ${tableName} (${columnDefs})`);
+        await this._insertInto(vault, tableName);
+    }
+
+    /**
+     * Insert data into existing table.
+     * @private
+     */
+    async _insertInto(vault, tableName) {
+        if (this._rowCount === 0) return { rowCount: 0 };
+
+        // Build INSERT statement with all values
+        const colList = this._columnNames.join(', ');
+        const valueRows = [];
+
+        for (let i = 0; i < this._rowCount; i++) {
+            const values = this._columnNames.map(name =>
+                this._formatValue(this._columns[name][i])
+            ).join(', ');
+            valueRows.push(`(${values})`);
+        }
+
+        await vault.exec(`INSERT INTO ${tableName} (${colList}) VALUES ${valueRows.join(', ')}`);
+        return { rowCount: this._rowCount };
+    }
+
+    /**
+     * Get a row as an object.
+     * @param {number} index - Row index
+     * @returns {Object}
+     */
+    row(index) {
+        if (index < 0 || index >= this._rowCount) return null;
+        const obj = {};
+        for (const name of this._columnNames) {
+            obj[name] = this._columns[name][index];
+        }
+        return obj;
+    }
+
+    /**
+     * Get column data.
+     * @param {string} name - Column name
+     * @returns {Array}
+     */
+    column(name) {
+        return this._columns[name] || null;
+    }
+
+    /**
+     * Convert to array of record objects.
+     * @returns {Object[]}
+     */
+    toRecords() {
+        const records = [];
+        for (let i = 0; i < this._rowCount; i++) {
+            records.push(this.row(i));
+        }
+        return records;
+    }
+}
+
+/**
  * Create a new Vault instance.
  *
  * @param {Function|null} getEncryptionKey - Async callback returning encryption key
@@ -602,4 +897,4 @@ async function vault(getEncryptionKey = null) {
  * const user = await store.get('user');
  */
 
-export { Vault, TableRef, vault };
+export { Vault, TableRef, WritableDataFrame, vault };

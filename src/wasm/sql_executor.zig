@@ -318,7 +318,7 @@ const MAX_CTES: usize = 4;
 pub const SetOp = enum { none, union_op, union_all, intersect, intersect_all, except, except_all };
 
 /// Query Type
-pub const QueryType = enum { select, create_table, drop_table, insert, update, delete, explain, explain_analyze };
+pub const QueryType = enum { select, create_table, drop_table, insert, update, delete, explain, explain_analyze, create_vector_index, drop_vector_index, show_vector_indexes };
 pub const ConflictAction = enum { none, nothing, update };
 
 pub const ParsedQuery = struct {
@@ -402,6 +402,22 @@ pub const ParsedQuery = struct {
     unpivot_name_col: []const u8 = "",   // New column for column names
     unpivot_cols: [16][]const u8 = undefined,  // Columns to unpivot
     unpivot_col_count: usize = 0,
+
+    // Vector index support
+    vector_index_table: []const u8 = "",
+    vector_index_column: []const u8 = "",
+    vector_index_model: []const u8 = "",
+    vector_index_if_not_exists: bool = false,
+    vector_index_if_exists: bool = false,
+};
+
+/// Vector Index Info - stored in global state
+pub const VectorIndexInfo = struct {
+    table_name: []const u8,
+    column_name: []const u8,
+    model: []const u8,
+    shadow_column: []const u8,
+    dimension: u32,
 };
 
 // Global state
@@ -411,6 +427,13 @@ var result_buffer: ?[]u8 = null;
 var result_size: usize = 0;
 export var sql_input: [131072]u8 = undefined;
 export var sql_input_len: usize = 0;
+
+// Vector index storage
+const MAX_VECTOR_INDEXES = 64;
+var vector_indexes: [MAX_VECTOR_INDEXES]?VectorIndexInfo = .{null} ** MAX_VECTOR_INDEXES;
+var vector_index_count: usize = 0;
+// Storage for shadow column names (to avoid allocation)
+var shadow_col_storage: [MAX_VECTOR_INDEXES][64]u8 = undefined;
 
 // Current timestamp (set by JavaScript)
 var current_timestamp_ms: i64 = 0;
@@ -3415,6 +3438,315 @@ fn executeCreateTable(query: *ParsedQuery) !void {
     table_count += 1;
 }
 
+fn executeCreateVectorIndex(query: *ParsedQuery) !void {
+    if (vector_index_count >= MAX_VECTOR_INDEXES) return error.VectorIndexLimitReached;
+
+    // Check if index already exists on this table/column
+    for (vector_indexes[0..vector_index_count]) |maybe_idx| {
+        if (maybe_idx) |idx| {
+            if (std.mem.eql(u8, idx.table_name, query.vector_index_table) and
+                std.mem.eql(u8, idx.column_name, query.vector_index_column))
+            {
+                if (query.vector_index_if_not_exists) {
+                    // Return success status even if already exists
+                    try writeVectorIndexResult("created", query.vector_index_column, query.vector_index_model);
+                    return;
+                }
+                return error.VectorIndexAlreadyExists;
+            }
+        }
+    }
+
+    // Validate model name
+    const is_valid_model = std.mem.eql(u8, query.vector_index_model, "minilm") or
+        std.mem.eql(u8, query.vector_index_model, "clip") or
+        std.mem.eql(u8, query.vector_index_model, "openai");
+    if (!is_valid_model) return error.UnknownEmbeddingModel;
+
+    // Find the table and get column dimension
+    var dim: u32 = 0;
+    var table_found = false;
+    var column_found = false;
+    for (&tables) |*t| {
+        if (t.*) |*tbl| {
+            if (std.mem.eql(u8, tbl.name, query.vector_index_table)) {
+                table_found = true;
+                for (tbl.columns[0..tbl.column_count]) |maybe_col| {
+                    if (maybe_col) |col| {
+                        if (std.mem.eql(u8, col.name, query.vector_index_column)) {
+                            column_found = true;
+                            dim = col.vector_dim;
+                            break;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    if (!table_found) return error.TableDoesNotExist;
+    if (!column_found) return error.ColumnDoesNotExist;
+
+    // Set default dimension based on model if not found from column
+    if (dim == 0) {
+        if (std.mem.eql(u8, query.vector_index_model, "minilm")) {
+            dim = 384;
+        } else if (std.mem.eql(u8, query.vector_index_model, "clip")) {
+            dim = 512;
+        } else {
+            dim = 384; // Default to minilm dimension
+        }
+    }
+
+    // Copy strings to persistent memory
+    const tbl_name = try memory.wasm_allocator.dupe(u8, query.vector_index_table);
+    const col_name = try memory.wasm_allocator.dupe(u8, query.vector_index_column);
+    const model = try memory.wasm_allocator.dupe(u8, query.vector_index_model);
+
+    // Generate shadow column name: __vec_{column}_{model}
+    const shadow_buf = &shadow_col_storage[vector_index_count];
+    const shadow_slice = std.fmt.bufPrint(shadow_buf, "__vec_{s}_{s}", .{ query.vector_index_column, query.vector_index_model }) catch blk: {
+        @memcpy(shadow_buf[0..6], "__vec_");
+        break :blk shadow_buf[0..6];
+    };
+    const shadow_col = shadow_slice;
+
+    vector_indexes[vector_index_count] = VectorIndexInfo{
+        .table_name = tbl_name,
+        .column_name = col_name,
+        .model = model,
+        .shadow_column = shadow_col,
+        .dimension = dim,
+    };
+    vector_index_count += 1;
+
+    // Output result with status and shadowColumn
+    try writeVectorIndexResult("created", query.vector_index_column, query.vector_index_model);
+}
+
+fn writeVectorIndexResult(status: []const u8, column: []const u8, model: []const u8) !void {
+    // Generate shadow column name for output
+    var shadow_name_buf: [64]u8 = undefined;
+    const shadow_name = std.fmt.bufPrint(&shadow_name_buf, "__vec_{s}_{s}", .{ column, model }) catch "__vec_unknown";
+
+    const est_size = status.len + shadow_name.len + 256;
+    if (lw.fragmentBegin(est_size) == 0) return error.OutOfMemory;
+
+    // Add status column
+    var status_offsets: [2]u32 = .{ 0, @intCast(status.len) };
+    const status_col: []const u8 = "status";
+    _ = lw.fragmentAddStringColumn(status_col.ptr, status_col.len, status.ptr, status.len, &status_offsets, 1, false);
+
+    // Add shadowColumn column
+    var shadow_offsets: [2]u32 = .{ 0, @intCast(shadow_name.len) };
+    const shadow_col: []const u8 = "shadowColumn";
+    _ = lw.fragmentAddStringColumn(shadow_col.ptr, shadow_col.len, shadow_name.ptr, shadow_name.len, &shadow_offsets, 1, false);
+
+    const res = lw.fragmentEnd();
+    if (res == 0) return error.EncodingError;
+
+    if (lw.writerGetBuffer()) |buf| {
+        result_buffer = buf[0..res];
+        result_size = res;
+    }
+}
+
+fn executeDropVectorIndex(query: *ParsedQuery) !void {
+    var found = false;
+    var remove_idx: usize = 0;
+
+    for (vector_indexes[0..vector_index_count], 0..) |maybe_idx, i| {
+        if (maybe_idx) |idx| {
+            if (std.mem.eql(u8, idx.table_name, query.vector_index_table) and
+                std.mem.eql(u8, idx.column_name, query.vector_index_column))
+            {
+                found = true;
+                remove_idx = i;
+                break;
+            }
+        }
+    }
+
+    if (!found) {
+        if (query.vector_index_if_exists) {
+            try writeDropVectorIndexResult("dropped");
+            return;
+        }
+        return error.VectorIndexNotFound;
+    }
+
+    // Shift remaining indexes down
+    var i = remove_idx;
+    while (i < vector_index_count - 1) : (i += 1) {
+        vector_indexes[i] = vector_indexes[i + 1];
+        shadow_col_storage[i] = shadow_col_storage[i + 1];
+    }
+    vector_indexes[vector_index_count - 1] = null;
+    vector_index_count -= 1;
+
+    // Output result
+    try writeDropVectorIndexResult("dropped");
+}
+
+fn writeDropVectorIndexResult(status: []const u8) !void {
+    if (lw.fragmentBegin(128) == 0) return error.OutOfMemory;
+
+    var status_offsets: [2]u32 = .{ 0, @intCast(status.len) };
+    const status_col: []const u8 = "status";
+    _ = lw.fragmentAddStringColumn(status_col.ptr, status_col.len, status.ptr, status.len, &status_offsets, 1, false);
+
+    const res = lw.fragmentEnd();
+    if (res == 0) return error.EncodingError;
+
+    if (lw.writerGetBuffer()) |buf| {
+        result_buffer = buf[0..res];
+        result_size = res;
+    }
+}
+
+fn executeShowVectorIndexes(query: *ParsedQuery) !void {
+    // Filter by table if specified
+    const filter_table = if (query.vector_index_table.len > 0) query.vector_index_table else null;
+
+    // Count matching indexes
+    var count: usize = 0;
+    for (vector_indexes[0..vector_index_count]) |maybe_idx| {
+        if (maybe_idx) |idx| {
+            if (filter_table == null or std.mem.eql(u8, idx.table_name, filter_table.?)) {
+                count += 1;
+            }
+        }
+    }
+
+    if (count == 0) {
+        // Return empty result
+        try writeEmptyResult();
+        return;
+    }
+
+    // Build result with columns: table_name, column_name, model, shadow_column, dimension
+    // Collect data for columns
+    var table_names: [MAX_VECTOR_INDEXES][]const u8 = undefined;
+    var column_names: [MAX_VECTOR_INDEXES][]const u8 = undefined;
+    var models: [MAX_VECTOR_INDEXES][]const u8 = undefined;
+    var shadow_cols: [MAX_VECTOR_INDEXES][]const u8 = undefined;
+    var dimensions: [MAX_VECTOR_INDEXES]u32 = undefined;
+    var result_count: usize = 0;
+
+    for (vector_indexes[0..vector_index_count]) |maybe_idx| {
+        if (maybe_idx) |idx| {
+            if (filter_table == null or std.mem.eql(u8, idx.table_name, filter_table.?)) {
+                table_names[result_count] = idx.table_name;
+                column_names[result_count] = idx.column_name;
+                models[result_count] = idx.model;
+                shadow_cols[result_count] = idx.shadow_column;
+                dimensions[result_count] = idx.dimension;
+                result_count += 1;
+            }
+        }
+    }
+
+    // Estimate buffer size
+    var total_str_len: usize = 0;
+    for (table_names[0..result_count]) |s| total_str_len += s.len;
+    for (column_names[0..result_count]) |s| total_str_len += s.len;
+    for (models[0..result_count]) |s| total_str_len += s.len;
+    for (shadow_cols[0..result_count]) |s| total_str_len += s.len;
+    const est_size = total_str_len + result_count * 50 + 1024;
+
+    if (lw.fragmentBegin(est_size) == 0) {
+        return error.OutOfMemory;
+    }
+
+    // Add table_name column
+    var tbl_offsets: [MAX_VECTOR_INDEXES + 1]u32 = undefined;
+    tbl_offsets[0] = 0;
+    var tbl_data_len: usize = 0;
+    for (table_names[0..result_count], 0..) |s, i| {
+        tbl_data_len += s.len;
+        tbl_offsets[i + 1] = @intCast(tbl_data_len);
+    }
+    // Build concatenated string
+    var tbl_concat: [2048]u8 = undefined;
+    var tbl_pos: usize = 0;
+    for (table_names[0..result_count]) |s| {
+        @memcpy(tbl_concat[tbl_pos..][0..s.len], s);
+        tbl_pos += s.len;
+    }
+    const col1_name: []const u8 = "table_name";
+    _ = lw.fragmentAddStringColumn(col1_name.ptr, col1_name.len, &tbl_concat, tbl_pos, &tbl_offsets, result_count, false);
+
+    // Add column_name column
+    var col_offsets: [MAX_VECTOR_INDEXES + 1]u32 = undefined;
+    col_offsets[0] = 0;
+    var col_data_len: usize = 0;
+    for (column_names[0..result_count], 0..) |s, i| {
+        col_data_len += s.len;
+        col_offsets[i + 1] = @intCast(col_data_len);
+    }
+    var col_concat: [2048]u8 = undefined;
+    var col_pos: usize = 0;
+    for (column_names[0..result_count]) |s| {
+        @memcpy(col_concat[col_pos..][0..s.len], s);
+        col_pos += s.len;
+    }
+    const col2_name: []const u8 = "column";
+    _ = lw.fragmentAddStringColumn(col2_name.ptr, col2_name.len, &col_concat, col_pos, &col_offsets, result_count, false);
+
+    // Add model column
+    var model_offsets: [MAX_VECTOR_INDEXES + 1]u32 = undefined;
+    model_offsets[0] = 0;
+    var model_data_len: usize = 0;
+    for (models[0..result_count], 0..) |s, i| {
+        model_data_len += s.len;
+        model_offsets[i + 1] = @intCast(model_data_len);
+    }
+    var model_concat: [2048]u8 = undefined;
+    var model_pos: usize = 0;
+    for (models[0..result_count]) |s| {
+        @memcpy(model_concat[model_pos..][0..s.len], s);
+        model_pos += s.len;
+    }
+    const col3_name: []const u8 = "model";
+    _ = lw.fragmentAddStringColumn(col3_name.ptr, col3_name.len, &model_concat, model_pos, &model_offsets, result_count, false);
+
+    // Add shadow_column column
+    var shadow_offsets: [MAX_VECTOR_INDEXES + 1]u32 = undefined;
+    shadow_offsets[0] = 0;
+    var shadow_data_len: usize = 0;
+    for (shadow_cols[0..result_count], 0..) |s, i| {
+        shadow_data_len += s.len;
+        shadow_offsets[i + 1] = @intCast(shadow_data_len);
+    }
+    var shadow_concat: [2048]u8 = undefined;
+    var shadow_pos: usize = 0;
+    for (shadow_cols[0..result_count]) |s| {
+        @memcpy(shadow_concat[shadow_pos..][0..s.len], s);
+        shadow_pos += s.len;
+    }
+    const col4_name: []const u8 = "shadowColumn";
+    _ = lw.fragmentAddStringColumn(col4_name.ptr, col4_name.len, &shadow_concat, shadow_pos, &shadow_offsets, result_count, false);
+
+    // Add dim column (as int64)
+    const col5_name: []const u8 = "dim";
+    var dim_vals: [MAX_VECTOR_INDEXES]i64 = undefined;
+    for (dimensions[0..result_count], 0..) |d, i| {
+        dim_vals[i] = @intCast(d);
+    }
+    _ = lw.fragmentAddInt64Column(col5_name.ptr, col5_name.len, &dim_vals, result_count, false);
+
+    const res = lw.fragmentEnd();
+    if (res == 0) {
+        return error.EncodingError;
+    }
+
+    if (lw.writerGetBuffer()) |buf| {
+        result_buffer = buf[0..res];
+        result_size = res;
+    }
+}
+
 fn appendInt(col: *ColumnData, val: i64) !void {
     if (col.data_ptr == null) {
         const list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(i64));
@@ -4758,6 +5090,30 @@ pub export fn executeSql() u32 {
         },
         .explain_analyze => {
             executeExplain(query, true) catch |err| {
+                setError(@errorName(err));
+                return 0;
+            };
+            if (result_buffer) |buf| return @intFromPtr(buf.ptr);
+            return 0;
+        },
+        .create_vector_index => {
+            executeCreateVectorIndex(query) catch |err| {
+                setError(@errorName(err));
+                return 0;
+            };
+            if (result_buffer) |buf| return @intFromPtr(buf.ptr);
+            return 0;
+        },
+        .drop_vector_index => {
+            executeDropVectorIndex(query) catch |err| {
+                setError(@errorName(err));
+                return 0;
+            };
+            if (result_buffer) |buf| return @intFromPtr(buf.ptr);
+            return 0;
+        },
+        .show_vector_indexes => {
+            executeShowVectorIndexes(query) catch |err| {
                 setError(@errorName(err));
                 return 0;
             };
@@ -12980,6 +13336,110 @@ pub fn parseSql(sql: []const u8) ?*ParsedQuery {
         query.type = if (is_explain_analyze) .explain_analyze else if (is_explain) .explain else .select;
         pos += 6;
         pos = skipWs(sql, pos);
+    } else if (startsWithIC(sql[pos..], "CREATE VECTOR INDEX")) {
+        // CREATE VECTOR INDEX [IF NOT EXISTS] ON table(column) USING model
+        query.type = .create_vector_index;
+        pos += 19; // "CREATE VECTOR INDEX"
+        pos = skipWs(sql, pos);
+
+        if (startsWithIC(sql[pos..], "IF NOT EXISTS")) {
+            query.vector_index_if_not_exists = true;
+            pos += 13;
+            pos = skipWs(sql, pos);
+        }
+
+        // ON keyword
+        if (startsWithIC(sql[pos..], "ON")) {
+            pos += 2;
+            pos = skipWs(sql, pos);
+        }
+
+        // Table name
+        const tbl_start = pos;
+        while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+        query.vector_index_table = sql[tbl_start..pos];
+        pos = skipWs(sql, pos);
+
+        // (column)
+        if (pos < sql.len and sql[pos] == '(') {
+            pos += 1;
+            pos = skipWs(sql, pos);
+            const col_start = pos;
+            while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+            query.vector_index_column = sql[col_start..pos];
+            pos = skipWs(sql, pos);
+            if (pos < sql.len and sql[pos] == ')') pos += 1;
+            pos = skipWs(sql, pos);
+        }
+
+        // USING model
+        if (startsWithIC(sql[pos..], "USING")) {
+            pos += 5;
+            pos = skipWs(sql, pos);
+            const model_start = pos;
+            // Model can be quoted or unquoted
+            if (pos < sql.len and sql[pos] == '\'') {
+                pos += 1;
+                const inner_start = pos;
+                while (pos < sql.len and sql[pos] != '\'') pos += 1;
+                query.vector_index_model = sql[inner_start..pos];
+                if (pos < sql.len) pos += 1;
+            } else {
+                while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+                query.vector_index_model = sql[model_start..pos];
+            }
+        }
+        return query;
+    } else if (startsWithIC(sql[pos..], "DROP VECTOR INDEX")) {
+        // DROP VECTOR INDEX [IF EXISTS] ON table(column)
+        query.type = .drop_vector_index;
+        pos += 17; // "DROP VECTOR INDEX"
+        pos = skipWs(sql, pos);
+
+        if (startsWithIC(sql[pos..], "IF EXISTS")) {
+            query.vector_index_if_exists = true;
+            pos += 9;
+            pos = skipWs(sql, pos);
+        }
+
+        // ON keyword
+        if (startsWithIC(sql[pos..], "ON")) {
+            pos += 2;
+            pos = skipWs(sql, pos);
+        }
+
+        // Table name
+        const tbl_start = pos;
+        while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+        query.vector_index_table = sql[tbl_start..pos];
+        pos = skipWs(sql, pos);
+
+        // (column)
+        if (pos < sql.len and sql[pos] == '(') {
+            pos += 1;
+            pos = skipWs(sql, pos);
+            const col_start = pos;
+            while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+            query.vector_index_column = sql[col_start..pos];
+            pos = skipWs(sql, pos);
+            if (pos < sql.len and sql[pos] == ')') pos += 1;
+        }
+        return query;
+    } else if (startsWithIC(sql[pos..], "SHOW VECTOR INDEXES")) {
+        // SHOW VECTOR INDEXES [FOR|ON table]
+        query.type = .show_vector_indexes;
+        pos += 19; // "SHOW VECTOR INDEXES"
+        pos = skipWs(sql, pos);
+
+        // Optional: FOR or ON table
+        if (startsWithIC(sql[pos..], "FOR") or startsWithIC(sql[pos..], "ON")) {
+            pos += if (startsWithIC(sql[pos..], "FOR")) @as(usize, 3) else @as(usize, 2);
+            pos = skipWs(sql, pos);
+            const tbl_start = pos;
+            while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+            query.vector_index_table = sql[tbl_start..pos];
+        }
+        return query;
     } else if (startsWithIC(sql[pos..], "DROP TABLE")) {
         // log("Found DROP TABLE", .{});
         query.type = .drop_table;

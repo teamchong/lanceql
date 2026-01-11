@@ -46,7 +46,7 @@
  * await v.exec('CREATE TABLE users (id INT, name TEXT)');
  * const result = await v.query('SELECT * FROM users');
  */
-export { vault, Vault, TableRef } from './store/vault.js';
+export { vault, Vault, TableRef, WritableDataFrame } from './store/vault.js';
 
 /**
  * Load WASM module for remote dataset access.

@@ -834,6 +834,9 @@ async function handleMessage(port, data) {
             result = await (await getVault()).keys();
         } else if (method === 'vault:has') {
             result = await (await getVault()).has(args.key);
+        } else if (method === 'vault:tables') {
+            const vault = await getVault();
+            result = vault._db ? vault._db.listTables() : [];
         } else if (method === 'vault:exec') {
             const vault = await getVault();
             const db = vault._db;
@@ -908,7 +911,16 @@ async function handleMessage(port, data) {
 
         sendResponse(port, id, result);
     } catch (error) {
-        port.postMessage({ id, error: error.stack || error.message });
+        // Map WASM error names to human-readable messages
+        let errorMsg = error.stack || error.message;
+        if (errorMsg.includes('TableDoesNotExist')) {
+            errorMsg = 'Table does not exist';
+        } else if (errorMsg.includes('ColumnDoesNotExist')) {
+            errorMsg = 'Column does not exist';
+        } else if (errorMsg.includes('UnknownEmbeddingModel')) {
+            errorMsg = 'Unknown embedding model';
+        }
+        port.postMessage({ id, error: errorMsg });
     }
 }
 

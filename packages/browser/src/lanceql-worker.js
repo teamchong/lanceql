@@ -39,6 +39,44 @@ async function decryptData(encrypted, cryptoKey) {
 var gpuTransformer = null;
 var gpuTransformerPromise = null;
 var embeddingCache = /* @__PURE__ */ new Map();
+// Vector index registry: key = "table.column", value = { table, column, model, shadowColumn, dimension }
+var vectorIndexes = /* @__PURE__ */ new Map();
+
+/**
+ * Get vector index info for a table.column
+ * @param {string} tableName
+ * @param {string} columnName
+ * @returns {Object|null}
+ */
+function getVectorIndex(tableName, columnName) {
+  const key = `${tableName}.${columnName}`;
+  return vectorIndexes.get(key) || null;
+}
+
+/**
+ * Resolve a column name to its shadow column if a vector index exists
+ * @param {string} tableName
+ * @param {string} columnName
+ * @returns {string}
+ */
+function resolveVectorColumn(tableName, columnName) {
+  const idx = getVectorIndex(tableName, columnName);
+  return idx ? idx.shadowColumn : columnName;
+}
+
+/**
+ * Get model dimension
+ * @param {string} model
+ * @returns {number}
+ */
+function getModelDimension(model) {
+  const modelLower = (model || '').toLowerCase();
+  if (modelLower.includes('minilm') || modelLower.includes('all-minilm')) return 384;
+  if (modelLower.includes('clip')) return 512;
+  if (modelLower.includes('openai') || modelLower.includes('ada')) return 1536;
+  return 384; // default
+}
+
 function setGPUTransformer(transformer) {
   gpuTransformer = transformer;
 }
@@ -1527,8 +1565,29 @@ var SQLParser = class {
       case TokenType.WITH:
         return this.parseWithClause();
       default:
+        // Check for SHOW as identifier
+        if (this.isKeyword('SHOW')) {
+          return this.parseShow();
+        }
         throw new Error(`Unexpected token: ${token.type}`);
     }
+  }
+  parseShow() {
+    this.advance(); // consume SHOW
+    // SHOW VECTOR INDEXES [ON table]
+    if (this.isKeyword('VECTOR')) {
+      this.advance(); // consume VECTOR
+      if (!this.isKeyword('INDEXES')) {
+        throw new Error('Expected INDEXES after VECTOR');
+      }
+      this.advance(); // consume INDEXES
+      let tableName = null;
+      if (this.match(TokenType.ON)) {
+        tableName = this.expect(TokenType.IDENTIFIER).value;
+      }
+      return { type: "SHOW_VECTOR_INDEXES", table: tableName };
+    }
+    throw new Error('Unknown SHOW command');
   }
   parseExplain() {
     this.expect(TokenType.EXPLAIN);
@@ -1578,6 +1637,17 @@ var SQLParser = class {
   }
   parseCreate() {
     this.expect(TokenType.CREATE);
+
+    // Check for CREATE VECTOR INDEX
+    if (this.isKeyword('VECTOR')) {
+      this.advance(); // consume VECTOR
+      if (!this.isKeyword('INDEX')) {
+        throw new Error('Expected INDEX after VECTOR');
+      }
+      this.advance(); // consume INDEX
+      return this.parseCreateVectorIndex();
+    }
+
     this.expect(TokenType.TABLE);
     let ifNotExists = false;
     if (this.match(TokenType.IF)) {
@@ -1601,6 +1671,36 @@ var SQLParser = class {
     this.expect(TokenType.RPAREN);
     return { type: "CREATE_TABLE", table: tableName, columns, ifNotExists };
   }
+  parseCreateVectorIndex() {
+    // CREATE VECTOR INDEX [IF NOT EXISTS] ON table(column) USING model [WITH (dim = N)]
+    let ifNotExists = false;
+    if (this.match(TokenType.IF)) {
+      this.expect(TokenType.NOT);
+      this.expect(TokenType.EXISTS);
+      ifNotExists = true;
+    }
+    this.expect(TokenType.ON);
+    const tableName = this.expect(TokenType.IDENTIFIER).value;
+    this.expect(TokenType.LPAREN);
+    const columnName = this.expect(TokenType.IDENTIFIER).value;
+    this.expect(TokenType.RPAREN);
+    if (!this.isKeyword('USING')) {
+      throw new Error('Expected USING after column');
+    }
+    this.advance(); // consume USING
+    const model = this.expect(TokenType.IDENTIFIER).value;
+    let dimension = null;
+    if (this.match(TokenType.WITH)) {
+      this.expect(TokenType.LPAREN);
+      if (this.isKeyword('dim') || this.isKeyword('dimension')) {
+        this.advance();
+        this.expect(TokenType.EQ);
+        dimension = parseInt(this.expect(TokenType.NUMBER).value);
+      }
+      this.expect(TokenType.RPAREN);
+    }
+    return { type: "CREATE_VECTOR_INDEX", table: tableName, column: columnName, model, dimension, ifNotExists };
+  }
   parseDataType() {
     const token = this.advance();
     let type = token.value || token.type;
@@ -1617,6 +1717,17 @@ var SQLParser = class {
   }
   parseDrop() {
     this.expect(TokenType.DROP);
+
+    // Check for DROP VECTOR INDEX
+    if (this.isKeyword('VECTOR')) {
+      this.advance(); // consume VECTOR
+      if (!this.isKeyword('INDEX')) {
+        throw new Error('Expected INDEX after VECTOR');
+      }
+      this.advance(); // consume INDEX
+      return this.parseDropVectorIndex();
+    }
+
     this.expect(TokenType.TABLE);
     let ifExists = false;
     if (this.match(TokenType.IF)) {
@@ -1625,6 +1736,20 @@ var SQLParser = class {
     }
     const tableName = this.expect(TokenType.IDENTIFIER).value;
     return { type: "DROP_TABLE", table: tableName, ifExists };
+  }
+  parseDropVectorIndex() {
+    // DROP VECTOR INDEX [IF EXISTS] ON table(column)
+    let ifExists = false;
+    if (this.match(TokenType.IF)) {
+      this.expect(TokenType.EXISTS);
+      ifExists = true;
+    }
+    this.expect(TokenType.ON);
+    const tableName = this.expect(TokenType.IDENTIFIER).value;
+    this.expect(TokenType.LPAREN);
+    const columnName = this.expect(TokenType.IDENTIFIER).value;
+    this.expect(TokenType.RPAREN);
+    return { type: "DROP_VECTOR_INDEX", table: tableName, column: columnName, ifExists };
   }
   parseInsert() {
     this.expect(TokenType.INSERT);
@@ -4280,8 +4405,25 @@ function cosineSimilarity(a, b) {
   }
   return dot / (Math.sqrt(magA) * Math.sqrt(magB));
 }
-async function executeNearSearch(rows, nearCondition, limit) {
-  const column = typeof nearCondition.column === "string" ? nearCondition.column : nearCondition.column.column;
+async function executeNearSearch(rows, nearCondition, limit, tableName = null) {
+  let column = typeof nearCondition.column === "string" ? nearCondition.column : nearCondition.column.column;
+
+  // Auto-resolve vector column: if a vector index exists for this column, use the shadow column
+  if (tableName) {
+    const idx = getVectorIndex(tableName, column);
+    if (idx) {
+      column = idx.shadowColumn;
+    }
+  } else {
+    // Try to resolve against all tables in the registry
+    for (const [key, info] of vectorIndexes) {
+      if (info.column === column) {
+        column = info.shadowColumn;
+        break;
+      }
+    }
+  }
+
   const text = nearCondition.text;
   const topK = nearCondition.topK || limit || 10;
   const gpuTransformer2 = getGPUTransformerState();
@@ -4412,6 +4554,52 @@ async function executeAST(db, ast) {
       return db.createTable(ast.table, ast.columns, ast.ifNotExists);
     case "DROP_TABLE":
       return db.dropTable(ast.table, ast.ifExists);
+    case "CREATE_VECTOR_INDEX": {
+      const key = `${ast.table}.${ast.column}`;
+      if (vectorIndexes.has(key)) {
+        if (ast.ifNotExists) {
+          return { created: false, message: 'Index already exists' };
+        }
+        throw new Error(`Vector index already exists on ${ast.table}(${ast.column})`);
+      }
+      const dimension = ast.dimension || getModelDimension(ast.model);
+      const shadowColumn = `__vec_${ast.column}_${ast.model}`;
+      vectorIndexes.set(key, {
+        table: ast.table,
+        column: ast.column,
+        model: ast.model,
+        shadowColumn,
+        dimension,
+        createdAt: Date.now()
+      });
+      return { created: true, table: ast.table, column: ast.column, model: ast.model, shadowColumn, dimension };
+    }
+    case "DROP_VECTOR_INDEX": {
+      const key = `${ast.table}.${ast.column}`;
+      if (!vectorIndexes.has(key)) {
+        if (ast.ifExists) {
+          return { dropped: false, message: 'Index does not exist' };
+        }
+        throw new Error(`Vector index not found on ${ast.table}(${ast.column})`);
+      }
+      vectorIndexes.delete(key);
+      return { dropped: true, table: ast.table, column: ast.column };
+    }
+    case "SHOW_VECTOR_INDEXES": {
+      const results = [];
+      for (const [key, info] of vectorIndexes) {
+        if (!ast.table || info.table === ast.table) {
+          results.push({
+            table: info.table,
+            column: info.column,
+            model: info.model,
+            shadow_column: info.shadowColumn,
+            dimension: info.dimension
+          });
+        }
+      }
+      return { columns: ['table', 'column', 'model', 'shadow_column', 'dimension'], rows: results };
+    }
     case "INSERT": {
       let rows = ast.rows || [];
       if (ast.select) {
@@ -4730,7 +4918,8 @@ async function executeAST(db, ast) {
       }
       const nearCondition = extractNearCondition(ast.where);
       if (nearCondition) {
-        rows = await executeNearSearch(rows, nearCondition, ast.limit);
+        const nearTableName = mainTable?.name || mainTable?.alias || ast.table || null;
+        rows = await executeNearSearch(rows, nearCondition, ast.limit, nearTableName);
         const remainingWhere = removeNearCondition(ast.where);
         if (remainingWhere) {
           rows = rows.filter((row) => evalWhere(remainingWhere, row, tableAliases));
