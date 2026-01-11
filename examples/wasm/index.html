@@ -2825,8 +2825,7 @@ LIMIT 20</textarea>
                 // Store in OPFS using package API
                 await opfsStorage.save(`${name}.lance`, new Uint8Array(buffer));
 
-                // Update state and refresh
-                hasUnsavedData = true;
+                // Data is now persisted to OPFS - no need for exit warning
                 refreshStorageStats();
 
                 showStatus(`Saved "${name}" locally (${formatBytes(buffer.byteLength)})`, 'success');

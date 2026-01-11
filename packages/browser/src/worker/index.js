@@ -661,6 +661,7 @@ async function executeWasmSqlFull(db, sql) {
         }
 
         let data = null;
+        let loadError = null;
         try {
             if (url.startsWith('https://') || url.startsWith('http://')) {
                 console.log(`[Worker] Fetching remote Lance: ${url} as ${alias}`);
@@ -675,14 +676,20 @@ async function executeWasmSqlFull(db, sql) {
                 data = await loadOPFSLance(url);
             }
         } catch (e) {
+            loadError = e;
             console.error(`[Worker] Failed to load ${url}:`, e);
         }
 
         if (data) {
-            console.log(`[Worker] Registering table ${alias} with ${data.rowCount} rows`);
+            console.log(`[Worker] Registering table ${alias} with ${data.rowCount} rows, columns: ${Object.keys(data.columns).join(', ')}`);
             executor.registerTable(alias, data.columns, data.rowCount, url);
+            // Verify registration succeeded
+            if (!executor.hasTable(alias)) {
+                throw new Error(`Failed to register table ${alias} from ${url}`);
+            }
         } else {
-            console.warn(`[Worker] Could not load data for ${url} (alias: ${alias})`);
+            const reason = loadError ? loadError.message : 'file may not exist or returned empty data';
+            throw new Error(`Could not load read_lance('${url}'): ${reason}`);
         }
     }
 
