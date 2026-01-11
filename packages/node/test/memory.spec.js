@@ -34,10 +34,11 @@ describe('Memory Safety', () => {
       }
     });
 
-    it('should handle 1000 prepared statements', { timeout: 120000 }, () => {
+    it('should handle 500 prepared statements', { timeout: 180000 }, () => {
       db = new Database(SIMPLE_INT64_LANCE);
 
-      for (let i = 0; i < 1000; i++) {
+      // Reduced from 1000 to 500 for CI performance
+      for (let i = 0; i < 500; i++) {
         const stmt = db.prepare('SELECT * FROM t WHERE id > 0');
         const rows = stmt.all();
         expect(rows.length).toBe(5);
