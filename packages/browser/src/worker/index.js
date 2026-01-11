@@ -655,25 +655,34 @@ async function executeWasmSqlFull(db, sql) {
 
     for (const { url, alias } of urlMappings) {
         // Skip if already registered
-        if (executor.hasTable(alias)) continue;
+        if (executor.hasTable(alias)) {
+            console.log(`[Worker] Table ${alias} already registered`);
+            continue;
+        }
 
-        if (url.startsWith('https://') || url.startsWith('http://')) {
-            const data = await fetchRemoteLance(url);
-            if (data) {
-                executor.registerTable(alias, data.columns, data.rowCount, url);
+        let data = null;
+        try {
+            if (url.startsWith('https://') || url.startsWith('http://')) {
+                console.log(`[Worker] Fetching remote Lance: ${url} as ${alias}`);
+                data = await fetchRemoteLance(url);
+            } else if (url.startsWith('opfs://')) {
+                const opfsPath = url.replace('opfs://', '');
+                console.log(`[Worker] Loading OPFS Lance: ${opfsPath} as ${alias}`);
+                data = await loadOPFSLance(opfsPath);
+            } else {
+                // Treat as OPFS path
+                console.log(`[Worker] Loading OPFS Lance (no prefix): ${url} as ${alias}`);
+                data = await loadOPFSLance(url);
             }
-        } else if (url.startsWith('opfs://')) {
-            const opfsPath = url.replace('opfs://', '');
-            const data = await loadOPFSLance(opfsPath);
-            if (data) {
-                executor.registerTable(alias, data.columns, data.rowCount, url);
-            }
+        } catch (e) {
+            console.error(`[Worker] Failed to load ${url}:`, e);
+        }
+
+        if (data) {
+            console.log(`[Worker] Registering table ${alias} with ${data.rowCount} rows`);
+            executor.registerTable(alias, data.columns, data.rowCount, url);
         } else {
-            // Treat as OPFS path
-            const data = await loadOPFSLance(url);
-            if (data) {
-                executor.registerTable(alias, data.columns, data.rowCount, url);
-            }
+            console.warn(`[Worker] Could not load data for ${url} (alias: ${alias})`);
         }
     }
 

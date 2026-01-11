@@ -5277,11 +5277,14 @@ LIMIT 20`;
                 if (opfsSupported) {
                     try {
                         await opfsStorage.save(`${name}.lance`, new Uint8Array(buffer));
-                        hasUnsavedData = true;
+                        // Data is persisted to OPFS - no unsaved warning needed
                         refreshStorageStats();
                     } catch (opfsErr) {
                         console.warn('Failed to save to OPFS, using memory only:', opfsErr);
+                        hasUnsavedData = true; // Only memory - warn on exit
                     }
+                } else {
+                    hasUnsavedData = true; // No OPFS - memory only, warn on exit
                 }
 
                 // Open as Lance file (always works - in memory)
@@ -5364,8 +5367,8 @@ LIMIT 20`;
                     }
                 }
 
-                // Update hasUnsavedData if we loaded any files
-                hasUnsavedData = loadedCount > 0;
+                // Data loaded from OPFS is already persisted - no unsaved warning needed
+                // hasUnsavedData stays false
 
                 renderTablesUI();
                 updateMemoryDisplay();
