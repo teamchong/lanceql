@@ -130,10 +130,16 @@ export class WasmSqlExecutor {
         }
 
         const memory = getWasmMemory();
+        if (!memory || !memory.buffer) {
+            throw new Error('WASM memory not available');
+        }
 
         // Write table name to WASM memory
         const tableNameBytes = new TextEncoder().encode(tableName);
         const tableNamePtr = wasm.alloc(tableNameBytes.length);
+        if (tableNamePtr < 0 || tableNamePtr >= memory.buffer.byteLength) {
+            throw new Error(`Invalid alloc result: ${tableNamePtr} for ${tableNameBytes.length} bytes`);
+        }
         new Uint8Array(memory.buffer, tableNamePtr, tableNameBytes.length).set(tableNameBytes);
 
         const registeredCols = new Set();
@@ -141,14 +147,22 @@ export class WasmSqlExecutor {
         // Register each column
         for (const [colName, data] of Object.entries(columns)) {
             if (colName.startsWith('__')) continue; // Skip metadata
+            // Skip empty arrays (e.g., vector columns we can't handle yet)
+            if (Array.isArray(data) && data.length === 0) continue;
 
             const colNameBytes = new TextEncoder().encode(colName);
             const colNamePtr = wasm.alloc(colNameBytes.length);
+            if (colNamePtr < 0 || colNamePtr >= memory.buffer.byteLength) {
+                throw new Error(`Invalid colName alloc: ${colNamePtr}`);
+            }
             new Uint8Array(memory.buffer, colNamePtr, colNameBytes.length).set(colNameBytes);
 
             if (data instanceof Float64Array) {
                 // Copy data to WASM memory
                 const dataPtr = wasm.allocFloat64Buffer(data.length);
+                if (dataPtr === 0 || dataPtr < 0 || dataPtr >= memory.buffer.byteLength) {
+                    throw new Error(`Invalid Float64 alloc: ${dataPtr} for ${data.length} elements`);
+                }
                 new Float64Array(memory.buffer, dataPtr, data.length).set(data);
 
                 wasm.registerTableFloat64(
@@ -209,12 +223,21 @@ export class WasmSqlExecutor {
 
                 // Copy to WASM
                 const offsetsPtr = wasm.alloc(offsets.byteLength);
+                if (offsetsPtr < 0 || offsetsPtr >= memory.buffer.byteLength) {
+                    throw new Error(`Invalid offsetsPtr alloc: ${offsetsPtr}`);
+                }
                 new Uint32Array(memory.buffer, offsetsPtr, offsets.length).set(offsets);
 
                 const lengthsPtr = wasm.alloc(lengths.byteLength);
+                if (lengthsPtr < 0 || lengthsPtr >= memory.buffer.byteLength) {
+                    throw new Error(`Invalid lengthsPtr alloc: ${lengthsPtr}`);
+                }
                 new Uint32Array(memory.buffer, lengthsPtr, lengths.length).set(lengths);
 
-                const dataPtr = wasm.alloc(stringData.length);
+                const dataPtr = wasm.alloc(stringData.length || 1); // Ensure at least 1 byte
+                if (dataPtr < 0 || dataPtr >= memory.buffer.byteLength) {
+                    throw new Error(`Invalid dataPtr alloc: ${dataPtr}`);
+                }
                 new Uint8Array(memory.buffer, dataPtr, stringData.length).set(stringData);
 
                 wasm.registerTableString(

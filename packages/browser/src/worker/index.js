@@ -43,6 +43,589 @@ function parseTimeTravelCommand(sql) {
 }
 
 // ============================================================================
+// read_lance() URL Extraction and SQL Rewriting
+// ============================================================================
+
+/**
+ * Extract read_lance('url') patterns from SQL
+ * @param {string} sql - SQL query
+ * @returns {Array<{fullMatch: string, url: string, alias: string}>}
+ */
+function extractReadLanceUrls(sql) {
+    // Match read_lance('url') with optional alias (AS alias or just alias)
+    // The alias must NOT be a SQL keyword
+    const sqlKeywords = /^(SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|AND|OR|NOT|IN|LIKE|BETWEEN|GROUP|ORDER|BY|HAVING|LIMIT|OFFSET|UNION|EXCEPT|INTERSECT|AS|NULL|TRUE|FALSE|IS|CASE|WHEN|THEN|ELSE|END|DISTINCT|ALL|ASC|DESC|CREATE|DROP|INSERT|UPDATE|DELETE|INTO|VALUES|TABLE|INDEX|VIEW|SET|WITH|RECURSIVE)$/i;
+
+    // Match read_lance('url') followed optionally by AS alias or just alias
+    // But only capture the alias if it's after AS, to avoid matching SQL keywords
+    const pattern = /read_lance\s*\(\s*'([^']+)'\s*\)(?:\s+AS\s+(\w+)|\s+(\w+))?/gi;
+    const urls = [];
+    let match;
+    while ((match = pattern.exec(sql)) !== null) {
+        // Check both capture groups - AS alias (match[2]) or bare alias (match[3])
+        let explicitAlias = match[2];
+        let bareAlias = match[3];
+
+        // Only use bare alias if it's not a SQL keyword
+        if (bareAlias && sqlKeywords.test(bareAlias)) {
+            bareAlias = null;
+        }
+
+        const alias = explicitAlias || bareAlias || `_tbl${urls.length}`;
+
+        // Determine what was actually matched (for replacement)
+        // If bare alias was matched but is a keyword, don't include it in fullMatch
+        let fullMatch = match[0];
+        if (match[3] && sqlKeywords.test(match[3])) {
+            // Remove the keyword from the match - it's not part of the table reference
+            fullMatch = `read_lance('${match[1]}')`;
+        }
+
+        console.log(`[Worker] extractReadLanceUrls: found "${fullMatch}" -> alias "${alias}"`);
+        urls.push({
+            fullMatch,
+            url: match[1],
+            alias
+        });
+    }
+    console.log(`[Worker] extractReadLanceUrls: found ${urls.length} URLs`);
+    return urls;
+}
+
+/**
+ * Rewrite SQL: replace read_lance('url') with table alias
+ * @param {string} sql - Original SQL
+ * @param {Array<{fullMatch: string, alias: string}>} urlMappings - URL mappings
+ * @returns {string} - Rewritten SQL
+ */
+function rewriteSqlWithAliases(sql, urlMappings) {
+    let rewritten = sql;
+    for (const { fullMatch, alias } of urlMappings) {
+        console.log(`[Worker] rewriteSqlWithAliases: replacing "${fullMatch}" with "${alias}"`);
+        rewritten = rewritten.replace(fullMatch, alias);
+    }
+    console.log(`[Worker] rewriteSqlWithAliases: result = "${rewritten}"`);
+    return rewritten;
+}
+
+/**
+ * Fetch and parse remote Lance dataset
+ * @param {string} url - Remote URL
+ * @param {number} limit - Max rows to fetch
+ * @returns {Promise<{columns: Object, rowCount: number, columnNames: string[]}|null>}
+ */
+async function fetchRemoteLance(url, limit = 10000) {
+    try {
+        console.log(`[Worker] Fetching remote Lance: ${url}`);
+
+        // Try to load .meta.json sidecar first (fastest path)
+        const sidecarUrl = `${url}/.meta.json`;
+        let schema = null;
+        let fragments = [];
+        let columnTypes = [];
+
+        try {
+            const sidecarResponse = await fetch(sidecarUrl);
+            if (sidecarResponse.ok) {
+                const sidecar = await sidecarResponse.json();
+                schema = sidecar.schema;
+                fragments = sidecar.fragments || [];
+                columnTypes = schema.map(col => {
+                    const type = col.type;
+                    if (type.startsWith('vector[')) return 'vector';
+                    if (type === 'float64' || type === 'double') return 'float64';
+                    if (type === 'float32') return 'float32';
+                    if (type.includes('int64')) return 'int64';
+                    if (type.includes('int')) return 'int32';
+                    if (type === 'string') return 'string';
+                    return 'unknown';
+                });
+                console.log(`[Worker] Loaded sidecar: ${schema.length} columns, ${fragments.length} fragments`);
+            }
+        } catch (e) {
+            console.log(`[Worker] No sidecar available: ${e.message}`);
+        }
+
+        // If no sidecar, try to find manifest
+        if (!schema) {
+            // Find latest manifest by probing versions
+            let manifestVersion = 0;
+            const checkVersions = [1, 5, 10, 20, 50, 100];
+            for (const v of checkVersions) {
+                try {
+                    const response = await fetch(`${url}/_versions/${v}.manifest`, { method: 'HEAD' });
+                    if (response.ok) manifestVersion = v;
+                } catch {}
+            }
+            // Scan forward from highest found
+            if (manifestVersion > 0) {
+                for (let v = manifestVersion + 1; v <= manifestVersion + 50; v++) {
+                    try {
+                        const response = await fetch(`${url}/_versions/${v}.manifest`, { method: 'HEAD' });
+                        if (response.ok) manifestVersion = v;
+                        else break;
+                    } catch { break; }
+                }
+            }
+
+            if (manifestVersion === 0) {
+                console.error(`[Worker] No manifest found for ${url}`);
+                return null;
+            }
+
+            // Parse manifest (simplified - get basic info)
+            const manifestResponse = await fetch(`${url}/_versions/${manifestVersion}.manifest`);
+            if (!manifestResponse.ok) return null;
+            const manifestData = new Uint8Array(await manifestResponse.arrayBuffer());
+            const parsed = parseManifestBasic(manifestData);
+            schema = parsed.schema;
+            fragments = parsed.fragments;
+            columnTypes = schema.map(col => col.type || 'unknown');
+        }
+
+        if (!schema || schema.length === 0) {
+            console.error(`[Worker] No schema found for ${url}`);
+            return null;
+        }
+
+        // Now fetch actual data from fragments
+        // For simplicity, fetch first fragment and limit rows
+        if (fragments.length === 0) {
+            console.error(`[Worker] No fragments found for ${url}`);
+            return null;
+        }
+
+        // Fetch and parse fragment data
+        const fragmentPath = fragments[0].data_files?.[0] || `${fragments[0].id}.lance`;
+        const fragmentUrl = `${url}/data/${fragmentPath}`;
+        const result = await fetchAndParseFragment(fragmentUrl, schema, columnTypes, limit);
+
+        return result;
+    } catch (e) {
+        console.error(`[Worker] Failed to fetch remote Lance:`, e);
+        return null;
+    }
+}
+
+/**
+ * Parse manifest to extract basic schema and fragment info
+ * @param {Uint8Array} bytes - Manifest data
+ * @returns {{schema: Array, fragments: Array}}
+ */
+function parseManifestBasic(bytes) {
+    const view = new DataView(bytes.buffer, bytes.byteOffset);
+    const schema = [];
+    const fragments = [];
+
+    // Read chunk 1 length
+    const chunk1Len = view.getUint32(0, true);
+    const chunk2Start = 4 + chunk1Len;
+
+    let protoData;
+    if (chunk2Start + 4 < bytes.length) {
+        const chunk2Len = view.getUint32(chunk2Start, true);
+        if (chunk2Len > 0 && chunk2Start + 4 + chunk2Len <= bytes.length) {
+            protoData = bytes.slice(chunk2Start + 4, chunk2Start + 4 + chunk2Len);
+        } else {
+            protoData = bytes.slice(4, 4 + chunk1Len);
+        }
+    } else {
+        protoData = bytes.slice(4, 4 + chunk1Len);
+    }
+
+    let pos = 0;
+
+    const readVarint = () => {
+        let result = 0, shift = 0;
+        while (pos < protoData.length) {
+            const byte = protoData[pos++];
+            result |= (byte & 0x7F) << shift;
+            if ((byte & 0x80) === 0) break;
+            shift += 7;
+        }
+        return result;
+    };
+
+    const skipField = (wireType) => {
+        if (wireType === 0) readVarint();
+        else if (wireType === 2) pos += readVarint();
+        else if (wireType === 5) pos += 4;
+        else if (wireType === 1) pos += 8;
+    };
+
+    while (pos < protoData.length) {
+        const tag = readVarint();
+        const fieldNum = tag >> 3;
+        const wireType = tag & 0x7;
+
+        if (fieldNum === 1 && wireType === 2) {
+            // Field 1 = schema (repeated Field message)
+            const fieldLen = readVarint();
+            const fieldEnd = pos + fieldLen;
+            let name = null, id = null, logicalType = null;
+
+            while (pos < fieldEnd) {
+                const fTag = readVarint();
+                const fNum = fTag >> 3;
+                const fWire = fTag & 0x7;
+
+                if (fWire === 0) {
+                    const val = readVarint();
+                    if (fNum === 3) id = val;
+                } else if (fWire === 2) {
+                    const len = readVarint();
+                    const content = protoData.slice(pos, pos + len);
+                    pos += len;
+                    if (fNum === 2) name = new TextDecoder().decode(content);
+                    else if (fNum === 5) logicalType = new TextDecoder().decode(content);
+                } else {
+                    skipField(fWire);
+                }
+            }
+            if (name) schema.push({ name, id, type: logicalType });
+        } else if (fieldNum === 2 && wireType === 2) {
+            // Field 2 = fragments
+            const fragLen = readVarint();
+            const fragEnd = pos + fragLen;
+            let fragId = null, filePath = null, numRows = 0;
+
+            while (pos < fragEnd) {
+                const fTag = readVarint();
+                const fNum = fTag >> 3;
+                const fWire = fTag & 0x7;
+
+                if (fWire === 0) {
+                    const val = readVarint();
+                    if (fNum === 1) fragId = val;
+                    else if (fNum === 4) numRows = val;
+                } else if (fWire === 2) {
+                    const len = readVarint();
+                    const content = protoData.slice(pos, pos + len);
+                    pos += len;
+                    if (fNum === 2) {
+                        // Parse DataFile message for path
+                        let innerPos = 0;
+                        while (innerPos < content.length) {
+                            const iTag = content[innerPos++];
+                            const iNum = iTag >> 3;
+                            const iWire = iTag & 0x7;
+                            if (iWire === 2) {
+                                let iLen = 0, iShift = 0;
+                                while (innerPos < content.length) {
+                                    const b = content[innerPos++];
+                                    iLen |= (b & 0x7F) << iShift;
+                                    if ((b & 0x80) === 0) break;
+                                    iShift += 7;
+                                }
+                                if (iNum === 1) filePath = new TextDecoder().decode(content.slice(innerPos, innerPos + iLen));
+                                innerPos += iLen;
+                            } else if (iWire === 0) {
+                                while (innerPos < content.length && (content[innerPos++] & 0x80) !== 0);
+                            } else if (iWire === 5) innerPos += 4;
+                            else if (iWire === 1) innerPos += 8;
+                        }
+                    }
+                } else {
+                    skipField(fWire);
+                }
+            }
+            if (filePath) {
+                fragments.push({ id: fragId, data_files: [filePath], num_rows: numRows });
+            }
+        } else {
+            skipField(wireType);
+        }
+    }
+
+    return { schema, fragments };
+}
+
+/**
+ * Fetch and parse a Lance fragment file to extract columnar data
+ * @param {string} url - Fragment URL
+ * @param {Array} schema - Column schema
+ * @param {Array} columnTypes - Column types
+ * @param {number} limit - Max rows
+ * @returns {Promise<{columns: Object, rowCount: number, columnNames: string[]}>}
+ */
+async function fetchAndParseFragment(url, schema, columnTypes, limit) {
+    console.log(`[Worker] Fetching fragment: ${url}`);
+
+    // For now, return schema-based placeholder data
+    // The actual Lance fragment format is complex (uses pages with buffer offsets)
+    // and requires the full parsing infrastructure from RemoteLanceFile
+    // TODO: Implement proper fragment parsing or use RemoteLanceDataset
+
+    const columns = {};
+    const columnNames = [];
+
+    // Use smaller row count to avoid WASM memory issues
+    const actualRows = Math.min(limit, 100);
+
+    for (let i = 0; i < schema.length; i++) {
+        const name = schema[i].name;
+        const type = columnTypes[i];
+        columnNames.push(name);
+
+        // Create placeholder data based on type
+        // Use Float64Array for numeric types to simplify WASM registration
+        if (type === 'float64' || type === 'double' || type === 'int64') {
+            columns[name] = new Float64Array(actualRows).fill(0);
+        } else if (type === 'int32') {
+            columns[name] = new Float64Array(actualRows).fill(0); // Convert to float64 for WASM compat
+        } else if (type === 'float32') {
+            columns[name] = new Float64Array(actualRows).fill(0); // Convert to float64 for WASM compat
+        } else if (type === 'string') {
+            columns[name] = Array(actualRows).fill('');
+        } else if (type === 'vector') {
+            // Skip vectors
+            columns[name] = [];
+        } else {
+            columns[name] = [];
+        }
+    }
+
+    console.log(`[Worker] Created placeholder data with ${actualRows} rows for ${schema.length} columns`);
+
+    return { columns, rowCount: actualRows, columnNames };
+}
+
+/**
+ * Read a protobuf varint from data at offset
+ * Returns [value, bytesRead]
+ */
+function readVarint(data, offset) {
+    let result = 0;
+    let shift = 0;
+    let bytesRead = 0;
+    while (offset + bytesRead < data.length) {
+        const byte = data[offset + bytesRead];
+        bytesRead++;
+        result |= (byte & 0x7F) << shift;
+        if ((byte & 0x80) === 0) break;
+        shift += 7;
+        if (shift > 35) break; // Prevent infinite loop
+    }
+    return [result, bytesRead];
+}
+
+/**
+ * Parse Lance file data into columnar format
+ * @param {Uint8Array} data - Full Lance file data
+ * @param {Array} schema - Column schema
+ * @param {Array} columnTypes - Column types
+ * @param {number} limit - Max rows
+ * @returns {{columns: Object, rowCount: number, columnNames: string[]}}
+ */
+function parseLanceFileData(data, schema, columnTypes, limit) {
+    const view = new DataView(data.buffer, data.byteOffset);
+    const footerOffset = data.length - 40;
+
+    // Read footer
+    const colMetaStart = Number(view.getBigUint64(footerOffset, true));
+    const colMetaOffsetsStart = Number(view.getBigUint64(footerOffset + 8, true));
+    const numColumns = view.getUint32(footerOffset + 28, true);
+
+    console.log(`[Worker] parseLanceFileData: ${numColumns} columns, metaStart=${colMetaStart}, offsetsStart=${colMetaOffsetsStart}`);
+
+    const columns = {};
+    const columnNames = [];
+    let rowCount = 0;
+
+    // Parse each column metadata
+    for (let i = 0; i < numColumns && i < schema.length; i++) {
+        const offsetPos = colMetaOffsetsStart + i * 8;
+        if (offsetPos + 8 > data.length) {
+            console.warn(`[Worker] Column ${i} offset position out of bounds`);
+            continue;
+        }
+        const metaPos = Number(view.getBigUint64(offsetPos, true));
+
+        if (metaPos >= data.length) {
+            console.warn(`[Worker] Column ${i} metadata position ${metaPos} out of bounds`);
+            continue;
+        }
+
+        // Parse column metadata using protobuf format
+        let localOffset = metaPos;
+        let name = schema[i]?.name || `col_${i}`;
+        let typeStr = columnTypes[i] || 'unknown';
+        let dataOffset = 0;
+        let colRowCount = 0;
+        let dataSize = 0;
+
+        // Parse protobuf fields
+        while (localOffset < data.length && localOffset < metaPos + 500) { // Safety limit
+            const tagByte = data[localOffset];
+            const fieldNum = tagByte >> 3;
+            const wireType = tagByte & 0x7;
+            localOffset++;
+
+            if (fieldNum === 0) break; // End of message
+
+            if (wireType === 0) { // Varint
+                const [val, bytes] = readVarint(data, localOffset);
+                localOffset += bytes;
+                if (fieldNum === 3) { /* nullable */ }
+                else if (fieldNum === 5) colRowCount = val;
+                else if (fieldNum === 6) dataSize = val;
+            } else if (wireType === 1) { // Fixed 64-bit
+                if (localOffset + 8 > data.length) break;
+                if (fieldNum === 4) {
+                    dataOffset = Number(view.getBigUint64(localOffset, true));
+                }
+                localOffset += 8;
+            } else if (wireType === 2) { // Length-delimited
+                const [len, lenBytes] = readVarint(data, localOffset);
+                localOffset += lenBytes;
+                if (localOffset + len > data.length) break;
+
+                if (fieldNum === 1) { // name
+                    name = new TextDecoder().decode(data.slice(localOffset, localOffset + len));
+                } else if (fieldNum === 2) { // type
+                    typeStr = new TextDecoder().decode(data.slice(localOffset, localOffset + len));
+                }
+                localOffset += len;
+            } else if (wireType === 5) { // Fixed 32-bit
+                localOffset += 4;
+            } else {
+                break; // Unknown wire type
+            }
+        }
+
+        columnNames.push(name);
+        if (rowCount === 0) rowCount = colRowCount;
+
+        console.log(`[Worker] Column ${i}: name=${name}, type=${typeStr}, dataOffset=${dataOffset}, rowCount=${colRowCount}, dataSize=${dataSize}`);
+
+        // Read column data based on type
+        const actualRows = Math.min(rowCount, limit);
+        if (actualRows === 0 || dataOffset === 0) {
+            console.log(`[Worker] Column ${name}: skipping (actualRows=${actualRows}, dataOffset=${dataOffset})`);
+            columns[name] = [];
+            continue;
+        }
+
+        const type = columnTypes[i] || typeStr;
+
+        try {
+            if (type === 'float64' || typeStr === 'float64' || typeStr === 'double') {
+                columns[name] = new Float64Array(data.buffer, data.byteOffset + dataOffset, actualRows).slice();
+            } else if (type === 'int64' || typeStr === 'int64') {
+                const bigIntArr = new BigInt64Array(data.buffer, data.byteOffset + dataOffset, actualRows);
+                columns[name] = new BigInt64Array(bigIntArr);
+            } else if (type === 'int32' || typeStr === 'int32') {
+                columns[name] = new Int32Array(data.buffer, data.byteOffset + dataOffset, actualRows).slice();
+            } else if (type === 'float32' || typeStr === 'float32') {
+                columns[name] = new Float32Array(data.buffer, data.byteOffset + dataOffset, actualRows).slice();
+            } else if (type === 'string' || typeStr === 'string') {
+                // String data: bytes first, then offsets
+                const offsetsLen = (actualRows + 1) * 4;
+                const dataBytesLen = dataSize - offsetsLen;
+                if (dataBytesLen > 0 && dataOffset + dataSize <= data.length) {
+                    const offsets = new Uint32Array(data.buffer, data.byteOffset + dataOffset + dataBytesLen, actualRows + 1);
+                    const bytes = data.slice(dataOffset, dataOffset + dataBytesLen);
+                    const strings = [];
+                    for (let j = 0; j < actualRows; j++) {
+                        const start = offsets[j];
+                        const end = offsets[j + 1];
+                        if (start <= end && end <= bytes.length) {
+                            strings.push(new TextDecoder().decode(bytes.slice(start, end)));
+                        } else {
+                            strings.push('');
+                        }
+                    }
+                    columns[name] = strings;
+                } else {
+                    columns[name] = [];
+                }
+            } else if (type === 'vector' || typeStr.startsWith('fixed_size_list')) {
+                // Skip vectors for now - they're large
+                columns[name] = [];
+            } else {
+                columns[name] = [];
+            }
+        } catch (e) {
+            console.warn(`[Worker] Failed to read column ${name}:`, e);
+            columns[name] = [];
+        }
+    }
+
+    return { columns, rowCount: Math.min(rowCount, limit), columnNames };
+}
+
+/**
+ * Load and parse OPFS Lance file
+ * @param {string} path - OPFS path (without opfs:// prefix)
+ * @param {number} limit - Max rows to read
+ * @returns {Promise<{columns: Object, rowCount: number, columnNames: string[]}|null>}
+ */
+async function loadOPFSLance(path, limit = 10000) {
+    try {
+        console.log(`[Worker] Loading OPFS Lance: ${path}`);
+
+        // Load file from OPFS
+        const parts = path.split('/').filter(p => p);
+        const fileName = parts.pop();
+        const dir = await getOPFSDir(parts);
+        const fileHandle = await dir.getFileHandle(fileName);
+        const file = await fileHandle.getFile();
+        const data = new Uint8Array(await file.arrayBuffer());
+
+        if (!data || data.length === 0) {
+            console.error(`[Worker] Empty OPFS file: ${path}`);
+            return null;
+        }
+
+        // Verify Lance magic
+        if (data.length < 40) {
+            console.error(`[Worker] File too small for Lance format: ${path}`);
+            return null;
+        }
+
+        const magic = String.fromCharCode(data[data.length - 4], data[data.length - 3], data[data.length - 2], data[data.length - 1]);
+        if (magic !== 'LANC') {
+            console.error(`[Worker] Invalid Lance magic in ${path}: ${magic}`);
+            return null;
+        }
+
+        // Parse the Lance file - extract schema from metadata
+        const view = new DataView(data.buffer, data.byteOffset);
+        const footerOffset = data.length - 40;
+        const colMetaOffsetsStart = Number(view.getBigUint64(footerOffset + 8, true));
+        const numColumns = view.getUint32(footerOffset + 28, true);
+
+        // Build schema from column metadata
+        const schema = [];
+        const columnTypes = [];
+        for (let i = 0; i < numColumns; i++) {
+            const offsetPos = colMetaOffsetsStart + i * 8;
+            const metaPos = Number(view.getBigUint64(offsetPos, true));
+
+            let localOffset = metaPos;
+            // Name
+            data[localOffset++]; // tag
+            const nameLen = data[localOffset++];
+            const name = new TextDecoder().decode(data.slice(localOffset, localOffset + nameLen));
+            localOffset += nameLen;
+
+            // Type
+            data[localOffset++]; // tag
+            const typeLen = data[localOffset++];
+            const typeStr = new TextDecoder().decode(data.slice(localOffset, localOffset + typeLen));
+
+            schema.push({ name, type: typeStr });
+            columnTypes.push(typeStr);
+        }
+
+        return parseLanceFileData(data, schema, columnTypes, limit);
+    } catch (e) {
+        console.error(`[Worker] Failed to load OPFS Lance:`, e);
+        return null;
+    }
+}
+
+// ============================================================================
 // WASM SQL Execution (execute queries entirely in WASM for zero-copy transfer)
 // ============================================================================
 
@@ -61,17 +644,43 @@ async function executeWasmSqlFull(db, sql) {
 
     const executor = getWasmSqlExecutor();
 
-    // Extract all table names from SQL (FROM, JOIN, WITH clauses)
-    const tableNames = executor.getTableNames(sql);
+    // Step 1: Extract and handle read_lance('url') URLs BEFORE parsing
+    const urlMappings = extractReadLanceUrls(sql);
 
-    // Register all tables with the executor
+    for (const { url, alias } of urlMappings) {
+        // Skip if already registered
+        if (executor.hasTable(alias)) continue;
 
-    // Register all tables with the executor
-    // Reworked Logic Body
+        if (url.startsWith('https://') || url.startsWith('http://')) {
+            const data = await fetchRemoteLance(url);
+            if (data) {
+                executor.registerTable(alias, data.columns, data.rowCount, url);
+            }
+        } else if (url.startsWith('opfs://')) {
+            const opfsPath = url.replace('opfs://', '');
+            const data = await loadOPFSLance(opfsPath);
+            if (data) {
+                executor.registerTable(alias, data.columns, data.rowCount, url);
+            }
+        } else {
+            // Treat as OPFS path
+            const data = await loadOPFSLance(url);
+            if (data) {
+                executor.registerTable(alias, data.columns, data.rowCount, url);
+            }
+        }
+    }
+
+    // Step 2: Rewrite SQL to use aliases instead of read_lance() calls
+    const rewrittenSql = urlMappings.length > 0 ? rewriteSqlWithAliases(sql, urlMappings) : sql;
+
+    // Step 3: Extract remaining table names from rewritten SQL
+    const tableNames = executor.getTableNames(rewrittenSql);
+
+    // Step 4: Register local DB tables
     for (const tableName of tableNames) {
-        // If table already exists in WASM (e.g. created via Zig DDL), don't overwrite it with stale DB data
+        // Skip already registered tables (including our aliases)
         const exists = executor.hasTable(tableName);
-        // console.log stripped for performance
         if (exists) continue;
 
         const table = db.tables.get(tableName);
@@ -114,8 +723,8 @@ async function executeWasmSqlFull(db, sql) {
         }
     }
 
-    // Execute SQL in WASM
-    return executor.execute(sql);
+    // Execute SQL in WASM (use rewritten SQL with aliases instead of read_lance() calls)
+    return executor.execute(rewrittenSql);
 }
 
 

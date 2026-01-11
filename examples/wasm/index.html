@@ -2034,10 +2034,10 @@
                 <div class="sql-editor">
                     <div class="sql-editor-container">
                         <textarea class="sql-textarea" id="sql-input"
-                            placeholder="SELECT * FROM read_lance('https://...') LIMIT 50">-- 🔍 Vector Search: Find images similar to "sunset beach"
-SELECT url, text, aesthetic
-FROM read_lance('https://data.metal0.dev/laion-1m/images.lance')
-WHERE embedding NEAR 'sunset beach'
+                            placeholder="SELECT * FROM read_lance('https://...') LIMIT 50">-- 🔗 Vector JOIN: Match remote images to local emoji by similarity
+SELECT i.url, i.text, e.emoji, e.description
+FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') i
+JOIN read_lance('opfs://emoji.lance') e ON i.embedding = e.embedding
 LIMIT 20</textarea>
                         <div class="sql-highlight" id="sql-highlight" aria-hidden="true"></div>
                     </div>
@@ -2304,7 +2304,7 @@ LIMIT 20</textarea>
         // Only public API exports are available
         import { vault, LanceQL, PureLanceWriter, opfsStorage as lanceOpfsStorage } from './lanceql.js';
 
-        // Simple OPFS support check (no internal OPFSStorage needed)
+        // Use the package's opfsStorage with fallback wrapper
         const opfsStorage = {
             async isSupported() {
                 return typeof navigator !== 'undefined' &&
@@ -2312,20 +2312,36 @@ LIMIT 20</textarea>
                        typeof navigator.storage.getDirectory === 'function';
             },
             async getStats() {
-                if (!await this.isSupported()) return { used: 0, available: 0 };
                 try {
-                    const estimate = await navigator.storage.estimate();
-                    return { used: estimate.usage || 0, available: estimate.quota || 0 };
-                } catch { return { used: 0, available: 0 }; }
+                    // Use package's opfsStorage
+                    return await lanceOpfsStorage.getStats();
+                } catch {
+                    return { totalSize: 0, fileCount: 0 };
+                }
             },
             async listFiles() {
-                // Simplified - full file listing requires internal API
-                return [];
+                try {
+                    return await lanceOpfsStorage.listFiles();
+                } catch {
+                    return [];
+                }
             },
-            async delete() { /* no-op for simplified demo */ },
-            async clearAll() { return 0; },
-            async save() { /* no-op */ },
-            async load() { return null; }
+            async delete(name) {
+                return lanceOpfsStorage.delete(name);
+            },
+            async clearAll() {
+                const files = await this.listFiles();
+                for (const f of files) {
+                    await this.delete(f.name);
+                }
+                return files.length;
+            },
+            async save(name, data) {
+                return lanceOpfsStorage.save(name, data);
+            },
+            async load(name) {
+                return lanceOpfsStorage.load(name);
+            }
         };
 
         // Helper to extract URL from read_lance('url') syntax
@@ -2609,6 +2625,7 @@ LIMIT 20</textarea>
                 refreshStorageStats();
             }
         }
+        window.toggleStoragePanel = toggleStoragePanel;
 
         function updateStoragePanelSupport() {
             const panel = document.getElementById('storage-panel');
@@ -2633,15 +2650,19 @@ LIMIT 20</textarea>
 
             try {
                 // Use package's opfsStorage for stats
-                const stats = await opfsStorage.getStats();
-                document.getElementById('storage-used').textContent = formatBytes(stats.totalSize);
-                document.getElementById('storage-files-count').textContent = stats.fileCount;
+                const stats = await opfsStorage.getStats?.() || { totalSize: 0, fileCount: 0 };
+                const totalSize = stats.totalSize || 0;
+                const fileCount = stats.fileCount || 0;
+                document.getElementById('storage-used').textContent = formatBytes(totalSize);
+                document.getElementById('storage-files-count').textContent = fileCount;
 
                 // Get storage quota
                 if (navigator.storage && navigator.storage.estimate) {
                     const estimate = await navigator.storage.estimate();
                     const quota = estimate.quota || 0;
-                    document.getElementById('storage-quota').textContent = formatBytes(quota - stats.totalSize);
+                    document.getElementById('storage-quota').textContent = formatBytes(Math.max(0, quota - totalSize));
+                } else {
+                    document.getElementById('storage-quota').textContent = '--';
                 }
 
                 // Get file list using package API
@@ -2650,12 +2671,21 @@ LIMIT 20</textarea>
                 // Update hasUnsavedData flag
                 hasUnsavedData = files.length > 0;
 
-                // Render file list
+                // Render file list with table details from registry
                 const listEl = document.getElementById('storage-files-list');
                 if (files.length === 0) {
                     listEl.innerHTML = '<div class="storage-empty">No files cached locally</div>';
                 } else {
-                    listEl.innerHTML = files.map(f => `
+                    listEl.innerHTML = files.map(f => {
+                        // Try to get table info from registry
+                        const tableName = f.name.replace(/\.lance$/, '');
+                        const tableInfo = tablesRegistry.get(tableName);
+                        const meta = [];
+                        if (tableInfo?.rows) meta.push(`${tableInfo.rows.toLocaleString()} rows`);
+                        if (tableInfo?.cols) meta.push(`${tableInfo.cols} cols`);
+                        meta.push(formatBytes(f.size));
+
+                        return `
                         <div class="storage-file-item" data-file="${f.name}">
                             <div class="storage-file-info">
                                 <svg class="storage-file-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -2663,11 +2693,11 @@ LIMIT 20</textarea>
                                     <polyline points="14,2 14,8 20,8"/>
                                 </svg>
                                 <span class="storage-file-name">${f.name}</span>
-                                <span class="storage-file-size">${formatBytes(f.size)}</span>
+                                <span class="storage-file-size">${meta.join(' · ')}</span>
                             </div>
                             <button class="storage-file-delete" onclick="deleteStorageFile('${f.name}')" title="Delete">×</button>
                         </div>
-                    `).join('');
+                    `}).join('');
                 }
             } catch (e) {
                 console.warn('Failed to refresh storage stats:', e);
@@ -2758,6 +2788,12 @@ LIMIT 20</textarea>
             }
         }
 
+        // Expose storage functions to global scope for onclick handlers
+        window.refreshStorageStats = refreshStorageStats;
+        window.clearAllStorage = clearAllStorage;
+        window.clearSession = clearSession;
+        window.deleteStorageFile = deleteStorageFile;
+
         // Save remote dataset to OPFS for offline use
         async function saveRemoteToLocal(url, name) {
             if (!opfsSupported) {
@@ -2819,15 +2855,22 @@ LIMIT 20</textarea>
 
         // Default demo dataset URL - LAION 1M images dataset
         const DEFAULT_DATASET_URL = 'https://data.metal0.dev/laion-1m/images.lance';
-        const DEFAULT_QUERY = `-- 🔍 Vector Search: Find images similar to "sunset beach"
-SELECT url, text, aesthetic
-FROM read_lance('https://data.metal0.dev/laion-1m/images.lance')
-WHERE embedding NEAR 'sunset beach'
+        const DEFAULT_QUERY = `-- 🔗 Vector JOIN: Match remote images to local emoji by similarity
+SELECT i.url, i.text, e.emoji, e.description
+FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') i
+JOIN read_lance('opfs://emoji.lance') e ON i.embedding = e.embedding
 LIMIT 20`;
+
+        // Vault instance for real SQL execution
+        let vaultInstance = null;
 
         // Initialize
         async function init() {
             try {
+                // Initialize vault for real SQL execution (uses worker with WASM SQL executor)
+                vaultInstance = await vault();
+                console.log('Vault initialized for SQL execution');
+
                 lanceql = await LanceQL.load('./lanceql.wasm');
                 document.getElementById('version').textContent = `v${lanceql.getVersion()}`;
                 console.log('LanceQL loaded:', lanceql.getVersion());
@@ -2855,16 +2898,20 @@ LIMIT 20`;
                     const query = sqlToQuery(sql);
                     syncQueryTabs(query, 'sql');
                 }
-                setTimeout(runSqlQuery, 100);
 
-                // Check OPFS support and load tables
+                // Check OPFS support and load tables BEFORE running query
                 opfsSupported = await checkOPFSSupport();
                 console.log('OPFS supported:', opfsSupported);
                 updateStoragePanelSupport();
 
                 if (opfsSupported) {
-                    loadOPFSTables();
+                    // Auto-create emoji.lance if it doesn't exist (needed for default JOIN query)
+                    await ensureEmojiTable();
+                    await loadOPFSTables();
                 }
+
+                // Run query AFTER emoji table is created
+                setTimeout(runSqlQuery, 100);
 
                 // Initialize storage stats, online status, and memory display
                 updateOnlineStatus();
@@ -4287,102 +4334,102 @@ LIMIT 20`;
             }
         }
 
-        // Execute simple SQL-like queries
+        // Execute SQL using vault.exec() - unified SQL execution via worker
         async function executeSimpleSql(sql) {
-            const upperSql = sql.toUpperCase();
-            const isRemote = currentFile._isRemote;
-
-            // Parse LIMIT
-            let limit = 100;
-            const limitMatch = upperSql.match(/LIMIT\s+(\d+)/);
-            if (limitMatch) limit = parseInt(limitMatch[1]);
-
-            // For remote files, we don't support WHERE filtering yet (would need full column scan)
-            // Just fetch the first N rows
-            if (isRemote) {
-                return await executeRemoteQuery(limit);
+            if (!vaultInstance) {
+                throw new Error('Vault not initialized');
             }
 
-            // Parse WHERE for simple conditions (local files only)
-            let filterIndices = null;
-            const whereMatch = sql.match(/WHERE\s+(\w+)\s*(>|>=|<|<=|=|!=)\s*(-?\d+(?:\.\d+)?)/i);
-            if (whereMatch) {
-                const colMatch = whereMatch[1].match(/column_?(\d+)/i);
-                if (colMatch) {
-                    const colIdx = parseInt(colMatch[1]);
-                    const op = whereMatch[2];
-                    const value = parseFloat(whereMatch[3]);
-                    const type = columnTypes[colIdx] || 'int64';
+            // Use unified SQL execution via vault (handles read_lance URLs, JOINs, etc.)
+            const result = await vaultInstance.exec(sql);
 
-                    const df = currentFile.df().filter(colIdx, op, value, type);
-                    filterIndices = df.collectIndices();
-                }
-            }
-
-            // Check for aggregation query
-            if (upperSql.includes('COUNT(') || upperSql.includes('SUM(') || upperSql.includes('AVG(')) {
-                return executeAggregationQuery(sql, filterIndices);
-            }
-
-            // Regular SELECT
-            const columns = [];
-            for (let i = 0; i < currentFile.numColumns; i++) {
-                columns.push(`column_${i}`);
-            }
-
+            // Convert columnar result to row format for display
+            const columns = result.columns || [];
+            const data = result.data || {};
+            const numRows = result.rowCount || 0;
             const rows = [];
-            const indices = filterIndices || Array.from({ length: Math.min(rowCount, limit) }, (_, i) => i);
-            const actualLimit = Math.min(indices.length, limit);
 
-            for (let i = 0; i < actualLimit; i++) {
+            for (let i = 0; i < numRows; i++) {
                 const row = [];
-                const idx = indices[i];
-                for (let c = 0; c < currentFile.numColumns; c++) {
-                    const type = columnTypes[c];
-                    if (type === 'int64') {
-                        const data = currentFile.readInt64AtIndices(c, new Uint32Array([idx]));
-                        row.push(data[0]?.toString() || '');
-                    } else if (type === 'float64') {
-                        const data = currentFile.readFloat64AtIndices(c, new Uint32Array([idx]));
-                        row.push(data[0]?.toFixed(4) || '');
-                    } else if (type === 'string') {
-                        const str = currentFile.readStringAt(c, idx);
-                        row.push(str || '');
+                for (const colName of columns) {
+                    const colData = data[colName];
+                    if (colData) {
+                        let val;
+                        // Handle Arrow string format
+                        if (colData._arrowString) {
+                            const { offsets, bytes } = colData;
+                            const start = offsets[i];
+                            const end = offsets[i + 1];
+                            val = new TextDecoder().decode(bytes.slice(start, end));
+                        } else if (Array.isArray(colData)) {
+                            val = colData[i];
+                        } else if (ArrayBuffer.isView(colData)) {
+                            val = colData[i];
+                        } else {
+                            val = colData[i];
+                        }
+                        row.push(val !== null && val !== undefined ? String(val) : '');
                     } else {
-                        row.push('?');
+                        row.push('');
                     }
                 }
                 rows.push(row);
             }
 
-            return { columns, rows, total: filterIndices ? filterIndices.length : rowCount };
+            return {
+                columns,
+                rows,
+                total: numRows
+            };
         }
 
         // Execute query for remote files via Range requests
         // Uses batched fetching - reads all indices per column in one batch
-        async function executeRemoteQuery(limit, randomIndices = null) {
+        async function executeRemoteQuery(limit, randomIndices = null, selectColumns = null) {
             // Get column names from schema if available
             const colNames = currentFile?.columnNames || [];
-            const columns = [];
+            const allColumns = [];
             for (let i = 0; i < currentFile.numColumns; i++) {
-                columns.push(colNames[i] || `column_${i}`);
+                allColumns.push(colNames[i] || `column_${i}`);
             }
+
+            // Determine which columns to fetch
+            let columnsToFetch = []; // { idx: number, name: string }
+            if (selectColumns && selectColumns.length > 0) {
+                // Only fetch selected columns
+                for (const selCol of selectColumns) {
+                    const idx = allColumns.findIndex(c => c.toLowerCase() === selCol.toLowerCase());
+                    if (idx >= 0) {
+                        columnsToFetch.push({ idx, name: allColumns[idx] });
+                    }
+                }
+                // If no columns matched, fall back to all
+                if (columnsToFetch.length === 0) {
+                    columnsToFetch = allColumns.map((name, idx) => ({ idx, name }));
+                }
+            } else {
+                // SELECT * - fetch all columns
+                columnsToFetch = allColumns.map((name, idx) => ({ idx, name }));
+            }
+
+            const columns = columnsToFetch.map(c => c.name);
 
             const indices = randomIndices || Array.from({ length: limit }, (_, i) => i);
             const actualLimit = indices.length;
-            const numCols = currentFile.numColumns;
+            const numColsToFetch = columnsToFetch.length;
 
             // Show progress bar
-            showProgress('Fetching column data...', 0, numCols);
+            showProgress('Fetching column data...', 0, numColsToFetch);
 
-            // Fetch all data per column using detected types
+            // Fetch data for selected columns only
             const columnData = [];
 
-            for (let c = 0; c < numCols; c++) {
-                showProgress(`Fetching column ${c + 1}/${numCols}`, c, numCols);
+            for (let i = 0; i < numColsToFetch; i++) {
+                const { idx: c, name: fetchColName } = columnsToFetch[i];
+                showProgress(`Fetching column ${i + 1}/${numColsToFetch} (${fetchColName})`, i, numColsToFetch);
 
                 const type = columnTypes[c] || 'unknown';
-                const colName = colNames[c]?.toLowerCase() || '';
+                const colNameLower = colNames[c]?.toLowerCase() || '';
                 let data = null;
 
                 console.log(`executeRemoteQuery: column ${c} (${colNames[c]}), type=${type}`);
@@ -4396,7 +4443,7 @@ LIMIT 20`;
 
                     if (type === 'int64') {
                         data = await currentFile.readInt64AtIndices(c, indices);
-                        columnData.push({ type: 'int64', data, colName });
+                        columnData.push({ type: 'int64', data, colName: colNameLower });
                         continue;
                     }
 
@@ -4457,13 +4504,13 @@ LIMIT 20`;
                 }
             }
 
-            showProgress('Building results...', numCols, numCols);
+            showProgress('Building results...', numColsToFetch, numColsToFetch);
 
             // Build rows from column data
             const rows = [];
             for (let i = 0; i < actualLimit; i++) {
                 const row = [];
-                for (let c = 0; c < numCols; c++) {
+                for (let c = 0; c < numColsToFetch; c++) {
                     const col = columnData[c];
                     const colName = col.colName || '';
 
@@ -6311,16 +6358,42 @@ LIMIT 20`;
             });
         });
 
+        // Auto-create emoji table if it doesn't exist
+        async function ensureEmojiTable() {
+            try {
+                // Check if emoji.lance already exists
+                const files = await lanceOpfsStorage.listFiles();
+                const exists = files.some(f => f.name === 'emoji.lance');
+                if (exists) {
+                    console.log('[Demo] emoji.lance already exists');
+                    // Update button state
+                    const btn = document.getElementById('create-demo-join-table');
+                    if (btn) {
+                        btn.textContent = '✓ Emoji Table';
+                        btn.style.background = '#22c55e';
+                    }
+                    return;
+                }
+
+                console.log('[Demo] Auto-creating emoji.lance...');
+                await createDemoJoinTable(true); // silent mode
+            } catch (e) {
+                console.warn('[Demo] Failed to auto-create emoji table:', e);
+            }
+        }
+
         // Create demo JOIN table for testing
         let demoTableDb = null;
 
-        async function createDemoJoinTable() {
+        async function createDemoJoinTable(silent = false) {
             const btn = document.getElementById('create-demo-join-table');
-            btn.disabled = true;
-            btn.textContent = 'Creating...';
+            if (btn) {
+                btn.disabled = true;
+                btn.textContent = 'Creating...';
+            }
 
             try {
-                showStatus('Creating emoji table with embeddings...', 'info');
+                if (!silent) showStatus('Creating emoji table with embeddings...', 'info');
 
                 // Emoji data with semantic descriptions
                 const emojiData = [
@@ -6348,14 +6421,14 @@ LIMIT 20`;
 
                 // Load MiniLM model for embeddings
                 if (!minilmModelLoaded) {
-                    showStatus('Loading MiniLM model...', 'info');
+                    if (!silent) showStatus('Loading MiniLM model...', 'info');
                     const loaded = await ensureMinilmModelLoaded();
                     if (!loaded) {
                         throw new Error('Failed to load MiniLM model');
                     }
                 }
 
-                showStatus('Generating embeddings...', 'info');
+                if (!silent) showStatus('Generating embeddings...', 'info');
 
                 // Generate embeddings for each description
                 const embeddings = [];
@@ -6379,40 +6452,46 @@ LIMIT 20`;
                 for (let i = 0; i < embeddings.length; i++) {
                     flatEmbeddings.set(embeddings[i], i * dim);
                 }
-                writer.addFloat32Column('embedding', flatEmbeddings);
+                writer.addVectorColumn('embedding', flatEmbeddings, dim);
 
                 // Finalize and save to OPFS
                 const lanceBytes = writer.finalize();
                 await lanceOpfsStorage.save('emoji.lance', lanceBytes);
 
                 console.log(`[Demo] Created emoji.lance: ${emojiData.length} rows, ${lanceBytes.length} bytes`);
-                showStatus(`Emoji table created (${emojiData.length} rows with embeddings)`, 'success');
+                if (!silent) showStatus(`Emoji table created (${emojiData.length} rows with embeddings)`, 'success');
 
-                // Reload OPFS tables
-                await loadOPFSTables();
+                // Reload OPFS tables (skip if silent - will be loaded by init)
+                if (!silent) await loadOPFSTables();
 
-                btn.textContent = '✓ Emoji Table';
-                btn.style.background = '#22c55e';
+                if (btn) {
+                    btn.textContent = '✓ Emoji Table';
+                    btn.style.background = '#22c55e';
+                }
 
-                // Update SQL with vector JOIN example
-                const sqlInput = document.getElementById('sql-input');
-                sqlInput.value = `-- 🚀 Vector JOIN: Remote images + Local emoji tags
+                // Update SQL with vector JOIN example (only if not silent)
+                if (!silent) {
+                    const sqlInput = document.getElementById('sql-input');
+                    sqlInput.value = `-- 🚀 Vector JOIN: Remote images + Local emoji tags
 SELECT r.url, r.text, e.emoji, e.description
 FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') r
 JOIN read_lance('opfs://emoji.lance') e ON r.embedding = e.embedding
 LIMIT 20`;
-                document.getElementById('sql-highlight').innerHTML = highlightSQL(sqlInput.value) + '\n';
+                    document.getElementById('sql-highlight').innerHTML = highlightSQL(sqlInput.value) + '\n';
+                }
 
             } catch (error) {
-                showStatus(`Error creating emoji table: ${error.message}`, 'error');
+                if (!silent) showStatus(`Error creating emoji table: ${error.message}`, 'error');
                 console.error(error);
-                btn.disabled = false;
-                btn.textContent = '+ Emoji Table';
-                btn.style.background = '#334155';
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = '+ Emoji Table';
+                    btn.style.background = '#334155';
+                }
             }
         }
 
-        document.getElementById('create-demo-join-table')?.addEventListener('click', createDemoJoinTable);
+        document.getElementById('create-demo-join-table')?.addEventListener('click', () => createDemoJoinTable(false));
 
         // Initialize
         init();
