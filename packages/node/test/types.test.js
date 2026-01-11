@@ -1,9 +1,9 @@
 const Database = require('../src/index.js');
 const assert = require('assert');
-const path = require('path');
+const { getBetterSqlite3FixturePath } = require('./test-utils.js');
 
 // Test with types fixture (has int32, float32, bool columns)
-const dbPath = path.join(__dirname, '../../../tests/fixtures/better-sqlite3/types_test.lance/data/1001011110111010000110017c7899445c8eadd0bc3b151743.lance');
+const dbPath = getBetterSqlite3FixturePath('types_test.lance');
 
 console.log('=== Additional Data Types Tests ===\n');
 
@@ -11,7 +11,7 @@ console.log('=== Additional Data Types Tests ===\n');
 console.log('Test 1: SELECT i32_col (int32 column)');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT i32_col FROM table');
+    const stmt = db.prepare('SELECT i32_col FROM t');
     const rows = stmt.all();
     console.log(`Rows: ${JSON.stringify(rows)}`);
 
@@ -31,7 +31,7 @@ try {
 console.log('\nTest 2: SELECT f32_col (float32 column)');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT f32_col FROM table');
+    const stmt = db.prepare('SELECT f32_col FROM t');
     const rows = stmt.all();
     console.log(`Rows: ${JSON.stringify(rows)}`);
 
@@ -56,7 +56,7 @@ try {
 console.log('\nTest 3: SELECT bool_col (bool column)');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT bool_col FROM table');
+    const stmt = db.prepare('SELECT bool_col FROM t');
     const rows = stmt.all();
     console.log(`Rows: ${JSON.stringify(rows)}`);
 
@@ -76,7 +76,7 @@ try {
 console.log('\nTest 4: SELECT * (all columns including new types)');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT * FROM table');
+    const stmt = db.prepare('SELECT * FROM t');
     const rows = stmt.all();
     console.log(`Rows: ${JSON.stringify(rows)}`);
 
@@ -101,7 +101,7 @@ try {
 console.log('\nTest 5: SELECT * WHERE i32_col > 0');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT * FROM table WHERE i32_col > 0');
+    const stmt = db.prepare('SELECT * FROM t WHERE i32_col > 0');
     const rows = stmt.all();
     console.log(`Rows: ${JSON.stringify(rows)}`);
 
@@ -120,10 +120,10 @@ try {
 }
 
 // Test 6: ORDER BY on int32
-console.log('\nTest 6: SELECT i32_col FROM table ORDER BY i32_col');
+console.log('\nTest 6: SELECT i32_col FROM t ORDER BY i32_col');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT i32_col FROM table ORDER BY i32_col');
+    const stmt = db.prepare('SELECT i32_col FROM t ORDER BY i32_col');
     const rows = stmt.all();
     console.log(`Rows: ${JSON.stringify(rows)}`);
 
@@ -138,10 +138,10 @@ try {
 }
 
 // Test 7: DISTINCT on bool
-console.log('\nTest 7: SELECT DISTINCT bool_col FROM table');
+console.log('\nTest 7: SELECT DISTINCT bool_col FROM t');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT DISTINCT bool_col FROM table');
+    const stmt = db.prepare('SELECT DISTINCT bool_col FROM t');
     const rows = stmt.all();
     console.log(`Rows: ${JSON.stringify(rows)}`);
 
@@ -155,11 +155,11 @@ try {
 }
 
 // Test 8: Mixed type expressions
-console.log('\nTest 8: SELECT name, i32_col, bool_col FROM table WHERE i32_col >= 0 AND bool_col = true');
+console.log('\nTest 8: SELECT name, i32_col, bool_col FROM t WHERE i32_col >= 0 AND bool_col = true');
 try {
     const db = new Database(dbPath);
     // Note: bool comparison syntax may vary - this tests if it works
-    const stmt = db.prepare('SELECT name, i32_col, bool_col FROM table WHERE i32_col >= 0');
+    const stmt = db.prepare('SELECT name, i32_col, bool_col FROM t WHERE i32_col >= 0');
     const rows = stmt.all();
     console.log(`Rows: ${JSON.stringify(rows)}`);
 

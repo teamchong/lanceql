@@ -1,9 +1,9 @@
 const Database = require('../src/index.js');
 const assert = require('assert');
-const path = require('path');
+const { getBetterSqlite3FixturePath } = require('./test-utils.js');
 
 // Test with distinct fixture (has duplicate values)
-const dbPath = path.join(__dirname, '../../../tests/fixtures/better-sqlite3/distinct_test.lance/data/1011100101110011011000001a2ed149c5895af73c13059290.lance');
+const dbPath = getBetterSqlite3FixturePath('distinct_test.lance');
 
 console.log('=== DISTINCT Tests ===\n');
 
@@ -11,7 +11,7 @@ console.log('=== DISTINCT Tests ===\n');
 console.log('Test 1: SELECT DISTINCT category (string column with duplicates)');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT DISTINCT category FROM table');
+    const stmt = db.prepare('SELECT DISTINCT category FROM t');
     const rows = stmt.all();
     console.log(`Rows: ${JSON.stringify(rows)}`);
 
@@ -34,7 +34,7 @@ try {
 console.log('\nTest 2: SELECT DISTINCT value (integer column with duplicates)');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT DISTINCT value FROM table');
+    const stmt = db.prepare('SELECT DISTINCT value FROM t');
     const rows = stmt.all();
     console.log(`Rows: ${JSON.stringify(rows)}`);
 
@@ -57,7 +57,7 @@ try {
 console.log('\nTest 3: SELECT DISTINCT category, value (multiple columns)');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT DISTINCT category, value FROM table');
+    const stmt = db.prepare('SELECT DISTINCT category, value FROM t');
     const rows = stmt.all();
     console.log(`Rows: ${JSON.stringify(rows)}`);
 
@@ -74,10 +74,10 @@ try {
 }
 
 // Test 4: SELECT DISTINCT with WHERE clause
-console.log('\nTest 4: SELECT DISTINCT category FROM table WHERE value > 1');
+console.log('\nTest 4: SELECT DISTINCT category FROM t WHERE value > 1');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT DISTINCT category FROM table WHERE value > 1');
+    const stmt = db.prepare('SELECT DISTINCT category FROM t WHERE value > 1');
     const rows = stmt.all();
     console.log(`Rows: ${JSON.stringify(rows)}`);
 
@@ -96,10 +96,10 @@ try {
 }
 
 // Test 5: SELECT DISTINCT with ORDER BY
-console.log('\nTest 5: SELECT DISTINCT category FROM table ORDER BY category DESC');
+console.log('\nTest 5: SELECT DISTINCT category FROM t ORDER BY category DESC');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT DISTINCT category FROM table ORDER BY category DESC');
+    const stmt = db.prepare('SELECT DISTINCT category FROM t ORDER BY category DESC');
     const rows = stmt.all();
     console.log(`Rows: ${JSON.stringify(rows)}`);
 
@@ -117,10 +117,10 @@ try {
 }
 
 // Test 6: SELECT DISTINCT with LIMIT
-console.log('\nTest 6: SELECT DISTINCT category FROM table LIMIT 2');
+console.log('\nTest 6: SELECT DISTINCT category FROM t LIMIT 2');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT DISTINCT category FROM table LIMIT 2');
+    const stmt = db.prepare('SELECT DISTINCT category FROM t LIMIT 2');
     const rows = stmt.all();
     console.log(`Rows: ${JSON.stringify(rows)}`);
 
@@ -135,10 +135,10 @@ try {
 }
 
 // Test 7: SELECT without DISTINCT (baseline - should have duplicates)
-console.log('\nTest 7: SELECT category FROM table (without DISTINCT - baseline)');
+console.log('\nTest 7: SELECT category FROM t (without DISTINCT - baseline)');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT category FROM table');
+    const stmt = db.prepare('SELECT category FROM t');
     const rows = stmt.all();
     console.log(`Rows: ${JSON.stringify(rows)}`);
 
@@ -153,10 +153,10 @@ try {
 }
 
 // Test 8: SELECT DISTINCT * (all columns)
-console.log('\nTest 8: SELECT DISTINCT * FROM table');
+console.log('\nTest 8: SELECT DISTINCT * FROM t');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT DISTINCT * FROM table');
+    const stmt = db.prepare('SELECT DISTINCT * FROM t');
     const rows = stmt.all();
     console.log(`Rows: ${JSON.stringify(rows)}`);
 

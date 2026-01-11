@@ -1,9 +1,9 @@
 const Database = require('../src/index.js');
 const assert = require('assert');
-const path = require('path');
+const { getFixturePath } = require('./test-utils.js');
 
 // Test with existing fixture
-const dbPath = path.join(__dirname, '../../../tests/fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance');
+const dbPath = getFixturePath('simple_int64.lance');
 
 console.log('=== Basic Functionality Tests ===\n');
 
@@ -23,7 +23,7 @@ try {
 console.log('\nTest 2: SELECT *');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT * FROM table');
+    const stmt = db.prepare('SELECT * FROM t');
     const rows = stmt.all();
     console.log(`Rows: ${JSON.stringify(rows)}`);
     assert.strictEqual(rows.length, 5);
@@ -40,7 +40,7 @@ try {
 console.log('\nTest 3: SELECT with WHERE');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT * FROM table WHERE id > 2');
+    const stmt = db.prepare('SELECT * FROM t WHERE id > 2');
     const rows = stmt.all();
     console.log(`Filtered rows: ${JSON.stringify(rows)}`);
     assert.strictEqual(rows.length, 3);
@@ -56,7 +56,7 @@ try {
 console.log('\nTest 4: Statement.get()');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT * FROM table WHERE id = 3');
+    const stmt = db.prepare('SELECT * FROM t WHERE id = 3');
     const row = stmt.get();
     console.log(`Single row: ${JSON.stringify(row)}`);
     assert.strictEqual(row.id, 3);

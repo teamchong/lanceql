@@ -1,9 +1,9 @@
 const Database = require('../src/index.js');
 const assert = require('assert');
-const path = require('path');
+const { getFixturePath } = require('./test-utils.js');
 
 // This test file uses ACTUAL better-sqlite3 code patterns to verify drop-in compatibility
-const dbPath = path.join(__dirname, '../../../tests/fixtures/simple_int64.lance/data/0100110011011011000010005445a8407eb6f52a3c35f80bd3.lance');
+const dbPath = getFixturePath('simple_int64.lance');
 
 console.log('=== better-sqlite3 Compatibility Test Suite ===\n');
 
@@ -43,7 +43,7 @@ try {
 console.log('\nTest 3: Statement Properties');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT * FROM table');
+    const stmt = db.prepare('SELECT * FROM t');
     assert.strictEqual(typeof stmt.source, 'string');
     assert.strictEqual(stmt.readonly, true);
     assert.strictEqual(stmt.database, db);
@@ -62,7 +62,7 @@ try {
 console.log('\nTest 4: stmt.all() returns array of objects');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT * FROM table');
+    const stmt = db.prepare('SELECT * FROM t');
     const rows = stmt.all();
     assert.strictEqual(Array.isArray(rows), true);
     assert.strictEqual(typeof rows[0], 'object');
@@ -79,7 +79,7 @@ try {
 console.log('\nTest 5: stmt.get() returns single object');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT * FROM table');
+    const stmt = db.prepare('SELECT * FROM t');
     const row = stmt.get();
     assert.strictEqual(typeof row, 'object');
     assert.strictEqual('id' in row, true);
@@ -95,7 +95,7 @@ try {
 console.log('\nTest 6: stmt.run() returns info object');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT * FROM table');
+    const stmt = db.prepare('SELECT * FROM t');
     const info = stmt.run();
     assert.strictEqual(typeof info, 'object');
     assert.strictEqual('changes' in info, true);
@@ -112,7 +112,7 @@ try {
 console.log('\nTest 7: Method chaining - pluck()');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT * FROM table');
+    const stmt = db.prepare('SELECT * FROM t');
     const values = stmt.pluck().all();
     assert.strictEqual(Array.isArray(values), true);
     assert.strictEqual(typeof values[0], 'number'); // First column only
@@ -128,7 +128,7 @@ try {
 console.log('\nTest 8: Method chaining - raw()');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT * FROM table');
+    const stmt = db.prepare('SELECT * FROM t');
     const arrays = stmt.raw().all();
     assert.strictEqual(Array.isArray(arrays), true);
     assert.strictEqual(Array.isArray(arrays[0]), true);
@@ -144,7 +144,7 @@ try {
 console.log('\nTest 9: iterate() returns iterator');
 try {
     const db = new Database(dbPath);
-    const stmt = db.prepare('SELECT * FROM table WHERE id < 3');
+    const stmt = db.prepare('SELECT * FROM t WHERE id < 3');
     let count = 0;
     for (const row of stmt.iterate()) {
         assert.strictEqual(typeof row, 'object');
