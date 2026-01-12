@@ -59,6 +59,24 @@ comptime {
 var minilm_initialized: bool = false;
 var minilm_model_loaded: bool = false;
 
+pub fn isLoaded() bool {
+    return minilm_model_loaded;
+}
+
+// Copy text to internal buffer for embedding
+pub fn copyTextToBuffer(text: []const u8) void {
+    const len = @min(text.len, minilm_text_buffer.len);
+    @memcpy(minilm_text_buffer[0..len], text[0..len]);
+}
+
+// Copy output embedding to buffer
+pub fn copyOutputToBuffer(buf: []f32) void {
+    if (buf.len >= 384) {
+        @memcpy(buf[0..384], minilm_output_buffer[0..384]);
+    }
+}
+
+
 // Buffers for MiniLM
 var minilm_text_buffer: [1024]u8 = undefined;
 var minilm_output_buffer: [MINILM_EMBED_DIM]f32 = undefined;

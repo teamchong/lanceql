@@ -3030,6 +3030,22 @@ var global_right_frag_ctx: ?FragmentContext = null;
 /// Always copies to provided buffer and returns dimension (0 on failure)
 /// WASM-safe: returns primitive instead of struct
 fn getVectorData(table: *const TableInfo, col: *const ColumnData, idx: u32, buf: *[MAX_VECTOR_DIM]f32, context: *?FragmentContext) usize {
+    // If it's a string column and MiniLM is loaded, embed on the fly
+    if (col.col_type == .string and minilm.isLoaded()) {
+        // Use optimized string reader (handles lazy/hybrid)
+        const str_val = getStringValueOptimized(table, col, idx, context);
+        if (str_val.len == 0) return 0;
+        
+        // Embed
+        minilm.copyTextToBuffer(str_val);
+        const res = minilm.minilm_encode_text(str_val.len);
+        if (res == 0) {
+            minilm.copyOutputToBuffer(buf);
+            return 384; // MiniLM dimension
+        }
+        return 0;
+    }
+
     if (col.vector_dim == 0) return 0;
     const dim = @as(usize, col.vector_dim);
 
@@ -9972,12 +9988,17 @@ fn executeGroupByNearQuery(table: *const TableInfo, query: *const ParsedQuery, m
         return error.ColumnNotFound;
     };
 
-    if (near_col.vector_dim == 0) {
-        setDebug("GROUP BY NEAR: column '{s}' is not a vector column", .{query.group_by_near_col});
-        return error.ExpectedVectorColumn;
+    var dim = near_col.vector_dim;
+    
+    // Auto-detect if string column and MiniLM is loaded
+    if (dim == 0 and near_col.col_type == .string and minilm.isLoaded()) {
+        dim = 384; // MiniLM dimension
     }
 
-    const dim = near_col.vector_dim;
+    if (dim == 0) {
+        setDebug("GROUP BY NEAR: column '{s}' is not a vector column (and MiniLM not loaded)", .{query.group_by_near_col});
+        return error.ExpectedVectorColumn;
+    }
 
     // Allocate centroids on heap to avoid stack overflow (384KB)
     const centroids = try memory.wasm_allocator.alloc(f32, num_clusters * MAX_VECTOR_DIM);
