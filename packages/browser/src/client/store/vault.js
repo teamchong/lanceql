@@ -124,6 +124,14 @@ class Vault {
     }
 
     /**
+     * Load the MiniLM model into the worker for CREATE VECTOR INDEX operations.
+     * @returns {Promise<{loaded: boolean, cached: boolean}>}
+     */
+    async loadMinilmModel() {
+        return workerRPC('loadMinilmModel', {});
+    }
+
+    /**
      * Execute a SQL query and return results as array of objects.
      * @param {string} sql - SELECT statement
      * @returns {Promise<Object[]>} Array of row objects

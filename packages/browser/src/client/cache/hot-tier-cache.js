@@ -2,6 +2,8 @@
  * HotTierCache - Two-tier caching (hot/cold) for frequent data
  */
 
+import { OPFSStorage } from '../storage/opfs.js';
+
 class HotTierCache {
     constructor(storage = null, options = {}) {
         this.storage = storage;

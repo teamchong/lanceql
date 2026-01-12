@@ -216,6 +216,28 @@ class PureLanceWriter {
     }
 
     /**
+     * Add a vector column (fixed-size list of float32)
+     * @param {string} name - Column name
+     * @param {Float32Array} values - Flat array of all vector values (numRows * dimension)
+     * @param {number} dimension - Vector dimension (e.g., 384 for MiniLM)
+     */
+    addVectorColumn(name, values, dimension) {
+        const numRows = values.length / dimension;
+        if (!Number.isInteger(numRows)) {
+            throw new Error(`Vector data length ${values.length} is not divisible by dimension ${dimension}`);
+        }
+        this._validateRowCount(numRows);
+        this.columns.push({
+            name,
+            type: LanceColumnType.FLOAT32,
+            data: new Uint8Array(values.buffer, values.byteOffset, values.byteLength),
+            length: numRows,
+            dimension, // Store dimension for metadata
+            isVector: true,
+        });
+    }
+
+    /**
      * Add a boolean column
      * @param {string} name - Column name
      * @param {boolean[]} values - Column values
@@ -246,18 +268,20 @@ class PureLanceWriter {
         const encoder = new TextEncoder();
 
         // Build offsets and data
-        // Lance strings use i32 offsets followed by UTF-8 data
-        const offsets = new Int32Array(values.length + 1);
+        // Lance v2 uses N offsets for N strings (end positions)
+        // WASM expects: offset[i] = cumulative byte position at END of string i
+        // So for row 0: str_start=0, str_end=offset[0]
+        //    for row i>0: str_start=offset[i-1], str_end=offset[i]
+        const offsets = new Int32Array(values.length); // N offsets (not N+1)
         const dataChunks = [];
         let currentOffset = 0;
 
         for (let i = 0; i < values.length; i++) {
-            offsets[i] = currentOffset;
             const encoded = encoder.encode(values[i]);
             dataChunks.push(encoded);
             currentOffset += encoded.length;
+            offsets[i] = currentOffset; // End position of string i
         }
-        offsets[values.length] = currentOffset;
 
         // Combine offsets and data
         const offsetsBytes = new Uint8Array(offsets.buffer);
@@ -410,10 +434,20 @@ class PureLanceWriter {
         }
 
         // 4. Write column metadata offset table
+        // Format: Each entry is 16 bytes (position: u64, length: u64)
+        // Position is ABSOLUTE file offset, length is byte size of metadata
         const columnMetaOffsetsStart = currentOffset;
-        const offsetTable = new BigUint64Array(columnMetaOffsets.length);
+        const offsetTable = new BigUint64Array(columnMetaOffsets.length * 2); // 2 u64 per entry
         for (let i = 0; i < columnMetaOffsets.length; i++) {
-            offsetTable[i] = BigInt(columnMetaOffsets[i]);
+            // Absolute position = columnMetaStart + relative offset
+            const absolutePos = BigInt(columnMetaStart) + BigInt(columnMetaOffsets[i]);
+            // Length = distance to next offset (or to end of metadata section)
+            const nextOffset = (i < columnMetaOffsets.length - 1)
+                ? columnMetaOffsets[i + 1]
+                : metaOffset; // metaOffset is total size of all metadata
+            const length = BigInt(nextOffset - columnMetaOffsets[i]);
+            offsetTable[i * 2] = absolutePos;
+            offsetTable[i * 2 + 1] = length;
         }
         const offsetTableBytes = new Uint8Array(offsetTable.buffer);
         chunks.push(offsetTableBytes);
@@ -473,6 +507,22 @@ class PureLanceWriter {
      */
     getColumnNames() {
         return this.columns.map(c => c.name);
+    }
+
+    /**
+     * Get schema as JSON-serializable object for sidecar storage
+     * @returns {{columns: Array<{name: string, type: string, dimension?: number}>}}
+     */
+    getSchema() {
+        return {
+            columns: this.columns.map(c => ({
+                name: c.name,
+                type: c.type,
+                ...(c.dimension ? { dimension: c.dimension } : {}),
+                ...(c.isVector ? { isVector: true } : {}),
+            })),
+            rowCount: this.rowCount,
+        };
     }
 }
 
