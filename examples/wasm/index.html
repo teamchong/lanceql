@@ -6538,7 +6538,7 @@ LIMIT 100`;
                 if (!silent) {
                     const sqlInput = document.getElementById('sql-input');
                     sqlInput.value = `-- 🎯 Shadow column demo: LIKE (text) + GROUP BY NEAR (vector) on same column
-SELECT emoji, description FROM read_lance('opfs://emoji.lance')
+SELECT MAX(emoji), description FROM read_lance('opfs://emoji.lance')
 WHERE description LIKE '%sun%'
 GROUP BY NEAR description TOPK 3`;
                     document.getElementById('sql-highlight').innerHTML = highlightSQL(sqlInput.value) + '\n';

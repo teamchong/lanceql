@@ -9979,8 +9979,9 @@ fn executeGroupByNearQuery(table: *const TableInfo, query: *const ParsedQuery, m
 
     const dim = near_col.vector_dim;
 
-    // Use first K rows as centroids (simple seeding)
-    var centroids: [MAX_CLUSTERS][MAX_VECTOR_DIM]f32 = undefined;
+    // Allocate centroids on heap to avoid stack overflow (384KB)
+    const centroids = try memory.wasm_allocator.alloc(f32, num_clusters * MAX_VECTOR_DIM);
+    defer memory.wasm_allocator.free(centroids);
     var centroid_count: usize = 0;
 
     const indices = maybe_indices orelse blk: {
@@ -9995,7 +9996,9 @@ fn executeGroupByNearQuery(table: *const TableInfo, query: *const ParsedQuery, m
     for (indices) |idx| {
         if (centroid_count >= num_clusters) break;
         var ctx: ?FragmentContext = null;
-        const got_dim = getVectorData(table, near_col, idx, &centroids[centroid_count], &ctx);
+        // Point to slice within flat centroids buffer
+        const centroid_ptr: *[MAX_VECTOR_DIM]f32 = @ptrCast(centroids[centroid_count * MAX_VECTOR_DIM..]);
+        const got_dim = getVectorData(table, near_col, idx, centroid_ptr, &ctx);
         if (got_dim > 0) {
             centroid_count += 1;
         }
@@ -10016,11 +10019,14 @@ fn executeGroupByNearQuery(table: *const TableInfo, query: *const ParsedQuery, m
 
     // Assign each row to nearest centroid
     var cluster_counts: [MAX_CLUSTERS]usize = undefined;
-    // Manual init for WASM compatibility
     for (0..MAX_CLUSTERS) |ci| {
         cluster_counts[ci] = 0;
     }
-    var cluster_indices: [MAX_CLUSTERS][MAX_ROWS]u32 = undefined;
+
+    // Allocate cluster indices on heap to avoid stack overflow (~51MB)
+    // Flattened array: [cluster_idx * MAX_ROWS + row_idx]
+    const cluster_indices = try memory.wasm_allocator.alloc(u32, MAX_CLUSTERS * MAX_ROWS);
+    defer memory.wasm_allocator.free(cluster_indices);
 
     for (indices) |idx| {
         var ctx: ?FragmentContext = null;
@@ -10031,7 +10037,8 @@ fn executeGroupByNearQuery(table: *const TableInfo, query: *const ParsedQuery, m
         var best_cluster: usize = 0;
         var best_score: f32 = -2.0;
         for (0..centroid_count) |ci| {
-            const score = simd_search.simdDotProduct(&vec_buf_1, &centroids[ci], dim);
+            const centroid_ptr: *[MAX_VECTOR_DIM]f32 = @ptrCast(centroids[ci * MAX_VECTOR_DIM..]);
+            const score = simd_search.simdDotProduct(&vec_buf_1, centroid_ptr, dim);
             if (score > best_score) {
                 best_score = score;
                 best_cluster = ci;
@@ -10040,7 +10047,8 @@ fn executeGroupByNearQuery(table: *const TableInfo, query: *const ParsedQuery, m
 
         // Add to cluster
         if (cluster_counts[best_cluster] < MAX_ROWS) {
-            cluster_indices[best_cluster][cluster_counts[best_cluster]] = idx;
+            const count = cluster_counts[best_cluster];
+            cluster_indices[best_cluster * MAX_ROWS + count] = idx;
             cluster_counts[best_cluster] += 1;
         }
     }
@@ -10052,7 +10060,8 @@ fn executeGroupByNearQuery(table: *const TableInfo, query: *const ParsedQuery, m
 
     for (0..centroid_count) |ci| {
         const cluster_row_count = cluster_counts[ci];
-        const cluster_row_indices = cluster_indices[ci][0..cluster_row_count];
+        const start_idx = ci * MAX_ROWS;
+        const cluster_row_indices = cluster_indices[start_idx..][0..cluster_row_count];
 
         for (query.aggregates[0..num_aggs], 0..) |agg, ai| {
             const result = computeAggregate(table, agg, cluster_row_indices);
