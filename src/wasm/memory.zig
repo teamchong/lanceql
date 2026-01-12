@@ -1,12 +1,69 @@
 const std = @import("std");
 
-// var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+// Import js_log for debugging
+extern fn js_log(ptr: [*]const u8, len: usize) void;
+
+// Use page_allocator for standard allocations
 pub const wasm_allocator = std.heap.page_allocator;
 
+// Simple bump allocator state for large one-off allocations
+var bump_base: usize = 0;
+var bump_offset: usize = 0;
+
 pub fn wasmAlloc(len: usize) ?[*]u8 {
+    js_log("wasmAlloc: enter", 16);
+
+    // Sanity check - reject huge allocations
+    if (len > 256 * 1024 * 1024) { // 256MB max
+        js_log("wasmAlloc: too big", 18);
+        return null;
+    }
+    js_log("wasmAlloc: size ok", 18);
+
+    // For very large allocations (>256KB), use WASM memory.grow directly
+    if (len > 256 * 1024) {
+        js_log("wasmAlloc: large alloc using grow", 33);
+        return wasmGrowAlloc(len);
+    }
+
+    // For smaller allocations, use the standard allocator
     const count = (len + 7) / 8;
-    const slice = wasm_allocator.alloc(u64, count) catch return null;
+    js_log("wasmAlloc: calling page_alloc", 29);
+    const slice = wasm_allocator.alloc(u64, count) catch {
+        js_log("wasmAlloc: alloc failed", 23);
+        return null;
+    };
+    js_log("wasmAlloc: alloc success", 24);
+
     return @ptrCast(slice.ptr);
+}
+
+// Direct WASM memory growth for large allocations
+fn wasmGrowAlloc(len: usize) ?[*]u8 {
+    js_log("wasmGrowAlloc: enter", 20);
+
+    // Align to 8 bytes
+    const aligned_len = (len + 7) & ~@as(usize, 7);
+
+    // Calculate pages needed (WASM pages are 64KB)
+    const pages_needed = (aligned_len + 65535) / 65536;
+
+    js_log("wasmGrowAlloc: calling grow", 27);
+
+    // @wasmMemoryGrow returns isize: previous size in pages, or -1 on failure
+    const prev_pages_signed: isize = @wasmMemoryGrow(0, pages_needed);
+
+    if (prev_pages_signed < 0) {
+        js_log("wasmGrowAlloc: grow failed", 26);
+        return null;
+    }
+
+    js_log("wasmGrowAlloc: grow success", 27);
+
+    // Calculate the address of the newly allocated memory
+    const prev_pages: usize = @intCast(prev_pages_signed);
+    const ptr_addr = prev_pages * 65536;
+    return @ptrFromInt(ptr_addr);
 }
 
 /// No-op as GPA doesn't support global reset, but we shouldn't need it if we free

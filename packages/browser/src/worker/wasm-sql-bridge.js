@@ -36,7 +36,6 @@ export class WasmSqlExecutor {
     getLastError() {
         const wasm = getWasm();
         if (!wasm) return "WASM not loaded";
-        const memory = getWasmMemory();
 
         // Alloc temp buffer for error
         const ptr = wasm.alloc(4096);
@@ -45,17 +44,10 @@ export class WasmSqlExecutor {
         console.log(`[WASM LOG] getLastError len: ${len}`);
         if (len === 0) return "Unknown Error";
 
-        const bytes = new Uint8Array(memory.buffer, ptr, len);
+        // Re-acquire memory after alloc (may have grown)
+        const bytes = new Uint8Array(getWasmMemory().buffer, ptr, len);
         const msg = new TextDecoder().decode(bytes);
         console.log(`[WASM LOG] getLastError msg: ${msg}`);
-        // Cleanup? wasm.alloc might not need free if we use stack logic in WASM side but we use allocator.
-        // We should free? Existing code doesn't seem to free systematically in tight loops but generic allocs should be freed.
-        // But alloc implementation in Zig uses GPA or Arena?
-        // memory.zig says wasmAlloc uses std.heap.page_allocator or similar.
-        // Assuming we should free if possible, but we don't expose free in this class easily.
-        // But wait, `alloc` is exposed. `free` should be too?
-        // Checking index.js would confirm exports.
-        // For now, leaking 256 bytes on error is fine.
         return msg;
     }
 
@@ -68,19 +60,18 @@ export class WasmSqlExecutor {
         const wasm = getWasm();
         if (!wasm) throw new Error('WASM not loaded');
 
-        const memory = getWasmMemory();
-
         // Write SQL to WASM
         const sqlBytes = new TextEncoder().encode(sql);
         const sqlPtr = wasm.alloc(sqlBytes.length);
-        new Uint8Array(memory.buffer, sqlPtr, sqlBytes.length).set(sqlBytes);
+        // Re-acquire memory after alloc (may have grown)
+        new Uint8Array(getWasmMemory().buffer, sqlPtr, sqlBytes.length).set(sqlBytes);
 
         // Call Zig to get comma-separated table names
         const namesPtr = wasm.getTableNames(sqlPtr, sqlBytes.length);
         if (namesPtr === 0) return [];
 
         // Read result (null-terminated string)
-        const view = new Uint8Array(memory.buffer, namesPtr);
+        const view = new Uint8Array(getWasmMemory().buffer, namesPtr);
         let len = 0;
         while (view[len] !== 0 && len < 1024) len++;
 
@@ -97,10 +88,10 @@ export class WasmSqlExecutor {
         const wasm = getWasm();
         if (!wasm) return false;
 
-        const memory = getWasmMemory();
         const bytes = new TextEncoder().encode(tableName);
         const ptr = wasm.alloc(bytes.length);
-        new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
+        // Re-acquire memory after alloc (may have grown)
+        new Uint8Array(getWasmMemory().buffer, ptr, bytes.length).set(bytes);
 
         const res = wasm.hasTable(ptr, bytes.length);
         return res === 1;
@@ -129,18 +120,20 @@ export class WasmSqlExecutor {
             wasm.clearTable(nameBytes, nameBytes.length);
         }
 
-        const memory = getWasmMemory();
-        if (!memory || !memory.buffer) {
+        // Helper to get fresh memory buffer (important: WASM memory may grow after allocs)
+        const getMemBuf = () => getWasmMemory().buffer;
+
+        if (!getMemBuf()) {
             throw new Error('WASM memory not available');
         }
 
         // Write table name to WASM memory
         const tableNameBytes = new TextEncoder().encode(tableName);
         const tableNamePtr = wasm.alloc(tableNameBytes.length);
-        if (tableNamePtr < 0 || tableNamePtr >= memory.buffer.byteLength) {
+        if (tableNamePtr < 0 || tableNamePtr >= getMemBuf().byteLength) {
             throw new Error(`Invalid alloc result: ${tableNamePtr} for ${tableNameBytes.length} bytes`);
         }
-        new Uint8Array(memory.buffer, tableNamePtr, tableNameBytes.length).set(tableNameBytes);
+        new Uint8Array(getMemBuf(), tableNamePtr, tableNameBytes.length).set(tableNameBytes);
 
         const registeredCols = new Set();
 
@@ -152,18 +145,18 @@ export class WasmSqlExecutor {
 
             const colNameBytes = new TextEncoder().encode(colName);
             const colNamePtr = wasm.alloc(colNameBytes.length);
-            if (colNamePtr < 0 || colNamePtr >= memory.buffer.byteLength) {
+            if (colNamePtr < 0 || colNamePtr >= getMemBuf().byteLength) {
                 throw new Error(`Invalid colName alloc: ${colNamePtr}`);
             }
-            new Uint8Array(memory.buffer, colNamePtr, colNameBytes.length).set(colNameBytes);
+            new Uint8Array(getMemBuf(), colNamePtr, colNameBytes.length).set(colNameBytes);
 
             if (data instanceof Float64Array) {
                 // Copy data to WASM memory
                 const dataPtr = wasm.allocFloat64Buffer(data.length);
-                if (dataPtr === 0 || dataPtr < 0 || dataPtr >= memory.buffer.byteLength) {
+                if (dataPtr === 0 || dataPtr < 0 || dataPtr >= getMemBuf().byteLength) {
                     throw new Error(`Invalid Float64 alloc: ${dataPtr} for ${data.length} elements`);
                 }
-                new Float64Array(memory.buffer, dataPtr, data.length).set(data);
+                new Float64Array(getMemBuf(), dataPtr, data.length).set(data);
 
                 wasm.registerTableFloat64(
                     tableNamePtr, tableNameBytes.length,
@@ -174,7 +167,7 @@ export class WasmSqlExecutor {
             } else if (data instanceof BigInt64Array) {
                 // Convert to Int64 array
                 const dataPtr = wasm.allocInt64Buffer(data.length);
-                new BigInt64Array(memory.buffer, dataPtr, data.length).set(data);
+                new BigInt64Array(getMemBuf(), dataPtr, data.length).set(data);
 
                 wasm.registerTableInt64(
                     tableNamePtr, tableNameBytes.length,
@@ -189,7 +182,7 @@ export class WasmSqlExecutor {
                 for (let i = 0; i < data.length; i++) f64Data[i] = data[i];
 
                 const dataPtr = wasm.allocFloat64Buffer(f64Data.length);
-                new Float64Array(memory.buffer, dataPtr, f64Data.length).set(f64Data);
+                new Float64Array(getMemBuf(), dataPtr, f64Data.length).set(f64Data);
 
                 wasm.registerTableFloat64(
                     tableNamePtr, tableNameBytes.length,
@@ -207,7 +200,7 @@ export class WasmSqlExecutor {
                 // Allocate and copy Float32 data to WASM
                 const dataPtr = wasm.allocFloat32Buffer ? wasm.allocFloat32Buffer(data.length) : null;
                 if (dataPtr) {
-                    new Float32Array(memory.buffer, dataPtr, data.length).set(data);
+                    new Float32Array(getMemBuf(), dataPtr, data.length).set(data);
 
                     if (wasm.registerTableFloat32Vector) {
                         wasm.registerTableFloat32Vector(
@@ -251,22 +244,22 @@ export class WasmSqlExecutor {
 
                 // Copy to WASM
                 const offsetsPtr = wasm.alloc(offsets.byteLength);
-                if (offsetsPtr < 0 || offsetsPtr >= memory.buffer.byteLength) {
+                if (offsetsPtr < 0 || offsetsPtr >= getMemBuf().byteLength) {
                     throw new Error(`Invalid offsetsPtr alloc: ${offsetsPtr}`);
                 }
-                new Uint32Array(memory.buffer, offsetsPtr, offsets.length).set(offsets);
+                new Uint32Array(getMemBuf(), offsetsPtr, offsets.length).set(offsets);
 
                 const lengthsPtr = wasm.alloc(lengths.byteLength);
-                if (lengthsPtr < 0 || lengthsPtr >= memory.buffer.byteLength) {
+                if (lengthsPtr < 0 || lengthsPtr >= getMemBuf().byteLength) {
                     throw new Error(`Invalid lengthsPtr alloc: ${lengthsPtr}`);
                 }
-                new Uint32Array(memory.buffer, lengthsPtr, lengths.length).set(lengths);
+                new Uint32Array(getMemBuf(), lengthsPtr, lengths.length).set(lengths);
 
                 const dataPtr = wasm.alloc(stringData.length || 1); // Ensure at least 1 byte
-                if (dataPtr < 0 || dataPtr >= memory.buffer.byteLength) {
+                if (dataPtr < 0 || dataPtr >= getMemBuf().byteLength) {
                     throw new Error(`Invalid dataPtr alloc: ${dataPtr}`);
                 }
-                new Uint8Array(memory.buffer, dataPtr, stringData.length).set(stringData);
+                new Uint8Array(getMemBuf(), dataPtr, stringData.length).set(stringData);
 
                 wasm.registerTableString(
                     tableNamePtr, tableNameBytes.length,
@@ -278,6 +271,38 @@ export class WasmSqlExecutor {
         }
 
         this._registered.set(tableName, { version, columns: registeredCols, rowCount });
+    }
+
+    /**
+     * Create an alias for an existing table (reuses table data including shadow columns)
+     * @param {string} sourceName - The existing table name
+     * @param {string} aliasName - The alias name to create
+     */
+    aliasTable(sourceName, aliasName) {
+        const wasm = getWasm();
+        if (!wasm) throw new Error('WASM not loaded');
+
+        const encoder = new TextEncoder();
+        const sourceBytes = encoder.encode(sourceName);
+        const aliasBytes = encoder.encode(aliasName);
+
+        const sourcePtr = wasm.alloc(sourceBytes.length);
+        const aliasPtr = wasm.alloc(aliasBytes.length);
+
+        // Re-acquire memory after allocs (may have grown)
+        const memBuf = getWasmMemory().buffer;
+        new Uint8Array(memBuf, sourcePtr, sourceBytes.length).set(sourceBytes);
+        new Uint8Array(memBuf, aliasPtr, aliasBytes.length).set(aliasBytes);
+
+        if (wasm.aliasTable) {
+            wasm.aliasTable(sourcePtr, sourceBytes.length, aliasPtr, aliasBytes.length);
+        }
+
+        // Copy registration info
+        const existing = this._registered.get(sourceName);
+        if (existing) {
+            this._registered.set(aliasName, { ...existing, aliasOf: sourceName });
+        }
     }
 
     /**
@@ -336,23 +361,24 @@ export class WasmSqlExecutor {
         const wasm = getWasm();
         if (!wasm) throw new Error('WASM not loaded');
 
-        const memory = getWasmMemory();
+        // Helper to get fresh memory buffer after allocs
+        const getMemBuf = () => getWasmMemory().buffer;
 
         // Write table name
         const tableNameBytes = new TextEncoder().encode(tableName);
         const tableNamePtr = wasm.alloc(tableNameBytes.length);
-        new Uint8Array(memory.buffer, tableNamePtr, tableNameBytes.length).set(tableNameBytes);
+        new Uint8Array(getMemBuf(), tableNamePtr, tableNameBytes.length).set(tableNameBytes);
 
         for (const [colName, data] of Object.entries(columns)) {
             if (colName.startsWith('__')) continue;
 
             const colNameBytes = new TextEncoder().encode(colName);
             const colNamePtr = wasm.alloc(colNameBytes.length);
-            new Uint8Array(memory.buffer, colNamePtr, colNameBytes.length).set(colNameBytes);
+            new Uint8Array(getMemBuf(), colNamePtr, colNameBytes.length).set(colNameBytes);
 
             if (data instanceof Float64Array) {
                 const dataPtr = wasm.allocFloat64Buffer(data.length);
-                new Float64Array(memory.buffer, dataPtr, data.length).set(data);
+                new Float64Array(getMemBuf(), dataPtr, data.length).set(data);
 
                 // type_code: 4 (float64)
                 wasm.appendTableMemory(
@@ -362,7 +388,7 @@ export class WasmSqlExecutor {
                 );
             } else if (data instanceof BigInt64Array) {
                 const dataPtr = wasm.allocInt64Buffer(data.length);
-                new BigInt64Array(memory.buffer, dataPtr, data.length).set(data);
+                new BigInt64Array(getMemBuf(), dataPtr, data.length).set(data);
 
                 // type_code: 2 (int64)
                 wasm.appendTableMemory(
@@ -371,10 +397,8 @@ export class WasmSqlExecutor {
                     dataPtr, 2, rowCount
                 );
             } else if (data instanceof Int32Array) {
-                // Convert to Float64 for now as int32 support is partial
-                // Or better, support int32 in appendTableMemory if Zig supports it (We added it!)
-                const dataPtr = wasm.alloc(data.byteLength); // int32 is just bytes
-                new Int32Array(memory.buffer, dataPtr, data.length).set(data);
+                const dataPtr = wasm.alloc(data.byteLength);
+                new Int32Array(getMemBuf(), dataPtr, data.length).set(data);
 
                 // type_code: 1 (int32)
                 wasm.appendTableMemory(
@@ -384,7 +408,7 @@ export class WasmSqlExecutor {
                 );
             } else if (data instanceof Float32Array) {
                 const dataPtr = wasm.alloc(data.byteLength);
-                new Float32Array(memory.buffer, dataPtr, data.length).set(data);
+                new Float32Array(getMemBuf(), dataPtr, data.length).set(data);
 
                 // type_code: 3 (float32)
                 wasm.appendTableMemory(
@@ -393,16 +417,6 @@ export class WasmSqlExecutor {
                     dataPtr, 3, rowCount
                 );
             }
-            // String support for append is tricky (variable length). 
-            // Zig implementation for appendTableMemory currently only takes fixed width arrays?
-            // Let's check Zig...
-            // Zig takes data_ptr, type_code.
-            // But for strings we need offsets+bytes.
-            // Our zig implementation returns error(4) for anything else.
-            // So Strings are NOT supported in Memory Batch yet?
-            // We should fix Zig or skip.
-            // For now we skip strings or convert to something else? 
-            // Skipping will cause empty column for new rows.
         }
     }
 
@@ -414,8 +428,6 @@ export class WasmSqlExecutor {
     execute(sql) {
         const wasm = getWasm();
         if (!wasm) throw new Error('WASM not loaded');
-
-        const memory = getWasmMemory();
 
         // Set current timestamp for NOW(), CURRENT_DATE() functions
         // Note: WASM i64 accepts BigInt in modern browsers
@@ -437,7 +449,7 @@ export class WasmSqlExecutor {
         if (sqlBytes.length > sqlInputSize) {
             throw new Error(`SQL too long: ${sqlBytes.length} > ${sqlInputSize}`);
         }
-        new Uint8Array(memory.buffer, sqlInputPtr, sqlBytes.length).set(sqlBytes);
+        new Uint8Array(getWasmMemory().buffer, sqlInputPtr, sqlBytes.length).set(sqlBytes);
         wasm.setSqlInputLength(sqlBytes.length);
 
         // Execute SQL in WASM
@@ -458,8 +470,7 @@ export class WasmSqlExecutor {
             // throw new Error(`[WASM DEBUG] ${debugMsg}`);
         }
 
-        const buffer = wasm.memory.buffer;
-        const result = this._parseResult(memory.buffer, resultPtr, resultSize);
+        const result = this._parseResult(getWasmMemory().buffer, resultPtr, resultSize);
 
         // Reset WASM state for next query
         wasm.resetResult();
