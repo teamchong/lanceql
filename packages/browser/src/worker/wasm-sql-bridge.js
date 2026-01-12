@@ -197,28 +197,56 @@ export class WasmSqlExecutor {
                     dataPtr, f64Data.length
                 );
                 registeredCols.add(colName);
+            } else if (data instanceof Float32Array) {
+                // Vector column (Float32Array with dimension metadata)
+                // Check for dimension metadata: __colName_dim
+                const dimKey = `__${colName}_dim`;
+                const vectorDim = columns[dimKey] || 0;
+                const actualRowCount = vectorDim > 0 ? Math.floor(data.length / vectorDim) : data.length;
+
+                // Allocate and copy Float32 data to WASM
+                const dataPtr = wasm.allocFloat32Buffer ? wasm.allocFloat32Buffer(data.length) : null;
+                if (dataPtr) {
+                    new Float32Array(memory.buffer, dataPtr, data.length).set(data);
+
+                    if (wasm.registerTableFloat32Vector) {
+                        wasm.registerTableFloat32Vector(
+                            tableNamePtr, tableNameBytes.length,
+                            colNamePtr, colNameBytes.length,
+                            dataPtr, actualRowCount, vectorDim
+                        );
+                        console.log(`[Bridge] Registered vector column ${colName}: ${actualRowCount} rows, dim=${vectorDim}`);
+                    } else {
+                        console.warn(`[Bridge] No registerTableFloat32Vector, skipping ${colName}`);
+                    }
+                    registeredCols.add(colName);
+                } else {
+                    console.warn(`[Bridge] Failed to alloc Float32 buffer for ${colName}`);
+                }
             } else if (Array.isArray(data)) {
                 // String column - encode as offsets + data
                 const offsets = new Uint32Array(data.length);
                 const lengths = new Uint32Array(data.length);
+                const encoder = new TextEncoder();
 
-                // Calculate total string length
+                // First pass: encode all strings to get byte lengths
+                const encodedStrings = [];
                 let totalLen = 0;
                 for (let i = 0; i < data.length; i++) {
                     const str = String(data[i] || '');
-                    lengths[i] = str.length;
+                    const bytes = encoder.encode(str);
+                    encodedStrings.push(bytes);
+                    lengths[i] = bytes.length; // Use byte length, not char length
                     offsets[i] = totalLen;
-                    totalLen += str.length;
+                    totalLen += bytes.length;
                 }
 
                 // Concatenate all strings
                 const stringData = new Uint8Array(totalLen);
                 let offset = 0;
-                for (let i = 0; i < data.length; i++) {
-                    const str = String(data[i] || '');
-                    const bytes = new TextEncoder().encode(str);
-                    stringData.set(bytes, offset);
-                    offset += bytes.length;
+                for (let i = 0; i < encodedStrings.length; i++) {
+                    stringData.set(encodedStrings[i], offset);
+                    offset += encodedStrings[i].length;
                 }
 
                 // Copy to WASM

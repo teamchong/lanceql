@@ -516,9 +516,15 @@ var debug_counter: usize = 0;
 var table_names_buf: [1024]u8 = undefined;
 
 fn getColByName(table: *const TableInfo, name: []const u8) ?*const ColumnData {
+    // Handle qualified column names (e.g., "i.url" -> "url")
+    const col_name = if (std.mem.indexOfScalar(u8, name, '.')) |dot_idx|
+        name[dot_idx + 1 ..]
+    else
+        name;
+
     for (0..table.column_count) |i| {
         if (table.columns[i]) |*col| {
-            if (std.mem.eql(u8, col.name, name)) return col;
+            if (std.mem.eql(u8, col.name, col_name)) return col;
         }
     }
     return null;
@@ -2804,6 +2810,69 @@ fn getStringValueOptimized(table: *const TableInfo, col: *const ColumnData, idx:
     return col.data.strings.data[off..][0..len];
 }
 
+/// Thread-local buffer for vector JOIN comparisons
+var vec_buf_1: [MAX_VECTOR_DIM]f32 = undefined;
+var vec_buf_2: [MAX_VECTOR_DIM]f32 = undefined;
+
+/// Get vector data for a row from a column (returns pointer to start of vector and dimension)
+/// For in-memory data, returns a direct pointer. For lazy data, copies to provided buffer.
+fn getVectorData(table: *const TableInfo, col: *const ColumnData, idx: u32, buf: *[MAX_VECTOR_DIM]f32, context: *?FragmentContext) ?struct { ptr: [*]const f32, dim: usize } {
+    if (col.vector_dim == 0) return null;
+    const dim = @as(usize, col.vector_dim);
+
+    // Hybrid Check: Read from column data directly for memory rows
+    if (table.memory_row_count > 0 and idx >= table.file_row_count) {
+        const mem_idx = idx - table.file_row_count;
+        if (col.col_type == .float32) {
+            const start = mem_idx * dim;
+            if (start + dim <= col.data.float32.len) {
+                return .{ .ptr = col.data.float32.ptr + start, .dim = dim };
+            }
+        }
+        return null;
+    }
+
+    // Lazy (fragment-based) data
+    if (col.is_lazy) {
+        // Find the right fragment
+        if (context.* == null or idx < context.*.?.start_idx or idx >= context.*.?.end_idx) {
+            var f_start: u32 = 0;
+            for (table.fragments[0..table.fragment_count]) |maybe_f| {
+                if (maybe_f) |f| {
+                    const f_rows = @as(u32, @intCast(f.getRowCount()));
+                    if (idx < f_start + f_rows) {
+                        context.* = FragmentContext{
+                            .frag = f,
+                            .start_idx = f_start,
+                            .end_idx = f_start + f_rows,
+                        };
+                        break;
+                    }
+                    f_start += f_rows;
+                }
+            }
+        }
+        if (context.*) |ctx| {
+            if (ctx.frag) |frag| {
+                const n = frag.fragmentReadVectorAt(col.fragment_col_idx, idx - ctx.start_idx, buf, dim);
+                if (n == dim) {
+                    return .{ .ptr = buf, .dim = dim };
+                }
+            }
+        }
+        return null;
+    }
+
+    // In-memory (non-lazy) data
+    if (col.col_type == .float32) {
+        const start = idx * dim;
+        if (start + dim <= col.data.float32.len) {
+            return .{ .ptr = col.data.float32.ptr + start, .dim = dim };
+        }
+    }
+    return null;
+}
+
 pub extern "env" fn js_log(ptr: [*]const u8, len: usize) void;
 
 fn log(comptime fmt: []const u8, args: anytype) void {
@@ -2931,6 +3000,29 @@ pub export fn registerTableFloat64(
     );
 }
 
+/// Register a Float32 column with optional vector dimension
+/// For regular scalars: vector_dim = 0
+/// For vectors: vector_dim = embedding dimension (e.g., 384 for MiniLM)
+/// For vectors, data contains row_count * vector_dim floats in row-major order
+pub export fn registerTableFloat32Vector(
+    table_name_ptr: [*]const u8,
+    table_name_len: usize,
+    col_name_ptr: [*]const u8,
+    col_name_len: usize,
+    data_ptr: [*]const f32,
+    row_count: usize,
+    vector_dim: u32,
+) u32 {
+    const total_floats = if (vector_dim > 0) row_count * vector_dim else row_count;
+    return registerColumnFloat32(
+        table_name_ptr[0..table_name_len],
+        col_name_ptr[0..col_name_len],
+        data_ptr[0..total_floats],
+        row_count,
+        vector_dim,
+    );
+}
+
 pub export fn registerTableString(
     table_name_ptr: [*]const u8,
     table_name_len: usize,
@@ -3019,10 +3111,10 @@ pub export fn registerTableSimpleBinary(
                      // Log error?
                 }
             },
-            3 => { // float32
+            3 => { // float32 (scalar)
                 if (@intFromPtr(col_data.ptr) % 4 != 0) return 22;
                 const ptr: [*]const f32 = @ptrCast(@alignCast(col_data.ptr));
-                _ = registerColumnFloat32(table_name, name, ptr[0..row_count], row_count);
+                _ = registerColumnFloat32(table_name, name, ptr[0..row_count], row_count, 0); // 0 = scalar
             },
             4 => { // float64
                 if (@intFromPtr(col_data.ptr) % 8 != 0) return 23;
@@ -5280,7 +5372,7 @@ fn registerColumnInt32(table_name: []const u8, col_name: []const u8, data: []con
     return 0;
 }
 
-fn registerColumnFloat32(table_name: []const u8, col_name: []const u8, data: []const f32, row_count: usize) u32 {
+fn registerColumnFloat32(table_name: []const u8, col_name: []const u8, data: []const f32, row_count: usize, vector_dim: u32) u32 {
     const tbl = findOrCreateTable(table_name, row_count) orelse return 1;
     if (tbl.column_count >= MAX_COLUMNS) return 2;
     tbl.columns[tbl.column_count] = ColumnData{
@@ -5289,6 +5381,7 @@ fn registerColumnFloat32(table_name: []const u8, col_name: []const u8, data: []c
         .data = .{ .float32 = data },
         .row_count = row_count,
         .schema_col_idx = @intCast(tbl.column_count),
+        .vector_dim = vector_dim,
     };
     tbl.column_count += 1;
     return 0;
@@ -6762,7 +6855,10 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                 }
                 if (found_left) break;
             }
-            if (left_col == null) return error.ColumnNotFound;
+            if (left_col == null) {
+                setDebug("ColumnNotFound: left_col='{s}' in JOIN with join_condition=null", .{join.left_col});
+                return error.ColumnNotFound;
+            }
         }
 
         var right_col: ?*const ColumnData = null;
@@ -6796,11 +6892,15 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                     }
                 }
             }
-            if (right_col == null) return error.ColumnNotFound;
+            if (right_col == null) {
+                setDebug("ColumnNotFound: right_col='{s}' in JOIN with join_condition=null", .{join.right_col});
+                return error.ColumnNotFound;
+            }
         }
 
-        const lc = if (join.is_near or join.join_type == .cross) null else left_col.?;
-        const rc: ?*const ColumnData = if (join.join_type == .cross) null else right_col.?;
+        // Only unwrap left_col/right_col when we actually set them (join_condition == null)
+        const lc: ?*const ColumnData = if (join.is_near or join.join_type == .cross or join.join_condition != null) null else left_col.?;
+        const rc: ?*const ColumnData = if (join.join_type == .cross or join.join_condition != null) null else right_col.?;
 
         // ------------------
         // Execution
@@ -6964,6 +7064,93 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                     }
                 }
             }
+        } else if (lc != null and rc != null and lc.?.vector_dim > 0 and rc.?.vector_dim > 0) {
+            // Vector Similarity JOIN - use nested loop with cosine similarity
+            const VECTOR_SIMILARITY_THRESHOLD: f32 = 0.5; // Lower threshold for semantic matching
+            const l_col = lc.?;
+            const r_col = rc.?;
+            const l_dim = l_col.vector_dim;
+            const r_dim = r_col.vector_dim;
+
+            if (l_dim != r_dim) {
+                setDebug("Vector dimension mismatch: left={d}, right={d}", .{l_dim, r_dim});
+                return error.DimensionMismatch;
+            }
+
+            const dim = l_dim;
+            setDebug("Vector JOIN: dim={d}, left_rows={d}, right_rows={d}, threshold={d}", .{dim, left_table.row_count, rtbl.row_count, @as(u32, @intFromFloat(VECTOR_SIMILARITY_THRESHOLD * 100))});
+
+            if (join_idx == 0) {
+                const lt = tables_in_join[0];
+                var l_ctx: ?FragmentContext = null;
+                var r_ctx: ?FragmentContext = null;
+                var best_match: u32 = std.math.maxInt(u32);
+                var best_sim: f32 = -1;
+
+                // For each left row, find the best matching right row
+                for (0..lt.row_count) |li_usize| {
+                    const li: u32 = @intCast(li_usize);
+                    const l_vec = getVectorData(lt, l_col, li, &vec_buf_1, &l_ctx);
+                    if (l_vec == null) continue;
+
+                    best_match = std.math.maxInt(u32);
+                    best_sim = VECTOR_SIMILARITY_THRESHOLD;
+
+                    // Find best match in right table
+                    for (0..rtbl.row_count) |ri_usize| {
+                        const ri: u32 = @intCast(ri_usize);
+                        const r_vec = getVectorData(rtbl, r_col, ri, &vec_buf_2, &r_ctx);
+                        if (r_vec == null) continue;
+
+                        const sim = simd_search.simdCosineSimilarity(l_vec.?.ptr, r_vec.?.ptr, dim);
+                        if (sim > best_sim) {
+                            best_sim = sim;
+                            best_match = ri;
+                        }
+                    }
+
+                    // Add the best match if found
+                    if (best_match != std.math.maxInt(u32) and pair_count < MAX_JOIN_ROWS) {
+                        @memset(&dst_buffer[pair_count].indices, std.math.maxInt(u32));
+                        dst_buffer[pair_count].indices[0] = li;
+                        dst_buffer[pair_count].indices[1] = best_match;
+                        pair_count += 1;
+                    }
+                }
+            } else {
+                // Multi-table vector JOIN - for each existing pair, find best match
+                var l_ctx: ?FragmentContext = null;
+                var r_ctx: ?FragmentContext = null;
+                for (0..src_count) |i| {
+                    const li = src_buffer[i].indices[left_tbl_idx];
+                    if (li == std.math.maxInt(u32)) continue;
+
+                    const l_vec = getVectorData(tables_in_join[left_tbl_idx], l_col, li, &vec_buf_1, &l_ctx);
+                    if (l_vec == null) continue;
+
+                    var best_match: u32 = std.math.maxInt(u32);
+                    var best_sim: f32 = VECTOR_SIMILARITY_THRESHOLD;
+
+                    for (0..rtbl.row_count) |ri_usize| {
+                        const ri: u32 = @intCast(ri_usize);
+                        const r_vec = getVectorData(rtbl, r_col, ri, &vec_buf_2, &r_ctx);
+                        if (r_vec == null) continue;
+
+                        const sim = simd_search.simdCosineSimilarity(l_vec.?.ptr, r_vec.?.ptr, l_dim);
+                        if (sim > best_sim) {
+                            best_sim = sim;
+                            best_match = ri;
+                        }
+                    }
+
+                    if (best_match != std.math.maxInt(u32) and pair_count < MAX_JOIN_ROWS) {
+                        dst_buffer[pair_count].indices = src_buffer[i].indices;
+                        dst_buffer[pair_count].indices[join_idx + 1] = best_match;
+                        pair_count += 1;
+                    }
+                }
+            }
+            setDebug("Vector JOIN found {d} pairs", .{pair_count});
         } else {
              // Hash Join
              const next_match = &global_indices_2;
@@ -7185,6 +7372,50 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
     
     const capacity = pair_count * total_cols * 16 + 1024 * total_cols + 65536;
     if (lw.fragmentBegin(capacity) == 0) return error.OutOfMemory;
+
+    // Handle empty result set (0 matching rows from JOIN)
+    if (pair_count == 0) {
+        // Return valid Lance fragment with just column metadata (no data rows)
+        // We need to add at least the column names/types to the schema
+        if (query.select_count > 0 and !query.is_star) {
+            for (query.select_exprs[0..query.select_count]) |expr| {
+                for (tables_in_join[0..query.join_count+1]) |t| {
+                    if (findTableColumn(t, expr.col_name)) |c| {
+                        const alias = if (expr.alias) |a| a else c.name;
+                        switch (c.col_type) {
+                            .int64 => _ = lw.fragmentAddInt64Column(alias.ptr, alias.len, &[_]i64{}, 0, false),
+                            .float64 => _ = lw.fragmentAddFloat64Column(alias.ptr, alias.len, &[_]f64{}, 0, false),
+                            .float32 => _ = lw.fragmentAddFloat32Column(alias.ptr, alias.len, &[_]f32{}, 0, false),
+                            .string, .list => _ = lw.fragmentAddStringColumn(alias.ptr, alias.len, &[_]u8{}, 0, &[_]u32{0}, 0, false),
+                            else => {}
+                        }
+                        break;
+                    }
+                }
+            }
+        } else {
+            // SELECT * - add all columns from all tables
+            for (tables_in_join[0..query.join_count+1]) |t| {
+                for (0..t.column_count) |c_idx| {
+                    if (t.columns[c_idx]) |*c| {
+                        switch (c.col_type) {
+                            .int64 => _ = lw.fragmentAddInt64Column(c.name.ptr, c.name.len, &[_]i64{}, 0, false),
+                            .float64 => _ = lw.fragmentAddFloat64Column(c.name.ptr, c.name.len, &[_]f64{}, 0, false),
+                            .float32 => _ = lw.fragmentAddFloat32Column(c.name.ptr, c.name.len, &[_]f32{}, 0, false),
+                            .string, .list => _ = lw.fragmentAddStringColumn(c.name.ptr, c.name.len, &[_]u8{}, 0, &[_]u32{0}, 0, false),
+                            else => {}
+                        }
+                    }
+                }
+            }
+        }
+        const final_size = lw.fragmentEnd();
+        if (lw.writerGetBuffer()) |buf| {
+            result_buffer = buf[0..final_size];
+            result_size = final_size;
+        }
+        return;
+    }
 
     const WriteContext = struct {
         table: *const TableInfo,
@@ -7496,9 +7727,15 @@ fn executeAggregateQuery(table: *const TableInfo, query: *const ParsedQuery) !vo
 }
 
 fn findTableColumn(table: *const TableInfo, name: []const u8) ?*const ColumnData {
+    // Handle qualified column names (e.g., "i.url" -> "url")
+    const col_name = if (std.mem.indexOfScalar(u8, name, '.')) |dot_idx|
+        name[dot_idx + 1 ..]
+    else
+        name;
+
     for (table.columns[0..table.column_count]) |*maybe_c| {
         if (maybe_c.*) |*c| {
-            if (std.mem.eql(u8, c.name, name)) return c;
+            if (std.mem.eql(u8, c.name, col_name)) return c;
         }
     }
     return null;
@@ -12599,8 +12836,9 @@ fn evaluateJoinCondition(
         .and_op => {
             const l = where.left orelse return false;
             const r = where.right orelse return false;
-            return evaluateJoinCondition(join_tables, join_aliases, row_indices, num_tables, l) and
-                evaluateJoinCondition(join_tables, join_aliases, row_indices, num_tables, r);
+            const lr = evaluateJoinCondition(join_tables, join_aliases, row_indices, num_tables, l);
+            const rr = evaluateJoinCondition(join_tables, join_aliases, row_indices, num_tables, r);
+            return lr and rr;
         },
         .or_op => {
             const l = where.left orelse return false;
@@ -12614,6 +12852,9 @@ fn evaluateJoinCondition(
             var col1_table: ?*const TableInfo = null;
             var col1: ?*const ColumnData = null;
             var col1_row: u32 = 0;
+
+            // Check if col_name has a prefix (e.g., "o.customer_id" vs bare "customer_id")
+            const col1_has_prefix = std.mem.indexOfScalar(u8, col_name, '.') != null;
 
             // Find the first column's table and column
             for (0..num_tables) |t_idx| {
@@ -12649,16 +12890,20 @@ fn evaluateJoinCondition(
                         break;
                     }
                 }
-                // Check bare column name
-                if (findTableColumn(tbl, col_name)) |c| {
-                    col1_table = tbl;
-                    col1 = c;
-                    col1_row = idx;
-                    break;
+                // Only check bare column name if no prefix was present
+                if (!col1_has_prefix) {
+                    if (findTableColumn(tbl, col_name)) |c| {
+                        col1_table = tbl;
+                        col1 = c;
+                        col1_row = idx;
+                        break;
+                    }
                 }
             }
 
-            const c1 = col1 orelse return false;
+            const c1 = col1 orelse {
+                return false;
+            };
             const t1 = col1_table orelse return false;
 
             // Get comparison value - either from another column or literal
@@ -12668,6 +12913,9 @@ fn evaluateJoinCondition(
                 var col2: ?*const ColumnData = null;
                 var col2_table: ?*const TableInfo = null;
                 var col2_row: u32 = 0;
+
+                // Check if col2_name has a prefix (e.g., "c.id" vs bare "id")
+                const has_prefix = std.mem.indexOfScalar(u8, col2_name, '.') != null;
 
                 for (0..num_tables) |t_idx| {
                     const tbl = join_tables[t_idx] orelse continue;
@@ -12702,21 +12950,49 @@ fn evaluateJoinCondition(
                             break;
                         }
                     }
-                    // Check bare column name
-                    if (findTableColumn(tbl, col2_name)) |c| {
-                        col2_table = tbl;
-                        col2 = c;
-                        col2_row = idx;
-                        break;
+                    // Only check bare column name if no prefix was present
+                    if (!has_prefix) {
+                        if (findTableColumn(tbl, col2_name)) |c| {
+                            col2_table = tbl;
+                            col2 = c;
+                            col2_row = idx;
+                            break;
+                        }
                     }
                 }
 
-                const c2 = col2 orelse return false;
+                const c2 = col2 orelse {
+                    return false;
+                };
                 const t2 = col2_table orelse return false;
 
                 // Compare values from both columns
                 var ctx2: ?FragmentContext = null;
-                if (c1.col_type == .string or c2.col_type == .string) {
+
+                // Vector column comparison - use cosine similarity instead of exact equality
+                if (c1.vector_dim > 0 and c2.vector_dim > 0) {
+                    // Both are vector columns - use similarity comparison
+                    const v1_data = getVectorData(t1, c1, col1_row, &vec_buf_1, &ctx1);
+                    const v2_data = getVectorData(t2, c2, col2_row, &vec_buf_2, &ctx2);
+
+                    if (v1_data != null and v2_data != null) {
+                        const v1 = v1_data.?;
+                        const v2 = v2_data.?;
+
+                        // Dimensions must match
+                        if (v1.dim == v2.dim) {
+                            // Compute cosine similarity using SIMD
+                            const similarity = simd_search.simdCosineSimilarity(v1.ptr, v2.ptr, v1.dim);
+                            // For vector JOINs, we use a high similarity threshold (0.9)
+                            // This allows approximate matching rather than exact equality
+                            const VECTOR_SIMILARITY_THRESHOLD: f32 = 0.9;
+                            const match = similarity >= VECTOR_SIMILARITY_THRESHOLD;
+                            return if (where.op == .eq) match else !match;
+                        }
+                    }
+                    // Vector comparison failed - no match
+                    return if (where.op == .eq) false else true;
+                } else if (c1.col_type == .string or c2.col_type == .string) {
                     const s1 = getStringValueOptimized(t1, c1, col1_row, &ctx1);
                     const s2 = getStringValueOptimized(t2, c2, col2_row, &ctx2);
                     const match = std.mem.eql(u8, s1, s2);

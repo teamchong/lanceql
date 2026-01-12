@@ -132,7 +132,12 @@ async function fetchRemoteLance(url, limit = 10000) {
                 fragments = sidecar.fragments || [];
                 columnTypes = schema.map(col => {
                     const type = col.type;
-                    if (type.startsWith('vector[')) return 'vector';
+                    if (type.startsWith('vector[')) {
+                        // Extract dimension from type like "vector[384]"
+                        const match = type.match(/vector\[(\d+)\]/);
+                        const dim = match ? parseInt(match[1], 10) : 0;
+                        return { type: 'vector', dim };
+                    }
                     if (type === 'float64' || type === 'double') return 'float64';
                     if (type === 'float32') return 'float32';
                     if (type.includes('int64')) return 'int64';
@@ -341,6 +346,290 @@ function parseManifestBasic(bytes) {
 }
 
 /**
+ * Fetch a byte range from a URL
+ * @param {string} url - URL to fetch from
+ * @param {number} start - Start byte (inclusive)
+ * @param {number} end - End byte (inclusive)
+ * @returns {Promise<Uint8Array>}
+ */
+async function fetchRange(url, start, end) {
+    const response = await fetch(url, {
+        headers: { 'Range': `bytes=${start}-${end}` }
+    });
+    if (!response.ok && response.status !== 206) {
+        throw new Error(`Range request failed: HTTP ${response.status}`);
+    }
+    return new Uint8Array(await response.arrayBuffer());
+}
+
+/**
+ * Read a varint from a buffer at a given position
+ * @returns {{value: number, bytesRead: number}}
+ */
+function readVarintAt(data, pos) {
+    let value = 0;
+    let shift = 0;
+    let bytesRead = 0;
+    while (pos + bytesRead < data.length) {
+        const b = data[pos + bytesRead];
+        bytesRead++;
+        value |= (b & 0x7F) << shift;
+        if ((b & 0x80) === 0) break;
+        shift += 7;
+    }
+    return { value, bytesRead };
+}
+
+/**
+ * Parse column metadata to extract buffer positions
+ * @param {Uint8Array} metaBytes - Column metadata protobuf
+ * @returns {{bufferOffsets: number[], bufferSizes: number[], length: number}}
+ */
+function parseColumnMeta(metaBytes) {
+    const bufferOffsets = [];
+    const bufferSizes = [];
+    let length = 0;
+    let pos = 0;
+
+    while (pos < metaBytes.length) {
+        const { value: tag, bytesRead: tagBytes } = readVarintAt(metaBytes, pos);
+        pos += tagBytes;
+        const fieldNum = tag >> 3;
+        const wireType = tag & 0x7;
+
+        if (fieldNum === 2 && wireType === 2) {
+            // pages field (length-delimited)
+            const { value: pageLen, bytesRead: lenBytes } = readVarintAt(metaBytes, pos);
+            pos += lenBytes;
+            const pageEnd = pos + pageLen;
+
+            // Parse page message
+            while (pos < pageEnd) {
+                const { value: pageTag, bytesRead: pTagBytes } = readVarintAt(metaBytes, pos);
+                pos += pTagBytes;
+                const pFieldNum = pageTag >> 3;
+                const pWireType = pageTag & 0x7;
+
+                if (pFieldNum === 1 && pWireType === 2) {
+                    // buffer_offsets (packed repeated)
+                    const { value: packedLen, bytesRead: pLenBytes } = readVarintAt(metaBytes, pos);
+                    pos += pLenBytes;
+                    const packedEnd = pos + packedLen;
+                    while (pos < packedEnd) {
+                        const { value, bytesRead } = readVarintAt(metaBytes, pos);
+                        pos += bytesRead;
+                        bufferOffsets.push(value);
+                    }
+                } else if (pFieldNum === 2 && pWireType === 2) {
+                    // buffer_sizes (packed repeated)
+                    const { value: packedLen, bytesRead: pLenBytes } = readVarintAt(metaBytes, pos);
+                    pos += pLenBytes;
+                    const packedEnd = pos + packedLen;
+                    while (pos < packedEnd) {
+                        const { value, bytesRead } = readVarintAt(metaBytes, pos);
+                        pos += bytesRead;
+                        bufferSizes.push(value);
+                    }
+                } else if (pFieldNum === 3 && pWireType === 0) {
+                    // length (varint)
+                    const { value, bytesRead } = readVarintAt(metaBytes, pos);
+                    pos += bytesRead;
+                    length = value;
+                } else if (pWireType === 0) {
+                    const { bytesRead } = readVarintAt(metaBytes, pos);
+                    pos += bytesRead;
+                } else if (pWireType === 2) {
+                    const { value: skipLen, bytesRead } = readVarintAt(metaBytes, pos);
+                    pos += bytesRead + skipLen;
+                } else if (pWireType === 5) pos += 4;
+                else if (pWireType === 1) pos += 8;
+            }
+            break; // Only parse first page
+        } else if (wireType === 0) {
+            const { bytesRead } = readVarintAt(metaBytes, pos);
+            pos += bytesRead;
+        } else if (wireType === 2) {
+            const { value: skipLen, bytesRead } = readVarintAt(metaBytes, pos);
+            pos += bytesRead + skipLen;
+        } else if (wireType === 5) pos += 4;
+        else if (wireType === 1) pos += 8;
+    }
+
+    return { bufferOffsets, bufferSizes, length };
+}
+
+/**
+ * Fetch a large Lance fragment using HTTP Range requests
+ * Reads only the needed columns for the first N rows
+ */
+async function fetchFragmentWithRangeRequests(url, schema, columnTypes, limit, fileSize) {
+    const FOOTER_SIZE = 40;
+
+    // 1. Fetch footer (last 40 bytes)
+    const footer = await fetchRange(url, fileSize - FOOTER_SIZE, fileSize - 1);
+    const footerView = new DataView(footer.buffer);
+
+    // Verify magic
+    const magic = String.fromCharCode(footer[36], footer[37], footer[38], footer[39]);
+    if (magic !== 'LANC') {
+        throw new Error(`Invalid Lance magic: ${magic}`);
+    }
+
+    const columnMetaStart = Number(footerView.getBigUint64(0, true));
+    const columnMetaOffsetsStart = Number(footerView.getBigUint64(8, true));
+    const numColumns = footerView.getUint32(28, true);
+
+    console.log(`[Worker] Range: footer parsed - ${numColumns} columns, metaStart=${columnMetaStart}, offsetsStart=${columnMetaOffsetsStart}`);
+
+    // 2. Fetch column offset table (16 bytes per column)
+    const offsetTableSize = numColumns * 16;
+    const offsetTable = await fetchRange(url, columnMetaOffsetsStart, columnMetaOffsetsStart + offsetTableSize - 1);
+    const offsetView = new DataView(offsetTable.buffer);
+
+    // Parse offset table entries (position, length for each column)
+    const columnOffsets = [];
+    for (let i = 0; i < numColumns; i++) {
+        const pos = Number(offsetView.getBigUint64(i * 16, true));
+        const len = Number(offsetView.getBigUint64(i * 16 + 8, true));
+        columnOffsets.push({ pos, len });
+    }
+
+    // 3. Fetch all column metadata in one request (more efficient)
+    const metaStart = columnOffsets[0]?.pos || columnMetaStart;
+    const metaEnd = columnMetaOffsetsStart - 1;
+    const allMeta = await fetchRange(url, metaStart, metaEnd);
+
+    // 4. Parse each column's metadata and read data
+    const columns = {};
+    const columnNames = [];
+    let totalRows = 0;
+
+    for (let i = 0; i < schema.length && i < numColumns; i++) {
+        const name = schema[i].name;
+        const type = columnTypes[i];
+        columnNames.push(name);
+
+        // Extract this column's metadata from the combined fetch
+        const colMetaOffset = columnOffsets[i].pos - metaStart;
+        const colMetaLen = columnOffsets[i].len;
+        const colMeta = allMeta.slice(colMetaOffset, colMetaOffset + colMetaLen);
+
+        // Parse column metadata
+        const { bufferOffsets, bufferSizes, length } = parseColumnMeta(colMeta);
+        if (i === 0) totalRows = length;
+        const actualRows = Math.min(length, limit);
+
+        const typeStr = typeof type === 'object' ? `${type.type}[${type.dim}]` : type;
+        console.log(`[Worker] Range: column ${i} (${name}): type=${typeStr}, rows=${length}, buffers=${bufferOffsets.length}`);
+
+        try {
+            if (type === 'string' && bufferOffsets.length >= 2) {
+                // String column: buffer[0]=offsets, buffer[1]=data
+                const offsetsStart = bufferOffsets[0];
+                const offsetsSize = bufferSizes[0];
+                const dataStart = bufferOffsets[1];
+                const dataSize = bufferSizes[1];
+
+                // Fetch offsets for first N rows (4 bytes each for int32 offsets)
+                const bytesPerOffset = Math.floor(offsetsSize / length);
+                const offsetsToFetch = actualRows * bytesPerOffset;
+                const offsetsData = await fetchRange(url, offsetsStart, offsetsStart + offsetsToFetch - 1);
+                const offsetsView = new DataView(offsetsData.buffer);
+
+                // Read string end positions
+                const stringEnds = [];
+                for (let r = 0; r < actualRows; r++) {
+                    if (bytesPerOffset === 4) {
+                        stringEnds.push(offsetsView.getInt32(r * 4, true));
+                    } else {
+                        stringEnds.push(Number(offsetsView.getBigInt64(r * 8, true)));
+                    }
+                }
+
+                // Calculate how much string data we need
+                const maxStringEnd = stringEnds[actualRows - 1] || 0;
+                const stringDataToFetch = Math.min(maxStringEnd, dataSize);
+
+                if (stringDataToFetch > 0) {
+                    const stringBytes = await fetchRange(url, dataStart, dataStart + stringDataToFetch - 1);
+                    const decoder = new TextDecoder('utf-8');
+
+                    // Decode strings
+                    const strings = [];
+                    let prevEnd = 0;
+                    for (let r = 0; r < actualRows; r++) {
+                        const end = stringEnds[r];
+                        const strBytes = stringBytes.slice(prevEnd, end);
+                        strings.push(decoder.decode(strBytes));
+                        prevEnd = end;
+                    }
+                    columns[name] = strings;
+                } else {
+                    columns[name] = Array(actualRows).fill('');
+                }
+            } else if ((type === 'float64' || type === 'double') && bufferOffsets.length >= 1) {
+                const bufferStart = bufferOffsets[0];
+                const bytesToFetch = actualRows * 8;
+                const data = await fetchRange(url, bufferStart, bufferStart + bytesToFetch - 1);
+                columns[name] = new Float64Array(data.buffer).slice(0, actualRows);
+            } else if ((type === 'int64') && bufferOffsets.length >= 1) {
+                const bufferStart = bufferOffsets[0];
+                const bytesToFetch = actualRows * 8;
+                const data = await fetchRange(url, bufferStart, bufferStart + bytesToFetch - 1);
+                const bigArr = new BigInt64Array(data.buffer);
+                const floatArr = new Float64Array(actualRows);
+                for (let j = 0; j < actualRows; j++) floatArr[j] = Number(bigArr[j]);
+                columns[name] = floatArr;
+            } else if ((type === 'int32') && bufferOffsets.length >= 1) {
+                const bufferStart = bufferOffsets[0];
+                const bytesToFetch = actualRows * 4;
+                const data = await fetchRange(url, bufferStart, bufferStart + bytesToFetch - 1);
+                const intArr = new Int32Array(data.buffer);
+                const floatArr = new Float64Array(actualRows);
+                for (let j = 0; j < actualRows; j++) floatArr[j] = intArr[j];
+                columns[name] = floatArr;
+            } else if ((type === 'float32') && bufferOffsets.length >= 1) {
+                const bufferStart = bufferOffsets[0];
+                const bytesToFetch = actualRows * 4;
+                const data = await fetchRange(url, bufferStart, bufferStart + bytesToFetch - 1);
+                const f32Arr = new Float32Array(data.buffer);
+                const floatArr = new Float64Array(actualRows);
+                for (let j = 0; j < actualRows; j++) floatArr[j] = f32Arr[j];
+                columns[name] = floatArr;
+            } else if (typeof type === 'object' && type.type === 'vector' && type.dim > 0 && bufferOffsets.length >= 1) {
+                // Vector column - read float32 data with dimension
+                const dim = type.dim;
+                const bufferStart = bufferOffsets[0];
+                const totalFloats = actualRows * dim;
+                const bytesToFetch = totalFloats * 4;
+                console.log(`[Worker] Range: Reading vector ${name}: dim=${dim}, rows=${actualRows}, bytes=${bytesToFetch}`);
+
+                const data = await fetchRange(url, bufferStart, bufferStart + bytesToFetch - 1);
+                const vecData = new Float32Array(data.buffer, 0, totalFloats);
+                columns[name] = vecData.slice(); // Copy the data
+                columns[`__${name}_dim`] = dim; // Store dimension metadata
+            } else if (type === 'vector' || (typeof type === 'string' && (type.includes('list') || type.includes('vector')))) {
+                // Fallback for vectors without dimension info
+                columns[name] = new Float32Array(0);
+            } else {
+                columns[name] = new Float64Array(actualRows).fill(0);
+            }
+        } catch (e) {
+            console.warn(`[Worker] Range: Failed to read column ${name}: ${e.message}`);
+            if (type === 'string') {
+                columns[name] = Array(actualRows).fill('');
+            } else {
+                columns[name] = new Float64Array(actualRows).fill(0);
+            }
+        }
+    }
+
+    const actualRows = Math.min(totalRows, limit);
+    console.log(`[Worker] Range: Read ${actualRows} rows from ${columnNames.length} columns via HTTP Range requests`);
+    return { columns, rowCount: actualRows, columnNames };
+}
+
+/**
  * Fetch and parse a Lance fragment file to extract columnar data
  * @param {string} url - Fragment URL
  * @param {Array} schema - Column schema
@@ -366,24 +655,9 @@ async function fetchAndParseFragment(url, schema, columnTypes, limit) {
     const MAX_FRAGMENT_SIZE = 100 * 1024 * 1024; // 100MB max for full download
 
     if (contentLength > MAX_FRAGMENT_SIZE) {
-        console.warn(`[Worker] Fragment too large (${(contentLength / 1024 / 1024).toFixed(1)}MB) - using schema-based placeholder data`);
-        // Return placeholder data for large files
-        const columns = {};
-        const columnNames = [];
-        const actualRows = Math.min(limit, 100);
-        for (let i = 0; i < schema.length; i++) {
-            const name = schema[i].name;
-            const type = columnTypes[i];
-            columnNames.push(name);
-            if (type === 'float64' || type === 'double' || type === 'int64' || type === 'int32' || type === 'float32') {
-                columns[name] = new Float64Array(actualRows).fill(0);
-            } else if (type === 'string') {
-                columns[name] = Array(actualRows).fill('(large file - use RemoteLanceDataset)');
-            } else {
-                columns[name] = [];
-            }
-        }
-        return { columns, rowCount: actualRows, columnNames };
+        console.log(`[Worker] Large fragment (${(contentLength / 1024 / 1024).toFixed(1)}MB) - using HTTP Range requests`);
+        // Use HTTP Range requests to read only needed data
+        return await fetchFragmentWithRangeRequests(url, schema, columnTypes, limit, contentLength);
     }
 
     // Fetch the entire fragment file (only for small files)
@@ -690,6 +964,18 @@ async function loadOPFSLance(path, limit = 10000) {
         const file = await fileHandle.getFile();
         const data = new Uint8Array(await file.arrayBuffer());
 
+        // Try to load schema sidecar file
+        let sidecarSchema = null;
+        try {
+            const schemaHandle = await dir.getFileHandle(`${fileName}.schema`);
+            const schemaFile = await schemaHandle.getFile();
+            const schemaText = await schemaFile.text();
+            sidecarSchema = JSON.parse(schemaText);
+            console.log(`[Worker] Loaded schema sidecar: ${sidecarSchema.columns?.length} columns`);
+        } catch {
+            // Schema sidecar doesn't exist, will use default column names
+        }
+
         if (!data || data.length === 0) {
             console.error(`[Worker] Empty OPFS file: ${path}`);
             return null;
@@ -714,49 +1000,33 @@ async function loadOPFSLance(path, limit = 10000) {
         const numColumns = view.getUint32(footerOffset + 28, true);
 
         // Build schema from column metadata (protobuf format)
+        // Format: Each offset table entry is 16 bytes (position: u64, length: u64)
         const schema = [];
         const columnTypes = [];
         for (let i = 0; i < numColumns; i++) {
-            const offsetPos = colMetaOffsetsStart + i * 8;
-            if (offsetPos + 8 > data.length) continue;
+            const offsetPos = colMetaOffsetsStart + i * 16;  // 16 bytes per entry
+            if (offsetPos + 16 > data.length) {
+                console.log(`[Worker] OPFS column ${i}: offset out of bounds (offsetPos=${offsetPos})`);
+                continue;
+            }
             const metaPos = Number(view.getBigUint64(offsetPos, true));
-            if (metaPos >= data.length) continue;
-
-            let localOffset = metaPos;
-            let name = `col_${i}`;
-            let typeStr = 'unknown';
-
-            // Parse protobuf - field 1 is name, field 2 is type
-            while (localOffset < data.length && localOffset < metaPos + 200) {
-                const tagByte = data[localOffset];
-                if (tagByte === 0) break;
-                const fieldNum = tagByte >> 3;
-                const wireType = tagByte & 0x7;
-                localOffset++;
-
-                if (wireType === 2) { // Length-delimited (string)
-                    const len = data[localOffset++];
-                    if (len > 0 && localOffset + len <= data.length) {
-                        const str = new TextDecoder().decode(data.slice(localOffset, localOffset + len));
-                        if (fieldNum === 1) name = str;
-                        else if (fieldNum === 2) typeStr = str;
-                    }
-                    localOffset += len;
-                } else if (wireType === 0) { // Varint
-                    while (localOffset < data.length && (data[localOffset] & 0x80)) localOffset++;
-                    localOffset++;
-                } else if (wireType === 1) { // Fixed 64-bit
-                    localOffset += 8;
-                } else if (wireType === 5) { // Fixed 32-bit
-                    localOffset += 4;
-                } else {
-                    break;
-                }
+            const metaLen = Number(view.getBigUint64(offsetPos + 8, true));
+            if (metaPos >= data.length || metaPos + metaLen > data.length) {
+                console.log(`[Worker] OPFS column ${i}: metadata bounds invalid (pos=${metaPos}, len=${metaLen})`);
+                continue;
             }
 
-            schema.push({ name, type: typeStr });
+            // Use sidecar schema if available, otherwise fall back to index-based names
+            let name = `col_${i}`;
+            let typeStr = 'unknown';
+            if (sidecarSchema?.columns?.[i]) {
+                name = sidecarSchema.columns[i].name;
+                typeStr = sidecarSchema.columns[i].type || 'unknown';
+            }
+
+            schema.push({ name, type: typeStr, metaPos, metaLen });
             columnTypes.push(typeStr);
-            console.log(`[Worker] OPFS column ${i}: name=${name}, type=${typeStr}`);
+            console.log(`[Worker] OPFS column ${i}: name=${name}, type=${typeStr}, metaPos=${metaPos}, metaLen=${metaLen}`);
         }
 
         // Ensure WASM is loaded
@@ -812,11 +1082,79 @@ async function loadOPFSLance(path, limit = 10000) {
                     columns[name] = new Float64Array(actualRows).fill(0);
                 }
             } else if (type === 'string') {
-                // String columns - placeholder for now
-                columns[name] = Array(actualRows).fill('(string)');
-            } else if (type.includes('vector') || type.includes('list')) {
-                // Vector columns - skip
-                columns[name] = [];
+                // Read string columns using WASM
+                const stringCount = wasm.getStringCount ? Number(wasm.getStringCount(i)) : 0;
+                console.log(`[Worker] OPFS column ${i} (${name}): stringCount=${stringCount}`);
+
+                if (stringCount > 0 && wasm.readStringAt && wasm.allocStringBuffer) {
+                    const strings = [];
+                    const maxStrLen = 4096; // Max bytes per string
+                    const strBufPtr = wasm.allocStringBuffer(maxStrLen);
+
+                    if (strBufPtr) {
+                        const decoder = new TextDecoder('utf-8');
+                        for (let row = 0; row < actualRows; row++) {
+                            const strLen = wasm.readStringAt(i, row, strBufPtr, maxStrLen);
+                            if (strLen > 0) {
+                                const copyLen = Math.min(strLen, maxStrLen);
+                                const strBytes = new Uint8Array(wasmMemory.buffer, strBufPtr, copyLen);
+                                strings.push(decoder.decode(strBytes.slice()));
+                            } else {
+                                strings.push('');
+                            }
+                        }
+                        columns[name] = strings;
+                        console.log(`[Worker] Read ${strings.length} strings for column ${name}, first: "${strings[0]}"`);
+                    } else {
+                        console.warn(`[Worker] Failed to allocate string buffer for column ${name}`);
+                        columns[name] = Array(actualRows).fill('');
+                    }
+                } else {
+                    console.warn(`[Worker] String column ${name}: no WASM string functions or zero count`);
+                    columns[name] = Array(actualRows).fill('');
+                }
+            } else if (type.includes('vector') || type.includes('list') || type === 'float32') {
+                // Vector columns - read all vectors
+                if (wasm.getVectorInfo && wasm.readVectorAt && wasm.allocFloat32Buffer) {
+                    const info = wasm.getVectorInfo(i);
+                    if (info > 0) {
+                        const rowCountVec = Number(info >> 32n);
+                        const dim = Number(info & 0xFFFFFFFFn);
+                        const readRows = Math.min(actualRows, rowCountVec);
+
+                        console.log(`[Worker] OPFS vector column ${name}: dim=${dim}, rows=${rowCountVec}, reading ${readRows}`);
+
+                        if (dim > 0 && readRows > 0) {
+                            // Allocate buffer for all vectors
+                            const totalFloats = readRows * dim;
+                            const outPtr = wasm.allocFloat32Buffer(totalFloats);
+
+                            if (outPtr) {
+                                // Read each vector into the buffer
+                                for (let row = 0; row < readRows; row++) {
+                                    const rowOffset = row * dim;
+                                    wasm.readVectorAt(i, row, outPtr + rowOffset, dim);
+                                }
+
+                                const vecData = new Float32Array(wasmMemory.buffer, outPtr, totalFloats).slice();
+                                // Store with dimension metadata
+                                columns[name] = vecData;
+                                columns[`__${name}_dim`] = dim;
+                            } else {
+                                console.warn(`[Worker] Failed to allocate vector buffer for column ${name}`);
+                                columns[name] = new Float32Array(0);
+                            }
+                        } else {
+                            columns[name] = new Float32Array(0);
+                        }
+                    } else {
+                        console.warn(`[Worker] getVectorInfo returned 0 for column ${name}`);
+                        columns[name] = new Float32Array(0);
+                    }
+                } else {
+                    console.warn(`[Worker] No WASM vector functions for column ${name}`);
+                    columns[name] = new Float32Array(0);
+                }
             } else {
                 // Default to float64
                 const outPtr = wasm.allocFloat64Buffer(actualRows);
@@ -875,8 +1213,10 @@ async function executeWasmSqlFull(db, sql) {
 
     for (const { url, alias } of urlMappings) {
         // Skip if already registered
-        if (executor.hasTable(alias)) {
-            console.log(`[Worker] Table ${alias} already registered`);
+        const alreadyRegistered = executor.hasTable(alias);
+        console.log(`[Worker] Processing URL mapping: alias=${alias}, url=${url.substring(0, 50)}..., alreadyRegistered=${alreadyRegistered}`);
+        if (alreadyRegistered) {
+            console.log(`[Worker] Table ${alias} already registered, skipping`);
             continue;
         }
 

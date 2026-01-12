@@ -2894,7 +2894,7 @@ LIMIT 20`;
                 const sql = document.getElementById('sql-input').value.trim();
                 if (sql) {
                     const query = sqlToQuery(sql);
-                    syncQueryTabs(query, 'sql');
+                    syncQueryTabs(query, 'sql', sql);
                 }
 
                 // Check OPFS support and load tables BEFORE running query
@@ -2978,7 +2978,7 @@ LIMIT 20`;
             const sql = sqlInput.value.trim();
             if (sql) {
                 const query = sqlToQuery(sql);
-                syncQueryTabs(query, 'sql');
+                syncQueryTabs(query, 'sql', sql);
             }
         });
         sqlInput.addEventListener('scroll', () => {
@@ -3621,11 +3621,20 @@ LIMIT 20`;
          * @param {string[]} query.select - Column names to select (optional)
          * @param {number} query.limit - Row limit (optional)
          * @param {string} source - Which tab initiated the sync ('sql', 'df', 'vector')
+         * @param {string} originalSql - Original SQL string (for preserving complex queries)
          */
-        function syncQueryTabs(query, source) {
+        function syncQueryTabs(query, source, originalSql = null) {
             const url = query.url || currentFile?._url || '';
             // Only include version if explicitly set in query, not from currentFile
             const version = query.version || null;
+
+            // For complex queries (JOINs, CTEs, etc.), preserve original SQL
+            // Detect complex queries by checking for JOIN, multiple read_lance(), or WITH
+            const isComplexQuery = originalSql && (
+                /\bJOIN\b/i.test(originalSql) ||
+                (originalSql.match(/read_lance\s*\(/gi) || []).length > 1 ||
+                /\bWITH\b/i.test(originalSql)
+            );
 
             // Generate SQL
             // read_lance() = current file, read_lance(24) = version 24, read_lance('url') = remote, read_lance('url', 24) = remote with version
@@ -3812,8 +3821,10 @@ LIMIT 20`;
             }
 
             // Update URL hash (only if sql is valid)
-            if (sql && !sql.includes('undefined')) {
-                const newHash = `sql=${encodeURIComponent(sql)}`;
+            // For complex queries, use the original SQL to preserve JOINs, CTEs, etc.
+            const hashSql = isComplexQuery ? originalSql : sql;
+            if (hashSql && !hashSql.includes('undefined')) {
+                const newHash = `sql=${encodeURIComponent(hashSql)}`;
                 history.replaceState(null, '', `#${newHash}`);
             }
         }
@@ -4104,7 +4115,7 @@ LIMIT 20`;
 
             // Sync other tabs with this SQL query
             const query = sqlToQuery(sql);
-            syncQueryTabs(query, 'sql');
+            syncQueryTabs(query, 'sql', sql);
 
             try {
                 setLoading(true);
@@ -6459,7 +6470,13 @@ LIMIT 20`;
                 const lanceBytes = writer.finalize();
                 await lanceOpfsStorage.save('emoji.lance', lanceBytes);
 
-                console.log(`[Demo] Created emoji.lance: ${emojiData.length} rows, ${lanceBytes.length} bytes`);
+                // Save schema sidecar for column name preservation
+                const schema = writer.getSchema();
+                const schemaJson = JSON.stringify(schema);
+                const schemaBytes = new TextEncoder().encode(schemaJson);
+                await lanceOpfsStorage.save('emoji.lance.schema', schemaBytes);
+
+                console.log(`[Demo] Created emoji.lance: ${emojiData.length} rows, ${lanceBytes.length} bytes, schema: ${schemaJson}`);
                 if (!silent) showStatus(`Emoji table created (${emojiData.length} rows with embeddings)`, 'success');
 
                 // Reload OPFS tables (skip if silent - will be loaded by init)
