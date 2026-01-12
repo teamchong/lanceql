@@ -4113,150 +4113,177 @@ LIMIT 100`;
                 // Check for read_lance('url') in SQL using regex
                 const extractedUrl = extractUrlFromSql(sql);
 
-                // If FROM clause has URL, load dataset first (skip OPFS - handled by worker)
+                // If FROM clause has URL, load dataset first
                 let targetFile = currentFile;
-                if (extractedUrl && !extractedUrl.startsWith('opfs://')) {
-                    const url = extractedUrl;
-                    const version = null; // Version parsing would need full parser
-                    const versionMsg = '';
-                    showStatus(`Loading dataset from ${url}${versionMsg}...`, 'info');
+                if (extractedUrl) {
+                    if (!extractedUrl.startsWith('opfs://')) {
+                        const url = extractedUrl;
+                        const version = null; // Version parsing would need full parser
+                        const versionMsg = '';
+                        showStatus(`Loading dataset from ${url}${versionMsg}...`, 'info');
 
-                    // Load dataset (detect if it's a dataset or single file)
-                    let remoteFile;
-                    if (url.endsWith('.lance') && !url.includes('/data/')) {
-                        remoteFile = await lanceql.openDataset(url, { version });
-                    } else {
-                        remoteFile = await lanceql.openUrl(url);
-                    }
+                        // Load dataset (detect if it's a dataset or single file)
+                        let remoteFile;
+                        if (url.endsWith('.lance') && !url.includes('/data/')) {
+                            remoteFile = await lanceql.openDataset(url, { version });
+                        } else {
+                            remoteFile = await lanceql.openUrl(url);
+                        }
 
-                    // Update UI to show the loaded file
-                    if (currentFile && currentFile.close) currentFile.close();
-                    remoteFile._isRemote = true;
-                    $currentFile.set(remoteFile);
-                    currentFile._url = url;
-                    currentFile._isDataset = url.endsWith('.lance') && !url.includes('/data/');
+                        // Update UI to show the loaded file
+                        if (currentFile && currentFile.close) currentFile.close();
+                        remoteFile._isRemote = true;
+                        $currentFile.set(remoteFile);
+                        currentFile._url = url;
+                        currentFile._isDataset = url.endsWith('.lance') && !url.includes('/data/');
 
-                    // Set up network stats callback
-                    currentFile.onFetch((bytes, requests) => {
-                        updateNetworkStats(bytes, requests);
-                    });
-
-                    $columnTypes.set([]);
-                    $rowCount.set(currentFile._isDataset ? currentFile.rowCount : 0);
-
-                    // Update UI via Alpine store
-                    const displayName = url.split('/').pop() || 'remote.lance';
-                    const versionSuffix = currentFile.version ? ` v${currentFile.version}` : '';
-                    Alpine.store('app').fileName = displayName + (currentFile._isDataset ? ` (dataset${versionSuffix})` : '');
-                    Alpine.store('app').fileSize = currentFile._isDataset ? '' : (currentFile.size / 1024 / 1024).toFixed(2) + ' MB';
-                    Alpine.store('app').colCount = currentFile.numColumns;
-                    Alpine.store('app').rowCount = currentFile._isDataset ? rowCount.toLocaleString() : 'Lazy';
-                    collapseFileLoader();
-
-                    // Reset network stats
-                    resetNetworkStats();
-
-                    // Detect column types
-                    try {
-                        $columnTypes.set(await currentFile.detectColumnTypes());
-                        showColumnChips();
-                    } catch (e) {
-                        console.warn('Could not detect column types:', e);
-                    }
-
-                    // Populate vector columns for vector search tab
-                    await populateVectorColumns();
-
-                    // Show dataset hint for default dataset
-                    const hintEl = document.getElementById('dataset-hint');
-                    if (url.includes('data.metal0.dev/laion-1m/images.lance')) {
-                        hintEl.innerHTML = `<strong>ℹ️ Default dataset:</strong> 1M LAION images with <strong>text embeddings</strong> (all-MiniLM-L6-v2, 384-dim). Use <strong>MiniLM encoder</strong> for vector search.`;
-                        hintEl.style.display = 'block';
-                    } else {
-                        hintEl.style.display = 'none';
-                    }
-
-                    // Auto-register remote URL to tables list
-                    const tableName = url;  // Use full URL as table name for remote sources
-                    if (!tablesRegistry.has(tableName)) {
-                        registerTable(tableName, {
-                            type: 'remote',
-                            url,
-                            dataset: currentFile,
-                            rows: currentFile._isDataset ? currentFile.rowCount : 0,
-                            cols: currentFile.numColumns
+                        // Set up network stats callback
+                        currentFile.onFetch((bytes, requests) => {
+                            updateNetworkStats(bytes, requests);
                         });
-                    }
 
-                    // Populate DataFrame builder selects
-                    document.getElementById('run-df-btn').disabled = false;
-                    const filterCol = document.getElementById('df-filter-col');
-                    const selectCols = document.getElementById('df-select-cols');
+                        $columnTypes.set([]);
+                        $rowCount.set(currentFile._isDataset ? currentFile.rowCount : 0);
 
-                    // Preserve current selections before repopulating
-                    const prevFilterValue = filterCol.value;
-                    const prevFilterColName = prevFilterValue ? filterCol.options[filterCol.selectedIndex]?.text.split(' (')[0] : null;
+                        // Update UI via Alpine store
+                        const displayName = url.split('/').pop() || 'remote.lance';
+                        const versionSuffix = currentFile.version ? ` v${currentFile.version}` : '';
+                        Alpine.store('app').fileName = displayName + (currentFile._isDataset ? ` (dataset${versionSuffix})` : '');
+                        Alpine.store('app').fileSize = currentFile._isDataset ? '' : (currentFile.size / 1024 / 1024).toFixed(2) + ' MB';
+                        Alpine.store('app').colCount = currentFile.numColumns;
+                        Alpine.store('app').rowCount = currentFile._isDataset ? rowCount.toLocaleString() : 'Lazy';
+                        collapseFileLoader();
 
-                    // Get selected columns - check pending attribute first, then current selection
-                    const pendingSelectCols = selectCols.getAttribute('data-pending-columns');
-                    let prevSelectedCols;
-                    if (pendingSelectCols) {
-                        prevSelectedCols = JSON.parse(pendingSelectCols);
-                    } else {
-                        prevSelectedCols = Array.from(selectCols.selectedOptions).map(opt => opt.text);
-                        // Save to pending if we have selections (will be used after repopulate)
-                        if (prevSelectedCols.length > 0) {
-                            selectCols.setAttribute('data-pending-columns', JSON.stringify(prevSelectedCols));
+                        // Reset network stats
+                        resetNetworkStats();
+
+                        // Detect column types
+                        try {
+                            $columnTypes.set(await currentFile.detectColumnTypes());
+                            showColumnChips();
+                        } catch (e) {
+                            console.warn('Could not detect column types:', e);
                         }
-                    }
 
-                    filterCol.innerHTML = '<option value="">No filter</option>';
-                    selectCols.innerHTML = '';
+                        // Populate vector columns for vector search tab
+                        await populateVectorColumns();
 
-                    const colNames = currentFile.columnNames || [];
-                    for (let i = 0; i < currentFile.numColumns; i++) {
-                        const name = colNames[i] || `column_${i}`;
-                        const type = columnTypes[i] || 'unknown';
-                        // Only show numeric columns in filter dropdown
-                        if (type !== 'string' && type !== 'vector') {
-                            filterCol.innerHTML += `<option value="${i}">${name} (${type})</option>`;
+                        // Show dataset hint for default dataset
+                        const hintEl = document.getElementById('dataset-hint');
+                        if (url.includes('data.metal0.dev/laion-1m/images.lance')) {
+                            hintEl.innerHTML = `<strong>ℹ️ Default dataset:</strong> 1M LAION images with <strong>text embeddings</strong> (all-MiniLM-L6-v2, 384-dim). Use <strong>MiniLM encoder</strong> for vector search.`;
+                            hintEl.style.display = 'block';
+                        } else {
+                            hintEl.style.display = 'none';
                         }
-                        // Preserve selection if column name matches (case-insensitive), default to all if no previous selection
-                        const isSelected = prevSelectedCols.length === 0 || prevSelectedCols.some(c => c.toLowerCase() === name.toLowerCase());
-                        selectCols.innerHTML += `<option value="${i}" ${isSelected ? 'selected' : ''}>${name}</option>`;
-                    }
 
-                    // Clear pending after successfully applying
-                    selectCols.removeAttribute('data-pending-columns');
-
-                    // Apply pending column value now that options exist
-                    const pendingColumn = filterCol.getAttribute('data-pending-column') || prevFilterColName;
-                    if (pendingColumn) {
-                        const colIdx = colNames.findIndex(n => n.toLowerCase() === pendingColumn.toLowerCase());
-                        if (colIdx >= 0 && filterCol.querySelector(`option[value="${colIdx}"]`)) {
-                            filterCol.value = colIdx;
+                        // Auto-register remote URL to tables list
+                        const tableName = url;  // Use full URL as table name for remote sources
+                        if (!tablesRegistry.has(tableName)) {
+                            registerTable(tableName, {
+                                type: 'remote',
+                                url,
+                                dataset: currentFile,
+                                rows: currentFile._isDataset ? currentFile.rowCount : 0,
+                                cols: currentFile.numColumns
+                            });
                         }
-                        filterCol.removeAttribute('data-pending-column');
-                    }
 
-                    // Populate vector column dropdown
-                    const vectorCol = document.getElementById('vector-col');
-                    vectorCol.innerHTML = '';
-                    for (let i = 0; i < currentFile.numColumns; i++) {
-                        if (columnTypes[i] === 'vector') {
+                        // Populate DataFrame builder selects
+                        document.getElementById('run-df-btn').disabled = false;
+                        const filterCol = document.getElementById('df-filter-col');
+                        const selectCols = document.getElementById('df-select-cols');
+
+                        // Preserve current selections before repopulating
+                        const prevFilterValue = filterCol.value;
+                        const prevFilterColName = prevFilterValue ? filterCol.options[filterCol.selectedIndex]?.text.split(' (')[0] : null;
+
+                        // Get selected columns - check pending attribute first, then current selection
+                        const pendingSelectCols = selectCols.getAttribute('data-pending-columns');
+                        let prevSelectedCols;
+                        if (pendingSelectCols) {
+                            prevSelectedCols = JSON.parse(pendingSelectCols);
+                        } else {
+                            prevSelectedCols = Array.from(selectCols.selectedOptions).map(opt => opt.text);
+                            // Save to pending if we have selections (will be used after repopulate)
+                            if (prevSelectedCols.length > 0) {
+                                selectCols.setAttribute('data-pending-columns', JSON.stringify(prevSelectedCols));
+                            }
+                        }
+
+                        filterCol.innerHTML = '<option value="">No filter</option>';
+                        selectCols.innerHTML = '';
+
+                        const colNames = currentFile.columnNames || [];
+                        for (let i = 0; i < currentFile.numColumns; i++) {
                             const name = colNames[i] || `column_${i}`;
-                            vectorCol.innerHTML += `<option value="${i}">${name}</option>`;
+                            const type = columnTypes[i] || 'unknown';
+                            // Only show numeric columns in filter dropdown
+                            if (type !== 'string' && type !== 'vector') {
+                                filterCol.innerHTML += `<option value="${i}">${name} (${type})</option>`;
+                            }
+                            // Preserve selection if column name matches (case-insensitive), default to all if no previous selection
+                            const isSelected = prevSelectedCols.length === 0 || prevSelectedCols.some(c => c.toLowerCase() === name.toLowerCase());
+                            selectCols.innerHTML += `<option value="${i}" ${isSelected ? 'selected' : ''}>${name}</option>`;
+                        }
+
+                        // Clear pending after successfully applying
+                        selectCols.removeAttribute('data-pending-columns');
+
+                        // Apply pending column value now that options exist
+                        const pendingColumn = filterCol.getAttribute('data-pending-column') || prevFilterColName;
+                        if (pendingColumn) {
+                            const colIdx = colNames.findIndex(n => n.toLowerCase() === pendingColumn.toLowerCase());
+                            if (colIdx >= 0 && filterCol.querySelector(`option[value="${colIdx}"]`)) {
+                                filterCol.value = colIdx;
+                            }
+                            filterCol.removeAttribute('data-pending-column');
+                        }
+
+                        // Populate vector column dropdown
+                        const vectorCol = document.getElementById('vector-col');
+                        vectorCol.innerHTML = '';
+                        for (let i = 0; i < currentFile.numColumns; i++) {
+                            if (columnTypes[i] === 'vector') {
+                                const name = colNames[i] || `column_${i}`;
+                                vectorCol.innerHTML += `<option value="${i}">${name}</option>`;
+                            }
+                        }
+                        // If no vector columns found, show placeholder
+                        if (vectorCol.options.length === 0) {
+                            vectorCol.innerHTML = '<option value="">No vector columns</option>';
+                        }
+
+                        // Update DataFrame code preview (skip sync to preserve SQL)
+                        updateDfPreview(true);
+
+                        targetFile = currentFile;
+                    } else {
+                        // Handle OPFS URL - try to resolve from registry
+                        const name = extractedUrl.replace('opfs://', '').replace('.lance', '');
+                        const info = tablesRegistry.get(name);
+                        if (info) {
+                            targetFile = info.dataset;
+                            $currentFile.set(targetFile);
+                            
+                            // Update UI state
+                            Alpine.store('app').fileName = name + ' (local)';
+                            Alpine.store('app').colCount = info.cols;
+                            Alpine.store('app').rowCount = info.rows.toLocaleString();
+                            
+                            // If we switched files, update columns
+                            if (targetFile !== currentFile) {
+                                try {
+                                    $columnTypes.set(targetFile._columnTypes || []);
+                                    showColumnChips();
+                                } catch (e) {}
+                            }
+                        } else {
+                            // If not in registry, worker handles execution anyway
+                            // Use a dummy target to pass the check if we don't need vector search
+                            targetFile = { _isRemote: false, close: () => {} };
                         }
                     }
-                    // If no vector columns found, show placeholder
-                    if (vectorCol.options.length === 0) {
-                        vectorCol.innerHTML = '<option value="">No vector columns</option>';
-                    }
-
-                    // Update DataFrame code preview (skip sync to preserve SQL)
-                    updateDfPreview(true);
-
-                    targetFile = currentFile;
                 }
 
                 if (!targetFile) {
