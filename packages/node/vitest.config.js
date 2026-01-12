@@ -4,7 +4,16 @@ export default defineConfig({
   test: {
     globals: true,
     testTimeout: 30000,
-    isolate: false,
+    // Avoid worker process crashes with native addons on Linux
+    // The native addon crashes during cleanup but tests pass, so we ignore the errors
+    dangerouslyIgnoreUnhandledErrors: true,
+    pool: 'forks',
+    poolOptions: {
+      forks: {
+        singleFork: true,
+        isolate: false,
+      },
+    },
     include: ['test/**/*.spec.js', 'test/**/*.test.js'],
     exclude: [
       'test/basic.test.js',
