@@ -7488,11 +7488,10 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
             js_log("executeJoinQuery: NEAR col2col path", 35);
             // Column-to-column NEAR JOIN (ON i.embedding NEAR e.description)
             js_log("NEAR: resolving top_k", 21);
-            // Avoid orelse chain - use explicit if statements
-            var top_k: u32 = 20;
+            // Default TOPK is 1 for NEAR JOIN (use explicit TOPK n syntax to override)
+            // Note: query.top_k is LIMIT, NOT join TOPK - don't use it as fallback
+            var top_k: u32 = 1;
             if (join.top_k) |v| {
-                top_k = v;
-            } else if (query.top_k) |v| {
                 top_k = v;
             }
             js_log("NEAR: top_k resolved", 20);
@@ -7617,11 +7616,10 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
         } else if (join.is_near and join_idx == 0) {
             // Legacy: NEAR [vector] or NEAR rownum syntax
             js_log("NEAR legacy: entering path", 26);
-            // Simplified top_k resolution to avoid orelse chain issues
-            var top_k: u32 = 20;
+            // Default TOPK is 1 for NEAR JOIN (use explicit TOPK n syntax to override)
+            // Note: query.top_k is LIMIT, NOT join TOPK - don't use it as fallback
+            var top_k: u32 = 1;
             if (join.top_k) |v| {
-                top_k = v;
-            } else if (query.top_k) |v| {
                 top_k = v;
             }
             js_log("NEAR legacy: got top_k", 22);
@@ -8140,7 +8138,9 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
     
     // Output Phase
     js_log("executeJoinQuery: output phase start", 36);
-    const pair_count = src_count;
+    // Apply LIMIT to final output (query.top_k is LIMIT, not join TOPK)
+    const raw_pair_count = src_count;
+    const pair_count = if (query.top_k) |limit| @min(raw_pair_count, limit) else raw_pair_count;
     js_log("executeJoinQuery: got pair_count", 32);
 
     var total_cols: usize = 0;
@@ -9961,7 +9961,8 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
 
 /// Execute GROUP BY NEAR query - cluster rows by vector similarity
 fn executeGroupByNearQuery(table: *const TableInfo, query: *const ParsedQuery, maybe_indices: ?[]const u32) !void {
-    const top_k = query.group_by_near_top_k orelse 20;
+    // Default TOPK is 1 for GROUP BY NEAR (use explicit TOPK n syntax to override)
+    const top_k = query.group_by_near_top_k orelse 1;
     const MAX_CLUSTERS: usize = 64;
     const num_clusters = @min(top_k, MAX_CLUSTERS);
 

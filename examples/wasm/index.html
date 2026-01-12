@@ -388,16 +388,9 @@
         }
 
         .sql-example.copy-link-btn {
-            background: #1e3a5f;
-            color: #60a5fa;
             display: inline-flex;
             align-items: center;
             gap: 4px;
-        }
-
-        .sql-example.copy-link-btn:hover {
-            background: #1e40af;
-            color: #93c5fd;
         }
 
         /* DataFrame Builder */
@@ -2037,20 +2030,17 @@
                             placeholder="SELECT * FROM read_lance('https://...') LIMIT 50">-- 🔗 NEAR JOIN: Match remote images to local emoji by vector similarity
 SELECT i.url, i.text, e.emoji, e.description
 FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') i
-JOIN read_lance('opfs://emoji.lance') e ON i.embedding NEAR e.embedding TOPK 5
+JOIN read_lance('opfs://emoji.lance') e ON i.embedding NEAR e.description TOPK 5
 LIMIT 100</textarea>
                         <div class="sql-highlight" id="sql-highlight" aria-hidden="true"></div>
                     </div>
                     <div class="sql-examples">
                         <button class="sql-example"
-                            data-sql="SELECT url, text, aesthetic FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') WHERE embedding NEAR 'cat playing' LIMIT 20"
-                            style="background: #7c3aed;">🔮 NEAR 'cat'</button>
+                            data-sql="SELECT url, text, aesthetic FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') WHERE embedding NEAR 'cat playing' LIMIT 20">🔮 NEAR 'cat'</button>
                         <button class="sql-example"
-                            data-sql="SELECT i.url, i.text, e.emoji, e.description FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') i JOIN read_lance('opfs://emoji.lance') e ON i.embedding NEAR e.embedding TOPK 5 LIMIT 100"
-                            style="background: #059669;">🔗 NEAR JOIN</button>
+                            data-sql="SELECT i.url, i.text, e.emoji, e.description FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') i JOIN read_lance('opfs://emoji.lance') e ON i.embedding NEAR e.description TOPK 5 LIMIT 100">🔗 NEAR JOIN</button>
                         <button class="sql-example"
-                            data-sql="SELECT SUM(aesthetic), AVG(aesthetic), MIN(aesthetic), MAX(aesthetic), COUNT(*) FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 100000"
-                            style="background: #ea580c;">📊 Stats 100K</button>
+                            data-sql="SELECT SUM(aesthetic), AVG(aesthetic), MIN(aesthetic), MAX(aesthetic), COUNT(*) FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 100000">📊 Stats 100K</button>
                         <button class="sql-example"
                             data-sql="SELECT * FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') WHERE aesthetic > 0.7 LIMIT 50">WHERE
                             Filter</button>
@@ -2060,8 +2050,7 @@ LIMIT 100</textarea>
                         <button class="sql-example"
                             data-sql="SELECT url, text, aesthetic FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') WHERE aesthetic > 6.0 ORDER BY aesthetic DESC LIMIT 20">High Aesthetic</button>
                         <button class="sql-example" id="create-demo-join-table"
-                            title="Create emoji.lance with embeddings for vector JOIN demo" style="background: #334155;">+ Emoji
-                            Table</button>
+                            title="Create emoji.lance for NEAR JOIN demo">+ Emoji Table</button>
                         <button class="sql-example copy-link-btn" id="copy-link-btn" title="Copy shareable link">
                             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                                 stroke-width="2">
@@ -2856,7 +2845,7 @@ LIMIT 100</textarea>
         const DEFAULT_QUERY = `-- 🔗 NEAR JOIN: Match remote images to local emoji by vector similarity
 SELECT i.url, i.text, e.emoji, e.description
 FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') i
-JOIN read_lance('opfs://emoji.lance') e ON i.embedding NEAR e.embedding TOPK 5
+JOIN read_lance('opfs://emoji.lance') e ON i.embedding NEAR e.description TOPK 5
 LIMIT 100`;
 
         // Vault instance for real SQL execution
@@ -2903,12 +2892,13 @@ LIMIT 100`;
                 updateStoragePanelSupport();
 
                 if (opfsSupported) {
-                    // Auto-create emoji.lance if it doesn't exist (needed for default JOIN query)
-                    await ensureEmojiTable();
+                    // Load OPFS tables first
                     await loadOPFSTables();
+                    // Then ensure emoji table exists and has vector index
+                    await ensureEmojiTable();
                 }
 
-                // Run query AFTER emoji table is created
+                // Run query AFTER emoji table and vector index are ready
                 setTimeout(runSqlQuery, 100);
 
                 // Initialize storage stats, online status, and memory display
@@ -4123,9 +4113,9 @@ LIMIT 100`;
                 // Check for read_lance('url') in SQL using regex
                 const extractedUrl = extractUrlFromSql(sql);
 
-                // If FROM clause has URL, load dataset first
+                // If FROM clause has URL, load dataset first (skip OPFS - handled by worker)
                 let targetFile = currentFile;
-                if (extractedUrl) {
+                if (extractedUrl && !extractedUrl.startsWith('opfs://')) {
                     const url = extractedUrl;
                     const version = null; // Version parsing would need full parser
                     const versionMsg = '';
@@ -4976,6 +4966,12 @@ LIMIT 100`;
 
         // Load from URL using HTTP Range requests (lazy loading)
         async function loadFromUrl(url) {
+            // OPFS URLs are handled by the worker, not here
+            if (url.startsWith('opfs://')) {
+                showStatus('OPFS files are loaded via SQL queries', 'info');
+                return;
+            }
+
             showStatus('Loading metadata via Range requests...', 'info');
             setLoading(true);
 
@@ -5297,7 +5293,7 @@ LIMIT 100`;
                 }
 
                 // Open as Lance file (always works - in memory)
-                const dataset = await lanceql.openMemory(new Uint8Array(buffer));
+                const dataset = lanceql.open(new Uint8Array(buffer));
 
                 // Detect column types
                 let cols = dataset.numColumns;
@@ -5358,7 +5354,7 @@ LIMIT 100`;
                         const buffer = await opfsStorage.load(fileInfo.name);
                         if (!buffer) continue;
 
-                        const dataset = await lanceql.openMemory(buffer);
+                        const dataset = lanceql.open(buffer);
                         let cols = dataset.numColumns;
                         try {
                             const types = await dataset.detectColumnTypes();
@@ -6370,21 +6366,41 @@ LIMIT 100`;
             });
         });
 
-        // Auto-create emoji table if it doesn't exist
+        // Auto-create emoji table if it doesn't exist, and ensure vector index exists
         async function ensureEmojiTable() {
             try {
                 // Check if emoji.lance already exists
                 const files = await lanceOpfsStorage.listFiles();
                 const exists = files.some(f => f.name === 'emoji.lance');
                 if (exists) {
-                    console.log('[Demo] emoji.lance already exists');
-                    // Update button state
-                    const btn = document.getElementById('create-demo-join-table');
-                    if (btn) {
-                        btn.textContent = '✓ Emoji Table';
-                        btn.style.background = '#22c55e';
+                    console.log('[Demo] emoji.lance already exists, validating...');
+                    // Try to load it - if it fails, recreate
+                    try {
+                        console.log('[Demo] Loading emoji table into WASM...');
+                        await vaultInstance.exec("SELECT * FROM read_lance('opfs://emoji.lance') AS emoji LIMIT 1");
+                        console.log('[Demo] emoji.lance is valid');
+                        // Update button state
+                        const btn = document.getElementById('create-demo-join-table');
+                        if (btn) {
+                            btn.textContent = '✓ Emoji Table';
+                        }
+                        // Load MiniLM model and create vector index
+                        try {
+                            console.log('[Demo] Loading MiniLM model into worker...');
+                            await vaultInstance.loadMinilmModel();
+                            console.log('[Demo] Creating vector index on emoji.description...');
+                            await vaultInstance.exec('CREATE VECTOR INDEX ON emoji(description) USING minilm');
+                            console.log('[Demo] Vector index created');
+                        } catch (e) {
+                            if (!e.message?.includes('AlreadyExists')) {
+                                console.warn('[Demo] Failed to create vector index:', e);
+                            }
+                        }
+                        return;
+                    } catch (e) {
+                        console.warn('[Demo] emoji.lance is corrupted, recreating...', e);
+                        // Fall through to recreate
                     }
-                    return;
                 }
 
                 console.log('[Demo] Auto-creating emoji.lance...');
@@ -6405,9 +6421,17 @@ LIMIT 100`;
             }
 
             try {
-                if (!silent) showStatus('Creating emoji table with embeddings...', 'info');
+                // Delete old emoji.lance if it exists (in case it's corrupted)
+                try {
+                    await lanceOpfsStorage.delete('emoji.lance');
+                    await lanceOpfsStorage.delete('emoji.lance.schema');
+                    console.log('[Demo] Deleted old emoji.lance');
+                } catch (e) {
+                    // Ignore if doesn't exist
+                }
+                if (!silent) showStatus('Creating emoji table...', 'info');
 
-                // Emoji data with semantic descriptions
+                // Emoji data with semantic descriptions (NO embedding - auto-embed at query time)
                 const emojiData = [
                     { emoji: '🌅', description: 'sunset sunrise dawn sky' },
                     { emoji: '🏖️', description: 'beach ocean sand vacation' },
@@ -6431,40 +6455,14 @@ LIMIT 100`;
                     { emoji: '🌈', description: 'rainbow colors sky weather' },
                 ];
 
-                // Load MiniLM model for embeddings
-                if (!minilmModelLoaded) {
-                    if (!silent) showStatus('Loading MiniLM model...', 'info');
-                    const loaded = await ensureMinilmModelLoaded();
-                    if (!loaded) {
-                        throw new Error('Failed to load MiniLM model');
-                    }
-                }
-
-                if (!silent) showStatus('Generating embeddings...', 'info');
-
-                // Generate embeddings for each description
-                const embeddings = [];
-                for (const item of emojiData) {
-                    const vec = encodeTextWithMinilm(item.description);
-                    embeddings.push(vec);
-                }
-
-                // Create Lance file using PureLanceWriter
+                // Create Lance file using PureLanceWriter (text only, auto-embed at query time)
                 const writer = new PureLanceWriter();
 
                 // Add emoji column (strings)
                 writer.addStringColumn('emoji', emojiData.map(d => d.emoji));
 
-                // Add description column (strings)
+                // Add description column (strings) - will be auto-embedded when used in NEAR JOIN
                 writer.addStringColumn('description', emojiData.map(d => d.description));
-
-                // Add embedding column (384-dim vectors as flat Float32Array)
-                const dim = embeddings[0].length;
-                const flatEmbeddings = new Float32Array(emojiData.length * dim);
-                for (let i = 0; i < embeddings.length; i++) {
-                    flatEmbeddings.set(embeddings[i], i * dim);
-                }
-                writer.addVectorColumn('embedding', flatEmbeddings, dim);
 
                 // Finalize and save to OPFS
                 const lanceBytes = writer.finalize();
@@ -6477,24 +6475,45 @@ LIMIT 100`;
                 await lanceOpfsStorage.save('emoji.lance.schema', schemaBytes);
 
                 console.log(`[Demo] Created emoji.lance: ${emojiData.length} rows, ${lanceBytes.length} bytes, schema: ${schemaJson}`);
-                if (!silent) showStatus(`Emoji table created (${emojiData.length} rows with embeddings)`, 'success');
 
-                // Reload OPFS tables (skip if silent - will be loaded by init)
-                if (!silent) await loadOPFSTables();
+                // Reload OPFS tables for UI
+                await loadOPFSTables();
 
-                if (btn) {
-                    btn.textContent = '✓ Emoji Table';
-                    btn.style.background = '#22c55e';
+                // Load emoji table into WASM via a query (needed for CREATE VECTOR INDEX)
+                console.log('[Demo] Loading emoji table into WASM...');
+                await vaultInstance.exec("SELECT * FROM read_lance('opfs://emoji.lance') AS emoji LIMIT 0");
+
+                // Load MiniLM model into worker's WASM for CREATE VECTOR INDEX
+                console.log('[Demo] Loading MiniLM model into worker...');
+                await vaultInstance.loadMinilmModel();
+
+                // Create vector index on description column for auto-embedding (ignore if exists)
+                if (!silent) showStatus('Creating vector index...', 'info');
+                try {
+                    await vaultInstance.exec('CREATE VECTOR INDEX ON emoji(description) USING minilm');
+                    console.log('[Demo] Created vector index on emoji.description');
+                } catch (e) {
+                    if (e.message?.includes('AlreadyExists')) {
+                        console.log('[Demo] Vector index already exists on emoji.description');
+                    } else {
+                        throw e;
+                    }
                 }
 
-                // Update SQL with NEAR JOIN example (only if not silent)
+                if (!silent) showStatus(`Emoji table created (${emojiData.length} rows)`, 'success');
+
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = '✓ Emoji Table';
+                }
+
+                // Update SQL with shadow column demo (only if not silent)
                 if (!silent) {
                     const sqlInput = document.getElementById('sql-input');
-                    sqlInput.value = `-- 🚀 NEAR JOIN: Remote images + Local emoji tags by similarity
-SELECT r.url, r.text, e.emoji, e.description
-FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') r
-JOIN read_lance('opfs://emoji.lance') e ON r.embedding NEAR e.embedding TOPK 5
-LIMIT 100`;
+                    sqlInput.value = `-- 🎯 Shadow column demo: LIKE (text) + GROUP BY NEAR (vector) on same column
+SELECT emoji, description FROM read_lance('opfs://emoji.lance')
+WHERE description LIKE '%sun%'
+GROUP BY NEAR description TOPK 3`;
                     document.getElementById('sql-highlight').innerHTML = highlightSQL(sqlInput.value) + '\n';
                 }
 
@@ -6504,7 +6523,6 @@ LIMIT 100`;
                 if (btn) {
                     btn.disabled = false;
                     btn.textContent = '+ Emoji Table';
-                    btn.style.background = '#334155';
                 }
             }
         }
