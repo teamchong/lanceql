@@ -4,6 +4,12 @@ export default defineConfig({
   test: {
     globals: true,
     testTimeout: 30000,
+    pool: 'forks',
+    poolOptions: {
+      forks: {
+        singleFork: true,
+      },
+    },
     include: ['test/**/*.spec.js', 'test/**/*.test.js'],
     exclude: [
       'test/basic.test.js',
@@ -12,7 +18,8 @@ export default defineConfig({
       'test/distinct.test.js',
       'test/types.test.js',
       'test/timestamp.test.js',
-    ], // Node.js native test runner files
+      'test/logic-table-compiler.spec.js', // Requires metal0 build
+    ],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],
