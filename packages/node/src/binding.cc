@@ -718,16 +718,19 @@ Napi::Object DynamicLogicTable::Init(Napi::Env env, Napi::Object exports) {
 // ============================================================================
 
 static void CleanupModule(void* /*arg*/) {
-    // Call Zig cleanup function to free all handles
+    // Call Zig cleanup function to signal cleanup has started
+    // This is a no-op now - we let the OS reclaim memory on process exit
     if (lance_cleanup_fn) {
         lance_cleanup_fn();
     }
 
-    // Unload the shared library
-    if (g_lib) {
-        dlclose(g_lib);
-        g_lib = nullptr;
-    }
+    // NOTE: Intentionally NOT calling dlclose(g_lib) here.
+    // On Linux, dlclose during process exit can cause crashes because:
+    // 1. The library's destructors may run in an inconsistent state
+    // 2. Thread-local storage may already be deallocated
+    // 3. Other libraries may have already been unloaded
+    // The OS will reclaim all memory when the process exits.
+    g_lib = nullptr;
 }
 
 // ============================================================================

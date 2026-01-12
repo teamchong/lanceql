@@ -12,7 +12,7 @@
 //!
 //! SQL CLAUSES TESTED (all use real SQL executor):
 //!   - FILTER (WHERE) - Real SQL: SELECT COUNT(*) WHERE amount > 100
-//!   - AGGREGATE (SUM) - Real SQL: SELECT SUM(amount) FROM table
+//!   - AGGREGATE (SUM) - Real SQL: SELECT SUM(amount) FROM t
 //!   - GROUP BY        - Real SQL: SELECT customer_id, SUM(amount) GROUP BY customer_id
 //!   - JOIN            - Real SQL: SELECT * FROM orders JOIN customers ON customer_id
 //!
@@ -23,7 +23,6 @@
 const std = @import("std");
 const table_mod = @import("lanceql.table");
 const Table = table_mod.Table;
-const LazyTable = table_mod.LazyTable;
 const ast = @import("lanceql.sql.ast");
 const parser = @import("lanceql.sql.parser");
 const executor_mod = @import("lanceql.sql.executor");
@@ -279,114 +278,6 @@ fn runJoinSQLBenchmark(
     return .{ .rows_per_sec = rows_per_sec, .iterations = iterations, .success = true, .error_msg = null };
 }
 
-/// Run benchmark using LazyTable (column-first I/O) - direct column access
-fn runLazyTableBenchmark(
-    allocator: std.mem.Allocator,
-    lance_file_path: []const u8,
-    warmup_secs: i64,
-    bench_secs: i64,
-    comptime op: enum { filter, aggregate, group_by },
-) BenchResult {
-    var iterations: u64 = 0;
-    var total_rows: u64 = 0;
-
-    // Warmup
-    const warmup_end = std.time.nanoTimestamp() + warmup_secs * 1_000_000_000;
-    while (std.time.nanoTimestamp() < warmup_end) {
-        var lazy_table = LazyTable.initFromPath(allocator, lance_file_path) catch {
-            return .{ .rows_per_sec = 0, .iterations = 0, .success = false, .error_msg = "failed to init lazy table" };
-        };
-        defer lazy_table.deinit();
-
-        // Get 'amount' column (physical column 1)
-        const amounts = lazy_table.readFloat64Column(1) catch {
-            return .{ .rows_per_sec = 0, .iterations = 0, .success = false, .error_msg = "failed to read column" };
-        };
-        defer allocator.free(amounts);
-
-        switch (op) {
-            .filter => {
-                var count: u64 = 0;
-                for (amounts) |v| {
-                    if (v > 100.0) count += 1;
-                }
-                std.mem.doNotOptimizeAway(&count);
-            },
-            .aggregate => {
-                var sum: f64 = 0;
-                for (amounts) |v| sum += v;
-                std.mem.doNotOptimizeAway(&sum);
-            },
-            .group_by => {
-                // Read customer_id column (physical column 2)
-                const ids = lazy_table.readInt64Column(2) catch {
-                    return .{ .rows_per_sec = 0, .iterations = 0, .success = false, .error_msg = "failed to read id column" };
-                };
-                defer allocator.free(ids);
-
-                // Simple group aggregation using hash map
-                var groups = std.AutoHashMap(i64, f64).init(allocator);
-                defer groups.deinit();
-
-                for (ids, 0..) |id, i| {
-                    const entry = groups.getOrPutValue(id, 0) catch break;
-                    entry.value_ptr.* += amounts[i];
-                }
-                std.mem.doNotOptimizeAway(&groups);
-            },
-        }
-    }
-
-    // Benchmark
-    const benchmark_end_time = std.time.nanoTimestamp() + bench_secs * 1_000_000_000;
-    const start_time = std.time.nanoTimestamp();
-
-    while (std.time.nanoTimestamp() < benchmark_end_time) {
-        var lazy_table = LazyTable.initFromPath(allocator, lance_file_path) catch break;
-        defer lazy_table.deinit();
-
-        const amounts = lazy_table.readFloat64Column(1) catch break;
-        defer allocator.free(amounts);
-
-        switch (op) {
-            .filter => {
-                var count: u64 = 0;
-                for (amounts) |v| {
-                    if (v > 100.0) count += 1;
-                }
-                std.mem.doNotOptimizeAway(&count);
-            },
-            .aggregate => {
-                var sum: f64 = 0;
-                for (amounts) |v| sum += v;
-                std.mem.doNotOptimizeAway(&sum);
-            },
-            .group_by => {
-                const ids = lazy_table.readInt64Column(2) catch break;
-                defer allocator.free(ids);
-
-                var groups = std.AutoHashMap(i64, f64).init(allocator);
-                defer groups.deinit();
-
-                for (ids, 0..) |id, i| {
-                    const entry = groups.getOrPutValue(id, 0) catch break;
-                    entry.value_ptr.* += amounts[i];
-                }
-                std.mem.doNotOptimizeAway(&groups);
-            },
-        }
-
-        iterations += 1;
-        total_rows += amounts.len;
-    }
-
-    const elapsed_ns = std.time.nanoTimestamp() - start_time;
-    const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000_000.0;
-    const rows_per_sec = @as(f64, @floatFromInt(total_rows)) / elapsed_s;
-
-    return .{ .rows_per_sec = rows_per_sec, .iterations = iterations, .success = true, .error_msg = null };
-}
-
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
@@ -465,7 +356,7 @@ pub fn main() !void {
         const result = runSQLBenchmark(
             allocator,
             lance_file_path,
-            "SELECT COUNT(*) FROM table WHERE amount > 100",
+            "SELECT COUNT(*) FROM t WHERE amount > 100",
             WARMUP_SECONDS,
             BENCHMARK_SECONDS,
         );
@@ -481,34 +372,6 @@ pub fn main() !void {
         } else {
             std.debug.print("{s:<45} {s:>12} {s:>12} {s:>10}\n", .{
                 "LanceQL (FILTER via SQL executor)",
-                result.error_msg orelse "error",
-                "-",
-                "-",
-            });
-        }
-    }
-
-    // LazyTable benchmark (column-first I/O)
-    {
-        const result = runLazyTableBenchmark(
-            allocator,
-            lance_file_path,
-            WARMUP_SECONDS,
-            BENCHMARK_SECONDS,
-            .filter,
-        );
-
-        if (result.success) {
-            const speedup = result.rows_per_sec / lanceql_filter_rps;
-            std.debug.print("{s:<45} {d:>10.0}K {d:>12} {d:>9.1}x\n", .{
-                "LanceQL (column-first I/O)",
-                result.rows_per_sec / 1000.0,
-                result.iterations,
-                speedup,
-            });
-        } else {
-            std.debug.print("{s:<45} {s:>12} {s:>12} {s:>10}\n", .{
-                "LanceQL (column-first I/O)",
                 result.error_msg orelse "error",
                 "-",
                 "-",
@@ -663,7 +526,7 @@ pub fn main() !void {
         const result = runSQLBenchmark(
             allocator,
             lance_file_path,
-            "SELECT SUM(amount) FROM table",
+            "SELECT SUM(amount) FROM t",
             WARMUP_SECONDS,
             BENCHMARK_SECONDS,
         );
@@ -679,34 +542,6 @@ pub fn main() !void {
         } else {
             std.debug.print("{s:<45} {s:>12} {s:>12} {s:>10}\n", .{
                 "LanceQL (AGGREGATE via SQL executor)",
-                result.error_msg orelse "error",
-                "-",
-                "-",
-            });
-        }
-    }
-
-    // LazyTable benchmark (column-first I/O)
-    {
-        const result = runLazyTableBenchmark(
-            allocator,
-            lance_file_path,
-            WARMUP_SECONDS,
-            BENCHMARK_SECONDS,
-            .aggregate,
-        );
-
-        if (result.success) {
-            const speedup = result.rows_per_sec / lanceql_agg_rps;
-            std.debug.print("{s:<45} {d:>10.0}K {d:>12} {d:>9.1}x\n", .{
-                "LanceQL (column-first I/O)",
-                result.rows_per_sec / 1000.0,
-                result.iterations,
-                speedup,
-            });
-        } else {
-            std.debug.print("{s:<45} {s:>12} {s:>12} {s:>10}\n", .{
-                "LanceQL (column-first I/O)",
                 result.error_msg orelse "error",
                 "-",
                 "-",
@@ -856,7 +691,7 @@ pub fn main() !void {
         const result = runSQLBenchmark(
             allocator,
             lance_file_path,
-            "SELECT customer_id, SUM(amount) FROM table GROUP BY customer_id",
+            "SELECT customer_id, SUM(amount) FROM t GROUP BY customer_id",
             WARMUP_SECONDS,
             BENCHMARK_SECONDS,
         );
@@ -872,34 +707,6 @@ pub fn main() !void {
         } else {
             std.debug.print("{s:<45} {s:>12} {s:>12} {s:>10}\n", .{
                 "LanceQL (GROUP BY via SQL executor)",
-                result.error_msg orelse "error",
-                "-",
-                "-",
-            });
-        }
-    }
-
-    // LazyTable benchmark (column-first I/O)
-    {
-        const result = runLazyTableBenchmark(
-            allocator,
-            lance_file_path,
-            WARMUP_SECONDS,
-            BENCHMARK_SECONDS,
-            .group_by,
-        );
-
-        if (result.success) {
-            const speedup = if (lanceql_groupby_rps > 0) result.rows_per_sec / lanceql_groupby_rps else 0;
-            std.debug.print("{s:<45} {d:>10.0}K {d:>12} {d:>9.1}x\n", .{
-                "LanceQL (column-first I/O)",
-                result.rows_per_sec / 1000.0,
-                result.iterations,
-                speedup,
-            });
-        } else {
-            std.debug.print("{s:<45} {s:>12} {s:>12} {s:>10}\n", .{
-                "LanceQL (column-first I/O)",
                 result.error_msg orelse "error",
                 "-",
                 "-",

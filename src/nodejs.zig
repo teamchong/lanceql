@@ -726,44 +726,17 @@ export fn lance_transaction_rollback(handle: *Handle) bool {
 
 /// Cleanup all resources when the module is unloaded.
 /// Call this from Node.js module unload handler.
+///
+/// NOTE: This is intentionally a no-op. On process exit, the OS reclaims all
+/// memory automatically. Attempting to free resources during Node.js/vitest
+/// worker shutdown can cause crashes on Linux because:
+/// 1. The allocator may already be in an inconsistent state
+/// 2. Mutex operations may fail during process teardown
+/// 3. Memory mappings may already be invalidated
+///
+/// Individual resources (tables, statements, results) are still properly closed
+/// via their explicit close() functions during normal operation.
 export fn lance_cleanup() void {
-    // Set flag first to prevent JS destructors from double-freeing handles
-    // that we're about to free here
     cleanup_started = true;
-
-    // Close all open tables
-    tables_lock.lock();
-    defer tables_lock.unlock();
-    var table_iter = tables.iterator();
-    while (table_iter.next()) |entry| {
-        const table_ptr = entry.value_ptr.*;
-        table_ptr.deinit();
-        allocator.destroy(table_ptr);
-    }
-    tables.clearAndFree();
-
-    // Close all statements
-    statements_lock.lock();
-    defer statements_lock.unlock();
-    var stmt_iter = statements.iterator();
-    while (stmt_iter.next()) |entry| {
-        const stmt_ptr = entry.value_ptr.*;
-        // Free all AST allocations (columns, where, group_by, order_by)
-        ast.deinitSelectStmt(&stmt_ptr.stmt, stmt_ptr.allocator);
-        // Free the SQL string copy
-        allocator.free(stmt_ptr.sql_copy);
-        allocator.destroy(stmt_ptr);
-    }
-    statements.clearAndFree();
-
-    // Close all results
-    results_lock.lock();
-    defer results_lock.unlock();
-    var result_iter = results.iterator();
-    while (result_iter.next()) |entry| {
-        const result_ptr = entry.value_ptr.*;
-        result_ptr.deinit();
-        allocator.destroy(result_ptr);
-    }
-    results.clearAndFree();
+    // No-op: Let the OS reclaim memory on process exit
 }
