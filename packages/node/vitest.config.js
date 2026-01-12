@@ -4,16 +4,10 @@ export default defineConfig({
   test: {
     globals: true,
     testTimeout: 30000,
-    // Avoid worker process crashes with native addons on Linux
-    // The native addon crashes during cleanup but tests pass, so we ignore the errors
+    // On Linux, native addons can crash during worker cleanup.
+    // Tests pass but worker processes crash afterward, causing vitest to exit with error.
+    // This option prevents vitest from failing due to worker process exit errors.
     dangerouslyIgnoreUnhandledErrors: true,
-    pool: 'forks',
-    poolOptions: {
-      forks: {
-        singleFork: true,
-        isolate: false,
-      },
-    },
     include: ['test/**/*.spec.js', 'test/**/*.test.js'],
     exclude: [
       'test/basic.test.js',
