@@ -1220,6 +1220,19 @@ async function executeWasmSqlFull(db, sql) {
             continue;
         }
 
+        // For OPFS URLs, check if the base table name is already registered (with shadow columns)
+        // e.g., opfs://emoji.lance -> check if 'emoji' table exists
+        if (url.startsWith('opfs://')) {
+            const opfsPath = url.replace('opfs://', '');
+            const baseName = opfsPath.replace('.lance', '');
+            if (executor.hasTable(baseName)) {
+                // Copy table registration from baseName to alias
+                console.log(`[Worker] Aliasing ${alias} to existing table ${baseName}`);
+                executor.aliasTable(baseName, alias);
+                continue;
+            }
+        }
+
         let data = null;
         let loadError = null;
         try {
@@ -2107,6 +2120,48 @@ async function handleMessage(port, data) {
                     columns: result.columns,
                     rowCount: result.rowCount
                 };
+            }
+        }
+        // Model loading for CREATE VECTOR INDEX
+        else if (method === 'loadMinilmModel') {
+            // Load MiniLM model into worker's WASM for CREATE VECTOR INDEX
+            if (!wasm) {
+                await loadWasm();
+            }
+            if (!wasm) throw new Error('WASM not loaded');
+
+            // Check if already loaded
+            if (wasm.minilm_weights_loaded && wasm.minilm_weights_loaded() === 1) {
+                result = { loaded: true, cached: true };
+            } else {
+                // Initialize MiniLM
+                if (wasm.minilm_init) {
+                    wasm.minilm_init();
+                }
+
+                // Fetch model
+                const modelUrl = args.url || 'https://data.metal0.dev/models/minilm-l6-v2.gguf';
+                console.log('[Worker] Downloading MiniLM model...');
+                const response = await fetch(modelUrl);
+                if (!response.ok) throw new Error('MiniLM model download failed');
+
+                const modelData = await response.arrayBuffer();
+                console.log('[Worker] MiniLM downloaded:', modelData.byteLength, 'bytes');
+
+                // Allocate WASM memory
+                const bufPtr = wasm.minilm_alloc_model_buffer(modelData.byteLength);
+                if (bufPtr === 0) throw new Error('Failed to allocate WASM memory for MiniLM');
+
+                // Copy model to WASM
+                const wasmMem = new Uint8Array(wasmMemory.buffer);
+                wasmMem.set(new Uint8Array(modelData), bufPtr);
+
+                // Load model
+                const loadResult = wasm.minilm_load_model(modelData.byteLength);
+                if (loadResult !== 0) throw new Error(`MiniLM load error: ${loadResult}`);
+
+                console.log('[Worker] MiniLM model loaded successfully');
+                result = { loaded: true, cached: false, size: modelData.byteLength };
             }
         }
         // Unknown method
