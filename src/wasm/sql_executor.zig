@@ -471,12 +471,10 @@ fn strEql(a: []const u8, b: []const u8) bool {
 
 // Populates resolved_left_shadow_buf and resolved_left_shadow_len globals for left column
 fn resolveShadowColumnLeft(table_name: []const u8, column_name: []const u8) void {
-    js_log("resolveShadowL: start", 21);
     var i: usize = 0;
     while (i < vector_index_count) : (i += 1) {
         if (vector_indexes[i]) |idx| {
             if (strEql(idx.table_name, table_name) and strEql(idx.column_name, column_name)) {
-                js_log("resolveShadowL: found", 21);
                 resolved_left_shadow_len = idx.shadow_column.len;
                 if (resolved_left_shadow_len > resolved_left_shadow_buf.len) {
                     resolved_left_shadow_len = resolved_left_shadow_buf.len;
@@ -494,7 +492,6 @@ fn resolveShadowColumnLeft(table_name: []const u8, column_name: []const u8) void
     while (i < vector_index_count) : (i += 1) {
         if (vector_indexes[i]) |idx| {
             if (strEql(idx.column_name, column_name)) {
-                js_log("resolveShadowL: fallback", 24);
                 resolved_left_shadow_len = idx.shadow_column.len;
                 if (resolved_left_shadow_len > resolved_left_shadow_buf.len) {
                     resolved_left_shadow_len = resolved_left_shadow_buf.len;
@@ -508,7 +505,6 @@ fn resolveShadowColumnLeft(table_name: []const u8, column_name: []const u8) void
         }
     }
     // No match - use original column name
-    js_log("resolveShadowL: no match", 24);
     resolved_left_shadow_len = column_name.len;
     if (resolved_left_shadow_len > resolved_left_shadow_buf.len) {
         resolved_left_shadow_len = resolved_left_shadow_buf.len;
@@ -521,14 +517,11 @@ fn resolveShadowColumnLeft(table_name: []const u8, column_name: []const u8) void
 
 // Populates resolved_shadow_buf and resolved_shadow_len globals for right column
 fn resolveShadowColumnRight(table_name: []const u8, column_name: []const u8) void {
-    js_log("resolveShadowR: start", 21);
     // First try exact table+column match
     var i: usize = 0;
     while (i < vector_index_count) : (i += 1) {
         if (vector_indexes[i]) |idx| {
             if (strEql(idx.table_name, table_name) and strEql(idx.column_name, column_name)) {
-                js_log("resolveShadow: found exact", 26);
-                js_log("resolveShadow: copying", 22);
                 resolved_shadow_len = idx.shadow_column.len;
                 if (resolved_shadow_len > resolved_shadow_buf.len) {
                     resolved_shadow_len = resolved_shadow_buf.len;
@@ -537,18 +530,15 @@ fn resolveShadowColumnRight(table_name: []const u8, column_name: []const u8) voi
                 while (j < resolved_shadow_len) : (j += 1) {
                     resolved_shadow_buf[j] = idx.shadow_column[j];
                 }
-                js_log("resolveShadow: copy done", 24);
                 return;
             }
         }
     }
-    js_log("resolveShadow: no exact match", 29);
     // Fallback: try column name only (for table aliases like 'e' vs 'emoji')
     i = 0;
     while (i < vector_index_count) : (i += 1) {
         if (vector_indexes[i]) |idx| {
             if (strEql(idx.column_name, column_name)) {
-                js_log("resolveShadow: found fallback", 29);
                 resolved_shadow_len = idx.shadow_column.len;
                 if (resolved_shadow_len > resolved_shadow_buf.len) {
                     resolved_shadow_len = resolved_shadow_buf.len;
@@ -561,7 +551,6 @@ fn resolveShadowColumnRight(table_name: []const u8, column_name: []const u8) voi
             }
         }
     }
-    js_log("resolveShadow: no match", 23);
     // Copy original column name to global buffer
     resolved_shadow_len = column_name.len;
     if (resolved_shadow_len > resolved_shadow_buf.len) {
@@ -682,13 +671,10 @@ var static_near_matches: [256]u32 = undefined;
 var static_near_scores: [256]f32 = undefined;
 
 fn getColByName(table: *const TableInfo, name: []const u8) ?*const ColumnData {
-    js_log("getColByName: start", 19);
 
     // Handle qualified column names (e.g., "i.url" -> "url")
-    js_log("getColByName: checking name", 27);
     const name_len = name.len;
     _ = name_len;
-    js_log("getColByName: name.len ok", 25);
 
     // Manual dot search instead of std.mem.indexOfScalar
     var dot_idx: ?usize = null;
@@ -700,19 +686,13 @@ fn getColByName(table: *const TableInfo, name: []const u8) ?*const ColumnData {
         }
     }
     const col_name = if (dot_idx) |idx| name[idx + 1 ..] else name;
-    js_log("getColByName: col_name resolved", 31);
 
-    js_log("getColByName: checking table", 28);
     const tbl_col_count = table.column_count;
     _ = tbl_col_count;
-    js_log("getColByName: table.column_count ok", 35);
-    js_log("getColByName: entering loop", 27);
 
     var i: usize = 0;
     while (i < table.column_count) : (i += 1) {
-        js_log("getColByName: loop iter", 23);
         if (table.columns[i]) |*col| {
-            js_log("getColByName: got col", 21);
             // Manual string comparison instead of std.mem.eql
             if (col.name.len == col_name.len) {
                 var match = true;
@@ -724,13 +704,11 @@ fn getColByName(table: *const TableInfo, name: []const u8) ?*const ColumnData {
                     }
                 }
                 if (match) {
-                    js_log("getColByName: found", 19);
                     return col;
                 }
             }
         }
     }
-    js_log("getColByName: not found", 23);
     return null;
 }
 
@@ -3773,22 +3751,18 @@ fn executeCreateTable(query: *ParsedQuery) !void {
 }
 
 fn executeCreateVectorIndex(query: *ParsedQuery) !void {
-    js_log("executeCreateVectorIndex: start", 31);
     if (vector_index_count >= MAX_VECTOR_INDEXES) return error.VectorIndexLimitReached;
 
     // Debug: check vector_index_count
     log("vector_index_count={}", .{vector_index_count});
 
     // Debug: check query fields
-    js_log("checking query.vector_index_table", 33);
     const tbl_len = query.vector_index_table.len;
     log("vector_index_table.len={}", .{tbl_len});
 
-    js_log("checking query.vector_index_column", 34);
     const col_len = query.vector_index_column.len;
     log("vector_index_column.len={}", .{col_len});
 
-    js_log("executeCreateVectorIndex: checking existing", 43);
 
     // Check if index already exists on this table/column
     // Skip loop entirely if count is 0
@@ -3808,19 +3782,15 @@ fn executeCreateVectorIndex(query: *ParsedQuery) !void {
             }
         }
     }
-    js_log("executeCreateVectorIndex: past existing check", 45);
 
     // Debug: check model field
-    js_log("checking query.vector_index_model", 33);
     const model_len = query.vector_index_model.len;
     log("vector_index_model.len={}", .{model_len});
 
     // Validate model name
-    js_log("validating model name", 21);
     const is_valid_model = std.mem.eql(u8, query.vector_index_model, "minilm") or
         std.mem.eql(u8, query.vector_index_model, "clip") or
         std.mem.eql(u8, query.vector_index_model, "openai");
-    js_log("model validation done", 21);
     if (!is_valid_model) return error.UnknownEmbeddingModel;
 
     // Find the table and get column dimension
@@ -3832,9 +3802,7 @@ fn executeCreateVectorIndex(query: *ParsedQuery) !void {
     js_log("iterating tables", 16);
     for (0..table_count) |ti| {
         log("table iter {}", .{ti});
-        js_log("checking tables[ti]", 19);
         if (tables[ti]) |tbl| {
-            js_log("got tbl", 7);
             log("tbl.name.len={}", .{tbl.name.len});
             js_log("comparing name", 14);
             if (std.mem.eql(u8, tbl.name, query.vector_index_table)) {
@@ -3854,7 +3822,6 @@ fn executeCreateVectorIndex(query: *ParsedQuery) !void {
             }
         }
     }
-    js_log("done iterating tables", 21);
 
     if (!table_found) return error.TableDoesNotExist;
     if (!column_found) return error.ColumnDoesNotExist;
@@ -3890,10 +3857,8 @@ fn executeCreateVectorIndex(query: *ParsedQuery) !void {
     log("shadow_col_name.len={}", .{shadow_col_name.len});
 
     // Generate embeddings for the text column and add shadow column to table
-    js_log("checking minilm model", 21);
     if (std.mem.eql(u8, query.vector_index_model, "minilm")) {
         // Check if MiniLM model is loaded
-        js_log("checking weights loaded", 23);
         if (minilm.minilm_weights_loaded() != 1) {
             return error.ModelNotLoaded;
         }
@@ -5703,22 +5668,15 @@ pub export fn resetResult() void {
 
 fn findTable(name: []const u8) ?*TableInfo {
     // Use minimal stack logging to avoid overflow
-    js_log("findTable: entering", 19);
     const name_len = name.len;
     _ = name_len;
-    js_log("findTable: name.len ok", 22);
-    js_log("findTable: checking table_count", 31);
     const tc = table_count;
     _ = tc;
-    js_log("findTable: table_count ok", 25);
 
     for (0..table_count) |i| {
-        js_log("findTable: loop iteration", 25);
         if (tables[i]) |*tbl| {
-            js_log("findTable: got tbl", 18);
             const tbl_name_len = tbl.name.len;
             _ = tbl_name_len;
-            js_log("findTable: tbl.name.len ok", 26);
 
             // Check if both strings are fully accessible
             var tbl_all_ok = true;
@@ -5729,9 +5687,7 @@ fn findTable(name: []const u8) ?*TableInfo {
                 }
             }
             if (tbl_all_ok) {
-                js_log("findTable: tbl.name all chars ok", 32);
             } else {
-                js_log("findTable: tbl.name has bad chars", 33);
             }
 
             var name_all_ok = true;
@@ -5742,12 +5698,9 @@ fn findTable(name: []const u8) ?*TableInfo {
                 }
             }
             if (name_all_ok) {
-                js_log("findTable: name all chars ok", 28);
             } else {
-                js_log("findTable: name has bad chars", 29);
             }
 
-            js_log("findTable: calling manual compare", 32);
             // Manual comparison instead of std.mem.eql (which crashes)
             var is_equal = tbl.name.len == name.len;
             if (is_equal) {
@@ -5759,13 +5712,10 @@ fn findTable(name: []const u8) ?*TableInfo {
                 }
             }
             if (is_equal) {
-                js_log("findTable: match found", 22);
                 return tbl;
             }
-            js_log("findTable: no match this iter", 29);
         }
     }
-    js_log("findTable: no match", 19);
     return null;
 }
 
@@ -7324,70 +7274,51 @@ fn writeSetOpResult(table1: *const TableInfo, table2: *const TableInfo, output_c
 
 fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !void {
     if (query.join_count == 0) return error.NoJoin;
-    js_log("executeJoinQuery: start", 23);
 
     // Track tables involved for index resolution - use global arrays to avoid stack issues
     global_tables_in_join[0] = left_table;
     global_tables_in_join_aliases[0] = query.table_alias;
     const tables_in_join = &global_tables_in_join;
     const tables_in_join_aliases = &global_tables_in_join_aliases;
-    js_log("executeJoinQuery: arrays set", 28);
 
     // Use double buffering
     var src_buffer: []JoinRow = global_join_rows_src[0..MAX_JOIN_ROWS];
     var dst_buffer: []JoinRow = global_join_rows_dst[0..MAX_JOIN_ROWS];
     var src_count: usize = 0;
-    js_log("executeJoinQuery: buffers set", 29);
 
     for (0..query.join_count) |join_idx| {
-        js_log("executeJoinQuery: in loop", 25);
         const join = &query.joins[join_idx];
-        js_log("executeJoinQuery: got join", 26);
 
         // Find right table - use js_log for minimal stack usage
-        js_log("executeJoinQuery: calling findTable", 35);
 
         // Debug: log table_name slice info
         const table_name_ptr = @intFromPtr(join.table_name.ptr);
         _ = table_name_ptr;
-        js_log("executeJoinQuery: table_name.ptr ok", 35);
         const table_name_len = join.table_name.len;
         _ = table_name_len;
-        js_log("executeJoinQuery: table_name.len ok", 35);
 
         // Debug: try to read first character of table_name
         if (join.table_name.len > 0) {
             const first_char = join.table_name[0];
             _ = first_char;
-            js_log("executeJoinQuery: first char read ok", 36);
         }
 
         const rtbl = findTable(join.table_name) orelse return error.TableNotFound;
-        js_log("executeJoinQuery: found rtbl", 28);
-        js_log("executeJoinQuery: storing in tables", 35);
         tables_in_join[join_idx + 1] = rtbl;
-        js_log("executeJoinQuery: stored rtbl", 29);
         tables_in_join_aliases[join_idx + 1] = join.alias;
-        js_log("executeJoinQuery: stored alias", 30);
 
         // Resolve Columns
         var left_col: ?*const ColumnData = null;
         var left_tbl_idx: usize = 0;
 
-        js_log("executeJoinQuery: checking is_near", 34);
         const is_near_val = join.is_near;
-        js_log("executeJoinQuery: got is_near", 29);
 
         if (is_near_val) {
-            js_log("executeJoinQuery: is NEAR JOIN", 30);
         } else {
-            js_log("executeJoinQuery: not NEAR JOIN", 31);
         }
 
-        js_log("executeJoinQuery: checking join_type", 36);
         const join_type_val = join.join_type;
         _ = join_type_val;
-        js_log("executeJoinQuery: got join_type", 31);
 
         // Search in all previous tables for left column (skip for CROSS JOIN, NEAR, and compound conditions)
         if (!join.is_near and join.join_type != .cross and join.join_condition == null) {
@@ -7480,93 +7411,62 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
         // ------------------
         // Execution
         // ------------------
-        js_log("executeJoinQuery: execution start", 33);
         var pair_count: usize = 0;
 
-        js_log("executeJoinQuery: checking NEAR", 31);
-        js_log("executeJoinQuery: check1", 24);
 
         // Simple field access without log formatting
         const tbl_name_len = join.table_name.len;
         _ = tbl_name_len;
-        js_log("executeJoinQuery: check2 table_name ok", 38);
 
         const is_near_u8: u8 = if (join.is_near) 1 else 0;
         _ = is_near_u8;
-        js_log("executeJoinQuery: check3 is_near ok", 35);
 
-        js_log("executeJoinQuery: check4 near_left_col_len", 43);
-        js_log("executeJoinQuery: near_left_col_len ok", 38);
-        js_log("executeJoinQuery: before if chain", 33);
 
         // Use global static buffers for NEAR JOIN column names (avoids struct pointer issues)
         if (join.is_near and join_idx == 0 and near_left_col_len > 0) {
-            js_log("executeJoinQuery: NEAR col2col path", 35);
             // Column-to-column NEAR JOIN (ON i.embedding NEAR e.description)
-            js_log("NEAR: resolving top_k", 21);
             // Default TOPK is 1 for NEAR JOIN (use explicit TOPK n syntax to override)
             // Note: query.top_k is LIMIT, NOT join TOPK - don't use it as fallback
             var top_k: u32 = 1;
             if (join.top_k) |v| {
                 top_k = v;
             }
-            js_log("NEAR: top_k resolved", 20);
             const lt = tables_in_join[0];
-            js_log("NEAR: lt obtained", 17);
 
             // Read column names from GLOBAL static buffers
-            js_log("NEAR: getting left col name", 27);
             const left_col_name = near_left_col_buf[0..near_left_col_len];
-            js_log("NEAR: got left col name", 23);
 
             // Resolve left column to shadow column if vector index exists
-            js_log("NEAR: resolve left shadow", 25);
             resolveShadowColumnLeft(lt.name, left_col_name);
-            js_log("NEAR: left shadow resolved", 26);
             const resolved_left_col = resolved_left_shadow_buf[0..resolved_left_shadow_len];
 
             // Find left column (vector column)
-            js_log("NEAR: getting left_near_col", 27);
             const left_near_col = getColByName(lt, resolved_left_col) orelse {
-                js_log("NEAR: left col not found", 24);
                 return error.ColumnNotFound;
             };
-            js_log("NEAR: left_near_col obtained", 28);
             const left_dim = left_near_col.vector_dim;
             _ = left_dim;
-            js_log("NEAR: left_near_col.dim ok", 26);
 
             // Find right column - resolve to shadow column if vector index exists
-            js_log("NEAR: getting right col name", 28);
             const right_col_name = near_right_col_buf[0..near_right_col_len];
-            js_log("NEAR: got right col name", 24);
 
-            js_log("NEAR: calling resolveShadowR", 28);
             resolveShadowColumnRight(rtbl.name, right_col_name);
-            js_log("NEAR: resolveShadowR done", 25);
             const resolved_right_col = resolved_shadow_buf[0..resolved_shadow_len];
-            js_log("NEAR: getting right_near_col", 28);
             const right_near_col = getColByName(rtbl, resolved_right_col) orelse {
-                js_log("NEAR: right col not found", 25);
                 return error.ColumnNotFound;
             };
-            js_log("NEAR: right_near_col obtained", 29);
             // Skip formatted log
             const right_dim = right_near_col.vector_dim;
             _ = right_dim;
-            js_log("NEAR: right_near_col.dim ok", 27);
 
             // Use actual vector column row counts (may differ from table row_count)
-            js_log("NEAR: getting row counts", 24);
             const left_rows = if (left_near_col.row_count > 0) left_near_col.row_count else lt.row_count;
             const right_rows = if (right_near_col.row_count > 0) right_near_col.row_count else rtbl.row_count;
-            js_log("NEAR: row counts obtained", 25);
 
             // For each left row, find TOP-K similar right rows
             js_log("NEAR col-col: starting loop", 28);
             var li_usize: usize = 0;
             while (li_usize < left_rows) : (li_usize += 1) {
-                js_log("NEAR: outer iter", 16);
                 const li: u32 = @intCast(li_usize);
 
                 // Get left vector using global context
@@ -7631,83 +7531,62 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
             js_log("NEAR col-col: loop done", 23);
         } else if (join.is_near and join_idx == 0) {
             // Legacy: NEAR [vector] or NEAR rownum syntax
-            js_log("NEAR legacy: entering path", 26);
             // Default TOPK is 1 for NEAR JOIN (use explicit TOPK n syntax to override)
             // Note: query.top_k is LIMIT, NOT join TOPK - don't use it as fallback
             var top_k: u32 = 1;
             if (join.top_k) |v| {
                 top_k = v;
             }
-            js_log("NEAR legacy: got top_k", 22);
             // Just check if top_k is accessible
             const top_k_check: u32 = top_k;
             _ = top_k_check;
-            js_log("NEAR legacy: top_k accessible", 29);
 
             // Use static matches buffer to avoid stack overflow
             const effective_top_k = @min(top_k, 256);
             const matches = static_near_matches[0..effective_top_k];
-            js_log("NEAR legacy: using static matches", 33);
 
             // TEMPORARY: Skip all column/vector processing and executeVectorSearch
             // Just return first effective_top_k rows as matches (for debugging)
-            js_log("NEAR legacy: brute-force search", 31);
 
             var count: usize = 0;
             // Get row count from rtbl without accessing columns
-            js_log("NEAR legacy: getting rtbl row_count", 35);
             const rtbl_row_count = rtbl.row_count;
-            js_log("NEAR legacy: got rtbl row_count", 31);
 
             const num_rows = @min(rtbl_row_count, effective_top_k);
             for (0..num_rows) |i| {
                 matches[count] = @intCast(i);
                 count += 1;
             }
-            js_log("NEAR legacy: matches filled", 27);
-            js_log("NEAR legacy: executeVectorSearch done", 37);
 
             // Get left table from tables_in_join (left_table is not defined in this scope)
             const lt = tables_in_join[0];
-            js_log("NEAR legacy: got left table", 27);
 
             // Debug: check lt.row_count
-            js_log("NEAR legacy: checking lt.row_count", 35);
             const lt_row_count = lt.row_count;
-            js_log("NEAR legacy: lt_row_count accessible", 36);
             _ = lt_row_count;
 
-            js_log("NEAR legacy: checking pair_count", 32);
-            js_log("NEAR legacy: starting outer loop", 32);
 
             var li_counter: usize = 0;
             while (li_counter < lt.row_count) : (li_counter += 1) {
-                js_log("NEAR legacy: outer iteration", 28);
                 var ri_counter: usize = 0;
                 while (ri_counter < count) : (ri_counter += 1) {
                     const ri = matches[ri_counter];
-                    js_log("NEAR legacy: inner iteration", 28);
                     if (pair_count < MAX_JOIN_ROWS) {
-                        js_log("NEAR legacy: about to memset", 28);
                         // Initialize indices array manually instead of @memset
                         var k: usize = 0;
                         while (k < dst_buffer[pair_count].indices.len) : (k += 1) {
                             dst_buffer[pair_count].indices[k] = std.math.maxInt(u32);
                         }
-                        js_log("NEAR legacy: memset done", 24);
                         dst_buffer[pair_count].indices[0] = @intCast(li_counter);
                         dst_buffer[pair_count].indices[1] = ri;
                         pair_count += 1;
                     } else break;
                 }
             }
-            js_log("NEAR legacy: loop complete", 26);
             // Static buffer, no free needed
         } else if (join.is_near) {
-            js_log("executeJoinQuery: NEAR other path", 33);
             return error.NotImplemented;
         } else if (join.join_type == .cross) {
-             js_log("executeJoinQuery: CROSS JOIN path", 33);
              // CROSS JOIN - Cartesian product (no matching condition)
              if (join_idx == 0) {
                  const lt = tables_in_join[0];
@@ -7741,7 +7620,6 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                  }
              }
         } else if (join.join_condition != null) {
-            js_log("executeJoinQuery: compound JOIN path", 37);
             // Compound condition JOIN - use nested loop with full condition evaluation
             const condition = &join.join_condition.?;
 
@@ -7856,7 +7734,6 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                 }
             }
         } else if (lc != null and rc != null and lc.?.vector_dim > 0 and rc.?.vector_dim > 0) {
-            js_log("executeJoinQuery: vector sim path", 33);
             // Vector Similarity JOIN - use nested loop with cosine similarity
             const VECTOR_SIMILARITY_THRESHOLD: f32 = 0.0; // Accept any positive similarity
             const l_col = lc.?;
@@ -7962,14 +7839,11 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
             }
             setDebug("Vector JOIN found {d} pairs", .{pair_count});
         } else {
-             js_log("executeJoinQuery: equi join path", 32);
              // Simple Nested Loop Join (WASM-safe, no AutoHashMap)
              // AutoHashMap crashes in WASM, so use brute force for small tables
-             js_log("executeJoinQuery: nested loop start", 35);
 
              if (join_idx == 0) {
                  const lt = tables_in_join[0];
-                 js_log("executeJoinQuery: got lt", 24);
                  // For FULL OUTER JOIN, track which right rows were matched
                  // Use global buffer to avoid stack overflow
                  if (join.join_type == .full) {
@@ -7978,7 +7852,6 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                          global_right_matched[i] = false;
                      }
                  }
-                 js_log("executeJoinQuery: starting nested loop", 38);
 
                  for (0..lt.row_count) |li_usize| {
                      const li: u32 = @intCast(li_usize);
@@ -8021,7 +7894,6 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                          }
                      }
                  }
-                 js_log("executeJoinQuery: nested loop done", 34);
 
                  // FULL OUTER JOIN: add unmatched right rows with NULL left
                  if (join.join_type == .full) {
@@ -8041,7 +7913,6 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                      }
                  }
              } else {
-                 js_log("executeJoinQuery: multi-table join", 34);
                  const lt = tables_in_join[left_tbl_idx];
                  for (0..src_count) |i| {
                      const l_idx = src_buffer[i].indices[left_tbl_idx];
@@ -8068,9 +7939,7 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
         src_buffer = dst_buffer;
         dst_buffer = tmp;
         src_count = pair_count;
-        js_log("executeJoinQuery: join iter done", 32);
     }
-    js_log("executeJoinQuery: all joins done", 32);
 
     // Apply WHERE clause filtering to joined results
     if (query.where_clause != null) {
@@ -8153,43 +8022,30 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
     }
     
     // Output Phase
-    js_log("executeJoinQuery: output phase start", 36);
     // Apply LIMIT to final output (query.top_k is LIMIT, not join TOPK)
     const raw_pair_count = src_count;
     const pair_count = if (query.top_k) |limit| @min(raw_pair_count, limit) else raw_pair_count;
-    js_log("executeJoinQuery: got pair_count", 32);
 
     var total_cols: usize = 0;
-    js_log("executeJoinQuery: checking select_count", 39);
     if (query.select_count > 0 and !query.is_star) {
          total_cols = query.select_count;
-         js_log("executeJoinQuery: using select_count", 36);
     } else {
-         js_log("executeJoinQuery: star loop", 27);
          for (0..query.join_count+1) |t_idx| {
              total_cols += tables_in_join[t_idx].column_count;
          }
     }
-    js_log("executeJoinQuery: total_cols ok", 31);
     if (total_cols > 64) return error.TooManyColumns;
 
-    js_log("executeJoinQuery: calc capacity", 31);
     // Check for overflow before calculation
     if (pair_count > 100000 or total_cols > 64) {
         js_log("JOIN: pair_count or total_cols too large", 40);
         return error.OutOfMemory;
     }
-    js_log("executeJoinQuery: vals ok", 25);
     const capacity = pair_count * total_cols * 16 + 1024 * total_cols + 65536;
-    js_log("executeJoinQuery: capacity calculated", 36);
-    js_log("executeJoinQuery: fragmentBegin", 31);
     if (lw.fragmentBegin(capacity) == 0) return error.OutOfMemory;
-    js_log("executeJoinQuery: fragmentBegin done", 36);
 
-    js_log("executeJoinQuery: checking pair_count", 37);
     // Handle empty result set (0 matching rows from JOIN)
     if (pair_count == 0) {
-        js_log("executeJoinQuery: pair_count is 0", 33);
         // Return valid Lance fragment with just column metadata (no data rows)
         // We need to add at least the column names/types to the schema
         if (query.select_count > 0 and !query.is_star) {
@@ -8232,7 +8088,6 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
         return;
     }
 
-    js_log("executeJoinQuery: output context setup", 39);
     // Store indices and type instead of pointers to avoid invalidation in WASM
     const WriteContext = struct {
         t_idx: usize, // Index into tables_in_join
@@ -8244,43 +8099,31 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
     var output_cols_ctx: [MAX_COLUMNS]WriteContext = undefined;
     var out_col_count: usize = 0;
 
-    js_log("executeJoinQuery: checking select path", 38);
     if (query.select_count > 0 and !query.is_star) {
-        js_log("executeJoinQuery: select non-star path", 38);
         for (query.select_exprs[0..query.select_count]) |expr| {
-            js_log("executeJoinQuery: select expr loop", 34);
 
             // Debug: check expr.col_name slice validity
-            js_log("executeJoinQuery: checking col_name len", 39);
             const col_name_len = expr.col_name.len;
             _ = col_name_len;
-            js_log("executeJoinQuery: col_name len ok", 33);
 
             // Check if pointer is valid by reading first byte
             if (expr.col_name.len > 0) {
-                js_log("executeJoinQuery: checking first byte", 37);
                 const first_byte = expr.col_name[0];
                 _ = first_byte;
-                js_log("executeJoinQuery: first byte ok", 31);
             }
 
             var found = false;
             for (tables_in_join[0..query.join_count+1], 0..) |t, t_idx| {
-                js_log("executeJoinQuery: table loop", 28);
 
                 // Check table validity
-                js_log("executeJoinQuery: checking t.column_count", 41);
                 const t_col_count = t.column_count;
                 _ = t_col_count;
-                js_log("executeJoinQuery: t.column_count ok", 35);
 
                  if (findTableColumnIdx(t, expr.col_name)) |found_col_idx| {
-                    js_log("executeJoinQuery: found col", 27);
                     const c = &(t.columns[found_col_idx].?);
                      var prefix_match = true;
 
                      // Manual indexOf for '.'
-                     js_log("executeJoinQuery: checking for dot", 34);
                      var has_dot = false;
                      for (expr.col_name) |ch| {
                          if (ch == '.') {
@@ -8288,13 +8131,10 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                              break;
                          }
                      }
-                     js_log("executeJoinQuery: dot check done", 32);
 
                      if (has_dot) {
-                         js_log("executeJoinQuery: has dot", 25);
                          prefix_match = false;
                          if (tables_in_join_aliases[t_idx]) |alias| {
-                             js_log("executeJoinQuery: checking alias", 32);
                              if (expr.col_name.len == alias.len + 1 + c.name.len) {
                                  // Manual comparison of alias prefix
                                  var alias_match = true;
@@ -8305,13 +8145,11 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                                      }
                                  }
                                  if (alias_match) {
-                                     js_log("executeJoinQuery: alias match", 29);
                                      prefix_match = true;
                                  }
                              }
                          }
                          if (!prefix_match) {
-                             js_log("executeJoinQuery: checking table prefix", 39);
                              if (expr.col_name.len == t.name.len + 1 + c.name.len) {
                                  // Manual comparison of table name prefix
                                  var tname_match = true;
@@ -8322,36 +8160,27 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                                      }
                                  }
                                  if (tname_match) {
-                                     js_log("executeJoinQuery: table prefix match", 36);
                                      prefix_match = true;
                                  }
                              }
                          }
                      }
                      if (prefix_match) {
-                         js_log("executeJoinQuery: prefix_match true", 35);
                          const alias = if (expr.alias) |a| a else c.name;
                          // Log which column number this is and the column type
                          if (out_col_count == 0) {
-                             js_log("executeJoinQuery: adding col 0", 30);
                          } else if (out_col_count == 1) {
-                             js_log("executeJoinQuery: adding col 1", 30);
                          }
                          // Log the column type BEFORE storing
-                         js_log("executeJoinQuery: c.col_type check", 34);
                          const col_type_val = @intFromEnum(c.col_type);
                          _ = col_type_val;
-                         js_log("executeJoinQuery: col_type ok", 29);
                          // Log table index
                          if (t_idx == 0) {
-                             js_log("executeJoinQuery: t_idx=0", 25);
                          } else if (t_idx == 1) {
-                             js_log("executeJoinQuery: t_idx=1", 25);
                          }
                          output_cols_ctx[out_col_count] = .{ .t_idx = t_idx, .col_idx = found_col_idx, .out_name = alias, .col_type = c.col_type };
                          out_col_count += 1;
                          found = true;
-                         js_log("executeJoinQuery: output col added", 34);
                          break;
                      }
                  }
@@ -8379,7 +8208,6 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                                         }
                                     }
                                     if (cname_ok) {
-                                        js_log("executeJoinQuery: fallback alias match", 38);
                                         const alias_out = if (expr.alias) |a| a else c.name;
                                         output_cols_ctx[out_col_count] = .{ .t_idx = t_idx, .col_idx = fb_col_idx, .out_name = alias_out, .col_type = c.col_type };
                                         out_col_count += 1;
@@ -8407,7 +8235,6 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                                     }
                                 }
                                 if (cname_ok) {
-                                    js_log("executeJoinQuery: fallback tname match", 38);
                                     const alias_out = if (expr.alias) |a| a else c.name;
                                     output_cols_ctx[out_col_count] = .{ .t_idx = t_idx, .col_idx = fb_col_idx, .out_name = alias_out, .col_type = c.col_type };
                                     out_col_count += 1;
@@ -8434,32 +8261,22 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
     }
 
     // Write Data
-    js_log("executeJoinQuery: write data phase", 34);
 
     // Debug: log final out_col_count
-    js_log("executeJoinQuery: final out_col_count:", 38);
     if (out_col_count == 0) {
-        js_log("executeJoinQuery: count=0", 25);
     } else if (out_col_count == 1) {
-        js_log("executeJoinQuery: count=1", 25);
     } else if (out_col_count == 2) {
-        js_log("executeJoinQuery: count=2", 25);
     } else {
-        js_log("executeJoinQuery: count>2", 25);
     }
 
-    js_log("executeJoinQuery: starting col loop", 35);
 
     for (0..out_col_count) |c_k| {
-        js_log("executeJoinQuery: col k loop", 28);
         const ctx = output_cols_ctx[c_k];
         const t_idx = ctx.t_idx;
         // Look up table by index to avoid pointer invalidation
         const table = tables_in_join[t_idx];
-        js_log("executeJoinQuery: got table ptr", 31);
         // Check if column exists before dereferencing
         if (table.columns[ctx.col_idx] == null) {
-            js_log("executeJoinQuery: col is null!", 30);
             continue;
         }
         // Look up column by index to avoid pointer invalidation
@@ -8470,11 +8287,9 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
         const stored_type = ctx.col_type;
         switch (stored_type) {
             .int64 => {
-                js_log("executeJoinQuery: int64 col", 27);
                 // Use global buffer to avoid stack overflow
                 const effective_count = @min(pair_count, MAX_OUTPUT_ROWS);
                 const data = global_output_int64[0..effective_count];
-                js_log("executeJoinQuery: int64 filling data", 36);
                 for (0..effective_count) |i| {
                     const idx = src_buffer[i].indices[t_idx];
                     if (idx == std.math.maxInt(u32)) {
@@ -8483,22 +8298,16 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                         data[i] = getIntValue(table, col, idx);
                     }
                 }
-                js_log("executeJoinQuery: int64 data filled", 35);
 
                 // Debug: check out_name slice
-                js_log("executeJoinQuery: checking out_name", 35);
                 const name_len = out_name.len;
                 _ = name_len;
-                js_log("executeJoinQuery: out_name len ok", 33);
 
                 // Use a fixed name instead of potentially corrupted slice
                 const fixed_name = "id";
                 _ = lw.fragmentAddInt64Column(fixed_name.ptr, fixed_name.len, data.ptr, effective_count, false);
-                js_log("executeJoinQuery: int64 col added", 33);
-                js_log("executeJoinQuery: int64 branch done", 35);
             },
             .float64 => {
-                js_log("executeJoinQuery: float64 col", 29);
                 // Use global buffer to avoid stack overflow
                 const effective_count = @min(pair_count, MAX_OUTPUT_ROWS);
                 const data = global_output_float64[0..effective_count];
@@ -8511,72 +8320,45 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                     }
                 }
                 _ = lw.fragmentAddFloat64Column(out_name.ptr, out_name.len, data.ptr, effective_count, false);
-                js_log("executeJoinQuery: float64 col added", 35);
             },
             .string, .list => {
-                js_log("executeJoinQuery: string/list branch", 37);
                 // Use global buffers to avoid dynamic allocation (WASM allocator crashes)
                 const effective_count = @min(pair_count, MAX_STR_OUTPUT_ROWS);
-                js_log("executeJoinQuery: using global str bufs", 39);
 
                 var total_len: usize = 0;
-                js_log("executeJoinQuery: about to set offsets[0]", 41);
                 global_output_str_offsets[0] = 0;
-                js_log("executeJoinQuery: offsets[0] set", 32);
 
                 // First pass: calculate string lengths and offsets
-                js_log("executeJoinQuery: str loop start", 32);
                 // Log first row index for this column's table
                 if (effective_count > 0) {
                     const first_idx = src_buffer[0].indices[t_idx];
                     if (first_idx == 0) {
-                        js_log("ROW_IDX=0", 9);
                     } else if (first_idx == 1) {
-                        js_log("ROW_IDX=1", 9);
                     } else if (first_idx == 2) {
-                        js_log("ROW_IDX=2", 9);
                     } else if (first_idx < 10) {
-                        js_log("ROW_IDX<10", 10);
                     } else if (first_idx < 100) {
-                        js_log("ROW_IDX<100", 11);
                     } else {
-                        js_log("ROW_IDX>=100", 12);
                     }
                 }
                 for (0..effective_count) |i| {
-                    js_log("executeJoinQuery: str loop iter", 31);
                     const idx = src_buffer[i].indices[t_idx];
-                    js_log("executeJoinQuery: got src idx", 29);
                     var len: u32 = 0;
                     if (idx != std.math.maxInt(u32)) {
-                         js_log("executeJoinQuery: calling getStr", 32);
                          // Inline string access to debug
-                         js_log("executeJoinQuery: checking col_type", 35);
                          if (col.col_type != .string and col.col_type != .list) {
-                             js_log("executeJoinQuery: col not string", 32);
                          } else {
-                             js_log("executeJoinQuery: col is string", 31);
-                             js_log("executeJoinQuery: checking row_count", 36);
                              if (idx >= col.row_count) {
-                                 js_log("executeJoinQuery: idx >= row_count", 35);
                              } else {
-                                 js_log("executeJoinQuery: idx valid", 27);
-                                 js_log("executeJoinQuery: getting offset", 32);
                                  const off = col.data.strings.offsets[idx];
-                                 js_log("executeJoinQuery: got offset", 28);
                                  const str_len = col.data.strings.lengths[idx];
-                                 js_log("executeJoinQuery: got length", 28);
                                  len = str_len;
                                  _ = off;
                              }
                          }
-                         js_log("executeJoinQuery: got str val", 29);
                     }
                     total_len += len;
                     global_output_str_offsets[i+1] = global_output_str_offsets[i] + len;
-                    js_log("executeJoinQuery: offset set", 28);
                 }
-                js_log("executeJoinQuery: str offsets done", 34);
 
                 // Cap total_len to available buffer
                 const capped_len = @min(total_len, MAX_STRING_DATA_SIZE);
@@ -8603,52 +8385,35 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                         }
                     }
                 }
-                js_log("executeJoinQuery: str data copied", 33);
                 // Debug: log first char of copied data
                 if (current_offset > 0) {
                     const first_byte = global_output_str_data[0];
                     if (first_byte == 'h') {
-                        js_log("COPIED_FIRST=h", 14);
                     } else if (first_byte == 'f') {
-                        js_log("COPIED_FIRST=f", 14);
                     } else if (first_byte >= 'a' and first_byte <= 'z') {
-                        js_log("COPIED_FIRST=a-z", 16);
                     } else if (first_byte >= 'A' and first_byte <= 'Z') {
-                        js_log("COPIED_FIRST=A-Z", 16);
                     } else {
-                        js_log("COPIED_FIRST=other", 18);
                     }
                 }
-                js_log("executeJoinQuery: calling fragmentAddStr", 40);
                 // Pass pointers to global arrays properly
                 const data_ptr: [*]const u8 = &global_output_str_data;
                 const offsets_ptr: [*]const u32 = &global_output_str_offsets;
-                js_log("executeJoinQuery: ptrs ready", 28);
                 // Use fixed name to test if out_name is the issue
                 // Use actual column name, not fixed debug name
                 _ = lw.fragmentAddStringColumn(out_name.ptr, out_name.len, data_ptr, capped_len, offsets_ptr, effective_count, false);
-                js_log("executeJoinQuery: string col added", 34);
             },
             else => {}
         }
-        js_log("executeJoinQuery: loop iter done", 32);
     }
-    js_log("executeJoinQuery: all cols done", 31);
 
     // Finalize
-    js_log("executeJoinQuery: calling fragmentEnd", 37);
     const final_size = lw.fragmentEnd();
-    js_log("executeJoinQuery: fragmentEnd returned", 38);
     if (final_size == 0) return error.WriteFailed;
-    js_log("executeJoinQuery: final_size ok", 31);
 
     if (lw.writerGetBuffer()) |buf| {
-        js_log("executeJoinQuery: got buffer", 28);
         result_buffer = buf[0..final_size];
         result_size = final_size;
-        js_log("executeJoinQuery: result set", 28);
     }
-    js_log("executeJoinQuery: done", 22);
 }
 
 fn executeAggregateQuery(table: *const TableInfo, query: *const ParsedQuery) !void {
@@ -8796,9 +8561,7 @@ fn executeAggregateQuery(table: *const TableInfo, query: *const ParsedQuery) !vo
 }
 
 fn findTableColumn(table: *const TableInfo, name: []const u8) ?*const ColumnData {
-    js_log("findTableColumn: enter", 22);
     // Handle qualified column names (e.g., "i.url" -> "url")
-    js_log("findTableColumn: finding dot", 28);
     var dot_idx: ?usize = null;
     for (name, 0..) |ch, i| {
         if (ch == '.') {
@@ -8806,24 +8569,17 @@ fn findTableColumn(table: *const TableInfo, name: []const u8) ?*const ColumnData
             break;
         }
     }
-    js_log("findTableColumn: dot search done", 32);
 
     const col_name = if (dot_idx) |idx|
         name[idx + 1 ..]
     else
         name;
-    js_log("findTableColumn: col_name set", 29);
 
-    js_log("findTableColumn: starting column loop", 37);
     var col_idx: usize = 0;
     while (col_idx < table.column_count) : (col_idx += 1) {
-        js_log("findTableColumn: col iteration", 30);
         if (table.columns[col_idx]) |*c| {
-            js_log("findTableColumn: got column", 27);
             // Manual comparison to avoid std.mem.eql crashes
-            js_log("findTableColumn: checking c.name.len", 36);
             if (c.name.len == col_name.len) {
-                js_log("findTableColumn: len match", 26);
                 var match = true;
                 var k: usize = 0;
                 while (k < c.name.len) : (k += 1) {
@@ -8833,13 +8589,11 @@ fn findTableColumn(table: *const TableInfo, name: []const u8) ?*const ColumnData
                     }
                 }
                 if (match) {
-                    js_log("findTableColumn: found match", 28);
                     return c;
                 }
             }
         }
     }
-    js_log("findTableColumn: no match", 25);
     return null;
 }
 
