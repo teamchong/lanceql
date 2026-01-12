@@ -3619,11 +3619,13 @@ LIMIT 100`;
             const version = query.version || null;
 
             // For complex queries (JOINs, CTEs, etc.), preserve original SQL
-            // Detect complex queries by checking for JOIN, multiple read_lance(), or WITH
+            // Detect complex queries by checking for JOIN, multiple read_lance(), WITH, GROUP BY, or LIKE
             const isComplexQuery = originalSql && (
                 /\bJOIN\b/i.test(originalSql) ||
                 (originalSql.match(/read_lance\s*\(/gi) || []).length > 1 ||
-                /\bWITH\b/i.test(originalSql)
+                /\bWITH\b/i.test(originalSql) ||
+                /\bGROUP\b/i.test(originalSql) ||
+                /\bLIKE\b/i.test(originalSql)
             );
 
             // Generate SQL
@@ -6538,7 +6540,7 @@ LIMIT 100`;
                 if (!silent) {
                     const sqlInput = document.getElementById('sql-input');
                     sqlInput.value = `-- 🎯 Shadow column demo: LIKE (text) + GROUP BY NEAR (vector) on same column
-SELECT MAX(emoji), description FROM read_lance('opfs://emoji.lance')
+SELECT COUNT(*), description FROM read_lance('opfs://emoji.lance')
 WHERE description LIKE '%sun%'
 GROUP BY NEAR description TOPK 3`;
                     document.getElementById('sql-highlight').innerHTML = highlightSQL(sqlInput.value) + '\n';
