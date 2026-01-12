@@ -4,12 +4,7 @@ export default defineConfig({
   test: {
     globals: true,
     testTimeout: 30000,
-    pool: 'forks',
-    poolOptions: {
-      forks: {
-        singleFork: true,
-      },
-    },
+    isolate: false,
     include: ['test/**/*.spec.js', 'test/**/*.test.js'],
     exclude: [
       'test/basic.test.js',
