@@ -2036,7 +2036,7 @@ LIMIT 100</textarea>
                     </div>
                     <div class="sql-examples">
                         <button class="sql-example"
-                            data-sql="SELECT url, text, aesthetic FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') WHERE embedding NEAR 'cat playing' LIMIT 20">🔮 NEAR 'cat'</button>
+                            data-sql="SELECT url, text, aesthetic FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') WHERE embedding NEAR 'cat' LIMIT 20">🔮 NEAR 'cat'</button>
                         <button class="sql-example"
                             data-sql="SELECT i.url, i.text, e.emoji, e.description FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') i JOIN read_lance('opfs://emoji.lance') e ON i.embedding NEAR e.description TOPK 5 LIMIT 100">🔗 NEAR JOIN</button>
                         <button class="sql-example"
