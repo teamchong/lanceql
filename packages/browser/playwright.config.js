@@ -9,7 +9,7 @@ export default defineConfig({
   workers: 1, // Tests share WASM state - must run serially
   reporter: 'html',
   use: {
-    baseURL: 'http://localhost:3000',
+    baseURL: 'http://localhost:3100',
     trace: 'on-first-retry',
     screenshot: 'only-on-failure',
   },
@@ -22,7 +22,6 @@ export default defineConfig({
           args: [
             '--disable-web-security',
             '--disable-features=IsolateOrigins,site-per-process',
-            '--enable-unsafe-webgpu',
             '--use-gl=angle',
             '--use-angle=vulkan'
           ],
@@ -36,9 +35,9 @@ export default defineConfig({
     // },
   ],
   webServer: {
-    command: 'python3 -m http.server 3000 -d ../../',
-    url: 'http://localhost:3000',
-    reuseExistingServer: !process.env.CI,
+    command: 'python3 -m http.server 3100 -d ../../',
+    url: 'http://localhost:3100',
+    reuseExistingServer: true,
     timeout: 30000,
   },
 });
