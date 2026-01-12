@@ -3794,19 +3794,15 @@ fn executeCreateVectorIndex(query: *ParsedQuery) !void {
     if (!is_valid_model) return error.UnknownEmbeddingModel;
 
     // Find the table and get column dimension
-    js_log("finding table and column", 24);
     var dim: u32 = 0;
     var table_found = false;
     var column_found = false;
     log("table_count={}", .{table_count});
-    js_log("iterating tables", 16);
     for (0..table_count) |ti| {
         log("table iter {}", .{ti});
         if (tables[ti]) |tbl| {
             log("tbl.name.len={}", .{tbl.name.len});
-            js_log("comparing name", 14);
             if (std.mem.eql(u8, tbl.name, query.vector_index_table)) {
-                js_log("table match", 11);
                 table_found = true;
                 log("tbl.column_count={}", .{tbl.column_count});
                 for (tbl.columns[0..tbl.column_count]) |maybe_col| {
@@ -3825,7 +3821,6 @@ fn executeCreateVectorIndex(query: *ParsedQuery) !void {
 
     if (!table_found) return error.TableDoesNotExist;
     if (!column_found) return error.ColumnDoesNotExist;
-    js_log("table and col found", 19);
 
     // Set default dimension based on model if not found from column
     if (dim == 0) {
@@ -3840,14 +3835,11 @@ fn executeCreateVectorIndex(query: *ParsedQuery) !void {
     log("dim={}", .{dim});
 
     // Copy strings to persistent memory
-    js_log("copying strings", 15);
     const tbl_name = try memory.wasm_allocator.dupe(u8, query.vector_index_table);
     const col_name = try memory.wasm_allocator.dupe(u8, query.vector_index_column);
     const model_name = try memory.wasm_allocator.dupe(u8, query.vector_index_model);
-    js_log("strings copied", 14);
 
     // Generate shadow column name: __vec_{column}_{model}
-    js_log("generating shadow", 17);
     const shadow_buf = &shadow_col_storage[vector_index_count];
     const shadow_slice = std.fmt.bufPrint(shadow_buf, "__vec_{s}_{s}", .{ query.vector_index_column, query.vector_index_model }) catch blk: {
         @memcpy(shadow_buf[0..6], "__vec_");
@@ -3862,15 +3854,12 @@ fn executeCreateVectorIndex(query: *ParsedQuery) !void {
         if (minilm.minilm_weights_loaded() != 1) {
             return error.ModelNotLoaded;
         }
-        js_log("weights ok, finding table", 25);
 
         // Find the table and source column
         for (tables[0..table_count], 0..) |maybe_t, ti| {
             if (maybe_t) |_| {
                 var tbl = &tables[ti].?;
-                js_log("minilm: checking table", 22);
                 if (std.mem.eql(u8, tbl.name, query.vector_index_table)) {
-                    js_log("minilm: table matched", 21);
                     // Find source column
                     var src_col_idx: ?usize = null;
                     log("minilm: searching in {} columns", .{tbl.column_count});
@@ -3879,39 +3868,28 @@ fn executeCreateVectorIndex(query: *ParsedQuery) !void {
                         if (maybe_col) |col| {
                             log("minilm: col name len={}", .{col.name.len});
                             if (std.mem.eql(u8, col.name, query.vector_index_column)) {
-                                js_log("minilm: found src col", 21);
                                 src_col_idx = ci;
                                 break;
                             }
                         }
                     }
-                    js_log("minilm: done col search", 23);
 
                     if (src_col_idx) |sci| {
-                        js_log("minilm: getting src_col", 23);
                         const src_col = tbl.columns[sci].?;
-                        js_log("minilm: got src_col", 19);
                         const row_count = if (src_col.row_count > 0) src_col.row_count else tbl.row_count;
                         log("minilm: row_count={}", .{row_count});
 
                         // Allocate embedding storage (row_count * 384 floats)
-                        js_log("minilm: allocating embed", 24);
                         const embed_size = row_count * 384 * @sizeOf(f32);
                         log("minilm: embed_size={}", .{embed_size});
                         const embed_data = try memory.wasm_allocator.alloc(u8, embed_size);
-                        js_log("minilm: alloc done", 18);
                         const embed_floats = @as([*]f32, @ptrCast(@alignCast(embed_data.ptr)));
 
                         // Generate embeddings for each row
-                        js_log("minilm: getting buffers", 23);
                         const text_buf = minilm.minilm_get_text_buffer();
-                        js_log("minilm: got text_buf", 20);
                         const out_buf = minilm.minilm_get_output_buffer();
-                        js_log("minilm: got out_buf", 19);
 
-                        js_log("minilm: starting loop", 21);
                         for (0..row_count) |ri| {
-                            if (ri == 0) js_log("minilm: row 0", 13);
                             // Get text for this row
                             const text = getStringValue(&src_col, @intCast(ri));
                             if (ri == 0) log("minilm: text.len={}", .{text.len});
@@ -3919,7 +3897,6 @@ fn executeCreateVectorIndex(query: *ParsedQuery) !void {
                             // Copy text to MiniLM input buffer
                             const text_len = @min(text.len, 512);
                             @memcpy(text_buf[0..text_len], text[0..text_len]);
-                            if (ri == 0) js_log("minilm: copied text", 19);
 
                             // Encode text
                             const result = minilm.minilm_encode_text(text_len);
@@ -3936,7 +3913,6 @@ fn executeCreateVectorIndex(query: *ParsedQuery) !void {
                                 }
                             }
                         }
-                        js_log("minilm: loop done", 17);
 
                         // Add shadow column to table
                         if (tbl.column_count < MAX_COLUMNS) {
@@ -5441,7 +5417,6 @@ pub export fn executeSql() u32 {
     }
 
     // Dispatch based on query type
-    js_log("executeSql: dispatching by query type", 38);
     switch (query.type) {
         .select => {}, // Continue to existing SELECT logic
         .create_table => {
@@ -5828,56 +5803,39 @@ fn registerColumnString(table_name: []const u8, col_name: []const u8, offsets: [
 // ============================================================================
 
 fn executeVectorSearch(table: *const TableInfo, near: *const WhereClause, limit: usize, out_indices: []u32) !usize {
-    js_log("executeVectorSearch: start", 26);
 
     // Check table pointer
     const table_addr = @intFromPtr(table);
-    js_log("executeVectorSearch: table addr check", 37);
     if (table_addr == 0 or table_addr > 0x10000000) {
-        js_log("executeVectorSearch: bad table ptr", 34);
         return 0;
     }
-    js_log("executeVectorSearch: table ptr ok", 33);
 
     // Find column - use manual comparison to avoid std.mem.eql issues
     var col: ?*const ColumnData = null;
     const search_name = near.column orelse {
-        js_log("executeVectorSearch: no column name", 35);
         return 0;
     };
-    js_log("executeVectorSearch: got search_name", 36);
 
-    js_log("executeVectorSearch: checking table col_count", 45);
     const col_count = table.column_count;
-    js_log("executeVectorSearch: got col_count", 34);
 
     // Check if col_count is reasonable
     if (col_count > MAX_COLUMNS) {
-        js_log("executeVectorSearch: col_count too big!", 41);
         return 0;
     }
-    js_log("executeVectorSearch: col_count valid", 36);
 
     // Check if col_count > 0 first
     if (col_count == 0) {
-        js_log("executeVectorSearch: col_count is 0", 35);
         return 0;
     }
-    js_log("executeVectorSearch: col_count is nonzero", 42);
 
     // Get pointer to columns array once
-    js_log("executeVectorSearch: getting columns ptr", 40);
     const columns_ptr = &table.columns;
     _ = columns_ptr;
-    js_log("executeVectorSearch: got columns ptr", 36);
 
     // Try direct access without loop
-    js_log("executeVectorSearch: direct access test", 39);
     {
         const col0 = table.columns[0];
-        js_log("executeVectorSearch: got col0", 29);
         if (col0) |*c| {
-            js_log("executeVectorSearch: col0 present", 33);
             if (c.name.len == search_name.len) {
                 var match = true;
                 var j: usize = 0;
@@ -5894,10 +5852,8 @@ fn executeVectorSearch(table: *const TableInfo, near: *const WhereClause, limit:
         }
     }
     if (col == null and col_count > 1) {
-        js_log("executeVectorSearch: checking col1", 34);
         const col1 = table.columns[1];
         if (col1) |*c| {
-            js_log("executeVectorSearch: col1 present", 33);
             if (c.name.len == search_name.len) {
                 var match = true;
                 var j: usize = 0;
@@ -5913,12 +5869,9 @@ fn executeVectorSearch(table: *const TableInfo, near: *const WhereClause, limit:
             }
         }
     }
-    js_log("executeVectorSearch: direct access done", 39);
     const c = col orelse {
-        js_log("executeVectorSearch: column not found", 37);
         return 0;
     };
-    js_log("executeVectorSearch: found column", 33);
     
     // Resolve query vector
     var query_vec_buf: [MAX_VECTOR_DIM]f32 = undefined;
@@ -5958,11 +5911,9 @@ fn executeVectorSearch(table: *const TableInfo, near: *const WhereClause, limit:
     }
 
     const top_k = if (limit > 0) @min(limit, 256) else 10;
-    js_log("executeVectorSearch: got top_k", 30);
 
     // Use static scores buffer to avoid stack/heap issues
     const scores = static_near_scores[0..top_k];
-    js_log("executeVectorSearch: got scores buffer", 38);
     
     // Initialize scores
     for (0..top_k) |i| scores[i] = -2.0;
@@ -7464,7 +7415,6 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
             const right_rows = if (right_near_col.row_count > 0) right_near_col.row_count else rtbl.row_count;
 
             // For each left row, find TOP-K similar right rows
-            js_log("NEAR col-col: starting loop", 28);
             var li_usize: usize = 0;
             while (li_usize < left_rows) : (li_usize += 1) {
                 const li: u32 = @intCast(li_usize);
@@ -7528,7 +7478,6 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                     } else break;
                 }
             }
-            js_log("NEAR col-col: loop done", 23);
         } else if (join.is_near and join_idx == 0) {
             // Legacy: NEAR [vector] or NEAR rownum syntax
             // Default TOPK is 1 for NEAR JOIN (use explicit TOPK n syntax to override)
@@ -8038,7 +7987,6 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
 
     // Check for overflow before calculation
     if (pair_count > 100000 or total_cols > 64) {
-        js_log("JOIN: pair_count or total_cols too large", 40);
         return error.OutOfMemory;
     }
     const capacity = pair_count * total_cols * 16 + 1024 * total_cols + 65536;
