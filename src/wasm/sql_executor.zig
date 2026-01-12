@@ -10003,6 +10003,9 @@ fn executeGroupByNearQuery(table: *const TableInfo, query: *const ParsedQuery, m
     // Allocate centroids on heap to avoid stack overflow (384KB)
     const centroids = try memory.wasm_allocator.alloc(f32, num_clusters * MAX_VECTOR_DIM);
     defer memory.wasm_allocator.free(centroids);
+    // Track original row index for each centroid to retrieve representative value
+    const centroid_row_indices = try memory.wasm_allocator.alloc(u32, num_clusters);
+    defer memory.wasm_allocator.free(centroid_row_indices);
     var centroid_count: usize = 0;
 
     const indices = maybe_indices orelse blk: {
@@ -10021,6 +10024,7 @@ fn executeGroupByNearQuery(table: *const TableInfo, query: *const ParsedQuery, m
         const centroid_ptr: *[MAX_VECTOR_DIM]f32 = @ptrCast(centroids[centroid_count * MAX_VECTOR_DIM..]);
         const got_dim = getVectorData(table, near_col, idx, centroid_ptr, &ctx);
         if (got_dim > 0) {
+            centroid_row_indices[centroid_count] = idx;
             centroid_count += 1;
         }
     }
@@ -10108,6 +10112,47 @@ fn executeGroupByNearQuery(table: *const TableInfo, query: *const ParsedQuery, m
         counts[ci] = @floatFromInt(cluster_counts[ci]);
     }
     _ = lw.fragmentAddFloat64Column("count", 5, counts.ptr, centroid_count, false);
+
+    // Output representative value for string columns (e.g. description)
+    if (near_col.col_type == .string) {
+        // Offsets need N+1 elements for N strings
+        const offsets = try memory.wasm_allocator.alloc(u32, centroid_count + 1);
+        defer memory.wasm_allocator.free(offsets);
+        
+        var total_len: usize = 0;
+        var null_ctx: ?FragmentContext = null;
+
+        // First pass: calculate length
+        for (0..centroid_count) |ci| {
+            const idx = centroid_row_indices[ci];
+            // Reset context for random access safe-guard
+            null_ctx = null;
+            const str_val = getStringValueOptimized(table, near_col, idx, &null_ctx);
+            total_len += str_val.len;
+        }
+        
+        const str_data = try memory.wasm_allocator.alloc(u8, total_len);
+        defer memory.wasm_allocator.free(str_data);
+        
+        var current_off: u32 = 0;
+        for (0..centroid_count) |ci| {
+            offsets[ci] = current_off;
+            const idx = centroid_row_indices[ci];
+            null_ctx = null;
+            const str_val = getStringValueOptimized(table, near_col, idx, &null_ctx);
+            @memcpy(str_data[current_off..][0..str_val.len], str_val);
+            current_off += @intCast(str_val.len);
+        }
+        offsets[centroid_count] = current_off; // Last offset
+        
+        _ = lw.fragmentAddStringColumn(
+            query.group_by_near_col.ptr, query.group_by_near_col.len,
+            str_data.ptr, str_data.len,
+            offsets.ptr,
+            centroid_count,
+            false
+        );
+    }
 
     // Output aggregates
     for (query.aggregates[0..num_aggs], 0..) |agg, ai| {
