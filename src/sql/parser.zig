@@ -1285,10 +1285,38 @@ pub const Parser = struct {
         // Parse ON condition or USING clause
         var on_condition: ?Expr = null;
         var using_columns: ?[][]const u8 = null;
+        var near_condition: ?ast.NearJoinCondition = null;
 
         if (join_type != .cross and join_type != .natural) {
             if (self.match(&[_]TokenType{.ON})) {
-                on_condition = try self.parseExpr();
+                // Parse left side (could be column for NEAR, or start of expression)
+                const left_expr = try self.parseAddExpr();
+
+                // Check for NEAR keyword
+                if (self.match(&[_]TokenType{.NEAR})) {
+                    // NEAR JOIN: ON left_col NEAR right_col [TOPK n]
+                    const left_col = try self.exprToColumnRef(left_expr);
+
+                    // Parse right column
+                    const right_expr = try self.parseAddExpr();
+                    const right_col = try self.exprToColumnRef(right_expr);
+
+                    // Optional TOPK
+                    var top_k: ?u32 = null;
+                    if (self.match(&[_]TokenType{.TOPK})) {
+                        const num_tok = try self.expect(.NUMBER);
+                        top_k = std.fmt.parseInt(u32, num_tok.lexeme, 10) catch null;
+                    }
+
+                    near_condition = ast.NearJoinCondition{
+                        .left_col = left_col,
+                        .right_col = right_col,
+                        .top_k = top_k,
+                    };
+                } else {
+                    // Regular ON condition - continue parsing as comparison/logical expression
+                    on_condition = try self.continueParsingComparison(left_expr);
+                }
             } else if (self.match(&[_]TokenType{.USING})) {
                 _ = try self.expect(.LPAREN);
                 var cols = std.ArrayList([]const u8){};
@@ -1309,7 +1337,65 @@ pub const Parser = struct {
             .table = right_table,
             .on_condition = on_condition,
             .using_columns = using_columns,
+            .near_condition = near_condition,
         };
+    }
+
+    /// Convert an Expr to ColumnRef (for NEAR conditions)
+    fn exprToColumnRef(self: *Self, expr: Expr) !ast.ColumnRef {
+        _ = self;
+        return switch (expr) {
+            .column => |col| ast.ColumnRef{
+                .table = col.table,
+                .name = col.name,
+            },
+            else => error.ExpectedColumnReference,
+        };
+    }
+
+    /// Continue parsing a comparison expression from a left operand
+    fn continueParsingComparison(self: *Self, left: Expr) anyerror!Expr {
+        // Check for comparison operators
+        if (self.match(&[_]TokenType{.EQ})) {
+            const right_ptr = try self.allocator.create(Expr);
+            right_ptr.* = try self.parseAddExpr();
+            const left_ptr = try self.allocator.create(Expr);
+            left_ptr.* = left;
+            return Expr{ .binary = .{ .op = .eq, .left = left_ptr, .right = right_ptr } };
+        } else if (self.match(&[_]TokenType{.NE})) {
+            const right_ptr = try self.allocator.create(Expr);
+            right_ptr.* = try self.parseAddExpr();
+            const left_ptr = try self.allocator.create(Expr);
+            left_ptr.* = left;
+            return Expr{ .binary = .{ .op = .ne, .left = left_ptr, .right = right_ptr } };
+        } else if (self.match(&[_]TokenType{.LT})) {
+            const right_ptr = try self.allocator.create(Expr);
+            right_ptr.* = try self.parseAddExpr();
+            const left_ptr = try self.allocator.create(Expr);
+            left_ptr.* = left;
+            return Expr{ .binary = .{ .op = .lt, .left = left_ptr, .right = right_ptr } };
+        } else if (self.match(&[_]TokenType{.LE})) {
+            const right_ptr = try self.allocator.create(Expr);
+            right_ptr.* = try self.parseAddExpr();
+            const left_ptr = try self.allocator.create(Expr);
+            left_ptr.* = left;
+            return Expr{ .binary = .{ .op = .le, .left = left_ptr, .right = right_ptr } };
+        } else if (self.match(&[_]TokenType{.GT})) {
+            const right_ptr = try self.allocator.create(Expr);
+            right_ptr.* = try self.parseAddExpr();
+            const left_ptr = try self.allocator.create(Expr);
+            left_ptr.* = left;
+            return Expr{ .binary = .{ .op = .gt, .left = left_ptr, .right = right_ptr } };
+        } else if (self.match(&[_]TokenType{.GE})) {
+            const right_ptr = try self.allocator.create(Expr);
+            right_ptr.* = try self.parseAddExpr();
+            const left_ptr = try self.allocator.create(Expr);
+            left_ptr.* = left;
+            return Expr{ .binary = .{ .op = .ge, .left = left_ptr, .right = right_ptr } };
+        }
+
+        // No comparison operator, return as-is
+        return left;
     }
 
     /// Parse a primary (non-joined) table reference
@@ -1399,6 +1485,34 @@ pub const Parser = struct {
     fn parseGroupBy(self: *Self) !ast.GroupBy {
         _ = try self.expect(.BY);
 
+        // Check for GROUP BY NEAR column [TOPK n]
+        if (self.match(&[_]TokenType{.NEAR})) {
+            // Parse column reference
+            const col_expr = try self.parsePrimary();
+            const near_col = try self.exprToColumnRef(col_expr);
+
+            // Optional TOPK
+            var top_k: ?u32 = null;
+            if (self.match(&[_]TokenType{.TOPK})) {
+                const num_tok = try self.expect(.NUMBER);
+                top_k = std.fmt.parseInt(u32, num_tok.lexeme, 10) catch null;
+            }
+
+            // HAVING clause (optional)
+            const having = if (self.match(&[_]TokenType{.HAVING}))
+                try self.parseExpr()
+            else
+                null;
+
+            return ast.GroupBy{
+                .columns = &[_][]const u8{},
+                .having = having,
+                .near_column = near_col,
+                .near_top_k = top_k,
+            };
+        }
+
+        // Regular GROUP BY column1, column2, ...
         var columns = std.ArrayList([]const u8){};
         errdefer columns.deinit(self.allocator);
 
@@ -1418,6 +1532,8 @@ pub const Parser = struct {
         return ast.GroupBy{
             .columns = try columns.toOwnedSlice(self.allocator),
             .having = having,
+            .near_column = null,
+            .near_top_k = null,
         };
     }
 

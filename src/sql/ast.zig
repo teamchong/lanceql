@@ -218,6 +218,20 @@ pub const JoinType = enum {
     natural,     // NATURAL JOIN
 };
 
+/// Column reference (table.column or just column)
+pub const ColumnRef = struct {
+    table: ?[]const u8,  // Optional table qualifier/alias
+    name: []const u8,    // Column name
+};
+
+/// NEAR condition for vector similarity JOIN
+/// Syntax: ON left_col NEAR right_col [TOPK n]
+pub const NearJoinCondition = struct {
+    left_col: ColumnRef,   // Vector column (e.g., i.embedding)
+    right_col: ColumnRef,  // Text/vector column (e.g., e.description)
+    top_k: ?u32,           // Optional TOPK (default 20)
+};
+
 /// JOIN clause
 pub const JoinClause = struct {
     /// Type of join
@@ -226,11 +240,15 @@ pub const JoinClause = struct {
     /// Right-hand table
     table: *TableRef,
 
-    /// ON condition (null for CROSS/NATURAL joins)
+    /// ON condition (null for CROSS/NATURAL joins or NEAR joins)
     on_condition: ?Expr,
 
     /// USING columns (alternative to ON)
     using_columns: ?[][]const u8,
+
+    /// NEAR condition for vector similarity join (alternative to ON)
+    /// Syntax: ON left_col NEAR right_col [TOPK n]
+    near_condition: ?NearJoinCondition,
 };
 
 /// FROM clause table reference
@@ -303,11 +321,18 @@ pub const OrderBy = struct {
 
 /// GROUP BY clause
 pub const GroupBy = struct {
-    /// Columns to group by
+    /// Columns to group by (empty if using NEAR)
     columns: [][]const u8,
 
     /// Optional HAVING clause
     having: ?Expr,
+
+    /// NEAR-based clustering column (alternative to columns)
+    /// Syntax: GROUP BY NEAR column [TOPK n]
+    near_column: ?ColumnRef,
+
+    /// Number of clusters for NEAR grouping (default 20)
+    near_top_k: ?u32,
 };
 
 /// Set operation (UNION, INTERSECT, EXCEPT) with another query

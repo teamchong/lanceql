@@ -160,12 +160,17 @@ pub const JoinClause = struct {
     right_col: []const u8 = "",
     // Compound condition support (AND/OR in ON clause)
     join_condition: ?WhereClause = null,
-    // NEAR support
+    // NEAR support (existing fields for WHERE-style NEAR)
     is_near: bool = false,
     near_vector_ptr: ?[*]f32 = null,
     near_dim: usize = 0,
     near_target_row: ?u32 = null,
     top_k: ?u32 = null,
+    // NEW: Column references for ON col NEAR col syntax
+    near_left_table: []const u8 = "",   // Left table alias (e.g., "i")
+    near_left_col: []const u8 = "",     // Left column name (e.g., "embedding")
+    near_right_table: []const u8 = "",  // Right table alias (e.g., "e")
+    near_right_col: []const u8 = "",    // Right column name (e.g., "description")
 };
 
 const MAX_JOINS: usize = 4;
@@ -363,6 +368,11 @@ pub const ParsedQuery = struct {
     group_by_cols: [MAX_GROUP_COLS][]const u8 = undefined,
     group_by_count: usize = 0,
     group_by_top_k: ?u32 = null,
+    // GROUP BY NEAR support (vector clustering)
+    is_group_by_near: bool = false,
+    group_by_near_table: []const u8 = "",  // Optional table qualifier
+    group_by_near_col: []const u8 = "",    // Column to cluster by
+    group_by_near_top_k: ?u32 = null,      // Number of clusters (default 20)
     // ROLLUP/CUBE/GROUPING SETS
     grouping_type: enum { none, rollup, cube, grouping_sets } = .none,
     grouping_sets_count: usize = 0,  // Number of explicit grouping sets
@@ -6907,32 +6917,101 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
         // ------------------
         var pair_count: usize = 0;
 
-        if (join.is_near and join_idx == 0) {
-             const top_k = join.top_k orelse query.top_k orelse 20;
-             const match_ptr = memory.wasmAlloc(top_k * 4) orelse return error.OutOfMemory;
-             const matches = @as([*]u32, @ptrCast(@alignCast(match_ptr)))[0..top_k];
-             
-             var near_clause = WhereClause{
-                 .op = .near,
-                 .column = rc.?.name,
-                 .near_dim = join.near_dim,
-                 .near_target_row = join.near_target_row,
-                 .near_vector_ptr = join.near_vector_ptr,
-             };
+        if (join.is_near and join_idx == 0 and join.near_left_col.len > 0) {
+            // NEW: Column-to-column NEAR JOIN (ON i.embedding NEAR e.description)
+            const top_k = join.top_k orelse query.top_k orelse 20;
+            const lt = tables_in_join[0];
 
-             const count = try executeVectorSearch(rtbl, &near_clause, top_k, matches);
-             
-             for (0..left_table.row_count) |li| {
-                 for (matches[0..count]) |ri| {
-                     if (pair_count < MAX_JOIN_ROWS) {
-                         @memset(&dst_buffer[pair_count].indices, std.math.maxInt(u32));
-                         dst_buffer[pair_count].indices[0] = @intCast(li);
-                         dst_buffer[pair_count].indices[1] = ri;
-                         pair_count += 1;
-                     } else break;
-                 }
-             }
-             memory.free(match_ptr, top_k * 4);
+            // Find left column (vector column)
+            const left_near_col = getColByName(lt, join.near_left_col) orelse {
+                setDebug("NEAR JOIN: left column '{s}' not found", .{join.near_left_col});
+                return error.ColumnNotFound;
+            };
+
+            // Find right column (vector or text column)
+            const right_near_col = getColByName(rtbl, join.near_right_col) orelse {
+                setDebug("NEAR JOIN: right column '{s}' not found", .{join.near_right_col});
+                return error.ColumnNotFound;
+            };
+
+            // For each left row, find TOP-K similar right rows
+            for (0..lt.row_count) |li_usize| {
+                const li: u32 = @intCast(li_usize);
+
+                // Get left vector
+                var l_ctx: ?FragmentContext = null;
+                const left_vec = getVectorData(lt, left_near_col, li, &vec_buf_1, &l_ctx) orelse continue;
+
+                // Find TOP-K matches in right table
+                var scores: [128]struct { idx: u32, score: f32 } = undefined;
+                var score_count: usize = 0;
+
+                for (0..rtbl.row_count) |ri_usize| {
+                    const ri: u32 = @intCast(ri_usize);
+                    var r_ctx: ?FragmentContext = null;
+                    const right_vec = getVectorData(rtbl, right_near_col, ri, &vec_buf_2, &r_ctx) orelse continue;
+
+                    // Compute cosine similarity (dot product for normalized vectors)
+                    const score = simd_search.simdDotProduct(left_vec.ptr, right_vec.ptr, left_vec.dim);
+
+                    // Insert into top-K list (sorted descending by score)
+                    if (score_count < top_k) {
+                        // Find insertion point
+                        var insert_at: usize = score_count;
+                        while (insert_at > 0 and scores[insert_at - 1].score < score) {
+                            scores[insert_at] = scores[insert_at - 1];
+                            insert_at -= 1;
+                        }
+                        scores[insert_at] = .{ .idx = ri, .score = score };
+                        score_count += 1;
+                    } else if (score > scores[top_k - 1].score) {
+                        // Replace lowest score
+                        var insert_at: usize = top_k - 1;
+                        while (insert_at > 0 and scores[insert_at - 1].score < score) {
+                            scores[insert_at] = scores[insert_at - 1];
+                            insert_at -= 1;
+                        }
+                        scores[insert_at] = .{ .idx = ri, .score = score };
+                    }
+                }
+
+                // Add matched pairs
+                for (scores[0..score_count]) |match| {
+                    if (pair_count < MAX_JOIN_ROWS) {
+                        @memset(&dst_buffer[pair_count].indices, std.math.maxInt(u32));
+                        dst_buffer[pair_count].indices[0] = li;
+                        dst_buffer[pair_count].indices[1] = match.idx;
+                        pair_count += 1;
+                    } else break;
+                }
+            }
+        } else if (join.is_near and join_idx == 0) {
+            // Legacy: NEAR [vector] or NEAR rownum syntax
+            const top_k = join.top_k orelse query.top_k orelse 20;
+            const match_ptr = memory.wasmAlloc(top_k * 4) orelse return error.OutOfMemory;
+            const matches = @as([*]u32, @ptrCast(@alignCast(match_ptr)))[0..top_k];
+
+            var near_clause = WhereClause{
+                .op = .near,
+                .column = rc.?.name,
+                .near_dim = join.near_dim,
+                .near_target_row = join.near_target_row,
+                .near_vector_ptr = join.near_vector_ptr,
+            };
+
+            const count = try executeVectorSearch(rtbl, &near_clause, top_k, matches);
+
+            for (0..left_table.row_count) |li| {
+                for (matches[0..count]) |ri| {
+                    if (pair_count < MAX_JOIN_ROWS) {
+                        @memset(&dst_buffer[pair_count].indices, std.math.maxInt(u32));
+                        dst_buffer[pair_count].indices[0] = @intCast(li);
+                        dst_buffer[pair_count].indices[1] = ri;
+                        pair_count += 1;
+                    } else break;
+                }
+            }
+            memory.free(match_ptr, top_k * 4);
         } else if (join.is_near) {
             return error.NotImplemented;
         } else if (join.join_type == .cross) {
@@ -7066,7 +7145,7 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
             }
         } else if (lc != null and rc != null and lc.?.vector_dim > 0 and rc.?.vector_dim > 0) {
             // Vector Similarity JOIN - use nested loop with cosine similarity
-            const VECTOR_SIMILARITY_THRESHOLD: f32 = 0.5; // Lower threshold for semantic matching
+            const VECTOR_SIMILARITY_THRESHOLD: f32 = 0.0; // Accept any positive similarity
             const l_col = lc.?;
             const r_col = rc.?;
             const l_dim = l_col.vector_dim;
@@ -7078,7 +7157,11 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
             }
 
             const dim = l_dim;
-            setDebug("Vector JOIN: dim={d}, left_rows={d}, right_rows={d}, threshold={d}", .{dim, left_table.row_count, rtbl.row_count, @as(u32, @intFromFloat(VECTOR_SIMILARITY_THRESHOLD * 100))});
+            setDebug("Vector JOIN: dim={d}, left={d}rows(type={d}), right={d}rows(type={d})", .{
+                dim,
+                left_table.row_count, @intFromEnum(l_col.col_type),
+                rtbl.row_count, @intFromEnum(r_col.col_type)
+            });
 
             if (join_idx == 0) {
                 const lt = tables_in_join[0];
@@ -7086,12 +7169,18 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                 var r_ctx: ?FragmentContext = null;
                 var best_match: u32 = std.math.maxInt(u32);
                 var best_sim: f32 = -1;
+                var left_null_count: u32 = 0;
+                var right_null_count: u32 = 0;
+                var max_sim_found: f32 = -1;
 
                 // For each left row, find the best matching right row
                 for (0..lt.row_count) |li_usize| {
                     const li: u32 = @intCast(li_usize);
                     const l_vec = getVectorData(lt, l_col, li, &vec_buf_1, &l_ctx);
-                    if (l_vec == null) continue;
+                    if (l_vec == null) {
+                        left_null_count += 1;
+                        continue;
+                    }
 
                     best_match = std.math.maxInt(u32);
                     best_sim = VECTOR_SIMILARITY_THRESHOLD;
@@ -7100,9 +7189,13 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                     for (0..rtbl.row_count) |ri_usize| {
                         const ri: u32 = @intCast(ri_usize);
                         const r_vec = getVectorData(rtbl, r_col, ri, &vec_buf_2, &r_ctx);
-                        if (r_vec == null) continue;
+                        if (r_vec == null) {
+                            if (li == 0) right_null_count += 1;
+                            continue;
+                        }
 
                         const sim = simd_search.simdCosineSimilarity(l_vec.?.ptr, r_vec.?.ptr, dim);
+                        if (sim > max_sim_found) max_sim_found = sim;
                         if (sim > best_sim) {
                             best_sim = sim;
                             best_match = ri;
@@ -7117,6 +7210,7 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
                         pair_count += 1;
                     }
                 }
+                setDebug("Vector JOIN stats: left_null={d}, right_null={d}, max_sim={d}", .{left_null_count, right_null_count, @as(i32, @intFromFloat(max_sim_found * 1000))});
             } else {
                 // Multi-table vector JOIN - for each existing pair, find best match
                 var l_ctx: ?FragmentContext = null;
@@ -7591,7 +7685,10 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
 fn executeAggregateQuery(table: *const TableInfo, query: *const ParsedQuery) !void {
     // OPTIMIZATION: If no filter, skip index building pass
     if (query.where_clause == null) {
-        if (query.group_by_count > 0) {
+        if (query.is_group_by_near) {
+            // GROUP BY NEAR - vector clustering
+            try executeGroupByNearQuery(table, query, null);
+        } else if (query.group_by_count > 0) {
             // Check for ROLLUP/CUBE/GROUPING SETS
             if (query.grouping_type != .none) {
                 try executeMultiDimAggQuery(table, query, null);
@@ -7711,8 +7808,11 @@ fn executeAggregateQuery(table: *const TableInfo, query: *const ParsedQuery) !vo
         }
     }
 
-    setDebug("executeAggregateQuery: gb_count={d}, agg_count={d}, grouping_type={any}", .{query.group_by_count, query.agg_count, query.grouping_type});
-    if (query.group_by_count > 0) {
+    setDebug("executeAggregateQuery: gb_count={d}, agg_count={d}, grouping_type={any}, is_gb_near={}", .{query.group_by_count, query.agg_count, query.grouping_type, query.is_group_by_near});
+    if (query.is_group_by_near) {
+        // GROUP BY NEAR - vector clustering
+        try executeGroupByNearQuery(table, query, match_indices[0..match_count]);
+    } else if (query.group_by_count > 0) {
         // Check for ROLLUP/CUBE/GROUPING SETS
         if (query.grouping_type != .none) {
             try executeMultiDimAggQuery(table, query, match_indices[0..match_count]);
@@ -8833,6 +8933,150 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
     }
 }
 
+/// Execute GROUP BY NEAR query - cluster rows by vector similarity
+fn executeGroupByNearQuery(table: *const TableInfo, query: *const ParsedQuery, maybe_indices: ?[]const u32) !void {
+    const top_k = query.group_by_near_top_k orelse 20;
+    const MAX_CLUSTERS: usize = 64;
+    const num_clusters = @min(top_k, MAX_CLUSTERS);
+
+    // Find the NEAR column (vector column)
+    const near_col = getColByName(table, query.group_by_near_col) orelse {
+        setDebug("GROUP BY NEAR: column '{s}' not found", .{query.group_by_near_col});
+        return error.ColumnNotFound;
+    };
+
+    if (near_col.vector_dim == 0) {
+        setDebug("GROUP BY NEAR: column '{s}' is not a vector column", .{query.group_by_near_col});
+        return error.ExpectedVectorColumn;
+    }
+
+    const dim = near_col.vector_dim;
+
+    // Use first K rows as centroids (simple seeding)
+    var centroids: [MAX_CLUSTERS][MAX_VECTOR_DIM]f32 = undefined;
+    var centroid_count: usize = 0;
+
+    const indices = maybe_indices orelse blk: {
+        // Generate full index array
+        for (0..@min(table.row_count, MAX_ROWS)) |i| {
+            global_indices_1[i] = @intCast(i);
+        }
+        break :blk global_indices_1[0..@min(table.row_count, MAX_ROWS)];
+    };
+
+    // Initialize centroids with first K rows that have valid vectors
+    for (indices) |idx| {
+        if (centroid_count >= num_clusters) break;
+        var ctx: ?FragmentContext = null;
+        if (getVectorData(table, near_col, idx, &centroids[centroid_count], &ctx)) |_| {
+            centroid_count += 1;
+        }
+    }
+
+    if (centroid_count == 0) {
+        // No valid vectors found - return empty result
+        _ = writeU32(RESULT_VERSION);
+        _ = writeU32(0);
+        _ = writeU64(0);
+        _ = writeU32(HEADER_SIZE);
+        _ = writeU32(HEADER_SIZE);
+        _ = writeU32(HEADER_SIZE);
+        _ = writeU32(0);
+        _ = writeU32(HEADER_SIZE);
+        return;
+    }
+
+    // Assign each row to nearest centroid
+    var cluster_counts: [MAX_CLUSTERS]usize = undefined;
+    @memset(&cluster_counts, 0);
+    var cluster_indices: [MAX_CLUSTERS][MAX_ROWS]u32 = undefined;
+
+    for (indices) |idx| {
+        var ctx: ?FragmentContext = null;
+        const vec = getVectorData(table, near_col, idx, &vec_buf_1, &ctx) orelse continue;
+
+        // Find nearest centroid
+        var best_cluster: usize = 0;
+        var best_score: f32 = -2.0;
+        for (0..centroid_count) |ci| {
+            const score = simd_search.simdDotProduct(vec.ptr, &centroids[ci], dim);
+            if (score > best_score) {
+                best_score = score;
+                best_cluster = ci;
+            }
+        }
+
+        // Add to cluster
+        if (cluster_counts[best_cluster] < MAX_ROWS) {
+            cluster_indices[best_cluster][cluster_counts[best_cluster]] = idx;
+            cluster_counts[best_cluster] += 1;
+        }
+    }
+
+    // Compute aggregates per cluster
+    const num_aggs = query.agg_count;
+    const all_agg_results = try memory.wasm_allocator.alloc(f64, centroid_count * num_aggs);
+    defer memory.wasm_allocator.free(all_agg_results);
+
+    for (0..centroid_count) |ci| {
+        const cluster_row_count = cluster_counts[ci];
+        const cluster_row_indices = cluster_indices[ci][0..cluster_row_count];
+
+        for (query.aggregates[0..num_aggs], 0..) |agg, ai| {
+            const result = computeAggregate(table, agg, cluster_row_indices);
+            all_agg_results[ci * num_aggs + ai] = result;
+        }
+    }
+
+    // Output results using Lance Writer
+    if (lw.fragmentBegin(65536 + centroid_count * 16 * (num_aggs + 1)) == 0) return error.OutOfMemory;
+
+    // Output cluster IDs as first column
+    const cluster_ids = try memory.wasm_allocator.alloc(f64, centroid_count);
+    defer memory.wasm_allocator.free(cluster_ids);
+    for (0..centroid_count) |ci| {
+        cluster_ids[ci] = @floatFromInt(ci);
+    }
+    _ = lw.fragmentAddFloat64Column("cluster", 7, cluster_ids.ptr, centroid_count, false);
+
+    // Output count per cluster
+    const counts = try memory.wasm_allocator.alloc(f64, centroid_count);
+    defer memory.wasm_allocator.free(counts);
+    for (0..centroid_count) |ci| {
+        counts[ci] = @floatFromInt(cluster_counts[ci]);
+    }
+    _ = lw.fragmentAddFloat64Column("count", 5, counts.ptr, centroid_count, false);
+
+    // Output aggregates
+    for (query.aggregates[0..num_aggs], 0..) |agg, ai| {
+        var name_buf: [64]u8 = undefined;
+        var name: []const u8 = "";
+        if (agg.alias) |alias| {
+            name = alias;
+        } else {
+            name = std.fmt.bufPrint(&name_buf, "agg_{d}", .{ai}) catch "agg";
+        }
+
+        const out_buf = try memory.wasm_allocator.alloc(f64, centroid_count);
+        defer memory.wasm_allocator.free(out_buf);
+
+        for (0..centroid_count) |ci| {
+            out_buf[ci] = all_agg_results[ci * num_aggs + ai];
+        }
+
+        _ = lw.fragmentAddFloat64Column(name.ptr, name.len, out_buf.ptr, centroid_count, false);
+    }
+
+    // Finalize
+    const final_size = lw.fragmentEnd();
+    if (final_size == 0) return error.EncodingError;
+
+    if (lw.writerGetBuffer()) |buf| {
+        result_buffer = buf[0..final_size];
+        result_size = final_size;
+    }
+}
+
 fn evaluateHaving(query: *const ParsedQuery, having: *const WhereClause, agg_results: []const f64) bool {
     switch (having.op) {
         .and_op => {
@@ -8974,7 +9218,6 @@ fn computeLazyAggregate(table: *const TableInfo, col: *const ColumnData, agg: Ag
                     for (0..n) |i| buf_f64[i] = @floatFromInt(buf_i32[i]);
                 },
                 .string, .list => {}, // No direct numeric aggregation for string/list
-                else => {},
             }
 
             // SIMD Aggregation on chunk
@@ -14436,89 +14679,145 @@ pub fn parseSql(sql: []const u8) ?*ParsedQuery {
             if (startsWithIC(sql[pos..], "NEAR")) {
                 pos += 4;
                 pos = skipWs(sql, pos);
-                if (std.mem.lastIndexOf(u8, first_expr, ".")) |dot| {
-                    right_col = first_expr[dot + 1 ..];
-                } else {
-                    right_col = first_expr;
-                }
 
-                const is_near_const = true;
-                var near_dim: usize = 0;
-                var near_target_row: ?u32 = null;
-                var near_vec_ptr: ?[*]f32 = null;
-
-                if (pos < sql.len and sql[pos] == '[') {
-                    pos += 1;
-                    // Count elements first to allocate proper size
-                    var temp_pos = pos;
-                    var count: usize = 0;
-                    while (temp_pos < sql.len and sql[temp_pos] != ']' and count < MAX_VECTOR_DIM) {
-                        temp_pos = skipWs(sql, temp_pos);
-                        if (sql[temp_pos] == ']') break;
-                        if (sql[temp_pos] == '-') temp_pos += 1;
-                        while (temp_pos < sql.len and (std.ascii.isDigit(sql[temp_pos]) or sql[temp_pos] == '.')) temp_pos += 1;
-                        count += 1;
-                        temp_pos = skipWs(sql, temp_pos);
-                        if (temp_pos < sql.len and sql[temp_pos] == ',') temp_pos += 1;
-                    }
-
-                    // Allocate memory for vector
-                    if (count > 0) {
-                        if (memory.wasmAlloc(count * 4)) |ptr| {
-                            near_vec_ptr = @ptrCast(@alignCast(ptr));
-                        }
-                    }
-
-                    while (pos < sql.len and near_dim < MAX_VECTOR_DIM) {
-                        pos = skipWs(sql, pos);
-                        if (pos < sql.len and sql[pos] == ']') {
-                            pos += 1;
-                            break;
-                        }
-                        const num_start = pos;
-                        if (sql[pos] == '-') pos += 1;
-                        while (pos < sql.len and (std.ascii.isDigit(sql[pos]) or sql[pos] == '.')) pos += 1;
-                        if (pos > num_start) {
-                            if (near_vec_ptr) |ptr| {
-                                ptr[near_dim] = std.fmt.parseFloat(f32, sql[num_start..pos]) catch 0;
-                            }
-                            near_dim += 1;
-                        }
-                        pos = skipWs(sql, pos);
-                        if (pos < sql.len and sql[pos] == ',') pos += 1;
-                    }
-                } else {
-                    const num_start = pos;
-                    while (pos < sql.len and std.ascii.isDigit(sql[pos])) pos += 1;
-                    if (pos > num_start) {
-                        near_target_row = std.fmt.parseInt(u32, sql[num_start..pos], 10) catch null;
-                    }
-                }
-
-                pos = skipWs(sql, pos);
-                var join_top_k: ?u32 = null;
-                if (startsWithIC(sql[pos..], "TOPK")) {
-                    pos += 4;
+                // Check what follows NEAR:
+                // - Identifier: column-to-column NEAR (e.g., ON i.embedding NEAR e.description)
+                // - '[': vector literal (legacy)
+                // - Number: row reference (legacy)
+                if (pos < sql.len and (isIdent(sql[pos]) or sql[pos] == '_')) {
+                    // NEW: Column-to-column NEAR JOIN
+                    // Parse right column reference
+                    const right_expr_start = pos;
+                    while (pos < sql.len and (isIdent(sql[pos]) or sql[pos] == '.')) pos += 1;
+                    const right_expr = sql[right_expr_start..pos];
                     pos = skipWs(sql, pos);
-                    const num_start = pos;
-                    while (pos < sql.len and std.ascii.isDigit(sql[pos])) pos += 1;
-                    if (pos > num_start) {
-                        join_top_k = std.fmt.parseInt(u32, sql[num_start..pos], 10) catch null;
-                    }
-                }
 
-                query.joins[query.join_count] = JoinClause{
-                    .table_name = join_table,
-                    .alias = join_alias,
-                    .join_type = join_type,
-                    .left_col = "", // NEAR join doesn't use left_col for now
-                    .right_col = right_col,
-                    .is_near = is_near_const,
-                    .near_vector_ptr = near_vec_ptr,
-                    .near_dim = near_dim,
-                    .near_target_row = near_target_row,
-                    .top_k = join_top_k,
-                };
+                    // Extract table.column from first_expr (left side)
+                    var near_left_table: []const u8 = "";
+                    var near_left_col: []const u8 = first_expr;
+                    if (std.mem.lastIndexOf(u8, first_expr, ".")) |dot| {
+                        near_left_table = first_expr[0..dot];
+                        near_left_col = first_expr[dot + 1 ..];
+                    }
+
+                    // Extract table.column from right_expr (right side)
+                    var near_right_table: []const u8 = "";
+                    var near_right_col: []const u8 = right_expr;
+                    if (std.mem.lastIndexOf(u8, right_expr, ".")) |dot| {
+                        near_right_table = right_expr[0..dot];
+                        near_right_col = right_expr[dot + 1 ..];
+                    }
+
+                    // Optional TOPK
+                    var join_top_k: ?u32 = null;
+                    if (startsWithIC(sql[pos..], "TOPK")) {
+                        pos += 4;
+                        pos = skipWs(sql, pos);
+                        const num_start = pos;
+                        while (pos < sql.len and std.ascii.isDigit(sql[pos])) pos += 1;
+                        if (pos > num_start) {
+                            join_top_k = std.fmt.parseInt(u32, sql[num_start..pos], 10) catch null;
+                        }
+                    }
+
+                    query.joins[query.join_count] = JoinClause{
+                        .table_name = join_table,
+                        .alias = join_alias,
+                        .join_type = join_type,
+                        .left_col = "",
+                        .right_col = "",
+                        .is_near = true,
+                        .top_k = join_top_k,
+                        .near_left_table = near_left_table,
+                        .near_left_col = near_left_col,
+                        .near_right_table = near_right_table,
+                        .near_right_col = near_right_col,
+                    };
+                } else {
+                    // Legacy: NEAR [vector] or NEAR row_number syntax
+                    if (std.mem.lastIndexOf(u8, first_expr, ".")) |dot| {
+                        right_col = first_expr[dot + 1 ..];
+                    } else {
+                        right_col = first_expr;
+                    }
+
+                    var near_dim: usize = 0;
+                    var near_target_row: ?u32 = null;
+                    var near_vec_ptr: ?[*]f32 = null;
+
+                    if (pos < sql.len and sql[pos] == '[') {
+                        pos += 1;
+                        // Count elements first to allocate proper size
+                        var temp_pos = pos;
+                        var count: usize = 0;
+                        while (temp_pos < sql.len and sql[temp_pos] != ']' and count < MAX_VECTOR_DIM) {
+                            temp_pos = skipWs(sql, temp_pos);
+                            if (sql[temp_pos] == ']') break;
+                            if (sql[temp_pos] == '-') temp_pos += 1;
+                            while (temp_pos < sql.len and (std.ascii.isDigit(sql[temp_pos]) or sql[temp_pos] == '.')) temp_pos += 1;
+                            count += 1;
+                            temp_pos = skipWs(sql, temp_pos);
+                            if (temp_pos < sql.len and sql[temp_pos] == ',') temp_pos += 1;
+                        }
+
+                        // Allocate memory for vector
+                        if (count > 0) {
+                            if (memory.wasmAlloc(count * 4)) |ptr| {
+                                near_vec_ptr = @ptrCast(@alignCast(ptr));
+                            }
+                        }
+
+                        while (pos < sql.len and near_dim < MAX_VECTOR_DIM) {
+                            pos = skipWs(sql, pos);
+                            if (pos < sql.len and sql[pos] == ']') {
+                                pos += 1;
+                                break;
+                            }
+                            const num_start = pos;
+                            if (sql[pos] == '-') pos += 1;
+                            while (pos < sql.len and (std.ascii.isDigit(sql[pos]) or sql[pos] == '.')) pos += 1;
+                            if (pos > num_start) {
+                                if (near_vec_ptr) |ptr| {
+                                    ptr[near_dim] = std.fmt.parseFloat(f32, sql[num_start..pos]) catch 0;
+                                }
+                                near_dim += 1;
+                            }
+                            pos = skipWs(sql, pos);
+                            if (pos < sql.len and sql[pos] == ',') pos += 1;
+                        }
+                    } else {
+                        const num_start = pos;
+                        while (pos < sql.len and std.ascii.isDigit(sql[pos])) pos += 1;
+                        if (pos > num_start) {
+                            near_target_row = std.fmt.parseInt(u32, sql[num_start..pos], 10) catch null;
+                        }
+                    }
+
+                    pos = skipWs(sql, pos);
+                    var join_top_k: ?u32 = null;
+                    if (startsWithIC(sql[pos..], "TOPK")) {
+                        pos += 4;
+                        pos = skipWs(sql, pos);
+                        const num_start = pos;
+                        while (pos < sql.len and std.ascii.isDigit(sql[pos])) pos += 1;
+                        if (pos > num_start) {
+                            join_top_k = std.fmt.parseInt(u32, sql[num_start..pos], 10) catch null;
+                        }
+                    }
+
+                    query.joins[query.join_count] = JoinClause{
+                        .table_name = join_table,
+                        .alias = join_alias,
+                        .join_type = join_type,
+                        .left_col = "",
+                        .right_col = right_col,
+                        .is_near = true,
+                        .near_vector_ptr = near_vec_ptr,
+                        .near_dim = near_dim,
+                        .near_target_row = near_target_row,
+                        .top_k = join_top_k,
+                    };
+                }
                 // Note: join_count incremented at end of loop
             } else {
                 // Check for compound condition (AND/OR after first comparison)
@@ -16434,6 +16733,41 @@ fn parseComparison(sql: []const u8, pos: *usize) ?WhereClause {
 
 fn parseGroupBy(sql: []const u8, start: usize, query: *ParsedQuery) usize {
     var pos = start;
+
+    // Check for GROUP BY NEAR column [TOPK n]
+    if (startsWithIC(sql[pos..], "NEAR")) {
+        pos += 4;
+        pos = skipWs(sql, pos);
+
+        // Parse column reference (possibly qualified: table.column)
+        const col_start = pos;
+        while (pos < sql.len and (isIdent(sql[pos]) or sql[pos] == '.')) pos += 1;
+        const full_col = sql[col_start..pos];
+
+        // Split into table.column if qualified
+        if (std.mem.lastIndexOf(u8, full_col, ".")) |dot| {
+            query.group_by_near_table = full_col[0..dot];
+            query.group_by_near_col = full_col[dot + 1 ..];
+        } else {
+            query.group_by_near_col = full_col;
+        }
+        query.is_group_by_near = true;
+
+        pos = skipWs(sql, pos);
+
+        // Optional TOPK
+        if (startsWithIC(sql[pos..], "TOPK")) {
+            pos += 4;
+            pos = skipWs(sql, pos);
+            const num_start = pos;
+            while (pos < sql.len and std.ascii.isDigit(sql[pos])) pos += 1;
+            if (pos > num_start) {
+                query.group_by_near_top_k = std.fmt.parseInt(u32, sql[num_start..pos], 10) catch null;
+            }
+        }
+
+        return pos;
+    }
 
     // Check for ROLLUP, CUBE, or GROUPING SETS
     if (startsWithIC(sql[pos..], "ROLLUP")) {

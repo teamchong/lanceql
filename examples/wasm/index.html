@@ -2034,11 +2034,11 @@
                 <div class="sql-editor">
                     <div class="sql-editor-container">
                         <textarea class="sql-textarea" id="sql-input"
-                            placeholder="SELECT * FROM read_lance('https://...') LIMIT 50">-- 🔗 Vector JOIN: Match remote images to local emoji by similarity
+                            placeholder="SELECT * FROM read_lance('https://...') LIMIT 50">-- 🔗 NEAR JOIN: Match remote images to local emoji by vector similarity
 SELECT i.url, i.text, e.emoji, e.description
 FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') i
-JOIN read_lance('opfs://emoji.lance') e ON i.embedding = e.embedding
-LIMIT 20</textarea>
+JOIN read_lance('opfs://emoji.lance') e ON i.embedding NEAR e.embedding TOPK 5
+LIMIT 100</textarea>
                         <div class="sql-highlight" id="sql-highlight" aria-hidden="true"></div>
                     </div>
                     <div class="sql-examples">
@@ -2046,8 +2046,8 @@ LIMIT 20</textarea>
                             data-sql="SELECT url, text, aesthetic FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') WHERE embedding NEAR 'cat playing' LIMIT 20"
                             style="background: #7c3aed;">🔮 NEAR 'cat'</button>
                         <button class="sql-example"
-                            data-sql="SELECT i.text, i.aesthetic, t.text_zh, t.text_es FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') i JOIN translations t ON i.rowid = t.row_id LIMIT 20"
-                            style="background: #059669;">🔗 JOIN</button>
+                            data-sql="SELECT i.url, i.text, e.emoji, e.description FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') i JOIN read_lance('opfs://emoji.lance') e ON i.embedding NEAR e.embedding TOPK 5 LIMIT 100"
+                            style="background: #059669;">🔗 NEAR JOIN</button>
                         <button class="sql-example"
                             data-sql="SELECT SUM(aesthetic), AVG(aesthetic), MIN(aesthetic), MAX(aesthetic), COUNT(*) FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') LIMIT 100000"
                             style="background: #ea580c;">📊 Stats 100K</button>
@@ -2853,11 +2853,11 @@ LIMIT 20</textarea>
 
         // Default demo dataset URL - LAION 1M images dataset
         const DEFAULT_DATASET_URL = 'https://data.metal0.dev/laion-1m/images.lance';
-        const DEFAULT_QUERY = `-- 🔗 Vector JOIN: Match remote images to local emoji by similarity
+        const DEFAULT_QUERY = `-- 🔗 NEAR JOIN: Match remote images to local emoji by vector similarity
 SELECT i.url, i.text, e.emoji, e.description
 FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') i
-JOIN read_lance('opfs://emoji.lance') e ON i.embedding = e.embedding
-LIMIT 20`;
+JOIN read_lance('opfs://emoji.lance') e ON i.embedding NEAR e.embedding TOPK 5
+LIMIT 100`;
 
         // Vault instance for real SQL execution
         let vaultInstance = null;
@@ -6487,14 +6487,14 @@ LIMIT 20`;
                     btn.style.background = '#22c55e';
                 }
 
-                // Update SQL with vector JOIN example (only if not silent)
+                // Update SQL with NEAR JOIN example (only if not silent)
                 if (!silent) {
                     const sqlInput = document.getElementById('sql-input');
-                    sqlInput.value = `-- 🚀 Vector JOIN: Remote images + Local emoji tags
+                    sqlInput.value = `-- 🚀 NEAR JOIN: Remote images + Local emoji tags by similarity
 SELECT r.url, r.text, e.emoji, e.description
 FROM read_lance('https://data.metal0.dev/laion-1m/images.lance') r
-JOIN read_lance('opfs://emoji.lance') e ON r.embedding = e.embedding
-LIMIT 20`;
+JOIN read_lance('opfs://emoji.lance') e ON r.embedding NEAR e.embedding TOPK 5
+LIMIT 100`;
                     document.getElementById('sql-highlight').innerHTML = highlightSQL(sqlInput.value) + '\n';
                 }
 
