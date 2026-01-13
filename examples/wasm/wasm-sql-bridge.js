@@ -40,14 +40,11 @@ export class WasmSqlExecutor {
 
         // Alloc temp buffer for error
         const ptr = wasm.alloc(4096);
-        console.log(`[WASM LOG] getLastError alloc ptr: ${ptr}`);
         const len = wasm.getLastError(ptr, 4096);
-        console.log(`[WASM LOG] getLastError len: ${len}`);
         if (len === 0) return "Unknown Error";
 
         const bytes = new Uint8Array(memory.buffer, ptr, len);
         const msg = new TextDecoder().decode(bytes);
-        console.log(`[WASM LOG] getLastError msg: ${msg}`);
         // Cleanup? wasm.alloc might not need free if we use stack logic in WASM side but we use allocator.
         // We should free? Existing code doesn't seem to free systematically in tight loops but generic allocs should be freed.
         // But alloc implementation in Zig uses GPA or Arena?
@@ -215,7 +212,6 @@ export class WasmSqlExecutor {
                             colNamePtr, colNameBytes.length,
                             dataPtr, actualRowCount, vectorDim
                         );
-                        console.log(`[Bridge] Registered vector column ${colName}: ${actualRowCount} rows, dim=${vectorDim}`);
                     } else {
                         console.warn(`[Bridge] No registerTableFloat32Vector, skipping ${colName}`);
                     }
@@ -475,22 +471,12 @@ export class WasmSqlExecutor {
         const resultPtr = wasm.executeSql();
         if (resultPtr === 0) {
             const errMsg = this.getLastError();
-            console.log(`[WASM LOG] execute throwing: "${errMsg}"`);
             throw new Error(errMsg);
         }
 
         const resultSize = wasm.getResultSize();
-        const debugMsg = this.getLastError();
-        if (debugMsg && debugMsg.length > 0) {
-            console.log(`[WASM DEBUG CAPTURED] ${debugMsg}`);
-        }
-        if (debugMsg.length > 0 && debugMsg.startsWith("DEBUG:")) {
-            // Throw to clear visible logs
-            // throw new Error(`[WASM DEBUG] ${debugMsg}`);
-        }
 
         const buffer = wasm.memory.buffer;
-        console.log(`[JS DEBUG] About to parse result: ptr=${resultPtr}, size=${resultSize}`);
         const result = this._parseResult(memory.buffer, resultPtr, resultSize);
 
         // Reset WASM state for next query
@@ -532,7 +518,6 @@ export class WasmSqlExecutor {
     }
 
     _parseLanceResult(buffer, ptr, size, footerOffset, view, decoder) {
-        console.log(`[JS DEBUG] _parseLanceResult called, size=${size} footerOffset=${footerOffset}`);
         // Read Footer
 
         // const colMetaStart = Number(view.getBigUint64(footerOffset, true));
@@ -586,7 +571,6 @@ export class WasmSqlExecutor {
             view.getUint8(localOffset++);
             const dataOffset = Number(view.getBigUint64(localOffset, true));
             localOffset += 8;
-            console.log(`[JS DEBUG] Col ${i} "${colName}" dataOffset=${dataOffset}`);
 
             // 5. Row Count
             // tag 40 (field 5, wire 0)
@@ -600,16 +584,9 @@ export class WasmSqlExecutor {
             view.getUint8(localOffset++);
             const [dataSize, sizeBytes] = this._readVarint(view, localOffset);
             localOffset += sizeBytes;
-            console.log(`[JS DEBUG] Col ${i} "${colName}" type=${typeStr} dataSize=${dataSize} rowCount=${rowCount}`);
 
             // Read Data
             const absDataOffset = ptr + dataOffset;
-            // Debug: show first few bytes at this offset
-            if (typeStr === 'string') {
-                const firstBytes = new Uint8Array(buffer, absDataOffset, Math.min(20, dataSize));
-                const preview = String.fromCharCode(...firstBytes);
-                console.log(`[JS DEBUG] Col ${i} first 20 bytes: "${preview}"`);
-            }
 
             // Map types
             if (typeStr === 'float64' || typeStr === 'int64' || typeStr === 'int32' || typeStr === 'float32') {
@@ -623,7 +600,6 @@ export class WasmSqlExecutor {
                         if (Number.isNaN(arr[k])) { hasNan = true; break; }
                     }
                     if (hasNan) {
-                        console.log(`[WASM LOG] Column ${colName} has NaNs, converting to nulls`);
                         const nullArr = new Array(rowCount);
                         for (let k = 0; k < rowCount; k++) {
                             const v = arr[k];

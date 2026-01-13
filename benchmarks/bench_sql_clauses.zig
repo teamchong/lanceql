@@ -857,13 +857,20 @@ pub fn main() !void {
         std.debug.print("{s:<45} {s:>12} {s:>12} {s:>10}\n", .{ "Method", "Rows/sec", "Iterations", "Speedup" });
         std.debug.print("{s:<45} {s:>12} {s:>12} {s:>10}\n", .{ "-" ** 45, "-" ** 12, "-" ** 12, "-" ** 10 });
 
+        // Find customers lance file path
+        const customers_file_path = findLanceFilePath(allocator, CUSTOMERS_LANCE_PATH) catch {
+            std.debug.print("Error: Could not find .lance file in {s}/data\n", .{CUSTOMERS_LANCE_PATH});
+            return;
+        };
+        defer allocator.free(customers_file_path);
+
         // LanceQL JOIN benchmark with multi-table registration
         var lanceql_join_rps: f64 = 0;
         {
             const result = runJoinSQLBenchmark(
                 allocator,
                 lance_file_path,
-                CUSTOMERS_LANCE_PATH,
+                customers_file_path,
                 "SELECT orders.customer_id, orders.amount, customers.name FROM orders INNER JOIN customers ON orders.customer_id = customers.id",
                 WARMUP_SECONDS,
                 BENCHMARK_SECONDS,

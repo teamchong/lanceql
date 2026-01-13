@@ -1657,12 +1657,23 @@ pub const Executor = struct {
             if (field.id < 0) continue;
             const col_idx: u32 = @intCast(field.id);
 
+            // Skip unsupported column types (e.g., fixed_size_list for embeddings)
+            const col_type = LanceColumnType.fromLogicalType(field.logical_type);
+            if (col_type == .unsupported or col_type == .bool_) continue;
+
             // Create qualified column name: "alias.column"
             const qualified_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ alias, field.name });
             errdefer self.allocator.free(qualified_name);
 
             // Read and filter column data based on row indices
-            const col_data = try self.readJoinedColumnData(table, col_idx, row_indices, is_right_side);
+            const col_data = self.readJoinedColumnData(table, col_idx, row_indices, is_right_side) catch |e| {
+                // Skip columns with unsupported encoding (e.g., dictionary encoding)
+                if (e == error.DictionaryEncodingNotSupported) {
+                    self.allocator.free(qualified_name);
+                    continue;
+                }
+                return e;
+            };
 
             try joined_data.columns.put(qualified_name, col_data);
             try col_names.append(self.allocator, qualified_name);

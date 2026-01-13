@@ -3099,28 +3099,23 @@ pub extern "env" fn js_log(ptr: [*]const u8, len: usize) void;
 var log_buf: [1024]u8 = undefined;
 
 fn log(comptime fmt: []const u8, args: anytype) void {
-    const slice = std.fmt.bufPrint(&log_buf, fmt, args) catch return;
-    js_log(slice.ptr, slice.len);
+    // Debug logging disabled for production
+    _ = fmt;
+    _ = args;
 }
 
 // Log message with integer value
 fn js_logInt(prefix: []const u8, prefix_len: usize, value: i64) void {
-    _ = prefix_len; // Use actual slice length
-    var buf: [128]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "{s}{d}", .{ prefix, value }) catch return;
-    js_log(msg.ptr, msg.len);
+    // Debug logging disabled for production
+    _ = prefix;
+    _ = prefix_len;
+    _ = value;
 }
 
 fn setDebug(comptime fmt: []const u8, args: anytype) void {
-    log(fmt, args);
-    if (last_error_len >= 4096) return;
-    if (last_error_len > 0) {
-        last_error_buf[last_error_len] = '\n';
-        last_error_len += 1;
-    }
-    const available = last_error_buf[last_error_len..];
-    const msg = std.fmt.bufPrint(available, "DEBUG: " ++ fmt, args) catch return;
-    last_error_len += msg.len;
+    // Debug logging disabled for production
+    _ = fmt;
+    _ = args;
 }
 
 // ============================================================================

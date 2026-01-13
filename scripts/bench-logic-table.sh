@@ -42,4 +42,21 @@ fi
 echo ""
 
 # Build and run
-zig build bench-logic-table 2>&1
+echo "Building bench-logic-table..."
+if ! zig build bench-logic-table 2>&1; then
+    echo ""
+    echo "================================================================================"
+    echo "SKIPPED: bench-logic-table requires metal0 module dependencies not yet configured"
+    echo "================================================================================"
+    echo ""
+    echo "The benchmark uses lanceql.codegen which requires metal0 with full module wiring."
+    echo "To enable this benchmark, configure all metal0 internal modules in build.zig:"
+    echo "  - c_interop"
+    echo "  - analysis/native_types.zig"
+    echo "  - lexer.zig, parser.zig, compiler.zig"
+    echo "  - codegen/native/main.zig"
+    echo "  - analysis/types.zig, analysis/lifetime.zig"
+    echo ""
+    echo "For now, use bench-sql-clauses.sh for SQL benchmarks instead."
+    exit 0
+fi

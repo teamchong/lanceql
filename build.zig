@@ -238,9 +238,14 @@ pub fn build(b: *std.Build) void {
     });
 
     // metal0 module - Python to native compiler (as submodule)
+    // Requires analysis.ast for parser to work
+    const metal0_ast_mod = b.addModule("analysis.ast", .{
+        .root_source_file = b.path("deps/metal0/src/ast.zig"),
+    });
     const metal0_mod = b.addModule("metal0", .{
         .root_source_file = b.path("deps/metal0/src/main.zig"),
     });
+    metal0_mod.addImport("analysis.ast", metal0_ast_mod);
 
     // Codegen module - JIT compilation integration with metal0
     const codegen_mod = b.addModule("lanceql.codegen", .{

@@ -33,6 +33,7 @@ pub const TableError = error{
     NoPages,
     InvalidBufferIndex,
     IndexOutOfBounds,
+    DictionaryEncodingNotSupported,
 };
 
 /// High-level table reader for Lance files.
@@ -459,8 +460,13 @@ pub const Table = struct {
             // Lance stores string columns with TWO separate buffers per page:
             // - Buffer 0: offsets array (uint32 or uint64, marking END positions)
             // - Buffer 1: string data (concatenated UTF-8 bytes)
+            // Dictionary-encoded columns have 3+ buffers - not yet supported
             if (page.buffer_offsets.len < 2) {
                 return TableError.InvalidMetadata;
+            }
+            if (page.buffer_offsets.len > 2) {
+                // Dictionary encoding not yet supported
+                return TableError.DictionaryEncodingNotSupported;
             }
 
             // Buffer 0 = offsets array
