@@ -143,6 +143,152 @@ inline fn hashTableGetRowIdx(entry_idx: u32) u32 {
     return hash_entries[entry_idx].row_idx;
 }
 
+// ============================================================================
+// Hash-based GROUP BY (O(n) instead of O(n*k))
+// ============================================================================
+const GROUP_HASH_SIZE: usize = 16384; // 2^14 buckets
+const GROUP_HASH_MASK: u64 = GROUP_HASH_SIZE - 1;
+const MAX_GROUP_ENTRIES: usize = 8192; // Max unique groups
+
+/// Group entry for hash-based GROUP BY
+const GroupEntry = struct {
+    key: i64,           // Group key value
+    group_id: u32,      // Group index (0..num_groups-1)
+    count: u32,         // Number of rows in this group
+    first_row: u32,     // First row index (for representative value)
+    next: u32,          // Next entry in chain
+};
+
+/// Global storage for group hash table
+var group_buckets: [GROUP_HASH_SIZE]u32 = undefined;
+var group_entries: [MAX_GROUP_ENTRIES]GroupEntry = undefined;
+var group_entry_count: usize = 0;
+
+/// Row-to-group mapping for aggregation
+var row_group_ids: [MAX_JOIN_ROWS]u32 = undefined;
+
+/// Initialize group hash table
+fn groupHashInit() void {
+    for (&group_buckets) |*b| {
+        b.* = std.math.maxInt(u32);
+    }
+    group_entry_count = 0;
+}
+
+/// Build group hash table and assign group IDs to rows - O(n)
+fn groupHashBuild(table: *const TableInfo, col: *const ColumnData, indices: ?[]const u32, max_groups: usize) usize {
+    groupHashInit();
+
+    const row_count = if (indices) |idx| idx.len else table.row_count;
+
+    for (0..row_count) |i| {
+        const row_idx: u32 = if (indices) |idx| idx[i] else @intCast(i);
+        const key = getIntValue(table, col, row_idx);
+
+        // Hash lookup
+        const h = hashInt64(key);
+        const bucket = @as(usize, @intCast(h & GROUP_HASH_MASK));
+
+        // Find existing group or create new one
+        var entry_idx = group_buckets[bucket];
+        var found = false;
+
+        while (entry_idx != std.math.maxInt(u32)) {
+            if (group_entries[entry_idx].key == key) {
+                // Found existing group
+                group_entries[entry_idx].count += 1;
+                row_group_ids[i] = group_entries[entry_idx].group_id;
+                found = true;
+                break;
+            }
+            entry_idx = group_entries[entry_idx].next;
+        }
+
+        if (!found and group_entry_count < @min(max_groups, MAX_GROUP_ENTRIES)) {
+            // Create new group
+            const group_id: u32 = @intCast(group_entry_count);
+            group_entries[group_entry_count] = GroupEntry{
+                .key = key,
+                .group_id = group_id,
+                .count = 1,
+                .first_row = row_idx,
+                .next = group_buckets[bucket],
+            };
+            group_buckets[bucket] = @intCast(group_entry_count);
+            row_group_ids[i] = group_id;
+            group_entry_count += 1;
+        } else if (!found) {
+            // Max groups reached, assign to special overflow group
+            row_group_ids[i] = std.math.maxInt(u32);
+        }
+    }
+
+    return group_entry_count;
+}
+
+/// Get group key by group ID
+inline fn groupHashGetKey(group_id: u32) i64 {
+    return group_entries[group_id].key;
+}
+
+/// Get group count by group ID
+inline fn groupHashGetCount(group_id: u32) u32 {
+    return group_entries[group_id].count;
+}
+
+/// Get first row of group
+inline fn groupHashGetFirstRow(group_id: u32) u32 {
+    return group_entries[group_id].first_row;
+}
+
+// ============================================================================
+// Vectorized Aggregation State (process batches of values)
+// ============================================================================
+const AGG_BATCH_SIZE: usize = 1024;
+
+/// Aggregation state per group
+const AggState = struct {
+    sum: f64 = 0,
+    count: u64 = 0,
+    min: f64 = std.math.inf(f64),
+    max: f64 = -std.math.inf(f64),
+
+    /// Update with single value
+    inline fn update(self: *AggState, val: f64) void {
+        self.sum += val;
+        self.count += 1;
+        if (val < self.min) self.min = val;
+        if (val > self.max) self.max = val;
+    }
+
+    /// Update with 4 values (manual unroll for SIMD-like behavior)
+    inline fn updateBatch4(self: *AggState, v0: f64, v1: f64, v2: f64, v3: f64) void {
+        self.sum += v0 + v1 + v2 + v3;
+        self.count += 4;
+        const min01 = @min(v0, v1);
+        const min23 = @min(v2, v3);
+        const max01 = @max(v0, v1);
+        const max23 = @max(v2, v3);
+        if (@min(min01, min23) < self.min) self.min = @min(min01, min23);
+        if (@max(max01, max23) > self.max) self.max = @max(max01, max23);
+    }
+
+    /// Finalize to result based on aggregate function
+    fn finalize(self: *const AggState, func: aggregates.AggFunc) f64 {
+        return switch (func) {
+            .sum => self.sum,
+            .count => @floatFromInt(self.count),
+            .avg => if (self.count > 0) self.sum / @as(f64, @floatFromInt(self.count)) else 0,
+            .min => if (self.min == std.math.inf(f64)) 0 else self.min,
+            .max => if (self.max == -std.math.inf(f64)) 0 else self.max,
+            else => self.sum,
+        };
+    }
+};
+
+/// Global aggregation states per group (up to MAX_GROUP_ENTRIES groups × MAX_AGGREGATES aggs)
+var global_agg_states: [MAX_GROUP_ENTRIES * MAX_AGGREGATES]AggState = undefined;
+
 
 /// Column types
 pub const ColumnType = enum(u32) {
@@ -9489,8 +9635,7 @@ fn executeMultiDimAggQuery(table: *const TableInfo, query: *const ParsedQuery, m
 }
 
 fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe_indices: ?[]const u32) !void {
-    // Simple hash-based GROUP BY for integer columns
-    // For now, support single column GROUP BY
+    // Hash-based GROUP BY - O(n) instead of O(n*k)
     if (query.group_by_count != 1) return error.UnsupportedGroupBy;
 
     const group_col_name = query.group_by_cols[0];
@@ -9507,95 +9652,95 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
 
     const gcol = group_col orelse return error.ColumnNotFound;
 
-    // Simple approach: collect unique values and their indices
-    const MAX_GROUPS_LIMIT: usize = 1024;
-    const effective_max_groups = if (query.group_by_top_k) |k| @min(k, MAX_GROUPS_LIMIT) else MAX_GROUPS_LIMIT;
-    var group_keys: [MAX_GROUPS_LIMIT]i64 = undefined;
-    var group_starts: [MAX_GROUPS_LIMIT]usize = undefined;
-    var group_counts: [MAX_GROUPS_LIMIT]usize = undefined;
-    var num_groups: usize = 0;
+    // Use hash-based grouping - O(n) single pass
+    const effective_max_groups = if (query.group_by_top_k) |k| @min(k, MAX_GROUP_ENTRIES) else MAX_GROUP_ENTRIES;
+    const num_groups = groupHashBuild(table, gcol, maybe_indices, effective_max_groups);
 
-    // Build groups (O(n*k) but simple)
-    if (maybe_indices) |indices| {
-        for (indices) |idx| {
-            const key = getIntValue(table, gcol, idx);
+    // Initialize aggregation states for all groups × all aggregates
+    const num_aggs = query.agg_count;
+    for (0..num_groups * num_aggs) |i| {
+        global_agg_states[i] = AggState{};
+    }
 
-            // Find or add group
-            var found = false;
-            for (group_keys[0..num_groups], 0..) |gk, gi| {
-                if (gk == key) {
-                    group_counts[gi] += 1;
-                    found = true;
+    // Single-pass aggregation using row_group_ids mapping
+    const row_count = if (maybe_indices) |idx| idx.len else table.row_count;
+
+    // For each aggregate, process all rows in batches
+    for (query.aggregates[0..num_aggs], 0..) |agg, agg_idx| {
+        // COUNT(*) or COUNT with empty column - just uses group counts
+        if (agg.func == .count and (std.mem.eql(u8, agg.column, "*") or agg.column.len == 0)) {
+            for (0..num_groups) |gi| {
+                global_agg_states[gi * num_aggs + agg_idx].count = groupHashGetCount(@intCast(gi));
+            }
+            continue;
+        }
+
+        // Find aggregate column
+        var agg_col: ?*const ColumnData = null;
+        for (table.columns[0..table.column_count]) |maybe_col| {
+            if (maybe_col) |*col| {
+                if (std.mem.eql(u8, col.name, agg.column)) {
+                    agg_col = col;
                     break;
                 }
-            }
-            if (!found and num_groups < effective_max_groups) {
-                group_keys[num_groups] = key;
-                group_starts[num_groups] = idx;
-                group_counts[num_groups] = 1;
-                num_groups += 1;
             }
         }
-    } else {
-        // Full Scan
-        for (0..table.row_count) |i| {
-            const idx = @as(u32, @intCast(i));
-            const key = getIntValue(table, gcol, idx);
 
-            // Find or add group
-            var found = false;
-            for (group_keys[0..num_groups], 0..) |gk, gi| {
-                if (gk == key) {
-                    group_counts[gi] += 1;
-                    found = true;
-                    break;
+        if (agg_col) |acol| {
+            // Process rows in batches for better cache locality
+            var batch_start: usize = 0;
+            while (batch_start < row_count) {
+                const batch_end = @min(batch_start + AGG_BATCH_SIZE, row_count);
+
+                // Process batch - update aggregation states
+                var i = batch_start;
+                while (i + 4 <= batch_end) : (i += 4) {
+                    // Unrolled loop for 4 rows at a time
+                    const gid0 = row_group_ids[i];
+                    const gid1 = row_group_ids[i + 1];
+                    const gid2 = row_group_ids[i + 2];
+                    const gid3 = row_group_ids[i + 3];
+
+                    const ri0: u32 = if (maybe_indices) |idx| idx[i] else @intCast(i);
+                    const ri1: u32 = if (maybe_indices) |idx| idx[i + 1] else @intCast(i + 1);
+                    const ri2: u32 = if (maybe_indices) |idx| idx[i + 2] else @intCast(i + 2);
+                    const ri3: u32 = if (maybe_indices) |idx| idx[i + 3] else @intCast(i + 3);
+
+                    // Get values
+                    const v0 = getFloatValue(table, acol, ri0);
+                    const v1 = getFloatValue(table, acol, ri1);
+                    const v2 = getFloatValue(table, acol, ri2);
+                    const v3 = getFloatValue(table, acol, ri3);
+
+                    // Update states (skip overflow groups)
+                    if (gid0 != std.math.maxInt(u32)) global_agg_states[gid0 * num_aggs + agg_idx].update(v0);
+                    if (gid1 != std.math.maxInt(u32)) global_agg_states[gid1 * num_aggs + agg_idx].update(v1);
+                    if (gid2 != std.math.maxInt(u32)) global_agg_states[gid2 * num_aggs + agg_idx].update(v2);
+                    if (gid3 != std.math.maxInt(u32)) global_agg_states[gid3 * num_aggs + agg_idx].update(v3);
                 }
-            }
-            if (!found and num_groups < effective_max_groups) {
-                group_keys[num_groups] = key;
-                group_starts[num_groups] = idx;
-                group_counts[num_groups] = 1;
-                num_groups += 1;
+
+                // Handle remaining rows
+                while (i < batch_end) : (i += 1) {
+                    const gid = row_group_ids[i];
+                    if (gid == std.math.maxInt(u32)) continue;
+
+                    const ri: u32 = if (maybe_indices) |idx| idx[i] else @intCast(i);
+                    const v = getFloatValue(table, acol, ri);
+                    global_agg_states[gid * num_aggs + agg_idx].update(v);
+                }
+
+                batch_start = batch_end;
             }
         }
     }
 
-    // Compute aggregates per group
-    const num_aggs = query.agg_count;
+    // Finalize aggregation results
     const all_agg_results = try memory.wasm_allocator.alloc(f64, num_groups * num_aggs);
     defer memory.wasm_allocator.free(all_agg_results);
 
-    const group_indices = &global_group_indices;
     for (0..num_groups) |gi| {
-        const key = group_keys[gi];
-        var group_idx_count: usize = 0;
-        
-        if (maybe_indices) |indices| {
-            for (indices) |idx| {
-                if (getIntValue(table, gcol, idx) == key) {
-                    if (group_idx_count < MAX_ROWS) {
-                        group_indices[group_idx_count] = idx;
-                        group_idx_count += 1;
-                    }
-                }
-            }
-        } else {
-            for (0..table.row_count) |i| {
-                const idx = @as(u32, @intCast(i));
-                if (getIntValue(table, gcol, idx) == key) {
-                    if (group_idx_count < MAX_ROWS) {
-                        group_indices[group_idx_count] = idx;
-                        group_idx_count += 1;
-                    }
-                }
-            }
-        }
-
-        var group_agg_res: [MAX_AGGREGATES]f64 = undefined;
-        try executeMultiAggregate(table, query.aggregates[0..num_aggs], group_indices[0..group_idx_count], group_agg_res[0..num_aggs]);
-        
         for (0..num_aggs) |ai| {
-            all_agg_results[gi * num_aggs + ai] = group_agg_res[ai];
+            all_agg_results[gi * num_aggs + ai] = global_agg_states[gi * num_aggs + ai].finalize(query.aggregates[ai].func);
         }
     }
 
@@ -9645,7 +9790,7 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
         var total_len: usize = 0;
         for (0..num_groups) |gi| {
             if (survivors[gi]) {
-                const representative_idx = @as(u32, @intCast(group_starts[gi]));
+                const representative_idx = groupHashGetFirstRow(@intCast(gi));
                 const str_val = getStringValueOptimized(table, gcol, representative_idx, &ctx);
                 total_len += str_val.len;
             }
@@ -9662,7 +9807,7 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
         var out_idx: usize = 0;
         for (0..num_groups) |gi| {
             if (survivors[gi]) {
-                const representative_idx = @as(u32, @intCast(group_starts[gi]));
+                const representative_idx = groupHashGetFirstRow(@intCast(gi));
                 const str_val = getStringValueOptimized(table, gcol, representative_idx, &ctx);
                 offsets[out_idx] = @intCast(current_offset);
                 @memcpy(str_data[current_offset..][0..str_val.len], str_val);
@@ -9679,7 +9824,7 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
         var out_idx: usize = 0;
         for (0..num_groups) |gi| {
             if (survivors[gi]) {
-                group_keys_out[out_idx] = @floatFromInt(group_keys[gi]);
+                group_keys_out[out_idx] = @floatFromInt(groupHashGetKey(@intCast(gi)));
                 out_idx += 1;
             }
         }
@@ -9707,7 +9852,7 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
             var total_str_len: usize = 0;
             for (0..num_groups) |gi| {
                 if (!survivors[gi]) continue;
-                const key = group_keys[gi];
+                const key = groupHashGetKey(@intCast(gi));
                 var first_in_group = true;
 
                 if (maybe_indices) |indices| {
@@ -9744,7 +9889,7 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
             for (0..num_groups) |gi| {
                 if (!survivors[gi]) continue;
                 offsets[out_idx] = @intCast(current_offset);
-                const key = group_keys[gi];
+                const key = groupHashGetKey(@intCast(gi));
                 var first_in_group = true;
 
                 if (maybe_indices) |indices| {
