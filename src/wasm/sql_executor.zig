@@ -36,6 +36,130 @@ const MAX_VECTOR_DIM: usize = 1536; // Support up to OpenAI embedding size
 const VECTOR_SIZE: usize = 1024; // Chunk size for vectorized execution
 
 // ============================================================================
+// SIMD Types and Primitives (WASM SIMD128 = 128 bits)
+// ============================================================================
+const Vec2i64 = @Vector(2, i64);
+const Vec2u64 = @Vector(2, u64);
+const Vec4f32 = @Vector(4, f32);
+const Vec2f64 = @Vector(2, f64);
+const Vec4i32 = @Vector(4, i32);
+const Vec4u32 = @Vector(4, u32);
+
+/// SIMD hash 2 i64 values at once (MurmurHash3 finalizer)
+inline fn simdHash2(values: Vec2i64) Vec2u64 {
+    var h: Vec2u64 = @bitCast(values);
+    h ^= h >> @splat(33);
+    h *%= @splat(0xff51afd7ed558ccd);
+    h ^= h >> @splat(33);
+    h *%= @splat(0xc4ceb9fe1a85ec53);
+    h ^= h >> @splat(33);
+    return h;
+}
+
+/// SIMD sum of f64 array (2-wide)
+inline fn simdSumF64(ptr: [*]const f64, len: usize) f64 {
+    var sum: Vec2f64 = @splat(0);
+    var i: usize = 0;
+    while (i + 2 <= len) : (i += 2) {
+        const v: Vec2f64 = .{ ptr[i], ptr[i + 1] };
+        sum += v;
+    }
+    var result = @reduce(.Add, sum);
+    // Handle remainder
+    while (i < len) : (i += 1) {
+        result += ptr[i];
+    }
+    return result;
+}
+
+/// SIMD min of f64 array (2-wide)
+inline fn simdMinF64(ptr: [*]const f64, len: usize) f64 {
+    if (len == 0) return std.math.inf(f64);
+    var min_vec: Vec2f64 = @splat(std.math.inf(f64));
+    var i: usize = 0;
+    while (i + 2 <= len) : (i += 2) {
+        const v: Vec2f64 = .{ ptr[i], ptr[i + 1] };
+        min_vec = @min(min_vec, v);
+    }
+    var result = @reduce(.Min, min_vec);
+    while (i < len) : (i += 1) {
+        if (ptr[i] < result) result = ptr[i];
+    }
+    return result;
+}
+
+/// SIMD max of f64 array (2-wide)
+inline fn simdMaxF64(ptr: [*]const f64, len: usize) f64 {
+    if (len == 0) return -std.math.inf(f64);
+    var max_vec: Vec2f64 = @splat(-std.math.inf(f64));
+    var i: usize = 0;
+    while (i + 2 <= len) : (i += 2) {
+        const v: Vec2f64 = .{ ptr[i], ptr[i + 1] };
+        max_vec = @max(max_vec, v);
+    }
+    var result = @reduce(.Max, max_vec);
+    while (i < len) : (i += 1) {
+        if (ptr[i] > result) result = ptr[i];
+    }
+    return result;
+}
+
+/// SIMD compare i64 array against scalar, returns count of matches
+inline fn simdCountEqI64(ptr: [*]const i64, len: usize, target: i64) usize {
+    var count: usize = 0;
+    const target_vec: Vec2i64 = @splat(target);
+    var i: usize = 0;
+    while (i + 2 <= len) : (i += 2) {
+        const v: Vec2i64 = .{ ptr[i], ptr[i + 1] };
+        const mask = v == target_vec;
+        count += @popCount(@as(u2, @bitCast(mask)));
+    }
+    while (i < len) : (i += 1) {
+        if (ptr[i] == target) count += 1;
+    }
+    return count;
+}
+
+/// SIMD filter: write indices where value equals target
+inline fn simdFilterEqI64(ptr: [*]const i64, len: usize, target: i64, out: [*]u32) usize {
+    var out_idx: usize = 0;
+    const target_vec: Vec2i64 = @splat(target);
+    var i: usize = 0;
+    while (i + 2 <= len) : (i += 2) {
+        const v: Vec2i64 = .{ ptr[i], ptr[i + 1] };
+        const mask = v == target_vec;
+        if (mask[0]) {
+            out[out_idx] = @intCast(i);
+            out_idx += 1;
+        }
+        if (mask[1]) {
+            out[out_idx] = @intCast(i + 1);
+            out_idx += 1;
+        }
+    }
+    while (i < len) : (i += 1) {
+        if (ptr[i] == target) {
+            out[out_idx] = @intCast(i);
+            out_idx += 1;
+        }
+    }
+    return out_idx;
+}
+
+/// SIMD gather: collect values at given indices
+inline fn simdGatherF64(src: [*]const f64, indices: [*]const u32, len: usize, dst: [*]f64) void {
+    var i: usize = 0;
+    // Process 2 at a time (can't do true SIMD gather in WASM, but unroll for ILP)
+    while (i + 2 <= len) : (i += 2) {
+        dst[i] = src[indices[i]];
+        dst[i + 1] = src[indices[i + 1]];
+    }
+    while (i < len) : (i += 1) {
+        dst[i] = src[indices[i]];
+    }
+}
+
+// ============================================================================
 // Hash Join Constants and Data Structures (DuckDB-style vectorized execution)
 // ============================================================================
 const HASH_TABLE_SIZE: usize = 262144; // 2^18 buckets (power of 2 for fast modulo)
@@ -141,6 +265,23 @@ inline fn hashTableProbeNext(value: i64, prev_idx: u32) ProbeResult {
 /// Get row index from hash entry
 inline fn hashTableGetRowIdx(entry_idx: u32) u32 {
     return hash_entries[entry_idx].row_idx;
+}
+
+/// Batch probe: compute hashes for multiple values using SIMD, return bucket indices
+/// This allows prefetching buckets while computing subsequent hashes
+fn hashTableProbeBatch(values: [*]const i64, len: usize, buckets_out: [*]usize) void {
+    var i: usize = 0;
+    // SIMD path: process 2 at a time
+    while (i + 2 <= len) : (i += 2) {
+        const v: Vec2i64 = .{ values[i], values[i + 1] };
+        const h = simdHash2(v);
+        buckets_out[i] = @intCast(h[0] & HASH_TABLE_MASK);
+        buckets_out[i + 1] = @intCast(h[1] & HASH_TABLE_MASK);
+    }
+    // Scalar remainder
+    while (i < len) : (i += 1) {
+        buckets_out[i] = @intCast(hashInt64(values[i]) & HASH_TABLE_MASK);
+    }
 }
 
 // ============================================================================
@@ -271,6 +412,17 @@ const AggState = struct {
         const max23 = @max(v2, v3);
         if (@min(min01, min23) < self.min) self.min = @min(min01, min23);
         if (@max(max01, max23) > self.max) self.max = @max(max01, max23);
+    }
+
+    /// SIMD batch update from contiguous f64 array
+    fn updateContiguous(self: *AggState, ptr: [*]const f64, len: usize) void {
+        if (len == 0) return;
+        self.sum += simdSumF64(ptr, len);
+        self.count += len;
+        const batch_min = simdMinF64(ptr, len);
+        const batch_max = simdMaxF64(ptr, len);
+        if (batch_min < self.min) self.min = batch_min;
+        if (batch_max > self.max) self.max = batch_max;
     }
 
     /// Finalize to result based on aggregate function

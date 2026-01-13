@@ -410,41 +410,95 @@ pub const MultiAggState = struct {
     }
 };
 
-/// Sum float64 buffer with SIMD acceleration
-/// Sum float64 buffer with NaN check
+/// Sum float64 buffer with SIMD acceleration (4-wide Vec4f64)
 pub export fn sumFloat64Buffer(ptr: [*]const f64, len: usize) f64 {
-    var sum: f64 = 0;
-    for (0..len) |i| {
-        const v = ptr[i];
-        if (!std.math.isNan(v)) sum += v;
+    if (len == 0) return 0;
+    var sum1: Vec4f64 = @splat(0);
+    var sum2: Vec4f64 = @splat(0);
+    var sum3: Vec4f64 = @splat(0);
+    var sum4: Vec4f64 = @splat(0);
+    var i: usize = 0;
+
+    // Process 16 elements at a time (4 vectors of 4)
+    while (i + 16 <= len) : (i += 16) {
+        const v1: Vec4f64 = ptr[i..][0..4].*;
+        const v2: Vec4f64 = ptr[i+4..][0..4].*;
+        const v3: Vec4f64 = ptr[i+8..][0..4].*;
+        const v4: Vec4f64 = ptr[i+12..][0..4].*;
+        sum1 += v1;
+        sum2 += v2;
+        sum3 += v3;
+        sum4 += v4;
     }
-    return sum;
+
+    var result = @reduce(.Add, sum1 + sum2 + sum3 + sum4);
+
+    // Handle remainder
+    while (i < len) : (i += 1) {
+        const v = ptr[i];
+        if (!std.math.isNan(v)) result += v;
+    }
+    return result;
 }
 
-/// Min float64 buffer with SIMD acceleration
-/// Min float64 buffer with NaN check
+/// Min float64 buffer with SIMD acceleration (4-wide Vec4f64)
 pub export fn minFloat64Buffer(ptr: [*]const f64, len: usize) f64 {
     if (len == 0) return 0;
-    var min_val = std.math.floatMax(f64);
-    for (0..len) |i| {
-         const v = ptr[i];
-         if (!std.math.isNan(v) and v < min_val) min_val = v;
+    var min1: Vec4f64 = @splat(std.math.floatMax(f64));
+    var min2: Vec4f64 = @splat(std.math.floatMax(f64));
+    var min3: Vec4f64 = @splat(std.math.floatMax(f64));
+    var min4: Vec4f64 = @splat(std.math.floatMax(f64));
+    var i: usize = 0;
+
+    while (i + 16 <= len) : (i += 16) {
+        const v1: Vec4f64 = ptr[i..][0..4].*;
+        const v2: Vec4f64 = ptr[i+4..][0..4].*;
+        const v3: Vec4f64 = ptr[i+8..][0..4].*;
+        const v4: Vec4f64 = ptr[i+12..][0..4].*;
+        min1 = @min(min1, v1);
+        min2 = @min(min2, v2);
+        min3 = @min(min3, v3);
+        min4 = @min(min4, v4);
     }
-    if (min_val == std.math.floatMax(f64)) return 0;
-    return min_val;
+
+    var result = @reduce(.Min, @min(@min(min1, min2), @min(min3, min4)));
+
+    while (i < len) : (i += 1) {
+        const v = ptr[i];
+        if (!std.math.isNan(v) and v < result) result = v;
+    }
+    if (result == std.math.floatMax(f64)) return 0;
+    return result;
 }
 
-/// Max float64 buffer with SIMD acceleration
-/// Max float64 buffer with NaN check
+/// Max float64 buffer with SIMD acceleration (4-wide Vec4f64)
 pub export fn maxFloat64Buffer(ptr: [*]const f64, len: usize) f64 {
     if (len == 0) return 0;
-    var max_val = -std.math.floatMax(f64);
-    for (0..len) |i| {
-        const v = ptr[i];
-        if (!std.math.isNan(v) and v > max_val) max_val = v;
+    var max1: Vec4f64 = @splat(-std.math.floatMax(f64));
+    var max2: Vec4f64 = @splat(-std.math.floatMax(f64));
+    var max3: Vec4f64 = @splat(-std.math.floatMax(f64));
+    var max4: Vec4f64 = @splat(-std.math.floatMax(f64));
+    var i: usize = 0;
+
+    while (i + 16 <= len) : (i += 16) {
+        const v1: Vec4f64 = ptr[i..][0..4].*;
+        const v2: Vec4f64 = ptr[i+4..][0..4].*;
+        const v3: Vec4f64 = ptr[i+8..][0..4].*;
+        const v4: Vec4f64 = ptr[i+12..][0..4].*;
+        max1 = @max(max1, v1);
+        max2 = @max(max2, v2);
+        max3 = @max(max3, v3);
+        max4 = @max(max4, v4);
     }
-    if (max_val == -std.math.floatMax(f64)) return 0; // Or NaN?
-    return max_val;
+
+    var result = @reduce(.Max, @max(@max(max1, max2), @max(max3, max4)));
+
+    while (i < len) : (i += 1) {
+        const v = ptr[i];
+        if (!std.math.isNan(v) and v > result) result = v;
+    }
+    if (result == -std.math.floatMax(f64)) return 0;
+    return result;
 }
 
 /// Average float64 buffer
@@ -474,20 +528,55 @@ export fn countNonNull(null_bitmap: [*]const u8, len: usize) usize {
     return count;
 }
 
-/// Sum int32 buffer
+/// Sum int32 buffer with SIMD acceleration
 export fn sumInt32Buffer(ptr: [*]const i32, len: usize) i64 {
     if (len == 0) return 0;
-    var sum: i64 = 0;
-    for (0..len) |i| sum += ptr[i];
-    return sum;
+    const Vec4i32 = @Vector(4, i32);
+    var sum1: Vec4i32 = @splat(0);
+    var sum2: Vec4i32 = @splat(0);
+    var sum3: Vec4i32 = @splat(0);
+    var sum4: Vec4i32 = @splat(0);
+    var i: usize = 0;
+
+    while (i + 16 <= len) : (i += 16) {
+        sum1 += ptr[i..][0..4].*;
+        sum2 += ptr[i+4..][0..4].*;
+        sum3 += ptr[i+8..][0..4].*;
+        sum4 += ptr[i+12..][0..4].*;
+    }
+
+    var result: i64 = @reduce(.Add, sum1) + @reduce(.Add, sum2) + @reduce(.Add, sum3) + @reduce(.Add, sum4);
+
+    while (i < len) : (i += 1) {
+        result += ptr[i];
+    }
+    return result;
 }
 
-/// Sum int64 buffer
+/// Sum int64 buffer with SIMD acceleration
 export fn sumInt64Buffer(ptr: [*]const i64, len: usize) i64 {
     if (len == 0) return 0;
-    var sum: i64 = 0;
-    for (0..len) |i| sum += ptr[i];
-    return sum;
+    const Vec2i64 = @Vector(2, i64);
+    var sum1: Vec2i64 = @splat(0);
+    var sum2: Vec2i64 = @splat(0);
+    var sum3: Vec2i64 = @splat(0);
+    var sum4: Vec2i64 = @splat(0);
+    var i: usize = 0;
+
+    // 128-bit SIMD = 2x i64, process 8 at a time
+    while (i + 8 <= len) : (i += 8) {
+        sum1 += ptr[i..][0..2].*;
+        sum2 += ptr[i+2..][0..2].*;
+        sum3 += ptr[i+4..][0..2].*;
+        sum4 += ptr[i+6..][0..2].*;
+    }
+
+    var result: i64 = @reduce(.Add, sum1) + @reduce(.Add, sum2) + @reduce(.Add, sum3) + @reduce(.Add, sum4);
+
+    while (i < len) : (i += 1) {
+        result += ptr[i];
+    }
+    return result;
 }
 
 /// Min int64 buffer
