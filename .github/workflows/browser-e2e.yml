@@ -85,6 +85,24 @@ jobs:
         working-directory: packages/browser
         run: node esbuild.config.js
 
+      - name: Cache MiniLM model
+        uses: actions/cache@v4
+        with:
+          path: examples/wasm/models
+          key: minilm-model-v1
+
+      - name: Download MiniLM model
+        run: |
+          mkdir -p examples/wasm/models
+          if [ ! -f examples/wasm/models/minilm-l6-v2.gguf ]; then
+            echo "Downloading MiniLM model..."
+            curl -L -o examples/wasm/models/minilm-l6-v2.gguf \
+              https://data.metal0.dev/models/minilm-l6-v2.gguf
+          else
+            echo "MiniLM model cached"
+          fi
+          ls -la examples/wasm/models/
+
       - name: Run E2E tests (non-benchmark)
         working-directory: packages/browser
         continue-on-error: true

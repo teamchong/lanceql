@@ -2139,10 +2139,19 @@ async function handleMessage(port, data) {
                     wasm.minilm_init();
                 }
 
-                // Fetch model
-                const modelUrl = args.url || 'https://data.metal0.dev/models/minilm-l6-v2.gguf';
-                console.log('[Worker] Downloading MiniLM model...');
-                const response = await fetch(modelUrl);
+                // Fetch model - try local path first (for CI/testing), fallback to CDN
+                const localModelUrl = '/examples/wasm/models/minilm-l6-v2.gguf';
+                const cdnModelUrl = 'https://data.metal0.dev/models/minilm-l6-v2.gguf';
+                const modelUrl = args.url || localModelUrl;
+
+                console.log('[Worker] Downloading MiniLM model from:', modelUrl);
+                let response = await fetch(modelUrl);
+
+                // Fallback to CDN if local not found
+                if (!response.ok && modelUrl === localModelUrl) {
+                    console.log('[Worker] Local model not found, trying CDN...');
+                    response = await fetch(cdnModelUrl);
+                }
                 if (!response.ok) throw new Error('MiniLM model download failed');
 
                 const modelData = await response.arrayBuffer();

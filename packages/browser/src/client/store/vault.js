@@ -120,6 +120,11 @@ class Vault {
      * const results = await v.exec('SELECT * FROM users WHERE name NEAR "alice"');
      */
     async exec(sql) {
+        // Auto-load MiniLM model for vector operations
+        const sqlUpper = sql.toUpperCase();
+        if (sqlUpper.includes('CREATE VECTOR INDEX') && sqlUpper.includes('MINILM')) {
+            await this.loadMinilmModel();
+        }
         return workerRPC('vault:exec', { sql });
     }
 
