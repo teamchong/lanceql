@@ -41,6 +41,14 @@ jobs:
         with:
           version: 0.15.2
 
+      - name: Create zig symlink for JIT (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # Create symlink at /usr/local/bin/zig so JIT compilation can find it
+          # The JIT code can't access PATH environment variable in Node.js addon context
+          sudo ln -sf $(which zig) /usr/local/bin/zig
+          ls -la /usr/local/bin/zig
+
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libbz2-dev liblzma-dev libvulkan-dev
