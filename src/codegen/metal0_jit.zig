@@ -878,42 +878,41 @@ fn extractClassName(allocator: std.mem.Allocator, source: []const u8) ![]const u
     return error.ClassNotFound;
 }
 
-/// Find zig executable using `which zig` command
-/// This properly inherits PATH from the parent process, working in CI environments
-/// where zig is installed via setup actions (e.g., mlugg/setup-zig)
-fn findZigViaWhich(allocator: std.mem.Allocator, buf: []u8) ![]const u8 {
-    const argv = [_][]const u8{ "which", "zig" };
+/// Comprehensive PATH that includes common zig installation locations
+/// This covers: GitHub Actions setup-zig, homebrew, system paths, local user installs
+const COMPREHENSIVE_PATH = "/opt/hostedtoolcache/zig/0.15.2/x64:" ++ // GitHub Actions setup-zig
+    "/opt/hostedtoolcache/zig/0.14.0/x64:" ++ // GitHub Actions older zig
+    "/opt/homebrew/bin:" ++ // macOS homebrew ARM
+    "/usr/local/bin:" ++ // macOS homebrew Intel / Linux
+    "/usr/bin:" ++
+    "/bin:" ++
+    "/home/runner/.local/bin:" ++ // GitHub Actions runner local
+    "/home/teamchong/.local/bin:" ++ // Local user install
+    "/home/teamchong/.local/zig"; // Local zig install
 
-    var child = std.process.Child.init(&argv, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    // Don't set env_map - inherit from parent process to get CI PATH
+/// Find zig executable by trying common paths directly
+/// Avoids using `which` command which requires environment inheritance
+fn findZigByPath(buf: []u8) ?[]const u8 {
+    // List of common zig binary locations
+    const zig_paths = [_][]const u8{
+        "/opt/hostedtoolcache/zig/0.15.2/x64/zig", // GitHub Actions setup-zig@v2 with 0.15.2
+        "/opt/hostedtoolcache/zig/0.14.0/x64/zig", // GitHub Actions with 0.14.0
+        "/opt/homebrew/bin/zig", // macOS homebrew ARM
+        "/usr/local/bin/zig", // macOS homebrew Intel / Linux
+        "/usr/bin/zig", // System install
+        "/home/runner/.local/bin/zig", // GitHub Actions runner
+        "/home/teamchong/.local/bin/zig", // Local user symlink
+        "/home/teamchong/.local/zig/zig", // Local zig install
+    };
 
-    child.spawn() catch return error.WhichFailed;
-
-    // Read stdout
-    var stdout_len: usize = 0;
-    if (child.stdout) |stdout| {
-        stdout_len = stdout.read(buf) catch 0;
+    for (zig_paths) |path| {
+        if (std.fs.cwd().access(path, .{})) |_| {
+            const len = @min(path.len, buf.len);
+            @memcpy(buf[0..len], path[0..len]);
+            return buf[0..len];
+        } else |_| continue;
     }
-
-    const result = child.wait() catch return error.WhichFailed;
-
-    switch (result) {
-        .Exited => |code| {
-            if (code != 0 or stdout_len == 0) return error.ZigNotFound;
-        },
-        else => return error.WhichFailed,
-    }
-
-    // Trim trailing newline
-    var end = stdout_len;
-    while (end > 0 and (buf[end - 1] == '\n' or buf[end - 1] == '\r')) {
-        end -= 1;
-    }
-
-    if (end == 0) return error.ZigNotFound;
-    return buf[0..end];
+    return null;
 }
 
 /// JIT compilation result
@@ -965,29 +964,14 @@ fn jitCompileSource(
     const emit_bin_arg = std.fmt.bufPrint(&emit_bin_buf, "-femit-bin={s}", .{full_lib_path}) catch
         return error.PathTooLong;
 
-    // Find zig compiler - use `which zig` first, then fall back to common paths
-    // This handles CI environments where zig is installed dynamically (e.g., mlugg/setup-zig)
+    // Find zig compiler by checking common paths directly
+    // This avoids spawning a subprocess (which can fail in Node.js context)
+    // and works in both CI environments and local development
     var zig_cmd_buf: [512]u8 = undefined;
     var zig_cmd: []const u8 = "zig";
 
-    // First, try to find zig via `which` command - this respects PATH from parent process
-    const which_result = findZigViaWhich(allocator, &zig_cmd_buf);
-    if (which_result) |found_path| {
+    if (findZigByPath(&zig_cmd_buf)) |found_path| {
         zig_cmd = found_path;
-    } else |_| {
-        // Fall back to common hardcoded locations
-        const zig_paths = [_][]const u8{
-            "/home/teamchong/.local/zig/zig", // Ubuntu user install
-            "/usr/local/bin/zig",
-            "/opt/homebrew/bin/zig", // macOS homebrew
-            "/usr/bin/zig",
-        };
-        for (zig_paths) |path| {
-            if (std.fs.cwd().access(path, .{})) |_| {
-                zig_cmd = path;
-                break;
-            } else |_| continue;
-        }
     }
 
     // Build shared library using zig build-lib
@@ -1001,16 +985,15 @@ fn jitCompileSource(
         src_path,
     };
 
-    // Build environment - inherit PATH from parent if possible for CI compatibility
-    // In CI environments, zig is added to PATH by setup actions
+    // Build environment - use comprehensive hardcoded PATH to avoid getenv issues
+    // In Node.js addon context, std.posix.getenv can cause issues on Linux
+    // The COMPREHENSIVE_PATH covers GitHub Actions, homebrew, and common installs
     var env_map2 = std.process.EnvMap.init(allocator);
     defer env_map2.deinit();
 
-    // Try to get PATH from parent process, fall back to hardcoded if unavailable
-    const parent_path = std.posix.getenv("PATH") orelse "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin";
-    env_map2.put("PATH", parent_path) catch {};
-    env_map2.put("HOME", std.posix.getenv("HOME") orelse "/tmp") catch {};
-    env_map2.put("TMPDIR", std.posix.getenv("TMPDIR") orelse "/tmp") catch {};
+    env_map2.put("PATH", COMPREHENSIVE_PATH) catch {};
+    env_map2.put("HOME", "/tmp") catch {};
+    env_map2.put("TMPDIR", "/tmp") catch {};
 
     var child = std.process.Child.init(&argv, allocator);
     child.stderr_behavior = .Pipe;
