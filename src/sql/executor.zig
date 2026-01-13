@@ -17,6 +17,7 @@ const OrcTable = @import("lanceql.orc_table").OrcTable;
 const XlsxTable = @import("lanceql.xlsx_table").XlsxTable;
 const AnyTable = @import("lanceql.any_table").AnyTable;
 const hash = @import("lanceql.hash");
+const vector_engine = @import("lanceql.vector_engine");
 pub const logic_table_dispatch = @import("logic_table_dispatch.zig");
 pub const scalar_functions = @import("scalar_functions.zig");
 pub const aggregate_functions = @import("aggregate_functions.zig");
@@ -1344,31 +1345,6 @@ pub const Executor = struct {
         const right_key_data = try self.readJoinKeyColumn(right_table, right_key_col_idx);
         defer self.freeJoinKeyData(right_key_data);
 
-        var hash_table = std.StringHashMap(std.ArrayListUnmanaged(usize)).init(self.allocator);
-        defer {
-            var iter = hash_table.iterator();
-            while (iter.next()) |entry| {
-                // Free the key (we allocated it during insertion)
-                self.allocator.free(entry.key_ptr.*);
-                // Deinit the ArrayList value
-                entry.value_ptr.deinit(self.allocator);
-            }
-            hash_table.deinit();
-        }
-
-        for (0..right_key_data.len()) |idx| {
-            const key = try self.joinKeyToString(right_key_data, idx);
-            defer self.allocator.free(key);
-
-            const result = try hash_table.getOrPut(key);
-            if (!result.found_existing) {
-                const key_copy = try self.allocator.dupe(u8, key);
-                result.key_ptr.* = key_copy;
-                result.value_ptr.* = .{};
-            }
-            try result.value_ptr.append(self.allocator, idx);
-        }
-
         var left_indices = std.ArrayListUnmanaged(usize){};
         defer left_indices.deinit(self.allocator);
         var right_indices = std.ArrayListUnmanaged(usize){};
@@ -1378,29 +1354,101 @@ pub const Executor = struct {
         var matched_right = std.AutoHashMap(usize, void).init(self.allocator);
         defer matched_right.deinit();
 
-        for (0..left_key_data.len()) |left_idx| {
-            const key = try self.joinKeyToString(left_key_data, left_idx);
-            defer self.allocator.free(key);
+        // Use LinearHashTable for int64 keys (fast path with SIMD hashing)
+        // Fall back to StringHashMap for other types
+        if (left_key_data == .int64 and right_key_data == .int64) {
+            // Fast path: DuckDB-style linear probing hash table with SIMD
+            const left_keys = left_key_data.int64;
+            const right_keys = right_key_data.int64;
 
-            if (hash_table.get(key)) |right_list| {
-                for (right_list.items) |right_idx| {
-                    try left_indices.append(self.allocator, left_idx);
-                    try right_indices.append(self.allocator, right_idx);
-                    try matched_right.put(right_idx, {});
+            var ht = try vector_engine.LinearHashTable.init(self.allocator, right_keys.len);
+            defer ht.deinit(self.allocator);
+
+            // Build phase: hash right table keys using SIMD
+            ht.buildFromColumn(right_keys);
+
+            // Probe phase: find matches for left table keys
+            var match_buf: [64]u32 = undefined;
+            for (left_keys, 0..) |key, left_idx| {
+                if (key == vector_engine.NULL_INT64) {
+                    if (join_clause.join_type == .left or join_clause.join_type == .full) {
+                        try left_indices.append(self.allocator, left_idx);
+                        try right_indices.append(self.allocator, std.math.maxInt(usize));
+                    }
+                    continue;
                 }
-            } else if (join_clause.join_type == .left or join_clause.join_type == .full) {
-                // LEFT/FULL JOIN: include left row with NULL for right
-                try left_indices.append(self.allocator, left_idx);
-                try right_indices.append(self.allocator, std.math.maxInt(usize)); // Sentinel for NULL
-            }
-        }
 
-        // For RIGHT/FULL JOIN: add unmatched right rows
-        if (join_clause.join_type == .right or join_clause.join_type == .full) {
-            for (0..right_key_data.len()) |right_idx| {
-                if (!matched_right.contains(right_idx)) {
-                    try left_indices.append(self.allocator, std.math.maxInt(usize)); // Sentinel for NULL
-                    try right_indices.append(self.allocator, right_idx);
+                // Find all matches in right table
+                const matches = ht.probeAll(key, right_keys, &match_buf);
+                if (matches > 0) {
+                    for (match_buf[0..matches]) |right_idx| {
+                        try left_indices.append(self.allocator, left_idx);
+                        try right_indices.append(self.allocator, right_idx);
+                        try matched_right.put(right_idx, {});
+                    }
+                } else if (join_clause.join_type == .left or join_clause.join_type == .full) {
+                    try left_indices.append(self.allocator, left_idx);
+                    try right_indices.append(self.allocator, std.math.maxInt(usize));
+                }
+            }
+
+            // RIGHT/FULL JOIN: add unmatched right rows
+            if (join_clause.join_type == .right or join_clause.join_type == .full) {
+                for (0..right_keys.len) |right_idx| {
+                    if (!matched_right.contains(right_idx)) {
+                        try left_indices.append(self.allocator, std.math.maxInt(usize));
+                        try right_indices.append(self.allocator, right_idx);
+                    }
+                }
+            }
+        } else {
+            // Slow path: string-based hash table for non-integer keys
+            var hash_table = std.StringHashMap(std.ArrayListUnmanaged(usize)).init(self.allocator);
+            defer {
+                var iter = hash_table.iterator();
+                while (iter.next()) |entry| {
+                    self.allocator.free(entry.key_ptr.*);
+                    entry.value_ptr.deinit(self.allocator);
+                }
+                hash_table.deinit();
+            }
+
+            for (0..right_key_data.len()) |idx| {
+                const key = try self.joinKeyToString(right_key_data, idx);
+                defer self.allocator.free(key);
+
+                const result = try hash_table.getOrPut(key);
+                if (!result.found_existing) {
+                    const key_copy = try self.allocator.dupe(u8, key);
+                    result.key_ptr.* = key_copy;
+                    result.value_ptr.* = .{};
+                }
+                try result.value_ptr.append(self.allocator, idx);
+            }
+
+            for (0..left_key_data.len()) |left_idx| {
+                const key = try self.joinKeyToString(left_key_data, left_idx);
+                defer self.allocator.free(key);
+
+                if (hash_table.get(key)) |right_list| {
+                    for (right_list.items) |right_idx| {
+                        try left_indices.append(self.allocator, left_idx);
+                        try right_indices.append(self.allocator, right_idx);
+                        try matched_right.put(right_idx, {});
+                    }
+                } else if (join_clause.join_type == .left or join_clause.join_type == .full) {
+                    try left_indices.append(self.allocator, left_idx);
+                    try right_indices.append(self.allocator, std.math.maxInt(usize));
+                }
+            }
+
+            // RIGHT/FULL JOIN: add unmatched right rows
+            if (join_clause.join_type == .right or join_clause.join_type == .full) {
+                for (0..right_key_data.len()) |right_idx| {
+                    if (!matched_right.contains(right_idx)) {
+                        try left_indices.append(self.allocator, std.math.maxInt(usize));
+                        try right_indices.append(self.allocator, right_idx);
+                    }
                 }
             }
         }
@@ -2485,6 +2533,7 @@ pub const Executor = struct {
     }
 
     /// Execute SELECT with GROUP BY and/or aggregates
+    /// SINGLE CODE PATH: Uses ve.HashGroupBy (same as WASM executor)
     fn executeWithGroupBy(self: *Self, stmt: *const SelectStmt, filtered_indices: []const u32) !Result {
         // Preload all columns we'll need for grouping and aggregates
         try self.preloadGroupByColumns(stmt);
@@ -2492,8 +2541,26 @@ pub const Executor = struct {
         // Get group by column names (empty if no GROUP BY but has aggregates)
         const group_cols = if (stmt.group_by) |gb| gb.columns else &[_][]const u8{};
 
-        // Build groups: maps hash key to list of row indices
-        // Using integer hashing for O(1) lookups (vs O(n) string comparison)
+        // =========================================================================
+        // SINGLE CODE PATH: Use ve.HashGroupBy (same implementation as WASM)
+        // =========================================================================
+
+        // Check if we can use fast path (single int64 GROUP BY column)
+        const use_ve_groupby = group_cols.len == 1 and blk: {
+            if (self.column_cache.get(group_cols[0])) |cached| {
+                break :blk switch (cached) {
+                    .int64, .int32 => true,
+                    else => false,
+                };
+            }
+            break :blk false;
+        };
+
+        if (use_ve_groupby and filtered_indices.len > 0) {
+            return self.executeWithGroupByVectorEngine(stmt, filtered_indices, group_cols[0]);
+        }
+
+        // Fall back to multi-column/mixed-type path for complex GROUP BY
         var groups = std.AutoHashMap(u64, std.ArrayListUnmanaged(u32)).init(self.allocator);
         defer {
             var iter = groups.valueIterator();
@@ -2544,6 +2611,152 @@ pub const Executor = struct {
         // Apply HAVING clause
         if (stmt.group_by) |gb| {
             if (gb.having) |having_expr| {
+                try having_eval.applyHaving(self.allocator, &result, &having_expr, stmt.columns);
+            }
+        }
+
+        // Apply ORDER BY
+        if (stmt.order_by) |order_by| {
+            try result_ops.applyOrderBy(self.allocator, result.columns, order_by);
+        }
+
+        // Apply LIMIT/OFFSET
+        result.row_count = result_ops.applyLimitOffset(self.allocator, result.columns, stmt.limit, stmt.offset);
+
+        return result;
+    }
+
+    /// Execute GROUP BY using ve.HashGroupBy - SINGLE CODE PATH (same as WASM)
+    fn executeWithGroupByVectorEngine(
+        self: *Self,
+        stmt: *const SelectStmt,
+        filtered_indices: []const u32,
+        group_col_name: []const u8,
+    ) !Result {
+        const row_count = filtered_indices.len;
+
+        // Materialize group key column into i64 slice
+        const key_buf = try self.allocator.alloc(i64, row_count);
+        defer self.allocator.free(key_buf);
+
+        const group_cached = self.column_cache.get(group_col_name) orelse return error.ColumnNotFound;
+        switch (group_cached) {
+            .int64 => |data| {
+                for (filtered_indices, 0..) |idx, i| key_buf[i] = data[idx];
+            },
+            .int32 => |data| {
+                for (filtered_indices, 0..) |idx, i| key_buf[i] = data[idx];
+            },
+            else => return error.UnsupportedGroupByType,
+        }
+
+        // Use shared ve.HashGroupBy - SINGLE CODE PATH (same as WASM)
+        var gb = try vector_engine.HashGroupBy.init(self.allocator, 8192);
+        defer gb.deinit();
+
+        try gb.buildGroups(key_buf);
+        const num_groups = gb.groupCount();
+
+        // Handle empty result case
+        if (num_groups == 0) {
+            return Result{
+                .columns = &.{},
+                .row_count = 0,
+                .allocator = self.allocator,
+            };
+        }
+
+        // Process aggregates using ve.HashGroupBy
+        for (stmt.columns) |item| {
+            if (item.expr == .call and aggregate_functions.isAggregateFunction(item.expr.call.name)) {
+                const call = item.expr.call;
+                if (call.args.len > 0 and call.args[0] == .column) {
+                    const agg_col_name = call.args[0].column.name;
+                    if (self.column_cache.get(agg_col_name)) |agg_cached| {
+                        // Materialize aggregate column
+                        const val_buf = try self.allocator.alloc(f64, row_count);
+                        defer self.allocator.free(val_buf);
+
+                        switch (agg_cached) {
+                            .int64 => |data| {
+                                for (filtered_indices, 0..) |idx, i| val_buf[i] = @floatFromInt(data[idx]);
+                            },
+                            .float64 => |data| {
+                                for (filtered_indices, 0..) |idx, i| val_buf[i] = data[idx];
+                            },
+                            .int32 => |data| {
+                                for (filtered_indices, 0..) |idx, i| val_buf[i] = @floatFromInt(data[idx]);
+                            },
+                            .float32 => |data| {
+                                for (filtered_indices, 0..) |idx, i| val_buf[i] = data[idx];
+                            },
+                            else => {},
+                        }
+
+                        // Use ve.HashGroupBy.aggregateF64 - SINGLE CODE PATH
+                        gb.aggregateF64(key_buf, val_buf);
+                    }
+                }
+            }
+        }
+
+        // Build result columns from ve.HashGroupBy results
+        var result_columns = std.ArrayListUnmanaged(Result.Column){};
+        errdefer {
+            for (result_columns.items) |col| {
+                col.data.free(self.allocator);
+            }
+            result_columns.deinit(self.allocator);
+        }
+
+        for (stmt.columns) |item| {
+            const col_name = if (item.alias) |a| a else blk: {
+                if (item.expr == .column) break :blk item.expr.column.name;
+                if (item.expr == .call) break :blk item.expr.call.name;
+                break :blk "col";
+            };
+
+            if (item.expr == .column and std.mem.eql(u8, item.expr.column.name, group_col_name)) {
+                // Group key column - output from ve.HashGroupBy
+                const out_data = try self.allocator.alloc(i64, num_groups);
+                for (0..num_groups) |gi| {
+                    out_data[gi] = gb.getGroupKey(gi, key_buf);
+                }
+                try result_columns.append(self.allocator, .{
+                    .name = try self.allocator.dupe(u8, col_name),
+                    .data = .{ .int64 = out_data },
+                });
+            } else if (item.expr == .call and aggregate_functions.isAggregateFunction(item.expr.call.name)) {
+                // Aggregate column - output from ve.HashGroupBy
+                const agg_type = aggregate_functions.parseAggregateType(item.expr.call.name) orelse continue;
+                const out_data = try self.allocator.alloc(f64, num_groups);
+                for (0..num_groups) |gi| {
+                    const agg_state = gb.getGroupAgg(gi);
+                    out_data[gi] = switch (agg_type) {
+                        .sum => agg_state.sum,
+                        .count, .count_star => @floatFromInt(agg_state.count),
+                        .avg => agg_state.getAvg(),
+                        .min => if (agg_state.min == std.math.inf(f64)) 0 else agg_state.min,
+                        .max => if (agg_state.max == -std.math.inf(f64)) 0 else agg_state.max,
+                        else => agg_state.sum,
+                    };
+                }
+                try result_columns.append(self.allocator, .{
+                    .name = try self.allocator.dupe(u8, col_name),
+                    .data = .{ .float64 = out_data },
+                });
+            }
+        }
+
+        var result = Result{
+            .columns = try result_columns.toOwnedSlice(self.allocator),
+            .row_count = num_groups,
+            .allocator = self.allocator,
+        };
+
+        // Apply HAVING clause
+        if (stmt.group_by) |gb_clause| {
+            if (gb_clause.having) |having_expr| {
                 try having_eval.applyHaving(self.allocator, &result, &having_expr, stmt.columns);
             }
         }

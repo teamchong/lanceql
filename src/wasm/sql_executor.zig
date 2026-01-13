@@ -19,6 +19,9 @@ const simd_search = @import("simd_search.zig");
 const lw = @import("lance_writer.zig");
 const minilm = @import("minilm_model.zig");
 
+// DuckDB-style vectorized query engine (shared with native executor)
+const ve = @import("../query/vector_engine.zig");
+
 const RESULT_VERSION: u32 = 1;
 const HEADER_SIZE: u32 = 36;
 const MAX_TABLES: usize = 16;
@@ -30,31 +33,23 @@ const MAX_AGGREGATES: usize = 16;
 const MAX_JOIN_ROWS: usize = 200000;
 const MAX_INSERT_ROWS: usize = 2000;
 const MAX_ROWS: usize = 200000;
-const NULL_SENTINEL_INT: i64 = std.math.minInt(i64);
-const NULL_SENTINEL_FLOAT: f64 = std.math.nan(f64);
+const NULL_SENTINEL_INT: i64 = ve.NULL_INT64; // Use shared null sentinel
+const NULL_SENTINEL_FLOAT: f64 = ve.NULL_FLOAT64;
 const MAX_VECTOR_DIM: usize = 1536; // Support up to OpenAI embedding size
-const VECTOR_SIZE: usize = 1024; // Chunk size for vectorized execution
+const VECTOR_SIZE: usize = ve.VECTOR_SIZE; // Use shared vector size (2048)
 
 // ============================================================================
-// SIMD Types and Primitives (WASM SIMD128 = 128 bits)
+// SIMD Types from shared vector_engine (WASM SIMD128 = 128 bits)
 // ============================================================================
-const Vec2i64 = @Vector(2, i64);
-const Vec2u64 = @Vector(2, u64);
-const Vec4f32 = @Vector(4, f32);
-const Vec2f64 = @Vector(2, f64);
-const Vec4i32 = @Vector(4, i32);
-const Vec4u32 = @Vector(4, u32);
+const Vec2i64 = ve.Vec2i64;
+const Vec2u64 = ve.Vec2u64;
+const Vec4f32 = ve.Vec4f32;
+const Vec2f64 = ve.Vec2f64;
+const Vec4i32 = ve.Vec4i32;
+const Vec4u32 = @Vector(4, u32); // Not in ve, keep local
 
-/// SIMD hash 2 i64 values at once (MurmurHash3 finalizer)
-inline fn simdHash2(values: Vec2i64) Vec2u64 {
-    var h: Vec2u64 = @bitCast(values);
-    h ^= h >> @splat(33);
-    h *%= @splat(0xff51afd7ed558ccd);
-    h ^= h >> @splat(33);
-    h *%= @splat(0xc4ceb9fe1a85ec53);
-    h ^= h >> @splat(33);
-    return h;
-}
+/// SIMD hash 2 i64 values at once (MurmurHash3 finalizer) - use shared implementation
+const simdHash2 = ve.LinearHashTable.hash64x2;
 
 /// SIMD sum of f64 array (2-wide)
 inline fn simdSumF64(ptr: [*]const f64, len: usize) f64 {
@@ -179,16 +174,8 @@ var hash_buckets: [HASH_TABLE_SIZE]u32 = undefined; // Head of each bucket chain
 var hash_entries: [HASH_CHAIN_SIZE]HashEntry = undefined; // All entries
 var hash_entry_count: usize = 0;
 
-/// Fast integer hash function (based on MurmurHash3 finalizer)
-inline fn hashInt64(value: i64) u64 {
-    var h: u64 = @bitCast(value);
-    h ^= h >> 33;
-    h *%= 0xff51afd7ed558ccd;
-    h ^= h >> 33;
-    h *%= 0xc4ceb9fe1a85ec53;
-    h ^= h >> 33;
-    return h;
-}
+/// Fast integer hash function (based on MurmurHash3 finalizer) - use shared implementation
+const hashInt64 = ve.LinearHashTable.hash64;
 
 /// Initialize hash table (clear all buckets)
 fn hashTableInit() void {
@@ -577,60 +564,12 @@ inline fn groupHashGetFirstRow(group_id: u32) u32 {
 }
 
 // ============================================================================
-// Vectorized Aggregation State (process batches of values)
+// Vectorized Aggregation State (SHARED with native executor via vector_engine)
 // ============================================================================
 const AGG_BATCH_SIZE: usize = 1024;
 
-/// Aggregation state per group
-const AggState = struct {
-    sum: f64 = 0,
-    count: u64 = 0,
-    min: f64 = std.math.inf(f64),
-    max: f64 = -std.math.inf(f64),
-
-    /// Update with single value
-    inline fn update(self: *AggState, val: f64) void {
-        self.sum += val;
-        self.count += 1;
-        if (val < self.min) self.min = val;
-        if (val > self.max) self.max = val;
-    }
-
-    /// Update with 4 values (manual unroll for SIMD-like behavior)
-    inline fn updateBatch4(self: *AggState, v0: f64, v1: f64, v2: f64, v3: f64) void {
-        self.sum += v0 + v1 + v2 + v3;
-        self.count += 4;
-        const min01 = @min(v0, v1);
-        const min23 = @min(v2, v3);
-        const max01 = @max(v0, v1);
-        const max23 = @max(v2, v3);
-        if (@min(min01, min23) < self.min) self.min = @min(min01, min23);
-        if (@max(max01, max23) > self.max) self.max = @max(max01, max23);
-    }
-
-    /// SIMD batch update from contiguous f64 array
-    fn updateContiguous(self: *AggState, ptr: [*]const f64, len: usize) void {
-        if (len == 0) return;
-        self.sum += simdSumF64(ptr, len);
-        self.count += len;
-        const batch_min = simdMinF64(ptr, len);
-        const batch_max = simdMaxF64(ptr, len);
-        if (batch_min < self.min) self.min = batch_min;
-        if (batch_max > self.max) self.max = batch_max;
-    }
-
-    /// Finalize to result based on aggregate function
-    fn finalize(self: *const AggState, func: aggregates.AggFunc) f64 {
-        return switch (func) {
-            .sum => self.sum,
-            .count => @floatFromInt(self.count),
-            .avg => if (self.count > 0) self.sum / @as(f64, @floatFromInt(self.count)) else 0,
-            .min => if (self.min == std.math.inf(f64)) 0 else self.min,
-            .max => if (self.max == -std.math.inf(f64)) 0 else self.max,
-            else => self.sum,
-        };
-    }
-};
+/// Aggregation state per group - use shared implementation from vector_engine
+const AggState = ve.AggState;
 
 /// Global aggregation states per group (up to MAX_GROUP_ENTRIES groups × MAX_AGGREGATES aggs)
 var global_agg_states: [MAX_GROUP_ENTRIES * MAX_AGGREGATES]AggState = undefined;
@@ -9981,7 +9920,10 @@ fn executeMultiDimAggQuery(table: *const TableInfo, query: *const ParsedQuery, m
 }
 
 fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe_indices: ?[]const u32) !void {
-    // Hash-based GROUP BY - O(n) instead of O(n*k)
+    // =========================================================================
+    // SINGLE CODE PATH: Use shared ve.HashGroupBy from vector_engine
+    // Same implementation for WASM and native executors
+    // =========================================================================
     if (query.group_by_count != 1) return error.UnsupportedGroupBy;
 
     const group_col_name = query.group_by_cols[0];
@@ -9997,27 +9939,35 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
     }
 
     const gcol = group_col orelse return error.ColumnNotFound;
-
-    // Use hash-based grouping - O(n) single pass
-    const effective_max_groups = if (query.group_by_top_k) |k| @min(k, MAX_GROUP_ENTRIES) else MAX_GROUP_ENTRIES;
-    const num_groups = groupHashBuild(table, gcol, maybe_indices, effective_max_groups);
-
-    // Initialize aggregation states for all groups × all aggregates
     const num_aggs = query.agg_count;
-    for (0..num_groups * num_aggs) |i| {
-        global_agg_states[i] = AggState{};
-    }
-
-    // Single-pass aggregation using row_group_ids mapping
     const row_count = if (maybe_indices) |idx| idx.len else table.row_count;
 
-    // For each aggregate, process all rows in batches
-    for (query.aggregates[0..num_aggs], 0..) |agg, agg_idx| {
-        // COUNT(*) or COUNT with empty column - just uses group counts
+    // Materialize group key column into i64 slice for ve.HashGroupBy
+    const key_buf = try memory.wasm_allocator.alloc(i64, row_count);
+    defer memory.wasm_allocator.free(key_buf);
+
+    if (maybe_indices) |indices| {
+        for (indices, 0..) |idx, i| {
+            key_buf[i] = getIntValue(table, gcol, idx);
+        }
+    } else {
+        for (0..row_count) |i| {
+            key_buf[i] = getIntValue(table, gcol, @intCast(i));
+        }
+    }
+
+    // Use shared ve.HashGroupBy - SINGLE CODE PATH
+    var gb = try ve.HashGroupBy.init(memory.wasm_allocator, MAX_GROUP_ENTRIES);
+    defer gb.deinit();
+
+    try gb.buildGroups(key_buf);
+    const num_groups = gb.groupCount();
+
+    // For each aggregate, materialize column and use ve.HashGroupBy.aggregateF64
+    for (query.aggregates[0..num_aggs]) |agg| {
+        // COUNT(*) - use group counts from HashGroupBy
         if (agg.func == .count and (std.mem.eql(u8, agg.column, "*") or agg.column.len == 0)) {
-            for (0..num_groups) |gi| {
-                global_agg_states[gi * num_aggs + agg_idx].count = groupHashGetCount(@intCast(gi));
-            }
+            // Count is tracked per group in HashGroupBy
             continue;
         }
 
@@ -10033,60 +9983,40 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
         }
 
         if (agg_col) |acol| {
-            // Process rows in batches for better cache locality
-            var batch_start: usize = 0;
-            while (batch_start < row_count) {
-                const batch_end = @min(batch_start + AGG_BATCH_SIZE, row_count);
+            // Materialize aggregate column
+            const val_buf = try memory.wasm_allocator.alloc(f64, row_count);
+            defer memory.wasm_allocator.free(val_buf);
 
-                // Process batch - update aggregation states
-                var i = batch_start;
-                while (i + 4 <= batch_end) : (i += 4) {
-                    // Unrolled loop for 4 rows at a time
-                    const gid0 = row_group_ids[i];
-                    const gid1 = row_group_ids[i + 1];
-                    const gid2 = row_group_ids[i + 2];
-                    const gid3 = row_group_ids[i + 3];
-
-                    const ri0: u32 = if (maybe_indices) |idx| idx[i] else @intCast(i);
-                    const ri1: u32 = if (maybe_indices) |idx| idx[i + 1] else @intCast(i + 1);
-                    const ri2: u32 = if (maybe_indices) |idx| idx[i + 2] else @intCast(i + 2);
-                    const ri3: u32 = if (maybe_indices) |idx| idx[i + 3] else @intCast(i + 3);
-
-                    // Get values
-                    const v0 = getFloatValue(table, acol, ri0);
-                    const v1 = getFloatValue(table, acol, ri1);
-                    const v2 = getFloatValue(table, acol, ri2);
-                    const v3 = getFloatValue(table, acol, ri3);
-
-                    // Update states (skip overflow groups)
-                    if (gid0 != std.math.maxInt(u32)) global_agg_states[gid0 * num_aggs + agg_idx].update(v0);
-                    if (gid1 != std.math.maxInt(u32)) global_agg_states[gid1 * num_aggs + agg_idx].update(v1);
-                    if (gid2 != std.math.maxInt(u32)) global_agg_states[gid2 * num_aggs + agg_idx].update(v2);
-                    if (gid3 != std.math.maxInt(u32)) global_agg_states[gid3 * num_aggs + agg_idx].update(v3);
+            if (maybe_indices) |indices| {
+                for (indices, 0..) |idx, i| {
+                    val_buf[i] = getFloatValue(table, acol, idx);
                 }
-
-                // Handle remaining rows
-                while (i < batch_end) : (i += 1) {
-                    const gid = row_group_ids[i];
-                    if (gid == std.math.maxInt(u32)) continue;
-
-                    const ri: u32 = if (maybe_indices) |idx| idx[i] else @intCast(i);
-                    const v = getFloatValue(table, acol, ri);
-                    global_agg_states[gid * num_aggs + agg_idx].update(v);
+            } else {
+                for (0..row_count) |i| {
+                    val_buf[i] = getFloatValue(table, acol, @intCast(i));
                 }
-
-                batch_start = batch_end;
             }
+
+            // Use shared ve.HashGroupBy.aggregateF64 - SINGLE CODE PATH
+            gb.aggregateF64(key_buf, val_buf);
         }
     }
 
-    // Finalize aggregation results
+    // Extract results from ve.HashGroupBy
     const all_agg_results = try memory.wasm_allocator.alloc(f64, num_groups * num_aggs);
     defer memory.wasm_allocator.free(all_agg_results);
 
     for (0..num_groups) |gi| {
-        for (0..num_aggs) |ai| {
-            all_agg_results[gi * num_aggs + ai] = global_agg_states[gi * num_aggs + ai].finalize(query.aggregates[ai].func);
+        const agg_state = gb.getGroupAgg(gi);
+        for (query.aggregates[0..num_aggs], 0..) |agg, ai| {
+            all_agg_results[gi * num_aggs + ai] = switch (agg.func) {
+                .sum => agg_state.sum,
+                .count => @floatFromInt(agg_state.count),
+                .avg => agg_state.getAvg(),
+                .min => if (agg_state.min == std.math.inf(f64)) 0 else agg_state.min,
+                .max => if (agg_state.max == -std.math.inf(f64)) 0 else agg_state.max,
+                else => agg_state.sum,
+            };
         }
     }
 
@@ -10136,7 +10066,7 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
         var total_len: usize = 0;
         for (0..num_groups) |gi| {
             if (survivors[gi]) {
-                const representative_idx = groupHashGetFirstRow(@intCast(gi));
+                const representative_idx = gb.getGroupFirstRow(gi);
                 const str_val = getStringValueOptimized(table, gcol, representative_idx, &ctx);
                 total_len += str_val.len;
             }
@@ -10153,7 +10083,7 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
         var out_idx: usize = 0;
         for (0..num_groups) |gi| {
             if (survivors[gi]) {
-                const representative_idx = groupHashGetFirstRow(@intCast(gi));
+                const representative_idx = gb.getGroupFirstRow(gi);
                 const str_val = getStringValueOptimized(table, gcol, representative_idx, &ctx);
                 offsets[out_idx] = @intCast(current_offset);
                 @memcpy(str_data[current_offset..][0..str_val.len], str_val);
@@ -10170,7 +10100,7 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
         var out_idx: usize = 0;
         for (0..num_groups) |gi| {
             if (survivors[gi]) {
-                group_keys_out[out_idx] = @floatFromInt(groupHashGetKey(@intCast(gi)));
+                group_keys_out[out_idx] = @floatFromInt(gb.getGroupKey(gi, key_buf));
                 out_idx += 1;
             }
         }
@@ -10198,7 +10128,7 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
             var total_str_len: usize = 0;
             for (0..num_groups) |gi| {
                 if (!survivors[gi]) continue;
-                const key = groupHashGetKey(@intCast(gi));
+                const key = gb.getGroupKey(gi, key_buf);
                 var first_in_group = true;
 
                 if (maybe_indices) |indices| {
@@ -10235,7 +10165,7 @@ fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe
             for (0..num_groups) |gi| {
                 if (!survivors[gi]) continue;
                 offsets[out_idx] = @intCast(current_offset);
-                const key = groupHashGetKey(@intCast(gi));
+                const key = gb.getGroupKey(gi, key_buf);
                 var first_in_group = true;
 
                 if (maybe_indices) |indices| {

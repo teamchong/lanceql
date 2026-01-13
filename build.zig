@@ -135,6 +135,12 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/hash.zig"),
     });
 
+    // DuckDB-style vectorized query engine primitives
+    // Shared between native and WASM executors for consistent performance
+    const vector_engine_mod = b.addModule("lanceql.query.vector_engine", .{
+        .root_source_file = b.path("src/query/vector_engine.zig"),
+    });
+
     const table_mod = b.addModule("lanceql.table", .{
         .root_source_file = b.path("src/table.zig"),
         .imports = &.{
@@ -293,6 +299,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lanceql.hash", .module = hash_mod },
             .{ .name = "lanceql.format", .module = format_mod },
             .{ .name = "lanceql.codegen", .module = codegen_mod },
+            .{ .name = "lanceql.vector_engine", .module = vector_engine_mod },
         },
     });
 
@@ -1068,7 +1075,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/wasm.zig"),
             .target = wasm_target,
             .optimize = .ReleaseSmall,
-            // No imports needed - wasm.zig is self-contained
+            .imports = &.{
+                // DuckDB-style vectorized query engine (shared with native)
+                .{ .name = "vector_engine", .module = vector_engine_mod },
+            },
         }),
     });
     wasm.entry = .disabled;

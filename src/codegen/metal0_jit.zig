@@ -938,15 +938,16 @@ fn jitCompileSource(
         src_path,
     };
 
-    // Explicitly build env_map to avoid Linux panic when /proc/self/environ is unavailable
+    // Build environment with minimal PATH for spawning zig compiler
+    // We use a hardcoded minimal environment to avoid issues with
+    // /proc/self/environ being unavailable in foreign contexts (Node.js, etc.)
     var env_map2 = std.process.EnvMap.init(allocator);
     defer env_map2.deinit();
-    const env_vars2 = [_][]const u8{ "PATH", "HOME", "USER", "TMPDIR", "TMP", "TEMP", "XDG_CACHE_HOME", "ZIG_LOCAL_CACHE_DIR", "ZIG_GLOBAL_CACHE_DIR" };
-    for (env_vars2) |key| {
-        if (std.posix.getenv(key)) |value| {
-            env_map2.put(key, value) catch {};
-        }
-    }
+
+    // Minimal environment needed for zig compiler
+    env_map2.put("PATH", "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:/home/teamchong/.local/bin:/home/teamchong/.local/zig") catch {};
+    env_map2.put("HOME", "/tmp") catch {};
+    env_map2.put("TMPDIR", "/tmp") catch {};
 
     var child = std.process.Child.init(&argv, allocator);
     child.stderr_behavior = .Pipe;
@@ -967,13 +968,30 @@ fn jitCompileSource(
     // Clean up source file
     std.fs.cwd().deleteFile(src_path) catch {};
 
-    if (result.Exited != 0) {
-        if (stderr_output.len > 0) {
-            std.log.err("JIT compile failed: {s}", .{stderr_output});
-        } else {
-            std.log.err("JIT compile failed with exit code {d}", .{result.Exited});
-        }
-        return error.CompilationFailed;
+    // Check result - handle both normal exit and signal termination
+    switch (result) {
+        .Exited => |code| {
+            if (code != 0) {
+                if (stderr_output.len > 0) {
+                    std.log.err("JIT compile failed: {s}", .{stderr_output});
+                } else {
+                    std.log.err("JIT compile failed with exit code {d}", .{code});
+                }
+                return error.CompilationFailed;
+            }
+        },
+        .Signal => |sig| {
+            std.log.err("JIT compiler killed by signal {d}", .{sig});
+            return error.CompilerFailed;
+        },
+        .Stopped => |sig| {
+            std.log.err("JIT compiler stopped by signal {d}", .{sig});
+            return error.CompilerFailed;
+        },
+        else => {
+            std.log.err("JIT compiler terminated abnormally", .{});
+            return error.CompilerFailed;
+        },
     }
 
     // Load the compiled library
