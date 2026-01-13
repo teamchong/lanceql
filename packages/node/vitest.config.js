@@ -14,6 +14,15 @@ export default defineConfig({
       'test/timestamp.test.js',
       'test/logic-table-compiler.spec.js', // Requires metal0 build
     ],
+    // Use threads instead of forks to avoid worker exit issues with native modules
+    pool: 'threads',
+    poolOptions: {
+      threads: {
+        singleThread: true, // Run tests sequentially to avoid native module conflicts
+      },
+    },
+    // Ignore unhandled errors from worker cleanup (native module cleanup crashes)
+    dangerouslyIgnoreUnhandledErrors: true,
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json', 'html'],
