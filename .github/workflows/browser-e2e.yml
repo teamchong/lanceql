@@ -85,16 +85,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache Zig
+        uses: actions/cache@v4
+        with:
+          path: zig-linux-x86_64-0.15.2
+          key: zig-0.15.2-linux-x86_64
+
       - name: Setup Zig
         run: |
-          apt-get update && apt-get install -y xz-utils
-          # Retry download up to 3 times with 10s delay
-          for i in 1 2 3; do
-            echo "Downloading Zig (attempt $i)..."
-            curl -L --retry 3 --retry-delay 5 -o zig.tar.xz https://ziglang.org/download/0.15.2/zig-linux-x86_64-0.15.2.tar.xz && break
-            sleep 10
-          done
-          tar -xJf zig.tar.xz
+          if [ ! -d "zig-linux-x86_64-0.15.2" ]; then
+            apt-get update && apt-get install -y xz-utils wget
+            # Use wget which handles redirects better
+            wget -q --show-progress https://ziglang.org/download/0.15.2/zig-linux-x86_64-0.15.2.tar.xz
+            tar -xJf zig-linux-x86_64-0.15.2.tar.xz
+            rm zig-linux-x86_64-0.15.2.tar.xz
+          else
+            echo "Using cached Zig"
+          fi
           echo "$PWD/zig-linux-x86_64-0.15.2" >> $GITHUB_PATH
 
       - name: Build WASM module
