@@ -153,7 +153,7 @@ pub const Table = struct {
             if (page.buffer_sizes.len > 0) total_values += page.buffer_sizes[0] / @sizeOf(T);
         }
 
-        var result = self.allocator.alloc(T, total_values) catch return TableError.OutOfMemory;
+        const result = self.allocator.alloc(T, total_values) catch return TableError.OutOfMemory;
         errdefer self.allocator.free(result);
 
         var offset: usize = 0;
