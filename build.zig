@@ -351,7 +351,13 @@ pub fn build(b: *std.Build) void {
             "deps/metal0/vendor/libdeflate/lib/arm/cpu_features.c",
             "deps/metal0/vendor/libdeflate/lib/x86/cpu_features.c",
         },
-        .flags = &.{ "-std=c99", "-O3" },
+        // Disable AVX-512 to avoid compilation errors on CI runners without evex512 support
+        .flags = &.{
+            "-std=c99",
+            "-O3",
+            "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI",
+            "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ",
+        },
     });
     // Link compression libraries
     metal0_runtime.linkSystemLibrary("bz2", .{});
