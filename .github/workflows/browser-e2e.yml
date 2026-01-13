@@ -28,13 +28,23 @@ jobs:
         with:
           node-version: 20
 
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build WASM module
+        run: zig build wasm
+
       - name: Install dependencies
         working-directory: packages/browser
         run: npm install
 
-      - name: Build with esbuild
+      - name: Build with esbuild and copy WASM
         working-directory: packages/browser
-        run: node esbuild.config.js
+        run: |
+          node esbuild.config.js
+          cp ../../zig-out/bin/lanceql.wasm dist/
 
       - name: Install Playwright browsers
         working-directory: packages/browser
@@ -62,12 +72,18 @@ jobs:
       - name: Build WASM module
         run: zig-linux-x86_64-0.15.2/zig build wasm
 
-      - name: Copy WASM to examples
-        run: cp zig-out/bin/lanceql.wasm examples/wasm/
+      - name: Copy WASM to examples and browser package
+        run: |
+          cp zig-out/bin/lanceql.wasm examples/wasm/
+          cp zig-out/bin/lanceql.wasm packages/browser/dist/
 
       - name: Install dependencies
         working-directory: packages/browser
         run: npm install
+
+      - name: Build browser package
+        working-directory: packages/browser
+        run: node esbuild.config.js
 
       - name: Run E2E tests (non-benchmark)
         working-directory: packages/browser
