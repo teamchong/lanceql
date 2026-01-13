@@ -198,33 +198,115 @@ fn hashTableInit() void {
     hash_entry_count = 0;
 }
 
-/// Build hash table from a column of integers (uses getIntValue internally)
+/// Build hash table from a column of integers - ZERO-COPY COLUMNAR
 fn hashTableBuild(table: *const TableInfo, col: *const ColumnData, max_rows: usize) void {
     hashTableInit();
-
     const row_count = @min(table.row_count, max_rows);
+    if (row_count == 0) return;
 
-    for (0..row_count) |i| {
-        const row_idx: u32 = @intCast(i);
-        const value = getIntValue(table, col, row_idx);
+    // ZERO-COPY: Get direct pointer to column data
+    if (!col.is_lazy and col.col_type == .int64) {
+        // Direct columnar access - no copying
+        const values = col.data.int64;
+        hashTableBuildFromSlice(values, row_count);
+        return;
+    }
 
-        // Skip NULL values
-        if (value == NULL_SENTINEL_INT) continue;
+    // Lazy column or type conversion needed - batch materialize first
+    // Allocate temp buffer for column data
+    const buf = memory.wasm_allocator.alloc(i64, row_count) catch return;
+    defer memory.wasm_allocator.free(buf);
 
-        // Compute hash and bucket
-        const h = hashInt64(value);
-        const bucket = @as(usize, @intCast(h & HASH_TABLE_MASK));
+    // Batch read entire column (single pass through fragments)
+    if (col.is_lazy) {
+        var buf_idx: usize = 0;
+        for (table.fragments[0..table.fragment_count]) |maybe_frag| {
+            if (maybe_frag) |frag| {
+                const frag_rows = frag.getRowCount();
+                const to_read = @min(frag_rows, row_count - buf_idx);
+                if (to_read == 0) break;
 
-        // Add entry to chain
-        if (hash_entry_count < HASH_CHAIN_SIZE) {
+                switch (col.col_type) {
+                    .int64 => _ = frag.fragmentReadInt64(col.fragment_col_idx, buf.ptr + buf_idx, to_read, 0),
+                    .int32 => {
+                        // Read i32 and convert
+                        const i32_buf = memory.wasm_allocator.alloc(i32, to_read) catch return;
+                        defer memory.wasm_allocator.free(i32_buf);
+                        _ = frag.fragmentReadInt32(col.fragment_col_idx, i32_buf.ptr, to_read, 0);
+                        for (i32_buf, 0..) |v, j| buf[buf_idx + j] = v;
+                    },
+                    else => {},
+                }
+                buf_idx += to_read;
+            }
+        }
+    } else {
+        // Non-lazy but needs type conversion
+        switch (col.col_type) {
+            .int32 => {
+                const src = col.data.int32;
+                for (src[0..row_count], 0..) |v, i| buf[i] = v;
+            },
+            .float64 => {
+                const src = col.data.float64;
+                for (src[0..row_count], 0..) |v, i| buf[i] = @intFromFloat(v);
+            },
+            else => {},
+        }
+    }
+
+    hashTableBuildFromSlice(buf, row_count);
+}
+
+/// Build hash table from i64 slice - SIMD vectorized
+fn hashTableBuildFromSlice(values: []const i64, row_count: usize) void {
+    var i: usize = 0;
+
+    // SIMD path: hash 2 values at once, then insert sequentially
+    // (insertion must be sequential due to chaining)
+    while (i + 2 <= row_count and hash_entry_count + 2 <= HASH_CHAIN_SIZE) : (i += 2) {
+        const v: Vec2i64 = .{ values[i], values[i + 1] };
+        const h = simdHash2(v);
+
+        // Insert first value
+        if (values[i] != NULL_SENTINEL_INT) {
+            const bucket0 = @as(usize, @intCast(h[0] & HASH_TABLE_MASK));
             hash_entries[hash_entry_count] = HashEntry{
-                .key = value,
-                .row_idx = row_idx,
-                .next = hash_buckets[bucket],
+                .key = values[i],
+                .row_idx = @intCast(i),
+                .next = hash_buckets[bucket0],
             };
-            hash_buckets[bucket] = @intCast(hash_entry_count);
+            hash_buckets[bucket0] = @intCast(hash_entry_count);
             hash_entry_count += 1;
         }
+
+        // Insert second value
+        if (values[i + 1] != NULL_SENTINEL_INT) {
+            const bucket1 = @as(usize, @intCast(h[1] & HASH_TABLE_MASK));
+            hash_entries[hash_entry_count] = HashEntry{
+                .key = values[i + 1],
+                .row_idx = @intCast(i + 1),
+                .next = hash_buckets[bucket1],
+            };
+            hash_buckets[bucket1] = @intCast(hash_entry_count);
+            hash_entry_count += 1;
+        }
+    }
+
+    // Scalar remainder
+    while (i < row_count and hash_entry_count < HASH_CHAIN_SIZE) : (i += 1) {
+        const value = values[i];
+        if (value == NULL_SENTINEL_INT) continue;
+
+        const h = hashInt64(value);
+        const bucket = @as(usize, @intCast(h & HASH_TABLE_MASK));
+        hash_entries[hash_entry_count] = HashEntry{
+            .key = value,
+            .row_idx = @intCast(i),
+            .next = hash_buckets[bucket],
+        };
+        hash_buckets[bucket] = @intCast(hash_entry_count);
+        hash_entry_count += 1;
     }
 }
 
@@ -316,27 +398,145 @@ fn groupHashInit() void {
     group_entry_count = 0;
 }
 
-/// Build group hash table and assign group IDs to rows - O(n)
+/// Build group hash table and assign group IDs to rows - ZERO-COPY COLUMNAR O(n)
 fn groupHashBuild(table: *const TableInfo, col: *const ColumnData, indices: ?[]const u32, max_groups: usize) usize {
     groupHashInit();
 
     const row_count = if (indices) |idx| idx.len else table.row_count;
+    if (row_count == 0) return 0;
 
-    for (0..row_count) |i| {
-        const row_idx: u32 = if (indices) |idx| idx[i] else @intCast(i);
-        const key = getIntValue(table, col, row_idx);
+    // ZERO-COPY path: direct columnar access for non-lazy int64 columns
+    if (!col.is_lazy and col.col_type == .int64 and indices == null) {
+        const values = col.data.int64;
+        return groupHashBuildFromSlice(values, row_count, max_groups);
+    }
 
-        // Hash lookup
-        const h = hashInt64(key);
-        const bucket = @as(usize, @intCast(h & GROUP_HASH_MASK));
+    // Need to materialize column data first
+    const buf = memory.wasm_allocator.alloc(i64, row_count) catch return 0;
+    defer memory.wasm_allocator.free(buf);
 
-        // Find existing group or create new one
+    if (indices) |idx| {
+        // Filtered rows - gather values
+        if (!col.is_lazy and col.col_type == .int64) {
+            const src = col.data.int64;
+            for (idx, 0..) |row_idx, i| buf[i] = src[row_idx];
+        } else {
+            for (idx, 0..) |row_idx, i| buf[i] = getIntValue(table, col, row_idx);
+        }
+    } else if (col.is_lazy) {
+        // Batch read from fragments
+        var buf_idx: usize = 0;
+        for (table.fragments[0..table.fragment_count]) |maybe_frag| {
+            if (maybe_frag) |frag| {
+                const frag_rows = frag.getRowCount();
+                const to_read = @min(frag_rows, row_count - buf_idx);
+                if (to_read == 0) break;
+                switch (col.col_type) {
+                    .int64 => _ = frag.fragmentReadInt64(col.fragment_col_idx, buf.ptr + buf_idx, to_read, 0),
+                    .int32 => {
+                        const i32_buf = memory.wasm_allocator.alloc(i32, to_read) catch return 0;
+                        defer memory.wasm_allocator.free(i32_buf);
+                        _ = frag.fragmentReadInt32(col.fragment_col_idx, i32_buf.ptr, to_read, 0);
+                        for (i32_buf, 0..) |v, j| buf[buf_idx + j] = v;
+                    },
+                    else => {},
+                }
+                buf_idx += to_read;
+            }
+        }
+    } else {
+        // Type conversion
+        switch (col.col_type) {
+            .int32 => {
+                const src = col.data.int32;
+                for (src[0..row_count], 0..) |v, i| buf[i] = v;
+            },
+            .float64 => {
+                const src = col.data.float64;
+                for (src[0..row_count], 0..) |v, i| buf[i] = @intFromFloat(v);
+            },
+            else => {},
+        }
+    }
+
+    return groupHashBuildFromSlice(buf, row_count, max_groups);
+}
+
+/// Build group hash from i64 slice - SIMD vectorized
+fn groupHashBuildFromSlice(values: []const i64, row_count: usize, max_groups: usize) usize {
+    const max_grps = @min(max_groups, MAX_GROUP_ENTRIES);
+
+    // Process with SIMD hash, sequential group assignment
+    var i: usize = 0;
+    while (i + 2 <= row_count) : (i += 2) {
+        const v: Vec2i64 = .{ values[i], values[i + 1] };
+        const h = simdHash2(v);
+
+        // Process first value
+        {
+            const bucket = @as(usize, @intCast(h[0] & GROUP_HASH_MASK));
+            var entry_idx = group_buckets[bucket];
+            var found = false;
+            while (entry_idx != std.math.maxInt(u32)) {
+                if (group_entries[entry_idx].key == values[i]) {
+                    group_entries[entry_idx].count += 1;
+                    row_group_ids[i] = group_entries[entry_idx].group_id;
+                    found = true;
+                    break;
+                }
+                entry_idx = group_entries[entry_idx].next;
+            }
+            if (!found and group_entry_count < max_grps) {
+                const gid: u32 = @intCast(group_entry_count);
+                group_entries[group_entry_count] = GroupEntry{
+                    .key = values[i], .group_id = gid, .count = 1,
+                    .first_row = @intCast(i), .next = group_buckets[bucket],
+                };
+                group_buckets[bucket] = @intCast(group_entry_count);
+                row_group_ids[i] = gid;
+                group_entry_count += 1;
+            } else if (!found) {
+                row_group_ids[i] = std.math.maxInt(u32);
+            }
+        }
+
+        // Process second value
+        {
+            const bucket = @as(usize, @intCast(h[1] & GROUP_HASH_MASK));
+            var entry_idx = group_buckets[bucket];
+            var found = false;
+            while (entry_idx != std.math.maxInt(u32)) {
+                if (group_entries[entry_idx].key == values[i + 1]) {
+                    group_entries[entry_idx].count += 1;
+                    row_group_ids[i + 1] = group_entries[entry_idx].group_id;
+                    found = true;
+                    break;
+                }
+                entry_idx = group_entries[entry_idx].next;
+            }
+            if (!found and group_entry_count < max_grps) {
+                const gid: u32 = @intCast(group_entry_count);
+                group_entries[group_entry_count] = GroupEntry{
+                    .key = values[i + 1], .group_id = gid, .count = 1,
+                    .first_row = @intCast(i + 1), .next = group_buckets[bucket],
+                };
+                group_buckets[bucket] = @intCast(group_entry_count);
+                row_group_ids[i + 1] = gid;
+                group_entry_count += 1;
+            } else if (!found) {
+                row_group_ids[i + 1] = std.math.maxInt(u32);
+            }
+        }
+    }
+
+    // Scalar remainder
+    while (i < row_count) : (i += 1) {
+        const key = values[i];
+        const bucket = @as(usize, @intCast(hashInt64(key) & GROUP_HASH_MASK));
         var entry_idx = group_buckets[bucket];
         var found = false;
-
         while (entry_idx != std.math.maxInt(u32)) {
             if (group_entries[entry_idx].key == key) {
-                // Found existing group
                 group_entries[entry_idx].count += 1;
                 row_group_ids[i] = group_entries[entry_idx].group_id;
                 found = true;
@@ -344,22 +544,16 @@ fn groupHashBuild(table: *const TableInfo, col: *const ColumnData, indices: ?[]c
             }
             entry_idx = group_entries[entry_idx].next;
         }
-
-        if (!found and group_entry_count < @min(max_groups, MAX_GROUP_ENTRIES)) {
-            // Create new group
-            const group_id: u32 = @intCast(group_entry_count);
+        if (!found and group_entry_count < max_grps) {
+            const gid: u32 = @intCast(group_entry_count);
             group_entries[group_entry_count] = GroupEntry{
-                .key = key,
-                .group_id = group_id,
-                .count = 1,
-                .first_row = row_idx,
-                .next = group_buckets[bucket],
+                .key = key, .group_id = gid, .count = 1,
+                .first_row = @intCast(i), .next = group_buckets[bucket],
             };
             group_buckets[bucket] = @intCast(group_entry_count);
-            row_group_ids[i] = group_id;
+            row_group_ids[i] = gid;
             group_entry_count += 1;
         } else if (!found) {
-            // Max groups reached, assign to special overflow group
             row_group_ids[i] = std.math.maxInt(u32);
         }
     }
