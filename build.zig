@@ -135,6 +135,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/hash.zig"),
     });
 
+    // SIMD columnar operations for SQL executor
+    const columnar_ops_mod = b.addModule("lanceql.columnar_ops", .{
+        .root_source_file = b.path("src/columnar_ops.zig"),
+    });
+
     // DuckDB-style vectorized query engine primitives
     // Shared between native and WASM executors for consistent performance
     const vector_engine_mod = b.addModule("lanceql.query.vector_engine", .{
@@ -507,6 +512,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lanceql.format", .module = format_mod },
             .{ .name = "lanceql.codegen", .module = codegen_mod },
             .{ .name = "lanceql.vector_engine", .module = vector_engine_mod },
+            .{ .name = "lanceql.columnar_ops", .module = columnar_ops_mod },
         },
     });
 

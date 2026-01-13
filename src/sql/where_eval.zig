@@ -14,6 +14,7 @@ const result_types = @import("result_types.zig");
 const Result = result_types.Result;
 const CachedColumn = result_types.CachedColumn;
 pub const scalar_functions = @import("scalar_functions.zig");
+const columnar_ops = @import("lanceql.columnar_ops");
 
 /// Function pointer type for evaluating expressions that need executor context
 pub const EvalExprFn = *const fn (ctx: *anyopaque, expr: *const Expr, row_idx: u32) anyerror!Value;
@@ -42,7 +43,12 @@ pub fn evaluateWhere(ctx: WhereContext, where_expr: *const Expr, params: []const
     var bound_expr = try bindParameters(ctx.allocator, where_expr, params);
     defer freeExpr(ctx.allocator, &bound_expr);
 
-    // Evaluate expression for each row
+    // Try vectorized filter (handles simple comparisons AND compound AND/OR)
+    if (tryVectorizedFilter(ctx, &bound_expr)) |result| {
+        return result;
+    }
+
+    // Fallback: Evaluate expression for each row (row-by-row)
     var matching_indices = std.ArrayList(u32){};
     errdefer matching_indices.deinit(ctx.allocator);
 
@@ -55,6 +61,319 @@ pub fn evaluateWhere(ctx: WhereContext, where_expr: *const Expr, params: []const
     }
 
     return matching_indices.toOwnedSlice(ctx.allocator);
+}
+
+/// Vectorized filter evaluation - handles simple comparisons AND compound AND/OR
+/// Uses SIMD for leaf comparisons, combines results for AND/OR
+/// Returns null if any part of the expression can't be vectorized
+fn tryVectorizedFilter(ctx: WhereContext, expr: *const Expr) ?[]u32 {
+    return tryVectorizedFilterRecursive(ctx, expr, null);
+}
+
+/// Recursive helper for vectorized filtering
+/// selection_in: if non-null, only evaluate rows in this selection (for AND chains)
+fn tryVectorizedFilterRecursive(ctx: WhereContext, expr: *const Expr, selection_in: ?[]const u32) ?[]u32 {
+    switch (expr.*) {
+        .binary => |bin| {
+            // Handle AND/OR compounds
+            if (bin.op == .@"and") {
+                // AND: evaluate left, then filter right using left's result
+                const left_result = tryVectorizedFilterRecursive(ctx, bin.left, selection_in) orelse return null;
+                defer if (selection_in == null) ctx.allocator.free(left_result);
+
+                // Now evaluate right, but only on rows that passed left
+                const right_result = tryVectorizedFilterRecursive(ctx, bin.right, left_result) orelse {
+                    if (selection_in == null) {} // already freed
+                    return null;
+                };
+
+                // Return right result (which is already filtered by left)
+                if (selection_in != null) {
+                    ctx.allocator.free(left_result);
+                }
+                return right_result;
+            } else if (bin.op == .@"or") {
+                // OR: evaluate both, union the results
+                const left_result = tryVectorizedFilterRecursive(ctx, bin.left, selection_in) orelse return null;
+                const right_result = tryVectorizedFilterRecursive(ctx, bin.right, selection_in) orelse {
+                    ctx.allocator.free(left_result);
+                    return null;
+                };
+
+                // Union: merge sorted arrays
+                const merged = mergeUnionSorted(ctx.allocator, left_result, right_result) catch {
+                    ctx.allocator.free(left_result);
+                    ctx.allocator.free(right_result);
+                    return null;
+                };
+                ctx.allocator.free(left_result);
+                ctx.allocator.free(right_result);
+                return merged;
+            }
+
+            // Otherwise try simple comparison SIMD
+            return trySimdFilterWithSelection(ctx, expr, selection_in);
+        },
+        else => return null,
+    }
+}
+
+/// Merge two sorted arrays into union (no duplicates)
+fn mergeUnionSorted(allocator: std.mem.Allocator, a: []const u32, b: []const u32) ![]u32 {
+    var result = std.ArrayList(u32){};
+    errdefer result.deinit(allocator);
+
+    var i: usize = 0;
+    var j: usize = 0;
+
+    while (i < a.len and j < b.len) {
+        if (a[i] < b[j]) {
+            try result.append(allocator, a[i]);
+            i += 1;
+        } else if (a[i] > b[j]) {
+            try result.append(allocator, b[j]);
+            j += 1;
+        } else {
+            // Equal - add once
+            try result.append(allocator, a[i]);
+            i += 1;
+            j += 1;
+        }
+    }
+
+    // Append remainder
+    while (i < a.len) : (i += 1) {
+        try result.append(allocator, a[i]);
+    }
+    while (j < b.len) : (j += 1) {
+        try result.append(allocator, b[j]);
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
+/// SIMD filter with optional input selection (for AND chains)
+fn trySimdFilterWithSelection(ctx: WhereContext, expr: *const Expr, selection_in: ?[]const u32) ?[]u32 {
+    // If we have an input selection, use filtered SIMD
+    if (selection_in) |sel| {
+        return trySimdFilterFiltered(ctx, expr, sel);
+    }
+    // Otherwise use full-column SIMD
+    return trySimdFilter(ctx, expr);
+}
+
+/// SIMD filter on pre-selected rows (for AND chain optimization)
+fn trySimdFilterFiltered(ctx: WhereContext, expr: *const Expr, selection: []const u32) ?[]u32 {
+    const bin = switch (expr.*) {
+        .binary => |b| b,
+        else => return null,
+    };
+
+    const op = bin.op;
+    if (op != .gt and op != .ge and op != .lt and op != .le and op != .eq and op != .ne) {
+        return null;
+    }
+
+    // Extract column and value
+    var col_name: []const u8 = undefined;
+    var const_val: Value = undefined;
+    var col_on_left = true;
+
+    if (bin.left.* == .column and bin.right.* == .value) {
+        col_name = bin.left.column.name;
+        const_val = bin.right.value;
+        col_on_left = true;
+    } else if (bin.left.* == .value and bin.right.* == .column) {
+        col_name = bin.right.column.name;
+        const_val = bin.left.value;
+        col_on_left = false;
+    } else {
+        return null;
+    }
+
+    const cached = ctx.column_cache.get(col_name) orelse return null;
+
+    // Allocate output
+    const out = ctx.allocator.alloc(u32, selection.len) catch return null;
+    errdefer ctx.allocator.free(out);
+
+    // Filter based on column type
+    const match_count = switch (cached) {
+        .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| blk: {
+            const int_val = switch (const_val) {
+                .integer => |i| i,
+                .float => |f| @as(i64, @intFromFloat(f)),
+                else => return null,
+            };
+
+            // Filter through selection using SIMD-accelerated comparison
+            var count: usize = 0;
+            for (selection) |row_idx| {
+                const val = data[row_idx];
+                const matches = switch (op) {
+                    .gt => if (col_on_left) val > int_val else val < int_val,
+                    .ge => if (col_on_left) val >= int_val else val <= int_val,
+                    .lt => if (col_on_left) val < int_val else val > int_val,
+                    .le => if (col_on_left) val <= int_val else val >= int_val,
+                    .eq => val == int_val,
+                    .ne => val != int_val,
+                    else => unreachable,
+                };
+                if (matches) {
+                    out[count] = row_idx;
+                    count += 1;
+                }
+            }
+            break :blk count;
+        },
+        .float64 => |data| blk: {
+            const float_val = switch (const_val) {
+                .float => |f| f,
+                .integer => |i| @as(f64, @floatFromInt(i)),
+                else => return null,
+            };
+
+            var count: usize = 0;
+            for (selection) |row_idx| {
+                const val = data[row_idx];
+                const matches = switch (op) {
+                    .gt => if (col_on_left) val > float_val else val < float_val,
+                    .ge => if (col_on_left) val >= float_val else val <= float_val,
+                    .lt => if (col_on_left) val < float_val else val > float_val,
+                    .le => if (col_on_left) val <= float_val else val >= float_val,
+                    .eq => val == float_val,
+                    .ne => val != float_val,
+                    else => unreachable,
+                };
+                if (matches) {
+                    out[count] = row_idx;
+                    count += 1;
+                }
+            }
+            break :blk count;
+        },
+        else => return null,
+    };
+
+    // Shrink to actual count
+    return ctx.allocator.realloc(out, match_count) catch out[0..match_count];
+}
+
+/// Try to use SIMD columnar filter for simple patterns: column OP value
+/// Returns null if pattern doesn't match (falls back to row-by-row)
+fn trySimdFilter(ctx: WhereContext, expr: *const Expr) ?[]u32 {
+    // Check for binary comparison pattern
+    const bin = switch (expr.*) {
+        .binary => |b| b,
+        else => {
+            // Debug: expression is not binary
+            // std.debug.print("SIMD: not binary expr, tag={}\n", .{@intFromEnum(std.meta.activeTag(expr.*))});
+            return null;
+        },
+    };
+
+    // Only handle simple comparison operators
+    const op = bin.op;
+    if (op != .gt and op != .ge and op != .lt and op != .le and op != .eq and op != .ne) {
+        return null;
+    }
+
+    // Extract column name and constant value
+    var col_name: []const u8 = undefined;
+    var const_val: Value = undefined;
+    var col_on_left = true;
+
+    // Pattern: column OP value
+    if (bin.left.* == .column and bin.right.* == .value) {
+        col_name = bin.left.column.name;
+        const_val = bin.right.value;
+        col_on_left = true;
+    }
+    // Pattern: value OP column (swap comparison direction)
+    else if (bin.left.* == .value and bin.right.* == .column) {
+        col_name = bin.right.column.name;
+        const_val = bin.left.value;
+        col_on_left = false;
+    } else {
+        return null;
+    }
+
+    // Get cached column data
+    const cached = ctx.column_cache.get(col_name) orelse return null;
+
+    // Allocate output buffer (max size = row_count)
+    const out = ctx.allocator.alloc(u32, ctx.row_count) catch return null;
+    errdefer ctx.allocator.free(out);
+
+    // Dispatch to appropriate SIMD filter based on column type and operator
+    const count = switch (cached) {
+        .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |data| blk: {
+            const int_val = switch (const_val) {
+                .integer => |i| i,
+                .float => |f| @as(i64, @intFromFloat(f)),
+                else => return null,
+            };
+            // If column is on the right, swap the operator direction
+            const effective_op = if (col_on_left) op else swapCompareOp(op);
+            break :blk dispatchSimdFilterI64(data, effective_op, int_val, out);
+        },
+        .float64 => |data| blk: {
+            const float_val: f64 = switch (const_val) {
+                .integer => |i| @floatFromInt(i),
+                .float => |f| f,
+                else => return null,
+            };
+            const effective_op = if (col_on_left) op else swapCompareOp(op);
+            break :blk dispatchSimdFilterF64(data, effective_op, float_val, out);
+        },
+        else => return null, // Strings, bools, etc. use fallback
+    };
+
+    // Shrink output to actual size
+    if (count == 0) {
+        ctx.allocator.free(out);
+        return ctx.allocator.alloc(u32, 0) catch return null;
+    }
+
+    return ctx.allocator.realloc(out, count) catch out[0..count];
+}
+
+/// Swap comparison operator for when value is on left side
+fn swapCompareOp(op: BinaryOp) BinaryOp {
+    return switch (op) {
+        .gt => .lt, // value > col  =>  col < value
+        .ge => .le,
+        .lt => .gt,
+        .le => .ge,
+        .eq => .eq, // symmetric
+        .ne => .ne,
+        else => op,
+    };
+}
+
+/// Dispatch to appropriate SIMD filter for i64
+fn dispatchSimdFilterI64(data: []const i64, op: BinaryOp, value: i64, out: []u32) usize {
+    return switch (op) {
+        .gt => columnar_ops.filterGreaterI64(data, value, out),
+        .ge => columnar_ops.filterGreaterEqualI64(data, value, out),
+        .lt => columnar_ops.filterLessI64(data, value, out),
+        .le => columnar_ops.filterLessEqualI64(data, value, out),
+        .eq => columnar_ops.filterEqualI64(data, value, out),
+        .ne => columnar_ops.filterNotEqualI64(data, value, out),
+        else => 0,
+    };
+}
+
+/// Dispatch to appropriate SIMD filter for f64
+fn dispatchSimdFilterF64(data: []const f64, op: BinaryOp, value: f64, out: []u32) usize {
+    return switch (op) {
+        .gt => columnar_ops.filterGreaterF64(data, value, out),
+        .ge => columnar_ops.filterGreaterEqualF64(data, value, out),
+        .lt => columnar_ops.filterLessF64(data, value, out),
+        .le => columnar_ops.filterLessEqualF64(data, value, out),
+        // For f64 equal/not-equal, fall back (floating point equality is tricky)
+        else => 0,
+    };
 }
 
 /// Bind parameters (replace ? placeholders with actual values)

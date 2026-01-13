@@ -3,6 +3,7 @@
 //! This module provides a VFS (Virtual File System) abstraction that allows
 //! the same Lance parsing code to work with:
 //! - Native file system (FileReader)
+//! - Memory-mapped files (MmapReader) - zero-copy, cached
 //! - In-memory buffers (MemoryReader)
 //! - HTTP Range requests (HttpReader)
 
@@ -10,6 +11,7 @@ const std = @import("std");
 
 pub const reader = @import("reader.zig");
 pub const file_reader = @import("file_reader.zig");
+pub const mmap_reader = @import("mmap_reader.zig");
 pub const memory_reader = @import("memory_reader.zig");
 pub const http_reader = @import("http_reader.zig");
 
@@ -17,8 +19,14 @@ pub const http_reader = @import("http_reader.zig");
 pub const Reader = reader.Reader;
 pub const ReadError = reader.ReadError;
 pub const FileReader = file_reader.FileReader;
+pub const MmapReader = mmap_reader.MmapReader;
+pub const FileCache = mmap_reader.FileCache;
 pub const MemoryReader = memory_reader.MemoryReader;
 pub const HttpReader = http_reader.HttpReader;
+
+// Global cache functions
+pub const initGlobalCache = mmap_reader.initGlobalCache;
+pub const deinitGlobalCache = mmap_reader.deinitGlobalCache;
 
 test {
     std.testing.refAllDecls(@This());

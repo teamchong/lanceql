@@ -16,6 +16,7 @@ pub const aggregate_functions = @import("aggregate_functions.zig");
 const AggregateType = aggregate_functions.AggregateType;
 const Accumulator = aggregate_functions.Accumulator;
 const PercentileAccumulator = aggregate_functions.PercentileAccumulator;
+const columnar_ops = @import("lanceql.columnar_ops");
 
 /// Group evaluation context
 pub const GroupContext = struct {
@@ -297,6 +298,20 @@ fn evaluateFloatAggregate(
     while (iter.next()) |entry| {
         const row_indices = entry.value_ptr.items;
 
+        // SIMD fast path for AVG on f64 columns
+        if (agg_type == .avg and agg_col_name != null) {
+            const col_name = agg_col_name.?;
+            const cached = ctx.column_cache.get(col_name) orelse return error.ColumnNotCached;
+
+            const simd_result = trySimdFloatAggregate(cached, row_indices, agg_type);
+            if (simd_result) |result| {
+                results[group_idx] = result;
+                group_idx += 1;
+                continue;
+            }
+        }
+
+        // Fallback: row-by-row accumulation (for STDDEV, VARIANCE, or non-f64)
         var acc = Accumulator.init(agg_type);
 
         for (row_indices) |row_idx| {
@@ -315,6 +330,26 @@ fn evaluateFloatAggregate(
     return Result.Column{
         .name = item.alias orelse call.name,
         .data = Result.ColumnData{ .float64 = results },
+    };
+}
+
+/// Try SIMD aggregate on f64 column, returns null if not applicable
+fn trySimdFloatAggregate(cached: CachedColumn, row_indices: []const u32, agg_type: AggregateType) ?f64 {
+    // Only handle f64 columns
+    const data: []const f64 = switch (cached) {
+        .float64 => |d| d,
+        else => return null,
+    };
+
+    if (row_indices.len == 0) return 0;
+
+    return switch (agg_type) {
+        .avg => blk: {
+            // AVG = SUM / COUNT using SIMD sum
+            const sum = columnar_ops.sumFilteredF64(data, row_indices);
+            break :blk sum / @as(f64, @floatFromInt(row_indices.len));
+        },
+        else => null, // STDDEV, VARIANCE need more complex accumulation
     };
 }
 
@@ -346,6 +381,20 @@ fn evaluateIntAggregate(
     while (iter.next()) |entry| {
         const row_indices = entry.value_ptr.items;
 
+        // SIMD fast path for simple aggregates on i64 columns
+        if (agg_col_name) |col_name| {
+            const cached = ctx.column_cache.get(col_name) orelse return error.ColumnNotCached;
+
+            // Try SIMD path for i64 columns
+            const simd_result = trySimdIntAggregate(cached, row_indices, agg_type);
+            if (simd_result) |result| {
+                results[group_idx] = result;
+                group_idx += 1;
+                continue;
+            }
+        }
+
+        // Fallback: row-by-row accumulation
         var acc = Accumulator.init(agg_type);
 
         for (row_indices) |row_idx| {
@@ -366,6 +415,28 @@ fn evaluateIntAggregate(
     return Result.Column{
         .name = item.alias orelse call.name,
         .data = Result.ColumnData{ .int64 = results },
+    };
+}
+
+/// Try SIMD aggregate on i64 column, returns null if not applicable
+fn trySimdIntAggregate(cached: CachedColumn, row_indices: []const u32, agg_type: AggregateType) ?i64 {
+    // Only handle i64 columns (and timestamp/date variants which are stored as i64)
+    const data: []const i64 = switch (cached) {
+        .int64, .timestamp_s, .timestamp_ms, .timestamp_us, .timestamp_ns, .date64 => |d| d,
+        else => return null,
+    };
+
+    return switch (agg_type) {
+        .sum => blk: {
+            // Use filtered SIMD sum
+            const sum128 = columnar_ops.sumFilteredI64(data, row_indices);
+            // Clamp to i64 (overflow is possible but matches row-by-row behavior)
+            break :blk @as(i64, @intCast(@min(@max(sum128, std.math.minInt(i64)), std.math.maxInt(i64))));
+        },
+        .min => columnar_ops.minFilteredI64(data, row_indices),
+        .max => columnar_ops.maxFilteredI64(data, row_indices),
+        .count, .count_star => @intCast(row_indices.len),
+        else => null, // AVG, STDDEV, etc. need float path
     };
 }
 
