@@ -88,7 +88,13 @@ jobs:
       - name: Setup Zig
         run: |
           apt-get update && apt-get install -y xz-utils
-          curl -L https://ziglang.org/download/0.15.2/zig-linux-x86_64-0.15.2.tar.xz | tar -xJ
+          # Retry download up to 3 times with 10s delay
+          for i in 1 2 3; do
+            echo "Downloading Zig (attempt $i)..."
+            curl -L --retry 3 --retry-delay 5 -o zig.tar.xz https://ziglang.org/download/0.15.2/zig-linux-x86_64-0.15.2.tar.xz && break
+            sleep 10
+          done
+          tar -xJf zig.tar.xz
           echo "$PWD/zig-linux-x86_64-0.15.2" >> $GITHUB_PATH
 
       - name: Build WASM module
