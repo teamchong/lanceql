@@ -927,9 +927,25 @@ fn jitCompileSource(
     const emit_bin_arg = std.fmt.bufPrint(&emit_bin_buf, "-femit-bin={s}", .{full_lib_path}) catch
         return error.PathTooLong;
 
+    // Find zig compiler - try common locations
+    const zig_paths = [_][]const u8{
+        "/home/teamchong/.local/zig/zig", // Ubuntu user install
+        "/usr/local/bin/zig",
+        "/opt/homebrew/bin/zig", // macOS homebrew
+        "/usr/bin/zig",
+        "zig", // fallback to PATH
+    };
+    var zig_cmd: []const u8 = "zig";
+    for (zig_paths) |path| {
+        if (std.fs.cwd().access(path, .{})) |_| {
+            zig_cmd = path;
+            break;
+        } else |_| continue;
+    }
+
     // Build shared library using zig build-lib
     const argv = [_][]const u8{
-        "zig",
+        zig_cmd,
         "build-lib",
         "-dynamic",
         "-O",
@@ -965,9 +981,6 @@ fn jitCompileSource(
 
     const result = child.wait() catch return error.CompilerFailed;
 
-    // Clean up source file
-    std.fs.cwd().deleteFile(src_path) catch {};
-
     // Check result - handle both normal exit and signal termination
     switch (result) {
         .Exited => |code| {
@@ -977,22 +990,30 @@ fn jitCompileSource(
                 } else {
                     std.log.err("JIT compile failed with exit code {d}", .{code});
                 }
+                // Clean up on failure
+                std.fs.cwd().deleteFile(src_path) catch {};
                 return error.CompilationFailed;
             }
         },
         .Signal => |sig| {
-            std.log.err("JIT compiler killed by signal {d}", .{sig});
+            std.log.err("JIT compiler killed by signal {d}, source preserved at: {s}", .{ sig, src_path });
+            // Don't delete source file on signal - useful for debugging
             return error.CompilerFailed;
         },
         .Stopped => |sig| {
             std.log.err("JIT compiler stopped by signal {d}", .{sig});
+            std.fs.cwd().deleteFile(src_path) catch {};
             return error.CompilerFailed;
         },
         else => {
             std.log.err("JIT compiler terminated abnormally", .{});
+            std.fs.cwd().deleteFile(src_path) catch {};
             return error.CompilerFailed;
         },
     }
+
+    // Clean up source file on success
+    std.fs.cwd().deleteFile(src_path) catch {};
 
     // Load the compiled library
     var lib = std.DynLib.open(full_lib_path) catch return error.CannotLoadLibrary;
