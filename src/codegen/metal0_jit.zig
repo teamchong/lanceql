@@ -878,6 +878,44 @@ fn extractClassName(allocator: std.mem.Allocator, source: []const u8) ![]const u
     return error.ClassNotFound;
 }
 
+/// Find zig executable using `which zig` command
+/// This properly inherits PATH from the parent process, working in CI environments
+/// where zig is installed via setup actions (e.g., mlugg/setup-zig)
+fn findZigViaWhich(allocator: std.mem.Allocator, buf: []u8) ![]const u8 {
+    const argv = [_][]const u8{ "which", "zig" };
+
+    var child = std.process.Child.init(&argv, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    // Don't set env_map - inherit from parent process to get CI PATH
+
+    child.spawn() catch return error.WhichFailed;
+
+    // Read stdout
+    var stdout_len: usize = 0;
+    if (child.stdout) |stdout| {
+        stdout_len = stdout.read(buf) catch 0;
+    }
+
+    const result = child.wait() catch return error.WhichFailed;
+
+    switch (result) {
+        .Exited => |code| {
+            if (code != 0 or stdout_len == 0) return error.ZigNotFound;
+        },
+        else => return error.WhichFailed,
+    }
+
+    // Trim trailing newline
+    var end = stdout_len;
+    while (end > 0 and (buf[end - 1] == '\n' or buf[end - 1] == '\r')) {
+        end -= 1;
+    }
+
+    if (end == 0) return error.ZigNotFound;
+    return buf[0..end];
+}
+
 /// JIT compilation result
 const JitResult = struct {
     ptr: *const anyopaque,
@@ -927,20 +965,29 @@ fn jitCompileSource(
     const emit_bin_arg = std.fmt.bufPrint(&emit_bin_buf, "-femit-bin={s}", .{full_lib_path}) catch
         return error.PathTooLong;
 
-    // Find zig compiler - try common locations
-    const zig_paths = [_][]const u8{
-        "/home/teamchong/.local/zig/zig", // Ubuntu user install
-        "/usr/local/bin/zig",
-        "/opt/homebrew/bin/zig", // macOS homebrew
-        "/usr/bin/zig",
-        "zig", // fallback to PATH
-    };
+    // Find zig compiler - use `which zig` first, then fall back to common paths
+    // This handles CI environments where zig is installed dynamically (e.g., mlugg/setup-zig)
+    var zig_cmd_buf: [512]u8 = undefined;
     var zig_cmd: []const u8 = "zig";
-    for (zig_paths) |path| {
-        if (std.fs.cwd().access(path, .{})) |_| {
-            zig_cmd = path;
-            break;
-        } else |_| continue;
+
+    // First, try to find zig via `which` command - this respects PATH from parent process
+    const which_result = findZigViaWhich(allocator, &zig_cmd_buf);
+    if (which_result) |found_path| {
+        zig_cmd = found_path;
+    } else |_| {
+        // Fall back to common hardcoded locations
+        const zig_paths = [_][]const u8{
+            "/home/teamchong/.local/zig/zig", // Ubuntu user install
+            "/usr/local/bin/zig",
+            "/opt/homebrew/bin/zig", // macOS homebrew
+            "/usr/bin/zig",
+        };
+        for (zig_paths) |path| {
+            if (std.fs.cwd().access(path, .{})) |_| {
+                zig_cmd = path;
+                break;
+            } else |_| continue;
+        }
     }
 
     // Build shared library using zig build-lib
@@ -954,16 +1001,16 @@ fn jitCompileSource(
         src_path,
     };
 
-    // Build environment with minimal PATH for spawning zig compiler
-    // We use a hardcoded minimal environment to avoid issues with
-    // /proc/self/environ being unavailable in foreign contexts (Node.js, etc.)
+    // Build environment - inherit PATH from parent if possible for CI compatibility
+    // In CI environments, zig is added to PATH by setup actions
     var env_map2 = std.process.EnvMap.init(allocator);
     defer env_map2.deinit();
 
-    // Minimal environment needed for zig compiler
-    env_map2.put("PATH", "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin:/home/teamchong/.local/bin:/home/teamchong/.local/zig") catch {};
-    env_map2.put("HOME", "/tmp") catch {};
-    env_map2.put("TMPDIR", "/tmp") catch {};
+    // Try to get PATH from parent process, fall back to hardcoded if unavailable
+    const parent_path = std.posix.getenv("PATH") orelse "/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin";
+    env_map2.put("PATH", parent_path) catch {};
+    env_map2.put("HOME", std.posix.getenv("HOME") orelse "/tmp") catch {};
+    env_map2.put("TMPDIR", std.posix.getenv("TMPDIR") orelse "/tmp") catch {};
 
     var child = std.process.Child.init(&argv, allocator);
     child.stderr_behavior = .Pipe;
