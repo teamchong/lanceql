@@ -6,7 +6,7 @@ import { test, expect } from '@playwright/test';
 
 test.describe('TOPK and NEAR Syntax', () => {
     test.beforeEach(async ({ page }) => {
-        await page.goto('/test-vault-sql.html');
+        await page.goto('/examples/wasm/test-vault-sql.html');
         await page.waitForFunction(() => typeof window.testInit === 'function', { timeout: 30000 });
         await page.evaluate(async () => {
             if (!window.vaultInstance) await window.testInit();
