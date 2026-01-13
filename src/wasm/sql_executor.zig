@@ -35,6 +35,114 @@ const NULL_SENTINEL_FLOAT: f64 = std.math.nan(f64);
 const MAX_VECTOR_DIM: usize = 1536; // Support up to OpenAI embedding size
 const VECTOR_SIZE: usize = 1024; // Chunk size for vectorized execution
 
+// ============================================================================
+// Hash Join Constants and Data Structures (DuckDB-style vectorized execution)
+// ============================================================================
+const HASH_TABLE_SIZE: usize = 262144; // 2^18 buckets (power of 2 for fast modulo)
+const HASH_TABLE_MASK: u64 = HASH_TABLE_SIZE - 1;
+const HASH_CHAIN_SIZE: usize = MAX_JOIN_ROWS; // Max entries in hash chains
+const HASH_SEED: u64 = 0x517cc1b727220a95; // FNV-1a seed
+
+/// Hash table entry for join build phase
+const HashEntry = struct {
+    key: i64, // Join key value
+    row_idx: u32, // Row index in build table
+    next: u32, // Next entry in chain (maxInt = end)
+};
+
+/// Global hash table storage (avoid stack allocation)
+var hash_buckets: [HASH_TABLE_SIZE]u32 = undefined; // Head of each bucket chain
+var hash_entries: [HASH_CHAIN_SIZE]HashEntry = undefined; // All entries
+var hash_entry_count: usize = 0;
+
+/// Fast integer hash function (based on MurmurHash3 finalizer)
+inline fn hashInt64(value: i64) u64 {
+    var h: u64 = @bitCast(value);
+    h ^= h >> 33;
+    h *%= 0xff51afd7ed558ccd;
+    h ^= h >> 33;
+    h *%= 0xc4ceb9fe1a85ec53;
+    h ^= h >> 33;
+    return h;
+}
+
+/// Initialize hash table (clear all buckets)
+fn hashTableInit() void {
+    for (&hash_buckets) |*b| {
+        b.* = std.math.maxInt(u32);
+    }
+    hash_entry_count = 0;
+}
+
+/// Build hash table from a column of integers (uses getIntValue internally)
+fn hashTableBuild(table: *const TableInfo, col: *const ColumnData, max_rows: usize) void {
+    hashTableInit();
+
+    const row_count = @min(table.row_count, max_rows);
+
+    for (0..row_count) |i| {
+        const row_idx: u32 = @intCast(i);
+        const value = getIntValue(table, col, row_idx);
+
+        // Skip NULL values
+        if (value == NULL_SENTINEL_INT) continue;
+
+        // Compute hash and bucket
+        const h = hashInt64(value);
+        const bucket = @as(usize, @intCast(h & HASH_TABLE_MASK));
+
+        // Add entry to chain
+        if (hash_entry_count < HASH_CHAIN_SIZE) {
+            hash_entries[hash_entry_count] = HashEntry{
+                .key = value,
+                .row_idx = row_idx,
+                .next = hash_buckets[bucket],
+            };
+            hash_buckets[bucket] = @intCast(hash_entry_count);
+            hash_entry_count += 1;
+        }
+    }
+}
+
+/// Probe hash table for a single value, returns iterator state
+const ProbeResult = struct {
+    found: bool,
+    entry_idx: u32,
+};
+
+inline fn hashTableProbeFirst(value: i64) ProbeResult {
+    const h = hashInt64(value);
+    const bucket = @as(usize, @intCast(h & HASH_TABLE_MASK));
+    var idx = hash_buckets[bucket];
+
+    // Walk chain to find first match
+    while (idx != std.math.maxInt(u32)) {
+        if (hash_entries[idx].key == value) {
+            return ProbeResult{ .found = true, .entry_idx = idx };
+        }
+        idx = hash_entries[idx].next;
+    }
+    return ProbeResult{ .found = false, .entry_idx = std.math.maxInt(u32) };
+}
+
+/// Continue probing for next match with same value
+inline fn hashTableProbeNext(value: i64, prev_idx: u32) ProbeResult {
+    var idx = hash_entries[prev_idx].next;
+
+    while (idx != std.math.maxInt(u32)) {
+        if (hash_entries[idx].key == value) {
+            return ProbeResult{ .found = true, .entry_idx = idx };
+        }
+        idx = hash_entries[idx].next;
+    }
+    return ProbeResult{ .found = false, .entry_idx = std.math.maxInt(u32) };
+}
+
+/// Get row index from hash entry
+inline fn hashTableGetRowIdx(entry_idx: u32) u32 {
+    return hash_entries[entry_idx].row_idx;
+}
+
 
 /// Column types
 pub const ColumnType = enum(u32) {
@@ -7783,100 +7891,128 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
             }
             setDebug("Vector JOIN found {d} pairs", .{pair_count});
         } else {
-             // Simple Nested Loop Join (WASM-safe, no AutoHashMap)
-             // AutoHashMap crashes in WASM, so use brute force for small tables
+            // ================================================================
+            // Hash Join (O(n + m) instead of O(n * m) nested loop)
+            // Build hash table on right table, probe with left table
+            // ================================================================
 
-             if (join_idx == 0) {
-                 const lt = tables_in_join[0];
-                 // For FULL OUTER JOIN, track which right rows were matched
-                 // Use global buffer to avoid stack overflow
-                 if (join.join_type == .full) {
-                     var i: usize = 0;
-                     while (i < @min(rtbl.row_count, MAX_JOIN_ROWS)) : (i += 1) {
-                         global_right_matched[i] = false;
-                     }
-                 }
+            // Build phase: hash the right table (join build side)
+            hashTableBuild(rtbl, rc.?, MAX_JOIN_ROWS);
 
-                 for (0..lt.row_count) |li_usize| {
-                     const li: u32 = @intCast(li_usize);
-                     const left_val = getIntValue(lt, lc.?, li);
-                     var found_match = false;
+            if (join_idx == 0) {
+                const lt = tables_in_join[0];
 
-                     // Nested loop through right table
-                     for (0..rtbl.row_count) |ri_usize| {
-                         const ri: u32 = @intCast(ri_usize);
-                         const right_val = getIntValue(rtbl, rc.?, ri);
+                // For FULL OUTER JOIN, track which right rows were matched
+                if (join.join_type == .full) {
+                    var i: usize = 0;
+                    while (i < @min(rtbl.row_count, MAX_JOIN_ROWS)) : (i += 1) {
+                        global_right_matched[i] = false;
+                    }
+                }
 
-                         if (left_val == right_val) {
-                             found_match = true;
-                             if (join.join_type == .full and ri < MAX_JOIN_ROWS) {
-                                 global_right_matched[ri] = true;
-                             }
-                             if (pair_count < MAX_JOIN_ROWS) {
-                                 // Manual init instead of @memset
-                                 var k: usize = 0;
-                                 while (k < dst_buffer[pair_count].indices.len) : (k += 1) {
-                                     dst_buffer[pair_count].indices[k] = std.math.maxInt(u32);
-                                 }
-                                 dst_buffer[pair_count].indices[0] = li;
-                                 dst_buffer[pair_count].indices[1] = ri;
-                                 pair_count += 1;
-                             }
-                         }
-                     }
+                // Probe phase: scan left table and lookup in hash table
+                for (0..lt.row_count) |li_usize| {
+                    const li: u32 = @intCast(li_usize);
+                    const left_val = getIntValue(lt, lc.?, li);
 
-                     // LEFT/FULL OUTER JOIN: add left row with NULL right
-                     if (!found_match and (join.join_type == .left or join.join_type == .full)) {
-                         if (pair_count < MAX_JOIN_ROWS) {
-                             var k: usize = 0;
-                             while (k < dst_buffer[pair_count].indices.len) : (k += 1) {
-                                 dst_buffer[pair_count].indices[k] = std.math.maxInt(u32);
-                             }
-                             dst_buffer[pair_count].indices[0] = li;
-                             // indices[1] stays maxInt (NULL)
-                             pair_count += 1;
-                         }
-                     }
-                 }
+                    // Skip NULL values
+                    if (left_val == NULL_SENTINEL_INT) {
+                        // LEFT/FULL OUTER: add with NULL right
+                        if (join.join_type == .left or join.join_type == .full) {
+                            if (pair_count < MAX_JOIN_ROWS) {
+                                var k: usize = 0;
+                                while (k < dst_buffer[pair_count].indices.len) : (k += 1) {
+                                    dst_buffer[pair_count].indices[k] = std.math.maxInt(u32);
+                                }
+                                dst_buffer[pair_count].indices[0] = li;
+                                pair_count += 1;
+                            }
+                        }
+                        continue;
+                    }
 
-                 // FULL OUTER JOIN: add unmatched right rows with NULL left
-                 if (join.join_type == .full) {
-                     for (0..rtbl.row_count) |ri_usize| {
-                         if (ri_usize >= MAX_JOIN_ROWS) break;
-                         if (!global_right_matched[ri_usize]) {
-                             if (pair_count < MAX_JOIN_ROWS) {
-                                 var k: usize = 0;
-                                 while (k < dst_buffer[pair_count].indices.len) : (k += 1) {
-                                     dst_buffer[pair_count].indices[k] = std.math.maxInt(u32);
-                                 }
-                                 // indices[0] stays maxInt (NULL)
-                                 dst_buffer[pair_count].indices[1] = @intCast(ri_usize);
-                                 pair_count += 1;
-                             }
-                         }
-                     }
-                 }
-             } else {
-                 const lt = tables_in_join[left_tbl_idx];
-                 for (0..src_count) |i| {
-                     const l_idx = src_buffer[i].indices[left_tbl_idx];
-                     if (l_idx == std.math.maxInt(u32)) continue;
+                    // Probe hash table for all matches
+                    var probe = hashTableProbeFirst(left_val);
+                    var found_match = false;
 
-                     const left_val = getIntValue(lt, lc.?, l_idx);
-                     // Nested loop through right table
-                     for (0..rtbl.row_count) |ri_usize| {
-                         const ri: u32 = @intCast(ri_usize);
-                         const right_val = getIntValue(rtbl, rc.?, ri);
-                         if (left_val == right_val) {
-                             if (pair_count < MAX_JOIN_ROWS) {
-                                 dst_buffer[pair_count].indices = src_buffer[i].indices;
-                                 dst_buffer[pair_count].indices[join_idx + 1] = ri;
-                                 pair_count += 1;
-                             }
-                         }
-                     }
-                 }
-             }
+                    while (probe.found) {
+                        found_match = true;
+                        const ri = hashTableGetRowIdx(probe.entry_idx);
+
+                        if (join.join_type == .full and ri < MAX_JOIN_ROWS) {
+                            global_right_matched[ri] = true;
+                        }
+
+                        if (pair_count < MAX_JOIN_ROWS) {
+                            var k: usize = 0;
+                            while (k < dst_buffer[pair_count].indices.len) : (k += 1) {
+                                dst_buffer[pair_count].indices[k] = std.math.maxInt(u32);
+                            }
+                            dst_buffer[pair_count].indices[0] = li;
+                            dst_buffer[pair_count].indices[1] = ri;
+                            pair_count += 1;
+                        }
+
+                        // Get next match with same key
+                        probe = hashTableProbeNext(left_val, probe.entry_idx);
+                    }
+
+                    // LEFT/FULL OUTER JOIN: add left row with NULL right if no match
+                    if (!found_match and (join.join_type == .left or join.join_type == .full)) {
+                        if (pair_count < MAX_JOIN_ROWS) {
+                            var k: usize = 0;
+                            while (k < dst_buffer[pair_count].indices.len) : (k += 1) {
+                                dst_buffer[pair_count].indices[k] = std.math.maxInt(u32);
+                            }
+                            dst_buffer[pair_count].indices[0] = li;
+                            pair_count += 1;
+                        }
+                    }
+                }
+
+                // FULL OUTER JOIN: add unmatched right rows
+                if (join.join_type == .full) {
+                    for (0..rtbl.row_count) |ri_usize| {
+                        if (ri_usize >= MAX_JOIN_ROWS) break;
+                        if (!global_right_matched[ri_usize]) {
+                            if (pair_count < MAX_JOIN_ROWS) {
+                                var k: usize = 0;
+                                while (k < dst_buffer[pair_count].indices.len) : (k += 1) {
+                                    dst_buffer[pair_count].indices[k] = std.math.maxInt(u32);
+                                }
+                                dst_buffer[pair_count].indices[1] = @intCast(ri_usize);
+                                pair_count += 1;
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Multi-table join: probe for each existing pair
+                const lt = tables_in_join[left_tbl_idx];
+
+                for (0..src_count) |i| {
+                    const l_idx = src_buffer[i].indices[left_tbl_idx];
+                    if (l_idx == std.math.maxInt(u32)) continue;
+
+                    const left_val = getIntValue(lt, lc.?, l_idx);
+                    if (left_val == NULL_SENTINEL_INT) continue;
+
+                    // Probe hash table for all matches
+                    var probe = hashTableProbeFirst(left_val);
+
+                    while (probe.found) {
+                        const ri = hashTableGetRowIdx(probe.entry_idx);
+
+                        if (pair_count < MAX_JOIN_ROWS) {
+                            dst_buffer[pair_count].indices = src_buffer[i].indices;
+                            dst_buffer[pair_count].indices[join_idx + 1] = ri;
+                            pair_count += 1;
+                        }
+
+                        probe = hashTableProbeNext(left_val, probe.entry_idx);
+                    }
+                }
+            }
         }
         
         const tmp = src_buffer;
