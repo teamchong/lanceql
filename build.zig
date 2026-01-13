@@ -243,15 +243,214 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // ============================================================================
     // metal0 module - Python to native compiler (as submodule)
-    // Requires analysis.ast for parser to work
+    // ============================================================================
+    // metal0 has many internal modules that need to be wired up for full functionality.
+    // This includes c_interop (for Python extension interop), runtime, collections, etc.
+
+    // Utility modules
+    const metal0_hashmap_helper = b.addModule("utils.hashmap_helper", .{
+        .root_source_file = b.path("deps/metal0/src/utils/hashmap_helper.zig"),
+    });
+    const metal0_allocator_helper = b.addModule("utils.allocator_helper", .{
+        .root_source_file = b.path("deps/metal0/src/utils/allocator_helper.zig"),
+    });
+    const metal0_platform = b.addModule("utils.platform", .{
+        .root_source_file = b.path("deps/metal0/src/utils/platform.zig"),
+    });
+    const metal0_fnv_hash = b.addModule("utils.fnv_hash", .{
+        .root_source_file = b.path("deps/metal0/src/utils/fnv_hash.zig"),
+    });
+    // Collections module
+    const metal0_collections = b.addModule("collections", .{
+        .root_source_file = b.path("deps/metal0/packages/collections/collections.zig"),
+    });
+
+    // JSON SIMD dispatch
+    const metal0_json_simd = b.addModule("json_simd", .{
+        .root_source_file = b.path("deps/metal0/packages/shared/json/simd/dispatch.zig"),
+    });
+
+    // JSON module
+    const metal0_json = b.addModule("json", .{
+        .root_source_file = b.path("deps/metal0/packages/shared/json/json.zig"),
+    });
+    metal0_json.addImport("json_simd", metal0_json_simd);
+    metal0_json.addImport("utils.hashmap_helper", metal0_hashmap_helper);
+
+    // Gzip module
+    const metal0_gzip = b.addModule("gzip", .{
+        .root_source_file = b.path("deps/metal0/packages/runtime/src/Modules/gzip/gzip.zig"),
+    });
+    metal0_gzip.addIncludePath(b.path("deps/metal0/vendor/libdeflate"));
+
+    // HTTP/2 module
+    const metal0_h2 = b.addModule("h2", .{
+        .root_source_file = b.path("deps/metal0/packages/shared/http/h2/Client.zig"),
+    });
+    metal0_h2.addImport("gzip", metal0_gzip);
+    metal0_h2.addImport("utils.hashmap_helper", metal0_hashmap_helper);
+
+    // Regex module
+    const metal0_regex = b.addModule("regex", .{
+        .root_source_file = b.path("deps/metal0/packages/regex/src/pyregex/regex.zig"),
+    });
+
+    // BigInt module
+    const metal0_bigint = b.addModule("bigint", .{
+        .root_source_file = b.path("deps/metal0/packages/bigint/src/bigint.zig"),
+    });
+
+    // Data structures module
+    const metal0_ds = b.addModule("ds", .{
+        .root_source_file = b.path("deps/metal0/packages/ds/src/ds.zig"),
+    });
+
+    // Glob module
+    const metal0_glob = b.addModule("glob", .{
+        .root_source_file = b.path("deps/metal0/packages/glob/src/glob.zig"),
+    });
+    metal0_glob.addImport("ds", metal0_ds);
+
+    // Tokenizer module
+    const metal0_tokenizer = b.addModule("tokenizer", .{
+        .root_source_file = b.path("deps/metal0/packages/tokenizer/src/tokenizer.zig"),
+    });
+    metal0_tokenizer.addImport("json", metal0_json);
+    metal0_tokenizer.addImport("utils.hashmap_helper", metal0_hashmap_helper);
+    metal0_tokenizer.addImport("utils.fnv_hash", metal0_fnv_hash);
+
+    // Package manager module
+    const metal0_pkg = b.addModule("pkg", .{
+        .root_source_file = b.path("deps/metal0/packages/pkg/src/pkg.zig"),
+    });
+    metal0_pkg.addImport("json", metal0_json);
+    metal0_pkg.addImport("h2", metal0_h2);
+    metal0_pkg.addImport("utils.hashmap_helper", metal0_hashmap_helper);
+
+    // Runtime module (core Python runtime)
+    const metal0_runtime = b.createModule(.{
+        .root_source_file = b.path("deps/metal0/packages/runtime/src/runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    metal0_runtime.addIncludePath(b.path("deps/metal0/vendor/libdeflate"));
+    // Add libdeflate source files
+    metal0_runtime.addCSourceFiles(.{
+        .files = &.{
+            "deps/metal0/vendor/libdeflate/lib/deflate_compress.c",
+            "deps/metal0/vendor/libdeflate/lib/deflate_decompress.c",
+            "deps/metal0/vendor/libdeflate/lib/utils.c",
+            "deps/metal0/vendor/libdeflate/lib/gzip_compress.c",
+            "deps/metal0/vendor/libdeflate/lib/gzip_decompress.c",
+            "deps/metal0/vendor/libdeflate/lib/zlib_compress.c",
+            "deps/metal0/vendor/libdeflate/lib/zlib_decompress.c",
+            "deps/metal0/vendor/libdeflate/lib/adler32.c",
+            "deps/metal0/vendor/libdeflate/lib/crc32.c",
+            "deps/metal0/vendor/libdeflate/lib/arm/cpu_features.c",
+            "deps/metal0/vendor/libdeflate/lib/x86/cpu_features.c",
+        },
+        .flags = &.{ "-std=c99", "-O3" },
+    });
+    // Link compression libraries
+    metal0_runtime.linkSystemLibrary("bz2", .{});
+    metal0_runtime.linkSystemLibrary("lzma", .{});
+    metal0_runtime.addImport("utils.hashmap_helper", metal0_hashmap_helper);
+    metal0_runtime.addImport("utils.allocator_helper", metal0_allocator_helper);
+    metal0_runtime.addImport("utils.platform", metal0_platform);
+    metal0_runtime.addImport("json_simd", metal0_json_simd);
+    metal0_runtime.addImport("json", metal0_json);
+    metal0_runtime.addImport("regex", metal0_regex);
+    metal0_runtime.addImport("bigint", metal0_bigint);
+    metal0_runtime.addImport("gzip", metal0_gzip);
+    metal0_runtime.addImport("h2", metal0_h2);
+    metal0_runtime.addImport("tokenizer", metal0_tokenizer);
+
+    // C interop module (Python extension interop)
+    const metal0_c_interop = b.createModule(.{
+        .root_source_file = b.path("deps/metal0/packages/c_interop/src/registry.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    metal0_c_interop.addImport("runtime", metal0_runtime);
+    metal0_c_interop.addImport("collections", metal0_collections);
+    metal0_c_interop.addImport("utils.hashmap_helper", metal0_hashmap_helper);
+
+    // AST module
     const metal0_ast_mod = b.addModule("analysis.ast", .{
         .root_source_file = b.path("deps/metal0/src/ast.zig"),
     });
+
+    // Main metal0 module
     const metal0_mod = b.addModule("metal0", .{
         .root_source_file = b.path("deps/metal0/src/main.zig"),
     });
     metal0_mod.addImport("analysis.ast", metal0_ast_mod);
+    metal0_mod.addImport("c_interop", metal0_c_interop);
+    metal0_mod.addImport("json", metal0_json);
+    metal0_mod.addImport("h2", metal0_h2);
+    metal0_mod.addImport("regex", metal0_regex);
+    metal0_mod.addImport("bigint", metal0_bigint);
+    metal0_mod.addImport("tokenizer", metal0_tokenizer);
+    metal0_mod.addImport("pkg", metal0_pkg);
+    metal0_mod.addImport("ds", metal0_ds);
+    metal0_mod.addImport("glob", metal0_glob);
+    metal0_mod.addImport("utils.hashmap_helper", metal0_hashmap_helper);
+    metal0_mod.addImport("utils.allocator_helper", metal0_allocator_helper);
+    metal0_mod.addImport("utils.fnv_hash", metal0_fnv_hash);
+    metal0_mod.addImport("collections", metal0_collections);
+    metal0_mod.addImport("runtime", metal0_runtime);
+
+    // Analysis modules needed by metal0
+    const metal0_function_traits = b.addModule("analysis.function_traits", .{
+        .root_source_file = b.path("deps/metal0/src/analysis/traits/function_traits.zig"),
+    });
+    metal0_function_traits.addImport("analysis.ast", metal0_ast_mod);
+    metal0_function_traits.addImport("utils.hashmap_helper", metal0_hashmap_helper);
+
+    const metal0_module_traits = b.addModule("analysis.module_traits", .{
+        .root_source_file = b.path("deps/metal0/src/analysis/traits/module_traits.zig"),
+    });
+    metal0_module_traits.addImport("analysis.ast", metal0_ast_mod);
+    metal0_module_traits.addImport("utils.hashmap_helper", metal0_hashmap_helper);
+    metal0_module_traits.addImport("analysis.function_traits", metal0_function_traits);
+
+    metal0_mod.addImport("analysis.function_traits", metal0_function_traits);
+    metal0_mod.addImport("analysis.module_traits", metal0_module_traits);
+
+    // Debug info module
+    const metal0_debug_info = b.addModule("debug.debug_info", .{
+        .root_source_file = b.path("deps/metal0/src/debug/debug_info.zig"),
+    });
+    metal0_debug_info.addImport("utils.hashmap_helper", metal0_hashmap_helper);
+    metal0_mod.addImport("debug.debug_info", metal0_debug_info);
+
+    // Codegen modules
+    const metal0_zig_keywords = b.addModule("utils.zig_keywords", .{
+        .root_source_file = b.path("deps/metal0/src/utils/zig_keywords.zig"),
+    });
+    const metal0_name_gen = b.addModule("codegen.name_gen", .{
+        .root_source_file = b.path("deps/metal0/src/codegen/native/name_gen.zig"),
+    });
+    metal0_name_gen.addImport("utils.zig_keywords", metal0_zig_keywords);
+    metal0_mod.addImport("codegen.name_gen", metal0_name_gen);
+    metal0_mod.addImport("utils.zig_keywords", metal0_zig_keywords);
+
+    // Builder module for structured Zig code generation
+    const metal0_builder = b.addModule("codegen.builder", .{
+        .root_source_file = b.path("deps/metal0/src/codegen/builder/builder.zig"),
+    });
+    metal0_builder.addImport("codegen.name_gen", metal0_name_gen);
+    metal0_builder.addImport("utils.zig_keywords", metal0_zig_keywords);
+    metal0_mod.addImport("codegen.builder", metal0_builder);
+
+    // String interner
+    const metal0_string_interner = b.addModule("utils.string_interner", .{
+        .root_source_file = b.path("deps/metal0/src/utils/string_interner.zig"),
+    });
+    metal0_mod.addImport("utils.string_interner", metal0_string_interner);
+    metal0_mod.addImport("utils.platform", metal0_platform);
 
     // Codegen module - JIT compilation integration with metal0
     const codegen_mod = b.addModule("lanceql.codegen", .{

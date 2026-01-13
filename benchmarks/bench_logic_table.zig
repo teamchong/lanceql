@@ -147,7 +147,7 @@ fn jitCompile(allocator: std.mem.Allocator) !struct { ctx: codegen.JitContext, f
 
     // Get the function pointer if available
     const fn_ptr: ?*const fn ([*]f64, [*]f64, usize) callconv(.c) f64 = if (compiled.ptr) |ptr|
-        @ptrCast(ptr)
+        @ptrCast(@alignCast(ptr))
     else
         null;
 
