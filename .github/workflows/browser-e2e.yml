@@ -76,6 +76,15 @@ jobs:
         continue-on-error: true
         run: npm test
 
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-build
+          path: |
+            zig-out/bin/lanceql.wasm
+            packages/browser/dist/
+          retention-days: 1
+
   # E2E tests (requires browser) - uses Playwright container
   e2e:
     runs-on: ubuntu-latest
@@ -85,43 +94,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache Zig
-        uses: actions/cache@v4
+      - name: Download WASM artifact
+        uses: actions/download-artifact@v4
         with:
-          path: zig-linux-x86_64-0.15.2
-          key: zig-0.15.2-linux-x86_64
+          name: wasm-build
 
-      - name: Setup Zig
+      - name: Setup WASM and JS files
         run: |
-          if [ ! -d "zig-linux-x86_64-0.15.2" ]; then
-            apt-get update && apt-get install -y xz-utils wget
-            # Use wget which handles redirects better
-            wget -q --show-progress https://ziglang.org/download/0.15.2/zig-linux-x86_64-0.15.2.tar.xz
-            tar -xJf zig-linux-x86_64-0.15.2.tar.xz
-            rm zig-linux-x86_64-0.15.2.tar.xz
-          else
-            echo "Using cached Zig"
-          fi
-          echo "$PWD/zig-linux-x86_64-0.15.2" >> $GITHUB_PATH
-
-      - name: Build WASM module
-        run: zig-linux-x86_64-0.15.2/zig build wasm
-
-      - name: Copy WASM to examples and browser package
-        run: |
+          mkdir -p zig-out/bin packages/browser/dist
+          # Artifact structure preserves paths
           cp zig-out/bin/lanceql.wasm examples/wasm/
           cp zig-out/bin/lanceql.wasm packages/browser/dist/
+          cp packages/browser/dist/lanceql-worker.js examples/wasm/
+          cp packages/browser/dist/lanceql.esm.js examples/wasm/lanceql.js
+          ls -la examples/wasm/
+          ls -la packages/browser/dist/
 
       - name: Install dependencies
         working-directory: packages/browser
         run: npm install
-
-      - name: Build browser package and sync to examples
-        working-directory: packages/browser
-        run: |
-          node esbuild.config.js
-          cp dist/lanceql-worker.js ../../examples/wasm/
-          cp dist/lanceql.esm.js ../../examples/wasm/lanceql.js
 
       - name: Cache MiniLM model
         uses: actions/cache@v4
