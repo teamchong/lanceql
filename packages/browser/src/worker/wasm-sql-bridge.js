@@ -98,6 +98,17 @@ export class WasmSqlExecutor {
     }
 
     /**
+     * Check if table exists in WASM with a specific version (for caching)
+     * @param {string} tableName
+     * @param {string} version
+     * @returns {boolean}
+     */
+    hasTableWithVersion(tableName, version) {
+        const existing = this._registered.get(tableName);
+        return existing && existing.version === version;
+    }
+
+    /**
      * Register table data in WASM for SQL execution
      * @param {string} tableName
      * @param {Object} columns - Map of column name to typed array

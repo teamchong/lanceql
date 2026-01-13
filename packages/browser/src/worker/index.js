@@ -1288,16 +1288,17 @@ async function executeWasmSqlFull(db, sql) {
 
     // Step 4: Register local DB tables
     for (const tableName of tableNames) {
-        // Skip already registered tables (including our aliases)
-        const exists = executor.hasTable(tableName);
-        if (exists) continue;
-
         const table = db.tables.get(tableName);
         if (!table) continue;
 
         const colBuf = db._columnarBuffer?.get(tableName);
         const bufLen = colBuf?.__length || 0;
         const version = `${tableName}:${table.fragments?.length || 0}:${bufLen}:${table.deletionVector?.length || 0}`;
+
+        // Skip if already registered with same version (caching)
+        if (executor.hasTableWithVersion(tableName, version)) {
+            continue;
+        }
 
         const hasFiles = table.fragments.length > 0;
         const hasMemory = bufLen > 0;
