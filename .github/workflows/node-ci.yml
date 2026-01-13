@@ -8,6 +8,7 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'deps/**'
+      - 'build.zig'
       - '.github/workflows/node-ci.yml'
   pull_request:
     branches: [main]
@@ -16,6 +17,7 @@ on:
       - 'src/**'
       - 'tests/**'
       - 'deps/**'
+      - 'build.zig'
       - '.github/workflows/node-ci.yml'
 
 jobs:
