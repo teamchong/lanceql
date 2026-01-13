@@ -359,6 +359,8 @@ pub fn build(b: *std.Build) void {
             "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_VPCLMULQDQ",
         },
     });
+    // Link libc for malloc/free used by libdeflate
+    metal0_runtime.link_libc = true;
     // Link compression libraries
     metal0_runtime.linkSystemLibrary("bz2", .{});
     metal0_runtime.linkSystemLibrary("lzma", .{});
