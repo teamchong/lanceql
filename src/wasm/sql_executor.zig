@@ -156,6 +156,446 @@ inline fn simdGatherF64(src: [*]const f64, indices: [*]const u32, len: usize, ds
 }
 
 // ============================================================================
+// WASM Column Reader - Implements ve.ColumnReader for StreamingExecutor
+// ============================================================================
+
+/// Column reader for WASM tables - implements ve.ColumnReader interface
+pub const WasmColumnReader = struct {
+    table: *const TableInfo,
+
+    const Self = @This();
+
+    pub fn init(table: *const TableInfo) Self {
+        return .{ .table = table };
+    }
+
+    /// Get a ve.ColumnReader interface
+    pub fn reader(self: *Self) ve.ColumnReader {
+        return .{
+            .ptr = self,
+            .vtable = &vtable,
+        };
+    }
+
+    /// Get column index by name
+    pub fn getColumnIndex(self: *Self, name: []const u8) ?usize {
+        for (self.table.columns[0..self.table.column_count], 0..) |maybe_col, idx| {
+            if (maybe_col) |col| {
+                if (std.mem.eql(u8, col.name, name)) return idx;
+            }
+        }
+        return null;
+    }
+
+    /// Get column type as ve.ColumnType
+    pub fn getColumnTypeByIdx(self: *Self, col_idx: usize) ve.ColumnType {
+        if (col_idx >= self.table.column_count) return .int64;
+        const col = self.table.columns[col_idx] orelse return .int64;
+        return switch (col.col_type) {
+            .int64 => .int64,
+            .float64 => .float64,
+            .int32 => .int32,
+            .float32 => .float32,
+            .string => .string,
+            .bool_ => .bool,
+            else => .int64,
+        };
+    }
+
+    const vtable = ve.ColumnReader.VTable{
+        .readBatchI64 = readBatchI64Fn,
+        .readBatchF64 = readBatchF64Fn,
+        .readBatchI32 = readBatchI32Fn,
+        .readBatchF32 = readBatchF32Fn,
+        .readBatchString = readBatchStringFn,
+        .getRowCount = getRowCountFn,
+        .getColumnType = getColumnTypeFn,
+    };
+
+    fn readBatchI64Fn(ptr: *anyopaque, col_idx: usize, offset: usize, count: usize) ?[]const i64 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        if (col_idx >= self.table.column_count) return null;
+        const col = self.table.columns[col_idx] orelse return null;
+
+        // Handle in-memory data
+        if (!col.is_lazy and col.col_type == .int64) {
+            if (offset >= self.table.row_count) return null;
+            const end = @min(offset + count, self.table.row_count);
+            return col.data.int64[offset..end];
+        }
+
+        // For lazy columns, return null for now (would need fragment reading)
+        return null;
+    }
+
+    fn readBatchF64Fn(ptr: *anyopaque, col_idx: usize, offset: usize, count: usize) ?[]const f64 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        if (col_idx >= self.table.column_count) return null;
+        const col = self.table.columns[col_idx] orelse return null;
+
+        if (!col.is_lazy and col.col_type == .float64) {
+            if (offset >= self.table.row_count) return null;
+            const end = @min(offset + count, self.table.row_count);
+            return col.data.float64[offset..end];
+        }
+
+        return null;
+    }
+
+    fn readBatchI32Fn(ptr: *anyopaque, col_idx: usize, offset: usize, count: usize) ?[]const i32 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        if (col_idx >= self.table.column_count) return null;
+        const col = self.table.columns[col_idx] orelse return null;
+
+        if (!col.is_lazy and col.col_type == .int32) {
+            if (offset >= self.table.row_count) return null;
+            const end = @min(offset + count, self.table.row_count);
+            return col.data.int32[offset..end];
+        }
+
+        return null;
+    }
+
+    fn readBatchF32Fn(ptr: *anyopaque, col_idx: usize, offset: usize, count: usize) ?[]const f32 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        if (col_idx >= self.table.column_count) return null;
+        const col = self.table.columns[col_idx] orelse return null;
+
+        if (!col.is_lazy and col.col_type == .float32) {
+            if (offset >= self.table.row_count) return null;
+            const end = @min(offset + count, self.table.row_count);
+            return col.data.float32[offset..end];
+        }
+
+        return null;
+    }
+
+    fn readBatchStringFn(ptr: *anyopaque, col_idx: usize, offset: usize, count: usize) ?[]const []const u8 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        _ = offset;
+        _ = count;
+        if (col_idx >= self.table.column_count) return null;
+        const col = self.table.columns[col_idx] orelse return null;
+        _ = col;
+        // String batch reading not yet implemented for WASM
+        return null;
+    }
+
+    fn getRowCountFn(ptr: *anyopaque) usize {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.table.row_count;
+    }
+
+    fn getColumnTypeFn(ptr: *anyopaque, col_idx: usize) ve.ColumnType {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.getColumnTypeByIdx(col_idx);
+    }
+};
+
+/// Try to execute GROUP BY using streaming (memory-efficient)
+/// Returns true if streaming was used, false to fall back to normal path
+fn tryStreamingGroupBy(table: *const TableInfo, query: *const ParsedQuery) bool {
+    // Only use streaming for simple cases:
+    // - No WHERE clause
+    // - Single GROUP BY column (int64)
+    // - Simple aggregates (COUNT, SUM, AVG, MIN, MAX)
+    // - In-memory data
+
+    if (query.where_clause != null) return false;
+    if (query.group_by_count != 1) return false;
+    if (query.agg_count == 0) return false;
+
+    // Check all columns are in-memory
+    for (table.columns[0..table.column_count]) |maybe_col| {
+        if (maybe_col) |col| {
+            if (col.is_lazy) return false;
+        }
+    }
+
+    // Find GROUP BY column index
+    const group_col_name = query.group_by_cols[0];
+    var group_col_idx: usize = 0;
+    var group_col_found = false;
+    for (table.columns[0..table.column_count], 0..) |maybe_col, idx| {
+        if (maybe_col) |col| {
+            if (std.mem.eql(u8, col.name, group_col_name)) {
+                // Only support int64 keys for now
+                if (col.col_type != .int64) return false;
+                group_col_idx = idx;
+                group_col_found = true;
+                break;
+            }
+        }
+    }
+    if (!group_col_found) return false;
+
+    // Build AggSpec array
+    var agg_specs: [MAX_AGGREGATES]ve.AggSpec = undefined;
+    var spec_count: usize = 0;
+
+    for (query.aggregates[0..query.agg_count]) |agg| {
+        const func: ve.AggFunc = switch (agg.func) {
+            .count => .count,
+            .sum => .sum,
+            .avg => .avg,
+            .min => .min,
+            .max => .max,
+            else => return false,
+        };
+
+        var col_idx: usize = 0;
+        if (!std.mem.eql(u8, agg.column, "*")) {
+            var found = false;
+            for (table.columns[0..table.column_count], 0..) |maybe_col, idx| {
+                if (maybe_col) |col| {
+                    if (std.mem.eql(u8, col.name, agg.column)) {
+                        col_idx = idx;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) return false;
+        }
+
+        agg_specs[spec_count] = .{
+            .func = func,
+            .col_idx = col_idx,
+            .output_name = agg.alias orelse agg.column,
+        };
+        spec_count += 1;
+    }
+
+    // Create WasmColumnReader
+    var col_reader = WasmColumnReader.init(table);
+    var reader_iface = col_reader.reader();
+
+    // Create StreamingExecutor
+    var executor = ve.StreamingExecutor.init(memory.wasm_allocator, spec_count + 1) catch return false;
+    defer executor.deinit();
+
+    // Execute GROUP BY
+    const gb_result = executor.executeGroupBy(
+        &reader_iface,
+        group_col_idx,
+        null, // No filter
+        agg_specs[0..spec_count],
+    ) catch return false;
+    defer {
+        memory.wasm_allocator.free(gb_result.keys);
+        for (gb_result.results) |r| memory.wasm_allocator.free(r);
+        memory.wasm_allocator.free(gb_result.results);
+    }
+
+    // Write result
+    writeStreamingGroupByResult(query, gb_result, group_col_name, spec_count) catch return false;
+
+    return true;
+}
+
+/// Write streaming GROUP BY result to result buffer
+fn writeStreamingGroupByResult(
+    query: *const ParsedQuery,
+    gb_result: struct { keys: []i64, results: [][]f64 },
+    group_col_name: []const u8,
+    agg_count: usize,
+) !void {
+    const num_groups = gb_result.keys.len;
+    const num_cols = 1 + agg_count; // key + aggregates
+
+    // Estimate buffer size
+    const est_size = HEADER_SIZE + (num_cols * 100) + (num_groups * num_cols * 8);
+    var buf = try memory.wasm_allocator.alloc(u8, est_size);
+    var pos: usize = 0;
+
+    // Write header
+    std.mem.writeInt(u32, buf[pos..][0..4], RESULT_VERSION, .little);
+    pos += 4;
+    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(num_cols), .little);
+    pos += 4;
+    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(num_groups), .little);
+    pos += 4;
+    const header_size_pos = pos;
+    pos += 4 * 4; // 4 more u32 fields
+
+    // Write column names and types
+    // First: GROUP BY column (int64)
+    buf[pos] = @intCast(group_col_name.len);
+    pos += 1;
+    @memcpy(buf[pos..][0..group_col_name.len], group_col_name);
+    pos += group_col_name.len;
+    buf[pos] = @intFromEnum(ColType.int64);
+    pos += 1;
+
+    // Then: aggregate columns (float64)
+    for (query.aggregates[0..agg_count]) |agg| {
+        const name = agg.alias orelse agg.column;
+        buf[pos] = @intCast(name.len);
+        pos += 1;
+        @memcpy(buf[pos..][0..name.len], name);
+        pos += name.len;
+        buf[pos] = @intFromEnum(ColType.float64);
+        pos += 1;
+    }
+
+    const data_start = pos;
+    std.mem.writeInt(u32, buf[header_size_pos..][0..4], @intCast(data_start), .little);
+    std.mem.writeInt(u32, buf[header_size_pos + 4 ..][0..4], @intCast(data_start), .little);
+
+    // Write data: key column first, then aggregate columns
+    // Key column (int64)
+    for (gb_result.keys) |key| {
+        std.mem.writeInt(i64, buf[pos..][0..8], key, .little);
+        pos += 8;
+    }
+
+    // Aggregate columns (float64)
+    for (0..agg_count) |a| {
+        for (0..num_groups) |g| {
+            std.mem.writeInt(u64, buf[pos..][0..8], @bitCast(gb_result.results[g][a]), .little);
+            pos += 8;
+        }
+    }
+
+    const data_size = pos - data_start;
+    const total_size = pos;
+    std.mem.writeInt(u32, buf[header_size_pos + 8 ..][0..4], @intCast(data_size), .little);
+    std.mem.writeInt(u32, buf[header_size_pos + 12 ..][0..4], @intCast(total_size), .little);
+
+    result_buffer = buf[0..total_size];
+    result_size = total_size;
+}
+
+/// Try to execute aggregate query using streaming (memory-efficient)
+/// Returns true if streaming was used, false to fall back to normal path
+fn tryStreamingAggregate(table: *const TableInfo, query: *const ParsedQuery) bool {
+    // Only use streaming for simple cases:
+    // - No WHERE clause (would need to build index)
+    // - No GROUP BY
+    // - Simple aggregates (COUNT, SUM, AVG, MIN, MAX)
+    // - In-memory data (not lazy fragments)
+
+    if (query.where_clause != null) return false;
+    if (query.group_by_count > 0) return false;
+    if (query.agg_count == 0) return false;
+
+    // Check all columns are in-memory
+    for (table.columns[0..table.column_count]) |maybe_col| {
+        if (maybe_col) |col| {
+            if (col.is_lazy) return false;
+        }
+    }
+
+    // Build AggSpec array
+    var agg_specs: [MAX_AGGREGATES]ve.AggSpec = undefined;
+    var spec_count: usize = 0;
+
+    for (query.aggregates[0..query.agg_count]) |agg| {
+        // Map AggFunc to ve.AggFunc
+        const func: ve.AggFunc = switch (agg.func) {
+            .count => .count,
+            .sum => .sum,
+            .avg => .avg,
+            .min => .min,
+            .max => .max,
+            else => return false, // Unsupported aggregate
+        };
+
+        // Find column index
+        var col_idx: usize = 0;
+        if (!std.mem.eql(u8, agg.column, "*")) {
+            var found = false;
+            for (table.columns[0..table.column_count], 0..) |maybe_col, idx| {
+                if (maybe_col) |col| {
+                    if (std.mem.eql(u8, col.name, agg.column)) {
+                        col_idx = idx;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) return false;
+        }
+
+        agg_specs[spec_count] = .{
+            .func = func,
+            .col_idx = col_idx,
+            .output_name = agg.alias orelse agg.column,
+        };
+        spec_count += 1;
+    }
+
+    // Create WasmColumnReader
+    var col_reader = WasmColumnReader.init(table);
+    var reader_iface = col_reader.reader();
+
+    // Create StreamingExecutor
+    var executor = ve.StreamingExecutor.init(memory.wasm_allocator, spec_count) catch return false;
+    defer executor.deinit();
+
+    // Execute
+    const results = executor.executeAggregate(
+        &reader_iface,
+        null, // No filter
+        agg_specs[0..spec_count],
+    ) catch return false;
+    defer memory.wasm_allocator.free(results);
+
+    // Write result
+    writeStreamingAggResult(query, results) catch return false;
+
+    return true;
+}
+
+/// Write streaming aggregate result to result buffer
+fn writeStreamingAggResult(query: *const ParsedQuery, results: []f64) !void {
+    // Estimate buffer size
+    const est_size = HEADER_SIZE + (query.agg_count * 100); // Conservative estimate
+    var buf = try memory.wasm_allocator.alloc(u8, est_size);
+    var pos: usize = 0;
+
+    // Write header
+    std.mem.writeInt(u32, buf[pos..][0..4], RESULT_VERSION, .little);
+    pos += 4;
+    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(query.agg_count), .little);
+    pos += 4;
+    std.mem.writeInt(u32, buf[pos..][0..4], 1, .little); // 1 row
+    pos += 4;
+    // Skip space for header_size, data_start, data_size, total_size
+    const header_size_pos = pos;
+    pos += 4 * 4; // 4 more u32 fields
+
+    // Write column names and types
+    for (query.aggregates[0..query.agg_count]) |agg| {
+        const name = agg.alias orelse agg.column;
+        buf[pos] = @intCast(name.len);
+        pos += 1;
+        @memcpy(buf[pos..][0..name.len], name);
+        pos += name.len;
+        buf[pos] = @intFromEnum(ColType.float64);
+        pos += 1;
+    }
+
+    const data_start = pos;
+    std.mem.writeInt(u32, buf[header_size_pos..][0..4], @intCast(data_start), .little);
+    std.mem.writeInt(u32, buf[header_size_pos + 4 ..][0..4], @intCast(data_start), .little);
+
+    // Write data (1 row of aggregate results)
+    for (results) |val| {
+        std.mem.writeInt(u64, buf[pos..][0..8], @bitCast(val), .little);
+        pos += 8;
+    }
+
+    const data_size = pos - data_start;
+    const total_size = pos;
+    std.mem.writeInt(u32, buf[header_size_pos + 8 ..][0..4], @intCast(data_size), .little);
+    std.mem.writeInt(u32, buf[header_size_pos + 12 ..][0..4], @intCast(total_size), .little);
+
+    result_buffer = buf[0..total_size];
+    result_size = total_size;
+}
+
+// ============================================================================
 // Hash Join Constants and Data Structures (DuckDB-style vectorized execution)
 // ============================================================================
 const HASH_TABLE_SIZE: usize = 262144; // 2^18 buckets (power of 2 for fast modulo)
@@ -8713,6 +9153,9 @@ fn executeJoinQuery(left_table: *const TableInfo, query: *const ParsedQuery) !vo
 }
 
 fn executeAggregateQuery(table: *const TableInfo, query: *const ParsedQuery) !void {
+    // Try streaming execution first (memory-efficient for large datasets)
+    if (tryStreamingAggregate(table, query)) return;
+
     // OPTIMIZATION: If no filter, skip index building pass
     if (query.where_clause == null) {
         if (query.is_group_by_near) {
@@ -9706,6 +10149,9 @@ fn executeMultiDimAggQuery(table: *const TableInfo, query: *const ParsedQuery, m
 }
 
 fn executeGroupByQuery(table: *const TableInfo, query: *const ParsedQuery, maybe_indices: ?[]const u32) !void {
+    // Try streaming execution first (memory-efficient, no index materialization)
+    if (maybe_indices == null and tryStreamingGroupBy(table, query)) return;
+
     // =========================================================================
     // SINGLE CODE PATH: Use shared ve.HashGroupBy from vector_engine
     // Same implementation for WASM and native executors

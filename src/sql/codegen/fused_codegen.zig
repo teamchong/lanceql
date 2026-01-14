@@ -2246,11 +2246,17 @@ pub const FusedCodeGen = struct {
 
         // Phase 1: Group key storage and aggregate accumulators
         try self.writeIndent();
-        try self.write("// Phase 1: Group keys and aggregate accumulators\n");
+        try self.write("// Phase 1: Group keys, hash table, and aggregate accumulators\n");
         try self.writeIndent();
         try self.write("const max_groups: usize = 65536;\n");
         try self.writeIndent();
-        try self.write("var num_groups: usize = 0;\n\n");
+        try self.write("const hash_capacity: usize = 131072; // 2x max_groups for load factor\n");
+        try self.writeIndent();
+        try self.write("var num_groups: usize = 0;\n");
+        try self.writeIndent();
+        try self.write("// Hash table: stores group index + 1 (0 = empty)\n");
+        try self.writeIndent();
+        try self.write("var hash_table: [hash_capacity]u32 = [_]u32{0} ** hash_capacity;\n\n");
 
         // Group key arrays (one per group key column)
         for (self.group_keys.items, 0..) |key, idx| {
@@ -2312,13 +2318,29 @@ pub const FusedCodeGen = struct {
             try self.fmt("var agg_{s}: [max_groups]{s} = ", .{ agg.name, zig_type });
             // Initialize with appropriate default
             switch (agg.agg_type) {
-                .count, .count_distinct, .sum => try self.write("[_]"),
-                .avg => try self.write("[_]"),
-                .min => try self.write("[_]"),
-                .max => try self.write("[_]"),
-                else => try self.write("[_]"),
+                .count, .count_distinct, .sum, .avg => {
+                    try self.fmt("[_]{s}{{0}} ** max_groups;\n", .{zig_type});
+                },
+                .min => {
+                    // Initialize MIN to max value so any value is smaller
+                    if (std.mem.eql(u8, zig_type, "f64")) {
+                        try self.fmt("[_]{s}{{@as(f64, @bitCast(@as(u64, 0x7ff0000000000000)))}} ** max_groups;\n", .{zig_type}); // +inf
+                    } else {
+                        try self.fmt("[_]{s}{{@as(i64, 0x7fffffffffffffff)}} ** max_groups;\n", .{zig_type}); // maxInt
+                    }
+                },
+                .max => {
+                    // Initialize MAX to min value so any value is larger
+                    if (std.mem.eql(u8, zig_type, "f64")) {
+                        try self.fmt("[_]{s}{{@as(f64, @bitCast(@as(u64, 0xfff0000000000000)))}} ** max_groups;\n", .{zig_type}); // -inf
+                    } else {
+                        try self.fmt("[_]{s}{{@as(i64, @bitCast(@as(u64, 0x8000000000000000)))}} ** max_groups;\n", .{zig_type}); // minInt
+                    }
+                },
+                else => {
+                    try self.fmt("[_]{s}{{0}} ** max_groups;\n", .{zig_type});
+                },
             }
-            try self.fmt("{s}{{0}} ** max_groups;\n", .{zig_type});
 
             // For AVG, we need a count accumulator too
             if (agg.agg_type == .avg) {
@@ -2344,51 +2366,48 @@ pub const FusedCodeGen = struct {
         }
         try self.write("\n");
 
-        // Find or create group
+        // Find or create group using hash table
         try self.writeIndent();
-        try self.write("// Find existing group or create new one\n");
-        try self.writeIndent();
-        try self.write("var group_idx: usize = 0;\n");
-        try self.writeIndent();
-        try self.write("var found: bool = false;\n");
-        try self.writeIndent();
-        try self.write("while (group_idx < num_groups) : (group_idx += 1) {\n");
-        self.indent += 1;
-
-        // Compare all group keys (if no group keys, all rows are in group 0)
+        try self.write("// Compute hash from group keys\n");
         try self.writeIndent();
         if (self.group_keys.items.len == 0) {
             // No GROUP BY - all rows belong to single group
-            try self.write("if (group_idx == 0 and num_groups > 0) {\n");
+            try self.write("const hash: u64 = 0;\n");
         } else {
-            try self.write("if (");
+            try self.write("var hash: u64 = 0;\n");
             for (self.group_keys.items, 0..) |key, idx| {
-                if (idx > 0) try self.write(" and ");
-                // Use std.mem.eql for string comparison
+                try self.writeIndent();
                 if (key.col_type == .string) {
-                    try self.fmt("std.mem.eql(u8, group_key_{d}[group_idx], curr_key_{d})", .{ idx, idx });
+                    // String hash
+                    try self.fmt("for (curr_key_{d}) |c| hash = hash *% 31 +% @as(u64, c);\n", .{idx});
                 } else {
-                    try self.fmt("group_key_{d}[group_idx] == curr_key_{d}", .{ idx, idx });
+                    // Numeric hash (MurmurHash finalizer)
+                    try self.fmt("{{ var h: u64 = @bitCast(curr_key_{d}); h ^= h >> 33; h *%= 0xff51afd7ed558ccd; h ^= h >> 33; hash ^= h; }}\n", .{idx});
                 }
             }
-            try self.write(") {\n");
         }
-        self.indent += 1;
-        try self.writeIndent();
-        try self.write("found = true;\n");
-        try self.writeIndent();
-        try self.write("break;\n");
-        self.indent -= 1;
-        try self.writeIndent();
-        try self.write("}\n");
-        self.indent -= 1;
-        try self.writeIndent();
-        try self.write("}\n\n");
 
-        // Create new group if not found
         try self.writeIndent();
-        try self.write("if (!found) {\n");
+        if (self.group_keys.items.len == 0) {
+            try self.write("const slot = hash & (hash_capacity - 1);\n");
+        } else {
+            try self.write("var slot = hash & (hash_capacity - 1);\n");
+        }
+        try self.writeIndent();
+        try self.write("var group_idx: usize = undefined;\n\n");
+
+        try self.writeIndent();
+        try self.write("// Hash table lookup with linear probing\n");
+        try self.writeIndent();
+        try self.write("while (true) {\n");
         self.indent += 1;
+        try self.writeIndent();
+        try self.write("const stored = hash_table[slot];\n");
+        try self.writeIndent();
+        try self.write("if (stored == 0) {\n");
+        self.indent += 1;
+        try self.writeIndent();
+        try self.write("// Empty slot - create new group\n");
         try self.writeIndent();
         try self.write("group_idx = num_groups;\n");
         for (self.group_keys.items, 0..) |_, idx| {
@@ -2396,7 +2415,41 @@ pub const FusedCodeGen = struct {
             try self.fmt("group_key_{d}[group_idx] = curr_key_{d};\n", .{ idx, idx });
         }
         try self.writeIndent();
+        try self.write("hash_table[slot] = @intCast(num_groups + 1);\n");
+        try self.writeIndent();
         try self.write("num_groups += 1;\n");
+        try self.writeIndent();
+        try self.write("break;\n");
+        self.indent -= 1;
+        try self.writeIndent();
+        try self.write("}\n");
+
+        try self.writeIndent();
+        try self.write("// Check if existing group matches\n");
+        try self.writeIndent();
+        try self.write("group_idx = stored - 1;\n");
+        if (self.group_keys.items.len == 0) {
+            // No keys to compare - single group, always matches
+            try self.writeIndent();
+            try self.write("break; // No keys to compare\n");
+        } else {
+            try self.writeIndent();
+            try self.write("if (");
+            for (self.group_keys.items, 0..) |key, idx| {
+                if (idx > 0) try self.write(" and ");
+                if (key.col_type == .string) {
+                    try self.fmt("std.mem.eql(u8, group_key_{d}[group_idx], curr_key_{d})", .{ idx, idx });
+                } else {
+                    try self.fmt("group_key_{d}[group_idx] == curr_key_{d}", .{ idx, idx });
+                }
+            }
+            try self.write(") break;\n");
+
+            try self.writeIndent();
+            try self.write("// Collision - linear probe to next slot\n");
+            try self.writeIndent();
+            try self.write("slot = (slot + 1) & (hash_capacity - 1);\n");
+        }
         self.indent -= 1;
         try self.writeIndent();
         try self.write("}\n\n");
@@ -2430,12 +2483,12 @@ pub const FusedCodeGen = struct {
                 },
                 .min => {
                     if (agg.input_col) |col| {
-                        try self.fmt("if (!found or columns.{s}[i] < agg_{s}[group_idx]) agg_{s}[group_idx] = columns.{s}[i];\n", .{ col.column, agg.name, agg.name, col.column });
+                        try self.fmt("if (columns.{s}[i] < agg_{s}[group_idx]) agg_{s}[group_idx] = columns.{s}[i];\n", .{ col.column, agg.name, agg.name, col.column });
                     }
                 },
                 .max => {
                     if (agg.input_col) |col| {
-                        try self.fmt("if (!found or columns.{s}[i] > agg_{s}[group_idx]) agg_{s}[group_idx] = columns.{s}[i];\n", .{ col.column, agg.name, agg.name, col.column });
+                        try self.fmt("if (columns.{s}[i] > agg_{s}[group_idx]) agg_{s}[group_idx] = columns.{s}[i];\n", .{ col.column, agg.name, agg.name, col.column });
                     }
                 },
                 .stddev, .stddev_pop, .variance, .var_pop => {

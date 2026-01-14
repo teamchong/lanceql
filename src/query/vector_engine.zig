@@ -250,6 +250,38 @@ pub const LinearHashTable = struct {
         return h;
     }
 
+    /// Batch hash function - compute hashes for entire batch using SIMD
+    pub fn hash64Batch(keys: []const i64, hashes: []u64) void {
+        std.debug.assert(hashes.len >= keys.len);
+        var i: usize = 0;
+
+        // SIMD path: hash 2 at a time
+        while (i + 2 <= keys.len) : (i += 2) {
+            const k: Vec2i64 = .{ keys[i], keys[i + 1] };
+            const h = hash64x2(k);
+            hashes[i] = h[0];
+            hashes[i + 1] = h[1];
+        }
+
+        // Scalar remainder
+        while (i < keys.len) : (i += 1) {
+            hashes[i] = hash64(keys[i]);
+        }
+    }
+
+    /// Prefetch hash table entries for a batch of hashes
+    /// Call this BEFORE doing lookups to warm the cache
+    pub fn prefetchSlots(self: *const Self, hashes: []const u64) void {
+        for (hashes) |h| {
+            const pos = @as(usize, @intCast(h & self.mask));
+            @prefetch(@as([*]const u8, @ptrCast(&self.entries[pos])), .{
+                .rw = .read,
+                .locality = 3,
+                .cache = .data,
+            });
+        }
+    }
+
     /// Insert key with linear probing
     pub fn insert(self: *Self, key: i64, row_idx: u32) void {
         const h = hash64(key);
@@ -696,6 +728,8 @@ pub fn filterF64(
 pub const GroupAggEntry = struct {
     /// First row index for this group (for retrieving group key)
     first_row: u32,
+    /// Cached key value for batch processing (avoids array lookup)
+    key: i64,
     /// Aggregation state
     agg: AggState,
 };
@@ -725,104 +759,173 @@ pub const HashGroupBy = struct {
         self.groups.deinit(self.allocator);
     }
 
-    /// Build groups from i64 key column
+    /// Build groups from i64 key column (optimized with batch hashing + prefetch)
     pub fn buildGroups(self: *Self, keys: []const i64) !void {
-        for (keys, 0..) |key, row_idx| {
-            if (key == NULL_INT64) continue;
+        var offset: usize = 0;
 
-            const h = LinearHashTable.hash64(key);
-            const hash_bits: u16 = @truncate(h >> 48);
-            var pos = @as(usize, @intCast(h & self.ht.mask));
+        // Process in VECTOR_SIZE batches for cache efficiency
+        while (offset < keys.len) {
+            const batch_end = @min(offset + VECTOR_SIZE, keys.len);
+            const batch_keys = keys[offset..batch_end];
+            const batch_size = batch_keys.len;
 
-            // Find existing group or create new one
-            var found = false;
-            while (self.ht.entries[pos].state == LinearHashTable.OCCUPIED) {
-                if (self.ht.entries[pos].hash_bits == hash_bits) {
-                    // Check actual key match
-                    const group_idx = self.ht.entries[pos].row_idx;
-                    const group_first_row = self.groups.items[group_idx].first_row;
-                    if (keys[group_first_row] == key) {
-                        found = true;
-                        break;
+            // Step 1: SIMD batch hash computation
+            LinearHashTable.hash64Batch(batch_keys, batch_hashes[0..batch_size]);
+
+            // Step 2: Prefetch all hash table slots
+            self.ht.prefetchSlots(batch_hashes[0..batch_size]);
+
+            // Step 3: Find or create groups
+            for (batch_keys, batch_hashes[0..batch_size], 0..) |key, h, i| {
+                if (key == NULL_INT64) continue;
+
+                const hash_bits: u16 = @truncate(h >> 48);
+                var pos = @as(usize, @intCast(h & self.ht.mask));
+
+                // Find existing group or create new one
+                var found = false;
+                while (self.ht.entries[pos].state == LinearHashTable.OCCUPIED) {
+                    if (self.ht.entries[pos].hash_bits == hash_bits) {
+                        if (self.groups.items[self.ht.entries[pos].row_idx].key == key) {
+                            found = true;
+                            break;
+                        }
                     }
+                    pos = (pos + 1) & @as(usize, @intCast(self.ht.mask));
                 }
-                pos = (pos + 1) & @as(usize, @intCast(self.ht.mask));
+
+                if (!found) {
+                    // Create new group with cached key
+                    const group_idx: u32 = @intCast(self.groups.items.len);
+                    try self.groups.append(self.allocator, .{
+                        .first_row = @intCast(offset + i),
+                        .key = key,
+                        .agg = .{},
+                    });
+
+                    // Insert into hash table
+                    self.ht.entries[pos] = .{
+                        .hash_bits = hash_bits,
+                        .row_idx = group_idx,
+                        .state = LinearHashTable.OCCUPIED,
+                        ._pad = 0,
+                    };
+                    self.ht.count += 1;
+                }
             }
 
-            if (!found) {
-                // Create new group
-                const group_idx: u32 = @intCast(self.groups.items.len);
-                try self.groups.append(self.allocator, .{
-                    .first_row = @intCast(row_idx),
-                    .agg = .{},
-                });
-
-                // Insert into hash table
-                self.ht.entries[pos] = .{
-                    .hash_bits = hash_bits,
-                    .row_idx = group_idx,
-                    .state = LinearHashTable.OCCUPIED,
-                    ._pad = 0,
-                };
-                self.ht.count += 1;
-            }
+            offset = batch_end;
         }
     }
 
-    /// Aggregate f64 values into groups
+    /// Aggregate f64 values into groups (optimized with batch hashing + prefetch)
     pub fn aggregateF64(self: *Self, keys: []const i64, values: []const f64) void {
-        for (keys, values) |key, value| {
-            if (key == NULL_INT64) continue;
+        var offset: usize = 0;
 
-            // Find group
-            const h = LinearHashTable.hash64(key);
-            const hash_bits: u16 = @truncate(h >> 48);
-            var pos = @as(usize, @intCast(h & self.ht.mask));
+        // Process in VECTOR_SIZE batches for cache efficiency
+        while (offset < keys.len) {
+            const batch_end = @min(offset + VECTOR_SIZE, keys.len);
+            const batch_keys = keys[offset..batch_end];
+            const batch_vals = values[offset..batch_end];
+            const batch_size = batch_keys.len;
 
-            while (self.ht.entries[pos].state == LinearHashTable.OCCUPIED) {
-                if (self.ht.entries[pos].hash_bits == hash_bits) {
-                    const group_idx = self.ht.entries[pos].row_idx;
-                    const group_first_row = self.groups.items[group_idx].first_row;
-                    if (keys[group_first_row] == key) {
-                        // Update aggregation
-                        const agg = &self.groups.items[group_idx].agg;
-                        agg.sum += value;
-                        agg.count += 1;
-                        if (value < agg.min) agg.min = value;
-                        if (value > agg.max) agg.max = value;
-                        break;
-                    }
+            // Step 1: SIMD batch hash computation
+            LinearHashTable.hash64Batch(batch_keys, batch_hashes[0..batch_size]);
+
+            // Step 2: Prefetch all hash table slots
+            self.ht.prefetchSlots(batch_hashes[0..batch_size]);
+
+            // Step 3: Find groups and store indices
+            for (batch_keys, batch_hashes[0..batch_size], 0..) |key, h, i| {
+                if (key == NULL_INT64) {
+                    batch_group_indices[i] = -1;
+                    continue;
                 }
-                pos = (pos + 1) & @as(usize, @intCast(self.ht.mask));
+
+                const hash_bits: u16 = @truncate(h >> 48);
+                var pos = @as(usize, @intCast(h & self.ht.mask));
+
+                var found_idx: i32 = -1;
+                while (self.ht.entries[pos].state == LinearHashTable.OCCUPIED) {
+                    if (self.ht.entries[pos].hash_bits == hash_bits) {
+                        const group_idx = self.ht.entries[pos].row_idx;
+                        if (self.groups.items[group_idx].key == key) {
+                            found_idx = @intCast(group_idx);
+                            break;
+                        }
+                    }
+                    pos = (pos + 1) & @as(usize, @intCast(self.ht.mask));
+                }
+                batch_group_indices[i] = found_idx;
             }
+
+            // Step 4: Batch aggregate updates
+            for (batch_group_indices[0..batch_size], batch_vals) |gidx, val| {
+                if (gidx < 0) continue;
+                const agg = &self.groups.items[@intCast(gidx)].agg;
+                agg.sum += val;
+                agg.count += 1;
+                if (val < agg.min) agg.min = val;
+                if (val > agg.max) agg.max = val;
+            }
+
+            offset = batch_end;
         }
     }
 
-    /// Aggregate i64 values into groups
+    /// Aggregate i64 values into groups (optimized with batch hashing + prefetch)
     pub fn aggregateI64(self: *Self, keys: []const i64, values: []const i64) void {
-        for (keys, values) |key, value| {
-            if (key == NULL_INT64) continue;
+        var offset: usize = 0;
 
-            const h = LinearHashTable.hash64(key);
-            const hash_bits: u16 = @truncate(h >> 48);
-            var pos = @as(usize, @intCast(h & self.ht.mask));
+        // Process in VECTOR_SIZE batches for cache efficiency
+        while (offset < keys.len) {
+            const batch_end = @min(offset + VECTOR_SIZE, keys.len);
+            const batch_keys = keys[offset..batch_end];
+            const batch_vals = values[offset..batch_end];
+            const batch_size = batch_keys.len;
 
-            while (self.ht.entries[pos].state == LinearHashTable.OCCUPIED) {
-                if (self.ht.entries[pos].hash_bits == hash_bits) {
-                    const group_idx = self.ht.entries[pos].row_idx;
-                    const group_first_row = self.groups.items[group_idx].first_row;
-                    if (keys[group_first_row] == key) {
-                        const agg = &self.groups.items[group_idx].agg;
-                        const vf: f64 = @floatFromInt(value);
-                        agg.sum += vf;
-                        agg.count += 1;
-                        if (vf < agg.min) agg.min = vf;
-                        if (vf > agg.max) agg.max = vf;
-                        break;
-                    }
+            // Step 1: SIMD batch hash computation
+            LinearHashTable.hash64Batch(batch_keys, batch_hashes[0..batch_size]);
+
+            // Step 2: Prefetch all hash table slots
+            self.ht.prefetchSlots(batch_hashes[0..batch_size]);
+
+            // Step 3: Find groups and store indices
+            for (batch_keys, batch_hashes[0..batch_size], 0..) |key, h, i| {
+                if (key == NULL_INT64) {
+                    batch_group_indices[i] = -1;
+                    continue;
                 }
-                pos = (pos + 1) & @as(usize, @intCast(self.ht.mask));
+
+                const hash_bits: u16 = @truncate(h >> 48);
+                var pos = @as(usize, @intCast(h & self.ht.mask));
+
+                var found_idx: i32 = -1;
+                while (self.ht.entries[pos].state == LinearHashTable.OCCUPIED) {
+                    if (self.ht.entries[pos].hash_bits == hash_bits) {
+                        const group_idx = self.ht.entries[pos].row_idx;
+                        if (self.groups.items[group_idx].key == key) {
+                            found_idx = @intCast(group_idx);
+                            break;
+                        }
+                    }
+                    pos = (pos + 1) & @as(usize, @intCast(self.ht.mask));
+                }
+                batch_group_indices[i] = found_idx;
             }
+
+            // Step 4: Batch aggregate updates
+            for (batch_group_indices[0..batch_size], batch_vals) |gidx, val| {
+                if (gidx < 0) continue;
+                const agg = &self.groups.items[@intCast(gidx)].agg;
+                const vf: f64 = @floatFromInt(val);
+                agg.sum += vf;
+                agg.count += 1;
+                if (vf < agg.min) agg.min = vf;
+                if (vf > agg.max) agg.max = vf;
+            }
+
+            offset = batch_end;
         }
     }
 
@@ -831,9 +934,10 @@ pub const HashGroupBy = struct {
         return self.groups.items.len;
     }
 
-    /// Get group key at index
+    /// Get group key at index (uses cached key)
     pub fn getGroupKey(self: *const Self, group_idx: usize, keys: []const i64) i64 {
-        return keys[self.groups.items[group_idx].first_row];
+        _ = keys; // No longer needed - using cached key
+        return self.groups.items[group_idx].key;
     }
 
     /// Get group aggregation state
@@ -845,6 +949,10 @@ pub const HashGroupBy = struct {
     pub fn getGroupFirstRow(self: *const Self, group_idx: usize) u32 {
         return self.groups.items[group_idx].first_row;
     }
+
+    // Static batch buffers for batch processing (used by buildGroups/aggregateF64/aggregateI64)
+    var batch_hashes: [VECTOR_SIZE]u64 = undefined;
+    var batch_group_indices: [VECTOR_SIZE]i32 = undefined;
 };
 
 // ============================================================================
@@ -1557,6 +1665,513 @@ pub const StreamingExecutor = struct {
         }
 
         return total_count;
+    }
+};
+
+// ============================================================================
+// Streaming Hash Join - Memory-efficient JOIN for large datasets
+// ============================================================================
+
+/// Streaming Hash Join - builds hash table incrementally, streams probe side
+/// Key insight: Build side must fit in hash table, but probe side can be arbitrarily large
+pub const StreamingHashJoin = struct {
+    allocator: std.mem.Allocator,
+    ht: LinearHashTable,
+    build_keys: std.ArrayList(i64),
+    build_complete: bool,
+
+    const Self = @This();
+
+    pub fn init(allocator: std.mem.Allocator, estimated_build_rows: usize) !Self {
+        return .{
+            .allocator = allocator,
+            .ht = try LinearHashTable.init(allocator, estimated_build_rows),
+            .build_keys = std.ArrayList(i64).init(allocator),
+            .build_complete = false,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.ht.deinit(self.allocator);
+        self.build_keys.deinit();
+    }
+
+    /// Add a batch of keys from the build side
+    /// Call this repeatedly to stream the build side
+    pub fn addBuildBatch(self: *Self, keys: []const i64) !void {
+        const start_idx = self.build_keys.items.len;
+        try self.build_keys.appendSlice(keys);
+
+        // Insert into hash table
+        for (keys, start_idx..) |key, idx| {
+            if (key != NULL_INT64) {
+                self.ht.insert(key, @intCast(idx));
+            }
+        }
+    }
+
+    /// Mark build phase as complete
+    pub fn finishBuild(self: *Self) void {
+        self.build_complete = true;
+    }
+
+    /// Probe with a batch of keys from the probe side
+    /// Returns (probe_indices, build_indices) for matching rows
+    pub fn probeBatch(
+        self: *Self,
+        probe_keys: []const i64,
+        probe_offset: usize,
+        max_results: usize,
+    ) !struct { probe: []u32, build: []u32 } {
+        if (!self.build_complete) return error.BuildNotComplete;
+
+        var probe_out = try self.allocator.alloc(u32, max_results);
+        errdefer self.allocator.free(probe_out);
+        var build_out = try self.allocator.alloc(u32, max_results);
+        errdefer self.allocator.free(build_out);
+
+        var out_count: usize = 0;
+        var match_buf: [64]u32 = undefined;
+
+        for (probe_keys, 0..) |key, local_idx| {
+            if (key == NULL_INT64) continue;
+            if (out_count >= max_results) break;
+
+            // Find all matches in build side
+            const matches = self.ht.probeAll(key, self.build_keys.items, &match_buf);
+            for (match_buf[0..matches]) |build_idx| {
+                if (out_count >= max_results) break;
+                probe_out[out_count] = @intCast(probe_offset + local_idx);
+                build_out[out_count] = build_idx;
+                out_count += 1;
+            }
+        }
+
+        return .{
+            .probe = probe_out[0..out_count],
+            .build = build_out[0..out_count],
+        };
+    }
+
+    /// Execute streaming hash join between two column readers
+    /// Returns all (left_idx, right_idx) matching pairs
+    pub fn executeStreaming(
+        allocator: std.mem.Allocator,
+        build_reader: *const ColumnReader,
+        build_col_idx: usize,
+        probe_reader: *const ColumnReader,
+        probe_col_idx: usize,
+        max_results: usize,
+    ) !struct { left: []u32, right: []u32 } {
+        const build_rows = build_reader.getRowCount();
+
+        // Initialize hash join
+        var join = try Self.init(allocator, build_rows);
+        defer join.deinit();
+
+        // Build phase: stream build side
+        var build_offset: usize = 0;
+        while (build_offset < build_rows) {
+            const batch_size = @min(VECTOR_SIZE, build_rows - build_offset);
+            const keys = build_reader.readBatchI64(build_col_idx, build_offset, batch_size) orelse break;
+            try join.addBuildBatch(keys);
+            build_offset += batch_size;
+        }
+        join.finishBuild();
+
+        // Probe phase: stream probe side and collect results
+        var all_probe = std.ArrayList(u32).init(allocator);
+        errdefer all_probe.deinit();
+        var all_build = std.ArrayList(u32).init(allocator);
+        errdefer all_build.deinit();
+
+        const probe_rows = probe_reader.getRowCount();
+        var probe_offset: usize = 0;
+
+        while (probe_offset < probe_rows and all_probe.items.len < max_results) {
+            const batch_size = @min(VECTOR_SIZE, probe_rows - probe_offset);
+            const keys = probe_reader.readBatchI64(probe_col_idx, probe_offset, batch_size) orelse break;
+
+            const remaining = max_results - all_probe.items.len;
+            const result = try join.probeBatch(keys, probe_offset, remaining);
+            defer {
+                allocator.free(result.probe);
+                allocator.free(result.build);
+            }
+
+            try all_probe.appendSlice(result.probe);
+            try all_build.appendSlice(result.build);
+
+            probe_offset += batch_size;
+        }
+
+        return .{
+            .left = try all_probe.toOwnedSlice(),
+            .right = try all_build.toOwnedSlice(),
+        };
+    }
+};
+
+// ============================================================================
+// Streaming Window Functions - Memory-efficient window computations
+// ============================================================================
+
+/// Window function types
+pub const WindowFunc = enum {
+    row_number,
+    rank,
+    dense_rank,
+    lag,
+    lead,
+    first_value,
+    last_value,
+    sum,
+    avg,
+    min,
+    max,
+    count,
+};
+
+/// Window function specification
+pub const WindowSpec = struct {
+    func: WindowFunc,
+    value_col_idx: usize, // Column for value functions (SUM, AVG, etc.)
+    partition_col_idx: ?usize, // PARTITION BY column (null = no partitioning)
+    order_col_idx: ?usize, // ORDER BY column (null = no ordering)
+    offset: i32 = 1, // For LAG/LEAD
+    default_value: f64 = 0, // For LAG/LEAD when out of bounds
+};
+
+/// Streaming Window Executor - computes window functions over partitions
+/// Accumulates data by partition, sorts, then computes window values
+pub const StreamingWindowExecutor = struct {
+    allocator: std.mem.Allocator,
+
+    // Partition buffers: key -> (indices, values)
+    partitions: std.AutoHashMap(i64, PartitionData),
+
+    const Self = @This();
+
+    const PartitionData = struct {
+        indices: std.ArrayList(u32),
+        values: std.ArrayList(f64),
+        order_keys: std.ArrayList(i64),
+    };
+
+    pub fn init(allocator: std.mem.Allocator) Self {
+        return .{
+            .allocator = allocator,
+            .partitions = std.AutoHashMap(i64, PartitionData).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        var iter = self.partitions.iterator();
+        while (iter.next()) |entry| {
+            entry.value_ptr.indices.deinit();
+            entry.value_ptr.values.deinit();
+            entry.value_ptr.order_keys.deinit();
+        }
+        self.partitions.deinit();
+    }
+
+    /// Add a batch of rows to partitions
+    pub fn addBatch(
+        self: *Self,
+        partition_keys: ?[]const i64,
+        order_keys: ?[]const i64,
+        values: []const f64,
+        base_offset: usize,
+    ) !void {
+        for (values, 0..) |val, i| {
+            const part_key: i64 = if (partition_keys) |pk| pk[i] else 0;
+            const ord_key: i64 = if (order_keys) |ok| ok[i] else @intCast(base_offset + i);
+
+            const gop = try self.partitions.getOrPut(part_key);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .{
+                    .indices = std.ArrayList(u32).init(self.allocator),
+                    .values = std.ArrayList(f64).init(self.allocator),
+                    .order_keys = std.ArrayList(i64).init(self.allocator),
+                };
+            }
+
+            try gop.value_ptr.indices.append(@intCast(base_offset + i));
+            try gop.value_ptr.values.append(val);
+            try gop.value_ptr.order_keys.append(ord_key);
+        }
+    }
+
+    /// Compute window function and return results
+    /// Returns (original_indices, window_values)
+    pub fn compute(self: *Self, spec: WindowSpec) !struct { indices: []u32, values: []f64 } {
+        var all_indices = std.ArrayList(u32).init(self.allocator);
+        errdefer all_indices.deinit();
+        var all_values = std.ArrayList(f64).init(self.allocator);
+        errdefer all_values.deinit();
+
+        var iter = self.partitions.iterator();
+        while (iter.next()) |entry| {
+            const part = entry.value_ptr;
+            const n = part.indices.items.len;
+            if (n == 0) continue;
+
+            // Sort by order key within partition
+            var sorted_idx = try self.allocator.alloc(usize, n);
+            defer self.allocator.free(sorted_idx);
+            for (0..n) |i| sorted_idx[i] = i;
+
+            std.mem.sort(usize, sorted_idx, part.order_keys.items, struct {
+                fn lessThan(keys: []const i64, a: usize, b: usize) bool {
+                    return keys[a] < keys[b];
+                }
+            }.lessThan);
+
+            // Compute window values in sorted order
+            for (sorted_idx, 0..) |orig_idx, rank| {
+                const win_val: f64 = switch (spec.func) {
+                    .row_number => @floatFromInt(rank + 1),
+                    .rank => blk: {
+                        // Same key = same rank
+                        if (rank == 0) break :blk 1;
+                        const prev_key = part.order_keys.items[sorted_idx[rank - 1]];
+                        const curr_key = part.order_keys.items[orig_idx];
+                        if (curr_key == prev_key) {
+                            // Find first occurrence
+                            var r: usize = rank;
+                            while (r > 0 and part.order_keys.items[sorted_idx[r - 1]] == curr_key) r -= 1;
+                            break :blk @floatFromInt(r + 1);
+                        }
+                        break :blk @floatFromInt(rank + 1);
+                    },
+                    .dense_rank => blk: {
+                        if (rank == 0) break :blk 1;
+                        var dense: usize = 1;
+                        var prev_key = part.order_keys.items[sorted_idx[0]];
+                        for (1..rank + 1) |r| {
+                            const curr_key = part.order_keys.items[sorted_idx[r]];
+                            if (curr_key != prev_key) {
+                                dense += 1;
+                                prev_key = curr_key;
+                            }
+                        }
+                        break :blk @floatFromInt(dense);
+                    },
+                    .lag => blk: {
+                        const off: usize = @intCast(@max(0, spec.offset));
+                        if (rank < off) break :blk spec.default_value;
+                        break :blk part.values.items[sorted_idx[rank - off]];
+                    },
+                    .lead => blk: {
+                        const off: usize = @intCast(@max(0, spec.offset));
+                        if (rank + off >= n) break :blk spec.default_value;
+                        break :blk part.values.items[sorted_idx[rank + off]];
+                    },
+                    .first_value => part.values.items[sorted_idx[0]],
+                    .last_value => part.values.items[sorted_idx[n - 1]],
+                    .sum => blk: {
+                        var sum: f64 = 0;
+                        for (part.values.items) |v| sum += v;
+                        break :blk sum;
+                    },
+                    .avg => blk: {
+                        var sum: f64 = 0;
+                        for (part.values.items) |v| sum += v;
+                        break :blk sum / @as(f64, @floatFromInt(n));
+                    },
+                    .min => blk: {
+                        var m: f64 = part.values.items[0];
+                        for (part.values.items[1..]) |v| if (v < m) {
+                            m = v;
+                        };
+                        break :blk m;
+                    },
+                    .max => blk: {
+                        var m: f64 = part.values.items[0];
+                        for (part.values.items[1..]) |v| if (v > m) {
+                            m = v;
+                        };
+                        break :blk m;
+                    },
+                    .count => @floatFromInt(n),
+                };
+
+                try all_indices.append(part.indices.items[orig_idx]);
+                try all_values.append(win_val);
+            }
+        }
+
+        return .{
+            .indices = try all_indices.toOwnedSlice(),
+            .values = try all_values.toOwnedSlice(),
+        };
+    }
+
+    /// Execute streaming window function on a column reader
+    pub fn executeStreaming(
+        allocator: std.mem.Allocator,
+        reader: *const ColumnReader,
+        spec: WindowSpec,
+    ) !struct { indices: []u32, values: []f64 } {
+        var executor = Self.init(allocator);
+        defer executor.deinit();
+
+        const total_rows = reader.getRowCount();
+        var offset: usize = 0;
+
+        while (offset < total_rows) {
+            const batch_size = @min(VECTOR_SIZE, total_rows - offset);
+
+            // Read partition keys (if partitioning)
+            var part_keys: ?[]const i64 = null;
+            if (spec.partition_col_idx) |col| {
+                part_keys = reader.readBatchI64(col, offset, batch_size);
+            }
+
+            // Read order keys (if ordering)
+            var ord_keys: ?[]const i64 = null;
+            if (spec.order_col_idx) |col| {
+                ord_keys = reader.readBatchI64(col, offset, batch_size);
+            }
+
+            // Read values
+            const values = reader.readBatchF64(spec.value_col_idx, offset, batch_size) orelse break;
+
+            try executor.addBatch(part_keys, ord_keys, values, offset);
+            offset += batch_size;
+        }
+
+        return executor.compute(spec);
+    }
+};
+
+// ============================================================================
+// String Hash Group By - GROUP BY with string keys
+// ============================================================================
+
+/// Hash function for strings (FNV-1a)
+pub fn hashString(s: []const u8) u64 {
+    var hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+    for (s) |byte| {
+        hash ^= byte;
+        hash *%= 0x100000001b3; // FNV prime
+    }
+    return hash;
+}
+
+/// String Hash Group By - groups by string keys with aggregate accumulators
+pub const StringHashGroupBy = struct {
+    allocator: std.mem.Allocator,
+    groups: std.StringHashMap(GroupState),
+    agg_count: usize,
+
+    const Self = @This();
+
+    const GroupState = struct {
+        counts: []u64,
+        sums: []f64,
+        mins: []f64,
+        maxs: []f64,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, num_aggs: usize) Self {
+        return .{
+            .allocator = allocator,
+            .groups = std.StringHashMap(GroupState).init(allocator),
+            .agg_count = num_aggs,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        var iter = self.groups.iterator();
+        while (iter.next()) |entry| {
+            self.allocator.free(entry.value_ptr.counts);
+            self.allocator.free(entry.value_ptr.sums);
+            self.allocator.free(entry.value_ptr.mins);
+            self.allocator.free(entry.value_ptr.maxs);
+            // Free the duplicated key
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.groups.deinit();
+    }
+
+    /// Add a batch of (key, values) pairs
+    pub fn addBatch(
+        self: *Self,
+        keys: []const []const u8,
+        values: []const []const f64, // values[agg_idx][row_idx]
+    ) !void {
+        for (keys, 0..) |key, row| {
+            const gop = try self.groups.getOrPut(key);
+            if (!gop.found_existing) {
+                // Duplicate the key string
+                const key_copy = try self.allocator.dupe(u8, key);
+                gop.key_ptr.* = key_copy;
+
+                // Initialize group state
+                gop.value_ptr.* = .{
+                    .counts = try self.allocator.alloc(u64, self.agg_count),
+                    .sums = try self.allocator.alloc(f64, self.agg_count),
+                    .mins = try self.allocator.alloc(f64, self.agg_count),
+                    .maxs = try self.allocator.alloc(f64, self.agg_count),
+                };
+                for (0..self.agg_count) |a| {
+                    gop.value_ptr.counts[a] = 0;
+                    gop.value_ptr.sums[a] = 0;
+                    gop.value_ptr.mins[a] = std.math.inf(f64);
+                    gop.value_ptr.maxs[a] = -std.math.inf(f64);
+                }
+            }
+
+            // Update accumulators
+            for (0..self.agg_count) |a| {
+                const val = values[a][row];
+                if (!std.math.isNan(val) and val != NULL_FLOAT64) {
+                    gop.value_ptr.counts[a] += 1;
+                    gop.value_ptr.sums[a] += val;
+                    if (val < gop.value_ptr.mins[a]) gop.value_ptr.mins[a] = val;
+                    if (val > gop.value_ptr.maxs[a]) gop.value_ptr.maxs[a] = val;
+                }
+            }
+        }
+    }
+
+    /// Get final results
+    /// Returns (keys, results[group_idx][agg_idx])
+    pub fn getResults(
+        self: *Self,
+        agg_funcs: []const AggFunc,
+    ) !struct { keys: [][]const u8, results: [][]f64 } {
+        const num_groups = self.groups.count();
+        const keys = try self.allocator.alloc([]const u8, num_groups);
+        errdefer self.allocator.free(keys);
+
+        const results = try self.allocator.alloc([]f64, num_groups);
+        errdefer self.allocator.free(results);
+
+        var iter = self.groups.iterator();
+        var idx: usize = 0;
+        while (iter.next()) |entry| {
+            keys[idx] = entry.key_ptr.*;
+
+            results[idx] = try self.allocator.alloc(f64, self.agg_count);
+            for (0..self.agg_count) |a| {
+                const state = entry.value_ptr;
+                results[idx][a] = switch (agg_funcs[a]) {
+                    .count => @floatFromInt(state.counts[a]),
+                    .sum => state.sums[a],
+                    .avg => if (state.counts[a] > 0)
+                        state.sums[a] / @as(f64, @floatFromInt(state.counts[a]))
+                    else
+                        0,
+                    .min => if (state.mins[a] == std.math.inf(f64)) 0 else state.mins[a],
+                    .max => if (state.maxs[a] == -std.math.inf(f64)) 0 else state.maxs[a],
+                };
+            }
+            idx += 1;
+        }
+
+        return .{ .keys = keys, .results = results };
     }
 };
 

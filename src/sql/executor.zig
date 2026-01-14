@@ -30,6 +30,7 @@ pub const window_eval = @import("window_eval.zig");
 pub const where_eval = @import("where_eval.zig");
 pub const expr_eval = @import("expr_eval.zig");
 pub const group_eval = @import("group_eval.zig");
+pub const streaming_reader = @import("streaming_reader.zig");
 
 // Fused query compilation (optional)
 pub const planner = @import("planner/planner.zig");
@@ -1821,6 +1822,383 @@ pub const Executor = struct {
     }
 
     // ========================================================================
+    // Streaming Execution (memory-efficient for large datasets)
+    // ========================================================================
+
+    /// Execute a SELECT statement using streaming (processes VECTOR_SIZE batches)
+    /// This avoids loading entire columns into memory at once.
+    /// Returns null if streaming is not applicable (falls back to compiled path)
+    pub fn executeStreaming(self: *Self, stmt: *const SelectStmt) !?Result {
+        // Only support streaming for Lance tables
+        const table = self.table orelse return null;
+
+        // Check if query is streaming-compatible
+        if (!self.isStreamingCompatible(stmt)) return null;
+
+        // Create TableColumnReader
+        var col_reader = streaming_reader.TableColumnReader.init(table, self.allocator) catch return null;
+        defer col_reader.deinit();
+
+        // Detect query type and execute
+        const has_group_by = stmt.group_by != null;
+        const has_aggs = self.hasAggregates(stmt.columns);
+
+        if (has_group_by) {
+            return try self.executeStreamingGroupBy(&col_reader, stmt);
+        } else if (has_aggs) {
+            return try self.executeStreamingAggregates(&col_reader, stmt);
+        } else {
+            // Simple SELECT - not yet optimized for streaming
+            return null;
+        }
+    }
+
+    /// Check if query can use streaming execution
+    fn isStreamingCompatible(self: *Self, stmt: *const SelectStmt) bool {
+        // Currently support:
+        // - Simple aggregates (COUNT, SUM, AVG, MIN, MAX)
+        // - GROUP BY with single key column
+        // Not yet supported:
+        // - JOINs
+        // - Window functions
+        // - Complex expressions in aggregates
+        // - Multiple GROUP BY columns
+
+        // No JOINs for now
+        if (stmt.from) |from| {
+            switch (from) {
+                .join => return false,
+                else => {},
+            }
+        }
+
+        // No HAVING clause for now
+        if (stmt.having != null) return false;
+
+        // No ORDER BY for now (streaming doesn't preserve order)
+        if (stmt.order_by != null) return false;
+
+        // Check aggregates are supported
+        for (stmt.columns) |col| {
+            switch (col) {
+                .expr => |e| {
+                    if (!self.isStreamingSupportedExpr(e.expr)) return false;
+                },
+                .all, .all_from_table => {},
+            }
+        }
+
+        return true;
+    }
+
+    /// Check if expression is supported in streaming mode
+    fn isStreamingSupportedExpr(self: *Self, expr: *const ast.Expr) bool {
+        _ = self;
+        switch (expr.*) {
+            .column => return true,
+            .literal => return true,
+            .function => |f| {
+                // Only support basic aggregates
+                if (aggregate_functions.isAggregateFunction(f.name)) {
+                    const agg_type = aggregate_functions.parseAggregateType(f.name);
+                    if (agg_type) |t| {
+                        return switch (t) {
+                            .count, .count_star, .sum, .avg, .min, .max => true,
+                            else => false, // stddev, variance, median, percentile not yet supported
+                        };
+                    }
+                }
+                return false; // Non-aggregate functions not supported in streaming
+            },
+            .binary => |b| {
+                // Allow simple arithmetic in WHERE but not in SELECT
+                _ = b;
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    /// Execute streaming aggregates (no GROUP BY)
+    fn executeStreamingAggregates(
+        self: *Self,
+        col_reader: *streaming_reader.TableColumnReader,
+        stmt: *const SelectStmt,
+    ) !Result {
+        // Build AggSpec array
+        var agg_specs = std.ArrayList(vector_engine.AggSpec).init(self.allocator);
+        defer agg_specs.deinit();
+
+        var col_names = std.ArrayList([]const u8).init(self.allocator);
+        defer col_names.deinit();
+
+        for (stmt.columns) |col| {
+            switch (col) {
+                .expr => |e| {
+                    const spec = try self.exprToAggSpec(col_reader, e.expr, e.alias);
+                    if (spec) |s| {
+                        try agg_specs.append(s);
+                        try col_names.append(e.alias orelse s.output_name);
+                    }
+                },
+                else => {},
+            }
+        }
+
+        if (agg_specs.items.len == 0) return error.NoAggregates;
+
+        // Create StreamingExecutor
+        var reader_iface = col_reader.reader();
+        var executor = try vector_engine.StreamingExecutor.init(
+            self.allocator,
+            agg_specs.items.len,
+        );
+        defer executor.deinit();
+
+        // Build filter condition if WHERE clause exists
+        const filter = try self.buildStreamingFilter(col_reader, stmt.where_clause);
+
+        // Execute
+        const results = try executor.executeAggregate(
+            &reader_iface,
+            filter,
+            agg_specs.items,
+        );
+        defer self.allocator.free(results);
+
+        // Convert to Result
+        return self.aggResultsToResult(results, col_names.items);
+    }
+
+    /// Execute streaming GROUP BY
+    fn executeStreamingGroupBy(
+        self: *Self,
+        col_reader: *streaming_reader.TableColumnReader,
+        stmt: *const SelectStmt,
+    ) !Result {
+        const group_by = stmt.group_by orelse return error.NoGroupBy;
+
+        // Get the key column index
+        if (group_by.exprs.len != 1) return error.MultipleGroupByNotSupported;
+        const key_expr = group_by.exprs[0];
+        const key_col_name = switch (key_expr.*) {
+            .column => |c| c.name,
+            else => return error.ComplexGroupByNotSupported,
+        };
+        const key_col_idx = col_reader.getColumnIndex(key_col_name) orelse return error.ColumnNotFound;
+
+        // Build AggSpec array
+        var agg_specs = std.ArrayList(vector_engine.AggSpec).init(self.allocator);
+        defer agg_specs.deinit();
+
+        var col_names = std.ArrayList([]const u8).init(self.allocator);
+        defer col_names.deinit();
+
+        // Add key column name first
+        try col_names.append(key_col_name);
+
+        for (stmt.columns) |col| {
+            switch (col) {
+                .expr => |e| {
+                    // Skip the key column (it's not an aggregate)
+                    if (e.expr.* == .column) {
+                        if (std.mem.eql(u8, e.expr.column.name, key_col_name)) continue;
+                    }
+                    const spec = try self.exprToAggSpec(col_reader, e.expr, e.alias);
+                    if (spec) |s| {
+                        try agg_specs.append(s);
+                        try col_names.append(e.alias orelse s.output_name);
+                    }
+                },
+                else => {},
+            }
+        }
+
+        // Create StreamingExecutor
+        var reader_iface = col_reader.reader();
+        var executor = try vector_engine.StreamingExecutor.init(
+            self.allocator,
+            agg_specs.items.len + 1, // +1 for key column
+        );
+        defer executor.deinit();
+
+        // Build filter condition
+        const filter = try self.buildStreamingFilter(col_reader, stmt.where_clause);
+
+        // Execute GROUP BY
+        const gb_result = try executor.executeGroupBy(
+            &reader_iface,
+            key_col_idx,
+            filter,
+            agg_specs.items,
+        );
+        defer {
+            self.allocator.free(gb_result.keys);
+            for (gb_result.results) |r| self.allocator.free(r);
+            self.allocator.free(gb_result.results);
+        }
+
+        // Convert to Result
+        return self.groupByResultToResult(gb_result, col_names.items);
+    }
+
+    /// Convert AST expression to AggSpec
+    fn exprToAggSpec(
+        self: *Self,
+        col_reader: *streaming_reader.TableColumnReader,
+        expr: *const ast.Expr,
+        alias: ?[]const u8,
+    ) !?vector_engine.AggSpec {
+        switch (expr.*) {
+            .function => |f| {
+                const agg_type = aggregate_functions.parseAggregateTypeWithArgs(f.name, f.args);
+
+                // Map to ve.AggFunc
+                const func: vector_engine.AggFunc = switch (agg_type) {
+                    .count, .count_star => .count,
+                    .sum => .sum,
+                    .avg => .avg,
+                    .min => .min,
+                    .max => .max,
+                    else => return null, // Unsupported aggregate
+                };
+
+                // Get column index (COUNT(*) uses 0)
+                var col_idx: usize = 0;
+                if (agg_type != .count_star and f.args.len > 0) {
+                    const arg = f.args[0];
+                    if (arg == .column) {
+                        col_idx = col_reader.getColumnIndex(arg.column.name) orelse return error.ColumnNotFound;
+                    }
+                }
+
+                // Generate output name
+                const output_name = alias orelse f.name;
+
+                return vector_engine.AggSpec{
+                    .func = func,
+                    .col_idx = col_idx,
+                    .output_name = output_name,
+                };
+            },
+            else => return null,
+        }
+        _ = self;
+    }
+
+    /// Build filter condition from WHERE clause
+    fn buildStreamingFilter(
+        self: *Self,
+        col_reader: *streaming_reader.TableColumnReader,
+        where_clause: ?*const ast.Expr,
+    ) !?vector_engine.FilterCondition {
+        _ = self;
+        const where = where_clause orelse return null;
+
+        // Only support simple comparisons for now: column op literal
+        switch (where.*) {
+            .binary => |b| {
+                // Get column
+                const col_name = switch (b.left.*) {
+                    .column => |c| c.name,
+                    else => return null,
+                };
+                const col_idx = col_reader.getColumnIndex(col_name) orelse return null;
+
+                // Get operator
+                const op: vector_engine.FilterOp = switch (b.op) {
+                    .eq => .eq,
+                    .ne => .ne,
+                    .lt => .lt,
+                    .le => .le,
+                    .gt => .gt,
+                    .ge => .ge,
+                    else => return null,
+                };
+
+                // Get value
+                const value: vector_engine.FilterValue = switch (b.right.*) {
+                    .literal => |lit| switch (lit) {
+                        .integer => |i| .{ .int64 = i },
+                        .float => |f| .{ .float64 = f },
+                        else => return null,
+                    },
+                    else => return null,
+                };
+
+                return vector_engine.FilterCondition{
+                    .col_idx = col_idx,
+                    .op = op,
+                    .value = value,
+                };
+            },
+            else => return null,
+        }
+    }
+
+    /// Convert aggregate results to Result
+    fn aggResultsToResult(self: *Self, results: []f64, col_names: []const []const u8) !Result {
+        var columns = try self.allocator.alloc(Result.Column, results.len);
+        errdefer self.allocator.free(columns);
+
+        for (results, 0..) |val, i| {
+            const data = try self.allocator.alloc(f64, 1);
+            data[0] = val;
+            columns[i] = .{
+                .name = col_names[i],
+                .data = .{ .float64 = data },
+            };
+        }
+
+        return Result{
+            .columns = columns,
+            .row_count = 1,
+            .allocator = self.allocator,
+            .owns_data = true,
+        };
+    }
+
+    /// Convert GROUP BY results to Result
+    fn groupByResultToResult(
+        self: *Self,
+        gb_result: struct { keys: []i64, results: [][]f64 },
+        col_names: []const []const u8,
+    ) !Result {
+        const num_groups = gb_result.keys.len;
+        const num_aggs = if (gb_result.results.len > 0) gb_result.results[0].len else 0;
+
+        var columns = try self.allocator.alloc(Result.Column, 1 + num_aggs);
+        errdefer self.allocator.free(columns);
+
+        // Key column
+        const key_data = try self.allocator.alloc(i64, num_groups);
+        @memcpy(key_data, gb_result.keys);
+        columns[0] = .{
+            .name = col_names[0],
+            .data = .{ .int64 = key_data },
+        };
+
+        // Aggregate columns
+        for (0..num_aggs) |a| {
+            const agg_data = try self.allocator.alloc(f64, num_groups);
+            for (0..num_groups) |g| {
+                agg_data[g] = gb_result.results[g][a];
+            }
+            columns[1 + a] = .{
+                .name = col_names[1 + a],
+                .data = .{ .float64 = agg_data },
+            };
+        }
+
+        return Result{
+            .columns = columns,
+            .row_count = num_groups,
+            .allocator = self.allocator,
+            .owns_data = true,
+        };
+    }
+
+    // ========================================================================
     // Statement Execution (handles all statement types)
     // ========================================================================
 
@@ -2532,265 +2910,6 @@ pub const Executor = struct {
         return aggregate_functions.parseAggregateTypeWithArgs(name, args);
     }
 
-    /// Execute SELECT with GROUP BY and/or aggregates
-    /// SINGLE CODE PATH: Uses ve.HashGroupBy (same as WASM executor)
-    fn executeWithGroupBy(self: *Self, stmt: *const SelectStmt, filtered_indices: []const u32) !Result {
-        // Preload all columns we'll need for grouping and aggregates
-        try self.preloadGroupByColumns(stmt);
-
-        // Get group by column names (empty if no GROUP BY but has aggregates)
-        const group_cols = if (stmt.group_by) |gb| gb.columns else &[_][]const u8{};
-
-        // =========================================================================
-        // SINGLE CODE PATH: Use ve.HashGroupBy (same implementation as WASM)
-        // =========================================================================
-
-        // Check if we can use fast path (single int64 GROUP BY column)
-        const use_ve_groupby = group_cols.len == 1 and blk: {
-            if (self.column_cache.get(group_cols[0])) |cached| {
-                break :blk switch (cached) {
-                    .int64, .int32 => true,
-                    else => false,
-                };
-            }
-            break :blk false;
-        };
-
-        if (use_ve_groupby and filtered_indices.len > 0) {
-            return self.executeWithGroupByVectorEngine(stmt, filtered_indices, group_cols[0]);
-        }
-
-        // Fall back to multi-column/mixed-type path for complex GROUP BY
-        var groups = std.AutoHashMap(u64, std.ArrayListUnmanaged(u32)).init(self.allocator);
-        defer {
-            var iter = groups.valueIterator();
-            while (iter.next()) |list| {
-                list.deinit(self.allocator);
-            }
-            groups.deinit();
-        }
-
-        // Group rows by their hash key (efficient integer hashing)
-        const group_ctx = self.buildGroupContext();
-        for (filtered_indices) |row_idx| {
-            const key = group_eval.hashGroupKey(group_ctx, group_cols, row_idx);
-
-            const entry = try groups.getOrPut(key);
-            if (!entry.found_existing) {
-                entry.value_ptr.* = .{};
-            }
-            try entry.value_ptr.append(self.allocator, row_idx);
-        }
-
-        // If no GROUP BY and no matching rows, return single row with 0/null for aggregates
-        const num_groups = if (groups.count() == 0 and group_cols.len == 0)
-            @as(usize, 1) // Single aggregate result
-        else
-            groups.count();
-
-        // Build result columns
-        var result_columns = std.ArrayListUnmanaged(Result.Column){};
-        errdefer {
-            for (result_columns.items) |col| {
-                col.data.free(self.allocator);
-            }
-            result_columns.deinit(self.allocator);
-        }
-
-        for (stmt.columns) |item| {
-            const col = try group_eval.evaluateSelectItemForGroups(group_ctx, item, &groups, group_cols, num_groups);
-            try result_columns.append(self.allocator, col);
-        }
-
-        var result = Result{
-            .columns = try result_columns.toOwnedSlice(self.allocator),
-            .row_count = num_groups,
-            .allocator = self.allocator,
-        };
-
-        // Apply HAVING clause
-        if (stmt.group_by) |gb| {
-            if (gb.having) |having_expr| {
-                try having_eval.applyHaving(self.allocator, &result, &having_expr, stmt.columns);
-            }
-        }
-
-        // Apply ORDER BY
-        if (stmt.order_by) |order_by| {
-            try result_ops.applyOrderBy(self.allocator, result.columns, order_by);
-        }
-
-        // Apply LIMIT/OFFSET
-        result.row_count = result_ops.applyLimitOffset(self.allocator, result.columns, stmt.limit, stmt.offset);
-
-        return result;
-    }
-
-    /// Execute GROUP BY using ve.HashGroupBy - SINGLE CODE PATH (same as WASM)
-    fn executeWithGroupByVectorEngine(
-        self: *Self,
-        stmt: *const SelectStmt,
-        filtered_indices: []const u32,
-        group_col_name: []const u8,
-    ) !Result {
-        const row_count = filtered_indices.len;
-
-        // Materialize group key column into i64 slice
-        const key_buf = try self.allocator.alloc(i64, row_count);
-        defer self.allocator.free(key_buf);
-
-        const group_cached = self.column_cache.get(group_col_name) orelse return error.ColumnNotFound;
-        switch (group_cached) {
-            .int64 => |data| {
-                for (filtered_indices, 0..) |idx, i| key_buf[i] = data[idx];
-            },
-            .int32 => |data| {
-                for (filtered_indices, 0..) |idx, i| key_buf[i] = data[idx];
-            },
-            else => return error.UnsupportedGroupByType,
-        }
-
-        // Use shared ve.HashGroupBy - SINGLE CODE PATH (same as WASM)
-        var gb = try vector_engine.HashGroupBy.init(self.allocator, 8192);
-        defer gb.deinit();
-
-        try gb.buildGroups(key_buf);
-        const num_groups = gb.groupCount();
-
-        // Handle empty result case
-        if (num_groups == 0) {
-            return Result{
-                .columns = &.{},
-                .row_count = 0,
-                .allocator = self.allocator,
-            };
-        }
-
-        // Process aggregates using ve.HashGroupBy
-        for (stmt.columns) |item| {
-            if (item.expr == .call and aggregate_functions.isAggregateFunction(item.expr.call.name)) {
-                const call = item.expr.call;
-                if (call.args.len > 0 and call.args[0] == .column) {
-                    const agg_col_name = call.args[0].column.name;
-                    if (self.column_cache.get(agg_col_name)) |agg_cached| {
-                        // Materialize aggregate column
-                        const val_buf = try self.allocator.alloc(f64, row_count);
-                        defer self.allocator.free(val_buf);
-
-                        switch (agg_cached) {
-                            .int64 => |data| {
-                                for (filtered_indices, 0..) |idx, i| val_buf[i] = @floatFromInt(data[idx]);
-                            },
-                            .float64 => |data| {
-                                for (filtered_indices, 0..) |idx, i| val_buf[i] = data[idx];
-                            },
-                            .int32 => |data| {
-                                for (filtered_indices, 0..) |idx, i| val_buf[i] = @floatFromInt(data[idx]);
-                            },
-                            .float32 => |data| {
-                                for (filtered_indices, 0..) |idx, i| val_buf[i] = data[idx];
-                            },
-                            else => {},
-                        }
-
-                        // Use ve.HashGroupBy.aggregateF64 - SINGLE CODE PATH
-                        gb.aggregateF64(key_buf, val_buf);
-                    }
-                }
-            }
-        }
-
-        // Build result columns from ve.HashGroupBy results
-        var result_columns = std.ArrayListUnmanaged(Result.Column){};
-        errdefer {
-            for (result_columns.items) |col| {
-                col.data.free(self.allocator);
-            }
-            result_columns.deinit(self.allocator);
-        }
-
-        for (stmt.columns) |item| {
-            const col_name = if (item.alias) |a| a else blk: {
-                if (item.expr == .column) break :blk item.expr.column.name;
-                if (item.expr == .call) break :blk item.expr.call.name;
-                break :blk "col";
-            };
-
-            if (item.expr == .column and std.mem.eql(u8, item.expr.column.name, group_col_name)) {
-                // Group key column - output from ve.HashGroupBy
-                const out_data = try self.allocator.alloc(i64, num_groups);
-                for (0..num_groups) |gi| {
-                    out_data[gi] = gb.getGroupKey(gi, key_buf);
-                }
-                try result_columns.append(self.allocator, .{
-                    .name = try self.allocator.dupe(u8, col_name),
-                    .data = .{ .int64 = out_data },
-                });
-            } else if (item.expr == .call and aggregate_functions.isAggregateFunction(item.expr.call.name)) {
-                // Aggregate column - output from ve.HashGroupBy
-                const agg_type = aggregate_functions.parseAggregateType(item.expr.call.name) orelse continue;
-                const out_data = try self.allocator.alloc(f64, num_groups);
-                for (0..num_groups) |gi| {
-                    const agg_state = gb.getGroupAgg(gi);
-                    out_data[gi] = switch (agg_type) {
-                        .sum => agg_state.sum,
-                        .count, .count_star => @floatFromInt(agg_state.count),
-                        .avg => agg_state.getAvg(),
-                        .min => if (agg_state.min == std.math.inf(f64)) 0 else agg_state.min,
-                        .max => if (agg_state.max == -std.math.inf(f64)) 0 else agg_state.max,
-                        else => agg_state.sum,
-                    };
-                }
-                try result_columns.append(self.allocator, .{
-                    .name = try self.allocator.dupe(u8, col_name),
-                    .data = .{ .float64 = out_data },
-                });
-            }
-        }
-
-        var result = Result{
-            .columns = try result_columns.toOwnedSlice(self.allocator),
-            .row_count = num_groups,
-            .allocator = self.allocator,
-        };
-
-        // Apply HAVING clause
-        if (stmt.group_by) |gb_clause| {
-            if (gb_clause.having) |having_expr| {
-                try having_eval.applyHaving(self.allocator, &result, &having_expr, stmt.columns);
-            }
-        }
-
-        // Apply ORDER BY
-        if (stmt.order_by) |order_by| {
-            try result_ops.applyOrderBy(self.allocator, result.columns, order_by);
-        }
-
-        // Apply LIMIT/OFFSET
-        result.row_count = result_ops.applyLimitOffset(self.allocator, result.columns, stmt.limit, stmt.offset);
-
-        return result;
-    }
-
-    /// Preload columns needed for GROUP BY and aggregates
-    fn preloadGroupByColumns(self: *Self, stmt: *const SelectStmt) !void {
-        var col_names = std.ArrayList([]const u8){};
-        defer col_names.deinit(self.allocator);
-
-        // Add GROUP BY columns
-        if (stmt.group_by) |gb| {
-            for (gb.columns) |col| {
-                try col_names.append(self.allocator, col);
-            }
-        }
-
-        // Add columns referenced in SELECT expressions
-        for (stmt.columns) |item| {
-            try self.extractExprColumnNames(&item.expr, &col_names);
-        }
-
-        try self.preloadColumns(col_names.items);
-    }
 
     /// Extract column names from any expression (delegates to group_eval)
     fn extractExprColumnNames(self: *Self, expr: *const Expr, list: *std.ArrayList([]const u8)) anyerror!void {
