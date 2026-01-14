@@ -384,6 +384,57 @@ pub const LinearHashTable = struct {
         }
         return out_count;
     }
+
+    /// Batch probe with SIMD hashing + prefetching for JOIN optimization
+    /// Returns total number of matches written to output buffers
+    pub fn probeBatch(
+        self: *const Self,
+        left_keys: []const i64,
+        right_keys: []const i64,
+        left_out: []usize,
+        right_out: []usize,
+        left_offset: usize,
+    ) usize {
+        const batch_size = @min(left_keys.len, VECTOR_SIZE);
+        if (batch_size == 0) return 0;
+
+        // Static buffers for batch processing
+        var hashes: [VECTOR_SIZE]u64 = undefined;
+
+        // Step 1: SIMD batch hash computation
+        hash64Batch(left_keys[0..batch_size], hashes[0..batch_size]);
+
+        // Step 2: Prefetch hash table slots
+        self.prefetchSlots(hashes[0..batch_size]);
+
+        // Step 3: Probe with cache-hot hash table
+        var out_count: usize = 0;
+        const max_out = @min(left_out.len, right_out.len);
+
+        for (left_keys[0..batch_size], hashes[0..batch_size], 0..) |key, h, i| {
+            if (key == NULL_INT64) continue;
+
+            const hash_bits: u16 = @truncate(h >> 48);
+            var pos = @as(usize, @intCast(h & self.mask));
+
+            // Find all matches
+            while (self.entries[pos].state != EMPTY and out_count < max_out) {
+                if (self.entries[pos].state == OCCUPIED and
+                    self.entries[pos].hash_bits == hash_bits)
+                {
+                    const row_idx = self.entries[pos].row_idx;
+                    if (right_keys[row_idx] == key) {
+                        left_out[out_count] = left_offset + i;
+                        right_out[out_count] = row_idx;
+                        out_count += 1;
+                    }
+                }
+                pos = (pos + 1) & @as(usize, @intCast(self.mask));
+            }
+        }
+
+        return out_count;
+    }
 };
 
 // ============================================================================
