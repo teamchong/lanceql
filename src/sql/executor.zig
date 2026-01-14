@@ -122,6 +122,10 @@ pub const Executor = struct {
     /// Set via setDatasetPath() after initialization
     dataset_path: ?[]const u8 = null,
 
+    /// Current SELECT items for projection pushdown in JOINs
+    /// Set during execute() before resolving table sources
+    current_select_items: ?[]const ast.SelectItem = null,
+
     const Self = @This();
 
     /// Vector index metadata
@@ -1547,19 +1551,48 @@ pub const Executor = struct {
             col_names.deinit(self.allocator);
         }
 
+        // Extract needed column names from SELECT items for projection pushdown
+        // Store unqualified names - addJoinedColumnsFiltered handles alias matching
+        var needed_cols: ?[]const []const u8 = null;
+        var needed_cols_buf: [64][]const u8 = undefined;
+        var needed_count: usize = 0;
+
+        if (self.current_select_items) |items| {
+            for (items) |item| {
+                if (needed_count >= 64) break;
+                switch (item.expr) {
+                    .column => |col| {
+                        // Check for star (*) - means all columns needed
+                        if (std.mem.eql(u8, col.name, "*")) {
+                            needed_count = 0;
+                            break;
+                        }
+                        // Store just the column name - filter function handles alias matching
+                        needed_cols_buf[needed_count] = col.name;
+                        needed_count += 1;
+                    },
+                    else => {},
+                }
+            }
+            if (needed_count > 0) {
+                needed_cols = needed_cols_buf[0..needed_count];
+            }
+        }
+
         // Add left table columns (with table alias prefix if available)
         const left_alias = switch (left_ref.*) {
             .simple => |s| s.alias orelse s.name,
             else => "left",
         };
 
-        try self.addJoinedColumns(
+        try self.addJoinedColumnsFiltered(
             left_table,
             left_alias,
             left_indices.items,
             joined_data,
             &col_names,
             false, // isRightSide
+            needed_cols,
         );
 
         // Add right table columns
@@ -1568,13 +1601,14 @@ pub const Executor = struct {
             else => "right",
         };
 
-        try self.addJoinedColumns(
+        try self.addJoinedColumnsFiltered(
             right_table,
             right_alias,
             right_indices.items,
             joined_data,
             &col_names,
             true, // isRightSide
+            needed_cols,
         );
 
         joined_data.column_names = try col_names.toOwnedSlice(self.allocator);
@@ -1901,6 +1935,8 @@ pub const Executor = struct {
         var source: ?TableSource = null;
         var original_table: ?*Table = null;
         if (!has_typed_table) {
+            // Set SELECT items for projection pushdown in JOINs
+            self.current_select_items = stmt.columns;
             source = try self.resolveTableSource(&stmt.from);
             self.active_source = source;
             original_table = self.table;
@@ -1911,6 +1947,7 @@ pub const Executor = struct {
             if (!has_typed_table) {
                 self.active_source = null;
                 self.table = original_table;
+                self.current_select_items = null;
             }
         }
 
