@@ -221,14 +221,15 @@ pub const Table = struct {
         } else {
             // Fast path: no null check needed (inner join)
             // Use prefetch to hint CPU about upcoming memory accesses
-            const prefetch_distance: usize = 8;
+            // Distance of 16 elements (~128 bytes for i64) allows L1 prefetch to complete
+            const prefetch_distance: usize = 16;
             for (row_indices, 0..) |idx, i| {
                 // Prefetch next few indices to reduce cache misses
                 if (i + prefetch_distance < row_indices.len) {
                     const next_idx = row_indices[i + prefetch_distance];
                     @prefetch(@as([*]const T, @ptrCast(&all_data[next_idx])), .{
                         .rw = .read,
-                        .locality = 1,
+                        .locality = 0, // Non-temporal - data won't be reused soon
                         .cache = .data,
                     });
                 }
