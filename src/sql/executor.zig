@@ -1802,6 +1802,7 @@ pub const Executor = struct {
     }
 
     /// Read column data for joined rows (handles NULL for outer joins)
+    /// Uses gather API for efficient single-pass extraction
     fn readJoinedColumnData(
         self: *Self,
         table: *Table,
@@ -1809,34 +1810,30 @@ pub const Executor = struct {
         row_indices: []const usize,
         is_right_side: bool,
     ) !CachedColumn {
+        _ = self;
         _ = is_right_side;
         const fld = table.getFieldById(col_idx) orelse return error.InvalidColumn;
         const col_type = LanceColumnType.fromLogicalType(fld.logical_type);
-        const null_idx = std.math.maxInt(usize);
 
         return switch (col_type) {
-            .int64, .int32, .timestamp_ns, .timestamp_us, .timestamp_ms, .timestamp_s, .date32, .date64 => blk: {
-                const all_data = try table.readInt64Column(col_idx);
-                defer self.allocator.free(all_data);
-                const result = try self.allocator.alloc(i64, row_indices.len);
-                for (row_indices, 0..) |idx, i| result[i] = if (idx == null_idx) 0 else all_data[idx];
-                break :blk .{ .int64 = result };
+            .int64, .int32, .timestamp_ns, .timestamp_us, .timestamp_ms, .timestamp_s, .date32, .date64 => .{
+                .int64 = try table.gatherInt64Column(col_idx, row_indices, 0),
             },
-            .float32, .float64 => blk: {
-                const all_data = try table.readFloat64Column(col_idx);
-                defer self.allocator.free(all_data);
-                const result = try self.allocator.alloc(f64, row_indices.len);
-                for (row_indices, 0..) |idx, i| result[i] = if (idx == null_idx) std.math.nan(f64) else all_data[idx];
-                break :blk .{ .float64 = result };
+            .float32, .float64 => .{
+                .float64 = try table.gatherFloat64Column(col_idx, row_indices, std.math.nan(f64)),
             },
             .string => blk: {
+                // String gather still needs manual handling due to allocations
+                const null_idx = std.math.maxInt(usize);
                 const all_data = try table.readStringColumn(col_idx);
                 defer {
-                    for (all_data) |s| self.allocator.free(s);
-                    self.allocator.free(all_data);
+                    for (all_data) |s| table.allocator.free(s);
+                    table.allocator.free(all_data);
                 }
-                const result = try self.allocator.alloc([]const u8, row_indices.len);
-                for (row_indices, 0..) |idx, i| result[i] = try self.allocator.dupe(u8, if (idx == null_idx) "" else all_data[idx]);
+                const result = try table.allocator.alloc([]const u8, row_indices.len);
+                for (row_indices, 0..) |idx, i| {
+                    result[i] = try table.allocator.dupe(u8, if (idx == null_idx) "" else all_data[idx]);
+                }
                 break :blk .{ .string = result };
             },
             .bool_, .unsupported => error.UnsupportedColumnType,

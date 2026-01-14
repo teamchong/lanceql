@@ -181,6 +181,37 @@ pub const Table = struct {
         return self.readNumericColumn(i64, col_idx);
     }
 
+    /// Gather specific row indices from an int64 column (avoids full column allocation)
+    /// More efficient for JOINs where only a subset of rows are needed
+    pub fn gatherInt64Column(self: Self, col_idx: u32, row_indices: []const usize, null_value: i64) TableError![]i64 {
+        return self.gatherNumericColumn(i64, col_idx, row_indices, null_value);
+    }
+
+    /// Gather specific row indices from a float64 column
+    pub fn gatherFloat64Column(self: Self, col_idx: u32, row_indices: []const usize, null_value: f64) TableError![]f64 {
+        return self.gatherNumericColumn(f64, col_idx, row_indices, null_value);
+    }
+
+    /// Generic gather - reads full column, returns only specified indices
+    /// More efficient than read + copy because it allocates only result size
+    fn gatherNumericColumn(self: Self, comptime T: type, col_idx: u32, row_indices: []const usize, null_value: T) TableError![]T {
+        const null_idx = std.math.maxInt(usize);
+
+        // Read full column (Lance columnar format requires sequential read)
+        const all_data = try self.readNumericColumn(T, col_idx);
+        defer self.allocator.free(all_data);
+
+        // Allocate result for gathered rows only
+        const result = self.allocator.alloc(T, row_indices.len) catch return TableError.OutOfMemory;
+
+        // Gather values - single pass, no intermediate allocation
+        for (row_indices, 0..) |idx, i| {
+            result[i] = if (idx == null_idx) null_value else all_data[idx];
+        }
+
+        return result;
+    }
+
     pub fn readInt64ColumnByName(self: Self, name: []const u8) TableError![]i64 {
         const idx = self.columnIndex(name) orelse return TableError.ColumnNotFound;
         return self.readInt64Column(@intCast(idx));
