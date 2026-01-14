@@ -1,6 +1,6 @@
 {
   "name": "@metal0/lanceql-node",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "SQLite-compatible API for Lance columnar files - drop-in replacement for better-sqlite3",
   "main": "src/index.js",
   "types": "types/index.d.ts",
