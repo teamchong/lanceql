@@ -14,15 +14,12 @@ export default defineConfig({
       'test/timestamp.test.js',
       'test/logic-table-compiler.spec.js', // Requires metal0 build
     ],
-    // CRITICAL: Native modules on Linux require special handling
-    // Run sequentially in main thread to avoid segfaults from:
-    // 1. Worker thread cleanup with native modules
-    // 2. Native module reloading between tests
-    // 3. Concurrent access to native bindings
-    pool: 'vmThreads',
+    // CRITICAL: Native modules require process isolation
+    // Use forks pool to avoid segfaults from VM context issues
+    pool: 'forks',
     poolOptions: {
-      vmThreads: {
-        singleThread: true,
+      forks: {
+        singleFork: true,
       },
     },
     dangerouslyIgnoreUnhandledErrors: true,
