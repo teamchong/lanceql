@@ -1381,27 +1381,18 @@ pub const Executor = struct {
                     defer self.allocator.free(join_result.build_indices);
                     defer self.allocator.free(join_result.probe_indices);
 
-                    // Use memcpy instead of element-by-element copy
-                    try left_indices.ensureTotalCapacity(self.allocator, join_result.count);
-                    try right_indices.ensureTotalCapacity(self.allocator, join_result.count);
-                    @memcpy(left_indices.items.ptr[0..join_result.count], join_result.probe_indices[0..join_result.count]);
-                    @memcpy(right_indices.items.ptr[0..join_result.count], join_result.build_indices[0..join_result.count]);
-                    left_indices.items.len = join_result.count;
-                    right_indices.items.len = join_result.count;
+                    // Use appendSlice for safe bulk copy
+                    try left_indices.appendSlice(self.allocator, join_result.probe_indices[0..join_result.count]);
+                    try right_indices.appendSlice(self.allocator, join_result.build_indices[0..join_result.count]);
                 } else {
                     // Small table: use LinearHashTable with parallel probe
                     const result = try ht.probeAllParallel(self.allocator, left_keys);
                     defer self.allocator.free(result.left_indices);
                     defer self.allocator.free(result.right_indices);
 
-                    // Use memcpy instead of element-by-element copy
-                    const count = result.left_indices.len;
-                    try left_indices.ensureTotalCapacity(self.allocator, count);
-                    try right_indices.ensureTotalCapacity(self.allocator, count);
-                    @memcpy(left_indices.items.ptr[0..count], result.left_indices);
-                    @memcpy(right_indices.items.ptr[0..count], result.right_indices);
-                    left_indices.items.len = count;
-                    right_indices.items.len = count;
+                    // Use appendSlice for safe bulk copy
+                    try left_indices.appendSlice(self.allocator, result.left_indices);
+                    try right_indices.appendSlice(self.allocator, result.right_indices);
                 }
             } else {
                 // Outer join: single-threaded with bitmap tracking
