@@ -204,9 +204,25 @@ pub const Table = struct {
         // Allocate result for gathered rows only
         const result = self.allocator.alloc(T, row_indices.len) catch return TableError.OutOfMemory;
 
-        // Gather values - single pass, no intermediate allocation
-        for (row_indices, 0..) |idx, i| {
-            result[i] = if (idx == null_idx) null_value else all_data[idx];
+        // Check if any null indices present (outer join case)
+        var has_nulls = false;
+        for (row_indices) |idx| {
+            if (idx == null_idx) {
+                has_nulls = true;
+                break;
+            }
+        }
+
+        // Gather values - branchless for inner join (no nulls)
+        if (has_nulls) {
+            for (row_indices, 0..) |idx, i| {
+                result[i] = if (idx == null_idx) null_value else all_data[idx];
+            }
+        } else {
+            // Fast path: no null check needed (inner join)
+            for (row_indices, 0..) |idx, i| {
+                result[i] = all_data[idx];
+            }
         }
 
         return result;
