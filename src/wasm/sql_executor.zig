@@ -197,7 +197,6 @@ pub const WasmColumnReader = struct {
             .int32 => .int32,
             .float32 => .float32,
             .string => .string,
-            .bool_ => .bool,
             else => .int64,
         };
     }
@@ -396,7 +395,7 @@ fn tryStreamingGroupBy(table: *const TableInfo, query: *const ParsedQuery) bool 
 /// Write streaming GROUP BY result to result buffer
 fn writeStreamingGroupByResult(
     query: *const ParsedQuery,
-    gb_result: struct { keys: []i64, results: [][]f64 },
+    gb_result: anytype,
     group_col_name: []const u8,
     agg_count: usize,
 ) !void {
@@ -424,7 +423,7 @@ fn writeStreamingGroupByResult(
     pos += 1;
     @memcpy(buf[pos..][0..group_col_name.len], group_col_name);
     pos += group_col_name.len;
-    buf[pos] = @intFromEnum(ColType.int64);
+    buf[pos] = @intFromEnum(ColumnType.int64);
     pos += 1;
 
     // Then: aggregate columns (float64)
@@ -434,7 +433,7 @@ fn writeStreamingGroupByResult(
         pos += 1;
         @memcpy(buf[pos..][0..name.len], name);
         pos += name.len;
-        buf[pos] = @intFromEnum(ColType.float64);
+        buf[pos] = @intFromEnum(ColumnType.float64);
         pos += 1;
     }
 
@@ -572,7 +571,7 @@ fn writeStreamingAggResult(query: *const ParsedQuery, results: []f64) !void {
         pos += 1;
         @memcpy(buf[pos..][0..name.len], name);
         pos += name.len;
-        buf[pos] = @intFromEnum(ColType.float64);
+        buf[pos] = @intFromEnum(ColumnType.float64);
         pos += 1;
     }
 
