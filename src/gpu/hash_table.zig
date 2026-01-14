@@ -836,7 +836,8 @@ pub const GPUHashTable64 = struct {
 // JOIN Hash Table (supports many-to-many matching)
 // =============================================================================
 
-/// GPU threshold for JOIN operations
+/// Threshold for parallel JOIN probe
+/// Threading overhead dominates below this size
 pub const JOIN_GPU_THRESHOLD: usize = 10_000;
 
 /// Hash table optimized for JOIN operations
