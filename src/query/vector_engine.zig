@@ -18,7 +18,8 @@ const std = @import("std");
 pub const VECTOR_SIZE: usize = 2048;
 
 /// Hash table load factor threshold for resize
-pub const HASH_LOAD_FACTOR: f32 = 0.7;
+/// Higher = better cache locality but more collisions
+pub const HASH_LOAD_FACTOR: f32 = 0.85;
 
 /// Null sentinel values
 pub const NULL_INT64: i64 = std.math.minInt(i64);
