@@ -1065,6 +1065,7 @@ pub const HashGroupBy = struct {
                         .row_idx = group_idx,
                         .state = LinearHashTable.OCCUPIED,
                         ._pad = 0,
+                        .key = key,
                     };
                     self.ht.count += 1;
                 }
@@ -1640,6 +1641,7 @@ pub const StreamingGroupBy = struct {
                 .row_idx = gidx,
                 .state = LinearHashTable.OCCUPIED,
                 ._pad = 0,
+                .key = key,
             };
             self.ht.count += 1;
             group_idx = gidx;
