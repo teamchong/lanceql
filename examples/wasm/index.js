@@ -1491,11 +1491,42 @@ export async function registerOPFSFile(path) {
         const fileName = parts.pop();
         const dir = await getOPFSDir(parts);
         const fileHandle = await dir.getFileHandle(fileName);
-        const accessHandle = await fileHandle.createSyncAccessHandle();
+
+        // Try sync access handle first (Worker context)
+        if (typeof fileHandle.createSyncAccessHandle === 'function') {
+            try {
+                const accessHandle = await fileHandle.createSyncAccessHandle();
+                const handleId = nextHandleId++;
+                accessHandle._path = path;
+                accessHandle._isSync = true;
+                opfsHandles.set(handleId, accessHandle);
+                return handleId;
+            } catch (syncErr) {
+                console.log('[LanceQLWorker] Sync access not available, using async fallback');
+            }
+        }
+
+        // Async fallback: store file handle for async reads
+        const file = await fileHandle.getFile();
+        const asyncHandle = {
+            _path: path,
+            _isSync: false,
+            _file: file,
+            _fileHandle: fileHandle,
+            getSize: () => file.size,
+            read: async (buffer, options = {}) => {
+                const offset = options.at || 0;
+                const slice = file.slice(offset, offset + buffer.byteLength);
+                const arrayBuffer = await slice.arrayBuffer();
+                const data = new Uint8Array(arrayBuffer);
+                buffer.set(data);
+                return data.byteLength;
+            },
+            close: () => { /* no-op for async */ }
+        };
 
         const handleId = nextHandleId++;
-        accessHandle._path = path; // Attach path for lookup in opfs_open
-        opfsHandles.set(handleId, accessHandle);
+        opfsHandles.set(handleId, asyncHandle);
         return handleId;
     } catch (e) {
         console.warn('[LanceQLWorker] Failed to register OPFS file:', path, e);
@@ -1572,29 +1603,45 @@ export async function loadFragmentToWasm(fragPath) {
     if (!w) return 0;
 
     try {
-        // Open OPFS file with sync access handle
+        // Open OPFS file
         const parts = fragPath.split('/').filter(p => p);
         const fileName = parts.pop();
         const dir = await getOPFSDir(parts);
         const fileHandle = await dir.getFileHandle(fileName);
-        const accessHandle = await fileHandle.createSyncAccessHandle();
 
-        // Get size and get reusable buffer
-        const size = accessHandle.getSize();
-        const ptr = getWasmBuffer(size);
-        if (!ptr) {
-            accessHandle.close();
-            return 0;
+        let size, wasmBuf, bytesRead;
+
+        // Try sync access handle first (faster, Worker context only)
+        if (typeof fileHandle.createSyncAccessHandle === 'function') {
+            try {
+                const accessHandle = await fileHandle.createSyncAccessHandle();
+                size = accessHandle.getSize();
+                const ptr = getWasmBuffer(size);
+                if (!ptr) {
+                    accessHandle.close();
+                    return 0;
+                }
+                wasmBuf = new Uint8Array(wasmMemory.buffer, ptr, size);
+                bytesRead = accessHandle.read(wasmBuf, { at: 0 });
+                accessHandle.close();
+
+                if (bytesRead !== size) return 0;
+                return w.openFile(ptr, size);
+            } catch (syncErr) {
+                console.log('[LanceQLWorker] Sync access not available for fragment, using async');
+            }
         }
 
-        // Read directly into WASM memory
-        const wasmBuf = new Uint8Array(wasmMemory.buffer, ptr, size);
-        const bytesRead = accessHandle.read(wasmBuf, { at: 0 });
-        accessHandle.close();
+        // Async fallback: use File API
+        const file = await fileHandle.getFile();
+        size = file.size;
+        const ptr = getWasmBuffer(size);
+        if (!ptr) return 0;
 
-        if (bytesRead !== size) return 0;
+        const arrayBuffer = await file.arrayBuffer();
+        wasmBuf = new Uint8Array(wasmMemory.buffer, ptr, size);
+        wasmBuf.set(new Uint8Array(arrayBuffer));
 
-        // Open as Lance file
         return w.openFile(ptr, size);
     } catch (e) {
         console.warn('[LanceQLWorker] Failed to load fragment:', fragPath, e);

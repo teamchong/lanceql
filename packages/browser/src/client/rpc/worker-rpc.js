@@ -1,17 +1,34 @@
 /**
- * worker-rpc - SharedWorker RPC infrastructure for LanceQL client.
+ * worker-rpc - Worker RPC infrastructure for LanceQL client.
+ * Supports both SharedWorker and regular Worker modes.
  */
 
-// SharedWorker singleton (shared across all Store/Database instances)
+// Worker singleton (shared across all Store/Database instances)
 let _lanceWorker = null;
 let _lanceWorkerReady = null;
 let _requestId = 0;
 const _pendingRequests = new Map();
 
+// Worker mode: 'shared' or 'dedicated'
+let _workerMode = 'dedicated';
+
 // Transfer mode detection
 let _transferMode = 'clone'; // 'sharedBuffer' | 'transfer' | 'clone'
 let _sharedBuffer = null;
 const SHARED_BUFFER_SIZE = 16 * 1024 * 1024; // 16MB shared buffer
+
+/**
+ * Configure worker mode before first use.
+ * @param {'shared' | 'dedicated'} mode - Worker mode
+ */
+export function setWorkerMode(mode) {
+    if (_lanceWorker) {
+        console.warn('[LanceQL] Worker already initialized, mode change ignored');
+        return;
+    }
+    _workerMode = mode;
+    console.log(`[LanceQL] Worker mode set to: ${mode}`);
+}
 
 /**
  * Check if SharedArrayBuffer is available (requires COOP/COEP headers).
@@ -47,7 +64,7 @@ export function checkSharedArrayBuffer() {
 }
 
 /**
- * Get or create the SharedWorker.
+ * Get or create the Worker (SharedWorker or dedicated Worker based on mode).
  */
 export function getLanceWorker() {
     if (_lanceWorker) return _lanceWorkerReady;
@@ -56,28 +73,64 @@ export function getLanceWorker() {
     checkSharedArrayBuffer();
 
     _lanceWorkerReady = new Promise((resolve, reject) => {
-        console.log('[LanceQL] Using regular Worker for better logging');
         try {
-            _lanceWorker = new Worker(
-                new URL('./lanceql-worker.js?v=' + Date.now(), import.meta.url),
-                { type: 'module', name: 'lanceql' }
-            );
+            if (_workerMode === 'shared' && typeof SharedWorker !== 'undefined') {
+                // SharedWorker mode - shares state across tabs
+                console.log('[LanceQL] Using SharedWorker for cross-tab efficiency');
+                _lanceWorker = new SharedWorker(
+                    new URL('./lanceql-worker.js?v=' + Date.now(), import.meta.url),
+                    { type: 'module', name: 'lanceql' }
+                );
 
-            _lanceWorker.onmessage = (e) => {
-                handleWorkerMessage(e.data, _lanceWorker, resolve);
-            };
+                const port = _lanceWorker.port;
+                port.onmessage = (e) => {
+                    handleWorkerMessage(e.data, port, resolve);
+                };
 
-            _lanceWorker.onerror = (e) => {
-                console.error('[LanceQL] Worker error:', e);
-                reject(e);
-            };
+                port.onmessageerror = (e) => {
+                    console.error('[LanceQL] SharedWorker message error:', e);
+                };
 
-            // Send shared buffer if available
-            if (_sharedBuffer) {
-                _lanceWorker.postMessage({
-                    type: 'initSharedBuffer',
-                    buffer: _sharedBuffer
-                });
+                _lanceWorker.onerror = (e) => {
+                    console.error('[LanceQL] SharedWorker error:', e);
+                    reject(e);
+                };
+
+                // Send shared buffer if available
+                if (_sharedBuffer) {
+                    port.postMessage({
+                        type: 'initSharedBuffer',
+                        buffer: _sharedBuffer
+                    });
+                }
+
+                port.start();
+                // Store port for postMessage
+                _lanceWorker._port = port;
+            } else {
+                // Dedicated Worker mode - better for debugging
+                console.log('[LanceQL] Using dedicated Worker');
+                _lanceWorker = new Worker(
+                    new URL('./lanceql-worker.js?v=' + Date.now(), import.meta.url),
+                    { type: 'module', name: 'lanceql' }
+                );
+
+                _lanceWorker.onmessage = (e) => {
+                    handleWorkerMessage(e.data, _lanceWorker, resolve);
+                };
+
+                _lanceWorker.onerror = (e) => {
+                    console.error('[LanceQL] Worker error:', e);
+                    reject(e);
+                };
+
+                // Send shared buffer if available
+                if (_sharedBuffer) {
+                    _lanceWorker.postMessage({
+                        type: 'initSharedBuffer',
+                        buffer: _sharedBuffer
+                    });
+                }
             }
         } catch (e) {
             console.error('[LanceQL] Failed to create Worker:', e);
