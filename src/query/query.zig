@@ -45,9 +45,11 @@ pub const AggType = gpu_group_by.AggType;
 pub const GroupByResult = gpu_group_by.GroupByResult;
 
 // GPU-accelerated Hash JOIN
-pub const GPUHashJoin = gpu_hash_join.GPUHashJoin;
+pub const ManyToManyHashJoin = gpu_hash_join.ManyToManyHashJoin;
+pub const hashJoinI64 = gpu_hash_join.hashJoinI64;
 pub const JoinResult = gpu_hash_join.JoinResult;
 pub const LeftJoinResult = gpu_hash_join.LeftJoinResult;
+pub const JOIN_THRESHOLD = gpu_hash_join.JOIN_THRESHOLD;
 
 // Batch vector operations for @logic_table
 pub const batchCosineSimilarity = logic_table.batchCosineSimilarity;

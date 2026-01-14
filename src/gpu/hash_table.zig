@@ -67,6 +67,18 @@ fn hashKey(key: u32) u32 {
     return hash;
 }
 
+/// Fast hash for i64 keys (CPU-only, AHash-style)
+/// Uses golden ratio multiply + xorshift for good distribution
+/// Much faster than FNV-1a: 1 multiply vs 8 for i64
+inline fn hashKeyFast(key: i64) u32 {
+    const k: u64 = @bitCast(key);
+    // Golden ratio constant for 64-bit
+    var h: u64 = k *% 0x9E3779B97F4A7C15;
+    // Mix high and low bits
+    h ^= h >> 33;
+    return @truncate(h);
+}
+
 /// GPU-accelerated hash table
 /// Uses 32-bit keys for WGSL compatibility
 pub const GPUHashTable = struct {
@@ -817,6 +829,272 @@ pub const GPUHashTable64 = struct {
         }
 
         self.allocator.free(old_table);
+    }
+};
+
+// =============================================================================
+// JOIN Hash Table (supports many-to-many matching)
+// =============================================================================
+
+/// GPU threshold for JOIN operations
+pub const JOIN_GPU_THRESHOLD: usize = 10_000;
+
+/// Hash table optimized for JOIN operations
+/// Supports duplicate keys and returns ALL matching pairs
+pub const JoinHashTable = struct {
+    allocator: Allocator,
+    /// Entries: [key_lo, key_hi, row_idx, next] - linked list for duplicates
+    entries: []u32,
+    /// Hash buckets pointing to first entry (or EMPTY)
+    buckets: []u32,
+    capacity: usize,
+    bucket_count: usize,
+    count: usize,
+
+    const Self = @This();
+    const ENTRY_SIZE: usize = 4; // key_lo, key_hi, row_idx, next
+    const EMPTY: u32 = 0xFFFFFFFF;
+
+    /// Result type for JOIN probe operations
+    pub const JoinProbeResult = struct {
+        left_indices: []usize,
+        right_indices: []usize,
+    };
+
+    pub fn init(allocator: Allocator, expected_count: usize) HashTableError!Self {
+        const capacity = nextPowerOfTwo(@max(expected_count, 16));
+        const bucket_count = nextPowerOfTwo(@max(expected_count / 4, 16));
+
+        const entries = allocator.alloc(u32, capacity * ENTRY_SIZE) catch
+            return HashTableError.OutOfMemory;
+        errdefer allocator.free(entries);
+
+        const buckets = allocator.alloc(u32, bucket_count) catch
+            return HashTableError.OutOfMemory;
+
+        // Initialize buckets to EMPTY
+        @memset(buckets, EMPTY);
+
+        return Self{
+            .allocator = allocator,
+            .entries = entries,
+            .buckets = buckets,
+            .capacity = capacity,
+            .bucket_count = bucket_count,
+            .count = 0,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.allocator.free(self.entries);
+        self.allocator.free(self.buckets);
+    }
+
+    /// Build hash table from i64 keys (stores row indices)
+    /// Allows duplicate keys - each gets its own entry
+    pub fn buildFromKeys(self: *Self, keys: []const i64) HashTableError!void {
+        // Resize if needed
+        if (self.count + keys.len > self.capacity) {
+            try self.resize(nextPowerOfTwo((self.count + keys.len) * 2));
+        }
+
+        const bucket_mask: u32 = @intCast(self.bucket_count - 1);
+
+        for (keys, 0..) |key, row_idx| {
+            const key_u64: u64 = @bitCast(key);
+            const key_lo: u32 = @truncate(key_u64);
+            const key_hi: u32 = @truncate(key_u64 >> 32);
+            const hash = hashKeyFast(key) & bucket_mask;
+
+            // Add entry
+            const entry_idx = self.count;
+            const base = entry_idx * ENTRY_SIZE;
+            self.entries[base] = key_lo;
+            self.entries[base + 1] = key_hi;
+            self.entries[base + 2] = @intCast(row_idx);
+            self.entries[base + 3] = self.buckets[hash]; // Link to previous head
+
+            // Update bucket head
+            self.buckets[hash] = @intCast(entry_idx);
+            self.count += 1;
+        }
+    }
+
+    /// Probe for JOIN - returns all matched (left_idx, right_idx) pairs
+    /// Uses parallel processing for large inputs
+    pub fn probeJoin(
+        self: *const Self,
+        left_keys: []const i64,
+        allocator: Allocator,
+    ) HashTableError!JoinProbeResult {
+        // Use parallel for large inputs
+        if (left_keys.len >= JOIN_GPU_THRESHOLD) {
+            return self.probeJoinParallel(left_keys, allocator);
+        }
+        return self.probeJoinSingle(left_keys, allocator);
+    }
+
+    /// Single-threaded JOIN probe
+    fn probeJoinSingle(
+        self: *const Self,
+        left_keys: []const i64,
+        allocator: Allocator,
+    ) HashTableError!JoinProbeResult {
+        var left_out = std.ArrayListUnmanaged(usize){};
+        var right_out = std.ArrayListUnmanaged(usize){};
+        errdefer {
+            left_out.deinit(allocator);
+            right_out.deinit(allocator);
+        }
+
+        // Pre-allocate estimate
+        left_out.ensureTotalCapacity(allocator, left_keys.len) catch
+            return HashTableError.OutOfMemory;
+        right_out.ensureTotalCapacity(allocator, left_keys.len) catch
+            return HashTableError.OutOfMemory;
+
+        const bucket_mask: u32 = @intCast(self.bucket_count - 1);
+
+        for (left_keys, 0..) |key, left_idx| {
+            const key_u64: u64 = @bitCast(key);
+            const key_lo: u32 = @truncate(key_u64);
+            const key_hi: u32 = @truncate(key_u64 >> 32);
+            const hash = hashKeyFast(key) & bucket_mask;
+
+            // Walk linked list for this bucket
+            var entry_idx = self.buckets[hash];
+            while (entry_idx != EMPTY) {
+                const base = entry_idx * ENTRY_SIZE;
+                const stored_lo = self.entries[base];
+                const stored_hi = self.entries[base + 1];
+
+                if (stored_lo == key_lo and stored_hi == key_hi) {
+                    const right_idx = self.entries[base + 2];
+                    left_out.append(allocator, left_idx) catch return HashTableError.OutOfMemory;
+                    right_out.append(allocator, right_idx) catch return HashTableError.OutOfMemory;
+                }
+
+                entry_idx = self.entries[base + 3]; // next
+            }
+        }
+
+        return .{
+            .left_indices = left_out.toOwnedSlice(allocator) catch return HashTableError.OutOfMemory,
+            .right_indices = right_out.toOwnedSlice(allocator) catch return HashTableError.OutOfMemory,
+        };
+    }
+
+    /// Parallel JOIN probe using multiple threads
+    fn probeJoinParallel(
+        self: *const Self,
+        left_keys: []const i64,
+        allocator: Allocator,
+    ) HashTableError!JoinProbeResult {
+        const num_threads = @min(std.Thread.getCpuCount() catch 4, 8);
+        const chunk_size = (left_keys.len + num_threads - 1) / num_threads;
+
+        const ThreadResult = struct {
+            left_indices: std.ArrayListUnmanaged(usize),
+            right_indices: std.ArrayListUnmanaged(usize),
+        };
+
+        var thread_results = allocator.alloc(ThreadResult, num_threads) catch
+            return HashTableError.OutOfMemory;
+        defer allocator.free(thread_results);
+
+        for (thread_results) |*r| {
+            r.left_indices = .{};
+            r.right_indices = .{};
+        }
+
+        var threads = allocator.alloc(std.Thread, num_threads) catch
+            return HashTableError.OutOfMemory;
+        defer allocator.free(threads);
+
+        const Worker = struct {
+            fn run(
+                ht: *const Self,
+                keys: []const i64,
+                offset: usize,
+                alloc: Allocator,
+                result: *ThreadResult,
+            ) void {
+                result.left_indices.ensureTotalCapacity(alloc, keys.len) catch return;
+                result.right_indices.ensureTotalCapacity(alloc, keys.len) catch return;
+
+                const bucket_mask: u32 = @intCast(ht.bucket_count - 1);
+
+                for (keys, 0..) |key, i| {
+                    const key_u64: u64 = @bitCast(key);
+                    const key_lo: u32 = @truncate(key_u64);
+                    const key_hi: u32 = @truncate(key_u64 >> 32);
+                    const hash = hashKeyFast(key) & bucket_mask;
+
+                    var entry_idx = ht.buckets[hash];
+                    while (entry_idx != EMPTY) {
+                        const base = entry_idx * ENTRY_SIZE;
+                        if (ht.entries[base] == key_lo and ht.entries[base + 1] == key_hi) {
+                            result.left_indices.append(alloc, offset + i) catch return;
+                            result.right_indices.append(alloc, ht.entries[base + 2]) catch return;
+                        }
+                        entry_idx = ht.entries[base + 3];
+                    }
+                }
+            }
+        };
+
+        // Spawn threads
+        var spawned: usize = 0;
+        for (0..num_threads) |t| {
+            const start = t * chunk_size;
+            if (start >= left_keys.len) break;
+            const end = @min(start + chunk_size, left_keys.len);
+            threads[t] = std.Thread.spawn(.{}, Worker.run, .{
+                self,
+                left_keys[start..end],
+                start,
+                allocator,
+                &thread_results[t],
+            }) catch break;
+            spawned += 1;
+        }
+
+        // Wait for threads
+        for (threads[0..spawned]) |t| t.join();
+
+        // Merge results
+        var total: usize = 0;
+        for (thread_results[0..spawned]) |r| {
+            total += r.left_indices.items.len;
+        }
+
+        var left_out = allocator.alloc(usize, total) catch return HashTableError.OutOfMemory;
+        errdefer allocator.free(left_out);
+        var right_out = allocator.alloc(usize, total) catch return HashTableError.OutOfMemory;
+
+        var pos: usize = 0;
+        for (thread_results[0..spawned]) |*r| {
+            const len = r.left_indices.items.len;
+            @memcpy(left_out[pos .. pos + len], r.left_indices.items);
+            @memcpy(right_out[pos .. pos + len], r.right_indices.items);
+            pos += len;
+            r.left_indices.deinit(allocator);
+            r.right_indices.deinit(allocator);
+        }
+
+        return .{ .left_indices = left_out, .right_indices = right_out };
+    }
+
+    fn resize(self: *Self, new_capacity: usize) HashTableError!void {
+        const new_entries = self.allocator.alloc(u32, new_capacity * ENTRY_SIZE) catch
+            return HashTableError.OutOfMemory;
+
+        // Copy existing entries
+        @memcpy(new_entries[0 .. self.count * ENTRY_SIZE], self.entries[0 .. self.count * ENTRY_SIZE]);
+
+        self.allocator.free(self.entries);
+        self.entries = new_entries;
+        self.capacity = new_capacity;
     }
 };
 

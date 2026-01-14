@@ -185,15 +185,23 @@ pub const DataChunk = struct {
 // Linear Probing Hash Table (DuckDB style)
 // ============================================================================
 
-/// Hash table entry with cached hash for fast comparison
+/// Hash table entry with cached key for cache-efficient probe
 const HashEntry = struct {
-    /// Upper bits of hash for fast comparison (avoid key comparison)
+    /// Upper bits of hash for fast comparison
     hash_bits: u16,
-    /// Row index in source data
-    row_idx: u32,
     /// 0 = empty, 1 = occupied, 2 = deleted
     state: u8,
     _pad: u8 = 0,
+    /// Row index in source data
+    row_idx: u32,
+    /// Cached key - avoids memory lookup during probe
+    key: i64,
+};
+
+/// Result from parallel probe operation
+pub const ProbeResult = struct {
+    left_indices: []usize,
+    right_indices: []usize,
 };
 
 /// Linear probing hash table - much faster than chaining for cache locality
@@ -214,7 +222,7 @@ pub const LinearHashTable = struct {
         while (capacity < target) capacity *= 2;
 
         const entries = try allocator.alloc(HashEntry, capacity);
-        @memset(entries, HashEntry{ .hash_bits = 0, .row_idx = 0, .state = EMPTY, ._pad = 0 });
+        @memset(entries, HashEntry{ .hash_bits = 0, .state = EMPTY, ._pad = 0, .row_idx = 0, .key = 0 });
 
         return .{
             .entries = entries,
@@ -295,43 +303,46 @@ pub const LinearHashTable = struct {
 
         self.entries[pos] = .{
             .hash_bits = hash_bits,
-            .row_idx = row_idx,
             .state = OCCUPIED,
             ._pad = 0,
+            .row_idx = row_idx,
+            .key = key,
         };
         self.count += 1;
     }
 
-    /// Build from i64 column - VECTORIZED
+    /// Build from i64 column - VECTORIZED with cached keys
     pub fn buildFromColumn(self: *Self, data: []const i64) void {
         var i: usize = 0;
 
         // SIMD path: hash 2 at a time
         while (i + 2 <= data.len) : (i += 2) {
-            const keys: Vec2i64 = .{ data[i], data[i + 1] };
+            const key0 = data[i];
+            const key1 = data[i + 1];
+            const keys: Vec2i64 = .{ key0, key1 };
             const hashes = hash64x2(keys);
 
             // Insert first
-            if (data[i] != NULL_INT64) {
+            if (key0 != NULL_INT64) {
                 const h0 = hashes[0];
                 const hash_bits0: u16 = @truncate(h0 >> 48);
                 var pos0 = @as(usize, @intCast(h0 & self.mask));
                 while (self.entries[pos0].state == OCCUPIED) {
                     pos0 = (pos0 + 1) & @as(usize, @intCast(self.mask));
                 }
-                self.entries[pos0] = .{ .hash_bits = hash_bits0, .row_idx = @intCast(i), .state = OCCUPIED, ._pad = 0 };
+                self.entries[pos0] = .{ .hash_bits = hash_bits0, .state = OCCUPIED, ._pad = 0, .row_idx = @intCast(i), .key = key0 };
                 self.count += 1;
             }
 
             // Insert second
-            if (data[i + 1] != NULL_INT64) {
+            if (key1 != NULL_INT64) {
                 const h1 = hashes[1];
                 const hash_bits1: u16 = @truncate(h1 >> 48);
                 var pos1 = @as(usize, @intCast(h1 & self.mask));
                 while (self.entries[pos1].state == OCCUPIED) {
                     pos1 = (pos1 + 1) & @as(usize, @intCast(self.mask));
                 }
-                self.entries[pos1] = .{ .hash_bits = hash_bits1, .row_idx = @intCast(i + 1), .state = OCCUPIED, ._pad = 0 };
+                self.entries[pos1] = .{ .hash_bits = hash_bits1, .state = OCCUPIED, ._pad = 0, .row_idx = @intCast(i + 1), .key = key1 };
                 self.count += 1;
             }
         }
@@ -363,7 +374,9 @@ pub const LinearHashTable = struct {
     }
 
     /// Probe and return all matches (for non-unique keys)
+    /// Uses cached keys in hash entries - no external memory lookup needed
     pub fn probeAll(self: *const Self, key: i64, keys_data: []const i64, out: []u32) usize {
+        _ = keys_data; // Now unused - we use cached keys
         const h = hash64(key);
         const hash_bits: u16 = @truncate(h >> 48);
         var pos = @as(usize, @intCast(h & self.mask));
@@ -371,14 +384,11 @@ pub const LinearHashTable = struct {
 
         while (self.entries[pos].state != EMPTY and out_count < out.len) {
             if (self.entries[pos].state == OCCUPIED and
-                self.entries[pos].hash_bits == hash_bits)
+                self.entries[pos].hash_bits == hash_bits and
+                self.entries[pos].key == key)
             {
-                // Verify actual key match (hash collision possible)
-                const row_idx = self.entries[pos].row_idx;
-                if (keys_data[row_idx] == key) {
-                    out[out_count] = row_idx;
-                    out_count += 1;
-                }
+                out[out_count] = self.entries[pos].row_idx;
+                out_count += 1;
             }
             pos = (pos + 1) & @as(usize, @intCast(self.mask));
         }
@@ -386,11 +396,11 @@ pub const LinearHashTable = struct {
     }
 
     /// Batch probe with SIMD hashing + prefetching for JOIN optimization
+    /// Uses cached keys in hash entries - no external memory lookup needed
     /// Returns total number of matches written to output buffers
-    pub fn probeBatch(
+    pub fn probeBatchCached(
         self: *const Self,
         left_keys: []const i64,
-        right_keys: []const i64,
         left_out: []usize,
         right_out: []usize,
         left_offset: usize,
@@ -407,7 +417,7 @@ pub const LinearHashTable = struct {
         // Step 2: Prefetch hash table slots
         self.prefetchSlots(hashes[0..batch_size]);
 
-        // Step 3: Probe with cache-hot hash table
+        // Step 3: Probe with cache-hot hash table (using cached keys)
         var out_count: usize = 0;
         const max_out = @min(left_out.len, right_out.len);
 
@@ -417,23 +427,217 @@ pub const LinearHashTable = struct {
             const hash_bits: u16 = @truncate(h >> 48);
             var pos = @as(usize, @intCast(h & self.mask));
 
-            // Find all matches
+            // Find all matches using cached key (no external memory access)
             while (self.entries[pos].state != EMPTY and out_count < max_out) {
                 if (self.entries[pos].state == OCCUPIED and
-                    self.entries[pos].hash_bits == hash_bits)
+                    self.entries[pos].hash_bits == hash_bits and
+                    self.entries[pos].key == key)
                 {
-                    const row_idx = self.entries[pos].row_idx;
-                    if (right_keys[row_idx] == key) {
-                        left_out[out_count] = left_offset + i;
-                        right_out[out_count] = row_idx;
-                        out_count += 1;
-                    }
+                    left_out[out_count] = left_offset + i;
+                    right_out[out_count] = self.entries[pos].row_idx;
+                    out_count += 1;
                 }
                 pos = (pos + 1) & @as(usize, @intCast(self.mask));
             }
         }
 
         return out_count;
+    }
+
+    /// Legacy batch probe (for compatibility)
+    pub fn probeBatch(
+        self: *const Self,
+        left_keys: []const i64,
+        right_keys: []const i64,
+        left_out: []usize,
+        right_out: []usize,
+        left_offset: usize,
+    ) usize {
+        _ = right_keys; // Now unused - we use cached keys
+        return self.probeBatchCached(left_keys, left_out, right_out, left_offset);
+    }
+
+    /// Parallel probe all left keys against the hash table
+    /// Spawns multiple threads to probe different chunks of left_keys
+    /// Returns lists of (left_idx, right_idx) matches
+    pub fn probeAllParallel(
+        self: *const Self,
+        allocator: std.mem.Allocator,
+        left_keys: []const i64,
+    ) !ProbeResult {
+        const num_threads = @min(std.Thread.getCpuCount() catch 4, 8);
+        if (left_keys.len < 10000 or num_threads <= 1) {
+            // Fall back to single-threaded for small inputs
+            return self.probeAllSingleThread(allocator, left_keys);
+        }
+
+        const chunk_size = (left_keys.len + num_threads - 1) / num_threads;
+
+        // Thread-local result buffers
+        const ThreadResult = struct {
+            left_indices: std.ArrayListUnmanaged(usize),
+            right_indices: std.ArrayListUnmanaged(usize),
+        };
+
+        var thread_results = try allocator.alloc(ThreadResult, num_threads);
+        defer allocator.free(thread_results);
+        for (thread_results) |*r| {
+            r.left_indices = .{};
+            r.right_indices = .{};
+        }
+
+        var threads = try allocator.alloc(std.Thread, num_threads);
+        defer allocator.free(threads);
+
+        // Worker function
+        const Worker = struct {
+            fn run(
+                ht: *const Self,
+                keys: []const i64,
+                offset: usize,
+                alloc: std.mem.Allocator,
+                result: *ThreadResult,
+            ) void {
+                // Pre-allocate estimate (assume 1:1 match ratio)
+                result.left_indices.ensureTotalCapacity(alloc, keys.len) catch return;
+                result.right_indices.ensureTotalCapacity(alloc, keys.len) catch return;
+
+                var hashes: [VECTOR_SIZE]u64 = undefined;
+                var left_batch: [VECTOR_SIZE * 4]usize = undefined;
+                var right_batch: [VECTOR_SIZE * 4]usize = undefined;
+
+                var i: usize = 0;
+                while (i < keys.len) {
+                    const batch_end = @min(i + VECTOR_SIZE, keys.len);
+                    const batch_keys = keys[i..batch_end];
+                    const batch_size = batch_keys.len;
+
+                    // Hash + prefetch
+                    hash64Batch(batch_keys, hashes[0..batch_size]);
+                    ht.prefetchSlots(hashes[0..batch_size]);
+
+                    // Probe each key
+                    for (batch_keys, hashes[0..batch_size], 0..) |key, h, j| {
+                        if (key == NULL_INT64) continue;
+
+                        const hash_bits: u16 = @truncate(h >> 48);
+                        var pos = @as(usize, @intCast(h & ht.mask));
+                        var matches: usize = 0;
+
+                        while (ht.entries[pos].state != EMPTY and matches < left_batch.len) {
+                            if (ht.entries[pos].state == OCCUPIED and
+                                ht.entries[pos].hash_bits == hash_bits and
+                                ht.entries[pos].key == key)
+                            {
+                                left_batch[matches] = offset + i + j;
+                                right_batch[matches] = ht.entries[pos].row_idx;
+                                matches += 1;
+                            }
+                            pos = (pos + 1) & @as(usize, @intCast(ht.mask));
+                        }
+
+                        // Append matches
+                        for (0..matches) |m| {
+                            result.left_indices.append(alloc, left_batch[m]) catch return;
+                            result.right_indices.append(alloc, right_batch[m]) catch return;
+                        }
+                    }
+
+                    i = batch_end;
+                }
+            }
+        };
+
+        // Spawn threads
+        var spawned: usize = 0;
+        errdefer {
+            for (threads[0..spawned]) |t| t.join();
+            for (thread_results) |*r| {
+                r.left_indices.deinit(allocator);
+                r.right_indices.deinit(allocator);
+            }
+        }
+
+        for (0..num_threads) |t| {
+            const start = t * chunk_size;
+            if (start >= left_keys.len) break;
+            const end = @min(start + chunk_size, left_keys.len);
+            threads[t] = std.Thread.spawn(.{}, Worker.run, .{
+                self,
+                left_keys[start..end],
+                start,
+                allocator,
+                &thread_results[t],
+            }) catch break;
+            spawned += 1;
+        }
+
+        // Wait for all threads
+        for (threads[0..spawned]) |t| t.join();
+
+        // Merge results
+        var total_matches: usize = 0;
+        for (thread_results[0..spawned]) |r| {
+            total_matches += r.left_indices.items.len;
+        }
+
+        var left_out = try allocator.alloc(usize, total_matches);
+        errdefer allocator.free(left_out);
+        var right_out = try allocator.alloc(usize, total_matches);
+
+        var pos: usize = 0;
+        for (thread_results[0..spawned]) |*r| {
+            const len = r.left_indices.items.len;
+            @memcpy(left_out[pos .. pos + len], r.left_indices.items);
+            @memcpy(right_out[pos .. pos + len], r.right_indices.items);
+            pos += len;
+            r.left_indices.deinit(allocator);
+            r.right_indices.deinit(allocator);
+        }
+
+        return .{ .left_indices = left_out, .right_indices = right_out };
+    }
+
+    /// Single-threaded probe all (fallback for small inputs)
+    fn probeAllSingleThread(
+        self: *const Self,
+        allocator: std.mem.Allocator,
+        left_keys: []const i64,
+    ) !ProbeResult {
+        var left_out = std.ArrayListUnmanaged(usize){};
+        var right_out = std.ArrayListUnmanaged(usize){};
+        errdefer {
+            left_out.deinit(allocator);
+            right_out.deinit(allocator);
+        }
+
+        try left_out.ensureTotalCapacity(allocator, left_keys.len);
+        try right_out.ensureTotalCapacity(allocator, left_keys.len);
+
+        var left_batch: [VECTOR_SIZE * 4]usize = undefined;
+        var right_batch: [VECTOR_SIZE * 4]usize = undefined;
+
+        var i: usize = 0;
+        while (i < left_keys.len) {
+            const batch_end = @min(i + VECTOR_SIZE, left_keys.len);
+            const batch_keys = left_keys[i..batch_end];
+
+            const matches = self.probeBatchCached(batch_keys, &left_batch, &right_batch, i);
+            try left_out.ensureUnusedCapacity(allocator, matches);
+            try right_out.ensureUnusedCapacity(allocator, matches);
+
+            for (0..matches) |m| {
+                left_out.appendAssumeCapacity(left_batch[m]);
+                right_out.appendAssumeCapacity(right_batch[m]);
+            }
+
+            i = batch_end;
+        }
+
+        return ProbeResult{
+            .left_indices = try left_out.toOwnedSlice(allocator),
+            .right_indices = try right_out.toOwnedSlice(allocator),
+        };
     }
 };
 

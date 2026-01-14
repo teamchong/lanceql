@@ -18,6 +18,7 @@ const XlsxTable = @import("lanceql.xlsx_table").XlsxTable;
 const AnyTable = @import("lanceql.any_table").AnyTable;
 const hash = @import("lanceql.hash");
 const vector_engine = @import("lanceql.vector_engine");
+const gpu_hash_join = @import("lanceql.query").gpu_hash_join;
 pub const logic_table_dispatch = @import("logic_table_dispatch.zig");
 pub const scalar_functions = @import("scalar_functions.zig");
 pub const aggregate_functions = @import("aggregate_functions.zig");
@@ -1359,86 +1360,109 @@ pub const Executor = struct {
             const left_keys = left_key_data.int64;
             const right_keys = right_key_data.int64;
 
-            // Pre-allocate result capacity
-            try left_indices.ensureTotalCapacity(self.allocator, left_keys.len);
-            try right_indices.ensureTotalCapacity(self.allocator, left_keys.len);
-
             var ht = try vector_engine.LinearHashTable.init(self.allocator, right_keys.len);
             defer ht.deinit(self.allocator);
 
             // Build phase: hash right table keys using SIMD
             ht.buildFromColumn(right_keys);
 
-            // For outer joins, use bitmaps instead of hash maps (much faster)
-            var matched_left_bitmap: ?[]bool = null;
-            var matched_right_bitmap: ?[]bool = null;
-            defer if (matched_left_bitmap) |b| self.allocator.free(b);
-            defer if (matched_right_bitmap) |b| self.allocator.free(b);
+            const is_inner_join = join_clause.join_type == .inner;
 
-            if (join_clause.join_type == .left or join_clause.join_type == .full) {
-                matched_left_bitmap = try self.allocator.alloc(bool, left_keys.len);
-                @memset(matched_left_bitmap.?, false);
-            }
-            if (join_clause.join_type == .right or join_clause.join_type == .full) {
-                matched_right_bitmap = try self.allocator.alloc(bool, right_keys.len);
-                @memset(matched_right_bitmap.?, false);
-            }
+            if (is_inner_join) {
+                // Fast path: Use JoinHashTable for large tables (better parallel scaling)
+                // or LinearHashTable for smaller tables (better cache locality)
+                if (left_keys.len >= gpu_hash_join.JOIN_THRESHOLD) {
+                    // Large table: use JoinHashTable with parallel probe
+                    const join_result = try gpu_hash_join.hashJoinI64(self.allocator, right_keys, left_keys);
+                    defer self.allocator.free(join_result.build_indices);
+                    defer self.allocator.free(join_result.probe_indices);
 
-            // Probe phase: batch probe with SIMD hashing + prefetching
-            const est_batch_matches = vector_engine.VECTOR_SIZE * 4; // Allow for duplicates
-            const left_batch_out = try self.allocator.alloc(usize, est_batch_matches);
-            defer self.allocator.free(left_batch_out);
-            const right_batch_out = try self.allocator.alloc(usize, est_batch_matches);
-            defer self.allocator.free(right_batch_out);
+                    try left_indices.ensureTotalCapacity(self.allocator, join_result.count);
+                    try right_indices.ensureTotalCapacity(self.allocator, join_result.count);
 
-            var offset: usize = 0;
-            const batch_size = vector_engine.VECTOR_SIZE;
+                    for (join_result.probe_indices, join_result.build_indices) |l, r| {
+                        left_indices.appendAssumeCapacity(l);
+                        right_indices.appendAssumeCapacity(r);
+                    }
+                } else {
+                    // Small table: use LinearHashTable with parallel probe
+                    const result = try ht.probeAllParallel(self.allocator, left_keys);
+                    defer self.allocator.free(result.left_indices);
+                    defer self.allocator.free(result.right_indices);
 
-            while (offset < left_keys.len) {
-                const batch_end = @min(offset + batch_size, left_keys.len);
-                const batch_keys = left_keys[offset..batch_end];
+                    try left_indices.ensureTotalCapacity(self.allocator, result.left_indices.len);
+                    try right_indices.ensureTotalCapacity(self.allocator, result.right_indices.len);
 
-                // Batch probe with prefetching
-                const matches = ht.probeBatch(
-                    batch_keys,
-                    right_keys,
-                    left_batch_out,
-                    right_batch_out,
-                    offset,
-                );
-
-                // Append all matches at once
-                try left_indices.ensureUnusedCapacity(self.allocator, matches);
-                try right_indices.ensureUnusedCapacity(self.allocator, matches);
-
-                for (0..matches) |m| {
-                    left_indices.appendAssumeCapacity(left_batch_out[m]);
-                    right_indices.appendAssumeCapacity(right_batch_out[m]);
-
-                    // Update bitmaps for outer joins
-                    if (matched_left_bitmap) |b| b[left_batch_out[m]] = true;
-                    if (matched_right_bitmap) |b| b[right_batch_out[m]] = true;
-                }
-
-                offset = batch_end;
-            }
-
-            // LEFT/FULL JOIN: add unmatched left rows
-            if (matched_left_bitmap) |bitmap| {
-                for (bitmap, 0..) |matched, left_idx| {
-                    if (!matched) {
-                        try left_indices.append(self.allocator, left_idx);
-                        try right_indices.append(self.allocator, std.math.maxInt(usize));
+                    for (result.left_indices, result.right_indices) |l, r| {
+                        left_indices.appendAssumeCapacity(l);
+                        right_indices.appendAssumeCapacity(r);
                     }
                 }
-            }
+            } else {
+                // Outer join: single-threaded with bitmap tracking
+                try left_indices.ensureTotalCapacity(self.allocator, left_keys.len);
+                try right_indices.ensureTotalCapacity(self.allocator, left_keys.len);
 
-            // RIGHT/FULL JOIN: add unmatched right rows
-            if (matched_right_bitmap) |bitmap| {
-                for (bitmap, 0..) |matched, right_idx| {
-                    if (!matched) {
-                        try left_indices.append(self.allocator, std.math.maxInt(usize));
-                        try right_indices.append(self.allocator, right_idx);
+                var matched_left_bitmap: ?[]bool = null;
+                var matched_right_bitmap: ?[]bool = null;
+                defer if (matched_left_bitmap) |b| self.allocator.free(b);
+                defer if (matched_right_bitmap) |b| self.allocator.free(b);
+
+                if (join_clause.join_type == .left or join_clause.join_type == .full) {
+                    matched_left_bitmap = try self.allocator.alloc(bool, left_keys.len);
+                    @memset(matched_left_bitmap.?, false);
+                }
+                if (join_clause.join_type == .right or join_clause.join_type == .full) {
+                    matched_right_bitmap = try self.allocator.alloc(bool, right_keys.len);
+                    @memset(matched_right_bitmap.?, false);
+                }
+
+                const est_batch_matches = vector_engine.VECTOR_SIZE * 4;
+                const left_batch_out = try self.allocator.alloc(usize, est_batch_matches);
+                defer self.allocator.free(left_batch_out);
+                const right_batch_out = try self.allocator.alloc(usize, est_batch_matches);
+                defer self.allocator.free(right_batch_out);
+
+                var offset: usize = 0;
+                const batch_size = vector_engine.VECTOR_SIZE;
+
+                while (offset < left_keys.len) {
+                    const batch_end = @min(offset + batch_size, left_keys.len);
+                    const batch_keys = left_keys[offset..batch_end];
+
+                    const matches = ht.probeBatch(batch_keys, right_keys, left_batch_out, right_batch_out, offset);
+
+                    try left_indices.ensureUnusedCapacity(self.allocator, matches);
+                    try right_indices.ensureUnusedCapacity(self.allocator, matches);
+
+                    for (0..matches) |m| {
+                        left_indices.appendAssumeCapacity(left_batch_out[m]);
+                        right_indices.appendAssumeCapacity(right_batch_out[m]);
+
+                        if (matched_left_bitmap) |b| b[left_batch_out[m]] = true;
+                        if (matched_right_bitmap) |b| b[right_batch_out[m]] = true;
+                    }
+
+                    offset = batch_end;
+                }
+
+                // LEFT/FULL JOIN: add unmatched left rows
+                if (matched_left_bitmap) |bitmap| {
+                    for (bitmap, 0..) |matched, left_idx| {
+                        if (!matched) {
+                            try left_indices.append(self.allocator, left_idx);
+                            try right_indices.append(self.allocator, std.math.maxInt(usize));
+                        }
+                    }
+                }
+
+                // RIGHT/FULL JOIN: add unmatched right rows
+                if (matched_right_bitmap) |bitmap| {
+                    for (bitmap, 0..) |matched, right_idx| {
+                        if (!matched) {
+                            try left_indices.append(self.allocator, std.math.maxInt(usize));
+                            try right_indices.append(self.allocator, right_idx);
+                        }
                     }
                 }
             }

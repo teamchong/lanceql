@@ -935,11 +935,12 @@ pub fn main() !void {
             }
             if (rows_per_sec > 0) {
                 duckdb_join_rps = rows_per_sec;
-                std.debug.print("{s:<45} {d:>10.0}K {d:>12} {s:>10}\n", .{
+                const speedup = if (lanceql_join_rps > 0) lanceql_join_rps / rows_per_sec else 0;
+                std.debug.print("{s:<45} {d:>10.0}K {d:>12} {d:>9.1}x\n", .{
                     "DuckDB SQL (JOIN)",
                     rows_per_sec / 1000.0,
                     iterations,
-                    "1.0x",
+                    speedup,
                 });
             }
         }
@@ -999,7 +1000,7 @@ pub fn main() !void {
                 }
             }
             if (rows_per_sec > 0) {
-                const speedup = if (duckdb_join_rps > 0) duckdb_join_rps / rows_per_sec else 0;
+                const speedup = if (lanceql_join_rps > 0) lanceql_join_rps / rows_per_sec else 0;
                 std.debug.print("{s:<45} {d:>10.0}K {d:>12} {d:>9.1}x\n", .{
                     "Polars DataFrame (JOIN)",
                     rows_per_sec / 1000.0,

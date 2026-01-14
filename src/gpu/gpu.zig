@@ -31,7 +31,9 @@ pub const batchCosineSimilarity = vector_search.batchCosineSimilarity;
 pub const hash_table = @import("hash_table.zig");
 pub const GPUHashTable = hash_table.GPUHashTable;
 pub const GPUHashTable64 = hash_table.GPUHashTable64;
+pub const JoinHashTable = hash_table.JoinHashTable;
 pub const HashTableError = hash_table.HashTableError;
+pub const JOIN_GPU_THRESHOLD = hash_table.JOIN_GPU_THRESHOLD;
 
 pub const batch_ops = @import("batch_ops.zig");
 pub const GPUBatchOps = batch_ops.GPUBatchOps;

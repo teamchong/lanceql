@@ -13,6 +13,7 @@ const io = @import("lanceql.io");
 const LanceFile = format.LanceFile;
 const LazyLanceFile = format.LazyLanceFile;
 const FileReader = io.FileReader;
+const MmapReader = io.MmapReader;
 const Schema = proto.Schema;
 const Field = proto.Field;
 const ColumnMetadata = proto.ColumnMetadata;

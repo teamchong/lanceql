@@ -513,6 +513,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lanceql.codegen", .module = codegen_mod },
             .{ .name = "lanceql.vector_engine", .module = vector_engine_mod },
             .{ .name = "lanceql.columnar_ops", .module = columnar_ops_mod },
+            .{ .name = "lanceql.query", .module = query_mod },
         },
     });
 
