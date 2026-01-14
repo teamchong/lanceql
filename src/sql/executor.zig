@@ -1772,6 +1772,20 @@ pub const Executor = struct {
         col_names: *std.ArrayListUnmanaged([]const u8),
         is_right_side: bool,
     ) !void {
+        try self.addJoinedColumnsFiltered(table, alias, row_indices, joined_data, col_names, is_right_side, null);
+    }
+
+    /// Add columns from a table to the joined result, optionally filtered to specific columns
+    fn addJoinedColumnsFiltered(
+        self: *Self,
+        table: *Table,
+        alias: []const u8,
+        row_indices: []const usize,
+        joined_data: *JoinedData,
+        col_names: *std.ArrayListUnmanaged([]const u8),
+        is_right_side: bool,
+        needed_cols: ?[]const []const u8, // If non-null, only include these columns
+    ) !void {
         const schema = table.getSchema() orelse return error.NoSchema;
 
         for (schema.fields) |field| {
@@ -1781,6 +1795,27 @@ pub const Executor = struct {
             // Skip unsupported column types (e.g., fixed_size_list for embeddings)
             const col_type = LanceColumnType.fromLogicalType(field.logical_type);
             if (col_type == .unsupported or col_type == .bool_) continue;
+
+            // Projection pushdown: skip columns not in needed list
+            if (needed_cols) |cols| {
+                var found = false;
+                for (cols) |needed| {
+                    // Check both unqualified and qualified name
+                    if (std.mem.eql(u8, field.name, needed)) {
+                        found = true;
+                        break;
+                    }
+                    // Check alias.column format
+                    if (std.mem.startsWith(u8, needed, alias)) {
+                        const suffix = needed[alias.len..];
+                        if (suffix.len > 0 and suffix[0] == '.' and std.mem.eql(u8, suffix[1..], field.name)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (!found) continue;
+            }
 
             // Create qualified column name: "alias.column"
             const qualified_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ alias, field.name });
