@@ -1,0 +1,78 @@
+[build-system]
+requires = [
+    "hatchling>=1.5.0",
+    "jupyterlab>=4.0.0,<5",
+    "hatch-nodejs-version>=0.3.2"
+]
+build-backend = "hatchling.build"
+
+[project]
+name = "lanceql-jupyterlab"
+version = "0.1.0"
+description = "JupyterLab extension for virtual scrolling DataFrames with lazy loading"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+authors = [
+    { name = "LanceQL Contributors" }
+]
+keywords = [
+    "jupyter",
+    "jupyterlab",
+    "jupyterlab-extension",
+    "dataframe",
+    "virtual-scroll"
+]
+classifiers = [
+    "Framework :: Jupyter",
+    "Framework :: Jupyter :: JupyterLab",
+    "Framework :: Jupyter :: JupyterLab :: 4",
+    "Framework :: Jupyter :: JupyterLab :: Extensions",
+    "Framework :: Jupyter :: JupyterLab :: Extensions :: Prebuilt",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "jupyterlab>=4.0.0,<5"
+]
+
+[project.optional-dependencies]
+dev = [
+    "build",
+    "hatch"
+]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    ".github",
+    "node_modules"
+]
+
+[tool.hatch.build.targets.wheel.shared-data]
+"lanceql_jupyterlab/labextension" = "share/jupyter/labextensions/lanceql-jupyterlab"
+"install.json" = "share/jupyter/labextensions/lanceql-jupyterlab/install.json"
+
+[tool.hatch.build.hooks.jupyter-builder]
+dependencies = ["hatch-jupyter-builder>=0.5"]
+build-function = "hatch_jupyter_builder.npm_builder"
+ensured-targets = [
+    "lanceql_jupyterlab/labextension/static/style.js",
+    "lanceql_jupyterlab/labextension/package.json"
+]
+skip-if-exists = ["lanceql_jupyterlab/labextension/static/style.js"]
+
+[tool.hatch.build.hooks.jupyter-builder.build-kwargs]
+build_cmd = "build:prod"
+npm = ["jlpm"]
+
+[tool.hatch.build.hooks.jupyter-builder.editable-build-kwargs]
+build_cmd = "install:extension"
+npm = ["jlpm"]
+source_dir = "src"
+build_dir = "lanceql_jupyterlab/labextension"

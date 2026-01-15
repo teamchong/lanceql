@@ -1,40 +1,72 @@
-"""LanceQL - PyArrow-compatible driver for Lance columnar files."""
+"""LanceQL - Query engine for Lance columnar files.
+
+Simple, unified API for working with Lance datasets:
+
+    import lanceql
+
+    # Connect to dataset (local or remote)
+    db = lanceql.connect("data.lance")
+
+    # DataFrame-style queries
+    results = (
+        db.table()
+        .filter("aesthetic > 0.8")
+        .similar("embedding", "red shoes", k=10)
+        .select("url", "text")
+        .limit(100)
+        .collect()
+    )
+
+    # SQL queries (same execution engine)
+    results = db.sql("SELECT url, text FROM data WHERE aesthetic > 0.8 LIMIT 10")
+
+    # Both return List[Dict] - convert to any format
+    df = db.table().filter("score > 0.5").to_polars()
+    table = db.table().limit(100).to_arrow()
+"""
 
 __version__ = "0.1.0"
 
-from . import parquet
-from .cache import HotTierCache, hot_tier_cache
-from .vector import VectorAccelerator, vector_accelerator
-from .remote import RemoteLanceDataset, IVFIndex
-from .compiler import (
-    LogicTableCompiler,
-    compile_logic_table,
-    compile_logic_table_file,
-    CompilerError,
-)
-from .logic_table import CompiledLogicTable
+# Public API - clean interface only
+from .api import connect, Connection, TableRef
 
-# polars is optional - import lazily to avoid ImportError if not installed
-def __getattr__(name):
-    if name == "polars":
-        from . import polars
-        return polars
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+# Convenience alias
+open = connect
 
 __all__ = [
-    "parquet",
-    "polars",
-    "HotTierCache",
-    "hot_tier_cache",
-    "VectorAccelerator",
-    "vector_accelerator",
-    "RemoteLanceDataset",
-    "IVFIndex",
-    # @logic_table runtime compilation
-    "LogicTableCompiler",
-    "compile_logic_table",
-    "compile_logic_table_file",
-    "CompilerError",
-    "CompiledLogicTable",
+    "connect",
+    "open",
+    "Connection",
+    "TableRef",
     "__version__",
 ]
+
+
+# Internal modules accessible via lanceql.internal.*
+def __getattr__(name):
+    """Lazy load internal modules."""
+    if name == "internal":
+        from types import SimpleNamespace
+        from . import parquet, cache, remote, vector, compiler, logic_table
+
+        return SimpleNamespace(
+            parquet=parquet,
+            HotTierCache=cache.HotTierCache,
+            hot_tier_cache=cache.hot_tier_cache,
+            RemoteLanceDataset=remote.RemoteLanceDataset,
+            IVFIndex=remote.IVFIndex,
+            VectorAccelerator=vector.VectorAccelerator,
+            vector_accelerator=vector.vector_accelerator,
+            LogicTableCompiler=compiler.LogicTableCompiler,
+            compile_logic_table=compiler.compile_logic_table,
+            compile_logic_table_file=compiler.compile_logic_table_file,
+            CompilerError=compiler.CompilerError,
+            CompiledLogicTable=logic_table.CompiledLogicTable,
+        )
+
+    # Display module for Jupyter integration
+    if name == "display":
+        from . import display
+        return display
+
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

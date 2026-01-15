@@ -1,0 +1,7 @@
+node_modules/
+lib/
+.ipynb_checkpoints/
+.virtual_documents/
+.mypy_cache/
+*.tsbuildinfo
+.yarn/
