@@ -12,6 +12,7 @@ pub const version = @import("version.zig");
 pub const lance_file = @import("lance_file.zig");
 pub const lazy_lance_file = @import("lazy_lance_file.zig");
 pub const manifest = @import("manifest.zig");
+pub const manifest_writer = @import("manifest_writer.zig");
 pub const page_row_index = @import("page_row_index.zig");
 
 // Parquet format
@@ -34,6 +35,8 @@ pub const latestVersion = manifest.latestVersion;
 pub const PageRowIndex = page_row_index.PageRowIndex;
 pub const RowLocation = page_row_index.RowLocation;
 pub const ByteRange = page_row_index.ByteRange;
+pub const ManifestWriter = manifest_writer.ManifestWriter;
+pub const generateUUID = manifest_writer.generateUUID;
 
 // Re-export Parquet types
 pub const ParquetFile = parquet_file.ParquetFile;

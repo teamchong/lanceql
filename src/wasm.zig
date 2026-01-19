@@ -31,6 +31,7 @@ const column_meta = @import("wasm/column_meta.zig");
 const aggregates = @import("wasm/aggregates.zig");
 const sql_executor = @import("wasm/sql_executor.zig");
 const buffer_pool = @import("wasm/buffer_pool.zig");
+const dataset_writer = @import("wasm/dataset_writer.zig");
 
 // Module exports are automatic via `pub export fn` in each module.
 // Force reference to ensure they're included in WASM binary:
@@ -50,6 +51,7 @@ comptime {
     _ = aggregates;
     _ = sql_executor;
     _ = buffer_pool;
+    _ = dataset_writer;
 }
 
 // ============================================================================

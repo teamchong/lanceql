@@ -22,9 +22,11 @@ pub const format = @import("lanceql.format");
 pub const io = @import("lanceql.io");
 pub const proto = @import("lanceql.proto");
 pub const encoding = @import("lanceql.encoding");
+pub const writer = @import("lanceql.writer");
 pub const table = @import("lanceql.table");
 pub const dataframe = @import("lanceql.dataframe");
 pub const dataset = @import("lanceql.dataset");
+pub const dataset_writer = @import("lanceql.dataset_writer");
 pub const logic_table = @import("lanceql.logic_table");
 
 // Re-export commonly used types
@@ -35,6 +37,9 @@ pub const Table = table.Table;
 pub const LanceFile = format.LanceFile;
 pub const DataFrame = dataframe.DataFrame;
 pub const LanceDataset = dataset.LanceDataset;
+pub const LanceWriter = writer.LanceWriter;
+pub const ColumnBuilder = writer.ColumnBuilder;
+pub const DatasetWriter = dataset_writer.DatasetWriter;
 
 /// Magic bytes at the end of every Lance file
 pub const LANCE_MAGIC = "LANC";

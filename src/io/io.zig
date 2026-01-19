@@ -15,6 +15,7 @@ pub const mmap_reader = @import("mmap_reader.zig");
 pub const memory_reader = @import("memory_reader.zig");
 pub const http_reader = @import("http_reader.zig");
 pub const batch_reader = @import("batch_reader.zig");
+pub const s3_client = @import("s3_client.zig");
 
 // Re-export main types
 pub const Reader = reader.Reader;
@@ -27,6 +28,11 @@ pub const FileCache = mmap_reader.FileCache;
 pub const MemoryReader = memory_reader.MemoryReader;
 pub const HttpReader = http_reader.HttpReader;
 pub const BatchReader = batch_reader.BatchReader;
+pub const S3Client = s3_client.S3Client;
+pub const S3Error = s3_client.S3Error;
+pub const GetResult = s3_client.GetResult;
+pub const PutResult = s3_client.PutResult;
+pub const parseVersionFromLatest = s3_client.parseVersionFromLatest;
 
 // Global cache functions
 pub const initGlobalCache = mmap_reader.initGlobalCache;

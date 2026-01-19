@@ -51,6 +51,13 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const writer_mod = b.addModule("lanceql.writer", .{
+        .root_source_file = b.path("src/writer/writer.zig"),
+        .imports = &.{
+            .{ .name = "lanceql.proto", .module = proto_mod },
+        },
+    });
+
     const value_mod = b.addModule("lanceql.value", .{
         .root_source_file = b.path("src/value.zig"),
     });
@@ -549,6 +556,17 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Dataset writer module - distributed writes with ETag-based CAS
+    const dataset_writer_mod = b.addModule("lanceql.dataset_writer", .{
+        .root_source_file = b.path("src/dataset_writer.zig"),
+        .imports = &.{
+            .{ .name = "lanceql.io", .module = io_mod },
+            .{ .name = "lanceql.format", .module = format_mod },
+            .{ .name = "lanceql.writer", .module = writer_mod },
+            .{ .name = "lanceql.proto", .module = proto_mod },
+        },
+    });
+
     // Root module exports all
     const lanceql_mod = b.addModule("lanceql", .{
         .root_source_file = b.path("src/lanceql.zig"),
@@ -557,11 +575,13 @@ pub fn build(b: *std.Build) void {
             .{ .name = "lanceql.io", .module = io_mod },
             .{ .name = "lanceql.proto", .module = proto_mod },
             .{ .name = "lanceql.encoding", .module = encoding_mod },
+            .{ .name = "lanceql.writer", .module = writer_mod },
             .{ .name = "lanceql.table", .module = table_mod },
             .{ .name = "lanceql.query", .module = query_mod },
             .{ .name = "lanceql.value", .module = value_mod },
             .{ .name = "lanceql.dataframe", .module = dataframe_mod },
             .{ .name = "lanceql.dataset", .module = dataset_mod },
+            .{ .name = "lanceql.dataset_writer", .module = dataset_writer_mod },
             .{ .name = "lanceql.gpu", .module = gpu_mod },
             .{ .name = "lanceql.logic_table", .module = logic_table_mod },
             .{ .name = "lanceql.codegen", .module = codegen_mod },
