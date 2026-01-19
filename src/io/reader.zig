@@ -18,6 +18,38 @@ pub const ReadError = error{
     Unsupported,
     /// Generic read failure
     ReadFailed,
+    /// Out of memory
+    OutOfMemory,
+};
+
+/// A byte range for batch reading
+pub const ByteRange = struct {
+    /// Start offset in file
+    start: u64,
+    /// End offset (exclusive) in file
+    end: u64,
+
+    /// Get the byte length of this range
+    pub fn len(self: ByteRange) u64 {
+        return self.end - self.start;
+    }
+};
+
+/// Result of a batch read operation
+pub const BatchReadResult = struct {
+    /// Array of data buffers, one per requested range
+    /// Each buffer is owned by the caller and must be freed
+    buffers: [][]u8,
+    /// Allocator used for the buffers
+    allocator: std.mem.Allocator,
+
+    /// Free all buffers and the result
+    pub fn deinit(self: *BatchReadResult) void {
+        for (self.buffers) |buf| {
+            self.allocator.free(buf);
+        }
+        self.allocator.free(self.buffers);
+    }
 };
 
 /// Virtual file system reader interface.
@@ -38,6 +70,11 @@ pub const Reader = struct {
 
         /// Release resources associated with this reader.
         deinit: *const fn (ptr: *anyopaque) void,
+
+        /// Optional batch read for multiple ranges in a single request.
+        /// If null, the Reader will fall back to sequential reads.
+        /// This enables HTTP multi-range requests for cloud-hosted files.
+        batch_read: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, ranges: []const ByteRange) ReadError!BatchReadResult = null,
     };
 
     /// Read data at the given offset into the buffer.
@@ -81,6 +118,57 @@ pub const Reader = struct {
 
         try self.readExact(offset, buffer);
         return buffer;
+    }
+
+    /// Check if this reader supports batch reads.
+    /// If true, batchRead may be more efficient than multiple sequential reads.
+    pub fn supportsBatchRead(self: Reader) bool {
+        return self.vtable.batch_read != null;
+    }
+
+    /// Read multiple byte ranges in a single operation.
+    ///
+    /// If the underlying reader supports batch reads (e.g., HTTP multi-range),
+    /// this will be more efficient. Otherwise, falls back to sequential reads.
+    ///
+    /// Returns a BatchReadResult with one buffer per range.
+    /// Caller must call result.deinit() to free memory.
+    pub fn batchRead(self: Reader, allocator: std.mem.Allocator, ranges: []const ByteRange) ReadError!BatchReadResult {
+        // Use native batch read if available
+        if (self.vtable.batch_read) |batch_fn| {
+            return batch_fn(self.ptr, allocator, ranges);
+        }
+
+        // Fallback: sequential reads
+        return self.batchReadSequential(allocator, ranges);
+    }
+
+    /// Fallback implementation using sequential reads
+    fn batchReadSequential(self: Reader, allocator: std.mem.Allocator, ranges: []const ByteRange) ReadError!BatchReadResult {
+        const buffers = allocator.alloc([]u8, ranges.len) catch return ReadError.OutOfMemory;
+        errdefer allocator.free(buffers);
+
+        var completed: usize = 0;
+        errdefer {
+            for (buffers[0..completed]) |buf| {
+                allocator.free(buf);
+            }
+        }
+
+        for (ranges, 0..) |range, i| {
+            const len: usize = @intCast(range.len());
+            const buffer = allocator.alloc(u8, len) catch return ReadError.OutOfMemory;
+            errdefer allocator.free(buffer);
+
+            try self.readExact(range.start, buffer);
+            buffers[i] = buffer;
+            completed += 1;
+        }
+
+        return BatchReadResult{
+            .buffers = buffers,
+            .allocator = allocator,
+        };
     }
 };
 

@@ -204,3 +204,169 @@ pub const TableSource = union(enum) {
         };
     }
 };
+
+// ============================================================================
+// Streaming Result Types (Late Materialization Support)
+// ============================================================================
+
+/// Specification for a column to be materialized
+pub const ColumnSpec = struct {
+    /// Physical column index in the table
+    col_idx: u32,
+    /// Column name for output
+    name: []const u8,
+    /// Column data type
+    col_type: LanceColumnType,
+};
+
+/// A single batch of materialized rows
+pub const StreamingBatch = struct {
+    /// Materialized column data for this batch
+    columns: []Result.Column,
+    /// Number of rows in this batch
+    row_count: usize,
+    /// Allocator used for this batch
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *StreamingBatch) void {
+        for (self.columns) |col| {
+            col.data.free(self.allocator);
+        }
+        self.allocator.free(self.columns);
+    }
+};
+
+/// Iterator-based streaming result for late materialization.
+///
+/// This enables memory-efficient query execution by:
+/// 1. Keeping only the row_ids in memory (4 bytes per row)
+/// 2. Materializing columns on-demand in batches
+/// 3. Allowing batch-by-batch streaming to output (HTTP chunked transfer)
+///
+/// Memory profile for 1M rows:
+/// - row_ids: 4MB
+/// - batch (1000 rows): ~1MB
+/// - Total peak: ~5-10MB instead of loading all columns
+pub const StreamingResult = struct {
+    /// Row indices that passed filtering, in output order
+    row_ids: []const u32,
+    /// Columns to materialize (from SELECT)
+    select_columns: []ColumnSpec,
+    /// Batch size for materialization
+    batch_size: usize,
+    /// Current position in row_ids
+    cursor: usize,
+    /// Allocator for batch allocations
+    allocator: std.mem.Allocator,
+    /// Whether this result owns the row_ids array
+    owns_row_ids: bool,
+
+    const Self = @This();
+
+    /// Default batch size (1000 rows)
+    pub const DEFAULT_BATCH_SIZE: usize = 1000;
+
+    /// Initialize a streaming result.
+    ///
+    /// Parameters:
+    ///   - row_ids: Row indices that passed filtering (takes ownership if owns_row_ids=true)
+    ///   - select_columns: Column specifications for materialization
+    ///   - batch_size: Number of rows to materialize per batch
+    ///   - allocator: Allocator for batch allocations
+    pub fn init(
+        row_ids: []const u32,
+        select_columns: []ColumnSpec,
+        batch_size: usize,
+        allocator: std.mem.Allocator,
+        owns_row_ids: bool,
+    ) Self {
+        return Self{
+            .row_ids = row_ids,
+            .select_columns = select_columns,
+            .batch_size = if (batch_size == 0) DEFAULT_BATCH_SIZE else batch_size,
+            .cursor = 0,
+            .allocator = allocator,
+            .owns_row_ids = owns_row_ids,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        if (self.owns_row_ids) {
+            self.allocator.free(self.row_ids);
+        }
+        for (self.select_columns) |col| {
+            self.allocator.free(col.name);
+        }
+        self.allocator.free(self.select_columns);
+    }
+
+    /// Get total number of rows in the result
+    pub fn totalRows(self: Self) usize {
+        return self.row_ids.len;
+    }
+
+    /// Get number of remaining rows
+    pub fn remainingRows(self: Self) usize {
+        if (self.cursor >= self.row_ids.len) return 0;
+        return self.row_ids.len - self.cursor;
+    }
+
+    /// Check if there are more batches
+    pub fn hasMore(self: Self) bool {
+        return self.cursor < self.row_ids.len;
+    }
+
+    /// Get the next batch of row indices to materialize.
+    /// Returns null if no more batches.
+    ///
+    /// Caller should then use the returned indices with
+    /// LazyTable.readInt64ColumnAtIndices() etc. to materialize each column.
+    pub fn nextBatchIndices(self: *Self) ?[]const u32 {
+        if (self.cursor >= self.row_ids.len) {
+            return null;
+        }
+
+        const start = self.cursor;
+        const end = @min(self.cursor + self.batch_size, self.row_ids.len);
+        self.cursor = end;
+
+        return self.row_ids[start..end];
+    }
+
+    /// Reset cursor to beginning for re-iteration
+    pub fn reset(self: *Self) void {
+        self.cursor = 0;
+    }
+
+    /// Get progress as a fraction (0.0 to 1.0)
+    pub fn progress(self: Self) f64 {
+        if (self.row_ids.len == 0) return 1.0;
+        return @as(f64, @floatFromInt(self.cursor)) / @as(f64, @floatFromInt(self.row_ids.len));
+    }
+
+    /// Get approximate memory usage of the row_ids array
+    pub fn rowIdsMemoryBytes(self: Self) usize {
+        return self.row_ids.len * @sizeOf(u32);
+    }
+};
+
+/// Statistics for streaming execution
+pub const StreamingStats = struct {
+    /// Total rows in result
+    total_rows: usize,
+    /// Number of batches materialized
+    batches_materialized: usize,
+    /// Total bytes read for materialization
+    bytes_read: u64,
+    /// Number of HTTP range requests made
+    range_requests: usize,
+
+    pub fn init() StreamingStats {
+        return .{
+            .total_rows = 0,
+            .batches_materialized = 0,
+            .bytes_read = 0,
+            .range_requests = 0,
+        };
+    }
+};

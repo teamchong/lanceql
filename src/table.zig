@@ -951,6 +951,63 @@ pub const LazyTable = struct {
             };
         };
     }
+
+    // ========================================================================
+    // Selective Row Reading (Late Materialization Support)
+    // ========================================================================
+
+    /// Read int64 values at specific row indices.
+    /// TRUE selective read - only fetches bytes for requested rows.
+    /// This is the key method for late materialization.
+    pub fn readInt64ColumnAtIndices(self: *Self, col_idx: u32, row_indices: []const u32) TableError![]i64 {
+        return self.lazy_file.readInt64ColumnAtIndices(col_idx, row_indices) catch |err| {
+            return switch (err) {
+                error.ColumnOutOfBounds => TableError.ColumnOutOfBounds,
+                error.NoPages => TableError.NoPages,
+                error.OutOfMemory => TableError.OutOfMemory,
+                else => TableError.ReadError,
+            };
+        };
+    }
+
+    /// Read float64 values at specific row indices.
+    /// TRUE selective read - only fetches bytes for requested rows.
+    pub fn readFloat64ColumnAtIndices(self: *Self, col_idx: u32, row_indices: []const u32) TableError![]f64 {
+        return self.lazy_file.readFloat64ColumnAtIndices(col_idx, row_indices) catch |err| {
+            return switch (err) {
+                error.ColumnOutOfBounds => TableError.ColumnOutOfBounds,
+                error.NoPages => TableError.NoPages,
+                error.OutOfMemory => TableError.OutOfMemory,
+                else => TableError.ReadError,
+            };
+        };
+    }
+
+    /// Read int32 values at specific row indices.
+    /// TRUE selective read - only fetches bytes for requested rows.
+    pub fn readInt32ColumnAtIndices(self: *Self, col_idx: u32, row_indices: []const u32) TableError![]i32 {
+        return self.lazy_file.readInt32ColumnAtIndices(col_idx, row_indices) catch |err| {
+            return switch (err) {
+                error.ColumnOutOfBounds => TableError.ColumnOutOfBounds,
+                error.NoPages => TableError.NoPages,
+                error.OutOfMemory => TableError.OutOfMemory,
+                else => TableError.ReadError,
+            };
+        };
+    }
+
+    /// Read float32 values at specific row indices.
+    /// TRUE selective read - only fetches bytes for requested rows.
+    pub fn readFloat32ColumnAtIndices(self: *Self, col_idx: u32, row_indices: []const u32) TableError![]f32 {
+        return self.lazy_file.readFloat32ColumnAtIndices(col_idx, row_indices) catch |err| {
+            return switch (err) {
+                error.ColumnOutOfBounds => TableError.ColumnOutOfBounds,
+                error.NoPages => TableError.NoPages,
+                error.OutOfMemory => TableError.OutOfMemory,
+                else => TableError.ReadError,
+            };
+        };
+    }
 };
 
 // ============================================================================

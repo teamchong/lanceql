@@ -11,6 +11,8 @@ const http = std.http;
 const ReaderMod = @import("reader.zig");
 const Reader = ReaderMod.Reader;
 const ReadError = ReaderMod.ReadError;
+const ByteRange = ReaderMod.ByteRange;
+const BatchReadResult = ReaderMod.BatchReadResult;
 
 /// HTTP Reader that fetches data using Range requests.
 /// Note: Creates a fresh HTTP client per request to avoid TLS connection pooling issues.
@@ -104,6 +106,55 @@ pub const HttpReader = struct {
         return self.file_size;
     }
 
+    /// Read multiple byte ranges.
+    ///
+    /// For maximum compatibility, this makes sequential requests for each range.
+    /// Note: HTTP/1.1 supports multipart/byteranges but not all servers implement it.
+    /// Future optimization: detect server support and use true multi-range requests.
+    pub fn batchRead(self: *Self, allocator: std.mem.Allocator, ranges: []const ByteRange) !BatchReadResult {
+        if (ranges.len == 0) {
+            return BatchReadResult{
+                .buffers = try allocator.alloc([]u8, 0),
+                .allocator = allocator,
+            };
+        }
+
+        // Allocate result buffers
+        const buffers = try allocator.alloc([]u8, ranges.len);
+        errdefer allocator.free(buffers);
+
+        var completed: usize = 0;
+        errdefer {
+            for (buffers[0..completed]) |buf| {
+                allocator.free(buf);
+            }
+        }
+
+        // Read each range sequentially
+        // Note: Could be parallelized with threads, but keeping simple for now
+        for (ranges, 0..) |range, i| {
+            const len: usize = @intCast(range.len());
+            const buffer = try allocator.alloc(u8, len);
+            errdefer allocator.free(buffer);
+
+            // Read this range
+            const bytes_read = try self.readAt(range.start, buffer);
+            if (bytes_read < len) {
+                // Partial read - resize buffer
+                const actual = try allocator.realloc(buffer, bytes_read);
+                buffers[i] = actual;
+            } else {
+                buffers[i] = buffer;
+            }
+            completed += 1;
+        }
+
+        return BatchReadResult{
+            .buffers = buffers,
+            .allocator = allocator,
+        };
+    }
+
     // ========================================================================
     // Reader VTable implementation
     // ========================================================================
@@ -123,10 +174,16 @@ pub const HttpReader = struct {
         self.deinit();
     }
 
+    fn vtableBatchRead(ptr: *anyopaque, allocator: std.mem.Allocator, ranges: []const ByteRange) ReadError!BatchReadResult {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        return self.batchRead(allocator, ranges) catch return ReadError.NetworkError;
+    }
+
     const vtable = Reader.VTable{
         .read = vtableRead,
         .size = vtableSize,
         .deinit = vtableDeinit,
+        .batch_read = vtableBatchRead,
     };
 
     /// Create a Reader interface from this HttpReader.

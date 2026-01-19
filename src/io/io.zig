@@ -14,15 +14,19 @@ pub const file_reader = @import("file_reader.zig");
 pub const mmap_reader = @import("mmap_reader.zig");
 pub const memory_reader = @import("memory_reader.zig");
 pub const http_reader = @import("http_reader.zig");
+pub const batch_reader = @import("batch_reader.zig");
 
 // Re-export main types
 pub const Reader = reader.Reader;
 pub const ReadError = reader.ReadError;
+pub const ByteRange = reader.ByteRange;
+pub const BatchReadResult = reader.BatchReadResult;
 pub const FileReader = file_reader.FileReader;
 pub const MmapReader = mmap_reader.MmapReader;
 pub const FileCache = mmap_reader.FileCache;
 pub const MemoryReader = memory_reader.MemoryReader;
 pub const HttpReader = http_reader.HttpReader;
+pub const BatchReader = batch_reader.BatchReader;
 
 // Global cache functions
 pub const initGlobalCache = mmap_reader.initGlobalCache;

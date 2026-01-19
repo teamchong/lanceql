@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const footer_mod = @import("footer.zig");
+const page_row_index_mod = @import("page_row_index.zig");
 const proto = @import("lanceql.proto");
 const encoding = @import("lanceql.encoding");
 const io = @import("lanceql.io");
@@ -33,8 +34,11 @@ const Footer = footer_mod.Footer;
 const FOOTER_SIZE = footer_mod.FOOTER_SIZE;
 const Reader = io.Reader;
 const ReadError = io.ReadError;
+const ByteRange = io.ByteRange;
+const BatchReadResult = io.BatchReadResult;
 const ColumnMetadata = proto.ColumnMetadata;
 const PlainDecoder = encoding.PlainDecoder;
+const PageRowIndex = page_row_index_mod.PageRowIndex;
 
 pub const LazyLanceFileError = error{
     FileTooSmall,
@@ -451,6 +455,140 @@ pub const LazyLanceFile = struct {
         return all_strings.toOwnedSlice() catch {
             return LazyLanceFileError.OutOfMemory;
         };
+    }
+
+    // ========================================================================
+    // Selective Row Reading (Late Materialization Support)
+    // ========================================================================
+
+    /// Default gap threshold for range coalescing (4KB)
+    const DEFAULT_GAP_THRESHOLD: u64 = 4096;
+
+    /// Read numeric column values at specific row indices.
+    /// Uses PageRowIndex for efficient byte offset mapping and batch reads.
+    ///
+    /// This is the key method for late materialization - it only reads the
+    /// bytes needed for the requested rows, not the entire column.
+    fn readNumericColumnAtIndices(self: *Self, comptime T: type, col_idx: u32, row_indices: []const u32) LazyLanceFileError![]T {
+        if (row_indices.len == 0) {
+            return self.allocator.alloc(T, 0) catch return LazyLanceFileError.OutOfMemory;
+        }
+
+        // Get column metadata
+        var col_meta = try self.readColumnMetadata(col_idx);
+        defer col_meta.deinit(self.allocator);
+
+        if (col_meta.pages.len == 0) return LazyLanceFileError.NoPages;
+
+        // Build page row index
+        var page_idx = PageRowIndex.init(self.allocator, &col_meta) catch return LazyLanceFileError.OutOfMemory;
+        defer page_idx.deinit();
+
+        // Determine data buffer index (nullable columns have validity bitmap in buffer 0)
+        const data_buf_idx: usize = if (col_meta.pages.len > 0 and col_meta.pages[0].buffer_sizes.len >= 2) 1 else 0;
+
+        // Get coalesced byte ranges
+        const format_ranges = page_idx.getByteRanges(row_indices, @sizeOf(T), DEFAULT_GAP_THRESHOLD, data_buf_idx) catch return LazyLanceFileError.OutOfMemory;
+        defer page_idx.allocator.free(format_ranges);
+
+        if (format_ranges.len == 0) {
+            return self.allocator.alloc(T, 0) catch return LazyLanceFileError.OutOfMemory;
+        }
+
+        // Convert to reader's ByteRange type
+        const reader_ranges = self.allocator.alloc(ByteRange, format_ranges.len) catch return LazyLanceFileError.OutOfMemory;
+        defer self.allocator.free(reader_ranges);
+
+        for (format_ranges, 0..) |fr, i| {
+            reader_ranges[i] = ByteRange{
+                .start = fr.start,
+                .end = fr.end,
+            };
+        }
+
+        // Batch read all ranges
+        var batch_result = self.reader.batchRead(self.allocator, reader_ranges) catch return LazyLanceFileError.IoError;
+        defer batch_result.deinit();
+
+        // Allocate result array
+        const result = self.allocator.alloc(T, row_indices.len) catch return LazyLanceFileError.OutOfMemory;
+        errdefer self.allocator.free(result);
+
+        // Map each row to its value from the batch results
+        const value_size = @sizeOf(T);
+        for (row_indices, 0..) |row, result_idx| {
+            const loc = page_idx.getFixedRowOffset(row, value_size, data_buf_idx) orelse {
+                // Row out of bounds - fill with zero
+                result[result_idx] = @as(T, 0);
+                continue;
+            };
+
+            // Find which range contains this byte offset
+            var found = false;
+            for (format_ranges, 0..) |range, range_idx| {
+                if (loc.byte_offset >= range.start and loc.byte_offset < range.end) {
+                    const buf_offset: usize = @intCast(loc.byte_offset - range.start);
+                    const buf = batch_result.buffers[range_idx];
+
+                    if (buf_offset + value_size <= buf.len) {
+                        // Read value based on type
+                        if (T == f64) {
+                            result[result_idx] = @bitCast(std.mem.readInt(u64, buf[buf_offset..][0..8], .little));
+                        } else if (T == f32) {
+                            result[result_idx] = @bitCast(std.mem.readInt(u32, buf[buf_offset..][0..4], .little));
+                        } else if (T == i64 or T == u64) {
+                            result[result_idx] = @bitCast(std.mem.readInt(u64, buf[buf_offset..][0..8], .little));
+                        } else if (T == i32 or T == u32) {
+                            result[result_idx] = @bitCast(std.mem.readInt(u32, buf[buf_offset..][0..4], .little));
+                        } else {
+                            @compileError("unsupported type for selective read");
+                        }
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!found) {
+                result[result_idx] = @as(T, 0);
+            }
+        }
+
+        return result;
+    }
+
+    /// Read int64 values at specific row indices.
+    /// Only fetches the bytes needed for the requested rows.
+    pub fn readInt64ColumnAtIndices(self: *Self, col_idx: u32, row_indices: []const u32) LazyLanceFileError![]i64 {
+        return self.readNumericColumnAtIndices(i64, col_idx, row_indices);
+    }
+
+    /// Read float64 values at specific row indices.
+    /// Only fetches the bytes needed for the requested rows.
+    pub fn readFloat64ColumnAtIndices(self: *Self, col_idx: u32, row_indices: []const u32) LazyLanceFileError![]f64 {
+        return self.readNumericColumnAtIndices(f64, col_idx, row_indices);
+    }
+
+    /// Read int32 values at specific row indices.
+    /// Only fetches the bytes needed for the requested rows.
+    pub fn readInt32ColumnAtIndices(self: *Self, col_idx: u32, row_indices: []const u32) LazyLanceFileError![]i32 {
+        return self.readNumericColumnAtIndices(i32, col_idx, row_indices);
+    }
+
+    /// Read float32 values at specific row indices.
+    /// Only fetches the bytes needed for the requested rows.
+    pub fn readFloat32ColumnAtIndices(self: *Self, col_idx: u32, row_indices: []const u32) LazyLanceFileError![]f32 {
+        return self.readNumericColumnAtIndices(f32, col_idx, row_indices);
+    }
+
+    /// Build a PageRowIndex for a column.
+    /// Caller owns the returned index and must call deinit().
+    /// Useful for performing multiple selective reads on the same column.
+    pub fn buildPageRowIndex(self: *Self, col_idx: u32) LazyLanceFileError!PageRowIndex {
+        var col_meta = try self.readColumnMetadata(col_idx);
+        defer col_meta.deinit(self.allocator);
+
+        return PageRowIndex.init(self.allocator, &col_meta) catch return LazyLanceFileError.OutOfMemory;
     }
 };
 

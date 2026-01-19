@@ -32,6 +32,7 @@ pub const where_eval = @import("where_eval.zig");
 pub const expr_eval = @import("expr_eval.zig");
 pub const group_eval = @import("group_eval.zig");
 pub const streaming_reader = @import("streaming_reader.zig");
+pub const late_materialization = @import("late_materialization.zig");
 
 // Fused query compilation (optional)
 pub const planner = @import("planner/planner.zig");

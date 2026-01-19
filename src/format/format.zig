@@ -12,6 +12,7 @@ pub const version = @import("version.zig");
 pub const lance_file = @import("lance_file.zig");
 pub const lazy_lance_file = @import("lazy_lance_file.zig");
 pub const manifest = @import("manifest.zig");
+pub const page_row_index = @import("page_row_index.zig");
 
 // Parquet format
 pub const parquet_metadata = @import("parquet_metadata.zig");
@@ -30,6 +31,9 @@ pub const Fragment = manifest.Fragment;
 pub const loadManifest = manifest.loadManifest;
 pub const listVersions = manifest.listVersions;
 pub const latestVersion = manifest.latestVersion;
+pub const PageRowIndex = page_row_index.PageRowIndex;
+pub const RowLocation = page_row_index.RowLocation;
+pub const ByteRange = page_row_index.ByteRange;
 
 // Re-export Parquet types
 pub const ParquetFile = parquet_file.ParquetFile;
