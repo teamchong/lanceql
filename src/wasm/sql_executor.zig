@@ -3939,6 +3939,131 @@ pub export fn getTableNames(sql_ptr: [*]const u8, sql_len: usize) [*]const u8 {
     return &table_names_buf;
 }
 
+// Buffer for read_lance URL extraction results
+// Format: url1|alias1\nurl2|alias2\n...
+var read_lance_buf: [4096]u8 = undefined;
+
+/// Extract read_lance('url') patterns from SQL
+/// Returns: "url1|alias1\nurl2|alias2\n" format, null-terminated
+/// SQL keywords are excluded from alias detection
+pub export fn extractReadLanceUrls(sql_ptr: [*]const u8, sql_len: usize) [*]const u8 {
+    const sql = sql_ptr[0..sql_len];
+    var out_len: usize = 0;
+    var tbl_idx: usize = 0;
+    var pos: usize = 0;
+
+    while (pos < sql.len) {
+        // Look for read_lance(
+        if (pos + 11 <= sql.len and startsWithIC(sql[pos..], "read_lance(")) {
+            pos += 11; // Skip "read_lance("
+            pos = skipWs(sql, pos);
+
+            // Expect opening quote
+            if (pos >= sql.len or (sql[pos] != '\'' and sql[pos] != '"')) {
+                pos += 1;
+                continue;
+            }
+            const quote_char = sql[pos];
+            pos += 1;
+
+            // Extract URL until closing quote
+            const url_start = pos;
+            while (pos < sql.len and sql[pos] != quote_char) pos += 1;
+            const url = sql[url_start..pos];
+
+            if (pos < sql.len) pos += 1; // Skip closing quote
+            pos = skipWs(sql, pos);
+
+            // Skip closing paren
+            if (pos < sql.len and sql[pos] == ')') pos += 1;
+            pos = skipWs(sql, pos);
+
+            // Look for alias: AS alias or bare alias (not a SQL keyword)
+            var alias: []const u8 = "";
+
+            if (pos + 3 <= sql.len and startsWithIC(sql[pos..], "AS ")) {
+                pos += 3;
+                pos = skipWs(sql, pos);
+                const alias_start = pos;
+                while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+                alias = sql[alias_start..pos];
+            } else if (pos < sql.len and isIdent(sql[pos])) {
+                // Check for bare alias (but not SQL keywords)
+                const alias_start = pos;
+                while (pos < sql.len and isIdent(sql[pos])) pos += 1;
+                const candidate = sql[alias_start..pos];
+
+                // Check if it's a SQL keyword
+                if (!isSqlKeyword(candidate)) {
+                    alias = candidate;
+                } else {
+                    // Rewind - it's a keyword, not an alias
+                    pos = alias_start;
+                }
+            }
+
+            // Write to output buffer: url|alias\n
+            if (out_len + url.len + 1 + 10 + 1 < read_lance_buf.len) {
+                @memcpy(read_lance_buf[out_len..][0..url.len], url);
+                out_len += url.len;
+                read_lance_buf[out_len] = '|';
+                out_len += 1;
+
+                if (alias.len > 0) {
+                    @memcpy(read_lance_buf[out_len..][0..alias.len], alias);
+                    out_len += alias.len;
+                } else {
+                    // Generate default alias _tbl0, _tbl1, etc.
+                    read_lance_buf[out_len] = '_';
+                    read_lance_buf[out_len + 1] = 't';
+                    read_lance_buf[out_len + 2] = 'b';
+                    read_lance_buf[out_len + 3] = 'l';
+                    out_len += 4;
+                    if (tbl_idx < 10) {
+                        read_lance_buf[out_len] = '0' + @as(u8, @intCast(tbl_idx));
+                        out_len += 1;
+                    } else {
+                        read_lance_buf[out_len] = '0' + @as(u8, @intCast(tbl_idx / 10));
+                        read_lance_buf[out_len + 1] = '0' + @as(u8, @intCast(tbl_idx % 10));
+                        out_len += 2;
+                    }
+                }
+                read_lance_buf[out_len] = '\n';
+                out_len += 1;
+                tbl_idx += 1;
+            }
+        } else {
+            pos += 1;
+        }
+    }
+
+    // Null terminate
+    if (out_len < read_lance_buf.len) {
+        read_lance_buf[out_len] = 0;
+    } else {
+        read_lance_buf[read_lance_buf.len - 1] = 0;
+    }
+
+    return &read_lance_buf;
+}
+
+/// Check if identifier is a SQL keyword (for alias detection)
+fn isSqlKeyword(word: []const u8) bool {
+    const keywords = [_][]const u8{
+        "SELECT", "FROM", "WHERE", "JOIN", "LEFT", "RIGHT", "INNER", "OUTER",
+        "ON", "AND", "OR", "NOT", "IN", "LIKE", "BETWEEN", "GROUP", "ORDER",
+        "BY", "HAVING", "LIMIT", "OFFSET", "UNION", "EXCEPT", "INTERSECT",
+        "AS", "NULL", "TRUE", "FALSE", "IS", "CASE", "WHEN", "THEN", "ELSE",
+        "END", "DISTINCT", "ALL", "ASC", "DESC", "CREATE", "DROP", "INSERT",
+        "UPDATE", "DELETE", "INTO", "VALUES", "TABLE", "INDEX", "VIEW", "SET",
+        "WITH", "RECURSIVE", "CROSS", "FULL", "NATURAL", "USING",
+    };
+    for (keywords) |kw| {
+        if (eqlIgnoreCase(word, kw)) return true;
+    }
+    return false;
+}
+
 pub export fn isComplexQuery(sql_ptr: [*]const u8, sql_len: usize) u32 {
     const sql = sql_ptr[0..sql_len];
     query_storage_idx = 0;

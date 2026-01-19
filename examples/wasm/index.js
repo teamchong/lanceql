@@ -47,49 +47,93 @@ function parseTimeTravelCommand(sql) {
 // ============================================================================
 
 /**
- * Extract read_lance('url') patterns from SQL
+ * Extract read_lance('url') patterns from SQL using WASM parser
  * @param {string} sql - SQL query
  * @returns {Array<{fullMatch: string, url: string, alias: string}>}
  */
 function extractReadLanceUrls(sql) {
-    // Match read_lance('url') with optional alias (AS alias or just alias)
-    // The alias must NOT be a SQL keyword
-    const sqlKeywords = /^(SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|AND|OR|NOT|IN|LIKE|BETWEEN|GROUP|ORDER|BY|HAVING|LIMIT|OFFSET|UNION|EXCEPT|INTERSECT|AS|NULL|TRUE|FALSE|IS|CASE|WHEN|THEN|ELSE|END|DISTINCT|ALL|ASC|DESC|CREATE|DROP|INSERT|UPDATE|DELETE|INTO|VALUES|TABLE|INDEX|VIEW|SET|WITH|RECURSIVE)$/i;
+    const wasmInstance = getWasm();
+    const memory = getWasmMemory();
 
-    // Match read_lance('url') followed optionally by AS alias or just alias
-    // But only capture the alias if it's after AS, to avoid matching SQL keywords
+    // Use WASM parser if available (more robust than regex)
+    if (wasmInstance && memory && wasmInstance.extractReadLanceUrls) {
+        const sqlBytes = new TextEncoder().encode(sql);
+        const sqlPtr = wasmInstance.alloc(sqlBytes.length);
+        new Uint8Array(memory.buffer, sqlPtr, sqlBytes.length).set(sqlBytes);
+
+        const resultPtr = wasmInstance.extractReadLanceUrls(sqlPtr, sqlBytes.length);
+
+        // Read null-terminated result string
+        const view = new Uint8Array(memory.buffer, resultPtr);
+        let len = 0;
+        while (view[len] !== 0 && len < 4096) len++;
+        const resultStr = new TextDecoder().decode(view.subarray(0, len));
+
+        if (!resultStr) {
+            console.log(`[Worker] extractReadLanceUrls: found 0 URLs`);
+            return [];
+        }
+
+        // Parse result: "url|alias\n" format
+        const urls = [];
+        for (const line of resultStr.split('\n')) {
+            if (!line) continue;
+            const [url, alias] = line.split('|');
+            if (!url) continue;
+
+            // Reconstruct fullMatch pattern for SQL replacement
+            // Search for exact pattern in original SQL
+            const patterns = [
+                new RegExp(`read_lance\\s*\\(\\s*'${escapeRegex(url)}'\\s*\\)\\s+AS\\s+${escapeRegex(alias)}`, 'i'),
+                new RegExp(`read_lance\\s*\\(\\s*'${escapeRegex(url)}'\\s*\\)\\s+${escapeRegex(alias)}(?!\\w)`, 'i'),
+                new RegExp(`read_lance\\s*\\(\\s*'${escapeRegex(url)}'\\s*\\)`, 'i'),
+            ];
+
+            let fullMatch = `read_lance('${url}')`;
+            for (const pattern of patterns) {
+                const match = sql.match(pattern);
+                if (match) {
+                    fullMatch = match[0];
+                    break;
+                }
+            }
+
+            console.log(`[Worker] extractReadLanceUrls: found "${fullMatch}" -> alias "${alias}"`);
+            urls.push({ fullMatch, url, alias });
+        }
+
+        console.log(`[Worker] extractReadLanceUrls: found ${urls.length} URLs`);
+        return urls;
+    }
+
+    // Fallback to regex (for when WASM not loaded)
+    return extractReadLanceUrlsRegex(sql);
+}
+
+/**
+ * Fallback regex-based extraction (used before WASM loads)
+ */
+function extractReadLanceUrlsRegex(sql) {
+    const sqlKeywords = /^(SELECT|FROM|WHERE|JOIN|LEFT|RIGHT|INNER|OUTER|ON|AND|OR|NOT|IN|LIKE|BETWEEN|GROUP|ORDER|BY|HAVING|LIMIT|OFFSET|UNION|EXCEPT|INTERSECT|AS|NULL|TRUE|FALSE|IS|CASE|WHEN|THEN|ELSE|END|DISTINCT|ALL|ASC|DESC|CREATE|DROP|INSERT|UPDATE|DELETE|INTO|VALUES|TABLE|INDEX|VIEW|SET|WITH|RECURSIVE)$/i;
     const pattern = /read_lance\s*\(\s*'([^']+)'\s*\)(?:\s+AS\s+(\w+)|\s+(\w+))?/gi;
     const urls = [];
     let match;
     while ((match = pattern.exec(sql)) !== null) {
-        // Check both capture groups - AS alias (match[2]) or bare alias (match[3])
         let explicitAlias = match[2];
         let bareAlias = match[3];
-
-        // Only use bare alias if it's not a SQL keyword
-        if (bareAlias && sqlKeywords.test(bareAlias)) {
-            bareAlias = null;
-        }
-
+        if (bareAlias && sqlKeywords.test(bareAlias)) bareAlias = null;
         const alias = explicitAlias || bareAlias || `_tbl${urls.length}`;
-
-        // Determine what was actually matched (for replacement)
-        // If bare alias was matched but is a keyword, don't include it in fullMatch
         let fullMatch = match[0];
         if (match[3] && sqlKeywords.test(match[3])) {
-            // Remove the keyword from the match - it's not part of the table reference
             fullMatch = `read_lance('${match[1]}')`;
         }
-
-        console.log(`[Worker] extractReadLanceUrls: found "${fullMatch}" -> alias "${alias}"`);
-        urls.push({
-            fullMatch,
-            url: match[1],
-            alias
-        });
+        urls.push({ fullMatch, url: match[1], alias });
     }
-    console.log(`[Worker] extractReadLanceUrls: found ${urls.length} URLs`);
     return urls;
+}
+
+function escapeRegex(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 /**

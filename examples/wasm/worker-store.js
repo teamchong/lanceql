@@ -3,6 +3,7 @@
  */
 
 import { encryptionKeys, importEncryptionKey, encryptData, decryptData } from './encryption.js';
+import { getWasm, getWasmMemory } from './index.js';
 
 // Shared state (set by index.js)
 let gpuTransformer = null;
@@ -365,6 +366,35 @@ export class WorkerStore {
     }
 
     _cosineSimilarity(a, b) {
+        const wasm = getWasm();
+        const memory = getWasmMemory();
+
+        // Use WASM SIMD if available (4-10x faster)
+        if (wasm && memory && wasm.simdCosineSimilarity && wasm.allocFloat32Buffer) {
+            const dim = a.length;
+            const aPtr = wasm.allocFloat32Buffer(dim);
+            const bPtr = wasm.allocFloat32Buffer(dim);
+
+            // Copy vectors to WASM memory
+            const aArr = new Float32Array(memory.buffer, aPtr, dim);
+            const bArr = new Float32Array(memory.buffer, bPtr, dim);
+
+            // Handle both Float32Array and regular arrays
+            if (a instanceof Float32Array) {
+                aArr.set(a);
+            } else {
+                for (let i = 0; i < dim; i++) aArr[i] = a[i];
+            }
+            if (b instanceof Float32Array) {
+                bArr.set(b);
+            } else {
+                for (let i = 0; i < dim; i++) bArr[i] = b[i];
+            }
+
+            return wasm.simdCosineSimilarity(aPtr, bPtr, dim);
+        }
+
+        // Fallback to JS implementation
         let dot = 0, normA = 0, normB = 0;
         for (let i = 0; i < a.length; i++) {
             dot += a[i] * b[i];
