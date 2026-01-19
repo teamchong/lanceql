@@ -11,7 +11,9 @@ const memory = @import("memory.zig");
 // ============================================================================
 
 const MAX_ENTRIES = 1024;
-const DEFAULT_MAX_BYTES: usize = 512 * 1024 * 1024; // 512MB
+/// Default 64MB - safe for Cloudflare Workers (128MB limit).
+/// For AWS Lambda or browsers with more memory, call bufferPoolInit() with larger value.
+const DEFAULT_MAX_BYTES: usize = 64 * 1024 * 1024; // 64MB (Worker-safe)
 
 // ============================================================================
 // Types
