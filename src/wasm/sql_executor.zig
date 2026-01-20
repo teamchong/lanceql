@@ -17,7 +17,69 @@ const fragment_reader = @import("fragment_reader.zig");
 const aggregates = @import("aggregates.zig");
 const simd_search = @import("simd_search.zig");
 const lw = @import("lance_writer.zig");
-const minilm = @import("minilm_model.zig");
+// Build options for conditional AI compilation
+// Browser build: zig build wasm (no AI, small binary)
+// Worker build:  zig build wasm -Denable_ai=true (with MiniLM + TinyBERT)
+const build_options = @import("build_options");
+const enable_ai = build_options.enable_ai;
+
+// AI modules - only compiled when enable_ai=true
+// When disabled, provide stub implementations that return "not available"
+const minilm = if (enable_ai) @import("minilm_model.zig") else struct {
+    // Stub buffer for browser build (never actually used since isLoaded returns false)
+    var stub_text_buf: [1]u8 = undefined;
+    var stub_out_buf: [1]f32 = undefined;
+
+    pub fn isLoaded() bool {
+        return false;
+    }
+    pub fn copyTextToBuffer(_: []const u8) void {}
+    pub fn copyOutputToBuffer(_: []f32) void {}
+    pub fn minilm_weights_loaded() i32 {
+        return 0;
+    }
+    pub fn minilm_encode_text(_: usize) i32 {
+        return -100; // AI not enabled
+    }
+    pub fn minilm_get_text_buffer() [*]u8 {
+        return &stub_text_buf;
+    }
+    pub fn minilm_get_output_buffer() [*]f32 {
+        return &stub_out_buf;
+    }
+};
+const tinybert = if (enable_ai) @import("tinybert_model.zig") else struct {};
+
+// Force AI exports to be included in WASM when enabled (prevents dead code elimination)
+comptime {
+    if (enable_ai) {
+        // MiniLM bi-encoder exports
+        _ = &@field(minilm, "minilm_init");
+        _ = &@field(minilm, "minilm_load_model");
+        _ = &@field(minilm, "minilm_encode_text");
+        _ = &@field(minilm, "minilm_get_text_buffer");
+        _ = &@field(minilm, "minilm_get_output_buffer");
+        _ = &@field(minilm, "minilm_alloc_model_buffer");
+        _ = &@field(minilm, "minilm_weights_loaded");
+        // MiniLM cross-encoder exports
+        _ = &@field(minilm, "minilm_is_cross_encoder");
+        _ = &@field(minilm, "minilm_cross_encode");
+        _ = &@field(minilm, "minilm_get_query_buffer");
+        _ = &@field(minilm, "minilm_get_doc_buffer");
+        _ = &@field(minilm, "minilm_get_score");
+        // TinyBERT cross-encoder exports
+        _ = &@field(tinybert, "tinybert_init");
+        _ = &@field(tinybert, "tinybert_load_model");
+        _ = &@field(tinybert, "tinybert_cross_encode");
+        _ = &@field(tinybert, "tinybert_get_query_buffer");
+        _ = &@field(tinybert, "tinybert_get_query_buffer_size");
+        _ = &@field(tinybert, "tinybert_get_doc_buffer");
+        _ = &@field(tinybert, "tinybert_get_doc_buffer_size");
+        _ = &@field(tinybert, "tinybert_get_score");
+        _ = &@field(tinybert, "tinybert_alloc_model_buffer");
+        _ = &@field(tinybert, "tinybert_weights_loaded");
+    }
+}
 
 // DuckDB-style vectorized query engine (shared with native executor)
 const ve = @import("../query/vector_engine.zig");

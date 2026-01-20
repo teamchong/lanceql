@@ -27,6 +27,12 @@ pub fn build(b: *std.Build) void {
     // Enable with: zig build -Donnx=/path/to/onnxruntime
     const onnx_path = b.option([]const u8, "onnx", "Path to ONNX Runtime installation (enables embedding support)");
 
+    // === WASM AI Features ===
+    // Enable MiniLM + TinyBERT for Cloudflare Workers (not browser)
+    // Browser build: zig build wasm (default, no AI, ~500KB)
+    // Worker build:  zig build wasm -Denable_ai=true (~1.5MB + models from R2)
+    const enable_ai = b.option(bool, "enable_ai", "Enable AI/ML features in WASM (MiniLM + TinyBERT for Workers)") orelse false;
+
     // === Core Modules ===
     const proto_mod = b.addModule("lanceql.proto", .{
         .root_source_file = b.path("src/proto/proto.zig"),
@@ -567,6 +573,12 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // AI module - native GGUF model inference (TinyBERT, MiniLM)
+    // Only built when enable_ai=true
+    const ai_mod = b.addModule("lanceql.ai", .{
+        .root_source_file = b.path("src/ai/ai.zig"),
+    });
+
     // Root module exports all
     const lanceql_mod = b.addModule("lanceql", .{
         .root_source_file = b.path("src/lanceql.zig"),
@@ -593,6 +605,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "use_gpu", true); // GPU via wgpu-native (cross-platform)
     build_options.addOption(bool, "use_accelerate", use_accelerate);
     build_options.addOption(bool, "use_onnx", onnx_path != null);
+    build_options.addOption(bool, "enable_ai", enable_ai); // Native GGUF inference (TinyBERT, MiniLM)
     gpu_mod.addOptions("build_options", build_options);
     lanceql_mod.addOptions("build_options", build_options);
 
@@ -1118,6 +1131,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "lanceql.sql.lexer", .module = sql_lexer_mod },
                 .{ .name = "lanceql.sql.parser", .module = sql_parser_mod },
                 .{ .name = "lanceql.sql.executor", .module = sql_executor_mod },
+                .{ .name = "lanceql.ai", .module = ai_mod },
             },
         }),
     });
@@ -1257,6 +1271,22 @@ pub fn build(b: *std.Build) void {
     test_codegen_step.dependOn(&run_test_codegen.step);
     test_step.dependOn(&run_test_codegen.step);
 
+    // AI module tests (TinyBERT native inference)
+    const test_ai = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/test_ai_native.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "lanceql.ai", .module = ai_mod },
+            },
+        }),
+    });
+    const run_test_ai = b.addRunArtifact(test_ai);
+    const test_ai_step = b.step("test-ai", "Run AI module tests (TinyBERT native inference)");
+    test_ai_step.dependOn(&run_test_ai.step);
+    // Don't add to main test step - requires model file
+
     // Stress tests - large datasets, memory pressure, edge cases
     const test_stress = b.addTest(.{
         .root_module = b.createModule(.{
@@ -1297,11 +1327,17 @@ pub fn build(b: *std.Build) void {
     conformance_step.dependOn(&conformance_vector.step);
 
     // === WASM Build ===
+    // Browser build (default): zig build wasm
+    // Worker build (with AI):  zig build wasm -Denable_ai=true
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
         .cpu_features_add = std.Target.wasm.featureSet(&.{.simd128}),
     });
+
+    // Build options module for conditional compilation
+    const wasm_options = b.addOptions();
+    wasm_options.addOption(bool, "enable_ai", enable_ai);
 
     const wasm = b.addExecutable(.{
         .name = "lanceql",
@@ -1312,13 +1348,15 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 // DuckDB-style vectorized query engine (shared with native)
                 .{ .name = "vector_engine", .module = vector_engine_mod },
+                // Build options for conditional AI compilation
+                .{ .name = "build_options", .module = wasm_options.createModule() },
             },
         }),
     });
     wasm.entry = .disabled;
     wasm.rdynamic = true;
 
-    const wasm_step = b.step("wasm", "Build WASM module");
+    const wasm_step = b.step("wasm", "Build WASM module (browser, no AI)");
     const install_wasm = b.addInstallArtifact(wasm, .{});
     wasm_step.dependOn(&install_wasm.step);
 

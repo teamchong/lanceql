@@ -23,8 +23,11 @@ const vector_column = @import("wasm/vector_column.zig");
 const compression = @import("wasm/compression.zig");
 const simd_search = @import("wasm/simd_search.zig");
 const gguf_utils = @import("wasm/gguf_utils.zig");
-const clip_model = @import("wasm/clip_model.zig");
-const minilm_model = @import("wasm/minilm_model.zig");
+// AI models - only included when enable_ai=true (for Workers, not browser)
+const build_options = @import("build_options");
+const clip_model = if (build_options.enable_ai) @import("wasm/clip_model.zig") else struct {};
+const minilm_model = if (build_options.enable_ai) @import("wasm/minilm_model.zig") else struct {};
+const tinybert_model = if (build_options.enable_ai) @import("wasm/tinybert_model.zig") else struct {};
 const lance_writer = @import("wasm/lance_writer.zig");
 const fragment_reader = @import("wasm/fragment_reader.zig");
 const column_meta = @import("wasm/column_meta.zig");
@@ -43,8 +46,6 @@ comptime {
     _ = compression;
     _ = simd_search;
     _ = gguf_utils;
-    _ = clip_model;
-    _ = minilm_model;
     _ = lance_writer;
     _ = fragment_reader;
     _ = column_meta;
@@ -52,6 +53,12 @@ comptime {
     _ = sql_executor;
     _ = buffer_pool;
     _ = dataset_writer;
+    // AI models only when enabled (Workers build)
+    if (build_options.enable_ai) {
+        _ = clip_model;
+        _ = minilm_model;
+        _ = tinybert_model;
+    }
 }
 
 // ============================================================================

@@ -120,6 +120,12 @@ var minilm_layer_ffn_down_bias_idx: [MINILM_NUM_LAYERS]?usize = [_]?usize{null} 
 var minilm_layer_ffn_ln_weight_idx: [MINILM_NUM_LAYERS]?usize = [_]?usize{null} ** MINILM_NUM_LAYERS;
 var minilm_layer_ffn_ln_bias_idx: [MINILM_NUM_LAYERS]?usize = [_]?usize{null} ** MINILM_NUM_LAYERS;
 
+// Cross-encoder classification head (384→1)
+var minilm_cls_weight_idx: ?usize = null;
+var minilm_cls_bias_idx: ?usize = null;
+var minilm_classification_output: f32 = 0;
+var minilm_cross_encoder_enabled: bool = false;
+
 // Scratch buffers for MiniLM inference
 var minilm_scratch_hidden: [MINILM_MAX_SEQ_LEN * MINILM_EMBED_DIM]f32 = undefined;
 var minilm_scratch_q: [MINILM_MAX_SEQ_LEN * MINILM_EMBED_DIM]f32 = undefined;
@@ -132,6 +138,11 @@ var minilm_weight_row_buf: [MINILM_MLP_DIM]f32 = undefined;
 // Static tokenizer buffers (moved from stack to avoid stack overflow)
 var minilm_tokens: [MINILM_MAX_SEQ_LEN]u32 = undefined;
 var minilm_attention_mask: [MINILM_MAX_SEQ_LEN]u32 = undefined;
+var minilm_token_types: [MINILM_MAX_SEQ_LEN]u32 = undefined; // Segment IDs for cross-encoder
+
+// Cross-encoder buffers (query and document inputs)
+var minilm_query_buffer: [512]u8 = undefined;
+var minilm_doc_buffer: [512]u8 = undefined;
 
 // Static buffers for attention output and FFN (moved from stack to avoid stack overflow)
 var minilm_scratch_attn_output: [MINILM_MAX_SEQ_LEN * MINILM_EMBED_DIM]f32 = undefined;
@@ -305,6 +316,252 @@ fn minilmTokenize(text: []const u8, tokens: []u32, attention_mask: []u32) usize 
     }
 
     return final_len;
+}
+
+/// Tokenize a (query, document) pair for cross-encoder.
+/// Format: [CLS] query [SEP] document [SEP]
+/// Segment IDs: query tokens = 0, document tokens = 1
+fn minilmTokenizePair(
+    query: []const u8,
+    doc: []const u8,
+    tokens: []u32,
+    attention_mask: []u32,
+    token_types: []u32,
+) usize {
+    if (minilm_vocab_data == null or minilm_vocab_count == 0) return 0;
+
+    var n_tokens: usize = 0;
+
+    // [CLS] token (segment 0)
+    tokens[n_tokens] = 101;
+    attention_mask[n_tokens] = 1;
+    token_types[n_tokens] = 0;
+    n_tokens += 1;
+
+    // Tokenize query (segment 0)
+    var text_pos: usize = 0;
+    while (text_pos < query.len and n_tokens < MINILM_MAX_SEQ_LEN - 2) {
+        if (query[text_pos] == 0) break;
+        if (query[text_pos] == ' ') {
+            text_pos += 1;
+            continue;
+        }
+
+        var word_end = text_pos;
+        while (word_end < query.len and query[word_end] != ' ' and query[word_end] != 0) {
+            word_end += 1;
+        }
+
+        var word_pos = text_pos;
+        var is_first = true;
+
+        while (word_pos < word_end and n_tokens < MINILM_MAX_SEQ_LEN - 2) {
+            var best_len: usize = 0;
+            var best_id: u32 = 100; // [UNK]
+
+            for (0..minilm_vocab_count) |i| {
+                const tok = minilmGetVocabToken(i);
+                if (tok.len == 0) continue;
+
+                var tok_text = tok;
+                var is_subword = false;
+                if (tok.len >= 2 and tok[0] == '#' and tok[1] == '#') {
+                    tok_text = tok[2..];
+                    is_subword = true;
+                }
+
+                if (is_subword == is_first) continue;
+
+                const remaining = word_end - word_pos;
+                if (tok_text.len > remaining) continue;
+                if (tok_text.len <= best_len) continue;
+
+                var matches = true;
+                for (0..tok_text.len) |j| {
+                    var tc = tok_text[j];
+                    var xc = query[word_pos + j];
+                    if (tc >= 'A' and tc <= 'Z') tc = tc + 32;
+                    if (xc >= 'A' and xc <= 'Z') xc = xc + 32;
+                    if (tc != xc) {
+                        matches = false;
+                        break;
+                    }
+                }
+
+                if (matches) {
+                    best_len = tok_text.len;
+                    best_id = @intCast(i);
+                }
+            }
+
+            if (best_len > 0) {
+                tokens[n_tokens] = best_id;
+                attention_mask[n_tokens] = 1;
+                token_types[n_tokens] = 0; // Query segment
+                n_tokens += 1;
+                word_pos += best_len;
+                is_first = false;
+            } else {
+                word_pos += 1;
+            }
+        }
+        text_pos = word_end;
+    }
+
+    // [SEP] after query (segment 0)
+    tokens[n_tokens] = 102;
+    attention_mask[n_tokens] = 1;
+    token_types[n_tokens] = 0;
+    n_tokens += 1;
+
+    // Tokenize document (segment 1)
+    text_pos = 0;
+    while (text_pos < doc.len and n_tokens < MINILM_MAX_SEQ_LEN - 1) {
+        if (doc[text_pos] == 0) break;
+        if (doc[text_pos] == ' ') {
+            text_pos += 1;
+            continue;
+        }
+
+        var word_end = text_pos;
+        while (word_end < doc.len and doc[word_end] != ' ' and doc[word_end] != 0) {
+            word_end += 1;
+        }
+
+        var word_pos = text_pos;
+        var is_first = true;
+
+        while (word_pos < word_end and n_tokens < MINILM_MAX_SEQ_LEN - 1) {
+            var best_len: usize = 0;
+            var best_id: u32 = 100; // [UNK]
+
+            for (0..minilm_vocab_count) |i| {
+                const tok = minilmGetVocabToken(i);
+                if (tok.len == 0) continue;
+
+                var tok_text = tok;
+                var is_subword = false;
+                if (tok.len >= 2 and tok[0] == '#' and tok[1] == '#') {
+                    tok_text = tok[2..];
+                    is_subword = true;
+                }
+
+                if (is_subword == is_first) continue;
+
+                const remaining = word_end - word_pos;
+                if (tok_text.len > remaining) continue;
+                if (tok_text.len <= best_len) continue;
+
+                var matches = true;
+                for (0..tok_text.len) |j| {
+                    var tc = tok_text[j];
+                    var xc = doc[word_pos + j];
+                    if (tc >= 'A' and tc <= 'Z') tc = tc + 32;
+                    if (xc >= 'A' and xc <= 'Z') xc = xc + 32;
+                    if (tc != xc) {
+                        matches = false;
+                        break;
+                    }
+                }
+
+                if (matches) {
+                    best_len = tok_text.len;
+                    best_id = @intCast(i);
+                }
+            }
+
+            if (best_len > 0) {
+                tokens[n_tokens] = best_id;
+                attention_mask[n_tokens] = 1;
+                token_types[n_tokens] = 1; // Document segment
+                n_tokens += 1;
+                word_pos += best_len;
+                is_first = false;
+            } else {
+                word_pos += 1;
+            }
+        }
+        text_pos = word_end;
+    }
+
+    // [SEP] after document (segment 1)
+    tokens[n_tokens] = 102;
+    attention_mask[n_tokens] = 1;
+    token_types[n_tokens] = 1;
+    n_tokens += 1;
+
+    // Pad remaining
+    const final_len = n_tokens;
+    while (n_tokens < MINILM_MAX_SEQ_LEN) {
+        tokens[n_tokens] = 0; // [PAD]
+        attention_mask[n_tokens] = 0;
+        token_types[n_tokens] = 0;
+        n_tokens += 1;
+    }
+
+    return final_len;
+}
+
+/// Build token embeddings with optional segment ID support.
+/// If use_token_types is false, uses segment 0 for all tokens (bi-encoder mode).
+/// If use_token_types is true, uses minilm_token_types array (cross-encoder mode).
+fn minilmBuildEmbeddings(seq_len: usize, use_token_types: bool) void {
+    const word_emb_idx = minilm_word_emb_idx orelse return;
+    const pos_emb_idx = minilm_pos_emb_idx orelse return;
+    const token_type_emb_idx = minilm_token_type_emb_idx orelse return;
+    const emb_ln_w_idx = minilm_emb_ln_weight_idx orelse return;
+    const emb_ln_b_idx = minilm_emb_ln_bias_idx orelse return;
+
+    for (0..seq_len) |pos| {
+        const tok_id = minilm_tokens[pos];
+        const segment_id = if (use_token_types) minilm_token_types[pos] else 0;
+        for (0..MINILM_EMBED_DIM) |i| {
+            minilm_scratch_hidden[pos * MINILM_EMBED_DIM + i] =
+                minilmReadWeight(word_emb_idx, tok_id * MINILM_EMBED_DIM + i) +
+                minilmReadWeight(pos_emb_idx, pos * MINILM_EMBED_DIM + i) +
+                minilmReadWeight(token_type_emb_idx, segment_id * MINILM_EMBED_DIM + i);
+        }
+    }
+
+    minilmLayerNorm(&minilm_scratch_hidden, seq_len, emb_ln_w_idx, emb_ln_b_idx);
+}
+
+/// Run BERT encoder layers on minilm_scratch_hidden.
+fn minilmRunEncoder(seq_len: usize) void {
+    for (0..MINILM_NUM_LAYERS) |layer| {
+        minilmMultiHeadAttention(&minilm_scratch_hidden, seq_len, layer);
+        minilmFFNBlock(&minilm_scratch_hidden, seq_len, layer);
+    }
+}
+
+/// Apply mean pooling over valid tokens and L2 normalize.
+fn minilmMeanPoolNormalize(seq_len: usize) void {
+    for (0..MINILM_EMBED_DIM) |d| {
+        minilm_output_buffer[d] = 0;
+    }
+
+    var valid_tokens: f32 = 0;
+    for (0..seq_len) |pos| {
+        if (minilm_attention_mask[pos] == 1) {
+            for (0..MINILM_EMBED_DIM) |d| {
+                minilm_output_buffer[d] += minilm_scratch_hidden[pos * MINILM_EMBED_DIM + d];
+            }
+            valid_tokens += 1;
+        }
+    }
+
+    if (valid_tokens > 0) {
+        for (0..MINILM_EMBED_DIM) |d| {
+            minilm_output_buffer[d] /= valid_tokens;
+        }
+    }
+
+    var norm_sq: f32 = 0;
+    for (minilm_output_buffer) |v| norm_sq += v * v;
+    const norm = @sqrt(norm_sq);
+    if (norm > 0) {
+        for (&minilm_output_buffer) |*v| v.* /= norm;
+    }
 }
 
 // ============================================================================
@@ -735,6 +992,27 @@ pub export fn minilm_load_model(size: usize) i32 {
         minilm_layer_ffn_ln_bias_idx[layer] = minilmFindTensor(ffn_ln_b);
     }
 
+    // Cross-encoder classification head (optional - only present in cross-encoder models)
+    // Try multiple naming conventions used by different cross-encoder models
+    minilm_cls_weight_idx = minilmFindTensor("classifier.dense.weight");
+    if (minilm_cls_weight_idx == null) {
+        minilm_cls_weight_idx = minilmFindTensor("classifier.weight");
+    }
+    if (minilm_cls_weight_idx == null) {
+        minilm_cls_weight_idx = minilmFindTensor("classifier.linear.weight");
+    }
+
+    minilm_cls_bias_idx = minilmFindTensor("classifier.dense.bias");
+    if (minilm_cls_bias_idx == null) {
+        minilm_cls_bias_idx = minilmFindTensor("classifier.bias");
+    }
+    if (minilm_cls_bias_idx == null) {
+        minilm_cls_bias_idx = minilmFindTensor("classifier.linear.bias");
+    }
+
+    // Enable cross-encoder mode if classification head weights were found
+    minilm_cross_encoder_enabled = (minilm_cls_weight_idx != null);
+
     if (minilm_word_emb_idx == null) return -10;
     if (minilm_pos_emb_idx == null) return -11;
     if (minilm_emb_ln_weight_idx == null) return -12;
@@ -748,58 +1026,113 @@ pub export fn minilm_encode_text(text_len: usize) i32 {
     if (!minilm_model_loaded) return -2;
     if (text_len == 0 or text_len > minilm_text_buffer.len) return -3;
 
-    const word_emb_idx = minilm_word_emb_idx orelse return -4;
-    const pos_emb_idx = minilm_pos_emb_idx orelse return -5;
-    const token_type_emb_idx = minilm_token_type_emb_idx orelse return -6;
-    const emb_ln_w_idx = minilm_emb_ln_weight_idx orelse return -7;
-    const emb_ln_b_idx = minilm_emb_ln_bias_idx orelse return -8;
+    if (minilm_word_emb_idx == null) return -4;
+    if (minilm_pos_emb_idx == null) return -5;
+    if (minilm_token_type_emb_idx == null) return -6;
+    if (minilm_emb_ln_weight_idx == null) return -7;
+    if (minilm_emb_ln_bias_idx == null) return -8;
 
-    // Use static buffers to avoid stack overflow
+    // Tokenize and encode using helper functions
     const seq_len = minilmTokenize(minilm_text_buffer[0..text_len], &minilm_tokens, &minilm_attention_mask);
+    minilmBuildEmbeddings(seq_len, false); // false = bi-encoder mode (segment 0 for all)
+    minilmRunEncoder(seq_len);
+    minilmMeanPoolNormalize(seq_len);
 
-    for (0..seq_len) |pos| {
-        const tok_id = minilm_tokens[pos];
-        for (0..MINILM_EMBED_DIM) |i| {
-            minilm_scratch_hidden[pos * MINILM_EMBED_DIM + i] =
-                minilmReadWeight(word_emb_idx, tok_id * MINILM_EMBED_DIM + i) +
-                minilmReadWeight(pos_emb_idx, pos * MINILM_EMBED_DIM + i) +
-                minilmReadWeight(token_type_emb_idx, i);
-        }
+    return 0;
+}
+
+// ============================================================================
+// Cross-Encoder Exports
+// ============================================================================
+
+/// Check if cross-encoder mode is available (classification head loaded).
+pub export fn minilm_is_cross_encoder() i32 {
+    return if (minilm_cross_encoder_enabled) 1 else 0;
+}
+
+/// Get pointer to query input buffer for cross-encoder.
+pub export fn minilm_get_query_buffer() [*]u8 {
+    return &minilm_query_buffer;
+}
+
+/// Get size of query buffer.
+pub export fn minilm_get_query_buffer_size() usize {
+    return minilm_query_buffer.len;
+}
+
+/// Get pointer to document input buffer for cross-encoder.
+pub export fn minilm_get_doc_buffer() [*]u8 {
+    return &minilm_doc_buffer;
+}
+
+/// Get size of document buffer.
+pub export fn minilm_get_doc_buffer_size() usize {
+    return minilm_doc_buffer.len;
+}
+
+/// Get the classification score from the last cross_encode call.
+pub export fn minilm_get_score() f32 {
+    return minilm_classification_output;
+}
+
+/// Score a (query, document) pair using cross-encoder.
+/// Returns 0 on success, negative error code on failure.
+/// Result stored in minilm_classification_output (use minilm_get_score() to retrieve).
+pub export fn minilm_cross_encode(query_len: usize, doc_len: usize) i32 {
+    if (!minilm_initialized) return -1;
+    if (!minilm_model_loaded) return -2;
+    if (!minilm_cross_encoder_enabled) return -3; // No classification head
+    if (query_len == 0 or query_len > minilm_query_buffer.len) return -4;
+    if (doc_len == 0 or doc_len > minilm_doc_buffer.len) return -5;
+
+    if (minilm_word_emb_idx == null) return -6;
+    if (minilm_pos_emb_idx == null) return -7;
+    if (minilm_token_type_emb_idx == null) return -8;
+    if (minilm_emb_ln_weight_idx == null) return -9;
+    if (minilm_emb_ln_bias_idx == null) return -10;
+
+    const cls_w_idx = minilm_cls_weight_idx orelse return -11;
+    const cls_b_idx = minilm_cls_bias_idx orelse return -12;
+
+    // Tokenize query-document pair with segment IDs
+    const seq_len = minilmTokenizePair(
+        minilm_query_buffer[0..query_len],
+        minilm_doc_buffer[0..doc_len],
+        &minilm_tokens,
+        &minilm_attention_mask,
+        &minilm_token_types,
+    );
+
+    if (seq_len == 0) return -13;
+
+    // Build embeddings with token types (cross-encoder mode)
+    minilmBuildEmbeddings(seq_len, true);
+
+    // Run BERT encoder
+    minilmRunEncoder(seq_len);
+
+    // Extract CLS token embedding (position 0)
+    const cls_embedding: *const [MINILM_EMBED_DIM]f32 = @ptrCast(minilm_scratch_hidden[0..MINILM_EMBED_DIM]);
+
+    // Apply classification head: score = sigmoid(W @ cls + b)
+    // W is (1, 384) or (384,) and b is (1,) or scalar
+
+    // Read classification weights into buffer once
+    minilmGetWeightRowF32(cls_w_idx, 0, MINILM_EMBED_DIM, minilm_weight_row_buf[0..MINILM_EMBED_DIM]);
+
+    // Start with bias
+    var logit: f32 = minilmReadWeight(cls_b_idx, 0);
+
+    // Compute dot product: logit += W @ cls
+    var j: usize = 0;
+    while (j < MINILM_EMBED_DIM) : (j += SIMD_WIDTH) {
+        const va: Vec4 = cls_embedding[j..][0..SIMD_WIDTH].*;
+        const vb: Vec4 = minilm_weight_row_buf[j..][0..SIMD_WIDTH].*;
+        logit += @reduce(.Add, va * vb);
     }
 
-    minilmLayerNorm(&minilm_scratch_hidden, seq_len, emb_ln_w_idx, emb_ln_b_idx);
-
-    for (0..MINILM_NUM_LAYERS) |layer| {
-        minilmMultiHeadAttention(&minilm_scratch_hidden, seq_len, layer);
-        minilmFFNBlock(&minilm_scratch_hidden, seq_len, layer);
-    }
-
-    for (0..MINILM_EMBED_DIM) |d| {
-        minilm_output_buffer[d] = 0;
-    }
-
-    var valid_tokens: f32 = 0;
-    for (0..seq_len) |pos| {
-        if (minilm_attention_mask[pos] == 1) {
-            for (0..MINILM_EMBED_DIM) |d| {
-                minilm_output_buffer[d] += minilm_scratch_hidden[pos * MINILM_EMBED_DIM + d];
-            }
-            valid_tokens += 1;
-        }
-    }
-
-    if (valid_tokens > 0) {
-        for (0..MINILM_EMBED_DIM) |d| {
-            minilm_output_buffer[d] /= valid_tokens;
-        }
-    }
-
-    var norm_sq: f32 = 0;
-    for (minilm_output_buffer) |v| norm_sq += v * v;
-    const norm = @sqrt(norm_sq);
-    if (norm > 0) {
-        for (&minilm_output_buffer) |*v| v.* /= norm;
-    }
+    // Apply sigmoid: score = 1 / (1 + exp(-logit))
+    minilm_classification_output = 1.0 / (1.0 + @exp(-logit));
 
     return 0;
 }
