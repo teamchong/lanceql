@@ -64,7 +64,7 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.57.0",
-    "esbuild": "^0.27.2"
+    "esbuild": "^0.27.3"
   },
   "dependencies": {
     "chrome-remote-interface": "^0.33.3"
