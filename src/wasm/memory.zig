@@ -13,12 +13,11 @@ pub fn wasmAlloc(len: usize) ?[*]u8 {
         return null;
     }
 
-    // For very large allocations (>256KB), use WASM memory.grow directly
-    if (len > 256 * 1024) {
-        return wasmGrowAlloc(len);
-    }
-
-    // For smaller allocations, use the standard allocator
+    // Always go through page_allocator. The previous dual-path implementation
+    // split at 256 KiB and called @wasmMemoryGrow directly for larger requests,
+    // which corrupted the page_allocator's bookkeeping when subsequent small
+    // allocations grew the same memory range. wasm_allocator (page_allocator)
+    // already grows memory internally as needed and returns valid pointers.
     const count = (len + 7) / 8;
     const slice = wasm_allocator.alloc(u64, count) catch {
         return null;
