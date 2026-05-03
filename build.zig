@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const WasmOptProfile = enum { none, size, speed };
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -1337,22 +1339,42 @@ pub fn build(b: *std.Build) void {
     // === WASM Build ===
     // Browser build (default): zig build wasm
     // Worker build (with AI):  zig build wasm -Denable_ai=true
+    // Feature set is the union of stable wasm features that any modern browser
+    // and Cloudflare Workers support, plus relaxed-simd for FMA-style codegen.
+    // Reference: turboquant-wasm and textsift use the same combo.
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
-        .cpu_features_add = std.Target.wasm.featureSet(&.{.simd128}),
+        .cpu_features_add = std.Target.wasm.featureSet(&.{
+            .simd128,
+            .relaxed_simd,
+            .bulk_memory,
+            .sign_ext,
+            .nontrapping_fptoint,
+            .mutable_globals,
+            .extended_const,
+        }),
     });
 
     // Build options module for conditional compilation
     const wasm_options = b.addOptions();
     wasm_options.addOption(bool, "enable_ai", enable_ai);
 
+    // Size-vs-speed knob. Default is ReleaseSmall (browser-friendly download).
+    // Use `-Dwasm_optimize=ReleaseFast` for compute-heavy kernels (vector search,
+    // joins, aggregations); pair it with the wasm-opt post-step which still
+    // runs `-Oz` on the output to claw back size.
+    const wasm_optimize = b.option(std.builtin.OptimizeMode, "wasm_optimize", "Optimization mode for the WASM target (ReleaseSmall|ReleaseFast|ReleaseSafe|Debug)") orelse .ReleaseSmall;
+
     const wasm = b.addExecutable(.{
         .name = "lanceql",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/wasm.zig"),
             .target = wasm_target,
-            .optimize = .ReleaseSmall,
+            .optimize = wasm_optimize,
+            .strip = true,
+            .single_threaded = true,
+            .omit_frame_pointer = true,
             .imports = &.{
                 // DuckDB-style vectorized query engine (shared with native)
                 .{ .name = "vector_engine", .module = vector_engine_mod },
@@ -1363,10 +1385,58 @@ pub fn build(b: *std.Build) void {
     });
     wasm.entry = .disabled;
     wasm.rdynamic = true;
+    wasm.lto = .full;
 
     const wasm_step = b.step("wasm", "Build WASM module (browser, no AI)");
     const install_wasm = b.addInstallArtifact(wasm, .{});
     wasm_step.dependOn(&install_wasm.step);
+
+    // === WASM post-processing via binaryen wasm-opt ===
+    // Optional: only runs when binaryen is on PATH. -Oz is size-first to minimise
+    // browser download cost; --converge re-runs passes until fixed point.
+    // For a speed-first artifact (Workers / native compute), pair this with
+    // -Dwasm_optimize=ReleaseFast which inlines more before wasm-opt sees it.
+    const wasm_opt_profile = b.option(WasmOptProfile, "wasm_opt", "Run binaryen wasm-opt on the WASM artifact (size|speed|none)") orelse .none;
+    if (wasm_opt_profile != .none) {
+        var wasm_opt_args: std.ArrayListUnmanaged([]const u8) = .empty;
+        const opt_flag: []const u8 = switch (wasm_opt_profile) {
+            .size => "-Oz",
+            .speed => "-O3",
+            .none => unreachable,
+        };
+        wasm_opt_args.appendSlice(b.allocator, &.{
+            "wasm-opt",
+            opt_flag,
+            "--converge",
+            "--strip-producers",
+            "--strip-target-features",
+            "--strip-debug",
+            "--enable-simd",
+            "--enable-relaxed-simd",
+            "--enable-bulk-memory",
+            "--enable-sign-ext",
+            "--enable-nontrapping-float-to-int",
+            "--enable-mutable-globals",
+        }) catch @panic("OOM");
+        if (wasm_opt_profile == .speed) {
+            // Aggressive inlining helps hot vector kernels; mirrors textsift.
+            wasm_opt_args.appendSlice(b.allocator, &.{
+                "--inlining-optimizing",
+                "--always-inline-max-function-size",
+                "256",
+                "--flexible-inline-max-function-size",
+                "512",
+                "--inline-functions-with-loops",
+            }) catch @panic("OOM");
+        }
+        const wasm_opt_cmd = b.addSystemCommand(wasm_opt_args.items);
+        wasm_opt_cmd.addFileArg(wasm.getEmittedBin());
+        wasm_opt_cmd.addArg("-o");
+        const opt_path = wasm_opt_cmd.addOutputFileArg("lanceql.opt.wasm");
+        const install_opt = b.addInstallFileWithDir(opt_path, .bin, "lanceql.wasm");
+        install_opt.step.dependOn(&wasm_opt_cmd.step);
+        wasm_step.dependOn(&install_opt.step);
+    }
 
     // === WASM Tests (Node.js) ===
     // Requires: node tests/wasm_test.mjs
