@@ -605,8 +605,8 @@ pub const LinearHashTable = struct {
         allocator: std.mem.Allocator,
         left_keys: []const i64,
     ) !ProbeResult {
-        var left_out = std.ArrayListUnmanaged(usize){};
-        var right_out = std.ArrayListUnmanaged(usize){};
+        var left_out = std.ArrayListUnmanaged(usize).empty;
+        var right_out = std.ArrayListUnmanaged(usize).empty;
         errdefer {
             left_out.deinit(allocator);
             right_out.deinit(allocator);
@@ -1005,7 +1005,7 @@ pub const HashGroupBy = struct {
     pub fn init(allocator: std.mem.Allocator, expected_groups: usize) !Self {
         return .{
             .ht = try LinearHashTable.init(allocator, expected_groups),
-            .groups = .{},
+            .groups = .empty,
             .allocator = allocator,
         };
     }
@@ -1566,10 +1566,10 @@ pub const StreamingGroupBy = struct {
     pub fn init(allocator: std.mem.Allocator, key_col_idx: usize, specs: []const AggSpec, expected_groups: usize) !Self {
         return .{
             .ht = try LinearHashTable.init(allocator, expected_groups),
-            .groups = .{},
+            .groups = .empty,
             .specs = specs,
             .key_col_idx = key_col_idx,
-            .keys = .{},
+            .keys = .empty,
             .allocator = allocator,
         };
     }

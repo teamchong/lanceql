@@ -22,11 +22,11 @@ pub export fn zstd_decompress(
 ) usize {
     const compressed = compressed_ptr[0..compressed_len];
 
-    // Use std.io.Reader.fixed for the new Zig 0.15 Reader API
-    var reader = std.io.Reader.fixed(compressed);
+    // Zig 0.16 renamed std.io to std.Io.
+    var reader = std.Io.Reader.fixed(compressed);
 
     // Use fixed Writer for output buffer
-    var writer = std.io.Writer.fixed(decompressed_ptr[0..decompressed_capacity]);
+    var writer = std.Io.Writer.fixed(decompressed_ptr[0..decompressed_capacity]);
 
     // Initialize zstd decompressor (empty buffer = direct streaming mode)
     var zstd_stream = std.compress.zstd.Decompress.init(&reader, &.{}, .{});

@@ -2894,8 +2894,8 @@ fn evaluateScalarString(table: *const TableInfo, expr: *const SelectExpr, idx: u
              return scalar_str_buf[0 .. n * s1.len];
         },
         .trim => return std.mem.trim(u8, s1, " "),
-        .ltrim => return std.mem.trimLeft(u8, s1, " "),
-        .rtrim => return std.mem.trimRight(u8, s1, " "),
+        .ltrim => return std.mem.trimStart(u8, s1, " "),
+        .rtrim => return std.mem.trimEnd(u8, s1, " "),
         .upper => {
              // Basic ASCII upper
              @memcpy(scalar_str_buf[0..s1.len], s1);
@@ -5121,7 +5121,7 @@ fn executeShowVectorIndexes(query: *ParsedQuery) !void {
 fn appendInt(col: *ColumnData, val: i64) !void {
     if (col.data_ptr == null) {
         const list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(i64));
-        list.* = std.ArrayListUnmanaged(i64){};
+        list.* = std.ArrayListUnmanaged(i64).empty;
         col.data_ptr = list;
     }
     var list = @as(*std.ArrayListUnmanaged(i64), @ptrCast(@alignCast(col.data_ptr)));
@@ -5132,7 +5132,7 @@ fn appendInt(col: *ColumnData, val: i64) !void {
 fn appendFloat(col: *ColumnData, val: f64) !void {
     if (col.data_ptr == null) {
         const list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(f64));
-        list.* = std.ArrayListUnmanaged(f64){};
+        list.* = std.ArrayListUnmanaged(f64).empty;
         col.data_ptr = list;
     }
     var list = @as(*std.ArrayListUnmanaged(f64), @ptrCast(@alignCast(col.data_ptr)));
@@ -5143,15 +5143,15 @@ fn appendFloat(col: *ColumnData, val: f64) !void {
 fn appendString(col: *ColumnData, val_str: []const u8) !void {
     if (col.string_buffer == null) {
         const char_list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(u8));
-        char_list.* = std.ArrayListUnmanaged(u8){};
+        char_list.* = std.ArrayListUnmanaged(u8).empty;
         col.string_buffer = char_list;
         
         const offset_list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(u32));
-        offset_list.* = std.ArrayListUnmanaged(u32){};
+        offset_list.* = std.ArrayListUnmanaged(u32).empty;
         col.offsets_buffer = offset_list;
         
         const len_list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(u32));
-        len_list.* = std.ArrayListUnmanaged(u32){};
+        len_list.* = std.ArrayListUnmanaged(u32).empty;
         col.data_ptr = len_list;
     }
     var offset_list = @as(*std.ArrayListUnmanaged(u32), @ptrCast(@alignCast(col.offsets_buffer)));
@@ -5172,15 +5172,15 @@ fn appendString(col: *ColumnData, val_str: []const u8) !void {
 fn appendEmptyString(col: *ColumnData) !void {
     if (col.string_buffer == null) {
         const char_list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(u8));
-        char_list.* = std.ArrayListUnmanaged(u8){};
+        char_list.* = std.ArrayListUnmanaged(u8).empty;
         col.string_buffer = char_list;
         
         const offset_list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(u32));
-        offset_list.* = std.ArrayListUnmanaged(u32){};
+        offset_list.* = std.ArrayListUnmanaged(u32).empty;
         col.offsets_buffer = offset_list;
         
         const len_list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(u32));
-        len_list.* = std.ArrayListUnmanaged(u32){};
+        len_list.* = std.ArrayListUnmanaged(u32).empty;
         col.data_ptr = len_list;
     }
     var offset_list = @as(*std.ArrayListUnmanaged(u32), @ptrCast(@alignCast(col.offsets_buffer)));
@@ -5578,7 +5578,7 @@ fn executeInsert(query: *ParsedQuery) !void {
                          // Initialize data_ptr if null
                          if (col.data_ptr == null) {
                              const new_list = try memory.wasm_allocator.create(std.ArrayListUnmanaged(f32));
-                             new_list.* = std.ArrayListUnmanaged(f32){};
+                             new_list.* = std.ArrayListUnmanaged(f32).empty;
                              col.data_ptr = new_list;
                          }
                          const list = @as(*std.ArrayListUnmanaged(f32), @ptrCast(@alignCast(col.data_ptr)));

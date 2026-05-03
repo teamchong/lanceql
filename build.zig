@@ -9,18 +9,26 @@ pub fn build(b: *std.Build) void {
     const use_accelerate = target.result.os.tag == .macos;
 
     // === GPU Module ===
-    // Cross-platform GPU via wgpu-native
-    // Uses same WGSL shaders as browser for code sharing
-    const wgpu_dep = b.dependency("wgpu_native_zig", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    // Cross-platform GPU via wgpu-native.
+    // Default: disabled. wgpu_native_zig is currently incompatible with Zig 0.16
+    // (uses Compile.linkFramework / Compile.addLibraryPath / Compile.addObjectFile,
+    // which moved to Module in 0.16). Re-enable with `-Dgpu=true` once an upstream
+    // 0.16-compatible wgpu_native_zig release is available.
+    const enable_gpu = b.option(bool, "gpu", "Enable wgpu-native GPU module (requires wgpu_native_zig built for Zig 0.16)") orelse false;
 
-    const gpu_mod = b.addModule("lanceql.gpu", .{
-        .root_source_file = b.path("src/gpu/gpu.zig"),
-        .imports = &.{
-            .{ .name = "wgpu", .module = wgpu_dep.module("wgpu") },
-        },
+    const gpu_mod = if (enable_gpu) blk: {
+        const wgpu_dep = b.lazyDependency("wgpu_native_zig", .{
+            .target = target,
+            .optimize = optimize,
+        }) orelse @panic("wgpu_native_zig dependency not available; either fetch it or build with -Dgpu=false");
+        break :blk b.addModule("lanceql.gpu", .{
+            .root_source_file = b.path("src/gpu/gpu.zig"),
+            .imports = &.{
+                .{ .name = "wgpu", .module = wgpu_dep.module("wgpu") },
+            },
+        });
+    } else b.addModule("lanceql.gpu", .{
+        .root_source_file = b.path("src/gpu/gpu_disabled.zig"),
     });
 
     // === Optional ONNX Runtime Support ===
@@ -602,7 +610,7 @@ pub fn build(b: *std.Build) void {
 
     // Pass build options to modules
     const build_options = b.addOptions();
-    build_options.addOption(bool, "use_gpu", true); // GPU via wgpu-native (cross-platform)
+    build_options.addOption(bool, "use_gpu", enable_gpu); // GPU via wgpu-native (cross-platform)
     build_options.addOption(bool, "use_accelerate", use_accelerate);
     build_options.addOption(bool, "use_onnx", onnx_path != null);
     build_options.addOption(bool, "enable_ai", enable_ai); // Native GGUF inference (TinyBERT, MiniLM)
@@ -713,17 +721,17 @@ pub fn build(b: *std.Build) void {
             test_query.root_module.linkFramework("QuartzCore", .{});
             test_query.root_module.linkFramework("Foundation", .{});
             test_query.root_module.linkFramework("CoreFoundation", .{});
-            test_query.linkLibC();
+            test_query.root_module.link_libc = true;
         },
         .linux => {
             test_query.root_module.linkSystemLibrary("vulkan", .{});
-            test_query.linkLibC();
+            test_query.root_module.link_libc = true;
         },
         .windows => {
             test_query.root_module.linkSystemLibrary("d3d12", .{});
             test_query.root_module.linkSystemLibrary("dxgi", .{});
             test_query.root_module.linkSystemLibrary("dxguid", .{});
-            test_query.linkLibC();
+            test_query.root_module.link_libc = true;
         },
         else => {},
     }
@@ -789,17 +797,17 @@ pub fn build(b: *std.Build) void {
             test_logic_table_e2e.root_module.linkFramework("QuartzCore", .{});
             test_logic_table_e2e.root_module.linkFramework("Foundation", .{});
             test_logic_table_e2e.root_module.linkFramework("CoreFoundation", .{});
-            test_logic_table_e2e.linkLibC();
+            test_logic_table_e2e.root_module.link_libc = true;
         },
         .linux => {
             test_logic_table_e2e.root_module.linkSystemLibrary("vulkan", .{});
-            test_logic_table_e2e.linkLibC();
+            test_logic_table_e2e.root_module.link_libc = true;
         },
         .windows => {
             test_logic_table_e2e.root_module.linkSystemLibrary("d3d12", .{});
             test_logic_table_e2e.root_module.linkSystemLibrary("dxgi", .{});
             test_logic_table_e2e.root_module.linkSystemLibrary("dxguid", .{});
-            test_logic_table_e2e.linkLibC();
+            test_logic_table_e2e.root_module.link_libc = true;
         },
         else => {},
     }
@@ -1145,19 +1153,19 @@ pub fn build(b: *std.Build) void {
             cli.root_module.linkFramework("QuartzCore", .{});
             cli.root_module.linkFramework("Foundation", .{});
             cli.root_module.linkFramework("CoreFoundation", .{});
-            cli.linkLibC();
+            cli.root_module.link_libc = true;
         },
         .linux => {
             // Vulkan backend on Linux
             cli.root_module.linkSystemLibrary("vulkan", .{});
-            cli.linkLibC();
+            cli.root_module.link_libc = true;
         },
         .windows => {
             // DirectX 12 backend on Windows (d3d12, dxgi)
             cli.root_module.linkSystemLibrary("d3d12", .{});
             cli.root_module.linkSystemLibrary("dxgi", .{});
             cli.root_module.linkSystemLibrary("dxguid", .{});
-            cli.linkLibC();
+            cli.root_module.link_libc = true;
         },
         else => {},
     }
@@ -1168,7 +1176,7 @@ pub fn build(b: *std.Build) void {
         cli.root_module.addLibraryPath(.{ .cwd_relative = lib_path });
         cli.root_module.addIncludePath(.{ .cwd_relative = include_path });
         cli.root_module.linkSystemLibrary("onnxruntime", .{});
-        cli.linkLibC();
+        cli.root_module.link_libc = true;
     }
     // Pass build options to CLI (for ONNX availability check)
     cli.root_module.addOptions("build_options", build_options);
@@ -1244,9 +1252,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
     // Link against the compiled @logic_table static library
-    test_logic_table_ffi.addObjectFile(b.path("lib/simple_logic_table.a"));
+    test_logic_table_ffi.root_module.addObjectFile(b.path("lib/simple_logic_table.a"));
     // Link system libraries that the .a depends on
-    test_logic_table_ffi.linkLibC();
+    test_logic_table_ffi.root_module.link_libc = true;
 
     const run_test_logic_table_ffi = b.addRunArtifact(test_logic_table_ffi);
     const test_logic_table_ffi_step = b.step("test-logic-table-ffi", "Run @logic_table FFI tests (compiled Python functions)");
