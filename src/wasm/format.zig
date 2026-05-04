@@ -174,6 +174,126 @@ pub export fn getVersion() u32 {
 }
 
 // ============================================================================
+// Range-fetch helpers — let JS callers read column metadata + data buffers
+// without holding the whole Lance file in memory. The flow is:
+//
+//   1. Range-fetch the last 40 bytes (the footer) and call
+//      parseFooterGetColumns / getColumnMetaStart / getColumnMetaOffsetsStart
+//      to learn how many columns there are and where the metadata table
+//      lives in the file.
+//   2. Range-fetch the column-meta-offsets array (8 bytes per column —
+//      consecutive u64 little-endian START positions of each column's
+//      metadata in the file). Column N's metadata length is
+//      offsets[N+1] - offsets[N], and the last column ends at
+//      column_meta_offsets_start. JS can do this directly with a
+//      DataView; no wasm helper needed.
+//   3. Range-fetch each column's metadata protobuf bytes and call
+//      rangeParseColumnMeta to extract data_offset, data_size,
+//      row_count, and vector_dim.
+//   4. Range-fetch only the data bytes you actually need (e.g. the
+//      vec for one HNSW-visited row at data_offset + row_idx*dim*4,
+//      the string entry for one matched row).
+//
+// All the parsing functions below take a buffer that contains JUST the
+// relevant slice of the file (not the whole file), so JS can read tiny
+// chunks instead of materialising the whole .lance.
+// ============================================================================
+
+/// Parse one column's metadata protobuf and emit its data-buffer info.
+/// `meta_data` is just that column's metadata bytes (typically 30-200B),
+/// not the whole file. Mirrors fragment_reader.zig's parseColumnMeta but
+/// is stateless and writes outputs to pointers so JS can collect them.
+/// Returns 1 if parsed successfully, 0 if the buffer was empty or
+/// malformed enough to abort.
+///
+/// Field layout (Lance v2.1 column metadata protobuf):
+///   1: name (string)         — column name e.g. "edge_id"
+///   2: type (string)         — type tag e.g. "string", "vec"
+///   3: nullable (varint)
+///   4: data_offset (fixed64) — byte offset in the file of column data
+///   5: row_count (varint)    — number of rows
+///   6: data_size (varint)    — size in bytes of the column data buffer
+///   7: vector_dim (varint)   — dim, only present for vec columns
+pub export fn rangeParseColumnMeta(
+    meta_data: [*]const u8,
+    meta_len: usize,
+    out_data_offset: *u64,
+    out_row_count: *u64,
+    out_data_size: *u64,
+    out_vector_dim: *u32,
+) u32 {
+    if (meta_len == 0) return 0;
+    out_data_offset.* = 0;
+    out_row_count.* = 0;
+    out_data_size.* = 0;
+    out_vector_dim.* = 0;
+
+    var pos: usize = 0;
+    while (pos < meta_len) {
+        const tag = meta_data[pos];
+        pos += 1;
+        const field_num = tag >> 3;
+        const wire_type = tag & 0x7;
+
+        switch (field_num) {
+            1, 2 => { // name (1) or type (2): length-delimited string, skip
+                if (wire_type == 2) {
+                    const slen = readVarintAtPtr(meta_data, meta_len, &pos);
+                    pos += @intCast(slen);
+                }
+            },
+            3 => { // nullable: varint, skip value
+                if (wire_type == 0) _ = readVarintAtPtr(meta_data, meta_len, &pos);
+            },
+            4 => { // data_offset: fixed64
+                if (wire_type == 1 and pos + 8 <= meta_len) {
+                    out_data_offset.* = std.mem.readInt(u64, meta_data[pos..][0..8], .little);
+                    pos += 8;
+                }
+            },
+            5 => { // row_count: varint
+                if (wire_type == 0) out_row_count.* = readVarintAtPtr(meta_data, meta_len, &pos);
+            },
+            6 => { // data_size: varint
+                if (wire_type == 0) out_data_size.* = readVarintAtPtr(meta_data, meta_len, &pos);
+            },
+            7 => { // vector_dim: varint
+                if (wire_type == 0) out_vector_dim.* = @intCast(readVarintAtPtr(meta_data, meta_len, &pos));
+            },
+            else => {
+                // Skip unknown field per its wire type.
+                if (wire_type == 0) {
+                    _ = readVarintAtPtr(meta_data, meta_len, &pos);
+                } else if (wire_type == 1) {
+                    pos += 8;
+                } else if (wire_type == 2) {
+                    const slen = readVarintAtPtr(meta_data, meta_len, &pos);
+                    pos += @intCast(slen);
+                } else if (wire_type == 5) {
+                    pos += 4;
+                } else {
+                    return 0; // Unsupported wire type
+                }
+            },
+        }
+    }
+    return 1;
+}
+
+fn readVarintAtPtr(data: [*]const u8, data_len: usize, pos: *usize) u64 {
+    var result: u64 = 0;
+    var shift: u6 = 0;
+    while (pos.* < data_len) {
+        const byte = data[pos.*];
+        pos.* += 1;
+        result |= @as(u64, byte & 0x7F) << shift;
+        if (byte & 0x80 == 0) break;
+        shift +|= 7;
+    }
+    return result;
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
