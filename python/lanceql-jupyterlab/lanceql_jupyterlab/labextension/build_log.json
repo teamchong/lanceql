@@ -112,7 +112,7 @@
         }
       },
       {
-        "_options": {
+        "options": {
           "name": "lanceql-jupyterlab",
           "library": {
             "type": "var",

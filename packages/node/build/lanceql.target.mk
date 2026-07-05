@@ -8,9 +8,9 @@ DEFS_Debug := \
 	'-DUSING_V8_SHARED=1' \
 	'-DV8_DEPRECATION_WARNINGS=1' \
 	'-D_GLIBCXX_USE_CXX11_ABI=1' \
+	'-D_FILE_OFFSET_BITS=64' \
 	'-D_DARWIN_USE_64_BIT_INODE=1' \
 	'-D_LARGEFILE_SOURCE' \
-	'-D_FILE_OFFSET_BITS=64' \
 	'-DOPENSSL_NO_PINSHARED' \
 	'-DOPENSSL_THREADS' \
 	'-DNAPI_DISABLE_CPP_EXCEPTIONS' \
@@ -22,6 +22,7 @@ DEFS_Debug := \
 CFLAGS_Debug := \
 	-O0 \
 	-gdwarf-2 \
+	-fno-strict-aliasing \
 	-mmacosx-version-min=10.15 \
 	-arch \
 	arm64 \
@@ -31,15 +32,13 @@ CFLAGS_Debug := \
 	-Wno-unused-parameter
 
 # Flags passed to only C files.
-CFLAGS_C_Debug := \
-	-fno-strict-aliasing
+CFLAGS_C_Debug :=
 
 # Flags passed to only C++ files.
 CFLAGS_CC_Debug := \
 	-std=c++17 \
 	-stdlib=libc++ \
-	-fno-rtti \
-	-fno-strict-aliasing
+	-fno-rtti
 
 # Flags passed to only ObjC files.
 CFLAGS_OBJC_Debug :=
@@ -48,13 +47,13 @@ CFLAGS_OBJC_Debug :=
 CFLAGS_OBJCC_Debug :=
 
 INCS_Debug := \
-	-I/Users/steven_chong/Library/Caches/node-gyp/20.18.0/include/node \
-	-I/Users/steven_chong/Library/Caches/node-gyp/20.18.0/src \
-	-I/Users/steven_chong/Library/Caches/node-gyp/20.18.0/deps/openssl/config \
-	-I/Users/steven_chong/Library/Caches/node-gyp/20.18.0/deps/openssl/openssl/include \
-	-I/Users/steven_chong/Library/Caches/node-gyp/20.18.0/deps/uv/include \
-	-I/Users/steven_chong/Library/Caches/node-gyp/20.18.0/deps/zlib \
-	-I/Users/steven_chong/Library/Caches/node-gyp/20.18.0/deps/v8/include \
+	-I/Users/steven_chong/Library/Caches/node-gyp/24.15.0/include/node \
+	-I/Users/steven_chong/Library/Caches/node-gyp/24.15.0/src \
+	-I/Users/steven_chong/Library/Caches/node-gyp/24.15.0/deps/openssl/config \
+	-I/Users/steven_chong/Library/Caches/node-gyp/24.15.0/deps/openssl/openssl/include \
+	-I/Users/steven_chong/Library/Caches/node-gyp/24.15.0/deps/uv/include \
+	-I/Users/steven_chong/Library/Caches/node-gyp/24.15.0/deps/zlib \
+	-I/Users/steven_chong/Library/Caches/node-gyp/24.15.0/deps/v8/include \
 	-I/Users/steven_chong/Downloads/repos/lanceql/packages/node/node_modules/node-addon-api
 
 DEFS_Release := \
@@ -63,9 +62,9 @@ DEFS_Release := \
 	'-DUSING_V8_SHARED=1' \
 	'-DV8_DEPRECATION_WARNINGS=1' \
 	'-D_GLIBCXX_USE_CXX11_ABI=1' \
+	'-D_FILE_OFFSET_BITS=64' \
 	'-D_DARWIN_USE_64_BIT_INODE=1' \
 	'-D_LARGEFILE_SOURCE' \
-	'-D_FILE_OFFSET_BITS=64' \
 	'-DOPENSSL_NO_PINSHARED' \
 	'-DOPENSSL_THREADS' \
 	'-DNAPI_DISABLE_CPP_EXCEPTIONS' \
@@ -75,6 +74,7 @@ DEFS_Release := \
 CFLAGS_Release := \
 	-O3 \
 	-gdwarf-2 \
+	-fno-strict-aliasing \
 	-mmacosx-version-min=10.15 \
 	-arch \
 	arm64 \
@@ -84,15 +84,13 @@ CFLAGS_Release := \
 	-Wno-unused-parameter
 
 # Flags passed to only C files.
-CFLAGS_C_Release := \
-	-fno-strict-aliasing
+CFLAGS_C_Release :=
 
 # Flags passed to only C++ files.
 CFLAGS_CC_Release := \
 	-std=c++17 \
 	-stdlib=libc++ \
-	-fno-rtti \
-	-fno-strict-aliasing
+	-fno-rtti
 
 # Flags passed to only ObjC files.
 CFLAGS_OBJC_Release :=
@@ -101,13 +99,13 @@ CFLAGS_OBJC_Release :=
 CFLAGS_OBJCC_Release :=
 
 INCS_Release := \
-	-I/Users/steven_chong/Library/Caches/node-gyp/20.18.0/include/node \
-	-I/Users/steven_chong/Library/Caches/node-gyp/20.18.0/src \
-	-I/Users/steven_chong/Library/Caches/node-gyp/20.18.0/deps/openssl/config \
-	-I/Users/steven_chong/Library/Caches/node-gyp/20.18.0/deps/openssl/openssl/include \
-	-I/Users/steven_chong/Library/Caches/node-gyp/20.18.0/deps/uv/include \
-	-I/Users/steven_chong/Library/Caches/node-gyp/20.18.0/deps/zlib \
-	-I/Users/steven_chong/Library/Caches/node-gyp/20.18.0/deps/v8/include \
+	-I/Users/steven_chong/Library/Caches/node-gyp/24.15.0/include/node \
+	-I/Users/steven_chong/Library/Caches/node-gyp/24.15.0/src \
+	-I/Users/steven_chong/Library/Caches/node-gyp/24.15.0/deps/openssl/config \
+	-I/Users/steven_chong/Library/Caches/node-gyp/24.15.0/deps/openssl/openssl/include \
+	-I/Users/steven_chong/Library/Caches/node-gyp/24.15.0/deps/uv/include \
+	-I/Users/steven_chong/Library/Caches/node-gyp/24.15.0/deps/zlib \
+	-I/Users/steven_chong/Library/Caches/node-gyp/24.15.0/deps/v8/include \
 	-I/Users/steven_chong/Downloads/repos/lanceql/packages/node/node_modules/node-addon-api
 
 OBJS := \

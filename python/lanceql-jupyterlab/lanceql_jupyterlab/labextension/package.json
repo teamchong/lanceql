@@ -60,7 +60,7 @@
     "extension": true,
     "outputDir": "lanceql_jupyterlab/labextension",
     "_build": {
-      "load": "static/remoteEntry.2ffa064b3f7be8ed00d4.js",
+      "load": "static/remoteEntry.d7b9a74b94f749c72b86.js",
       "extension": "./extension",
       "style": "./style"
     }
