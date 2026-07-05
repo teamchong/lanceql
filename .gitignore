@@ -57,3 +57,4 @@ tests/fixtures/lance-repo
 benchmarks/benchmark_e2e.lance/
 benchmarks/benchmark_e2e.parquet
 .metal0/
+zig-pkg/
