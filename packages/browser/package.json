@@ -67,6 +67,6 @@
     "esbuild": "^0.28.1"
   },
   "dependencies": {
-    "chrome-remote-interface": "^0.33.3"
+    "chrome-remote-interface": "^0.34.0"
   }
 }
